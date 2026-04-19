@@ -1,14 +1,11 @@
 """`/continue` command: list & restore past model_responses sessions.
-
 Pure functions + one `install(cls)` monkey-patch entry. No side effects at import.
 """
 import ast, glob, json, os, re, time
-
 _LOG_GLOB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          'temp', 'model_responses', 'model_responses_*.txt')
 _BLOCK_RE = re.compile(r'^=== (Prompt|Response) ===.*?\n(.*?)(?=^=== (?:Prompt|Response) ===|\Z)',
                        re.DOTALL | re.MULTILINE)
-
 
 def _rel_time(mtime):
     d = int(time.time() - mtime)
@@ -17,7 +14,6 @@ def _rel_time(mtime):
     if d < 86400: return f'{d // 3600}小时前'
     return f'{d // 86400}天前'
 
-
 def _pairs(content):
     blocks, pairs, pending = _BLOCK_RE.findall(content or ''), [], None
     for label, body in blocks:
@@ -25,7 +21,6 @@ def _pairs(content):
         elif pending is not None:
             pairs.append((pending, body.strip())); pending = None
     return pairs
-
 
 def _first_user(pairs):
     for p, _ in pairs:
@@ -43,7 +38,6 @@ def _first_user(pairs):
             if s and not s.startswith('###'): return s
     return ''
 
-
 def _parse_native_history(pairs):
     history = []
     for p, r in pairs:
@@ -56,7 +50,6 @@ def _parse_native_history(pairs):
         history.append(user_msg)
         history.append({'role': 'assistant', 'content': blocks})
     return history
-
 
 def list_sessions(exclude_pid=None):
     """Newest-first list of (path, mtime, first_user_text, n_rounds)."""
@@ -74,12 +67,8 @@ def list_sessions(exclude_pid=None):
         out.append((f, os.path.getmtime(f), _first_user(pairs), len(pairs)))
     out.sort(key=lambda x: x[1], reverse=True)
     return out
-
-
 _MD_ESCAPE_RE = re.compile(r'([\\`*_\[\]])')
-
-def _escape_md(s):
-    return _MD_ESCAPE_RE.sub(r'\\\1', s)
+def _escape_md(s): return _MD_ESCAPE_RE.sub(r'\\\1', s)
 
 def format_list(sessions, limit=20):
     if not sessions: return '❌ 没有可恢复的历史会话'
@@ -88,7 +77,6 @@ def format_list(sessions, limit=20):
         preview = _escape_md((first or '（无法预览）').replace('\n', ' ')[:60])
         lines.append(f'{i}. `{_rel_time(mtime)}` · **{n} 轮** · {preview}')
     return '\n'.join(lines)
-
 
 def restore(agent, path):
     """Restore session at path. Returns (msg, is_full)."""
@@ -110,7 +98,6 @@ def restore(agent, path):
     n = sum(1 for l in summary if l.startswith('[USER]: '))
     return f'⚠️ 非 native 格式，已降级恢复 {n} 轮摘要（{name}）\n(请输入新问题继续)', False
 
-
 def handle(agent, query, display_queue):
     """Dispatch /continue or /continue N. Returns None if consumed else original query."""
     s = (query or '').strip()
@@ -128,8 +115,6 @@ def handle(agent, query, display_queue):
         display_queue.put({'done': msg, 'source': 'system'})
         return None
     return query
-
-
 def install(cls):
     """Wrap cls._handle_slash_cmd so /continue is handled before original dispatch."""
     orig = cls._handle_slash_cmd
