@@ -6,7 +6,7 @@
 </div>
 
 <p align="center">
-  <a href="#english">English</a> | <a href="#chinese">中文</a> | 📄 <a href="assets/GenericAgent_Technical_Report.pdf">Technical Report</a>
+  <a href="#english">English</a> | <a href="#chinese">中文</a> | 📄 Technical Report:&nbsp;<a href="assets/GenericAgent_Technical_Report.pdf"><img src="https://img.shields.io/badge/-PDF-EA4335?logo=adobeacrobatreader&logoColor=white" alt="Technical Report PDF" height="18"/></a>&nbsp;<a href="https://github.com/JinyiHan99/GA-Technical-Report"><img src="https://img.shields.io/badge/-Code%20%26%20Data-181717?logo=github&logoColor=white" alt="Experiments & Reproduction Repo" height="18"/></a>
 </p>
 
 ---
