@@ -9,6 +9,9 @@
   <a href="#english">English</a> | <a href="#chinese">中文</a> | 📄 <a href="assets/GenericAgent_Technical_Report.pdf">Technical Report</a>
 </p>
 
+> [!NOTE]
+> **Disclaimer** — This project does not build or operate any commercial website. Apart from DintalClaw, no institution, organization, or individual is currently officially authorized to conduct commercial activities under the GenericAgent name. / 本项目未构建任何商业站点；除 DintalClaw 外，目前未官方授权任何机构、组织或个人以 GenericAgent 名义从事商业活动。
+
 ---
 <a name="english"></a>
 ## 🌟 Overview
