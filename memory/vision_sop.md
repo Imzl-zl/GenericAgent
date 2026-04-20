@@ -34,15 +34,10 @@ result = ask_vision("image.png", prompt="描述图片内容")  # 路径或PIL Im
 ## 故障排除
 | 问题 | 解决方案 |
 |------|--------|
-| 导入失败 | 可检查 `../../mykey.py` 文件是否存在（仅检查存在性，不读取内容） |
+| 导入失败 | 可检查 `mykey.py` 文件是否存在（仅检查存在性，不读取内容） |
 | 超时 | 提高 timeout 或降低 max_pixels |
 | 格式错误 | 确保使用 PIL 支持的格式（PNG/JPG/GIF等） |
 
 ## 关键风险与坑点 (L3 Caveats)
 - **无重试机制**: `vision_api.py` 内部未实现 API 错误重试（如 503、超时）。在自动化流程中使用时，**必须在上层代码手动实现重试逻辑**（建议指数退避），否则偶发网络波动会导致任务直接崩溃中断。
-- **API Config**: 当前使用 `claude_config141`(ncode.vkm2.com, 已验证)。备选可用: `native_claude_config2/84/5535`。失效时直接改 `vision_api.py` 中的 `cfg = mk.claude_configXXX`。
-
----
-更新: 2025-07-18 | 修复oai_config导入+返回值统一str
-更新: 2026-02-18 | 默认后端改为Claude原生API | SOP精简(删废话/水段/合并示例)
-更新: 2026-07 | 修复config(原claude_config8不存在)→改为claude_config141
+- **API Config**: 失效时直接改 `vision_api.py` 中的 `cfg = mk.claude_configXXX`。
