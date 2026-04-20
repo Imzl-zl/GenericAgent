@@ -939,3 +939,7 @@ class NativeToolClient:
         if resp: _write_llm_log('Response', resp.raw)
         if resp and hasattr(resp, 'tool_calls') and resp.tool_calls: self._pending_tool_ids = [tc.id for tc in resp.tool_calls]
         return resp
+
+try: import langfuse_tracing  # opt-in observability; noop if langfuse_config not set in mykey
+except Exception: pass
+
