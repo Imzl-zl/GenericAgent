@@ -3,12 +3,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'temp')
 from agentmain import GeneraticAgent
 try:
-    from telegram import Update
-    from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+    from telegram import BotCommand
+    from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
     from telegram.request import HTTPXRequest
 except:
     print("Please ask the agent install python-telegram-bot to use telegram module.")
     sys.exit(1)
+from chatapp_common import HELP_TEXT, TELEGRAM_MENU_COMMANDS, format_restore
+from continue_cmd import handle_frontend_command, reset_conversation
 from llmcore import mykeys
 
 agent = GeneraticAgent()
@@ -82,6 +84,26 @@ async def _stream(dq, msg):
                     except Exception: pass
             break
 
+
+def _normalized_command(text):
+    parts = (text or '').strip().split(None, 1)
+    if not parts:
+        return ''
+    head = parts[0].lower()
+    if head.startswith('/'):
+        head = '/' + head[1:].split('@', 1)[0]
+    return head + (f" {parts[1].strip()}" if len(parts) > 1 and parts[1].strip() else '')
+
+
+def _cancel_stream_task(ctx):
+    task = ctx.user_data.pop('stream_task', None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _sync_commands(application):
+    await application.bot.set_my_commands([BotCommand(command, description) for command, description in TELEGRAM_MENU_COMMANDS])
+
 async def handle_msg(update, ctx):
     uid = update.effective_user.id
     if ALLOWED and uid not in ALLOWED:
@@ -93,11 +115,9 @@ async def handle_msg(update, ctx):
     ctx.user_data['stream_task'] = task
 
 async def cmd_abort(update, ctx):
+    _cancel_stream_task(ctx)
     agent.abort()
-    task = ctx.user_data.get('stream_task')
-    if task and not task.done():
-        task.cancel()
-    await update.message.reply_text("Aborted")
+    await update.message.reply_text("⏹️ 正在停止...")
 
 async def cmd_llm(update, ctx):
     args = (update.message.text or '').split()
@@ -105,12 +125,49 @@ async def cmd_llm(update, ctx):
         try:
             n = int(args[1])
             agent.next_llm(n)
-            await update.message.reply_text(f"Switched to [{agent.llm_no}] {agent.get_llm_name()}")
+            await update.message.reply_text(f"✅ 已切换到 [{agent.llm_no}] {agent.get_llm_name()}")
         except (ValueError, IndexError):
-            await update.message.reply_text(f"Usage: /llm <0-{len(agent.list_llms())-1}>")
+            await update.message.reply_text(f"用法: /llm <0-{len(agent.list_llms())-1}>")
     else:
         lines = [f"{'→' if cur else '  '} [{i}] {name}" for i, name, cur in agent.list_llms()]
         await update.message.reply_text("LLMs:\n" + "\n".join(lines))
+
+
+async def handle_command(update, ctx):
+    uid = update.effective_user.id
+    if ALLOWED and uid not in ALLOWED:
+        return await update.message.reply_text("no")
+    cmd = _normalized_command(update.message.text)
+    op = cmd.split()[0] if cmd else ''
+    if op == '/help':
+        return await update.message.reply_text(HELP_TEXT)
+    if op == '/status':
+        llm = agent.get_llm_name() if agent.llmclient else '未配置'
+        return await update.message.reply_text(f"状态: {'🔴 运行中' if agent.is_running else '🟢 空闲'}\nLLM: [{agent.llm_no}] {llm}")
+    if op == '/stop':
+        return await cmd_abort(update, ctx)
+    if op == '/llm':
+        return await cmd_llm(update, ctx)
+    if op == '/new':
+        _cancel_stream_task(ctx)
+        return await update.message.reply_text(reset_conversation(agent))
+    if op == '/restore':
+        _cancel_stream_task(ctx)
+        try:
+            restored_info, err = format_restore()
+            if err:
+                return await update.message.reply_text(err)
+            restored, fname, count = restored_info
+            agent.abort()
+            agent.history.extend(restored)
+            return await update.message.reply_text(f"✅ 已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)")
+        except Exception as e:
+            return await update.message.reply_text(f"❌ 恢复失败: {e}")
+    if op == '/continue':
+        if cmd != '/continue':
+            _cancel_stream_task(ctx)
+        return await update.message.reply_text(handle_frontend_command(agent, cmd))
+    return await update.message.reply_text(HELP_TEXT)
 
 if __name__ == '__main__':
     # Single instance lock using socket
@@ -141,9 +198,9 @@ if __name__ == '__main__':
                    .token(mykeys['tg_bot_token'])
                    .request(request)
                    .get_updates_request(request)
+                   .post_init(_sync_commands)
                    .build())
-            app.add_handler(CommandHandler("stop", cmd_abort))
-            app.add_handler(CommandHandler("llm", cmd_llm))
+            app.add_handler(MessageHandler(filters.COMMAND, handle_command))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
             app.add_error_handler(_error_handler)
             

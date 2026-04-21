@@ -118,7 +118,7 @@ streamlit run frontends/stapp2.py        # Alternative Streamlit UI
 
 ### Common Chat Commands
 
-The default Streamlit desktop UI started by `python launch.pyw`, plus the QQ / Feishu / WeCom / DingTalk frontends, support these chat commands:
+The default Streamlit desktop UI started by `python launch.pyw`, plus the QQ / Telegram / Feishu / WeCom / DingTalk frontends, support these chat commands:
 
 - `/new` - start a fresh conversation and clear the current context
 - `/continue` - list recoverable conversation snapshots
@@ -393,7 +393,7 @@ streamlit run frontends/stapp2.py        # 另一种 Streamlit 风格 UI
 
 ### 通用聊天命令
 
-默认通过 `python launch.pyw` 启动的 Streamlit 桌面 UI，以及 QQ / 飞书 / 企业微信 / 钉钉前端，都支持以下命令：
+默认通过 `python launch.pyw` 启动的 Streamlit 桌面 UI，以及 QQ / Telegram / 飞书 / 企业微信 / 钉钉前端，都支持以下命令：
 
 - `/new` - 开启新对话并清空当前上下文
 - `/continue` - 列出可恢复会话快照
