@@ -1,6 +1,32 @@
 import ast, asyncio, glob, json, os, queue as Q, re, socket, sys, time
 
-HELP_TEXT = "📖 命令列表:\n/help - 显示帮助\n/status - 查看状态\n/stop - 停止当前任务\n/new - 开启新对话并清空当前上下文\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/llm [n] - 查看或切换模型"
+HELP_COMMANDS = (
+    ("/help", "显示帮助"),
+    ("/status", "查看状态"),
+    ("/stop", "停止当前任务"),
+    ("/new", "开启新对话并清空当前上下文"),
+    ("/restore", "恢复上次对话历史"),
+    ("/continue", "列出可恢复会话"),
+    ("/continue [n]", "恢复第 n 个会话"),
+    ("/llm", "查看当前模型列表"),
+    ("/llm [n]", "切换到第 n 个模型"),
+)
+TELEGRAM_MENU_COMMANDS = (
+    ("help", "显示帮助"),
+    ("status", "查看状态"),
+    ("stop", "停止当前任务"),
+    ("new", "开启新对话并清空当前上下文"),
+    ("restore", "恢复上次对话历史"),
+    ("continue", "列出可恢复会话；/continue n 恢复第 n 个"),
+    ("llm", "查看模型列表；/llm n 切换到指定模型"),
+)
+
+
+def build_help_text(commands=HELP_COMMANDS):
+    return "📖 命令列表:\n" + "\n".join(f"{cmd} - {desc}" for cmd, desc in commands)
+
+
+HELP_TEXT = build_help_text()
 FILE_HINT = "If you need to show files to user, use [FILE:filepath] in your response."
 TAG_PATS = [r"<" + t + r">.*?</" + t + r">" for t in ("thinking", "summary", "tool_use", "file_content")]
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
