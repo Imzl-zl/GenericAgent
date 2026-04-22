@@ -386,7 +386,7 @@ def _to_responses_input(messages):
                 elif ptype == "image_url":
                     url = (part.get("image_url") or {}).get("url", "")
                     if url and role != "assistant": parts.append({"type": "input_image", "image_url": url})
-        if len(parts) == 0: parts = [{"type": text_type, "text": str(content)}]
+        if len(parts) == 0: parts = [{"type": text_type, "text": str(content) or '[empty]'}]
         result.append({"role": role, "content": parts})
         for tc in (msg.get("tool_calls") or []):
             f = tc.get("function", {})
@@ -404,7 +404,7 @@ def _msgs_claude2oai(messages):
             text_parts, tool_calls = [], []
             for b in blocks:
                 if not isinstance(b, dict): continue
-                if b.get("type") == "text": text_parts.append({"type": "text", "text": b.get("text", "")})
+                if b.get("type") == "text" and b.get("text"): text_parts.append({"type": "text", "text": b.get("text", "")})
                 elif b.get("type") == "tool_use":
                     tool_calls.append({
                         "id": b.get("id", ""), "type": "function",
@@ -432,7 +432,7 @@ def _msgs_claude2oai(messages):
                     if src.get("type") == "base64" and src.get("data"):
                         text_parts.append({"type": "image_url", "image_url": {"url": f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"}})
                 elif b.get("type") == "image_url": text_parts.append(b)
-                elif b.get("type") == "text": text_parts.append({"type": "text", "text": b.get("text", "")})
+                elif b.get("type") == "text" and b.get("text"): text_parts.append({"type": "text", "text": b.get("text", "")})
             if text_parts: result.append({"role": "user", "content": text_parts})
         else: result.append(msg)
     return result
@@ -895,6 +895,7 @@ THINKING_PROMPT_ZH = """
 每次回复请先在回复文字中包含：
 1. 在 <thinking></thinking> 标签中先分析现状和策略
 2. 在 <summary></summary> 中输出极简单行（<30字）物理快照：上次结果新信息+本次意图。此内容进入长期工作记忆。
+再进行回答。
 \n**除了最后回答，必须进行工具调用！**
 """.strip()
 THINKING_PROMPT_EN = """
@@ -902,6 +903,7 @@ THINKING_PROMPT_EN = """
 The reply body should first include:
 1. Analyze the current situation and strategy inside <thinking></thinking>
 2. Output a minimal one-line (<30 words) physical snapshot in <summary></summary>: new info from last result + current intent. This goes into long-term working memory.
+Then reply.
 \n**Tool calls are required for every turn except the final answer!**
 """.strip()
 
