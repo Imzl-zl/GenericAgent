@@ -243,9 +243,13 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
                 text = delta["content"]; content_text += text; yield text
             for tc in (delta.get("tool_calls") or []):
                 idx = tc.get("index", 0)
-                if idx not in tc_buf: tc_buf[idx] = {"id": tc.get("id") or '', "name": "", "args": ""}
-                if tc.get("function", {}).get("name"): tc_buf[idx]["name"] = tc["function"]["name"]
+                has_name = bool(tc.get("function", {}).get("name"))
+                if idx not in tc_buf:
+                    if has_name or not tc_buf: tc_buf[idx] = {"id": tc.get("id") or '', "name": "", "args": ""}
+                    else: idx = max(tc_buf)
+                if has_name: tc_buf[idx]["name"] = tc["function"]["name"]
                 if tc.get("function", {}).get("arguments"): tc_buf[idx]["args"] += tc["function"]["arguments"]
+                if tc.get("id") and not tc_buf[idx]["id"]: tc_buf[idx]["id"] = tc["id"]
             usage = evt.get("usage")
             if usage: _record_usage(usage, api_mode)
         blocks = []
@@ -672,7 +676,7 @@ class MockFunction:
          
 class MockToolCall:
     def __init__(self, name, args, id=''):
-        arg_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else args
+        arg_str = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else (args or '{}')
         self.function = MockFunction(name, arg_str); self.id = id
 
 class MockResponse:
