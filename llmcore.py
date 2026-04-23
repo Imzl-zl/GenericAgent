@@ -314,7 +314,7 @@ def _stamp_oai_cache_markers(messages, model):
             messages[idx] = {**messages[idx], 'content': c}
 
 def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completions', *,
-                   temperature=0.5, max_tokens=None, tools=None, reasoning_effort=None,
+                   system=None, temperature=0.5, max_tokens=None, tools=None, reasoning_effort=None,
                    max_retries=0, connect_timeout=10, read_timeout=300, proxies=None, stream=True):
     """Shared OpenAI-compatible streaming request with retry. Yields text chunks, returns list[content_block]."""
     ml = model.lower()
@@ -323,10 +323,12 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"}
     if api_mode == "responses":
         url = auto_make_url(api_base, "responses")
-        payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, "prompt_cache_key": _RESP_CACHE_KEY}
+        payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, 
+                   "prompt_cache_key": _RESP_CACHE_KEY, "instructions": system or "You are an Omnipotent Executor."}
         if reasoning_effort: payload["reasoning"] = {"effort": reasoning_effort}
     else:
         url = auto_make_url(api_base, "chat/completions")
+        if system: messages = [{"role": "system", "content": system}] + messages
         _stamp_oai_cache_markers(messages, model)
         payload = {"model": model, "messages": messages, "stream": stream}
         if stream: payload["stream_options"] = {"include_usage": True}
@@ -643,11 +645,9 @@ class NativeClaudeSession(BaseSession):
 
 class NativeOAISession(NativeClaudeSession):
     def raw_ask(self, messages):
-        """OpenAI streaming. yields text chunks, generator return = list[content_block]"""
         messages = _fix_messages(messages)
-        msgs = ([{"role": "system", "content": self.system}] if self.system else []) + _msgs_claude2oai(messages)
-        return (yield from _openai_stream(self.api_base, self.api_key, msgs, self.model, self.api_mode,
-                                          temperature=self.temperature, max_tokens=self.max_tokens,
+        return (yield from _openai_stream(self.api_base, self.api_key, _msgs_claude2oai(messages), self.model, self.api_mode,
+                                          system=self.system, temperature=self.temperature, max_tokens=self.max_tokens,
                                           tools=self.tools, reasoning_effort=self.reasoning_effort,
                                           max_retries=self.max_retries, connect_timeout=self.connect_timeout,
                                           read_timeout=self.read_timeout, proxies=self.proxies, stream=self.stream))
