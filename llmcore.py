@@ -384,11 +384,12 @@ def _prepare_oai_tools(tools, api_mode="chat_completions"):
     return tools
 
 def _to_responses_input(messages):
-    result = []
+    result, pending = [], []
     for msg in messages:
         role = str(msg.get("role", "user")).lower()
         if role == "tool":
-            result.append({"type": "function_call_output", "call_id": msg.get("tool_call_id", ""), "output": msg.get("content", "")})
+            cid = msg.get("tool_call_id") or (pending.pop(0) if pending else f"call_{uuid.uuid4().hex[:8]}")
+            result.append({"type": "function_call_output", "call_id": cid, "output": msg.get("content", "")})
             continue
         if role not in ["user", "assistant", "system", "developer"]: role = "user"
         if role == "system": role = "developer"  # Responses API uses 'developer' instead of 'system'
@@ -409,9 +410,12 @@ def _to_responses_input(messages):
                     if url and role != "assistant": parts.append({"type": "input_image", "image_url": url})
         if len(parts) == 0: parts = [{"type": text_type, "text": str(content) or '[empty]'}]
         result.append({"role": role, "content": parts})
+        pending = []
         for tc in (msg.get("tool_calls") or []):
             f = tc.get("function", {})
-            result.append({"type": "function_call", "call_id": tc.get("id") or '', "name": f.get("name", ""), "arguments": f.get("arguments", "")})
+            cid = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+            pending.append(cid)
+            result.append({"type": "function_call", "call_id": cid, "name": f.get("name", ""), "arguments": f.get("arguments", "")})
     return result
 
 
