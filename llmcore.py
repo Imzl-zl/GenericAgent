@@ -1,7 +1,7 @@
 import os, json, re, time, requests, sys, threading, urllib3, base64, mimetypes, uuid
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-_RESP_CACHE_KEY = str(uuid.uuid4()) 
+_RESP_CACHE_KEY = str(uuid.uuid4())
 
 def _load_mykeys():
     try:
@@ -157,6 +157,22 @@ def _parse_claude_sse(resp_lines):
         content_blocks.append({"type": "text", "text": warn}); yield warn
     return content_blocks
 
+
+def _try_parse_tool_args(raw):
+    """Parse tool args string; split concatenated JSON objects like {..}{..} if needed.
+    Returns list of parsed dicts."""
+    if not raw: return [{}]
+    try: return [json.loads(raw)]
+    except: pass
+    parts = re.split(r'(?<=\})(?=\{)', raw)
+    if len(parts) > 1:
+        parsed = []
+        for p in parts:
+            try: parsed.append(json.loads(p))
+            except: return [{"_raw": raw}]
+        return parsed
+    return [{"_raw": raw}]
+
 def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
     """Parse OpenAI SSE stream (chat_completions or responses API).
     Yields text chunks, returns list[content_block].
@@ -205,9 +221,11 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
         if content_text: blocks.append({"type": "text", "text": content_text})
         for idx in sorted(fc_buf):
             fc = fc_buf[idx]
-            try: inp = json.loads(fc["args"]) if fc["args"] else {}
-            except: inp = {"_raw": fc["args"]}
-            blocks.append({"type": "tool_use", "id": fc["id"] or '', "name": fc["name"], "input": inp})
+            inps = _try_parse_tool_args(fc["args"])
+            for i, inp in enumerate(inps):
+                bid = fc["id"] or ''
+                if len(inps) > 1: bid = f"{bid}_{i}" if bid else f"split_{i}"
+                blocks.append({"type": "tool_use", "id": bid, "name": fc["name"], "input": inp})
         return blocks
     else:
         tc_buf = {}  # index -> {id, name, args}
@@ -234,9 +252,11 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
         if content_text: blocks.append({"type": "text", "text": content_text})
         for idx in sorted(tc_buf):
             tc = tc_buf[idx]
-            try: inp = json.loads(tc["args"]) if tc["args"] else {}
-            except: inp = {"_raw": tc["args"]}
-            blocks.append({"type": "tool_use", "id": tc["id"] or '', "name": tc["name"], "input": inp})
+            inps = _try_parse_tool_args(tc["args"])
+            for i, inp in enumerate(inps):
+                bid = tc["id"] or ''
+                if len(inps) > 1: bid = f"{bid}_{i}" if bid else f"split_{i}"
+                blocks.append({"type": "tool_use", "id": bid, "name": tc["name"], "input": inp})
         return blocks
 
 def _record_usage(usage, api_mode):
