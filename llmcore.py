@@ -333,7 +333,7 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
                     body = ""
                     try: body = r.text.strip()[:500]
                     except: pass
-                    err = f"Error: HTTP {r.status_code}" + (f": {body}" if body else "")
+                    err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
                     yield err; return [{"type": "text", "text": err}]
                 gen = _parse_openai_sse(r.iter_lines(), api_mode) if stream else _parse_openai_json(r.json(), api_mode)
                 try:
@@ -345,10 +345,10 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
                 d = _delay(None, attempt)
                 print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{max_retries+1})")
                 time.sleep(d); continue
-            err = f"Error: {type(e).__name__}"
+            err = f"!!!Error: {type(e).__name__}"
             yield err; return [{"type": "text", "text": err}]
         except Exception as e:
-            err = f"Error: {type(e).__name__}: {e}"
+            err = f"!!!Error: {type(e).__name__}: {e}"
             yield err; return [{"type": "text", "text": err}]
         
 def _prepare_oai_tools(tools, api_mode="chat_completions"):
