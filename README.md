@@ -400,6 +400,16 @@ streamlit run frontends/stapp2.py        # 另一种 Streamlit 风格 UI
 - `/continue` - 列出可恢复会话快照
 - `/continue N` - 恢复第 `N` 个可恢复会话
 
+### macOS Desktop App (Optional)
+
+将 GenericAgent 安装为 macOS 原生桌面应用，支持通过 Spotlight、Launchpad 或应用程序文件夹一键启动：
+
+```bash
+bash scripts/install-macos-app.sh
+```
+
+安装后按 `Cmd + Space` → 输入 "GenericAgent" 即可启动。首次运行会提示选择 GenericAgent 项目文件夹。
+
 
 ## 📊 与同类产品对比
 
