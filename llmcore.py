@@ -207,7 +207,7 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             fc = fc_buf[idx]
             try: inp = json.loads(fc["args"]) if fc["args"] else {}
             except: inp = {"_raw": fc["args"]}
-            blocks.append({"type": "tool_use", "id": fc["id"], "name": fc["name"], "input": inp})
+            blocks.append({"type": "tool_use", "id": fc["id"] or '', "name": fc["name"], "input": inp})
         return blocks
     else:
         tc_buf = {}  # index -> {id, name, args}
@@ -225,7 +225,7 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
                 text = delta["content"]; content_text += text; yield text
             for tc in (delta.get("tool_calls") or []):
                 idx = tc.get("index", 0)
-                if idx not in tc_buf: tc_buf[idx] = {"id": tc.get("id", ""), "name": "", "args": ""}
+                if idx not in tc_buf: tc_buf[idx] = {"id": tc.get("id") or '', "name": "", "args": ""}
                 if tc.get("function", {}).get("name"): tc_buf[idx]["name"] = tc["function"]["name"]
                 if tc.get("function", {}).get("arguments"): tc_buf[idx]["args"] += tc["function"]["arguments"]
             usage = evt.get("usage")
@@ -236,7 +236,7 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             tc = tc_buf[idx]
             try: inp = json.loads(tc["args"]) if tc["args"] else {}
             except: inp = {"_raw": tc["args"]}
-            blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": inp})
+            blocks.append({"type": "tool_use", "id": tc["id"] or '', "name": tc["name"], "input": inp})
         return blocks
 
 def _record_usage(usage, api_mode):
@@ -390,7 +390,7 @@ def _to_responses_input(messages):
         result.append({"role": role, "content": parts})
         for tc in (msg.get("tool_calls") or []):
             f = tc.get("function", {})
-            result.append({"type": "function_call", "call_id": tc.get("id", ""), "name": f.get("name", ""), "arguments": f.get("arguments", "")})
+            result.append({"type": "function_call", "call_id": tc.get("id") or '', "name": f.get("name", ""), "arguments": f.get("arguments", "")})
     return result
 
 
@@ -407,7 +407,7 @@ def _msgs_claude2oai(messages):
                 if b.get("type") == "text" and b.get("text"): text_parts.append({"type": "text", "text": b.get("text", "")})
                 elif b.get("type") == "tool_use":
                     tool_calls.append({
-                        "id": b.get("id", ""), "type": "function",
+                        "id": b.get("id") or '', "type": "function",
                         "function": {"name": b.get("name", ""), "arguments": json.dumps(b.get("input", {}), ensure_ascii=False)}
                     })
             m = {"role": "assistant"}
@@ -426,7 +426,7 @@ def _msgs_claude2oai(messages):
                     tr = b.get("content", "")
                     if isinstance(tr, list):
                         tr = "\n".join(x.get("text", "") for x in tr if isinstance(x, dict) and x.get("type") == "text")
-                    result.append({"role": "tool", "tool_call_id": b.get("tool_use_id", ""), "content": tr if isinstance(tr, str) else str(tr)})
+                    result.append({"role": "tool", "tool_call_id": b.get("tool_use_id") or '', "content": tr if isinstance(tr, str) else str(tr)})
                 elif b.get("type") == "image":
                     src = b.get("source") or {}
                     if src.get("type") == "base64" and src.get("data"):
