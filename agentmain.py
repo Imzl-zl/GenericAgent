@@ -141,7 +141,7 @@ class GeneraticAgent:
             if 'gpt' in self.get_llm_name(model=True): handler._done_hooks.append('请确定任务是否完成，如果完成请给出信息完整的简报回答，如未完成需要继续工具调用直到完成任务，确实需要问用户应使用ask_user工具')
             # although new handler, the **full** history is in llmclient, so it is full history!
             gen = agent_runner_loop(self.llmclient, sys_prompt, user_input, 
-                                handler, TOOLS_SCHEMA, max_turns=40, verbose=self.verbose)
+                                handler, TOOLS_SCHEMA, max_turns=70, verbose=self.verbose)
             try:
                 full_resp = ""; last_pos = 0
                 for chunk in gen:

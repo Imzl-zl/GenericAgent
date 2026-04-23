@@ -315,8 +315,7 @@ def _stamp_oai_cache_markers(messages, model):
 
 def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completions', *,
                    temperature=0.5, max_tokens=None, tools=None, reasoning_effort=None,
-                   max_retries=0, connect_timeout=10, read_timeout=300, proxies=None,
-                   stream=True):
+                   max_retries=0, connect_timeout=10, read_timeout=300, proxies=None, stream=True):
     """Shared OpenAI-compatible streaming request with retry. Yields text chunks, returns list[content_block]."""
     ml = model.lower()
     if 'kimi' in ml or 'moonshot' in ml: temperature = 1
@@ -912,19 +911,13 @@ class MixinSession:
 
 THINKING_PROMPT_ZH = """
 ### 行动规范（持续有效）
-每次回复请先在回复文字中包含：
-1. 在 <thinking></thinking> 标签中先分析现状和策略
-2. 在 <summary></summary> 中输出极简单行（<30字）物理快照：上次结果新信息+本次意图。此内容进入长期工作记忆。
-再进行回答。
-\n**除了最后回答，必须进行工具调用！**
+每次回复请先在回复文字中包含一个<summary></summary> 中输出极简单行（<30字）物理快照：上次结果新信息+本次意图。此内容进入长期工作记忆。
+\n**若用户需求未完成，必须进行工具调用！**
 """.strip()
 THINKING_PROMPT_EN = """
 ### Action Protocol (always in effect)
-The reply body should first include:
-1. Analyze the current situation and strategy inside <thinking></thinking>
-2. Output a minimal one-line (<30 words) physical snapshot in <summary></summary>: new info from last result + current intent. This goes into long-term working memory.
-Then reply.
-\n**Tool calls are required for every turn except the final answer!**
+The reply body should first include a minimal one-line (<30 words) physical snapshot in <summary></summary>: new info from last result + current intent. This goes into long-term working memory.
+\n**If the user's request is not yet complete, tool calls are required!**
 """.strip()
 
 class NativeToolClient:
