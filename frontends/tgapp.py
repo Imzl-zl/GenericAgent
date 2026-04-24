@@ -1,4 +1,4 @@
-import os, sys, re, threading, asyncio, queue as Q, socket, time, random
+import os, sys, re, threading, asyncio, queue as Q, time, random
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'temp')
 from agentmain import GeneraticAgent
@@ -16,10 +16,12 @@ from chatapp_common import (
     HELP_TEXT,
     TELEGRAM_MENU_COMMANDS,
     clean_reply,
+    ensure_single_instance,
     extract_files,
     format_restore,
+    redirect_log,
+    require_runtime,
     split_text,
-    strip_files,
 )
 from continue_cmd import handle_frontend_command, reset_conversation
 from llmcore import mykeys
@@ -60,6 +62,11 @@ def _resolve_files(paths):
         seen.add(fpath)
     return files
 
+
+def _render_file_markers(text):
+    def repl(match):
+        return os.path.basename(match.group(1))
+    return re.sub(r"\[FILE:([^\]]+)\]", repl, text or "").strip()
 
 def _escape_pre(text):
     return escape_markdown(text or "", version=2, entity_type="pre")
@@ -144,7 +151,7 @@ class _TelegramStreamSession:
     async def _refresh(self, done, send_files):
         cleaned = clean_reply(self.raw_text) if self.raw_text.strip() else ""
         self.files = _resolve_files(extract_files(cleaned))
-        body = strip_files(cleaned)
+        body = _render_file_markers(cleaned)
         if done and not body and self.files:
             body = "已生成附件"
         elif done and not body:
@@ -359,17 +366,12 @@ async def handle_command(update, ctx):
     return await update.message.reply_text(HELP_TEXT)
 
 if __name__ == '__main__':
-    try:  # Single instance lock using socket
-        _lock_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); _lock_sock.bind(('127.0.0.1', 19527))
-    except OSError: 
-        print('[Telegram] Another instance is already running, skiping...')
-        sys.exit(1)
+    _LOCK_SOCK = ensure_single_instance(19527, "Telegram")
     if not ALLOWED: 
         print('[Telegram] ERROR: tg_allowed_users in mykey.py is empty or missing. Set it to avoid unauthorized access.')
         sys.exit(1)
-    _logf = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'temp', 'tgapp.log'), 'a', encoding='utf-8', buffering=1)
-    sys.stdout = sys.stderr = _logf
-    print('[NEW] New process starting, the above are history infos ...')
+    require_runtime(agent, "Telegram", tg_bot_token=mykeys.get("tg_bot_token"))
+    redirect_log(__file__, "tgapp.log", "Telegram", ALLOWED)
     threading.Thread(target=agent.run, daemon=True).start()
     proxy = mykeys.get('proxy', None)  # set 'proxy' in mykey.py if needed, e.g. 'http://127.0.0.1:2082'
     print('proxy:', proxy)
