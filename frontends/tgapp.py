@@ -40,6 +40,8 @@ _MD_TOKEN_RE = re.compile(
     r"|\[([^\]]+)\]\(([^)\n]+)\)"
     r"|`([^`\n]+)`"
     r"|\*\*([^\n]+?)\*\*"
+    r"|__([^\n]+?)__"
+    r"|~~([^\n]+?)~~"
     r"|(?<!\*)\*(?!\*)([^\n]+?)(?<!\*)\*(?!\*)",
     re.DOTALL,
 )
@@ -97,7 +99,11 @@ def _to_markdown_v2(text):
         elif match.group(7) is not None:
             parts.append(f"*{escape_markdown(match.group(7), version=2)}*")
         elif match.group(8) is not None:
-            parts.append(f"_{escape_markdown(match.group(8), version=2)}_")
+            parts.append(f"*{escape_markdown(match.group(8), version=2)}*")
+        elif match.group(9) is not None:
+            parts.append(f"~{escape_markdown(match.group(9), version=2)}~")
+        elif match.group(10) is not None:
+            parts.append(f"_{escape_markdown(match.group(10), version=2)}_")
         pos = match.end()
     parts.append(escape_markdown(text[pos:], version=2))
     return "".join(parts)
