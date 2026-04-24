@@ -89,6 +89,20 @@ cp mykey_template.py mykey.py
 python launch.pyw
 ```
 
+#### Method 2: uv (for experienced Python users)
+
+If you prefer a modern Python workflow, GenericAgent also provides a minimal `pyproject.toml`:
+
+```bash
+git clone https://github.com/lsdefine/GenericAgent.git
+cd GenericAgent
+uv pip install -e ".[ui]"        # Core + GUI dependencies
+cp mykey_template.py mykey.py
+python launch.pyw
+```
+
+> GenericAgent is meant to grow its environment through the Agent itself, not by pre-installing every possible package.
+
 Full guide: [GETTING_STARTED.md](GETTING_STARTED.md)
 
 ---
@@ -292,6 +306,20 @@ cp mykey_template.py mykey.py
 # 4. 启动
 python launch.pyw
 ```
+
+#### 方法二：uv 快速安装（熟悉 Python 的用户）
+
+如果你习惯现代 Python 工作流，GenericAgent 也提供了一个最小化的 `pyproject.toml`：
+
+```bash
+git clone https://github.com/lsdefine/GenericAgent.git
+cd GenericAgent
+uv pip install -e ".[ui]"        # 核心 + GUI 依赖
+cp mykey_template.py mykey.py
+python launch.pyw
+```
+
+> GenericAgent 更推荐由 Agent 在使用中自举环境，而不是预先手动装完整依赖。
 
 完整引导流程见 [GETTING_STARTED.md](GETTING_STARTED.md)。
 
