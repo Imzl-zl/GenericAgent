@@ -205,10 +205,9 @@ You're also welcome to join our **GenericAgent Community Group** for discussion,
 <div align="center">
   <table>
     <tr>
-      <td align="center"><strong>WeChat Group 6</strong><br><img src="assets/images/wechat_group6.jpg" alt="WeChat Group 6 QR Code" width="250"/></td>
       <td align="center"><strong>WeChat Group 8</strong><br><img src="assets/images/wechat_group8.jpg" alt="WeChat Group 8 QR Code" width="250"/></td>
       <td align="center"><strong>WeChat Group 9</strong><br><img src="assets/images/wechat_group9.jpg" alt="WeChat Group 9 QR Code" width="250"/></td>
-      <td align="center"><strong>WeChat Group 10</strong><br><img src="assets/images/wechat_group10.jpg" alt="WeChat Group 10 QR Code" width="250"/></td>
+      <td align="center"><strong>WeChat Group 11</strong><br><img src="assets/images/wechat_group11.jpg" alt="WeChat Group 11 QR Code" width="250"/></td>
     </tr>
   </table>
 </div>
@@ -493,10 +492,9 @@ GenericAgent 通过**分层记忆 × 最小工具集 × 自主执行循环**完�
 <div align="center">
   <table>
     <tr>
-      <td align="center"><strong>微信群 6</strong><br><img src="assets/images/wechat_group6.jpg" alt="微信群 6 二维码" width="250"/></td>
       <td align="center"><strong>微信群 8</strong><br><img src="assets/images/wechat_group8.jpg" alt="微信群 8 二维码" width="250"/></td>
       <td align="center"><strong>微信群 9</strong><br><img src="assets/images/wechat_group9.jpg" alt="微信群 9 二维码" width="250"/></td>
-      <td align="center"><strong>微信群 10</strong><br><img src="assets/images/wechat_group10.jpg" alt="微信群 10 二维码" width="250"/></td>
+      <td align="center"><strong>微信群 11</strong><br><img src="assets/images/wechat_group11.jpg" alt="微信群 11 二维码" width="250"/></td>
     </tr>
   </table>
 </div>
