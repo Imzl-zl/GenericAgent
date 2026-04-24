@@ -148,7 +148,7 @@ def _parse_claude_sse(resp_lines):
         elif evt_type == "error":
             err = evt.get("error", {})
             emsg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-            warn = f"\n\n[SSE Error: {emsg}]"; break
+            warn = f"\n\n!!!Error: SSE {emsg}"; break
     if not warn:
         if not got_message_stop and not stop_reason: warn = "\n\n[!!! 流异常中断，未收到完整响应 !!!]"
         elif stop_reason == "max_tokens": warn = "\n\n[!!! Response truncated: max_tokens !!!]"
@@ -211,7 +211,7 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             elif etype == "error":
                 err = evt.get("error", {})
                 emsg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                if emsg: content_text += f"Error: {emsg}"; yield f"Error: {emsg}"
+                if emsg: content_text += f"!!!Error: {emsg}"; yield f"!!!Error: {emsg}"
                 break
             elif etype == "response.completed":
                 usage = evt.get("response", {}).get("usage", {})
@@ -243,9 +243,13 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
                 text = delta["content"]; content_text += text; yield text
             for tc in (delta.get("tool_calls") or []):
                 idx = tc.get("index", 0)
-                if idx not in tc_buf: tc_buf[idx] = {"id": tc.get("id") or '', "name": "", "args": ""}
-                if tc.get("function", {}).get("name"): tc_buf[idx]["name"] = tc["function"]["name"]
+                has_name = bool(tc.get("function", {}).get("name"))
+                if idx not in tc_buf:
+                    if has_name or not tc_buf: tc_buf[idx] = {"id": tc.get("id") or '', "name": "", "args": ""}
+                    else: idx = max(tc_buf)
+                if has_name: tc_buf[idx]["name"] = tc["function"]["name"]
                 if tc.get("function", {}).get("arguments"): tc_buf[idx]["args"] += tc["function"]["arguments"]
+                if tc.get("id") and not tc_buf[idx]["id"]: tc_buf[idx]["id"] = tc["id"]
             usage = evt.get("usage")
             if usage: _record_usage(usage, api_mode)
         blocks = []
@@ -518,7 +522,7 @@ class BaseSession:
                 if block.get('type', '') == 'tool_use':
                     tu = {'name': block.get('name', ''), 'arguments': block.get('input', {})}
                     yield f'<tool_use>{json.dumps(tu, ensure_ascii=False)}</tool_use>'
-            if not content.startswith("Error:"): self.history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
+            if not content.startswith("!!!Error:"): self.history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
         return _ask_gen() if stream else ''.join(list(_ask_gen()))
 
 class ClaudeSession(BaseSession):
@@ -533,7 +537,7 @@ class ClaudeSession(BaseSession):
                 if r.status_code != 200: raise Exception(f"HTTP {r.status_code} {r.content.decode('utf-8', errors='replace')[:500]}")
                 return (yield from _parse_claude_sse(r.iter_lines())) or []
         except Exception as e:
-            yield (err := f"Error: {e}")
+            yield (err := f"!!!Error: {e}")
             return [{"type": "text", "text": err}]
     def make_messages(self, raw_list):
         msgs = [{"role": m['role'], "content": list(m['content'])} for m in raw_list]
@@ -617,7 +621,7 @@ class NativeClaudeSession(BaseSession):
                         elif b.get("type") == "thinking": yield ""
                     return content_blocks
         except Exception as e:
-            yield (err := f"Error: {e}")
+            yield (err := f"!!!Error: {e}")
             return [{"type": "text", "text": err}]
 
     def ask(self, msg):
@@ -631,7 +635,7 @@ class NativeClaudeSession(BaseSession):
         try:
             while True: yield next(gen)
         except StopIteration as e: content_blocks = e.value or []
-        if content_blocks and not (len(content_blocks) == 1 and content_blocks[0].get("text", "").startswith("Error:")):
+        if content_blocks and not (len(content_blocks) == 1 and content_blocks[0].get("text", "").startswith("!!!Error:")):
             self.history.append({"role": "assistant", "content": content_blocks})
         text_parts = [b["text"] for b in content_blocks if b.get("type") == "text"]
         content = "\n".join(text_parts).strip()
@@ -672,7 +676,7 @@ class MockFunction:
          
 class MockToolCall:
     def __init__(self, name, args, id=''):
-        arg_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else args
+        arg_str = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else (args or '{}')
         self.function = MockFunction(name, arg_str); self.id = id
 
 class MockResponse:
@@ -887,7 +891,7 @@ class MixinSession:
         return self._cur_idx
     def _raw_ask(self, *args, **kwargs):
         base, n = self._pick(), len(self._sessions)
-        test_error = lambda x: isinstance(x, str) and (x.startswith('Error:') or x.startswith('[Error:'))
+        test_error = lambda x: isinstance(x, str) and x.lstrip().startswith(('!!!Error:', '[Error:'))
         for attempt in range(self._retries + 1):
             idx = (base + attempt) % n
             gen = self._orig_raw_asks[idx](*args, **kwargs)
