@@ -420,8 +420,8 @@ def _to_responses_input(messages):
                 elif ptype == "image_url":
                     url = (part.get("image_url") or {}).get("url", "")
                     if url and role != "assistant": parts.append({"type": "input_image", "image_url": url})
-        if len(parts) == 0 and not isinstance(content, list): parts = [{"type": text_type, "text": str(content) or '[empty]'}]
-        if parts: result.append({"role": role, "content": parts})
+        if len(parts) == 0: parts = [{"type": text_type, "text": str(content) if not isinstance(content, list) else '[empty]'}]
+        result.append({"role": role, "content": parts})
         pending = []
         for tc in (msg.get("tool_calls") or []):
             f = tc.get("function", {})
@@ -537,7 +537,9 @@ class BaseSession:
 
 def _keep_claude_block(b): return not isinstance(b, dict) or b.get("type") != "thinking" or b.get("signature")
 def _drop_unsigned_thinking(messages):
-    for m in messages: m["content"] = [b for b in m["content"] if _keep_claude_block(b)]
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list): m["content"] = [b for b in c if _keep_claude_block(b)]
     return messages
 
 class ClaudeSession(BaseSession):
