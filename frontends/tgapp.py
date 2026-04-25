@@ -102,7 +102,7 @@ class _TelegramStreamSession:
     def __init__(self, root_msg):
         self.root_msg = root_msg
         self.private_chat = getattr(getattr(root_msg, "chat", None), "type", "") == ChatType.PRIVATE
-        self.can_use_draft = self.private_chat
+        self.can_use_draft = False  # can not use or streaming dead
         self.draft_id = _make_draft_id()
         self.live_msg = None
         self.raw_text = ""
@@ -244,16 +244,12 @@ async def _stream(dq, msg):
     await session.prime()
     try:
         while True:
-            try:
-                first = await asyncio.to_thread(dq.get, True, _QUEUE_WAIT_SECONDS)
-            except Q.Empty:
-                continue
+            try: first = await asyncio.to_thread(dq.get, True, _QUEUE_WAIT_SECONDS)
+            except Q.Empty: continue
             items = [first]
             try:
-                while True:
-                    items.append(dq.get_nowait())
-            except Q.Empty:
-                pass
+                while True: items.append(dq.get_nowait())
+            except Q.Empty: pass
             done_item = next((item for item in items if "done" in item), None)
             if done_item is not None:
                 await session.finalize(done_item.get("done", ""))
@@ -267,20 +263,16 @@ async def _stream(dq, msg):
         print(f"[TG stream error] {type(exc).__name__}: {exc}", flush=True)
         await session.finish_with_notice(f"❌ 输出失败: {exc}")
 
-
 def _normalized_command(text):
     parts = (text or "").strip().split(None, 1)
-    if not parts:
-        return ''
+    if not parts: return ''
     head = parts[0].lower()
-    if head.startswith('/'):
-        head = '/' + head[1:].split('@', 1)[0]
+    if head.startswith('/'): head = '/' + head[1:].split('@', 1)[0]
     return head + (f" {parts[1].strip()}" if len(parts) > 1 and parts[1].strip() else '')
 
 def _cancel_stream_task(ctx):
     task = ctx.user_data.pop('stream_task', None)
-    if task and not task.done():
-        task.cancel()
+    if task and not task.done(): task.cancel()
 
 async def _sync_commands(application):
     await application.bot.set_my_commands([BotCommand(command, description) for command, description in TELEGRAM_MENU_COMMANDS])
@@ -314,14 +306,22 @@ async def cmd_llm(update, ctx):
 
 async def handle_photo(update, ctx):
     uid = update.effective_user.id
-    if ALLOWED and uid not in ALLOWED:
-        return await update.message.reply_text("no")
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    fpath = f"tg_{photo.file_unique_id}.jpg"
+    if ALLOWED and uid not in ALLOWED: return await update.message.reply_text("no")
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        fpath = f"tg_{photo.file_unique_id}.jpg"
+        kind = "图片"
+    elif update.message.document:
+        doc = update.message.document
+        file = await doc.get_file()
+        ext = os.path.splitext(doc.file_name or '')[1] or ''
+        fpath = f"tg_{doc.file_unique_id}{ext}"
+        kind = "文件"
+    else: return
     await file.download_to_drive(os.path.join(_TEMP_DIR, fpath))
     caption = update.message.caption
-    prompt = f"[TIPS] 收到图片temp/{fpath}\n{caption}" if caption else f"[TIPS] 收到图片temp/{fpath}，请等待下一步指令"
+    prompt = f"[TIPS] 收到{kind}temp/{fpath}\n{caption}" if caption else f"[TIPS] 收到{kind}temp/{fpath}，请等待下一步指令"
     dq = agent.put_task(prompt, source="telegram")
     task = asyncio.create_task(_stream(dq, update.message))
     ctx.user_data['stream_task'] = task
@@ -386,6 +386,7 @@ if __name__ == '__main__':
                    .request(request).get_updates_request(request).post_init(_sync_commands).build())
             app.add_handler(MessageHandler(filters.COMMAND, handle_command))
             app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+            app.add_handler(MessageHandler(filters.Document.ALL, handle_photo))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
             app.add_error_handler(_error_handler)
             app.run_polling(drop_pending_updates=True, poll_interval=1.0, timeout=30)

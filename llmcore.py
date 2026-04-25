@@ -74,6 +74,12 @@ def _sanitize_leading_user_msg(msg):
     msg['content'] = [{"type": "text", "text": '\n'.join(t for t in texts if t)}]
     return msg
 
+_oldprint = print
+def safeprint(*argv):
+    try: _oldprint(*argv)
+    except OSError: pass
+print = safeprint
+
 def trim_messages_history(history, context_win):
     compress_history_tags(history)
     cost = sum(len(json.dumps(m, ensure_ascii=False)) for m in history) 
@@ -337,6 +343,7 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
         payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, 
                    "prompt_cache_key": _RESP_CACHE_KEY, "instructions": system or "You are an Omnipotent Executor."}
         if reasoning_effort: payload["reasoning"] = {"effort": reasoning_effort}
+        if max_tokens: payload["max_output_tokens"] = max_tokens
     else:
         url = auto_make_url(api_base, "chat/completions")
         if system: messages = [{"role": "system", "content": system}] + messages
@@ -502,7 +509,7 @@ class BaseSession:
         mode = str(cfg.get('api_mode', 'chat_completions')).strip().lower().replace('-', '_')
         self.api_mode = 'responses' if mode in ('responses', 'response') else 'chat_completions'
         self.temperature = cfg.get('temperature', 1)
-        self.max_tokens = cfg.get('max_tokens', 8192)
+        self.max_tokens = cfg.get('max_tokens')
     def _apply_claude_thinking(self, payload):
         if self.thinking_type:
             thinking = {"type": self.thinking_type}
@@ -543,6 +550,7 @@ def _drop_unsigned_thinking(messages):
 
 class ClaudeSession(BaseSession):
     def raw_ask(self, messages):
+        if self.max_tokens is None: self.max_tokens = 8192
         headers = {"x-api-key": self.api_key, "Content-Type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31"}
         payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
         if self.temperature != 1: payload["temperature"] = self.temperature
@@ -599,6 +607,7 @@ class NativeClaudeSession(BaseSession):
         self.tools = None
     def raw_ask(self, messages):
         messages = _drop_unsigned_thinking(_fix_messages(messages))
+        if self.max_tokens is None: self.max_tokens = 8192
         model = self.model
         beta_parts = ["claude-code-20250219", "interleaved-thinking-2025-05-14", "redact-thinking-2026-02-12", "prompt-caching-scope-2026-01-05"]
         if "[1m]" in model.lower():

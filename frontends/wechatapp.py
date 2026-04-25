@@ -289,26 +289,33 @@ def on_message(bot, msg):
         dq = agent.put_task(prompt, source="wechat")
         try: bot.send_typing(uid)
         except: pass
-        # Wait for completion
-        result = ''
+        result = ''; sent = 0; mi = 0; last_turns = 0; last_send = 0
+        def _wx_send(text):
+            try: bot.send_text(uid, text.strip(), context_token=ctx); return True
+            except Exception as e:
+                print(f'[WX] send maybe-ok: {e}', file=sys.__stdout__); return True
+        def _flush(show, final=False):
+            nonlocal sent, mi, last_send
+            now = time.time()
+            if mi < 9 and sent < len(show) and (mi == 0 or now - last_send >= 6):
+                chunk = show[sent:sent+900]; sent += len(chunk); mi += 1
+                if chunk.strip() and _wx_send(chunk): last_send = time.time()
+            if final:
+                rest = (show[sent:] + '\n\n[Info] 任务完成')[-1800:]
+                if rest.strip(): _wx_send(rest)
         try:
             while True:
                 item = dq.get(timeout=300)
                 if 'done' in item: result = item['done']; break
+                raw = item.get('next', '')
+                turns = raw.count('LLM Running')
+                if turns > last_turns:
+                    last_turns = turns; _flush(_clean(raw))
         except queue.Empty: result = '[超时]'
+        show = _clean(result); _flush(show, final=True)
         files = re.findall(r'\[FILE:([^\]]+)\]', result)
         bad = {'filepath', '<filepath>', 'path', '<path>', 'file_path', '<file_path>', '...'}
         files = [f for f in files if f.strip().lower() not in bad and (f if os.path.isabs(f) else os.path.join(_TEMP_DIR, f)) not in media_paths]
-        show = _clean(result)
-        chunks = _split(show)
-        _MAX_MSGS = 6
-        if len(chunks) > _MAX_MSGS:
-            keep = chunks[:3] + [f'...（省略{len(chunks) - 5}条）...'] + chunks[-2:]
-            chunks = keep
-        for chunk in chunks:
-            try: bot.send_text(uid, chunk, context_token=ctx)
-            except Exception as e: print(f'[WX] send err: {e}', file=sys.__stdout__)
-            time.sleep(0.3)
         for fpath in set(files):
             if not os.path.isabs(fpath): fpath = os.path.join(_TEMP_DIR, fpath)
             try:
