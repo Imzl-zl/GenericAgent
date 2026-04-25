@@ -337,7 +337,6 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
         payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, 
                    "prompt_cache_key": _RESP_CACHE_KEY, "instructions": system or "You are an Omnipotent Executor."}
         if reasoning_effort: payload["reasoning"] = {"effort": reasoning_effort}
-        if max_tokens: payload["max_output_tokens"] = max_tokens
     else:
         url = auto_make_url(api_base, "chat/completions")
         if system: messages = [{"role": "system", "content": system}] + messages
