@@ -92,7 +92,11 @@ with st.sidebar: render_sidebar()
 
 def fold_turns(text):
     """Return list of segments: [{'type':'text','content':...}, {'type':'fold','title':...,'content':...}]"""
-    parts = re.split(r'(\**LLM Running \(Turn \d+\) \.\.\.\*\**)', text)
+    # 先把4+反引号块替换为占位符，避免误切子agent嵌套的 LLM Running
+    _ph = []
+    safe = re.sub(r'`{4,}.*?`{4,}', lambda m: (_ph.append(m.group(0)), f'\x00PH{len(_ph)-1}\x00')[1], text, flags=re.DOTALL)
+    parts = re.split(r'(\**LLM Running \(Turn \d+\) \.\.\.\*\**)', safe)
+    parts = [re.sub(r'\x00PH(\d+)\x00', lambda m: _ph[int(m.group(1))], p) for p in parts]
     if len(parts) < 4: return [{'type': 'text', 'content': text}]
     segments = []
     if parts[0].strip(): segments.append({'type': 'text', 'content': parts[0]})
@@ -103,7 +107,7 @@ def fold_turns(text):
         turns.append((marker, content))
     for idx, (marker, content) in enumerate(turns):
         if idx < len(turns) - 1:
-            _c = re.sub(r'```.*?```|<thinking>.*?</thinking>', '', content, flags=re.DOTALL)
+            _c = re.sub(r'`{3,}.*?`{3,}|<thinking>.*?</thinking>', '', content, flags=re.DOTALL)
             matches = re.findall(r'<summary>\s*((?:(?!<summary>).)*?)\s*</summary>', _c, re.DOTALL)
             if matches:
                 title = matches[0].strip()
