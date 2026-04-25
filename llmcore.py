@@ -337,6 +337,7 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
         payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, 
                    "prompt_cache_key": _RESP_CACHE_KEY, "instructions": system or "You are an Omnipotent Executor."}
         if reasoning_effort: payload["reasoning"] = {"effort": reasoning_effort}
+        if max_tokens: payload["max_output_tokens"] = max_tokens
     else:
         url = auto_make_url(api_base, "chat/completions")
         if system: messages = [{"role": "system", "content": system}] + messages
@@ -344,7 +345,7 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
         payload = {"model": model, "messages": messages, "stream": stream}
         if stream: payload["stream_options"] = {"include_usage": True}
         if temperature != 1: payload["temperature"] = temperature
-        if max_tokens: payload["max_tokens"] = max_tokens
+        if max_tokens: payload["max_completion_tokens" if ml.startswith(("gpt-5", "o1", "o2", "o3", "o4")) else "max_tokens"] = max_tokens
         if reasoning_effort: payload["reasoning_effort"] = reasoning_effort
     if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
     RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
