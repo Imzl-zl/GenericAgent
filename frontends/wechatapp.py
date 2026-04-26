@@ -8,6 +8,8 @@ _TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 from agentmain import GeneraticAgent
 
 # ── WxBotClient (inline from wx_bot_client.py) ──
+for _k in ('HTTPS_PROXY', 'https_proxy'):
+    os.environ.pop(_k, None)  # avoid inherited proxy breaking WeChat long-poll SSL
 API = 'https://ilinkai.weixin.qq.com'
 TOKEN_FILE = Path.home() / '.wxbot' / 'token.json'
 TOKEN_FILE.parent.mkdir(exist_ok=True)
