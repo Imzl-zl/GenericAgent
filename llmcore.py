@@ -1,26 +1,33 @@
-import os, json, re, time, requests, sys, threading, urllib3, base64, mimetypes, uuid
+import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RESP_CACHE_KEY = str(uuid.uuid4())
 
 def _load_mykeys():
+    global _mykey_path
     try:
-        import mykey; return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
+        import mykey; importlib.reload(mykey); _mykey_path = mykey.__file__
+        return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
     except ImportError: pass
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
+    _mykey_path = p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
     if not os.path.exists(p): raise Exception('[ERROR] mykey.py or mykey.json not found, please create one from mykey_template.')
     with open(p, encoding='utf-8') as f: return json.load(f)
 
+_mykey_path = _mykey_mtime = None
+def reload_mykeys():
+    global _mykey_mtime
+    mt = os.stat(_mykey_path).st_mtime_ns if _mykey_path else -1
+    if mt == _mykey_mtime: return globals().get('mykeys', {}), False
+    mk = _load_mykeys(); _mykey_mtime = os.stat(_mykey_path).st_mtime_ns
+    print(f'[Info] Load mykeys from {_mykey_path}')
+    globals().update(mykeys=mk)
+    if mk.get('langfuse_config'):
+        try: from plugins import langfuse_tracing
+        except Exception: pass
+    return mk, True
+
 def __getattr__(name):  # once guard in PEP 562
-    if name in ('mykeys', 'proxies'):  
-        mk = _load_mykeys()
-        proxy = mk.get("proxy", 'http://127.0.0.1:2082')
-        px = {"http": proxy, "https": proxy} if proxy else None
-        globals().update(mykeys=mk, proxies=px)
-        if mk.get('langfuse_config'):
-            try: from plugins import langfuse_tracing
-            except Exception: pass
-        return globals()[name]
+    if name == 'mykeys': return reload_mykeys()[0]
     raise AttributeError(f"module 'llmcore' has no attribute {name}")
 
 def compress_history_tags(messages, keep_recent=10, max_len=800, force=False):
@@ -158,6 +165,11 @@ def _parse_claude_sse(resp_lines):
     if not warn:
         if not got_message_stop and not stop_reason: warn = "\n\n[!!! 流异常中断，未收到完整响应 !!!]"
         elif stop_reason == "max_tokens": warn = "\n\n[!!! Response truncated: max_tokens !!!]"
+    if current_block:
+        if current_block["type"] == "tool_use":
+            try: current_block["input"] = json.loads(tool_json_buf) if tool_json_buf else {}
+            except: current_block["input"] = {"_raw": tool_json_buf}
+        content_blocks.append(current_block); current_block = None
     if warn:
         print(f"[WARN] {warn.strip()}")
         content_blocks.append({"type": "text", "text": warn}); yield warn
@@ -488,7 +500,7 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
-        self.context_win = cfg.get('context_win', 24000)
+        self.context_win = cfg.get('context_win', 28000)
         self.history = []
         self.lock = threading.Lock()
         self.system = ""
@@ -598,7 +610,6 @@ def _fix_messages(messages):
 class NativeClaudeSession(BaseSession):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.context_win = cfg.get("context_win", 28000)
         self.fake_cc_system_prompt = cfg.get("fake_cc_system_prompt", False)
         self.user_agent = cfg.get("user_agent", "claude-cli/2.1.113 (external, cli)")
         self._session_id = str(uuid.uuid4())
