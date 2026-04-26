@@ -225,10 +225,13 @@ def file_read(path, start=1, keyword=None, count=200, show_linenos=True):
             realcnt = len(res); L_MAX = min(max(100, 256000//max(realcnt,1)), 8000); TAG = " ... [TRUNCATED]"
             remaining = sum(1 for _ in itertools.islice(stream, 5000))
             total_lines = (res[0][0] - 1 if res else start - 1) + realcnt + remaining
-            total_tag = "[FILE] Total " + (f"{total_lines}+" if remaining >= 5000 else str(total_lines)) + ' lines\n'
+            tl_str = f"{total_lines}+" if remaining >= 5000 else str(total_lines)
+            partial = total_lines > realcnt
+            total_tag = f"[FILE] {tl_str} lines" + (f" | PARTIAL showing {realcnt}; assess need for more" if partial else "") + "\n"
             res = [(i, l if len(l) <= L_MAX else l[:L_MAX] + TAG) for i, l in res]
             result = "\n".join(f"{i}|{l}" if show_linenos else l for i, l in res)
             if show_linenos: result = total_tag + result
+            elif partial: result += f"\n\n[FILE PARTIAL: showing {realcnt}/{tl_str} lines; assess need for more]"
             _read_dirs.add(os.path.dirname(os.path.abspath(path)))
             return result
     except FileNotFoundError:
