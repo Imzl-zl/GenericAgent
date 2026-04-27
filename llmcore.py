@@ -563,6 +563,17 @@ def _drop_unsigned_thinking(messages):
         if isinstance(c, list): m["content"] = [b for b in c if _keep_claude_block(b)]
     return messages
 
+def _ensure_thinking_blocks(messages, model):
+    """deepseek needs thinking in history!"""
+    if 'deepseek' not in model.lower(): return messages
+    for m in messages:
+        if m.get("role") != "assistant": continue
+        c = m.get("content")
+        if not isinstance(c, list): continue
+        has_thinking = any(isinstance(b, dict) and b.get("type") == "thinking" for b in c)
+        if not has_thinking: m["content"] = [{"type": "thinking", "thinking": "...", "signature": "placeholder"}, *c]
+    return messages
+
 class ClaudeSession(BaseSession):
     def raw_ask(self, messages):
         if self.max_tokens is None: self.max_tokens = 8192
@@ -586,8 +597,7 @@ class ClaudeSession(BaseSession):
         return msgs
 
 class LLMSession(BaseSession):
-    def raw_ask(self, messages):
-        return (yield from _openai_stream(self, messages))
+    def raw_ask(self, messages): return (yield from _openai_stream(self, messages))
     def make_messages(self, raw_list): return _msgs_claude2oai(raw_list)
 
 def _fix_messages(messages):
@@ -617,7 +627,7 @@ class NativeClaudeSession(BaseSession):
         self._device_id = uuid.uuid4().hex + uuid.uuid4().hex[:32]
         self.tools = None
     def raw_ask(self, messages):
-        messages = _drop_unsigned_thinking(_fix_messages(messages))
+        messages = _ensure_thinking_blocks(_drop_unsigned_thinking(_fix_messages(messages)), self.model)
         if self.max_tokens is None: self.max_tokens = 8192
         model = self.model
         beta_parts = ["claude-code-20250219", "interleaved-thinking-2025-05-14", "redact-thinking-2026-02-12", "prompt-caching-scope-2026-01-05"]
@@ -690,6 +700,7 @@ class NativeClaudeSession(BaseSession):
 class NativeOAISession(NativeClaudeSession):
     def raw_ask(self, messages):
         messages = _fix_messages(messages)
+        messages = _ensure_thinking_blocks(messages, self.model)
         return (yield from _openai_stream(self, _msgs_claude2oai(messages)))
 
 def openai_tools_to_claude(tools):
