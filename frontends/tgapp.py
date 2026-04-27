@@ -1,11 +1,11 @@
-import os, sys, re, threading, asyncio, queue as Q, time, random
+import os, sys, re, threading, asyncio, queue as Q, time, random, uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'temp')
 from agentmain import GeneraticAgent
 try:
-    from telegram import BotCommand
+    from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.constants import ChatType, MessageLimit, ParseMode
-    from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+    from telegram.ext import ApplicationBuilder, CallbackQueryHandler, MessageHandler, filters, ContextTypes
     from telegram.helpers import escape_markdown
     from telegram.request import HTTPXRequest
 except:
@@ -35,6 +35,13 @@ _DRAFT_HINT = "thinking..."
 _STREAM_SUFFIX = " ⏳"
 _STREAM_SEGMENT_LIMIT = max(1200, MessageLimit.MAX_TEXT_LENGTH - 256)
 _QUEUE_WAIT_SECONDS = 1
+_ASK_USER_HOOK_KEY = "telegram_ask_user_menu"
+_ASK_CALLBACK_PREFIX = "ask:"
+_ASK_CANCEL_ACTION = "none"
+_ASK_CANCEL_LABEL = "none of these above"
+_ASK_CANCEL_PROMPT = "已取消选择，请直接发送下一步操作。"
+_ask_menu_events = Q.Queue()
+_ask_menu_store = {}
 _MD_TOKEN_RE = re.compile(
     r"(`{3,})([A-Za-z0-9_+-]*)\n([\s\S]*?)\1"
     r"|\[([^\]]+)\]\(([^)\n]+)\)"
@@ -110,6 +117,135 @@ def _to_markdown_v2(text):
 
 def _is_not_modified_error(exc):
     return "not modified" in str(exc).lower()
+
+def _extract_ask_user_event(ctx):
+    exit_reason = (ctx or {}).get("exit_reason") or {}
+    if exit_reason.get("result") != "EXITED":
+        return None
+    payload = exit_reason.get("data")
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") != "INTERRUPT" or payload.get("intent") != "HUMAN_INTERVENTION":
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    raw_candidates = data.get("candidates") or []
+    if not isinstance(raw_candidates, (list, tuple)):
+        return None
+    candidates = []
+    for candidate in raw_candidates:
+        if candidate is None:
+            continue
+        text = str(candidate).strip()
+        if text:
+            candidates.append(text)
+    if not candidates:
+        return None
+    question = str(data.get("question") or "请选择下一步操作：").strip() or "请选择下一步操作："
+    return {"question": question, "candidates": candidates}
+
+def _register_ask_user_hook():
+    if not hasattr(agent, "_turn_end_hooks"):
+        agent._turn_end_hooks = {}
+    def _hook(ctx):
+        event = _extract_ask_user_event(ctx)
+        if event:
+            _ask_menu_events.put(event)
+    agent._turn_end_hooks[_ASK_USER_HOOK_KEY] = _hook
+
+def _drain_latest_ask_user_event():
+    latest = None
+    while True:
+        try:
+            latest = _ask_menu_events.get_nowait()
+        except Q.Empty:
+            break
+    return latest
+
+def _build_ask_user_markup(menu_id, candidates):
+    rows = [
+        [InlineKeyboardButton(candidate, callback_data=f"{_ASK_CALLBACK_PREFIX}{menu_id}:{idx}")]
+        for idx, candidate in enumerate(candidates)
+    ]
+    rows.append([
+        InlineKeyboardButton(_ASK_CANCEL_LABEL, callback_data=f"{_ASK_CALLBACK_PREFIX}{menu_id}:{_ASK_CANCEL_ACTION}")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+def _parse_ask_callback_data(data):
+    if not (data or "").startswith(_ASK_CALLBACK_PREFIX):
+        return None, None
+    payload = data[len(_ASK_CALLBACK_PREFIX):]
+    menu_id, sep, action = payload.partition(":")
+    if not sep or not menu_id or not action:
+        return None, None
+    return menu_id, action
+
+def _build_text_prompt(text):
+    return f"{FILE_HINT}\n\n{text}"
+
+def _normalize_ask_menu_event(stored):
+    if isinstance(stored, dict):
+        candidates = stored.get("candidates") or []
+        return {
+            "question": str(stored.get("question") or "请选择下一步操作：").strip() or "请选择下一步操作：",
+            "candidates": [str(candidate).strip() for candidate in candidates if str(candidate).strip()],
+        }
+    if isinstance(stored, (list, tuple)):
+        return {
+            "question": "请选择下一步操作：",
+            "candidates": [str(candidate).strip() for candidate in stored if str(candidate).strip()],
+        }
+    return None
+
+def _render_ask_user_result(event, selected=None, cancelled=False):
+    question = str(event.get("question") or "请选择下一步操作：").strip() or "请选择下一步操作："
+    candidates = event.get("candidates") or []
+    lines = [question, "", "选项："]
+    for idx, candidate in enumerate(candidates, start=1):
+        lines.append(f"{idx}. {candidate}")
+    lines.append(f"{len(candidates) + 1}. {_ASK_CANCEL_LABEL}")
+    lines.append("")
+    if cancelled:
+        lines.append(f"已取消：{_ASK_CANCEL_LABEL}")
+    elif selected:
+        lines.append(f"已选择：{selected}")
+    text = "\n".join(lines)
+    if len(text) > MessageLimit.MAX_TEXT_LENGTH:
+        text = text[:MessageLimit.MAX_TEXT_LENGTH - 18].rstrip() + "\n...[truncated]"
+    return text
+
+async def _clear_ask_reply_markup(query):
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as exc:
+        print(f"[TG ask_user menu cleanup] {type(exc).__name__}: {exc}", flush=True)
+
+async def _edit_ask_user_result(query, event, selected=None, cancelled=False):
+    try:
+        await query.edit_message_text(
+            _render_ask_user_result(event, selected=selected, cancelled=cancelled),
+            reply_markup=None,
+        )
+    except Exception as exc:
+        print(f"[TG ask_user menu edit] {type(exc).__name__}: {exc}", flush=True)
+        await _clear_ask_reply_markup(query)
+
+async def _send_ask_user_menu(root_msg, event):
+    menu_id = uuid.uuid4().hex[:16]
+    candidates = event["candidates"]
+    _ask_menu_store[menu_id] = {"question": event["question"], "candidates": list(candidates)}
+    try:
+        await root_msg.reply_text(
+            event["question"],
+            reply_markup=_build_ask_user_markup(menu_id, candidates),
+        )
+    except Exception as exc:
+        _ask_menu_store.pop(menu_id, None)
+        print(f"[TG ask_user menu error] {type(exc).__name__}: {exc}", flush=True)
+        fallback = event["question"] + "\n" + "\n".join(f"- {candidate}" for candidate in candidates)
+        await root_msg.reply_text(fallback)
 
 class _TelegramStreamSession:
     def __init__(self, root_msg):
@@ -266,6 +402,9 @@ async def _stream(dq, msg):
             done_item = next((item for item in items if "done" in item), None)
             if done_item is not None:
                 await session.finalize(done_item.get("done", ""))
+                event = _drain_latest_ask_user_event()
+                if event:
+                    await _send_ask_user_menu(msg, event)
                 break
             chunk = "".join(item.get("next", "") for item in items if item.get("next"))
             if chunk:
@@ -294,9 +433,44 @@ async def handle_msg(update, ctx):
     uid = update.effective_user.id
     if ALLOWED and uid not in ALLOWED:
         return await update.message.reply_text("no")
-    prompt = f"{FILE_HINT}\n\n{update.message.text}"
+    prompt = _build_text_prompt(update.message.text)
     dq = agent.put_task(prompt, source="telegram")
     task = asyncio.create_task(_stream(dq, update.message))
+    ctx.user_data['stream_task'] = task
+
+async def handle_ask_callback(update, ctx):
+    query = update.callback_query
+    if query is None:
+        return
+    uid = update.effective_user.id if update.effective_user else None
+    if ALLOWED and uid not in ALLOWED:
+        return await query.answer("no", show_alert=True)
+    menu_id, action = _parse_ask_callback_data(query.data)
+    if not menu_id:
+        return await query.answer("菜单无效")
+    event = _normalize_ask_menu_event(_ask_menu_store.get(menu_id))
+    if event is None:
+        await query.answer("菜单已过期")
+        return await _clear_ask_reply_markup(query)
+    candidates = event["candidates"]
+    if action == _ASK_CANCEL_ACTION:
+        _ask_menu_store.pop(menu_id, None)
+        await query.answer()
+        await _edit_ask_user_result(query, event, cancelled=True)
+        if query.message is not None:
+            await query.message.reply_text(_ASK_CANCEL_PROMPT)
+        return
+    try:
+        selected = candidates[int(action)]
+    except (ValueError, IndexError):
+        return await query.answer("菜单无效")
+    _ask_menu_store.pop(menu_id, None)
+    await query.answer()
+    await _edit_ask_user_result(query, event, selected=selected)
+    if query.message is None:
+        return
+    dq = agent.put_task(_build_text_prompt(selected), source="telegram")
+    task = asyncio.create_task(_stream(dq, query.message))
     ctx.user_data['stream_task'] = task
 
 async def cmd_abort(update, ctx):
@@ -378,6 +552,7 @@ if __name__ == '__main__':
         sys.exit(1)
     require_runtime(agent, "Telegram", tg_bot_token=mykeys.get("tg_bot_token"))
     redirect_log(__file__, "tgapp.log", "Telegram", ALLOWED)
+    _register_ask_user_hook()
     threading.Thread(target=agent.run, daemon=True).start()
     proxy = mykeys.get('proxy')
     if proxy:
@@ -398,6 +573,7 @@ if __name__ == '__main__':
             request = HTTPXRequest(**request_kwargs)
             app = (ApplicationBuilder().token(mykeys['tg_bot_token'])
                    .request(request).get_updates_request(request).post_init(_sync_commands).build())
+            app.add_handler(CallbackQueryHandler(handle_ask_callback, pattern=r"^ask:"))
             app.add_handler(MessageHandler(filters.COMMAND, handle_command))
             app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
             app.add_handler(MessageHandler(filters.Document.ALL, handle_photo))
