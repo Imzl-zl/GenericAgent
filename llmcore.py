@@ -377,7 +377,7 @@ def _openai_stream(sess, messages):
         streamed = False
         try:
             with requests.post(url, headers=headers, json=payload, stream=sess.stream,
-                               timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies) as r:
+                               timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
                 if r.status_code >= 400:
                     if r.status_code in RETRYABLE and attempt < max_retries:
                         d = _delay(r, attempt)
@@ -509,6 +509,7 @@ class BaseSession:
         self.name = cfg.get('name', self.model)
         proxy = cfg.get('proxy')
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
+        self.verify = cfg.get('verify', True)
         self.max_retries = max(0, int(cfg.get('max_retries', 1)))
         self.stream = cfg.get('stream', True)
         default_ct, default_rt = (5, 30) if self.stream else (10, 240)
@@ -583,7 +584,7 @@ class ClaudeSession(BaseSession):
         self._apply_claude_thinking(payload)
         if self.system: payload["system"] = [{"type": "text", "text": self.system, "cache_control": {"type": "persistent"}}]
         try:
-            with requests.post(auto_make_url(self.api_base, "messages"), headers=headers, json=payload, stream=True, timeout=(self.connect_timeout, self.read_timeout)) as r:
+            with requests.post(auto_make_url(self.api_base, "messages"), headers=headers, json=payload, stream=True, timeout=(self.connect_timeout, self.read_timeout), verify=self.verify) as r:
                 if r.status_code != 200: raise Exception(f"HTTP {r.status_code} {r.content.decode('utf-8', errors='replace')[:500]}")
                 return (yield from _parse_claude_sse(r.iter_lines())) or []
         except Exception as e:
@@ -656,7 +657,7 @@ class NativeClaudeSession(BaseSession):
             messages[idx] = {**messages[idx], "content": list(messages[idx]["content"])}
             messages[idx]["content"][-1] = dict(messages[idx]["content"][-1], cache_control={"type": "ephemeral"})
         try:
-            with requests.post(auto_make_url(self.api_base, "messages")+'?beta=true', headers=headers, json=payload, stream=self.stream, timeout=(self.connect_timeout, self.read_timeout)) as resp:
+            with requests.post(auto_make_url(self.api_base, "messages")+'?beta=true', headers=headers, json=payload, stream=self.stream, timeout=(self.connect_timeout, self.read_timeout), verify=self.verify) as resp:
                 if resp.status_code != 200: raise Exception(f"HTTP {resp.status_code} {resp.content.decode('utf-8', errors='replace')[:500]}")
                 if self.stream: return (yield from _parse_claude_sse(resp.iter_lines())) or []
                 else:

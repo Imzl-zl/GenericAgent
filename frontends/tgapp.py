@@ -115,7 +115,7 @@ class _TelegramStreamSession:
     def __init__(self, root_msg):
         self.root_msg = root_msg
         self.private_chat = getattr(getattr(root_msg, "chat", None), "type", "") == ChatType.PRIVATE
-        self.can_use_draft = False  # can not use or streaming dead
+        self.can_use_draft = True   # update tg client!
         self.draft_id = _make_draft_id()
         self.live_msg = None
         self.raw_text = ""
