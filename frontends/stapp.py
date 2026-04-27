@@ -32,10 +32,11 @@ agent = init()
 
 st.title("🖥️ Cowork")
 
-if 'autonomous_enabled' not in st.session_state: st.session_state.autonomous_enabled = False
+st.session_state.setdefault('autonomous_enabled', False)
 
 @st.fragment
 def render_sidebar():
+    st.session_state.setdefault('autonomous_enabled', False)
     llm_options = agent.list_llms()
     current_idx = agent.llm_no
     llm_labels = {idx: f"{idx}: {(name or '').strip()}" for idx, name, _ in llm_options}
