@@ -342,30 +342,32 @@ def _stamp_oai_cache_markers(messages, model):
             c = list(c); c[-1] = dict(c[-1], cache_control={'type': 'ephemeral'})
             messages[idx] = {**messages[idx], 'content': c}
 
-def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completions', *,
-                   system=None, temperature=0.5, max_tokens=None, tools=None, reasoning_effort=None,
-                   max_retries=0, connect_timeout=10, read_timeout=300, proxies=None, stream=True):
+def _openai_stream(sess, messages):
     """Shared OpenAI-compatible streaming request with retry. Yields text chunks, returns list[content_block]."""
+    model, api_mode, max_retries = sess.model, sess.api_mode, sess.max_retries
     ml = model.lower()
+    temperature = sess.temperature
     if 'kimi' in ml or 'moonshot' in ml: temperature = 1
     elif 'minimax' in ml: temperature = max(0.01, min(temperature, 1.0))  # MiniMax requires temp in (0, 1]
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"}
+    headers = {"Authorization": f"Bearer {sess.api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"}
     if api_mode == "responses":
-        url = auto_make_url(api_base, "responses")
-        payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, 
-                   "prompt_cache_key": _RESP_CACHE_KEY, "instructions": system or "You are an Omnipotent Executor."}
-        if reasoning_effort: payload["reasoning"] = {"effort": reasoning_effort}
-        if max_tokens: payload["max_output_tokens"] = max_tokens
+        url = auto_make_url(sess.api_base, "responses")
+        payload = {"model": model, "input": _to_responses_input(messages), "stream": sess.stream, 
+                   "prompt_cache_key": _RESP_CACHE_KEY, "instructions": sess.system or "You are an Omnipotent Executor."}
+        if sess.reasoning_effort: payload["reasoning"] = {"effort": sess.reasoning_effort}
+        if sess.max_tokens: payload["max_output_tokens"] = sess.max_tokens
     else:
-        url = auto_make_url(api_base, "chat/completions")
-        if system: messages = [{"role": "system", "content": system}] + messages
+        url = auto_make_url(sess.api_base, "chat/completions")
+        if sess.system: messages = [{"role": "system", "content": sess.system}] + messages
         _stamp_oai_cache_markers(messages, model)
-        payload = {"model": model, "messages": messages, "stream": stream}
-        if stream: payload["stream_options"] = {"include_usage": True}
+        payload = {"model": model, "messages": messages, "stream": sess.stream}
+        if sess.stream: payload["stream_options"] = {"include_usage": True}
         if temperature != 1: payload["temperature"] = temperature
-        if max_tokens: payload["max_completion_tokens" if ml.startswith(("gpt-5", "o1", "o2", "o3", "o4")) else "max_tokens"] = max_tokens
-        if reasoning_effort: payload["reasoning_effort"] = reasoning_effort
+        if sess.max_tokens: payload["max_completion_tokens" if ml.startswith(("gpt-5", "o1", "o2", "o3", "o4")) else "max_tokens"] = sess.max_tokens
+        if sess.reasoning_effort: payload["reasoning_effort"] = sess.reasoning_effort
+    tools = getattr(sess, 'tools', None)
     if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
+    if sess.service_tier: payload["service_tier"] = sess.service_tier
     RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
     def _delay(resp, attempt):
         try: ra = float((resp.headers or {}).get("retry-after"))
@@ -374,8 +376,8 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
     for attempt in range(max_retries + 1):
         streamed = False
         try:
-            with requests.post(url, headers=headers, json=payload, stream=stream,
-                               timeout=(connect_timeout, read_timeout), proxies=proxies) as r:
+            with requests.post(url, headers=headers, json=payload, stream=sess.stream,
+                               timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies) as r:
                 if r.status_code >= 400:
                     if r.status_code in RETRYABLE and attempt < max_retries:
                         d = _delay(r, attempt)
@@ -386,7 +388,7 @@ def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completion
                     except: pass
                     err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
                     yield err; return [{"type": "text", "text": err}]
-                gen = _parse_openai_sse(r.iter_lines(), api_mode) if stream else _parse_openai_json(r.json(), api_mode)
+                gen = _parse_openai_sse(r.iter_lines(), api_mode) if sess.stream else _parse_openai_json(r.json(), api_mode)
                 try:
                     while True: streamed = True; yield next(gen)
                 except StopIteration as e:
@@ -516,6 +518,7 @@ class BaseSession:
             v = cfg.get(key); v = None if v is None else str(v).strip().lower()
             return v if not v or v in valid else print(f"[WARN] Invalid {key} {v!r}, ignored.")
         self.reasoning_effort = _enum('reasoning_effort', {'none', 'minimal', 'low', 'medium', 'high', 'xhigh'})
+        self.service_tier = _enum('service_tier', {'auto', 'default', 'priority', 'flex'})
         self.thinking_type = _enum('thinking_type', {'adaptive', 'enabled', 'disabled'})
         self.thinking_budget_tokens = cfg.get('thinking_budget_tokens')
         mode = str(cfg.get('api_mode', 'chat_completions')).strip().lower().replace('-', '_')
@@ -584,10 +587,7 @@ class ClaudeSession(BaseSession):
 
 class LLMSession(BaseSession):
     def raw_ask(self, messages):
-        return (yield from _openai_stream(self.api_base, self.api_key, messages, self.model, self.api_mode,
-                                  temperature=self.temperature, reasoning_effort=self.reasoning_effort,
-                                  max_tokens=self.max_tokens, max_retries=self.max_retries, stream=self.stream,
-                                  connect_timeout=self.connect_timeout, read_timeout=self.read_timeout, proxies=self.proxies))
+        return (yield from _openai_stream(self, messages))
     def make_messages(self, raw_list): return _msgs_claude2oai(raw_list)
 
 def _fix_messages(messages):
@@ -690,11 +690,7 @@ class NativeClaudeSession(BaseSession):
 class NativeOAISession(NativeClaudeSession):
     def raw_ask(self, messages):
         messages = _fix_messages(messages)
-        return (yield from _openai_stream(self.api_base, self.api_key, _msgs_claude2oai(messages), self.model, self.api_mode,
-                                          system=self.system, temperature=self.temperature, max_tokens=self.max_tokens,
-                                          tools=self.tools, reasoning_effort=self.reasoning_effort,
-                                          max_retries=self.max_retries, connect_timeout=self.connect_timeout,
-                                          read_timeout=self.read_timeout, proxies=self.proxies, stream=self.stream))
+        return (yield from _openai_stream(self, _msgs_claude2oai(messages)))
 
 def openai_tools_to_claude(tools):
     """[{type:'function', function:{name,description,parameters}}] → [{name,description,input_schema}]."""
