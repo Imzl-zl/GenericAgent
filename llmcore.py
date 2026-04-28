@@ -374,14 +374,14 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                     while True: streamed = True; yield next(gen)
                 except StopIteration as e: return e.value or []
         except (requests.Timeout, requests.ConnectionError) as e:
-            if attempt < sess.max_retries and not streamed:
+            err = f"!!!Error: {type(e).__name__}"
+            if attempt < sess.max_retries:
                 d = _delay(None, attempt)
                 print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
-                time.sleep(d); continue
-            err = f"!!!Error: {type(e).__name__}"
+                yield err; time.sleep(d); continue
             yield err; return [{"type": "text", "text": err}]
         except Exception as e:
-            err = f"!!!Error: {type(e).__name__}: {e}"
+            err = f"\n\n[!!! 流异常中断 {type(e).__name__}: {e} !!!]" if streamed else f"!!!Error: {type(e).__name__}: {e}"
             yield err; return [{"type": "text", "text": err}]
 
 def _openai_stream(sess, messages):
@@ -746,19 +746,6 @@ class ToolClient:
         _write_llm_log('Response', raw_text)
         return self._parse_mixed_response(raw_text)
 
-    def _estimate_content_len(self, content):
-        if isinstance(content, str): return len(content)
-        if isinstance(content, list):
-            total = 0
-            for part in content:
-                if not isinstance(part, dict): continue
-                if part.get("type") == "text":
-                    total += len(part.get("text", ""))
-                elif part.get("type") == "image_url":
-                    total += 1000
-            return total
-        return len(str(content))
-    
     def _prepare_tool_instruction(self, tools):
         tool_instruction = ""
         if not tools: return tool_instruction
@@ -799,7 +786,7 @@ Follow these steps to think and act:
             user += f"=== {role} ===\n"
             for tr in m.get('tool_results', []): user += f'<tool_result>{tr["content"]}</tool_result>\n'
             user += str(m['content']) + "\n"
-            self.total_cd_tokens += self._estimate_content_len(user)           
+            self.total_cd_tokens += len(user) // 3
         if self.total_cd_tokens > 9000: self.last_tools = ''
         user += "=== ASSISTANT ===\n" 
         return system + user
