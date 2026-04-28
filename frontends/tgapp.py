@@ -42,16 +42,27 @@ _ASK_CANCEL_LABEL = "none of these above"
 _ASK_CANCEL_PROMPT = "已取消选择，请直接发送下一步操作。"
 _ask_menu_events = Q.Queue()
 _ask_menu_store = {}
+_QUOTE_OPEN_TAG = "<_quote_>"
+_QUOTE_CLOSE_TAG = "</_quote_>"
+_QUOTE_TOKEN_PATTERN = re.escape(_QUOTE_OPEN_TAG) + r"([\s\S]*?)" + re.escape(_QUOTE_CLOSE_TAG)
 _MD_TOKEN_RE = re.compile(
-    r"(`{3,})([A-Za-z0-9_+-]*)\n([\s\S]*?)\1"
-    r"|\[([^\]]+)\]\(([^)\n]+)\)"
-    r"|`([^`\n]+)`"
-    r"|\*\*([^\n]+?)\*\*"
-    r"|__([^\n]+?)__"
-    r"|~~([^\n]+?)~~"
-    r"|(?<!\*)\*(?!\*)([^\n]+?)(?<!\*)\*(?!\*)",
+    (
+        r"(`{3,})([A-Za-z0-9_+-]*)\n([\s\S]*?)\1"
+        r"|" + _QUOTE_TOKEN_PATTERN +
+        r"|\[([^\]]+)\]\(([^)\n]+)\)"
+        r"|`([^`\n]+)`"
+        r"|\*\*([^\n]+?)\*\*"
+        r"|__([^\n]+?)__"
+        r"|~~([^\n]+?)~~"
+        r"|(?<!\*)\*(?!\*)([^\n]+?)(?<!\*)\*(?!\*)"
+    ),
     re.DOTALL,
 )
+_TURN_MARKER_RE = re.compile(r"^\*{0,2}LLM Running \(Turn (\d+)\) \.\.\.\*{0,2}\s*$")
+_CODE_FENCE_RE = re.compile(r"^\s*(`{3,})(.*)$")
+_TURN_SUMMARY_LIMIT = 160
+_TURN_SUMMARY_RE = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
+_TURN_SUMMARY_SEARCH_STRIP_RE = re.compile(r"`{3,}[\s\S]*?`{3,}|<thinking>[\s\S]*?</thinking>", re.DOTALL)
 
 def _make_draft_id():
     return random.randint(1, 2**31 - 1)
@@ -59,6 +70,50 @@ def _make_draft_id():
 def _visible_segments(text):
     text = (text or "").strip()
     return split_text(text, _STREAM_SEGMENT_LIMIT) if text else []
+
+def _line_complete(line):
+    return (line or "").endswith(("\n", "\r"))
+
+def _turn_marker_number(line):
+    match = _TURN_MARKER_RE.fullmatch((line or "").strip())
+    return int(match.group(1)) if match else None
+
+def _maybe_partial_turn_marker(line):
+    text = (line or "").strip().lstrip("*")
+    if not text:
+        return False
+    marker_head = "LLM Running (Turn "
+    return marker_head.startswith(text) or text.startswith(marker_head)
+
+def _maybe_partial_code_fence(line):
+    return bool(re.match(r"^\s*`{1,}[^`\r\n]*$", line or ""))
+
+def _extract_turn_summary(raw_text):
+    search_text = _TURN_SUMMARY_SEARCH_STRIP_RE.sub("", raw_text or "")
+    match = _TURN_SUMMARY_RE.search(search_text)
+    if not match:
+        return ""
+    summary = re.sub(r"\s+", " ", match.group(1)).strip()
+    if len(summary) > _TURN_SUMMARY_LIMIT:
+        summary = summary[:_TURN_SUMMARY_LIMIT - 3].rstrip() + "..."
+    return summary
+
+def _quote_tag(text):
+    safe_text = (text or "").strip().replace(_QUOTE_OPEN_TAG, "").replace(_QUOTE_CLOSE_TAG, "")
+    return f"{_QUOTE_OPEN_TAG}{safe_text}{_QUOTE_CLOSE_TAG}"
+
+def _inject_turn_summary(body, summary):
+    if not (body or "").strip() or not (summary or "").strip():
+        return body
+    lines = (body or "").splitlines()
+    if not lines or _turn_marker_number(lines[0]) is None:
+        return body
+    title = lines[0].strip()
+    rest = "\n".join(lines[1:]).strip()
+    summary_line = _quote_tag(summary)
+    if rest:
+        return f"{title}\n\n{summary_line}\n\n{rest}"
+    return f"{title}\n\n{summary_line}"
 
 def _resolve_files(paths):
     files, seen = [], set()
@@ -77,6 +132,28 @@ def _render_file_markers(text):
         return os.path.basename(match.group(1))
     return re.sub(r"\[FILE:([^\]]+)\]", repl, text or "").strip()
 
+def _files_from_text(text):
+    cleaned = clean_reply(text) if (text or "").strip() else ""
+    return _resolve_files(extract_files(cleaned))
+
+async def _send_files(root_msg, files):
+    for fpath in files:
+        if fpath.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            try:
+                with open(fpath, "rb") as fp:
+                    await root_msg.reply_photo(fp)
+            except Exception:
+                pass
+        else:
+            try:
+                with open(fpath, "rb") as fp:
+                    await root_msg.reply_document(fp)
+            except Exception:
+                pass
+
+async def _send_files_from_text(root_msg, text):
+    await _send_files(root_msg, _files_from_text(text))
+
 def _escape_pre(text):
     return escape_markdown(text or "", version=2, entity_type="pre")
 
@@ -85,6 +162,10 @@ def _escape_code(text):
 
 def _escape_link_target(text):
     return escape_markdown(text or "", version=2, entity_type="text_link")
+
+def _quote_to_markdown_v2(text):
+    lines = (text or "").strip().splitlines() or [""]
+    return "\n".join(f"> {escape_markdown(line, version=2)}" for line in lines)
 
 def _to_markdown_v2(text):
     if not text:
@@ -98,19 +179,21 @@ def _to_markdown_v2(text):
             header = f"```{lang}\n" if lang else "```\n"
             parts.append(f"{header}{code}\n```")
         elif match.group(4) is not None:
-            label = escape_markdown(match.group(4), version=2)
-            target = _escape_link_target(match.group(5))
+            parts.append(_quote_to_markdown_v2(match.group(4)))
+        elif match.group(5) is not None:
+            label = escape_markdown(match.group(5), version=2)
+            target = _escape_link_target(match.group(6))
             parts.append(f"[{label}]({target})")
-        elif match.group(6) is not None:
-            parts.append(f"`{_escape_code(match.group(6))}`")
         elif match.group(7) is not None:
-            parts.append(f"*{escape_markdown(match.group(7), version=2)}*")
+            parts.append(f"`{_escape_code(match.group(7))}`")
         elif match.group(8) is not None:
             parts.append(f"*{escape_markdown(match.group(8), version=2)}*")
         elif match.group(9) is not None:
-            parts.append(f"~{escape_markdown(match.group(9), version=2)}~")
+            parts.append(f"*{escape_markdown(match.group(9), version=2)}*")
         elif match.group(10) is not None:
-            parts.append(f"_{escape_markdown(match.group(10), version=2)}_")
+            parts.append(f"~{escape_markdown(match.group(10), version=2)}~")
+        elif match.group(11) is not None:
+            parts.append(f"_{escape_markdown(match.group(11), version=2)}_")
         pos = match.end()
     parts.append(escape_markdown(text[pos:], version=2))
     return "".join(parts)
@@ -251,7 +334,7 @@ class _TelegramStreamSession:
     def __init__(self, root_msg):
         self.root_msg = root_msg
         self.private_chat = getattr(getattr(root_msg, "chat", None), "type", "") == ChatType.PRIVATE
-        self.can_use_draft = True   # update tg client!
+        self.can_use_draft = self.private_chat   # update tg client!
         self.draft_id = _make_draft_id()
         self.live_msg = None
         self.raw_text = ""
@@ -291,9 +374,10 @@ class _TelegramStreamSession:
         self.active_display = ""
 
     async def _refresh(self, done, send_files):
+        summary = _extract_turn_summary(self.raw_text)
         cleaned = clean_reply(self.raw_text) if self.raw_text.strip() else ""
-        self.files = _resolve_files(extract_files(cleaned))
-        body = _render_file_markers(cleaned)
+        self.files = _files_from_text(cleaned)
+        body = _inject_turn_summary(_render_file_markers(cleaned), summary)
         if done and not body and self.files:
             body = "已生成附件"
         elif done and not body:
@@ -334,17 +418,7 @@ class _TelegramStreamSession:
             self.draft_id = _make_draft_id()
 
     async def _send_files(self):
-        for fpath in self.files:
-            if fpath.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                try:
-                    with open(fpath, "rb") as fp:
-                     await self.root_msg.reply_photo(fp)
-                except Exception: pass
-            else:
-                try:
-                    with open(fpath, "rb") as fp:
-                        await self.root_msg.reply_document(fp)
-                except Exception: pass
+        await _send_files(self.root_msg, self.files)
 
     async def _send_draft(self, text):
         try:
@@ -388,9 +462,98 @@ class _TelegramStreamSession:
             self.live_msg = await self._edit_text(self.live_msg, text)
 
 
+class _TelegramTurnStreamCoordinator:
+    def __init__(self, root_msg):
+        self.root_msg = root_msg
+        self.session = None
+        self.pending_line = ""
+        self.code_fence_len = 0
+        self.last_turn = 0
+
+    async def prime(self):
+        await self._ensure_session()
+
+    async def add_chunk(self, chunk):
+        if not chunk:
+            return
+        text = self.pending_line + chunk
+        self.pending_line = ""
+        for line in text.splitlines(keepends=True):
+            if _line_complete(line):
+                await self._process_line(line)
+            elif _maybe_partial_turn_marker(line) or _maybe_partial_code_fence(line):
+                self.pending_line = line
+            else:
+                await self._process_line(line)
+
+    async def finalize(self, done_text="", send_files=True):
+        await self._flush_pending_line()
+        if self.session is None:
+            if done_text:
+                await self._add_to_current(done_text)
+        elif not self.session.raw_text.strip() and done_text:
+            await self.session.finalize(done_text, send_files=False)
+            if send_files:
+                await _send_files_from_text(self.root_msg, done_text)
+            return
+        if self.session is not None:
+            await self.session.finalize(send_files=False)
+        if send_files:
+            await _send_files_from_text(self.root_msg, done_text)
+
+    async def finish_with_notice(self, notice):
+        await self._flush_pending_line()
+        await self._ensure_session()
+        await self.session.finish_with_notice(notice)
+
+    async def _ensure_session(self):
+        if self.session is None:
+            self.session = _TelegramStreamSession(self.root_msg)
+            await self.session.prime()
+
+    async def _start_turn(self, marker):
+        if self.session is not None and self.session.raw_text.strip():
+            await self.session.finalize(send_files=False)
+            self.session = None
+        await self._ensure_session()
+        await self.session.add_chunk(marker)
+
+    async def _add_to_current(self, text):
+        if not text:
+            return
+        await self._ensure_session()
+        await self.session.add_chunk(text)
+
+    async def _process_line(self, line):
+        turn_no = _turn_marker_number(line)
+        if self.code_fence_len == 0 and turn_no == self.last_turn + 1:
+            self.last_turn = turn_no
+            await self._start_turn(line)
+            return
+        await self._add_to_current(line)
+        self._update_code_fence(line)
+
+    async def _flush_pending_line(self):
+        if not self.pending_line:
+            return
+        line = self.pending_line
+        self.pending_line = ""
+        await self._add_to_current(line)
+
+    def _update_code_fence(self, line):
+        match = _CODE_FENCE_RE.match(line or "")
+        if not match:
+            return
+        fence_len = len(match.group(1))
+        if self.code_fence_len:
+            if fence_len >= self.code_fence_len:
+                self.code_fence_len = 0
+            return
+        self.code_fence_len = fence_len
+
 async def _stream(dq, msg):
-    session = _TelegramStreamSession(msg)
-    await session.prime()
+    stream = _TelegramTurnStreamCoordinator(msg)
+    await stream.prime()
     try:
         while True:
             try: first = await asyncio.to_thread(dq.get, True, _QUEUE_WAIT_SECONDS)
@@ -399,21 +562,25 @@ async def _stream(dq, msg):
             try:
                 while True: items.append(dq.get_nowait())
             except Q.Empty: pass
-            done_item = next((item for item in items if "done" in item), None)
+            done_item = None
+            for item in items:
+                chunk = item.get("next", "")
+                if chunk:
+                    await stream.add_chunk(chunk)
+                if "done" in item:
+                    done_item = item
+                    break
             if done_item is not None:
-                await session.finalize(done_item.get("done", ""))
+                await stream.finalize(done_item.get("done", ""))
                 event = _drain_latest_ask_user_event()
                 if event:
                     await _send_ask_user_menu(msg, event)
                 break
-            chunk = "".join(item.get("next", "") for item in items if item.get("next"))
-            if chunk:
-                await session.add_chunk(chunk)
     except asyncio.CancelledError:
-        await session.finish_with_notice("⏹️ 已停止")
+        await stream.finish_with_notice("⏹️ 已停止")
     except Exception as exc:
         print(f"[TG stream error] {type(exc).__name__}: {exc}", flush=True)
-        await session.finish_with_notice(f"❌ 输出失败: {exc}")
+        await stream.finish_with_notice(f"❌ 输出失败: {exc}")
 
 def _normalized_command(text):
     parts = (text or "").strip().split(None, 1)
