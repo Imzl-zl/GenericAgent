@@ -152,7 +152,7 @@ class GenericAgentAcpBridge:
     def new_agent(self) -> GeneraticAgent:
         agent = GeneraticAgent()
         agent.next_llm(self.llm_no)
-        agent.verbose = False
+        agent.verbose = True
         threading.Thread(target=agent.run, daemon=True).start()
         return agent
 
