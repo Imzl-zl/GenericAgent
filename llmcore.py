@@ -481,6 +481,7 @@ def _msgs_claude2oai(messages):
             if text_parts: m["content"] = text_parts
             else: m["content"] = ""
             if tool_calls: m["tool_calls"] = tool_calls
+            if not text_parts and not tool_calls and reasoning: m["content"] = "."
             result.append(m)
         elif role == "user":
             text_parts = []

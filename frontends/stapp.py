@@ -164,13 +164,17 @@ try:
     _embed_html = lambda html, **kw: _st_iframe(html, **{k: max(v, 1) if isinstance(v, int) else v for k, v in kw.items()})
 except (ImportError, AttributeError):
     from streamlit.components.v1 import html as _embed_html  # ≤1.55
-_js_scroll_fix = ("!function(){var p=window.parent;if(p.__sfx)return;p.__sfx=1;"
-    "var d=p.document;setInterval(function(){"
-    "var m=d.querySelector('section.main');if(!m)return;"
-    "var b=m.querySelector('.block-container');if(!b)return;"
-    "if(m.scrollHeight>b.scrollHeight+150){"
-    "m.style.overflow='hidden';void m.offsetHeight;m.style.overflow=''}"
-    "},3000)}()")
+_js_scroll_fix = (
+    "!function(){var p=window.parent;if(p.__sfx2)return;p.__sfx2=1;var d=p.document;"
+    "function f(){var m=d.querySelector('section.main');if(!m)return;"
+    "var s=m.scrollTop;m.style.minHeight=m.scrollHeight+1+'px';void m.offsetHeight;"
+    "m.style.minHeight='';void m.offsetHeight;m.scrollTop=s}"
+    "d.addEventListener('transitionend',function(e){"
+    "e.target.closest&&e.target.closest('details')&&setTimeout(f,60)},!0);"
+    "new MutationObserver(function(){setTimeout(f,80)})"
+    ".observe(d.body,{subtree:1,attributes:1,attributeFilter:['open']});"
+    "setInterval(f,5000)}()"
+)
 # IME composition fix (macOS only) - prevents Enter from submitting during CJK input
 _js_ime_fix = ("" if os.name == 'nt' else
     "!function(){if(window.parent.__imeFix)return;window.parent.__imeFix=1;"
