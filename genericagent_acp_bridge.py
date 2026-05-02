@@ -13,11 +13,15 @@ if sys.platform == "win32":
     msvcrt.setmode(_stdout_fd, os.O_BINARY)
     _acp_stdout = os.fdopen(_stdout_fd, "wb", buffering=0)
     msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+    # Mark the ACP fd as non-inheritable so child processes can't write to it.
+    os.set_inheritable(_stdout_fd, False)
     # Redirect the original stdout fd to stderr so child processes
     # (tool calls) don't write into the ACP JSON-RPC channel.
     os.dup2(sys.stderr.fileno(), sys.__stdout__.fileno())
 else:
-    _acp_stdout = sys.__stdout__.buffer if hasattr(sys.__stdout__, 'buffer') else sys.__stdout__
+    _stdout_fd = os.dup(sys.__stdout__.fileno())
+    os.set_inheritable(_stdout_fd, False)
+    _acp_stdout = os.fdopen(_stdout_fd, "wb", buffering=0)
     os.dup2(sys.stderr.fileno(), sys.__stdout__.fileno())
 
 
