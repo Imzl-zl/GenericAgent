@@ -954,6 +954,7 @@ class NativeToolClient:
         self.backend.system = combined
     def chat(self, messages, tools=None):
         if tools: self.backend.tools = tools
+        if not self.backend.history: self._pending_tool_ids = []
         combined_content = []; resp = None; tool_results = []
         for msg in messages:
             c = msg.get('content', '')
