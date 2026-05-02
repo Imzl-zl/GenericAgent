@@ -82,6 +82,11 @@ def _load_default_font(size):
         'C:/Windows/Fonts/msyh.ttc',
         'C:/Windows/Fonts/simhei.ttf',
         'C:/Windows/Fonts/arial.ttf',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+        '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf',
+        '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
     ]
     for font_path in font_candidates:
         if os.path.exists(font_path):
