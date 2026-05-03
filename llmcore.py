@@ -1,26 +1,33 @@
-import os, json, re, time, requests, sys, threading, urllib3, base64, mimetypes, uuid
+import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RESP_CACHE_KEY = str(uuid.uuid4())
 
 def _load_mykeys():
+    global _mykey_path
     try:
-        import mykey; return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
+        import mykey; importlib.reload(mykey); _mykey_path = mykey.__file__
+        return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
     except ImportError: pass
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
+    _mykey_path = p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
     if not os.path.exists(p): raise Exception('[ERROR] mykey.py or mykey.json not found, please create one from mykey_template.')
     with open(p, encoding='utf-8') as f: return json.load(f)
 
+_mykey_path = _mykey_mtime = None
+def reload_mykeys():
+    global _mykey_mtime
+    mt = os.stat(_mykey_path).st_mtime_ns if _mykey_path else -1
+    if mt == _mykey_mtime: return globals().get('mykeys', {}), False
+    mk = _load_mykeys(); _mykey_mtime = os.stat(_mykey_path).st_mtime_ns
+    print(f'[Info] Load mykeys from {_mykey_path}')
+    globals().update(mykeys=mk)
+    if mk.get('langfuse_config'):
+        try: from plugins import langfuse_tracing
+        except Exception: pass
+    return mk, True
+
 def __getattr__(name):  # once guard in PEP 562
-    if name in ('mykeys', 'proxies'):  
-        mk = _load_mykeys()
-        proxy = mk.get("proxy", 'http://127.0.0.1:2082')
-        px = {"http": proxy, "https": proxy} if proxy else None
-        globals().update(mykeys=mk, proxies=px)
-        if mk.get('langfuse_config'):
-            try: from plugins import langfuse_tracing
-            except Exception: pass
-        return globals()[name]
+    if name == 'mykeys': return reload_mykeys()[0]
     raise AttributeError(f"module 'llmcore' has no attribute {name}")
 
 def compress_history_tags(messages, keep_recent=10, max_len=800, force=False):
@@ -30,7 +37,7 @@ def compress_history_tags(messages, keep_recent=10, max_len=800, force=False):
     if compress_history_tags._cd % 5 != 0: return messages
     _before = sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
     _pats = {tag: re.compile(rf'(<{tag}>)([\s\S]*?)(</{tag}>)') for tag in ('thinking', 'think', 'tool_use', 'tool_result')}
-    _hist_pat = re.compile(r'<(history|key_info)>[\s\S]*?</\1>')
+    _hist_pat = re.compile(r'<(history|key_info|earlier_context)>[\s\S]*?</\1>')
     def _trunc_str(s): return s[:max_len//2] + '\n...[Truncated]...\n' + s[-max_len//2:] if isinstance(s, str) and len(s) > max_len else s
     def _trunc(text):
         text = _hist_pat.sub(lambda m: f'<{m.group(1)}>[...]</{m.group(1)}>', text)
@@ -100,6 +107,14 @@ def auto_make_url(base, path):
     if b.endswith(p): return b
     return f"{b}/{p}" if re.search(r'/v\d+(/|$)', b) else f"{b}/v1/{p}"
 
+def _parse_claude_json(data):
+    content_blocks = data.get("content", [])
+    _record_usage(data.get("usage", {}), "messages")
+    for b in content_blocks:
+        if b.get("type") == "text": yield b.get("text", "")
+        elif b.get("type") == "thinking": yield ""
+    return content_blocks
+
 def _parse_claude_sse(resp_lines):
     """Parse Anthropic SSE stream. Yields text chunks, returns list[content_block]."""
     content_blocks = []; current_block = None; tool_json_buf = ""
@@ -158,11 +173,15 @@ def _parse_claude_sse(resp_lines):
     if not warn:
         if not got_message_stop and not stop_reason: warn = "\n\n[!!! 流异常中断，未收到完整响应 !!!]"
         elif stop_reason == "max_tokens": warn = "\n\n[!!! Response truncated: max_tokens !!!]"
+    if current_block:
+        if current_block["type"] == "tool_use":
+            try: current_block["input"] = json.loads(tool_json_buf) if tool_json_buf else {}
+            except: current_block["input"] = {"_raw": tool_json_buf}
+        content_blocks.append(current_block); current_block = None
     if warn:
         print(f"[WARN] {warn.strip()}")
         content_blocks.append({"type": "text", "text": warn}); yield warn
     return content_blocks
-
 
 def _try_parse_tool_args(raw):
     """Parse tool args string; split concatenated JSON objects like {..}{..} if needed.
@@ -330,65 +349,68 @@ def _stamp_oai_cache_markers(messages, model):
             c = list(c); c[-1] = dict(c[-1], cache_control={'type': 'ephemeral'})
             messages[idx] = {**messages[idx], 'content': c}
 
-def _openai_stream(api_base, api_key, messages, model, api_mode='chat_completions', *,
-                   system=None, temperature=0.5, max_tokens=None, tools=None, reasoning_effort=None,
-                   max_retries=0, connect_timeout=10, read_timeout=300, proxies=None, stream=True):
-    """Shared OpenAI-compatible streaming request with retry. Yields text chunks, returns list[content_block]."""
-    ml = model.lower()
-    if 'kimi' in ml or 'moonshot' in ml: temperature = 1
-    elif 'minimax' in ml: temperature = max(0.01, min(temperature, 1.0))  # MiniMax requires temp in (0, 1]
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"}
-    if api_mode == "responses":
-        url = auto_make_url(api_base, "responses")
-        payload = {"model": model, "input": _to_responses_input(messages), "stream": stream, 
-                   "prompt_cache_key": _RESP_CACHE_KEY, "instructions": system or "You are an Omnipotent Executor."}
-        if reasoning_effort: payload["reasoning"] = {"effort": reasoning_effort}
-        if max_tokens: payload["max_output_tokens"] = max_tokens
-    else:
-        url = auto_make_url(api_base, "chat/completions")
-        if system: messages = [{"role": "system", "content": system}] + messages
-        _stamp_oai_cache_markers(messages, model)
-        payload = {"model": model, "messages": messages, "stream": stream}
-        if stream: payload["stream_options"] = {"include_usage": True}
-        if temperature != 1: payload["temperature"] = temperature
-        if max_tokens: payload["max_completion_tokens" if ml.startswith(("gpt-5", "o1", "o2", "o3", "o4")) else "max_tokens"] = max_tokens
-        if reasoning_effort: payload["reasoning_effort"] = reasoning_effort
-    if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
-    RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+def _stream_with_retry(sess, url, headers, payload, parse_fn):
+    _RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
     def _delay(resp, attempt):
         try: ra = float((resp.headers or {}).get("retry-after"))
         except: ra = None
         return max(0.5, ra if ra is not None else min(30.0, 1.5 * (2 ** attempt)))
-    for attempt in range(max_retries + 1):
+    for attempt in range(sess.max_retries + 1):
         streamed = False
         try:
-            with requests.post(url, headers=headers, json=payload, stream=stream,
-                               timeout=(connect_timeout, read_timeout), proxies=proxies) as r:
+            with requests.post(url, headers=headers, json=payload, stream=sess.stream, 
+                               timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
                 if r.status_code >= 400:
-                    if r.status_code in RETRYABLE and attempt < max_retries:
+                    if r.status_code in _RETRYABLE and attempt < sess.max_retries:
                         d = _delay(r, attempt)
-                        print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{max_retries+1})")
+                        print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
                         time.sleep(d); continue
-                    body = ""
                     try: body = r.text.strip()[:500]
-                    except: pass
+                    except: body = ""
                     err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
                     yield err; return [{"type": "text", "text": err}]
-                gen = _parse_openai_sse(r.iter_lines(), api_mode) if stream else _parse_openai_json(r.json(), api_mode)
+                gen = parse_fn(r)
                 try:
                     while True: streamed = True; yield next(gen)
-                except StopIteration as e:
-                    return e.value or []
+                except StopIteration as e: return e.value or []
         except (requests.Timeout, requests.ConnectionError) as e:
-            if attempt < max_retries and not streamed:
-                d = _delay(None, attempt)
-                print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{max_retries+1})")
-                time.sleep(d); continue
             err = f"!!!Error: {type(e).__name__}"
+            if attempt < sess.max_retries:
+                d = _delay(None, attempt)
+                print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
+                yield err; time.sleep(d); continue
             yield err; return [{"type": "text", "text": err}]
         except Exception as e:
-            err = f"!!!Error: {type(e).__name__}: {e}"
+            err = f"\n\n[!!! 流异常中断 {type(e).__name__}: {e} !!!]" if streamed else f"!!!Error: {type(e).__name__}: {e}"
             yield err; return [{"type": "text", "text": err}]
+
+def _openai_stream(sess, messages):
+    model, api_mode = sess.model, sess.api_mode
+    ml = model.lower()
+    temperature = sess.temperature
+    if 'kimi' in ml or 'moonshot' in ml: temperature = 1
+    elif 'minimax' in ml: temperature = max(0.01, min(temperature, 1.0))  # MiniMax requires temp in (0, 1]
+    headers = {"Authorization": f"Bearer {sess.api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"}
+    if api_mode == "responses":
+        url = auto_make_url(sess.api_base, "responses")
+        payload = {"model": model, "input": _to_responses_input(messages), "stream": sess.stream, 
+                   "prompt_cache_key": _RESP_CACHE_KEY, "instructions": sess.system or "You are an Omnipotent Executor."}
+        if sess.reasoning_effort: payload["reasoning"] = {"effort": sess.reasoning_effort}
+        if sess.max_tokens: payload["max_output_tokens"] = sess.max_tokens
+    else:
+        url = auto_make_url(sess.api_base, "chat/completions")
+        if sess.system: messages = [{"role": "system", "content": sess.system}] + messages
+        _stamp_oai_cache_markers(messages, model)
+        payload = {"model": model, "messages": messages, "stream": sess.stream}
+        if sess.stream: payload["stream_options"] = {"include_usage": True}
+        if temperature != 1: payload["temperature"] = temperature
+        if sess.max_tokens: payload["max_completion_tokens" if ml.startswith(("gpt-5", "o1", "o2", "o3", "o4")) else "max_tokens"] = sess.max_tokens
+        if sess.reasoning_effort: payload["reasoning_effort"] = sess.reasoning_effort
+    tools = getattr(sess, 'tools', None)
+    if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
+    if sess.service_tier: payload["service_tier"] = sess.service_tier
+    parse_fn = (lambda r: _parse_openai_sse(r.iter_lines(), api_mode)) if sess.stream else (lambda r: _parse_openai_json(r.json(), api_mode))
+    return (yield from _stream_with_retry(sess, url, headers, payload, parse_fn))
         
 def _prepare_oai_tools(tools, api_mode="chat_completions"):
     if api_mode == "responses":
@@ -459,6 +481,7 @@ def _msgs_claude2oai(messages):
             if text_parts: m["content"] = text_parts
             else: m["content"] = ""
             if tool_calls: m["tool_calls"] = tool_calls
+            if not text_parts and not tool_calls and reasoning: m["content"] = "."
             result.append(m)
         elif role == "user":
             text_parts = []
@@ -488,14 +511,15 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
-        self.context_win = cfg.get('context_win', 24000)
+        self.context_win = cfg.get('context_win', 28000)
         self.history = []
         self.lock = threading.Lock()
         self.system = ""
         self.name = cfg.get('name', self.model)
         proxy = cfg.get('proxy')
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
-        self.max_retries = max(0, int(cfg.get('max_retries', 1)))
+        self.max_retries = max(0, int(cfg.get('max_retries', 4)))
+        self.verify = cfg.get('verify', True)
         self.stream = cfg.get('stream', True)
         default_ct, default_rt = (5, 30) if self.stream else (10, 240)
         self.connect_timeout = max(1, int(cfg.get('timeout', default_ct)))
@@ -504,6 +528,7 @@ class BaseSession:
             v = cfg.get(key); v = None if v is None else str(v).strip().lower()
             return v if not v or v in valid else print(f"[WARN] Invalid {key} {v!r}, ignored.")
         self.reasoning_effort = _enum('reasoning_effort', {'none', 'minimal', 'low', 'medium', 'high', 'xhigh'})
+        self.service_tier = _enum('service_tier', {'auto', 'default', 'priority', 'flex'})
         self.thinking_type = _enum('thinking_type', {'adaptive', 'enabled', 'disabled'})
         self.thinking_budget_tokens = cfg.get('thinking_budget_tokens')
         mode = str(cfg.get('api_mode', 'chat_completions')).strip().lower().replace('-', '_')
@@ -522,7 +547,7 @@ class BaseSession:
             effort = {'low': 'low', 'medium': 'medium', 'high': 'high', 'xhigh': 'max'}.get(self.reasoning_effort)
             if effort: payload["output_config"] = {"effort": effort}
             else: print(f"[WARN] reasoning_effort {self.reasoning_effort!r} is unsupported for Claude output_config.effort, ignored.")
-    def ask(self, prompt, stream=False):
+    def ask(self, prompt):
         def _ask_gen():
             with self.lock:
                 self.history.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
@@ -539,7 +564,7 @@ class BaseSession:
                     tu = {'name': block.get('name', ''), 'arguments': block.get('input', {})}
                     yield f'<tool_use>{json.dumps(tu, ensure_ascii=False)}</tool_use>'
             if not content.startswith("!!!Error:"): self.history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
-        return _ask_gen() if stream else ''.join(list(_ask_gen()))
+        return _ask_gen() if self.stream else ''.join(list(_ask_gen()))
 
 def _keep_claude_block(b): return not isinstance(b, dict) or b.get("type") != "thinking" or b.get("signature")
 def _drop_unsigned_thinking(messages):
@@ -548,21 +573,28 @@ def _drop_unsigned_thinking(messages):
         if isinstance(c, list): m["content"] = [b for b in c if _keep_claude_block(b)]
     return messages
 
+def _ensure_thinking_blocks(messages, model):
+    """deepseek needs thinking in history!"""
+    if 'deepseek' not in model.lower(): return messages
+    for m in messages:
+        if m.get("role") != "assistant": continue
+        c = m.get("content")
+        if not isinstance(c, list): continue
+        has_thinking = any(isinstance(b, dict) and b.get("type") == "thinking" for b in c)
+        if not has_thinking: m["content"] = [{"type": "thinking", "thinking": "...", "signature": "placeholder"}, *c]
+    return messages
+
 class ClaudeSession(BaseSession):
     def raw_ask(self, messages):
         if self.max_tokens is None: self.max_tokens = 8192
         headers = {"x-api-key": self.api_key, "Content-Type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31"}
-        payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
+        payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": self.stream}
         if self.temperature != 1: payload["temperature"] = self.temperature
         self._apply_claude_thinking(payload)
         if self.system: payload["system"] = [{"type": "text", "text": self.system, "cache_control": {"type": "persistent"}}]
-        try:
-            with requests.post(auto_make_url(self.api_base, "messages"), headers=headers, json=payload, stream=True, timeout=(self.connect_timeout, self.read_timeout)) as r:
-                if r.status_code != 200: raise Exception(f"HTTP {r.status_code} {r.content.decode('utf-8', errors='replace')[:500]}")
-                return (yield from _parse_claude_sse(r.iter_lines())) or []
-        except Exception as e:
-            yield (err := f"!!!Error: {e}")
-            return [{"type": "text", "text": err}]
+        url = auto_make_url(self.api_base, "messages")
+        parse_fn = (lambda r: _parse_claude_sse(r.iter_lines())) if self.stream else (lambda r: _parse_claude_json(r.json()))
+        return (yield from _stream_with_retry(self, url, headers, payload, parse_fn))
     def make_messages(self, raw_list):
         msgs = _drop_unsigned_thinking([{"role": m['role'], "content": list(m['content'])} for m in raw_list])
         user_idxs = [i for i, m in enumerate(msgs) if m['role'] == 'user']
@@ -571,11 +603,7 @@ class ClaudeSession(BaseSession):
         return msgs
 
 class LLMSession(BaseSession):
-    def raw_ask(self, messages):
-        return (yield from _openai_stream(self.api_base, self.api_key, messages, self.model, self.api_mode,
-                                  temperature=self.temperature, reasoning_effort=self.reasoning_effort,
-                                  max_tokens=self.max_tokens, max_retries=self.max_retries, stream=self.stream,
-                                  connect_timeout=self.connect_timeout, read_timeout=self.read_timeout, proxies=self.proxies))
+    def raw_ask(self, messages): return (yield from _openai_stream(self, messages))
     def make_messages(self, raw_list): return _msgs_claude2oai(raw_list)
 
 def _fix_messages(messages):
@@ -591,6 +619,8 @@ def _fix_messages(messages):
             has = {b.get('tool_use_id') for b in _wrap(m['content']) if isinstance(b, dict) and b.get('type') == 'tool_result'}
             miss = [uid for uid in uses if uid not in has]
             if miss: m = {**m, 'content': [{"type": "tool_result", "tool_use_id": uid, "content": "(error)"} for uid in miss] + _wrap(m['content'])}
+            orphan = has - set(uses)
+            if orphan: m = {**m, 'content': [{"type":"text","text":str(b.get('content',''))} if isinstance(b,dict) and b.get('type')=='tool_result' and b.get('tool_use_id') in orphan else b for b in _wrap(m['content'])]}
         fixed.append(m)
     while fixed and fixed[0]['role'] != 'user': fixed.pop(0)
     return fixed
@@ -598,7 +628,6 @@ def _fix_messages(messages):
 class NativeClaudeSession(BaseSession):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.context_win = cfg.get("context_win", 28000)
         self.fake_cc_system_prompt = cfg.get("fake_cc_system_prompt", False)
         self.user_agent = cfg.get("user_agent", "claude-cli/2.1.113 (external, cli)")
         self._session_id = str(uuid.uuid4())
@@ -606,7 +635,7 @@ class NativeClaudeSession(BaseSession):
         self._device_id = uuid.uuid4().hex + uuid.uuid4().hex[:32]
         self.tools = None
     def raw_ask(self, messages):
-        messages = _drop_unsigned_thinking(_fix_messages(messages))
+        messages = _ensure_thinking_blocks(_drop_unsigned_thinking(_fix_messages(messages)), self.model)
         if self.max_tokens is None: self.max_tokens = 8192
         model = self.model
         beta_parts = ["claude-code-20250219", "interleaved-thinking-2025-05-14", "redact-thinking-2026-02-12", "prompt-caching-scope-2026-01-05"]
@@ -634,20 +663,9 @@ class NativeClaudeSession(BaseSession):
         for idx in user_idxs[-2:]:
             messages[idx] = {**messages[idx], "content": list(messages[idx]["content"])}
             messages[idx]["content"][-1] = dict(messages[idx]["content"][-1], cache_control={"type": "ephemeral"})
-        try:
-            with requests.post(auto_make_url(self.api_base, "messages")+'?beta=true', headers=headers, json=payload, stream=self.stream, timeout=(self.connect_timeout, self.read_timeout)) as resp:
-                if resp.status_code != 200: raise Exception(f"HTTP {resp.status_code} {resp.content.decode('utf-8', errors='replace')[:500]}")
-                if self.stream: return (yield from _parse_claude_sse(resp.iter_lines())) or []
-                else:
-                    data = resp.json(); content_blocks = data.get("content", [])
-                    _record_usage(data.get("usage", {}), "messages")
-                    for b in content_blocks:
-                        if b.get("type") == "text": yield b.get("text", "")
-                        elif b.get("type") == "thinking": yield ""
-                    return content_blocks
-        except Exception as e:
-            yield (err := f"!!!Error: {e}")
-            return [{"type": "text", "text": err}]
+        url = auto_make_url(self.api_base, "messages") + '?beta=true'
+        parse_fn = (lambda r: _parse_claude_sse(r.iter_lines())) if self.stream else (lambda r: _parse_claude_json(r.json()))
+        return (yield from _stream_with_retry(self, url, headers, payload, parse_fn))
 
     def ask(self, msg):
         assert type(msg) is dict
@@ -660,6 +678,7 @@ class NativeClaudeSession(BaseSession):
         try:
             while True: yield next(gen)
         except StopIteration as e: content_blocks = e.value or []
+        if content_blocks and (_injected := _ensure_text_block(content_blocks)): yield _injected
         if content_blocks and not (len(content_blocks) == 1 and content_blocks[0].get("text", "").startswith("!!!Error:")):
             self.history.append({"role": "assistant", "content": content_blocks})
         text_parts = [b["text"] for b in content_blocks if b.get("type") == "text"]
@@ -679,11 +698,8 @@ class NativeClaudeSession(BaseSession):
 class NativeOAISession(NativeClaudeSession):
     def raw_ask(self, messages):
         messages = _fix_messages(messages)
-        return (yield from _openai_stream(self.api_base, self.api_key, _msgs_claude2oai(messages), self.model, self.api_mode,
-                                          system=self.system, temperature=self.temperature, max_tokens=self.max_tokens,
-                                          tools=self.tools, reasoning_effort=self.reasoning_effort,
-                                          max_retries=self.max_retries, connect_timeout=self.connect_timeout,
-                                          read_timeout=self.read_timeout, proxies=self.proxies, stream=self.stream))
+        messages = _ensure_thinking_blocks(messages, self.model)
+        return (yield from _openai_stream(self, _msgs_claude2oai(messages)))
 
 def openai_tools_to_claude(tools):
     """[{type:'function', function:{name,description,parameters}}] → [{name,description,input_schema}]."""
@@ -694,7 +710,6 @@ def openai_tools_to_claude(tools):
         result.append({'name': fn['name'], 'description': fn.get('description', ''),
             'input_schema': fn.get('parameters', {'type': 'object', 'properties': {}})})
     return result
-
 
 class MockFunction:
     def __init__(self, name, arguments): self.name, self.arguments = name, arguments  
@@ -723,31 +738,14 @@ class ToolClient:
     def chat(self, messages, tools=None):
         full_prompt = self._build_protocol_prompt(messages, tools)
         print("Full prompt length:", len(full_prompt), 'chars')
-        prompt_log = full_prompt
-        gen = self.backend.ask(full_prompt, stream=True)
-        _write_llm_log('Prompt', prompt_log)
-        raw_text = ''; summarytag = '[NextWillSummary]'
+        gen = self.backend.ask(full_prompt)
+        _write_llm_log('Prompt', full_prompt)
+        raw_text = ''
         for chunk in gen:
-            raw_text += chunk
-            if chunk != summarytag: yield chunk
-        if raw_text.endswith(summarytag):
-            self.last_tools = ''; raw_text = raw_text[:-len(summarytag)]
+            raw_text += chunk; yield chunk
         _write_llm_log('Response', raw_text)
         return self._parse_mixed_response(raw_text)
 
-    def _estimate_content_len(self, content):
-        if isinstance(content, str): return len(content)
-        if isinstance(content, list):
-            total = 0
-            for part in content:
-                if not isinstance(part, dict): continue
-                if part.get("type") == "text":
-                    total += len(part.get("text", ""))
-                elif part.get("type") == "image_url":
-                    total += 1000
-            return total
-        return len(str(content))
-    
     def _prepare_tool_instruction(self, tools):
         tool_instruction = ""
         if not tools: return tool_instruction
@@ -788,61 +786,47 @@ Follow these steps to think and act:
             user += f"=== {role} ===\n"
             for tr in m.get('tool_results', []): user += f'<tool_result>{tr["content"]}</tool_result>\n'
             user += str(m['content']) + "\n"
-            self.total_cd_tokens += self._estimate_content_len(user)           
+            self.total_cd_tokens += len(user) // 3
         if self.total_cd_tokens > 9000: self.last_tools = ''
         user += "=== ASSISTANT ===\n" 
         return system + user
 
     def _parse_mixed_response(self, text):
         remaining_text = text; thinking = ''
-        think_pattern = r"<think(?:ing)?>(.*?)</think(?:ing)?>"
-        think_match = re.search(think_pattern, text, re.DOTALL)
-        
+        think_match = re.search(r"<think(?:ing)?>(.*?)</think(?:ing)?>", text, re.DOTALL)
         if think_match:
             thinking = think_match.group(1).strip()
-            remaining_text = re.sub(think_pattern, "", remaining_text, flags=re.DOTALL)
-        
-        tool_calls = []; json_strs = []; errors = []
-        tool_pattern = r"<(?:tool_use|tool_call)>((?:(?!<(?:tool_use|tool_call)>).){15,}?)</(?:tool_use|tool_call)>"
-        tool_all = re.findall(tool_pattern, remaining_text, re.DOTALL)
-        
-        if tool_all:
-            tool_all = [s.strip() for s in tool_all]
-            json_strs.extend([s for s in tool_all if s.startswith('{') and s.endswith('}')])
-            remaining_text = re.sub(tool_pattern, "", remaining_text, flags=re.DOTALL)
-        elif '<tool_use>' in remaining_text:
-            weaktoolstr = remaining_text.split('<tool_use>')[-1].strip().strip('><')
-            json_str = weaktoolstr if weaktoolstr.endswith('}') else ''
-            if json_str == '' and '```' in weaktoolstr and weaktoolstr.split('```')[0].strip().endswith('}'):
-                json_str = weaktoolstr.split('```')[0].strip()
-            if json_str:
-                json_strs.append(json_str)
-            remaining_text = remaining_text.replace('<tool_use>'+weaktoolstr, "")
-        elif '"name":' in remaining_text and '"arguments":' in remaining_text:
-            json_match = re.search(r'\{.*"name":.*\}', remaining_text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0).strip()
-                json_strs.append(json_str)
-                remaining_text = remaining_text.replace(json_str, "").strip()
-
-        for json_str in json_strs:
-            try:
-                data = tryparse(json_str)
-                func_name = data.get('name') or data.get('function') or data.get('tool')
-                args = data.get('arguments') or data.get('args') or data.get('params') or data.get('parameters')
-                if args is None: args = data
-                if func_name: tool_calls.append(MockToolCall(func_name, args))
-            except json.JSONDecodeError as e:
-                errors.append({'err': f"[Warn] Failed to parse tool_use JSON: {json_str}", 'bad_json': f'Failed to parse tool_use JSON: {json_str[:200]}'})
-                self.last_tools = ''   # llm肯定忘了tool schema了，再提供下
-            except Exception as e:
-                errors.append({'err': f'[Warn] Exception during tool_use parsing: {str(e)} {str(data)}'})
-        if len(tool_calls) == 0:
-            for e in errors:
-                print(e['err'])
-                if 'bad_json' in e: tool_calls.append(MockToolCall('bad_json', {'msg': e['bad_json']}))
-        content = remaining_text.strip()
-        return MockResponse(thinking, content, tool_calls, text)
+            remaining_text = re.sub(r"<think(?:ing)?>(.*?)</think(?:ing)?>", "", remaining_text, flags=re.DOTALL)
+        tool_calls, remaining_text = _parse_text_tool_calls(remaining_text)
+        if not tool_calls:
+            json_strs = []; errors = []
+            if '<tool_use>' in remaining_text:
+                weaktoolstr = remaining_text.split('<tool_use>')[-1].strip().strip('><')
+                json_str = weaktoolstr if weaktoolstr.endswith('}') else ''
+                if json_str == '' and '```' in weaktoolstr and weaktoolstr.split('```')[0].strip().endswith('}'):
+                    json_str = weaktoolstr.split('```')[0].strip()
+                if json_str: json_strs.append(json_str)
+                remaining_text = remaining_text.replace('<tool_use>'+weaktoolstr, "")
+            elif '"name":' in remaining_text and '"arguments":' in remaining_text:
+                json_match = re.search(r'\{.*"name":.*\}', remaining_text, re.DOTALL)
+                if json_match:
+                    json_strs.append(json_match.group(0).strip())
+                    remaining_text = remaining_text.replace(json_match.group(0), "").strip()
+            for json_str in json_strs:
+                try:
+                    data = tryparse(json_str)
+                    func_name = data.get('name') or data.get('function') or data.get('tool')
+                    args = data.get('arguments') or data.get('args') or data.get('params') or data.get('parameters')
+                    if args is None: args = data
+                    if func_name: tool_calls.append(MockToolCall(func_name, args))
+                except json.JSONDecodeError:
+                    errors.append(f'Failed to parse tool_use JSON: {json_str[:200]}')
+                    self.last_tools = ''
+                except: pass
+            if not tool_calls:
+                for e in errors:
+                    print(f"[Warn] {e}"); tool_calls.append(MockToolCall('bad_json', {'msg': e}))
+        return MockResponse(thinking, remaining_text.strip(), tool_calls, text)
 
 def _parse_text_tool_calls(content):
     """Fallback: extract tool calls from text when model doesn't use native tool_use blocks."""
@@ -865,6 +849,16 @@ def _parse_text_tool_calls(content):
         except: pass
     if tcs: content = re.sub(_xp, "", content, flags=re.DOTALL).strip()
     return tcs, content
+
+def _ensure_text_block(blocks):
+    """If response has thinking but no text block, inject a synthetic summary from thinking's first line."""
+    if any(b.get("type") == "text" for b in blocks): return None
+    th = next((b.get("thinking", "") for b in blocks if b.get("type") == "thinking"), "")
+    if not th: return None
+    line = th.strip().split('\n', 1)[0]
+    txt = "<summary>" + (line[:60] + '...' if len(line) > 60 else line) + "</summary>"
+    blocks.insert(1, {"type": "text", "text": txt})
+    return txt
 
 def _write_llm_log(label, content):
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp/model_responses')
@@ -896,7 +890,8 @@ class MixinSession:
         groups = {is_native(s) for s in self._sessions}
         assert len(groups) == 1, f"MixinSession: sessions must be in same group (Native or non-Native), got {[type(s).__name__ for s in self._sessions]}"
         self.name = '|'.join(s.name for s in self._sessions)
-        import copy; self._sessions[0] = copy.copy(self._sessions[0])
+        import copy; self._sessions = [copy.copy(s) for s in self._sessions]
+        for s in self._sessions: s.max_retries = 0
         self._orig_raw_asks = [s.raw_ask for s in self._sessions]
         self._sessions[0].raw_ask = self._raw_ask
         self.model = getattr(self._sessions[0], 'model', None)
@@ -931,6 +926,9 @@ class MixinSession:
             is_err = test_error(last_chunk)
             if not is_err:
                 if attempt > 0: self._cur_idx = idx; self._switched_at = time.time()
+                elif isinstance(last_chunk, str) and '[!!! 流异常中断' in last_chunk and n > 1:
+                    self._cur_idx = (idx + 1) % n; self._switched_at = time.time()
+                    print(f'[MixinSession] Partial failure, next call → s{self._cur_idx} ({self._sessions[self._cur_idx].name})')
                 return return_val
             if attempt >= self._retries:
                 yield last_chunk; return return_val
@@ -967,6 +965,7 @@ class NativeToolClient:
         self.backend.system = combined
     def chat(self, messages, tools=None):
         if tools: self.backend.tools = tools
+        if not self.backend.history: self._pending_tool_ids = []
         combined_content = []; resp = None; tool_results = []
         for msg in messages:
             c = msg.get('content', '')
@@ -994,4 +993,3 @@ class NativeToolClient:
         if resp: _write_llm_log('Response', resp.raw)
         if resp and hasattr(resp, 'tool_calls') and resp.tool_calls: self._pending_tool_ids = [tc.id for tc in resp.tool_calls]
         return resp
-

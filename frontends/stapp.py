@@ -32,17 +32,21 @@ agent = init()
 
 st.title("🖥️ Cowork")
 
-if 'autonomous_enabled' not in st.session_state: st.session_state.autonomous_enabled = False
+st.session_state.setdefault('autonomous_enabled', False)
 
 @st.fragment
 def render_sidebar():
+    st.session_state.setdefault('autonomous_enabled', False)
+    llm_options = agent.list_llms()
     current_idx = agent.llm_no
-    st.caption(f"LLM Core: {current_idx}: {agent.get_llm_name()}", help="点击切换备用链路")
+    llm_labels = {idx: f"{idx}: {(name or '').strip()}" for idx, name, _ in llm_options}
+    st.caption(f"LLM Core: {llm_labels.get(current_idx, str(current_idx))}", help="下拉切换备用链路")
+    selected_idx = st.selectbox("备用链路", [idx for idx, _, _ in llm_options], index=next((i for i, (idx, _, _) in enumerate(llm_options) if idx == current_idx), 0), format_func=llm_labels.get, label_visibility="collapsed", key="sidebar_llm_select")
+    if selected_idx != current_idx:
+        agent.next_llm(selected_idx); st.rerun(scope="fragment")
     last_reply_time = st.session_state.get('last_reply_time', 0)
     if last_reply_time > 0:
         st.caption(f"空闲时间：{int(time.time()) - last_reply_time}秒", help="当超过30分钟未收到回复时，系统会自动任务")
-    if st.button("切换备用链路"):
-        agent.next_llm(); st.rerun(scope="fragment")
     if st.button("强行停止任务"):
         agent.abort(); st.toast("已发送停止信号"); st.rerun()
     if st.button("重新注入工具"):
@@ -95,6 +99,8 @@ def fold_turns(text):
     # 先把4+反引号块替换为占位符，避免误切子agent嵌套的 LLM Running
     _ph = []
     safe = re.sub(r'`{4,}.*?`{4,}', lambda m: (_ph.append(m.group(0)), f'\x00PH{len(_ph)-1}\x00')[1], text, flags=re.DOTALL)
+    # 流式中间态：末尾可能有未闭合的4+反引号块，也需保护
+    safe = re.sub(r'`{4,}[^`].*$', lambda m: (_ph.append(m.group(0)), f'\x00PH{len(_ph)-1}\x00')[1], safe, flags=re.DOTALL)
     parts = re.split(r'(\**LLM Running \(Turn \d+\) \.\.\.\*\**)', safe)
     parts = [re.sub(r'\x00PH(\d+)\x00', lambda m: _ph[int(m.group(1))], p) for p in parts]
     if len(parts) < 4: return [{'type': 'text', 'content': text}]
@@ -113,7 +119,9 @@ def fold_turns(text):
                 title = matches[0].strip()
                 title = title.split('\n')[0]
                 if len(title) > 50: title = title[:50] + '...'
-            else: title = marker.strip('*')
+            else:
+                _plain = _c.strip().split('\n', 1)[0]
+                title = (_plain[:50] + '...') if len(_plain) > 50 else (_plain or marker.strip('*'))
             segments.append({'type': 'fold', 'title': title, 'content': content})
         else: segments.append({'type': 'text', 'content': marker + content})
     return segments
@@ -158,13 +166,17 @@ try:
     _embed_html = lambda html, **kw: _st_iframe(html, **{k: max(v, 1) if isinstance(v, int) else v for k, v in kw.items()})
 except (ImportError, AttributeError):
     from streamlit.components.v1 import html as _embed_html  # ≤1.55
-_js_scroll_fix = ("!function(){var p=window.parent;if(p.__sfx)return;p.__sfx=1;"
-    "var d=p.document;setInterval(function(){"
-    "var m=d.querySelector('section.main');if(!m)return;"
-    "var b=m.querySelector('.block-container');if(!b)return;"
-    "if(m.scrollHeight>b.scrollHeight+150){"
-    "m.style.overflow='hidden';void m.offsetHeight;m.style.overflow=''}"
-    "},3000)}()")
+_js_scroll_fix = (
+    "!function(){var p=window.parent;if(p.__sfx2)return;p.__sfx2=1;var d=p.document;"
+    "function f(){var m=d.querySelector('section.main');if(!m)return;"
+    "var s=m.scrollTop;m.style.minHeight=m.scrollHeight+1+'px';void m.offsetHeight;"
+    "m.style.minHeight='';void m.offsetHeight;m.scrollTop=s}"
+    "d.addEventListener('transitionend',function(e){"
+    "e.target.closest&&e.target.closest('details')&&setTimeout(f,60)},!0);"
+    "new MutationObserver(function(){setTimeout(f,80)})"
+    ".observe(d.body,{subtree:1,attributes:1,attributeFilter:['open']});"
+    "setInterval(f,5000)}()"
+)
 # IME composition fix (macOS only) - prevents Enter from submitting during CJK input
 _js_ime_fix = ("" if os.name == 'nt' else
     "!function(){if(window.parent.__imeFix)return;window.parent.__imeFix=1;"

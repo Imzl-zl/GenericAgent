@@ -46,8 +46,10 @@ def agent_runner_loop(client, system_prompt, user_input, handler, tools_schema, 
     ]
     turn = 0;  handler.max_turns = max_turns
     while turn < handler.max_turns:
-        turn += 1; md = '**' if verbose else ''
-        yield f"{md}LLM Running (Turn {turn}) ...{md}\n\n"
+        turn += 1; turnstr = f'LLM Running (Turn {turn}) ...'
+        if handler.parent.task_dir: turnstr = f'Turn {turn} ...'
+        if verbose: turnstr = f'**{turnstr}**'
+        yield f"\n\n{turnstr}\n\n"
         if turn%10 == 0: client.last_tools = ''  # 每10轮重置一次工具描述，避免上下文过大导致的模型性能下降
         response_gen = client.chat(messages=messages, tools=tools_schema)
         if verbose:
@@ -115,4 +117,9 @@ def _compact_tool_args(name, args):
     for k in ('path',): 
         if k in a: a[k] = os.path.basename(a[k])
     if name == 'update_working_checkpoint': s = a.get('key_info', ''); return (s[:60]+'...') if len(s)>60 else s
+    if name == 'ask_user':
+        q = str(a.get('question', ''))
+        cs = a.get('candidates') or []
+        if cs: q += '\ncandidates:\n' + '\n'.join(f'- {c}' for c in cs)
+        return q
     s = json.dumps(a, ensure_ascii=False); return (s[:120]+'...') if len(s)>120 else s
