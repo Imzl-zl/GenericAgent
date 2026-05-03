@@ -546,7 +546,7 @@ class GenericAgentHandler(BaseHandler):
             summary = f"调用工具{tool_name}, args: {clean_args}"
             if tool_name == 'no_tool': summary = "直接回答了用户问题"
             next_prompt += "\n\n\nUSER: <summary>呢？？？！\n\n"
-        summary = smart_format(summary.replace('\n', ''), max_str_len=100)
+        summary = smart_format(summary.replace('\n', ''), max_str_len=80)
         self.history_info.append(f'[Agent] {summary}')
         _plan = self._in_plan_mode()
         if turn % 65 == 0 and (not _plan):
