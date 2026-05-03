@@ -1660,6 +1660,7 @@ class ChatPanel(QWidget):
                 border-color: rgba(124,58,237,0.6); }}
             {SCROLLBAR_STYLE}
         """)
+        self._hist_list.itemDoubleClicked.connect(self._restore_selected)
         ly.addWidget(self._hist_list)
         return page
 
