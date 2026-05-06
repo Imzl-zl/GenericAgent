@@ -284,7 +284,8 @@ class GenericAgentHandler(BaseHandler):
         if not code:
             code = self._extract_code_block(response, code_type)
             if not code: return StepOutcome("[Error] Code missing. Must use reply code block or 'script' arg.", next_prompt="\n")
-        timeout = args.get("timeout", 60)
+        try: timeout = int(args.get("timeout", 60))
+        except: timeout = 60
         raw_path = os.path.join(self.cwd, args.get("cwd", './'))
         cwd = os.path.normpath(os.path.abspath(raw_path))
         code_cwd = os.path.normpath(self.cwd)
@@ -380,12 +381,12 @@ class GenericAgentHandler(BaseHandler):
             if blocks: return blocks[-1].strip()
             return None
         
-        blocks = extract_robust_content(response.content)
-        if not blocks:
+        content = args.get('content') or extract_robust_content(response.content)
+        if not content:
             yield f"[Status] ❌ 失败: 未在回复中找到<file_content>代码块内容\n"
-            return StepOutcome({"status": "error", "msg": "No content found. Put content inside <file_content>...</file_content> tags in your reply body before call file_write."}, next_prompt="\n")
+            return StepOutcome({"status": "error", "msg": "No content found. Blank is not supported. Put content inside <file_content>...</file_content> tags in your reply body before call file_write."}, next_prompt="\n")
         try:
-            new_content = expand_file_refs(blocks, base_dir=self.cwd)
+            new_content = expand_file_refs(content, base_dir=self.cwd)
             if mode == "prepend":
                 old = open(path, 'r', encoding="utf-8").read() if os.path.exists(path) else ""
                 open(path, 'w', encoding="utf-8").write(new_content + old)
