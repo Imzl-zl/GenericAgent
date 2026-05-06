@@ -505,7 +505,7 @@ class GenericAgentHandler(BaseHandler):
 ''' + get_global_memory()
         yield "[Info] Start distilling good memory for long-term storage.\n"
         path = './memory/memory_management_sop.md'
-        if os.path.exists(path): result = '自动读取L0内容：\n' + file_read(path, show_linenos=False)
+        if os.path.exists(path): result = 'This is L0:\n' + file_read(path, show_linenos=False)
         else: result = "Memory Management SOP not found. Do not update memory."
         return StepOutcome(result, next_prompt=prompt)
 
