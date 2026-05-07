@@ -290,7 +290,7 @@ class GenericAgentHandler(BaseHandler):
         cwd = os.path.normpath(os.path.abspath(raw_path))
         code_cwd = os.path.normpath(self.cwd)
         if code_type == 'python' and args.get("inline_eval"):
-            ns = {'handler': self, 'parent': self.parent}
+            ns = {'handler':self, 'parent':self.parent, 'history':json.dumps(self.parent.llmclient.backend.history)}
             old_cwd = os.getcwd()
             try:
                 os.chdir(cwd)

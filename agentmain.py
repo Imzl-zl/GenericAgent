@@ -39,7 +39,7 @@ def get_system_prompt():
     prompt += get_global_memory()
     return prompt
 
-class GeneraticAgent:
+class GenericAgent:
     def __init__(self):
         os.makedirs(os.path.join(script_dir, 'temp'), exist_ok=True)
         self.lock = threading.Lock()
@@ -169,7 +169,9 @@ class GeneraticAgent:
                 self.is_running = self.stop_sig = False
                 self.task_queue.task_done()
                 if self.handler is not None: self.handler.code_stop_signal.append(1)
-    
+
+GeneraticAgent = GenericAgent    
+
 if __name__ == '__main__':
     import argparse
     from datetime import datetime
@@ -179,12 +181,12 @@ if __name__ == '__main__':
     parser.add_argument('--input', help='prompt')
     parser.add_argument('--llm_no', type=int, default=0)
     parser.add_argument('--verbose', action='store_true')
-    parser.add_argument('--bg', action='store_true', help='popen, print PID, exit')
+    parser.add_argument('--nobg', action='store_true')
     args = parser.parse_args()
 
-    if args.bg:
+    if args.task and not args.nobg:
         import subprocess, platform
-        cmd = [sys.executable, os.path.abspath(__file__)] + [a for a in sys.argv[1:] if a != '--bg']
+        cmd = [sys.executable, os.path.abspath(__file__)] + [a for a in sys.argv[1:]] + ['--nobg']
         d = os.path.join(script_dir, f'temp/{args.task}'); os.makedirs(d, exist_ok=True)
         p = subprocess.Popen(cmd, cwd=script_dir,
             creationflags=0x08000000 if platform.system() == 'Windows' else 0,
@@ -205,6 +207,7 @@ if __name__ == '__main__':
             os.makedirs(d, exist_ok=True)
             import glob; [os.remove(f) for f in glob.glob(os.path.join(d, 'output*.txt'))]
             with open(infile, 'w', encoding='utf-8') as f: f.write(args.input)
+        if (fh := consume_file(d, '_history.json')): agent.llmclient.backend.history = json.loads(fh)
         with open(infile, encoding='utf-8') as f: raw = f.read()
         while True:
             dq = agent.put_task(raw, source='task')
