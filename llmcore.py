@@ -1016,7 +1016,7 @@ def resolve_client(cfg_name):
     s = resolve_session(cfg_name)
     return (NativeToolClient(s) if isinstance(s, (NativeClaudeSession, NativeOAISession)) else ToolClient(s)) if s else None
 
-def fast_ask(prompt, cfg_name, system=None):
+def fast_ask(prompt, cfg_name):
     sess = resolve_session(cfg_name)
-    if not sess: raise ValueError(f"fast_ask: '{cfg_name}' unsupported (mixin?)")
-    return "".join(sess.raw_ask(([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]))
+    if not sess: raise ValueError(f"fast_ask: '{cfg_name}' unsupported")
+    return "".join(sess.raw_ask([{"role": "user", "content": prompt}]))
