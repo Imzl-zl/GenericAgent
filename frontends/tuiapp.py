@@ -231,6 +231,15 @@ class GenericAgentTUI(App[None]):
         ("ctrl+s", "stop_current", "Stop"),
         ("ctrl+f", "toggle_fold", "Fold/Unfold"),
         ("ctrl+q", "quit", "Quit"),
+        ("ctrl+1", "switch_session(1)", "Session 1"),
+        ("ctrl+2", "switch_session(2)", "Session 2"),
+        ("ctrl+3", "switch_session(3)", "Session 3"),
+        ("ctrl+4", "switch_session(4)", "Session 4"),
+        ("ctrl+5", "switch_session(5)", "Session 5"),
+        ("ctrl+6", "switch_session(6)", "Session 6"),
+        ("ctrl+7", "switch_session(7)", "Session 7"),
+        ("ctrl+8", "switch_session(8)", "Session 8"),
+        ("ctrl+9", "switch_session(9)", "Session 9"),
     ]
 
     def __init__(self, agent_factory: Optional[AgentFactory] = None, *, demo: bool = False) -> None:
@@ -280,6 +289,15 @@ class GenericAgentTUI(App[None]):
         self.current_id = agent_id
         self._refresh_all()
         return session
+
+    def action_switch_session(self, n: int) -> None:
+        """Switch to session by id via Ctrl+N shortcut."""
+        if n in self.sessions:
+            self.current_id = n
+            self._refresh_all()
+            self._system(f"Switched to session #{n}.")
+        else:
+            self.notify(f"Session #{n} does not exist.", severity="warning")
 
     def action_new_session(self) -> None:
         self.add_session()
@@ -476,7 +494,7 @@ class GenericAgentTUI(App[None]):
         for msg in reversed(session.messages):
             if msg.role == "user":
                 text = msg.content.strip().replace("\n", " ")
-                return text[:24] + "…" if len(text) > 25 else text
+                return text[:18] + "…" if len(text) > 18 else text
         return ""
 
     def _session_last_summary(self, session: AgentSession) -> str:
@@ -486,7 +504,7 @@ class GenericAgentTUI(App[None]):
                 matches = re.findall(r"<summary>\s*(.*?)\s*</summary>", msg.content, re.DOTALL)
                 if matches:
                     text = matches[-1].strip().split("\n", 1)[0].replace("\n", " ")
-                    return text[:24] + "…" if len(text) > 25 else text
+                    return text[:18] + "…" if len(text) > 18 else text
         return ""
 
     def _refresh_sidebar(self) -> None:
