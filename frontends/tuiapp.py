@@ -576,6 +576,11 @@ class GenericAgentTUI(App[None]):
 
     def action_toggle_fold(self) -> None:
         self.fold_mode = not self.fold_mode
+        # Invalidate cached panels for assistant messages since fold state changed
+        if self.current_id is not None:
+            for msg in self.current.messages:
+                if msg.role == "assistant":
+                    msg._rendered_panel = None
         self._refresh_log()
         mode_label = "folded" if self.fold_mode else "expanded"
         self.notify(f"Display mode: {mode_label} (Ctrl+F to toggle)")
