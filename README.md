@@ -80,8 +80,9 @@ After a few weeks, your agent instance will have a skill tree no one else in the
 git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 
-# 2. Install minimal dependencies
-pip install requests streamlit pywebview textual
+# 2. Install dependencies
+pip install requests streamlit pywebview   # Desktop GUI (launch.pyw)
+pip install requests textual               # Terminal UI (tuiapp.py)
 
 # 3. Configure API Key
 cp mykey_template.py mykey.py
@@ -112,15 +113,13 @@ Full guide: [GETTING_STARTED.md](GETTING_STARTED.md)
 
 ## 🖥️ Desktop Frontends
 
-### Terminal UI (Recommended)
+### Terminal UI
 
 A lightweight, keyboard-driven interface built on [Textual](https://github.com/Textualize/textual). Supports multiple concurrent sessions, real-time streaming, and runs anywhere a terminal does — no browser needed.
 
 ```bash
 python frontends/tuiapp.py
 ```
-
-> Tip: `python frontends/tuiapp.py --demo` runs a smoke test without consuming API tokens.
 
 ### Other Desktop Frontends
 
@@ -325,8 +324,9 @@ MIT License — see [LICENSE](LICENSE)
 git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 
-# 2. 安装最小依赖
-pip install requests streamlit pywebview textual
+# 2. 安装依赖
+pip install requests streamlit pywebview   # 桌面 GUI (launch.pyw)
+pip install requests textual               # 终端 UI (tuiapp.py)
 
 # 3. 配置 API Key
 cp mykey_template.py mykey.py
@@ -360,15 +360,13 @@ python launch.pyw
 
 ## 🖥️ 桌面前端
 
-### 终端 UI（推荐）
+### 终端 UI
 
 基于 [Textual](https://github.com/Textualize/textual) 的轻量键盘驱动界面。支持多会话并发、实时流式输出，有终端就能跑，无需浏览器。
 
 ```bash
 python frontends/tuiapp.py
 ```
-
-> 提示：`python frontends/tuiapp.py --demo` 可在不消耗 API Token 的情况下进行冒烟测试。
 
 ### 其他桌面前端
 
