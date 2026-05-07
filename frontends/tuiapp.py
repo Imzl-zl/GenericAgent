@@ -33,6 +33,7 @@ try:
     from rich.panel import Panel
     from rich.text import Text
     from textual.app import App, ComposeResult
+    from textual.binding import Binding
     from textual.containers import Horizontal, Vertical
     from textual.widgets import Footer, Header, Input, RichLog, Static
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised by manual missing-dep path
@@ -218,7 +219,7 @@ class GenericAgentTUI(App[None]):
     CSS = """
     Screen { layout: vertical; }
     #body { height: 1fr; }
-    #sidebar { width: 30; min-width: 24; border: solid $accent; padding: 0 1; }
+    #sidebar { width: 30; min-width: 24; border: solid $accent; padding: 0 1; overflow-x: hidden; }
     #main { width: 1fr; }
     #status { height: 3; border: solid $primary; padding: 0 1; }
     #log { height: 1fr; border: solid $primary; padding: 0 1; }
@@ -231,15 +232,8 @@ class GenericAgentTUI(App[None]):
         ("ctrl+s", "stop_current", "Stop"),
         ("ctrl+f", "toggle_fold", "Fold/Unfold"),
         ("ctrl+q", "quit", "Quit"),
-        ("ctrl+1", "switch_session(1)", "Session 1"),
-        ("ctrl+2", "switch_session(2)", "Session 2"),
-        ("ctrl+3", "switch_session(3)", "Session 3"),
-        ("ctrl+4", "switch_session(4)", "Session 4"),
-        ("ctrl+5", "switch_session(5)", "Session 5"),
-        ("ctrl+6", "switch_session(6)", "Session 6"),
-        ("ctrl+7", "switch_session(7)", "Session 7"),
-        ("ctrl+8", "switch_session(8)", "Session 8"),
-        ("ctrl+9", "switch_session(9)", "Session 9"),
+        Binding("ctrl+left", "prev_session", "←Prev", show=True, priority=True),
+        Binding("ctrl+right", "next_session", "Next→", show=True, priority=True),
     ]
 
     def __init__(self, agent_factory: Optional[AgentFactory] = None, *, demo: bool = False) -> None:
@@ -290,12 +284,29 @@ class GenericAgentTUI(App[None]):
         self._refresh_all()
         return session
 
+    def action_prev_session(self) -> None:
+        """Switch to previous session."""
+        ids = sorted(self.sessions.keys())
+        if len(ids) <= 1:
+            return
+        idx = ids.index(self.current_id)
+        self.current_id = ids[(idx - 1) % len(ids)]
+        self._refresh_all()
+
+    def action_next_session(self) -> None:
+        """Switch to next session."""
+        ids = sorted(self.sessions.keys())
+        if len(ids) <= 1:
+            return
+        idx = ids.index(self.current_id)
+        self.current_id = ids[(idx + 1) % len(ids)]
+        self._refresh_all()
+
     def action_switch_session(self, n: int) -> None:
-        """Switch to session by id via Ctrl+N shortcut."""
+        """Switch to session by id (used by /switch command)."""
         if n in self.sessions:
             self.current_id = n
             self._refresh_all()
-            self._system(f"Switched to session #{n}.")
         else:
             self.notify(f"Session #{n} does not exist.", severity="warning")
 
@@ -494,7 +505,7 @@ class GenericAgentTUI(App[None]):
         for msg in reversed(session.messages):
             if msg.role == "user":
                 text = msg.content.strip().replace("\n", " ")
-                return text[:18] + "…" if len(text) > 18 else text
+                return self._truncate_display(text, 20)
         return ""
 
     def _session_last_summary(self, session: AgentSession) -> str:
@@ -504,22 +515,46 @@ class GenericAgentTUI(App[None]):
                 matches = re.findall(r"<summary>\s*(.*?)\s*</summary>", msg.content, re.DOTALL)
                 if matches:
                     text = matches[-1].strip().split("\n", 1)[0].replace("\n", " ")
-                    return text[:18] + "…" if len(text) > 18 else text
+                    return self._truncate_display(text, 20)
         return ""
+
+    @staticmethod
+    def _truncate_display(text: str, max_width: int) -> str:
+        """Truncate text by display width (CJK chars count as 2)."""
+        import unicodedata
+        width = 0
+        result = []
+        for ch in text:
+            w = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+            if width + w > max_width:
+                result.append("…")
+                break
+            result.append(ch)
+            width += w
+        return "".join(result)
 
     def _refresh_sidebar(self) -> None:
         sidebar = self.query_one("#sidebar", Static)
-        lines = ["[b]Sessions[/b]", ""]
+        max_w = 26  # 30 - 2(border) - 2(padding)
+        lines: list[str] = ["[b]Sessions[/b]", ""]
         for sid, session in self.sessions.items():
             mark = "▶" if sid == self.current_id else " "
             last_q = self._session_last_user_query(session)
             last_s = self._session_last_summary(session)
-            lines.append(f"{mark} #{sid} {session.name} [{session.status}]")
+            status_style = "green" if session.status == "running" else "dim"
+            # Header line: "▶ #1 name status" — truncate name if needed
+            prefix = f"{mark} #{sid} "
+            suffix = f" {session.status}"
+            name_max = max_w - len(prefix) - len(suffix)
+            name_disp = self._truncate_display(session.name, max(name_max, 4))
+            lines.append(f"{prefix}{name_disp} [{status_style}]{session.status}[/{status_style}]")
             if last_q:
-                lines.append(f"   [dim]Q: {last_q}[/dim]")
+                lines.append(f"   [dim]Q:{last_q}[/dim]")
             if last_s:
-                lines.append(f"   [dim]S: {last_s}[/dim]")
-        lines.append("\n[dim]Shared temp/memory/tools; use /new, /switch.[/dim]")
+                lines.append(f"   [dim]S:{last_s}[/dim]")
+        lines.append("")
+        lines.append("[dim]/new, /switch, Ctrl+N[/dim]")
+        lines.append("[dim]I have memory, just say what you want[/dim]")
         sidebar.update("\n".join(lines))
 
     def _refresh_status(self) -> None:
