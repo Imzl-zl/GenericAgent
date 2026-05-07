@@ -56,6 +56,7 @@ class ChatMessage:
     content: str
     task_id: Optional[int] = None
     done: bool = True
+    _rendered_panel: Any = field(default=None, repr=False)
 
 
 @dataclass
@@ -596,15 +597,25 @@ class GenericAgentTUI(App[None]):
             recent_task_ids = set(seen)
         for msg in self.current.messages:
             if msg.role == "user":
-                log.write(Panel(Markdown(msg.content), title="You", border_style="blue"))
+                if msg._rendered_panel is None:
+                    msg._rendered_panel = Panel(Markdown(msg.content), title="You", border_style="blue")
+                log.write(msg._rendered_panel)
             elif msg.role == "assistant":
-                suffix = "" if msg.done else "\n▌"
-                # Fold older tasks even in unfold mode to reduce render cost
-                should_fold = self.fold_mode or (msg.task_id not in recent_task_ids)
-                content = render_folded_text(msg.content) if should_fold else msg.content
-                log.write(Panel(Markdown(content + suffix), title=f"Agent task {msg.task_id}", border_style="green"))
+                if msg.done and msg._rendered_panel is not None:
+                    log.write(msg._rendered_panel)
+                else:
+                    suffix = "" if msg.done else "\n▌"
+                    # Fold older tasks even in unfold mode to reduce render cost
+                    should_fold = self.fold_mode or (msg.task_id not in recent_task_ids)
+                    content = render_folded_text(msg.content) if should_fold else msg.content
+                    panel = Panel(Markdown(content + suffix), title=f"Agent task {msg.task_id}", border_style="green")
+                    if msg.done:
+                        msg._rendered_panel = panel
+                    log.write(panel)
             else:
-                log.write(Panel(Text(msg.content), title="System", border_style="yellow"))
+                if msg._rendered_panel is None:
+                    msg._rendered_panel = Panel(Text(msg.content), title="System", border_style="yellow")
+                log.write(msg._rendered_panel)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
