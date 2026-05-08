@@ -22,7 +22,7 @@ C = {
     'blue': '\033[94m', 'magenta': '\033[95m', 'cyan': '\033[96m', 'white': '\033[97m',
 }
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MYKPY_PATH = os.path.join(PROJECT_ROOT, 'mykey.py')
 
 # ── 模型厂商定义 ───────────────────────────────────────────────────────────
