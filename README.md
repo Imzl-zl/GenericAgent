@@ -331,6 +331,7 @@ pip install requests textual               # 终端 UI (tuiapp.py)
 # 3. 配置 API Key
 cp mykey_template.py mykey.py
 # 编辑 mykey.py，填入你的 LLM API Key
+# 或使用交互式向导：python assets/configure_mykey.py
 
 # 4. 启动
 python launch.pyw
