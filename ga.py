@@ -546,10 +546,11 @@ class GenericAgentHandler(BaseHandler):
             clean_args = {k: v for k, v in args.items() if not k.startswith('_')}
             summary = f"调用工具{tool_name}, args: {clean_args}"
             if tool_name == 'no_tool': summary = "直接回答了用户问题"
-            next_prompt += "\n\n\nUSER: <summary>呢？？？！\n\n"
+            next_prompt += "\n\n\n[SYSTEM] 必须在回复文本中包含<summary>！\n\n"
         summary = smart_format(summary.replace('\n', ''), max_str_len=80)
         self.history_info.append(f'[Agent] {summary}')
         _plan = self._in_plan_mode()
+
         if turn % 65 == 0 and (not _plan):
             next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。必须总结情况进行ask_user，不允许继续重试。"
         elif turn % 7 == 0:

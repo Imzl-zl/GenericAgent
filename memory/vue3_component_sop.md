@@ -151,13 +151,50 @@ fileInput.dispatchEvent(new Event('change', { bubbles: true }));
 - Composition API 组件的逻辑主要在 setupState 而非 $options.methods
 - 如果 proxy 上找不到方法，试试 `comp.exposed`（`<script setup>` 用 defineExpose 暴露的）
 
+## Vue 富文本编辑器操作
+
+### 核心原则
+1. **禁止只改 DOM** — `innerHTML` 不触发编辑器内部 model 更新，提交时数据丢失
+2. **优先找编辑器实例调原生 API** — 唯一稳路径：
+   - Quill: `el.__quill.setText()` / `.clipboard.dangerouslyPasteHTML()`
+   - Tiptap: `el.__tiptap.commands.setContent()` 或 Vue ref `.editor.commands.setContent()`
+   - TinyMCE: `tinymce.get(id).setContent()` 或 `tinymce.activeEditor.setContent()`
+   - WangEditor: `el.__wangEditor.setHtml()` 或 Vue ref `.editorRef.setHtml()`
+   - CKEditor: `editor.setData()`
+3. **次选 `innerHTML + InputEvent`** — 对简单 Vue wrapper 有效（wrapper 监听 input 并 emit），复杂编辑器不保证
+4. **兜底 CDP `Input.insertText`** — 绕过 `isTrusted` 检查，等同物理输入
+5. **验证标准是"提交对了"不是"看到了"** — 拦截 fetch/XHR 看 payload，或读 `editor.getHTML()`
+
+### 编辑器实例查找路径（按优先级）
+1. DOM 私有字段: `el.__quill`, `el.__tiptap`, `el.cmView`(CodeMirror)
+2. Vue 组件 setupState/exposed: `comp.setupState.editor`, `comp.exposed.editor`
+3. 全局变量: `window.editor`, `tinymce.editors[0]`
+4. Quill 静态方法: `Quill.find(el)`
+
+### 编辑器类型识别
+- `.ql-editor` → Quill
+- `.ProseMirror` → Tiptap / ProseMirror
+- `.tox-edit-area` / `iframe` → TinyMCE
+- `.w-e-text-container` → WangEditor
+- `.ck-editor__editable` → CKEditor 5
+- `.cm-editor` → CodeMirror 6
+
+### 避坑
+- Element Plus Select 选项被 Teleport 到 body，不在组件 DOM 子树内，要从 `document.querySelectorAll('.el-select-dropdown__item')` 全局找
+- 编辑器可能在 iframe 内（TinyMCE 默认），需 `iframe.contentDocument.body` 操作
+- 提交时数据来源可能不是 Vue state，而是编辑器实例现取 `getHTML()`，所以必须改编辑器 model
+- debounce：有些 wrapper 用 debounce 同步到 v-model，改完后等 300-500ms 再验证
+- Pinia/Vuex：表单数据可能在 store 里而非组件 data，需找到 store 直接赋值
+
 ## 适用场景
 - Vue 3 自定义 Select/Dropdown/Autocomplete 组件 → vnode 实例方法
 - Vue 3 普通 Input/Textarea（v-model）→ nativeSetter + input 事件
 - Date 组件 → nativeSetter + focus/blur 链
 - File Upload → DataTransfer + change 事件
 - 需要绕过 isTrusted 检查的场景
+- **Vue 3 富文本编辑器（Quill/Tiptap/TinyMCE/WangEditor/CKEditor）→ 编辑器实例 API**
 
 ## 验证于
 - OrangeHRM (opensource-demo.orangehrmlive.com) Vue 3 + OXD 组件库
+- 本地 Vue3 + Element Plus + 模拟 Quill/Tiptap 富文本靶场 (2026-05-09)
 - 2026-05-08
