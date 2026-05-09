@@ -173,19 +173,27 @@ def agent_backend_stream(prompt=None):
     # content on the next chunk (raw_resp is cumulative).
     response = re.sub(r'\**LLM Running \(Turn \d+\) \.\.\.\**\s*$',
                       '', st.session_state.get('partial_response', '')).rstrip()
-    while True:
-        try: item = dq.get(timeout=1)
-        except queue.Empty:
-            yield response   # heartbeat: let outer st.markdown() run → Streamlit checks StopException
-            continue
-        if 'next' in item:
-            response = item['next']
-            st.session_state.partial_response = response
-            yield response
-        if 'done' in item:
+    try:
+        while True:
+            try: item = dq.get(timeout=1)
+            except queue.Empty:
+                yield response   # heartbeat: let outer st.markdown() run → Streamlit checks StopException
+                continue
+            if 'next' in item:
+                response = item['next']
+                st.session_state.partial_response = response
+                yield response
+            if 'done' in item:
+                st.session_state.display_queue = None
+                st.session_state.partial_response = ''
+                yield item['done']; break
+    finally:
+        agent.abort()
+        try:
             st.session_state.display_queue = None
             st.session_state.partial_response = ''
-            yield item['done']; break
+        except BaseException:
+            pass
 
 
 def render_main_stream(prompt=None):
@@ -285,12 +293,8 @@ if prompt := st.chat_input("any task?"):
             {"role": "assistant", "content": answer, "time": ts},
         ]
         st.rerun()  # preserve display_queue/partial_response so resume path drains the running main task
-    # Regular prompt: cancel any in-flight task to match original "submit cancels" UX.
-    # (/btw branch above is the only path that intentionally lets the prior task keep streaming.)
-    if st.session_state.get('display_queue') is not None:
-        agent.abort()
-        st.session_state.display_queue = None
-        st.session_state.partial_response = ''
+    # Regular prompt: any in-flight task will be aborted by the finally block in
+    # agent_backend_stream when StopException interrupts the prior generator.
     st.session_state.messages.append({"role": "user", "content": prompt})
     if hasattr(agent, '_pet_req') and not prompt.startswith('/'): agent._pet_req('state=walk')
     with st.chat_message("user"): st.markdown(prompt)
