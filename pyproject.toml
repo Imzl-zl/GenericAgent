@@ -39,3 +39,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = []
+packages = ["command"]
+
+[project.scripts]
+ga = "command.cli:main"
