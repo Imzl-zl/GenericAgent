@@ -1,7 +1,7 @@
 """
-command/cli.py - GenericAgent 命令行分发系统
+ga_cli/cli.py - GenericAgent 命令行分发系统
 
-通过 python -m command <命令> 或 ga <命令> 调用
+通过 python -m ga_cli <命令> 或 ga <命令> 调用
 """
 import os, sys, subprocess, argparse, textwrap
 

@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-:: command-install.cmd - 将 GenericAgent 命令注册到系统 PATH
+:: ga-cli-install.cmd - 将 GenericAgent 命令注册到系统 PATH
 :: 运行一次后，即可在任意位置敲 ga <command>
 :: 建议以管理员身份运行
 
