@@ -1,8 +1,8 @@
 """
-command - GenericAgent CLI 命令包
+ga_cli - GenericAgent CLI 命令包
 
 作为包导入时，自动从根 ga.py 加载核心类（GenericAgentHandler 等）
-以 python -m command 运行时，进入 CLI 命令模式
+以 python -m ga_cli 运行时，进入 CLI 命令模式
 """
 import importlib.util, sys, os
 
