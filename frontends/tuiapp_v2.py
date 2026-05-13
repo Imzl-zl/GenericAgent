@@ -763,6 +763,13 @@ class GenericAgentTUI(App[None]):
         self.set_interval(0.5, self._tick)
         self._patch_auto_scroll_for_selection()
         self._apply_responsive_layout()
+        # Disable alternate scroll mode (?1007). Textual 开 ?1006 SGR mouse 但没关 ?1007；
+        # macOS Terminal.app / iTerm2 默认 profile 的 ?1007 是 ON，滚轮会同时发 mouse 事件
+        # 和 ↑/↓ 按键 → InputArea 历史导航被误触发。退出 alt screen 自动失效，不需要恢复。
+        try:
+            sys.stdout.write("\x1b[?1007l"); sys.stdout.flush()
+        except Exception:
+            pass
 
     def _tick(self) -> None:
         """0.5s 轮询：刷顶栏时间 + 兜底检测尺寸变化（Windows 窗口吸附/全屏不发 resize）。"""
@@ -1616,7 +1623,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     build_arg_parser().parse_args(argv)
-    GenericAgentTUI().run(mouse=sys.platform != "darwin")
+    GenericAgentTUI().run()
     return 0
 
 
