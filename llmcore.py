@@ -373,7 +373,9 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                 gen = parse_fn(r)
                 try:
                     while True: streamed = True; yield next(gen)
-                except StopIteration as e: return e.value or []
+                except StopIteration as e:
+                    if not e.value and not streamed: raise requests.ConnectionError("empty response")
+                    return e.value or []
         except (requests.Timeout, requests.ConnectionError) as e:
             err = f"!!!Error: {type(e).__name__}"
             if attempt < sess.max_retries:
