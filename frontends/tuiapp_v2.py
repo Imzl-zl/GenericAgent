@@ -275,6 +275,94 @@ class HardBreakMarkdown(Markdown):
             if tok.children:
                 HardBreakMarkdown._soft_to_hard(tok.children)
 
+
+# Rich's default divide_line treats a CJK run as one indivisible word and bumps
+# it whole to the next line when it doesn't fit the remaining space, wasting
+# the tail of the current line and producing wraps like "AI ↩ 助手...". Patch
+# both module bindings so Text.wrap (used by Markdown) sees CJK as breakable.
+_CJK_WRAP_RE = re.compile(r"[　-鿿가-힯＀-￯]")
+
+
+def _cjk_divide_line(text: str, width: int, fold: bool = True) -> list[int]:
+    from rich._wrap import words as _rich_words
+    from rich.cells import cell_len as _clen, chop_cells as _chop
+
+    break_positions: list[int] = []
+    cell_offset = 0
+    for start, _end, word in _rich_words(text):
+        word_length = _clen(word.rstrip())
+        remaining = width - cell_offset
+        if remaining >= word_length:
+            cell_offset += _clen(word)
+            continue
+        if not fold:
+            if cell_offset:
+                break_positions.append(start)
+            cell_offset = _clen(word)
+            continue
+
+        if _CJK_WRAP_RE.search(word):
+            # Pack as many leading chars as fit in remaining space, then fold rest.
+            prefix_chars = 0
+            if cell_offset > 0 and remaining > 0:
+                accum = 0
+                for i, ch in enumerate(word):
+                    cw = _clen(ch)
+                    if accum + cw > remaining:
+                        break
+                    accum += cw
+                    prefix_chars = i + 1
+            if prefix_chars > 0:
+                break_positions.append(start + prefix_chars)
+                rest = word[prefix_chars:]
+                cursor = start + prefix_chars
+            else:
+                if cell_offset:
+                    break_positions.append(start)
+                rest = word
+                cursor = start
+            if _clen(rest) > width:
+                chunks = _chop(rest, width)
+                for i in range(len(chunks) - 1):
+                    cursor += len(chunks[i])
+                    break_positions.append(cursor)
+                cell_offset = _clen(chunks[-1].rstrip())
+            else:
+                cell_offset = _clen(rest.rstrip())
+            continue
+
+        # Non-CJK: keep stock behavior.
+        if word_length > width:
+            folded_word = _chop(word, width=width)
+            cursor = start
+            for i, line in enumerate(folded_word):
+                if cursor != 0 or i > 0:
+                    break_positions.append(cursor)
+                if i < len(folded_word) - 1:
+                    cursor += len(line)
+            cell_offset = _clen(folded_word[-1])
+        elif cell_offset and start:
+            break_positions.append(start)
+            cell_offset = _clen(word)
+    return break_positions
+
+
+def _install_cjk_wrap() -> None:
+    # `from rich._wrap import divide_line` in textual.content / rich.text creates
+    # a binding copy that survives our rebind on rich._wrap — patch each holder.
+    import rich._wrap as _rw
+    import rich.text as _rt
+    import textual.content as _tc
+    if getattr(_rw.divide_line, "_cjk_patched", False):
+        return
+    _cjk_divide_line._cjk_patched = True
+    _rw.divide_line = _cjk_divide_line
+    _rt.divide_line = _cjk_divide_line
+    _tc.divide_line = _cjk_divide_line
+
+
+_install_cjk_wrap()
+
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
