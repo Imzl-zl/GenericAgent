@@ -109,6 +109,13 @@ _TASKLIST_DONE_RE = re.compile(r"^(\s*[-*+] )\[[xX]\] ", re.MULTILINE)
 # JSON braces/quotes never leak into the markdown render.
 _TOOL_USE_RE = re.compile(r"<tool_use>\s*(\{.*?\})\s*</tool_use>", re.DOTALL)
 
+# Agent-internal metadata tags. The sidebar's `S:` and the fold title already
+# surface the summary; the chat body should not show the raw tag. Stripping is
+# also required because `<summary>X</summary>\n<body>` (no blank line) is parsed
+# as a CommonMark HTML block that swallows the following body line, so the
+# model's actual reply disappears from the rendered output.
+_META_TAG_RE = re.compile(r"<(summary|thinking)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
+
 
 # Rotating usage tips, picked once per launch.
 _TIPS = (
@@ -3108,6 +3115,8 @@ class GenericAgentTUI(App[None]):
             text = _TASKLIST_DONE_RE.sub(r"\1✔ ", text)
             # Tool-use envelopes get replaced wholesale — see _render_tool_use_block.
             text = _TOOL_USE_RE.sub(_render_tool_use_block, text)
+            # Drop agent-internal metadata before Markdown sees it (see _META_TAG_RE).
+            text = _META_TAG_RE.sub("", text)
             from io import StringIO
             from rich.console import Console
             # Render one column narrower so Rich horizontal rules don't wrap.
