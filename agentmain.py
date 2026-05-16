@@ -155,17 +155,17 @@ class GenericAgent:
                     full_resp += chunk;  turn_resps[-1] += chunk
                     if len(full_resp) - last_pos > 30 or 'LLM Running' in chunk:
                         display_queue.put({'next': full_resp[last_pos:] if self.inc_out else full_resp, 
-                                           'source': source, 'turn': curr_turn, 'outputs': turn_resps[-1:]})
+                                           'source': source, 'turn': curr_turn, 'outputs': turn_resps[-2:]})
                         last_pos = len(full_resp)
                 if self.inc_out and last_pos < len(full_resp): display_queue.put({'next': full_resp[last_pos:], 'source': source, 
-                                                                                  'turn': curr_turn, 'outputs': turn_resps[-1:]})
+                                                                                  'turn': curr_turn, 'outputs': turn_resps[-2:]})
                 #if '</summary>' in full_resp: full_resp = full_resp.replace('</summary>', '</summary>\n\n')
                 #if '</file_content>' in full_resp: full_resp = re.sub(r'<file_content>\s*(.*?)\s*</file_content>', r'\n````\n<file_content>\n\1\n</file_content>\n````', full_resp, flags=re.DOTALL)                
                 display_queue.put({'done': full_resp, 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
                 self.history = handler.history_info
             except Exception as e:
                 print(f"Backend Error: {format_error(e)}")
-                display_queue.put({'done': full_resp + f'\n```\n{format_error(e)}\n```', 'source': source})
+                display_queue.put({'done': full_resp + f'\n```\n{format_error(e)}\n```', 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
             finally:
                 if self.stop_sig: print('User aborted the task.')
                 self.is_running = self.stop_sig = False
