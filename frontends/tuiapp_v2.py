@@ -613,6 +613,32 @@ _DEFAULT_PALETTE: dict[str, str] = {
 
 _THEME_CYCLE = ["ga-default", "nord", "gruvbox", "dracula", "tokyo-night", "textual-light"]
 
+
+# ---------- persisted settings ----------
+# Lightweight JSON dropbox for cross-run UI state (theme, future toggles).
+# Lives under temp/ alongside model logs so it tracks the workspace.
+_SETTINGS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "temp", "tui_settings.json"
+)
+
+def _load_settings() -> dict:
+    try:
+        with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_settings(patch: dict) -> None:
+    cur = _load_settings()
+    cur.update(patch)
+    try:
+        os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 _palette: dict[str, str] = dict(_DEFAULT_PALETTE)
 C_FG     = _palette["fg"]
 C_MUTED  = _palette["muted"]
@@ -660,6 +686,9 @@ def _markdown_rich_theme(p: dict[str, str]):
         "markdown.link_url":    f"underline {p['dim']}",
         "markdown.block_quote": p["muted"],
         "markdown.item":        p["fg"],
+        "markdown.list":        p["blue"],
+        "markdown.item.bullet": f"bold {p['blue']}",
+        "markdown.item.number": p["blue"],
         "markdown.hr":          p["border"],
         "markdown.strong":      f"bold {p['fg']}",
         "markdown.em":          f"italic {p['fg']}",
@@ -1644,6 +1673,64 @@ class HelpScreen(ModalScreen):
         yield Static(self._content)
 
 
+class ThemePicker(ModalScreen):
+    # Live-preview theme picker: highlight applies the theme so the rest of the
+    # UI repaints behind the modal; Enter commits + persists, Esc reverts.
+    CSS = """
+    ThemePicker { align: center middle; }
+    ThemePicker > OptionList {
+        width: 36;
+        max-height: 80%;
+        background: $ga-alt-bg;
+        border: solid $ga-border;
+        padding: 0 1;
+        color: $ga-fg;
+    }
+    ThemePicker > OptionList > .option-list--option-highlighted {
+        background: $ga-sel-bg;
+        color: $ga-fg;
+    }
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("enter",  "commit", "Apply",  show=False),
+    ]
+
+    def __init__(self, themes: list[str], current: str) -> None:
+        super().__init__()
+        self._themes = themes
+        self._initial = current
+
+    def compose(self) -> ComposeResult:
+        ol = OptionList(*self._themes, id="theme-picker")
+        yield ol
+
+    def on_mount(self) -> None:
+        ol = self.query_one(OptionList)
+        try:
+            ol.highlighted = self._themes.index(self._initial)
+        except ValueError:
+            ol.highlighted = 0
+        ol.focus()
+
+    def on_option_list_option_highlighted(self, ev) -> None:
+        name = self._themes[ev.option_index]
+        if self.app.theme != name:
+            self.app.theme = name
+
+    def on_option_list_option_selected(self, ev) -> None:
+        self.action_commit()
+
+    def action_commit(self) -> None:
+        _save_settings({"theme": self.app.theme})
+        self.dismiss()
+
+    def action_cancel(self) -> None:
+        if self.app.theme != self._initial:
+            self.app.theme = self._initial
+        self.dismiss()
+
+
 class GenericAgentTUI(App[None]):
 
     CSS = _MAIN_CSS
@@ -1669,7 +1756,7 @@ class GenericAgentTUI(App[None]):
         Binding("cmd+/",      "show_help", "Help", show=False),
         Binding("escape",     "escape",        "Close", show=False),
         Binding("tab",        "complete_command", "Complete", show=False, priority=True),
-        Binding("ctrl+t",     "cycle_theme",   "Theme", show=False),
+        Binding("ctrl+t",     "pick_theme",    "Theme", show=False),
     ]
 
     def __init__(self, agent_factory: Optional[AgentFactory] = None) -> None:
@@ -1702,7 +1789,8 @@ class GenericAgentTUI(App[None]):
             foreground=p["fg"],
             primary=p["green"], secondary=p["blue"], accent=p["purple"],
         ))
-        self.theme = "ga-default"
+        saved = _load_settings().get("theme")
+        self.theme = saved if saved in _THEME_CYCLE else "ga-default"
         self._spinner_frame: int = 0
         self._spinner_timer = None
         self._handlers: dict = {
@@ -2067,10 +2155,10 @@ class GenericAgentTUI(App[None]):
         else:
             self.push_screen(HelpScreen(self._render_help()))
 
-    def action_cycle_theme(self) -> None:
-        cur = self.theme or "ga-default"
-        idx = _THEME_CYCLE.index(cur) if cur in _THEME_CYCLE else -1
-        self.theme = _THEME_CYCLE[(idx + 1) % len(_THEME_CYCLE)]
+    def action_pick_theme(self) -> None:
+        if isinstance(self.screen, ThemePicker):
+            return
+        self.push_screen(ThemePicker(list(_THEME_CYCLE), self.theme or "ga-default"))
 
     def _resolve_palette(self) -> dict[str, str]:
         theme = self.current_theme
