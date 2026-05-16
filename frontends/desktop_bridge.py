@@ -26,35 +26,17 @@ WS API:
 """
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import importlib
-import json
-import os
-import sys
-import threading
-import time
-import traceback
-import uuid
+import asyncio, contextlib, importlib, json, os, sys
+import threading, time, traceback, uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
-
 from aiohttp import web, WSMsgType
 
 APP_DIR = Path(__file__).resolve().parent
 
 
 def find_default_ga_root() -> Path:
-    """Find GenericAgent root near this bridge.
-
-    Probe, in order:
-      ../
-      ../../
-      ../GenericAgent
-      ../../GenericAgent
-    and return the first directory containing agentmain.py.
-    """
     candidates = [
         APP_DIR / "..",
         APP_DIR / ".." / "..",
