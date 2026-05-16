@@ -7,7 +7,7 @@ Two audiences:
 - **[For Humans](#for-humans)** — you are installing GA for yourself.
 - **[For LLM Agents](#for-llm-agents)** — you are a coding agent such as Claude Code, or Codex installing GA for a human user. Read that section first so you do not guess.
 
-> The shortest install commands live in the main [README](README.md#-quick-start). This guide adds platform notes, key setup, verification, troubleshooting, and agent-safe rules.
+> The shortest install commands live in the main [README](../README.md#-quick-start). This guide adds platform notes, key setup, verification, troubleshooting, and agent-safe rules.
 
 ---
 
@@ -204,7 +204,7 @@ If `git pull` reports conflicts:
 > **IMPORTANT: fetch this file with `curl`, not a summarized web reader.** Summaries often drop flags, command quoting, and safety rules.
 >
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/lsdefine/GenericAgent/refs/heads/main/installation.md
+> curl -fsSL https://raw.githubusercontent.com/lsdefine/GenericAgent/refs/heads/main/docs/installation.md
 > ```
 
 You are installing **GenericAgent** for a human user. Be direct, verify each step, and avoid destructive cleanup unless the user explicitly authorizes it.
@@ -317,7 +317,7 @@ Only open or run anything related to starring the repository if the user explici
 
 ## References
 
-- Main README: [README.md](README.md)
+- Main README: [README.md](../README.md)
 - Getting started: [GETTING_STARTED.md](GETTING_STARTED.md)
 - Datawhale tutorial: <https://datawhalechina.github.io/hello-generic-agent/>
 - Technical report: <https://arxiv.org/abs/2604.17091>

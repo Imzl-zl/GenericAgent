@@ -7,7 +7,7 @@
 - **[面向用户（For Humans）](#面向用户-for-humans)** —— 你自己安装 GA。
 - **[面向 LLM Agent（For LLM Agents）](#面向-llm-agent-for-llm-agents)** —— 你是 Claude Code、Codex 等编程 Agent，需要替人类用户安装 GA。请先读这一段，避免靠猜。
 
-> 最短安装命令见主 [README](README.md#-快速开始)。这份文档补充平台差异、Key 配置、验证、排障，以及 Agent 自动安装时的安全规则。
+> 最短安装命令见主 [README](../README.md#-快速开始)。这份文档补充平台差异、Key 配置、验证、排障，以及 Agent 自动安装时的安全规则。
 
 ---
 
@@ -317,7 +317,7 @@ python frontends/tuiapp_v2.py
 
 ## 参考资料
 
-- 主 README：[README.md](README.md)
+- 主 README：[README.md](../README.md)
 - Getting Started：[GETTING_STARTED.md](GETTING_STARTED.md)
 - Datawhale 教程：<https://datawhalechina.github.io/hello-generic-agent/>
 - 技术报告：<https://arxiv.org/abs/2604.17091>
