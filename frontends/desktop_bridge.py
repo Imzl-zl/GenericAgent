@@ -173,9 +173,9 @@ class AgentManager:
                 raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
             if self.active_session_id == sid:
                 self.active_session_id = next(iter(self.sessions), None)
-            if sess.agent and hasattr(sess.agent, "cancel"):
+            if sess.agent and hasattr(sess.agent, "abort"):
                 with contextlib.suppress(Exception):
-                    sess.agent.cancel()
+                    sess.agent.abort()
         emit_session_state(sess, "closed")
         return {"ok": True, "sessionId": sid}
 
@@ -237,6 +237,10 @@ class AgentManager:
                 full = "GenericAgent object has no put_task/run method"
             if not full:
                 full = "(completed)"
+            if sess.cancel_requested:
+                with self.lock:
+                    sess.partial = None
+                return
             with self.lock:
                 sess.partial = None
                 # Strip trailing [Info] Final response to user. marker
@@ -280,9 +284,9 @@ class AgentManager:
             if not sess:
                 raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
             sess.cancel_requested = True
-            if sess.agent and hasattr(sess.agent, "cancel"):
+            if sess.agent and hasattr(sess.agent, "abort"):
                 with contextlib.suppress(Exception):
-                    sess.agent.cancel()
+                    sess.agent.abort()
             sess.status = "cancelled"
             sess.partial = None
             sess.updated_at = time.time()
