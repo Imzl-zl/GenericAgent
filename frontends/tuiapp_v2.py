@@ -1616,8 +1616,10 @@ def render_sidebar(sessions: dict[int, AgentSession], current_id: Optional[int])
     def spacer(style):
         sess_tbl.add_row(blank, blank, blank, blank, blank, style=style)
     def preview(label, txt, style):
+        # C_DIM blends bg/fg at 0.35 — under SEL_BG on the active row the contrast
+        # collapses (e.g. tokyo-night). C_MUTED (0.55 blend) stays readable in both.
         sess_tbl.add_row(blank, blank,
-                         Text(f"{label}: {txt}", style=C_DIM, no_wrap=True, overflow="ellipsis"),
+                         Text(f"{label}: {txt}", style=C_MUTED, no_wrap=True, overflow="ellipsis"),
                          blank, blank, style=style)
     for sid, sess in sessions.items():
         active = sid == current_id
@@ -2211,7 +2213,6 @@ class GenericAgentTUI(App[None]):
             self._refresh_topbar()
             self._refresh_sidebar()
             self._refresh_bottombar()
-            self._system(f"主题: {theme.name}")
         except Exception:
             pass
 
