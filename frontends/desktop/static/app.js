@@ -1784,8 +1784,14 @@ inputEl.addEventListener('input', () => {
   updateSendButton();
 });
 
+// IME composition fix - triple guard for CJK input methods (macOS especially)
+let _imeComposing = false;
+inputEl.addEventListener('compositionstart', () => { _imeComposing = true; });
+inputEl.addEventListener('compositionend', () => { _imeComposing = false; });
+
 inputEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.isComposing || _imeComposing || e.keyCode === 229) return; // IME active, ignore
     e.preventDefault();
     submitInput();
   } else if (e.key === 'Escape' && getActiveSessionRuntime()?.busy) {

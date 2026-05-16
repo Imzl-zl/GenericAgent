@@ -4,6 +4,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use std::thread;
 use std::path::PathBuf;
+use tauri::Manager;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -134,6 +135,12 @@ pub fn run() {
     ensure_bridge_running();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Focus existing window when a second instance is launched
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_focus();
+            }
+        }))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
