@@ -1,5 +1,5 @@
 [package]
-name = "tauri-hello"
+name = "ga-desktop"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,9 +8,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [lib]
-name = "tauri_hello_lib"
+name = "ga_desktop_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
