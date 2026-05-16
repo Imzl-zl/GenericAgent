@@ -92,6 +92,10 @@ _ANSI_CONTROL_RE = re.compile(
     r"|\x1b[=>]"
 )
 
+# Strip SGR-only codes — used when we need plain text for downstream parsing
+# (e.g. mapping narrow rendered output to source positions for selection).
+_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 # Strip the leading `**LLM Running (Turn N) ...**` marker that agent_loop yields per turn.
 # fold_turns still needs the marker in source content to split turns, so we only strip at
 # render time. Applies to the live (last) text segment, since folded turns don't include it.
@@ -362,6 +366,147 @@ def _install_cjk_wrap() -> None:
 
 
 _install_cjk_wrap()
+
+
+# Markdown render result that supports clean copy. We render twice: once at the
+# display width (wraps to ANSI for selectability) and once at a wide width (one
+# logical line per block, no wrap newlines). The narrow render goes into the
+# Text widget for display; the wide render becomes the "source" string that
+# get_selection extracts from, with per-visual-line offsets mapping cursor
+# positions back into source — wrap continuations skip the wide-side whitespace
+# eaten at the break, and hanging indent on wrap lines maps to the same source
+# position as the start of the wrapped content.
+@dataclass
+class _MdRender:
+    text: Text
+    source: str
+    line_starts: list  # source offset for the content start of each visual line
+    line_indents: list  # leading whitespace count to skip when mapping x
+    line_lengths: list  # total length of each visual line (incl. indent)
+
+
+_CENTER_LEAD_MIN = 4
+
+
+def _align_md_renders(narrow_raw: str, wide_raw: str):
+    """Walk narrow + wide line-by-line; return (source, line_starts, line_indents, line_lengths)."""
+    narrow = [l.rstrip() for l in narrow_raw.split("\n")]
+    wide = [l.rstrip() for l in wide_raw.split("\n")]
+
+    wrap_groups: list = []
+    ni = 0
+    wi = 0
+    while ni < len(narrow):
+        if narrow[ni] == "":
+            ni += 1
+            while wi < len(wide) and wide[wi] == "":
+                wi += 1
+            continue
+        run_start = ni
+        while ni < len(narrow) and narrow[ni] != "":
+            ni += 1
+        run_lines = narrow[run_start:ni]
+
+        wide_start = wi
+        while wi < len(wide) and wide[wi] != "":
+            wi += 1
+        wide_lines = wide[wide_start:wi]
+
+        K, W = len(run_lines), len(wide_lines)
+        if W == 0:
+            for k in range(K):
+                wrap_groups.append(((run_start + k, run_start + k + 1), run_lines[k]))
+        elif K == W:
+            for k in range(K):
+                wrap_groups.append(((run_start + k, run_start + k + 1), wide_lines[k]))
+        else:
+            j = 0
+            for w_idx, w_line in enumerate(wide_lines):
+                g_start = run_start + j
+                accumulated = 0
+                target = len(w_line)
+                is_last = (w_idx == W - 1)
+                while j < K and (accumulated < target or is_last):
+                    nt = run_lines[j]
+                    content = nt.lstrip() if j > g_start - run_start else nt
+                    accumulated += len(content)
+                    j += 1
+                    if not is_last and accumulated >= target:
+                        break
+                wrap_groups.append(((g_start, run_start + j), w_line))
+
+    source_parts: list = []
+    line_starts = [0] * len(narrow)
+    line_indents = [0] * len(narrow)
+    line_lengths = [len(nt) for nt in narrow]
+    src_pos = 0
+    last_was_content = False
+    group_idx = 0
+
+    ni = 0
+    while ni < len(narrow):
+        if narrow[ni] == "":
+            line_starts[ni] = src_pos
+            if last_was_content:
+                source_parts.append("\n")
+                src_pos += 1
+            source_parts.append("\n")
+            src_pos += 1
+            last_was_content = False
+            ni += 1
+            continue
+
+        while group_idx < len(wrap_groups) and ni >= wrap_groups[group_idx][0][1]:
+            group_idx += 1
+        if group_idx >= len(wrap_groups):
+            line_starts[ni] = src_pos
+            source_parts.append(narrow[ni])
+            src_pos += len(narrow[ni])
+            ni += 1
+            last_was_content = True
+            continue
+
+        (g_start, g_end), wide_line = wrap_groups[group_idx]
+        single_line = (g_end - g_start == 1)
+
+        nt0 = narrow[g_start]
+        nt0_lead = len(nt0) - len(nt0.lstrip())
+        wide_lead = len(wide_line) - len(wide_line.lstrip())
+        is_centered = (single_line and wide_lead > _CENTER_LEAD_MIN and nt0_lead > 0)
+
+        if last_was_content:
+            source_parts.append("\n")
+            src_pos += 1
+
+        if is_centered:
+            content = wide_line.lstrip()
+            source_parts.append(content)
+            line_starts[g_start] = src_pos
+            line_indents[g_start] = nt0_lead
+            src_pos += len(content)
+        else:
+            block_start = src_pos
+            source_parts.append(wide_line)
+            src_pos += len(wide_line)
+            pointer = 0
+            for k in range(g_start, g_end):
+                nt = narrow[k]
+                if k == g_start:
+                    content = nt
+                    indent = 0
+                else:
+                    indent = len(nt) - len(nt.lstrip())
+                    content = nt.lstrip()
+                    while pointer < len(wide_line) and wide_line[pointer].isspace():
+                        pointer += 1
+                line_starts[k] = block_start + pointer
+                line_indents[k] = indent
+                pointer += len(content)
+        ni = g_end
+        last_was_content = True
+
+    return "".join(source_parts).rstrip("\n"), line_starts, line_indents, line_lengths
+
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
@@ -782,6 +927,9 @@ class MultiChoiceList(SelectionList):
 class SelectableStatic(Static):
     # Widget.get_selection returns None for non-Text/Content visuals; fall back to render_line.
     def get_selection(self, selection):
+        render = getattr(self, "_ga_render", None)
+        if render is not None:
+            return _extract_md_render(render, selection), "\n"
         result = super().get_selection(selection)
         if result is not None:
             return result
@@ -799,6 +947,37 @@ class SelectableStatic(Static):
         if not lines:
             return None
         return selection.extract("\n".join(lines)), "\n"
+
+
+def _extract_md_render(render, selection) -> str:
+    starts = render.line_starts
+    indents = render.line_indents
+    lens = render.line_lengths
+    n = len(starts)
+    if n == 0:
+        return ""
+
+    if selection.start is None:
+        s_y, s_x = 0, 0
+    else:
+        s_y, s_x = selection.start.y, selection.start.x
+    if selection.end is None:
+        e_y, e_x = n - 1, lens[n - 1]
+    else:
+        e_y, e_x = selection.end.y, selection.end.x
+
+    s_y = max(0, min(s_y, n - 1))
+    e_y = max(0, min(e_y, n - 1))
+
+    def col(y, x):
+        ind = indents[y]
+        total = lens[y]
+        content_len = max(0, total - ind)
+        if x <= ind:
+            return 0
+        return min(x - ind, content_len)
+
+    return render.source[starts[s_y] + col(s_y, s_x): starts[e_y] + col(e_y, e_x)]
 
 
 class FoldHeader(SelectableStatic):
@@ -3195,34 +3374,39 @@ class GenericAgentTUI(App[None]):
     def _render_md(self, text: str, width: int):
         # Markdown via RichVisual loses segment.style.meta["offset"] so mouse selection
         # can't anchor; round-trip through ANSI → Text.from_ansi to restore selectability.
+        # A parallel wide render builds a wrap-free "source" string that
+        # SelectableStatic.get_selection uses, so copy never includes wrap newlines.
         try:
-            # Plan-mode / task-list polish: swap commonmark task-list source for
-            # unicode symbols before Markdown sees it. ☐/✔ are base-BMP and
-            # render on every terminal we target.
             text = _TASKLIST_OPEN_RE.sub(r"\1☐ ", text)
             text = _TASKLIST_DONE_RE.sub(r"\1✔ ", text)
-            # Tool-use envelopes get replaced wholesale — see _render_tool_use_block.
             text = _TOOL_USE_RE.sub(_render_tool_use_block, text)
-            # Drop agent-internal metadata before Markdown sees it (see _META_TAG_RE).
             text = _META_TAG_RE.sub("", text)
             from io import StringIO
             from rich.console import Console
-            # Render one column narrower so Rich horizontal rules don't wrap.
             render_w = max(1, width - 1)
             buf = StringIO()
             Console(file=buf, width=render_w, force_terminal=True,
                     color_system="truecolor", legacy_windows=False,
                     theme=_markdown_rich_theme(_palette)
                     ).print(HardBreakMarkdown(text), end="")
-            t = Text.from_ansi(buf.getvalue().rstrip("\n"))
-            # Completed task lines fade to muted gray so the eye lands on
-            # outstanding work. Done first so the green tick re-overrides next.
+            narrow_raw = buf.getvalue().rstrip("\n")
+            t = Text.from_ansi(narrow_raw)
             t.highlight_regex(r"✔[^\n]*", style=C_DIM)
             t.highlight_regex(r"☐", style=C_DIM)
             t.highlight_regex(r"✔", style=C_GREEN)
-            return t
+
+            wide_buf = StringIO()
+            Console(file=wide_buf, width=10000, force_terminal=False,
+                    legacy_windows=False).print(HardBreakMarkdown(text), end="")
+            wide_raw = wide_buf.getvalue().rstrip("\n")
+            narrow_plain = _ANSI_SGR_RE.sub("", narrow_raw)
+            source, starts, indents, lens = _align_md_renders(narrow_plain, wide_raw)
+            return _MdRender(text=t, source=source, line_starts=starts,
+                             line_indents=indents, line_lengths=lens)
         except Exception:
-            return Text(text, style=C_FG)
+            fallback = Text(text, style=C_FG)
+            return _MdRender(text=fallback, source=text,
+                             line_starts=[0], line_indents=[0], line_lengths=[len(text)])
 
     def _assistant_segments(self, m: ChatMessage, width: int) -> list[tuple]:
         """Return [(kind, body, fold_idx_or_None)]. kind ∈ {'text','fold-header','fold-body'}.
@@ -3244,7 +3428,7 @@ class GenericAgentTUI(App[None]):
         if m._seg_render_cache and any(k[1] != width for k in m._seg_render_cache):
             m._seg_render_cache.clear()
 
-        def cached_render(content: str) -> Text:
+        def cached_render(content: str) -> "_MdRender":
             k = (hash(content), width)
             v = m._seg_render_cache.get(k)
             if v is None:
@@ -3435,7 +3619,11 @@ class GenericAgentTUI(App[None]):
             if kind == "fold-header":
                 w = FoldHeader(body, m, fold_idx, classes="msg fold-header")
             else:
-                w = SelectableStatic(body, classes="msg")
+                if isinstance(body, _MdRender):
+                    w = SelectableStatic(body.text, classes="msg")
+                    w._ga_render = body
+                else:
+                    w = SelectableStatic(body, classes="msg")
             if anchor is None:
                 container.mount(w)
             else:
@@ -3479,7 +3667,13 @@ class GenericAgentTUI(App[None]):
             cleaned = _ANSI_CONTROL_RE.sub("", raw)
             last_seg = fold_turns(cleaned)[-1]
             last_text = _TURN_MARKER_RE.sub("", last_seg.get("content", ""), count=1)
-            m._segment_widgets[-1].update(self._render_md(last_text, width))
+            rendered = self._render_md(last_text, width)
+            last_widget = m._segment_widgets[-1]
+            if isinstance(rendered, _MdRender):
+                last_widget._ga_render = rendered
+                last_widget.update(rendered.text)
+            else:
+                last_widget.update(rendered)
             if m.done and m._spinner_widget is not None:
                 try: m._spinner_widget.remove()
                 except Exception: pass
