@@ -280,89 +280,156 @@ class HardBreakMarkdown(Markdown):
                 HardBreakMarkdown._soft_to_hard(tok.children)
 
 
-# Rich's default divide_line treats a CJK run as one indivisible word and bumps
-# it whole to the next line when it doesn't fit the remaining space, wasting
-# the tail of the current line and producing wraps like "AI ↩ 助手...". Patch
-# both module bindings so Text.wrap (used by Markdown) sees CJK as breakable.
-_CJK_WRAP_RE = re.compile(r"[　-鿿가-힯＀-￯]")
+# Rich/Textual wrap treats a continuous CJK run as one indivisible word and
+# bumps it whole to the next line when it doesn't fit the remaining space,
+# leaving the line tail padded and producing wraps like "AI ↩ 助手...". We patch
+# every binding of divide_line/compute_wrap_offsets so CJK-bearing chunks pack
+# leading chars into the remainder then fold the rest at full width.
+# Covers CJK Unified Ideographs, Hangul Syllables, fullwidth/halfwidth forms.
+_CJK_WRAP_RE = re.compile(
+    r"[　-鿿"   # CJK punctuation through Unified Ideographs
+    r"가-힯"    # Hangul Syllables
+    r"＀-￯]"   # Halfwidth / Fullwidth Forms
+)
+
+
+def _fold_chunk_cells(chunk, width, char_width_fn, line_offset=0):
+    """Walk chunk char-by-char; return (breaks_relative_to_chunk, final_offset).
+
+    A break at index i means a newline lands before chunk[i]. line_offset is the
+    column where chunk[0] starts. char_width_fn must be called in order — it may
+    carry state (e.g. tab section index).
+    """
+    breaks: list[int] = []
+    for i, ch in enumerate(chunk):
+        cw = char_width_fn(ch)
+        if line_offset > 0 and line_offset + cw > width:
+            breaks.append(i)
+            line_offset = cw
+        else:
+            line_offset += cw
+    return breaks, line_offset
 
 
 def _cjk_divide_line(text: str, width: int, fold: bool = True) -> list[int]:
-    from rich._wrap import words as _rich_words
-    from rich.cells import cell_len as _clen, chop_cells as _chop
+    from rich._wrap import words as _words
+    from rich.cells import cell_len as _clen
 
-    break_positions: list[int] = []
+    breaks: list[int] = []
     cell_offset = 0
-    for start, _end, word in _rich_words(text):
+    for start, _end, word in _words(text):
         word_length = _clen(word.rstrip())
-        remaining = width - cell_offset
-        if remaining >= word_length:
+        if width - cell_offset >= word_length:
             cell_offset += _clen(word)
             continue
         if not fold:
             if cell_offset:
-                break_positions.append(start)
+                breaks.append(start)
             cell_offset = _clen(word)
             continue
 
-        if _CJK_WRAP_RE.search(word):
-            # Pack as many leading chars as fit in remaining space, then fold rest.
-            prefix_chars = 0
-            if cell_offset > 0 and remaining > 0:
-                accum = 0
-                for i, ch in enumerate(word):
-                    cw = _clen(ch)
-                    if accum + cw > remaining:
-                        break
-                    accum += cw
-                    prefix_chars = i + 1
-            if prefix_chars > 0:
-                break_positions.append(start + prefix_chars)
-                rest = word[prefix_chars:]
-                cursor = start + prefix_chars
-            else:
-                if cell_offset:
-                    break_positions.append(start)
-                rest = word
-                cursor = start
-            if _clen(rest) > width:
-                chunks = _chop(rest, width)
-                for i in range(len(chunks) - 1):
-                    cursor += len(chunks[i])
-                    break_positions.append(cursor)
-                cell_offset = _clen(chunks[-1].rstrip())
-            else:
-                cell_offset = _clen(rest.rstrip())
+        has_cjk = bool(_CJK_WRAP_RE.search(word))
+        if not has_cjk and word_length <= width:
+            if cell_offset:
+                breaks.append(start)
+            cell_offset = _clen(word)
             continue
 
-        # Non-CJK: keep stock behavior.
-        if word_length > width:
-            folded_word = _chop(word, width=width)
-            cursor = start
-            for i, line in enumerate(folded_word):
-                if cursor != 0 or i > 0:
-                    break_positions.append(cursor)
-                if i < len(folded_word) - 1:
-                    cursor += len(line)
-            cell_offset = _clen(folded_word[-1])
-        elif cell_offset and start:
-            break_positions.append(start)
-            cell_offset = _clen(word)
-    return break_positions
+        if has_cjk:
+            line_offset = cell_offset
+        else:
+            if cell_offset:
+                breaks.append(start)
+            line_offset = 0
+        sub_breaks, cell_offset = _fold_chunk_cells(
+            word, width, _clen, line_offset
+        )
+        breaks.extend(start + b for b in sub_breaks)
+    return breaks
+
+
+def _cjk_compute_wrap_offsets(text, width, tab_size, fold=True,
+                              precomputed_tab_sections=None):
+    from rich.cells import get_character_cell_size
+    from textual._cells import cell_len as _clen
+    from textual._loop import loop_last
+    from textual.expand_tabs import get_tab_widths
+
+    tab_size = min(tab_size, width)
+    tab_sections = precomputed_tab_sections or get_tab_widths(text, tab_size)
+
+    cumulative_widths: list[int] = []
+    cumulative_width = 0
+    for last, (tab_section, tab_width) in loop_last(tab_sections):
+        cumulative_widths.extend([cumulative_width] * (len(tab_section) + int(bool(tab_width))))
+        cumulative_width += tab_width
+        if last:
+            cumulative_widths.append(cumulative_width)
+
+    tab_idx = [0]
+    def char_width(ch):
+        if ch == "\t":
+            cw = tab_sections[tab_idx[0]][1]
+            tab_idx[0] += 1
+            return cw
+        return get_character_cell_size(ch)
+
+    breaks: list[int] = []
+    cell_offset = 0
+    pos = 0
+    chunk_re = re.compile(r"\S+\s*|\s+")
+    while pos < len(text):
+        m = chunk_re.match(text, pos)
+        if m is None:
+            break
+        start, end = m.span()
+        chunk = m.group(0)
+        pos = end
+        chunk_width = _clen(chunk) + (cumulative_widths[end] - cumulative_widths[start])
+
+        if width - cell_offset >= chunk_width:
+            cell_offset += chunk_width
+            continue
+        if not fold:
+            if cell_offset:
+                breaks.append(start)
+            cell_offset = chunk_width
+            continue
+
+        has_cjk = bool(_CJK_WRAP_RE.search(chunk))
+        if not has_cjk and chunk_width <= width:
+            if cell_offset:
+                breaks.append(start)
+            cell_offset = chunk_width
+            continue
+
+        if has_cjk:
+            line_offset = cell_offset
+        else:
+            if cell_offset:
+                breaks.append(start)
+            line_offset = 0
+        sub_breaks, cell_offset = _fold_chunk_cells(chunk, width, char_width, line_offset)
+        breaks.extend(start + b for b in sub_breaks)
+    return breaks
 
 
 def _install_cjk_wrap() -> None:
-    # `from rich._wrap import divide_line` in textual.content / rich.text creates
-    # a binding copy that survives our rebind on rich._wrap — patch each holder.
+    # `from X import fn` copies the binding into the importer's namespace, so a
+    # rebind on the source module misses every holder. Patch each one explicitly.
     import rich._wrap as _rw
     import rich.text as _rt
     import textual.content as _tc
-    if getattr(_rw.divide_line, "_cjk_patched", False):
+    import textual._wrap as _tw
+    import textual.document._wrapped_document as _twd
+    if getattr(_cjk_divide_line, "_cjk_patched", False):
         return
     _cjk_divide_line._cjk_patched = True
     _rw.divide_line = _cjk_divide_line
     _rt.divide_line = _cjk_divide_line
     _tc.divide_line = _cjk_divide_line
+    _tw.compute_wrap_offsets = _cjk_compute_wrap_offsets
+    _twd.compute_wrap_offsets = _cjk_compute_wrap_offsets
 
 
 _install_cjk_wrap()
