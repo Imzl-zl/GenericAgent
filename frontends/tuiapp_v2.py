@@ -669,29 +669,36 @@ def _mix(a: str, b: str, t: float) -> str:
     return _rgb_hex(tuple(ra[i] * (1 - t) + rb[i] * t for i in range(3)))
 
 
-def _markdown_rich_theme(p: dict[str, str], colored: bool = True):
-    """Map our palette to Rich Markdown's named styles. With `colored=False`,
-    drop every hue and keep only structural emphasis (bold/italic/underline/
-    code-block backdrop) — non-ga-default themes route here while we tune
-    proper per-theme accents."""
+def _markdown_rich_theme(p: dict[str, str], minimal: bool = False):
+    """Map our palette to Rich Markdown's named styles so code/links/headings
+    follow the active theme instead of Rich's frozen defaults.
+
+    `minimal=True` collapses everything to fg/muted so non-default themes don't
+    fight Rich's frozen accent colors — each theme can be re-colorised case by
+    case later."""
     from rich.theme import Theme as _RichTheme
-    if not colored:
+    if minimal:
+        fg, muted, dim, border = p["fg"], p["muted"], p["dim"], p["border"]
         return _RichTheme({
-            "markdown.h1":          "bold", "markdown.h2": "bold", "markdown.h3": "bold",
-            "markdown.h4":          "bold", "markdown.h5": "bold", "markdown.h6": "bold",
-            "markdown.code":        f"on {p['sel_bg']}",
-            "markdown.code_block":  f"on {p['sel_bg']}",
-            "markdown.link":        "underline",
-            "markdown.link_url":    "underline",
-            "markdown.block_quote": "italic",
-            "markdown.item":        "",
-            "markdown.list":        "",
-            "markdown.item.bullet": "bold",
-            "markdown.item.number": "",
-            "markdown.hr":          "",
-            "markdown.strong":      "bold",
-            "markdown.em":          "italic",
-            "markdown.s":           "strike",
+            "markdown.h1":          f"bold {fg}",
+            "markdown.h2":          f"bold {fg}",
+            "markdown.h3":          f"bold {fg}",
+            "markdown.h4":          f"bold {fg}",
+            "markdown.h5":          f"bold {fg}",
+            "markdown.h6":          f"bold {fg}",
+            "markdown.code":        f"bold {fg}",
+            "markdown.code_block":  fg,
+            "markdown.link":        f"underline {fg}",
+            "markdown.link_url":    f"underline {dim}",
+            "markdown.block_quote": muted,
+            "markdown.item":        fg,
+            "markdown.list":        fg,
+            "markdown.item.bullet": f"bold {fg}",
+            "markdown.item.number": fg,
+            "markdown.hr":          border,
+            "markdown.strong":      f"bold {fg}",
+            "markdown.em":          f"italic {fg}",
+            "markdown.s":           f"strike {dim}",
         })
     return _RichTheme({
         "markdown.h1":          f"bold {p['green']}",
@@ -700,7 +707,7 @@ def _markdown_rich_theme(p: dict[str, str], colored: bool = True):
         "markdown.h4":          f"bold {p['fg']}",
         "markdown.h5":          f"bold {p['fg']}",
         "markdown.h6":          f"bold {p['fg']}",
-        "markdown.code":        f"{p['purple']} on {p['sel_bg']}",
+        "markdown.code":        f"bold {p['fg']}",
         "markdown.code_block":  f"{p['fg']} on {p['sel_bg']}",
         "markdown.link":        p["blue"],
         "markdown.link_url":    f"underline {p['dim']}",
@@ -2217,19 +2224,19 @@ class GenericAgentTUI(App[None]):
         # point sessions is empty and the DOM isn't composed yet. Skip the rebuild.
         if not self.is_mounted or self.current_id is None:
             return
-        # Long histories make a full remount slow because every assistant turn
-        # re-parses Markdown. Instead: just invalidate render caches so any future
-        # reflow (fold toggle, resize, new message, remount on session switch)
-        # picks up new theme colors. Already-mounted message text stays in old
-        # palette until naturally touched — acceptable since chrome + future turns
-        # are repainted immediately by Textual CSS vars.
+        # Cached Rich Text / Markdown captured the old hex values; force a remount.
         for s in self.sessions.values():
             for m in s.messages:
                 m._cache_key = None
                 m._cached_body = None
-                if hasattr(m, "_seg_render_cache"):
-                    m._seg_render_cache.clear()
+                m._segment_widgets = []
+                m._segment_sig = ()
+                m._role_widget = None
+                m._body_widget = None
+                m._hint_widget = None
+                m._spinner_widget = None
         try:
+            self._remount_current_session()
             self._refresh_topbar()
             self._refresh_sidebar()
             self._refresh_bottombar()
@@ -3561,10 +3568,9 @@ class GenericAgentTUI(App[None]):
             from rich.console import Console
             render_w = max(1, width - 1)
             buf = StringIO()
-            colored = (self.theme == "ga-default")
             Console(file=buf, width=render_w, force_terminal=True,
                     color_system="truecolor", legacy_windows=False,
-                    theme=_markdown_rich_theme(_palette, colored)
+                    theme=_markdown_rich_theme(_palette, minimal=(self.theme != "ga-default"))
                     ).print(HardBreakMarkdown(text), end="")
             narrow_raw = buf.getvalue().rstrip("\n")
             t = Text.from_ansi(narrow_raw)
