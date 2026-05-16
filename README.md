@@ -78,14 +78,14 @@ After a few weeks, your agent instance will have a skill tree no one else in the
 
 > ⚠️ **Python version:** use **Python 3.11 or 3.12**. **Do not** use Python 3.14 — it is incompatible with `pywebview` and a few other GA dependencies.
 
-> 📖 Detailed installation guide: **[installation.md](installation.md)** · **[installation_zh.md（中文）](installation_zh.md)**
+> 📖 Detailed installation guide: **[installation.md](docs/installation.md)** · **[installation_zh.md（中文）](docs/installation_zh.md)**
 
 ### For LLM Agents
 
 Fetch the installation guide and follow it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lsdefine/GenericAgent/refs/heads/main/installation.md
+curl -fsSL https://raw.githubusercontent.com/lsdefine/GenericAgent/refs/heads/main/docs/installation.md
 ```
 
 ### For Humans
@@ -125,7 +125,7 @@ python launch.pyw
 
 > GenericAgent is meant to grow its environment through the Agent itself, not by pre-installing every possible package.
 
-Full guide: [GETTING_STARTED.md](GETTING_STARTED.md)
+Full guide: [GETTING_STARTED.md](docs/GETTING_STARTED.md)
 
 ---
 
@@ -369,14 +369,14 @@ MIT License — see [LICENSE](LICENSE)
 
 > ⚠️ **Python 版本：** 推荐使用 **Python 3.11 或 3.12**。**请不要使用 Python 3.14**，与 `pywebview` 及部分依赖不兼容。
 
-> 📖 详细安装指南：**[installation_zh.md（中文）](installation_zh.md)** · **[installation.md (English)](installation.md)**
+> 📖 详细安装指南：**[installation_zh.md（中文）](docs/installation_zh.md)** · **[installation.md (English)](docs/installation.md)**
 
 ### 给 LLM Agent 看的
 
 获取安装指南并照做：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lsdefine/GenericAgent/refs/heads/main/installation_zh.md
+curl -fsSL https://raw.githubusercontent.com/lsdefine/GenericAgent/refs/heads/main/docs/installation_zh.md
 ```
 
 ### 给人类用户看的
@@ -416,7 +416,7 @@ python launch.pyw
 
 > GenericAgent 更推荐由 Agent 在使用中自举环境，而不是预先手动装完整依赖。
 
-完整引导流程见 [GETTING_STARTED.md](GETTING_STARTED.md)。
+完整引导流程见 [GETTING_STARTED.md](docs/GETTING_STARTED.md)。
 
 📖 新手使用指南（图文版）：[飞书文档](https://my.feishu.cn/wiki/CGrDw0T76iNFuskmwxdcWrpinPb)
 
