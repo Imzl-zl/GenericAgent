@@ -233,15 +233,29 @@ def handle(agent, query, display_queue):
     return query
 
 
+_INJECT_MARKERS = ('### [WORKING MEMORY]', '[SYSTEM TIPS]', '[SYSTEM]', '[System]',
+                   '[DANGER]', '### [总结提炼经验]')
+
+
 def _user_text(prompt_body):
-    """User-typed text from a prompt JSON; '' if this is an agent auto-continuation."""
+    """User-typed text from a prompt JSON; '' if this is an agent auto-continuation.
+
+    A Prompt is auto-continue when *either* (a) it carries any tool_result block
+    (so it's the next round of an in-flight LLM call), or (b) its text blocks all
+    match known injection prefixes ([WORKING MEMORY], [SYSTEM TIPS], [System]
+    regenerate prompts, [DANGER] guards, etc.). Real first-prompts only contain
+    one plain text block with no injection markers.
+    """
     try: msg = json.loads(prompt_body)
     except Exception: return ''
     if not isinstance(msg, dict): return ''
-    for blk in msg.get('content', []) or []:
+    blocks = msg.get('content', []) or []
+    if any(isinstance(b, dict) and b.get('type') == 'tool_result' for b in blocks):
+        return ''
+    for blk in blocks:
         if isinstance(blk, dict) and blk.get('type') == 'text':
             t = (blk.get('text') or '').strip()
-            if t and not t.startswith('### [WORKING MEMORY]'): return t
+            if t and not any(mk in t for mk in _INJECT_MARKERS): return t
     return ''
 
 
