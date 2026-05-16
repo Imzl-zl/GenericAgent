@@ -655,6 +655,32 @@ function setActiveSession(id) {
   renderDiagnostics();
   const runtime = getSessionRuntime(sess);
   setBusy(runtime.busy, runtime.busy ? 'Agent is responding…' : null, sess);
+  // When switching to a session that is still running, ensure the live draft
+  // is rendered immediately and polling is active (it may have been started
+  // earlier but its render calls were no-ops because the session wasn't active).
+  if (runtime.busy) {
+    const draft = runtime.assistantDraft;
+    if (draft && !draft.finalized) {
+      renderAssistantDraftInPlace(sess, draft);
+    }
+    // Restart polling if it stopped (e.g. page reload or race condition)
+    if (!runtime.polling) {
+      runtime.forcePollOnce = true;
+      pollSessionMessages(sess);
+    } else {
+      // Polling is running but was rendering as no-op while we were away.
+      // Do an immediate one-shot poll to refresh the view right now.
+      (async () => {
+        try {
+          const res = await GaBridge.pollSession(sess.bridgeSessionId || sess.id, runtime.lastPolledMessageId || 0);
+          if (res?.error) return;
+          const result = res.result || res;
+          for (const msg of (result.messages || [])) upsertPolledMessage(sess, msg, { partial: false });
+          if (result.partial) upsertPolledMessage(sess, result.partial, { partial: true });
+        } catch(e) { /* ignore, regular polling will handle it */ }
+      })();
+    }
+  }
 }
 
 function renderSessionList() {
@@ -837,6 +863,15 @@ function renderMessages() {
     messagesEl.innerHTML = '';
     messagesEl.appendChild(cached.fragment);
     _domCache.delete(state.activeId);
+    // If there's a live draft, the cached DOM is stale — re-render the draft portion
+    if (hasDraft) {
+      // Remove the stale assistant wrap (last unfinalized msg-assistant element)
+      const last = messagesEl.lastElementChild;
+      if (last?.classList?.contains('msg-assistant') && last.dataset.finalized !== '1') {
+        last.remove();
+      }
+      renderAssistantDraft(sess, runtime.assistantDraft);
+    }
     messagesEl.scrollTop = cached.scrollTop;
   } else {
     messagesEl.innerHTML = '';
@@ -953,6 +988,30 @@ function scrollToBottom(smooth = true) {
 // ACP sends method='session/update' with params.update.sessionUpdate=
 //   agent_message_chunk | agent_thought_chunk | tool_call | tool_call_update | plan | available_commands_update
 function handleNotification(msg) {
+  // Handle WS session-state notifications from the bridge backend.
+  // These have {type: "session-state", sessionId, state, status, seq, ...}
+  // and are used to kick-start polling for sessions that became active
+  // (e.g. after page reload, or when a background session starts running).
+  if (msg.type === 'session-state') {
+    const sess = findSessionByBridgeId(msg.sessionId);
+    if (!sess) return;
+    const runtime = getSessionRuntime(sess);
+    if ((msg.state === 'running' || msg.status === 'running') && !runtime.polling) {
+      runtime.busy = true;
+      runtime.forcePollOnce = true;
+      setBusy(true, 'Thinking…', sess);
+      pollSessionMessages(sess);
+    } else if (msg.state === 'idle' || msg.state === 'error' || msg.status === 'idle') {
+      // Session finished in background — do a final poll to pick up remaining messages
+      if (!runtime.polling && runtime.busy) {
+        runtime.forcePollOnce = true;
+        pollSessionMessages(sess);
+      }
+    }
+    // Update tab dot regardless
+    renderSessionList();
+    return;
+  }
   if (msg.method !== 'session/update') return;
   const update = msg.params?.update;
   if (!update) return;
@@ -1264,6 +1323,10 @@ function finalizeAssistantReply(sess) {
     wrap.dataset.taskEndedAt = String(endedAt);
     ensureAssistantTaskElapsed(wrap, wrap.dataset.taskStartedAt || runtime.taskStartedAt || draft?.taskStartedAt, endedAt);
     renderMessages();
+  } else if (!isActiveSession(sess)) {
+    // Session finished in background — its DOM cache is stale, discard it
+    // so that switching to it will do a full re-render from sess.messages
+    _domCache.delete(sess.id);
   }
   stopTaskTimer(sess);
 }
