@@ -294,6 +294,14 @@ _DEFAULT_PALETTE: dict[str, str] = {
     "bg": "#0d1117", "alt_bg": "#21262d", "sel_bg": "#161b22",
     "border": "#30363d", "border_hi": "#484f58",
     "green": "#7ec27e", "blue": "#82adcf", "purple": "#b596d8",
+    # Topbar info-segment chips — distinct hues for at-a-glance scanability.
+    # Values are from the github-dark palette; built-in Textual themes derive
+    # these from primary/secondary/warning/accent/success in get_css_variables.
+    "chip_name":   "#79c0ff",  # session name — cyan-blue
+    "chip_model":  "#a5d6ff",  # model id     — pale blue
+    "chip_effort": "#f0883e",  # effort       — amber (heat)
+    "chip_tasks":  "#d2a8ff",  # task count   — lavender
+    "chip_time":   "#56d364",  # clock        — leaf green
 }
 
 _THEME_CYCLE = ["ga-default", "nord", "gruvbox", "dracula", "tokyo-night", "textual-light"]
@@ -306,6 +314,11 @@ C_SEL_BG = _palette["sel_bg"]
 C_GREEN  = _palette["green"]
 C_BLUE   = _palette["blue"]
 C_PURPLE = _palette["purple"]
+C_CHIP_NAME   = _palette["chip_name"]
+C_CHIP_MODEL  = _palette["chip_model"]
+C_CHIP_EFFORT = _palette["chip_effort"]
+C_CHIP_TASKS  = _palette["chip_tasks"]
+C_CHIP_TIME   = _palette["chip_time"]
 
 
 def _hex_rgb(h: str) -> tuple[int, int, int]:
@@ -370,6 +383,13 @@ def _palette_from_resolved_vars(v: dict[str, str], dark: bool) -> dict[str, str]
         "green":  v.get("success") or primary,
         "blue":   v.get("secondary") or primary,
         "purple": v.get("accent") or primary,
+        # Topbar chips — five distinguishable Textual roles so each segment keeps
+        # its own hue across themes. Fall back to primary if a slot is missing.
+        "chip_name":   v.get("primary") or primary,
+        "chip_model":  v.get("secondary") or primary,
+        "chip_effort": v.get("warning") or v.get("accent") or primary,
+        "chip_tasks":  v.get("accent") or primary,
+        "chip_time":   v.get("success") or primary,
     }
 
 
@@ -510,15 +530,6 @@ ChoiceList {
 }
 #input:focus { border: none; }
 """
-
-# Topbar chip palette — each segment gets a distinct hue so the eye can scan
-# past unchanged chips and notice what just shifted. Values picked from the
-# github-dark palette so contrast stays consistent with the rest of the chrome.
-C_CHIP_NAME    = "#79c0ff"  # cyan-blue   — session name, identity-like
-C_CHIP_MODEL   = "#a5d6ff"  # pale blue   — model identifier
-C_CHIP_EFFORT  = "#f0883e"  # amber       — effort gradient (xhigh hot)
-C_CHIP_TASKS   = "#d2a8ff"  # lavender    — task count, neutral-ish
-C_CHIP_TIME    = "#56d364"  # leaf green  — clock, always-moving
 
 
 @dataclass
@@ -1087,7 +1098,7 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
 
     short_name = session_name if len(session_name) <= 20 else session_name[:19] + "…"
 
-    # LEFT: identity chip · session · status · fold
+    # LEFT: identity chip · session · status
     left = Text()
     left.append_text(render_status_chip(busy=tasks_running > 0, elapsed=busy_elapsed))
     left.append("  ·  ", style=C_DIM)
@@ -1102,8 +1113,6 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
         left.append("done", style=f"bold {C_GREEN}")
     else:
         left.append("● ", style=C_DIM); left.append(status, style=C_MUTED)
-    if fold_mode:
-        left.append("  ·  ", style=C_DIM); left.append("▾ fold", style=C_DIM)
 
     # CENTER: model · effort · tasks — dropped right-to-left on narrow terminals
     # so the chip column never wraps under the left half.
@@ -1123,7 +1132,13 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
         mid.append("  ·  ", style=C_DIM)
         mid.append("tasks: ", style=C_MUTED); mid.append(str(tasks_running), style=C_CHIP_TASKS)
 
+    # RIGHT: fold indicator + clock. Moved here from the LEFT column to keep the
+    # narrow `▾ fold` glyph from being eaten by the left's ellipsis when the
+    # running status pill fills the column budget.
     right = Text()
+    if fold_mode:
+        right.append("▾ fold", style=C_DIM)
+        right.append("  ·  ", style=C_DIM)
     right.append(time.strftime("%H:%M:%S"), style=C_CHIP_TIME)
 
     t.add_row(left, mid, right)
@@ -1737,10 +1752,16 @@ class GenericAgentTUI(App[None]):
         theme = self.current_theme
         if theme is None: return
         global _palette, C_FG, C_MUTED, C_DIM, C_SEL_BG, C_GREEN, C_BLUE, C_PURPLE
+        global C_CHIP_NAME, C_CHIP_MODEL, C_CHIP_EFFORT, C_CHIP_TASKS, C_CHIP_TIME
         _palette = self._resolve_palette()
         C_FG, C_MUTED, C_DIM = _palette["fg"], _palette["muted"], _palette["dim"]
         C_SEL_BG = _palette["sel_bg"]
         C_GREEN, C_BLUE, C_PURPLE = _palette["green"], _palette["blue"], _palette["purple"]
+        C_CHIP_NAME   = _palette["chip_name"]
+        C_CHIP_MODEL  = _palette["chip_model"]
+        C_CHIP_EFFORT = _palette["chip_effort"]
+        C_CHIP_TASKS  = _palette["chip_tasks"]
+        C_CHIP_TIME   = _palette["chip_time"]
         # watch_theme fires once during __init__ when we set ga-default — at that
         # point sessions is empty and the DOM isn't composed yet. Skip the rebuild.
         if not self.is_mounted or self.current_id is None:
