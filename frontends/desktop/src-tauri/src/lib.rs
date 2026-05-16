@@ -69,6 +69,71 @@ fn find_python() -> String {
     { "python3".to_string() }
 }
 
+/// Find project directory by searching upward from exe for agentmain.py
+fn find_project_dir() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent();
+    // Walk up to 8 levels from exe location
+    for _ in 0..8 {
+        match dir {
+            Some(d) => {
+                if d.join("agentmain.py").exists() {
+                    return Some(d.to_string_lossy().to_string());
+                }
+                dir = d.parent();
+            }
+            None => break,
+        }
+    }
+    None
+}
+
+/// Settings file path: ~/.ga_desktop_settings.json
+fn settings_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ga_desktop_settings.json")
+}
+
+/// Read config from settings file, or auto-discover and save
+pub fn get_or_discover_config() -> (String, String) {
+    let path = settings_path();
+
+    // Try reading existing settings
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                let python = val.get("python_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let project = val.get("project_dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !python.is_empty() && !project.is_empty() {
+                    return (python, project);
+                }
+            }
+        }
+    }
+
+    // Auto-discover
+    let python = find_python();
+    let project = find_project_dir().unwrap_or_default();
+
+    // Save discovered config
+    if !python.is_empty() && !project.is_empty() {
+        let json = serde_json::json!({
+            "python_path": python,
+            "project_dir": project
+        });
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap());
+    }
+
+    (python, project)
+}
+
 fn is_bridge_running() -> bool {
     TcpStream::connect(("127.0.0.1", 14168)).is_ok()
 }
