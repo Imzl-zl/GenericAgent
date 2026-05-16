@@ -49,10 +49,17 @@ button:disabled{opacity:.4;cursor:not-allowed}
 </div>
 <script>
 const {invoke} = window.__TAURI__.core;
+const {getCurrentWindow, Window} = window.__TAURI__.window;
 const statusEl = document.getElementById('status');
 const btn = document.getElementById('start-btn');
 const pyInput = document.getElementById('pypath');
 const dirInput = document.getElementById('projdir');
+
+// Pre-fill from Rust config discovery
+invoke('get_config').then(([py, dir]) => {
+  if (py) pyInput.value = py;
+  if (dir) dirInput.value = dir;
+}).catch(()=>{});
 
 async function doStart() {
   const pythonPath = pyInput.value.trim();
@@ -62,9 +69,16 @@ async function doStart() {
   btn.disabled = true;
   statusEl.className=''; statusEl.textContent='Starting bridge… 正在启动…';
   try {
-    await invoke('start_bridge_with_python', {pythonPath, projectDir});
-    statusEl.className='ok'; statusEl.textContent='Connected! Redirecting… 已连接，跳转中…';
-    setTimeout(()=>{ window.location.href='http://127.0.0.1:14168/'; }, 600);
+    await invoke('start_bridge_with_config', {pythonPath, projectDir});
+    statusEl.className='ok'; statusEl.textContent='Connected! 已连接，正在打开主窗口…';
+    // Show main window and hide setup
+    const mainWin = await Window.getByLabel('main');
+    if (mainWin) {
+      await mainWin.show();
+      await mainWin.setFocus();
+    }
+    const setupWin = getCurrentWindow();
+    await setupWin.hide();
   } catch(e) {
     statusEl.className='err'; statusEl.textContent='Failed: '+e;
     btn.disabled = false;
