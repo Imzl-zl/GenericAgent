@@ -75,6 +75,9 @@ memory/L4_raw_sessions/*
 # Goal Mode SOP
 !memory/goal_mode_sop.md
 
+# Goal Hive Mode SOP
+!memory/goal_hive_sop.md
+
 # Skill Search SOP
 !memory/skill_search/
 !memory/skill_search/**
