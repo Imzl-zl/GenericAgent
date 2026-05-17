@@ -92,6 +92,10 @@ _ANSI_CONTROL_RE = re.compile(
     r"|\x1b[=>]"
 )
 
+# Strip SGR-only codes — used when we need plain text for downstream parsing
+# (e.g. mapping narrow rendered output to source positions for selection).
+_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 # Strip the leading `**LLM Running (Turn N) ...**` marker that agent_loop yields per turn.
 # fold_turns still needs the marker in source content to split turns, so we only strip at
 # render time. Applies to the live (last) text segment, since folded turns don't include it.
@@ -108,6 +112,19 @@ _TASKLIST_DONE_RE = re.compile(r"^(\s*[-*+] )\[[xX]\] ", re.MULTILINE)
 # {"name": ..., "arguments": ...}. We replace the whole envelope so the raw
 # JSON braces/quotes never leak into the markdown render.
 _TOOL_USE_RE = re.compile(r"<tool_use>\s*(\{.*?\})\s*</tool_use>", re.DOTALL)
+
+# Agent-internal metadata tags. The sidebar's `S:` and the fold title already
+# surface the summary; the chat body should not show the raw tag. Stripping is
+# also required because `<summary>X</summary>\n<body>` (no blank line) is parsed
+# as a CommonMark HTML block that swallows the following body line, so the
+# model's actual reply disappears from the rendered output.
+# Only the start-of-line form triggers the CommonMark HTML-block swallow; mid-line
+# occurrences are inline HTML that Rich renders as text, and tags inside backticks
+# / fenced / indented code must stay verbatim. Anchoring sidesteps all of those.
+_META_TAG_RE = re.compile(
+    r"^[ ]{0,3}<(summary|thinking)>.*?</\1>\s*",
+    re.DOTALL | re.IGNORECASE | re.MULTILINE,
+)
 
 
 # Rotating usage tips, picked once per launch.
@@ -268,6 +285,302 @@ class HardBreakMarkdown(Markdown):
             if tok.children:
                 HardBreakMarkdown._soft_to_hard(tok.children)
 
+
+# Rich/Textual wrap treats a continuous CJK run as one indivisible word and
+# bumps it whole to the next line when it doesn't fit the remaining space,
+# leaving the line tail padded and producing wraps like "AI ↩ 助手...". We patch
+# every binding of divide_line/compute_wrap_offsets so CJK-bearing chunks pack
+# leading chars into the remainder then fold the rest at full width.
+# Covers CJK Unified Ideographs, Hangul Syllables, fullwidth/halfwidth forms.
+_CJK_WRAP_RE = re.compile(
+    r"[　-鿿"   # CJK punctuation through Unified Ideographs
+    r"가-힯"    # Hangul Syllables
+    r"＀-￯]"   # Halfwidth / Fullwidth Forms
+)
+
+
+def _fold_chunk_cells(chunk, width, char_width_fn, line_offset=0):
+    """Walk chunk char-by-char; return (breaks_relative_to_chunk, final_offset).
+
+    A break at index i means a newline lands before chunk[i]. line_offset is the
+    column where chunk[0] starts. char_width_fn must be called in order — it may
+    carry state (e.g. tab section index).
+    """
+    breaks: list[int] = []
+    for i, ch in enumerate(chunk):
+        cw = char_width_fn(ch)
+        if line_offset > 0 and line_offset + cw > width:
+            breaks.append(i)
+            line_offset = cw
+        else:
+            line_offset += cw
+    return breaks, line_offset
+
+
+def _cjk_divide_line(text: str, width: int, fold: bool = True) -> list[int]:
+    from rich._wrap import words as _words
+    from rich.cells import cell_len as _clen
+
+    breaks: list[int] = []
+    cell_offset = 0
+    for start, _end, word in _words(text):
+        word_length = _clen(word.rstrip())
+        if width - cell_offset >= word_length:
+            cell_offset += _clen(word)
+            continue
+        if not fold:
+            if cell_offset:
+                breaks.append(start)
+            cell_offset = _clen(word)
+            continue
+
+        has_cjk = bool(_CJK_WRAP_RE.search(word))
+        if not has_cjk and word_length <= width:
+            if cell_offset:
+                breaks.append(start)
+            cell_offset = _clen(word)
+            continue
+
+        if has_cjk:
+            line_offset = cell_offset
+        else:
+            if cell_offset:
+                breaks.append(start)
+            line_offset = 0
+        sub_breaks, cell_offset = _fold_chunk_cells(
+            word, width, _clen, line_offset
+        )
+        breaks.extend(start + b for b in sub_breaks)
+    return breaks
+
+
+def _cjk_compute_wrap_offsets(text, width, tab_size, fold=True,
+                              precomputed_tab_sections=None):
+    from rich.cells import get_character_cell_size
+    from textual._cells import cell_len as _clen
+    from textual._loop import loop_last
+    from textual.expand_tabs import get_tab_widths
+
+    tab_size = min(tab_size, width)
+    tab_sections = precomputed_tab_sections or get_tab_widths(text, tab_size)
+
+    cumulative_widths: list[int] = []
+    cumulative_width = 0
+    for last, (tab_section, tab_width) in loop_last(tab_sections):
+        cumulative_widths.extend([cumulative_width] * (len(tab_section) + int(bool(tab_width))))
+        cumulative_width += tab_width
+        if last:
+            cumulative_widths.append(cumulative_width)
+
+    tab_idx = [0]
+    def char_width(ch):
+        if ch == "\t":
+            cw = tab_sections[tab_idx[0]][1]
+            tab_idx[0] += 1
+            return cw
+        return get_character_cell_size(ch)
+
+    breaks: list[int] = []
+    cell_offset = 0
+    pos = 0
+    chunk_re = re.compile(r"\S+\s*|\s+")
+    while pos < len(text):
+        m = chunk_re.match(text, pos)
+        if m is None:
+            break
+        start, end = m.span()
+        chunk = m.group(0)
+        pos = end
+        chunk_width = _clen(chunk) + (cumulative_widths[end] - cumulative_widths[start])
+
+        if width - cell_offset >= chunk_width:
+            cell_offset += chunk_width
+            continue
+        if not fold:
+            if cell_offset:
+                breaks.append(start)
+            cell_offset = chunk_width
+            continue
+
+        has_cjk = bool(_CJK_WRAP_RE.search(chunk))
+        if not has_cjk and chunk_width <= width:
+            if cell_offset:
+                breaks.append(start)
+            cell_offset = chunk_width
+            continue
+
+        if has_cjk:
+            line_offset = cell_offset
+        else:
+            if cell_offset:
+                breaks.append(start)
+            line_offset = 0
+        sub_breaks, cell_offset = _fold_chunk_cells(chunk, width, char_width, line_offset)
+        breaks.extend(start + b for b in sub_breaks)
+    return breaks
+
+
+def _install_cjk_wrap() -> None:
+    # `from X import fn` copies the binding into the importer's namespace, so a
+    # rebind on the source module misses every holder. Patch each one explicitly.
+    import rich._wrap as _rw
+    import rich.text as _rt
+    import textual.content as _tc
+    import textual._wrap as _tw
+    import textual.document._wrapped_document as _twd
+    if getattr(_cjk_divide_line, "_cjk_patched", False):
+        return
+    _cjk_divide_line._cjk_patched = True
+    _rw.divide_line = _cjk_divide_line
+    _rt.divide_line = _cjk_divide_line
+    _tc.divide_line = _cjk_divide_line
+    _tw.compute_wrap_offsets = _cjk_compute_wrap_offsets
+    _twd.compute_wrap_offsets = _cjk_compute_wrap_offsets
+
+
+_install_cjk_wrap()
+
+
+# Markdown render result that supports clean copy. We render twice: once at the
+# display width (wraps to ANSI for selectability) and once at a wide width (one
+# logical line per block, no wrap newlines). The narrow render goes into the
+# Text widget for display; the wide render becomes the "source" string that
+# get_selection extracts from, with per-visual-line offsets mapping cursor
+# positions back into source — wrap continuations skip the wide-side whitespace
+# eaten at the break, and hanging indent on wrap lines maps to the same source
+# position as the start of the wrapped content.
+@dataclass
+class _MdRender:
+    text: Text
+    source: str
+    line_starts: list  # source offset for the content start of each visual line
+    line_indents: list  # leading whitespace count to skip when mapping x
+    line_lengths: list  # total length of each visual line (incl. indent)
+
+
+_CENTER_LEAD_MIN = 4
+
+
+def _align_md_renders(narrow_raw: str, wide_raw: str):
+    """Walk narrow + wide line-by-line; return (source, line_starts, line_indents, line_lengths)."""
+    narrow = [l.rstrip() for l in narrow_raw.split("\n")]
+    wide = [l.rstrip() for l in wide_raw.split("\n")]
+
+    wrap_groups: list = []
+    ni = 0
+    wi = 0
+    while ni < len(narrow):
+        if narrow[ni] == "":
+            ni += 1
+            while wi < len(wide) and wide[wi] == "":
+                wi += 1
+            continue
+        run_start = ni
+        while ni < len(narrow) and narrow[ni] != "":
+            ni += 1
+        run_lines = narrow[run_start:ni]
+
+        wide_start = wi
+        while wi < len(wide) and wide[wi] != "":
+            wi += 1
+        wide_lines = wide[wide_start:wi]
+
+        K, W = len(run_lines), len(wide_lines)
+        if W == 0:
+            for k in range(K):
+                wrap_groups.append(((run_start + k, run_start + k + 1), run_lines[k]))
+        elif K == W:
+            for k in range(K):
+                wrap_groups.append(((run_start + k, run_start + k + 1), wide_lines[k]))
+        else:
+            j = 0
+            for w_idx, w_line in enumerate(wide_lines):
+                g_start = run_start + j
+                accumulated = 0
+                target = len(w_line)
+                is_last = (w_idx == W - 1)
+                while j < K and (accumulated < target or is_last):
+                    nt = run_lines[j]
+                    content = nt.lstrip() if j > g_start - run_start else nt
+                    accumulated += len(content)
+                    j += 1
+                    if not is_last and accumulated >= target:
+                        break
+                wrap_groups.append(((g_start, run_start + j), w_line))
+
+    source_parts: list = []
+    line_starts = [0] * len(narrow)
+    line_indents = [0] * len(narrow)
+    line_lengths = [len(nt) for nt in narrow]
+    src_pos = 0
+    last_was_content = False
+    group_idx = 0
+
+    ni = 0
+    while ni < len(narrow):
+        if narrow[ni] == "":
+            line_starts[ni] = src_pos
+            if last_was_content:
+                source_parts.append("\n")
+                src_pos += 1
+            source_parts.append("\n")
+            src_pos += 1
+            last_was_content = False
+            ni += 1
+            continue
+
+        while group_idx < len(wrap_groups) and ni >= wrap_groups[group_idx][0][1]:
+            group_idx += 1
+        if group_idx >= len(wrap_groups):
+            line_starts[ni] = src_pos
+            source_parts.append(narrow[ni])
+            src_pos += len(narrow[ni])
+            ni += 1
+            last_was_content = True
+            continue
+
+        (g_start, g_end), wide_line = wrap_groups[group_idx]
+        single_line = (g_end - g_start == 1)
+
+        nt0 = narrow[g_start]
+        nt0_lead = len(nt0) - len(nt0.lstrip())
+        wide_lead = len(wide_line) - len(wide_line.lstrip())
+        is_centered = (single_line and wide_lead > _CENTER_LEAD_MIN and nt0_lead > 0)
+
+        if last_was_content:
+            source_parts.append("\n")
+            src_pos += 1
+
+        if is_centered:
+            content = wide_line.lstrip()
+            source_parts.append(content)
+            line_starts[g_start] = src_pos
+            line_indents[g_start] = nt0_lead
+            src_pos += len(content)
+        else:
+            block_start = src_pos
+            source_parts.append(wide_line)
+            src_pos += len(wide_line)
+            pointer = 0
+            for k in range(g_start, g_end):
+                nt = narrow[k]
+                if k == g_start:
+                    content = nt
+                    indent = 0
+                else:
+                    indent = len(nt) - len(nt.lstrip())
+                    content = nt.lstrip()
+                    while pointer < len(wide_line) and wide_line[pointer].isspace():
+                        pointer += 1
+                line_starts[k] = block_start + pointer
+                line_indents[k] = indent
+                pointer += len(content)
+        ni = g_end
+        last_was_content = True
+
+    return "".join(source_parts).rstrip("\n"), line_starts, line_indents, line_lengths
+
+
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
@@ -284,23 +597,308 @@ from export_cmd import last_assistant_text, export_to_temp, wrap_for_clipboard
 
 AgentFactory = Callable[[], Any]
 
-# ---------- colors ----------
-C_FG     = "#c9d1d9"
-C_MUTED  = "#8b949e"
-C_DIM    = "#6e7681"
-C_SEL_BG = "#161b22"
-C_GREEN  = "#7ec27e"
-C_BLUE   = "#82adcf"
-C_PURPLE = "#b596d8"
+# ---------- themes ----------
+# Our `ga-default` palette is registered as a Textual Theme; the other themes in
+# `_THEME_CYCLE` are Textual built-ins, whose ga-* slots are derived in
+# get_css_variables. C_* globals are kept in sync via watch_theme so Rich Text
+# styles (which take plain hex strings) update on theme switch.
+_DEFAULT_PALETTE: dict[str, str] = {
+    "fg": "#c9d1d9", "muted": "#8b949e", "dim": "#6e7681",
+    "bg": "#0d1117", "alt_bg": "#21262d", "sel_bg": "#161b22",
+    "border": "#30363d", "border_hi": "#484f58",
+    "green": "#7ec27e", "blue": "#82adcf", "purple": "#b596d8",
+    # Topbar info-segment chips — distinct hues for at-a-glance scanability.
+    # Values are from the github-dark palette; built-in Textual themes derive
+    # these from primary/secondary/warning/accent/success in get_css_variables.
+    "chip_name":   "#79c0ff",  # session name — cyan-blue
+    "chip_model":  "#a5d6ff",  # model id     — pale blue
+    "chip_effort": "#f0883e",  # effort       — amber (heat)
+    "chip_tasks":  "#d2a8ff",  # task count   — lavender
+    "chip_time":   "#7ec27e",  # clock        — same muted green as the sidebar's active-session marker
+}
 
-# Topbar chip palette — each segment gets a distinct hue so the eye can scan
-# past unchanged chips and notice what just shifted. Values picked from the
-# github-dark palette so contrast stays consistent with the rest of the chrome.
-C_CHIP_NAME    = "#79c0ff"  # cyan-blue   — session name, identity-like
-C_CHIP_MODEL   = "#a5d6ff"  # pale blue   — model identifier
-C_CHIP_EFFORT  = "#f0883e"  # amber       — effort gradient (xhigh hot)
-C_CHIP_TASKS   = "#d2a8ff"  # lavender    — task count, neutral-ish
-C_CHIP_TIME    = "#56d364"  # leaf green  — clock, always-moving
+_THEME_CYCLE = ["ga-default", "nord", "gruvbox", "dracula", "tokyo-night", "textual-light"]
+
+
+# ---------- persisted settings ----------
+# Lightweight JSON dropbox for cross-run UI state (theme, future toggles).
+# Lives under temp/ alongside model logs so it tracks the workspace.
+_SETTINGS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "temp", "tui_settings.json"
+)
+
+def _load_settings() -> dict:
+    try:
+        with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_settings(patch: dict) -> None:
+    cur = _load_settings()
+    cur.update(patch)
+    try:
+        os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+_palette: dict[str, str] = dict(_DEFAULT_PALETTE)
+C_FG     = _palette["fg"]
+C_MUTED  = _palette["muted"]
+C_DIM    = _palette["dim"]
+C_SEL_BG = _palette["sel_bg"]
+C_GREEN  = _palette["green"]
+C_BLUE   = _palette["blue"]
+C_PURPLE = _palette["purple"]
+C_CHIP_NAME   = _palette["chip_name"]
+C_CHIP_MODEL  = _palette["chip_model"]
+C_CHIP_EFFORT = _palette["chip_effort"]
+C_CHIP_TASKS  = _palette["chip_tasks"]
+C_CHIP_TIME   = _palette["chip_time"]
+
+
+def _hex_rgb(h: str) -> tuple[int, int, int]:
+    h = (h or "#000000").lstrip("#")
+    if len(h) == 3: h = "".join(c * 2 for c in h)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _rgb_hex(rgb) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*(max(0, min(255, int(c))) for c in rgb))
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    ra, rb = _hex_rgb(a), _hex_rgb(b)
+    return _rgb_hex(tuple(ra[i] * (1 - t) + rb[i] * t for i in range(3)))
+
+
+def _markdown_rich_theme(p: dict[str, str], minimal: bool = False):
+    """Map our palette to Rich Markdown's named styles so code/links/headings
+    follow the active theme instead of Rich's frozen defaults.
+
+    `minimal=True` collapses everything to fg/muted so non-default themes don't
+    fight Rich's frozen accent colors — each theme can be re-colorised case by
+    case later."""
+    from rich.theme import Theme as _RichTheme
+    if minimal:
+        fg, muted, dim, border = p["fg"], p["muted"], p["dim"], p["border"]
+        return _RichTheme({
+            "markdown.h1":          f"bold {fg}",
+            "markdown.h2":          f"bold {fg}",
+            "markdown.h3":          f"bold {fg}",
+            "markdown.h4":          f"bold {fg}",
+            "markdown.h5":          f"bold {fg}",
+            "markdown.h6":          f"bold {fg}",
+            "markdown.code":        f"bold {fg}",
+            "markdown.code_block":  fg,
+            "markdown.link":        f"underline {fg}",
+            "markdown.link_url":    f"underline {dim}",
+            "markdown.block_quote": muted,
+            "markdown.item":        fg,
+            "markdown.list":        fg,
+            "markdown.item.bullet": f"bold {fg}",
+            "markdown.item.number": fg,
+            "markdown.hr":          border,
+            "markdown.strong":      f"bold {fg}",
+            "markdown.em":          f"italic {fg}",
+            "markdown.s":           f"strike {dim}",
+        })
+    return _RichTheme({
+        "markdown.h1":          f"bold {p['green']}",
+        "markdown.h2":          f"bold {p['blue']}",
+        "markdown.h3":          f"bold {p['purple']}",
+        "markdown.h4":          f"bold {p['fg']}",
+        "markdown.h5":          f"bold {p['fg']}",
+        "markdown.h6":          f"bold {p['fg']}",
+        "markdown.code":        f"bold {p['fg']}",
+        "markdown.code_block":  f"{p['fg']} on {p['sel_bg']}",
+        "markdown.link":        p["blue"],
+        "markdown.link_url":    f"underline {p['dim']}",
+        "markdown.block_quote": p["muted"],
+        "markdown.item":        p["fg"],
+        "markdown.list":        p["blue"],
+        "markdown.item.bullet": f"bold {p['blue']}",
+        "markdown.item.number": p["blue"],
+        "markdown.hr":          p["border"],
+        "markdown.strong":      f"bold {p['fg']}",
+        "markdown.em":          f"italic {p['fg']}",
+        "markdown.s":           f"strike {p['dim']}",
+    })
+
+
+def _palette_from_resolved_vars(v: dict[str, str], dark: bool) -> dict[str, str]:
+    """Derive our 11-slot palette from Textual's *resolved* CSS variables (i.e.
+    after super().get_css_variables()). Textual auto-fills foreground / surface /
+    panel when the Theme leaves them None, so we read those rather than raw
+    Theme attributes."""
+    bg = v.get("background") or ("#1a1a1a" if dark else "#ffffff")
+    fg = v.get("foreground") or ("#e6e6e6" if dark else "#1a1a1a")
+    surface = v.get("surface") or _mix(bg, fg, 0.08)
+    panel = v.get("panel") or _mix(bg, fg, 0.14)
+    primary = v.get("primary") or fg
+    return {
+        "fg": fg, "bg": bg,
+        "alt_bg": surface, "sel_bg": panel,
+        # text-muted / text-disabled in Textual resolve to "auto NN%" — a Textual-only
+        # syntax Rich can't parse. Always derive from bg/fg blend so the strings we
+        # hand to Rich Text are plain hex.
+        "muted": _mix(bg, fg, 0.55),
+        "dim":   _mix(bg, fg, 0.35),
+        "border":    _mix(bg, fg, 0.20),
+        "border_hi": _mix(bg, fg, 0.35),
+        "green":  v.get("success") or primary,
+        "blue":   v.get("secondary") or primary,
+        "purple": v.get("accent") or primary,
+        # Topbar chips — five distinguishable Textual roles so each segment keeps
+        # its own hue across themes. Fall back to primary if a slot is missing.
+        "chip_name":   v.get("primary") or primary,
+        "chip_model":  v.get("secondary") or primary,
+        "chip_effort": v.get("warning") or v.get("accent") or primary,
+        "chip_tasks":  v.get("accent") or primary,
+        "chip_time":   v.get("success") or primary,
+    }
+
+
+_MAIN_CSS = """
+Screen { background: $ga-bg; color: $ga-fg; }
+
+#topbar, #bottombar {
+    height: 1;
+    background: $ga-bg;
+    padding: 0 2;
+}
+
+#body { height: 1fr; }
+
+#sidebar {
+    width: 34;
+    height: 100%;
+    background: $ga-bg;
+    padding: 1 2;
+    border-right: solid $ga-alt-bg;
+}
+#sidebar.-hidden, #sidebar.-narrow { display: none; }
+
+#main {
+    height: 100%;
+    padding: 1 6;
+    background: $ga-bg;
+}
+
+#messages {
+    height: 1fr;
+    background: $ga-bg;
+    /* horizontal hidden, 1-col vertical bar on right. */
+    scrollbar-size: 0 1;
+    scrollbar-background: $ga-bg;
+    scrollbar-background-hover: $ga-bg;
+    scrollbar-background-active: $ga-bg;
+    scrollbar-color: $ga-border;
+    scrollbar-color-hover: $ga-border-hi;
+    scrollbar-color-active: $ga-dim;
+}
+
+/* `└ Tip:` footer — one dim row, never grows. */
+#tipbar {
+    height: 1;
+    background: $ga-bg;
+    padding: 0 2;
+    color: $ga-dim;
+}
+
+/* Pickers — used by both ChoiceList (OptionList) and MultiChoiceList
+   (SelectionList). Same flat single-column look as the rest of the chat,
+   with a thin green left edge so the picker reads as an actionable card. */
+OptionList.picker, SelectionList.picker {
+    height: auto;
+    max-height: 12;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    background: $ga-bg;
+    border: none;
+    border-left: thick $ga-green;
+    scrollbar-size: 0 1;
+}
+OptionList.picker > .option-list--option-hover,
+SelectionList.picker > .option-list--option-hover { background: $ga-sel-bg; }
+OptionList.picker > .option-list--option-highlighted,
+SelectionList.picker > .option-list--option-highlighted {
+    background: $ga-blue 20%;
+    color: $ga-fg;
+    text-style: none;
+}
+SelectionList.picker > .selection-list--button { color: $ga-dim; }
+SelectionList.picker > .selection-list--button-selected { color: $ga-green; }
+SelectionList.picker > .selection-list--button-highlighted { background: transparent; }
+
+.role {
+    height: 1;
+    margin-top: 1;
+    margin-bottom: 0;
+}
+.msg {
+    height: auto;
+    margin-bottom: 0;
+}
+.fold-header:hover { background: $ga-sel-bg; }
+.spinner { height: 1; }
+
+#palette {
+    height: auto;
+    max-height: 8;
+    background: $ga-bg;
+    border: none;
+    padding: 0;
+    display: none;
+    margin-bottom: 1;
+    scrollbar-size: 0 0;
+}
+#palette.-visible { display: block; }
+OptionList {
+    background: $ga-bg;
+    border: none;
+    padding: 0;
+}
+OptionList > .option-list--option {
+    padding: 0 2;
+    background: $ga-bg;
+    color: $ga-fg;
+}
+OptionList > .option-list--option-highlighted {
+    background: $ga-fg;
+    color: $ga-bg;
+    text-style: bold;
+}
+
+ChoiceList {
+    height: auto;
+    max-height: 12;
+    background: $ga-bg;
+    border: none;
+    padding: 0;
+    margin-bottom: 1;
+    scrollbar-size: 0 0;
+}
+
+#input {
+    height: 3;
+    min-height: 3;
+    max-height: 5;
+    /* min-width guards TextArea.render_lines against `range() arg 3 must not be zero`
+       when the content region collapses to <= 0 cols (narrow window + sidebar shown). */
+    min-width: 10;
+    background: $ga-sel-bg;
+    border: none;
+    margin-bottom: 1;
+    padding: 1 2;
+    color: $ga-fg;
+    scrollbar-size: 0 0;
+}
+#input:focus { border: none; }
+"""
 
 
 @dataclass
@@ -458,6 +1056,9 @@ class MultiChoiceList(SelectionList):
 class SelectableStatic(Static):
     # Widget.get_selection returns None for non-Text/Content visuals; fall back to render_line.
     def get_selection(self, selection):
+        render = getattr(self, "_ga_render", None)
+        if render is not None:
+            return _extract_md_render(render, selection), "\n"
         result = super().get_selection(selection)
         if result is not None:
             return result
@@ -475,6 +1076,37 @@ class SelectableStatic(Static):
         if not lines:
             return None
         return selection.extract("\n".join(lines)), "\n"
+
+
+def _extract_md_render(render, selection) -> str:
+    starts = render.line_starts
+    indents = render.line_indents
+    lens = render.line_lengths
+    n = len(starts)
+    if n == 0:
+        return ""
+
+    if selection.start is None:
+        s_y, s_x = 0, 0
+    else:
+        s_y, s_x = selection.start.y, selection.start.x
+    if selection.end is None:
+        e_y, e_x = n - 1, lens[n - 1]
+    else:
+        e_y, e_x = selection.end.y, selection.end.x
+
+    s_y = max(0, min(s_y, n - 1))
+    e_y = max(0, min(e_y, n - 1))
+
+    def col(y, x):
+        ind = indents[y]
+        total = lens[y]
+        content_len = max(0, total - ind)
+        if x <= ind:
+            return 0
+        return min(x - ind, content_len)
+
+    return render.source[starts[s_y] + col(s_y, s_x): starts[e_y] + col(e_y, e_x)]
 
 
 class FoldHeader(SelectableStatic):
@@ -869,7 +1501,7 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
 
     short_name = session_name if len(session_name) <= 20 else session_name[:19] + "…"
 
-    # LEFT: identity chip · session · status · fold
+    # LEFT: identity chip · session · status
     left = Text()
     left.append_text(render_status_chip(busy=tasks_running > 0, elapsed=busy_elapsed))
     left.append("  ·  ", style=C_DIM)
@@ -884,8 +1516,6 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
         left.append("done", style=f"bold {C_GREEN}")
     else:
         left.append("● ", style=C_DIM); left.append(status, style=C_MUTED)
-    if fold_mode:
-        left.append("  ·  ", style=C_DIM); left.append("▾ fold", style=C_DIM)
 
     # CENTER: model · effort · tasks — dropped right-to-left on narrow terminals
     # so the chip column never wraps under the left half.
@@ -905,7 +1535,13 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
         mid.append("  ·  ", style=C_DIM)
         mid.append("tasks: ", style=C_MUTED); mid.append(str(tasks_running), style=C_CHIP_TASKS)
 
+    # RIGHT: fold indicator + clock. Moved here from the LEFT column to keep the
+    # narrow `▾ fold` glyph from being eaten by the left's ellipsis when the
+    # running status pill fills the column budget.
     right = Text()
+    if fold_mode:
+        right.append("▾ fold", style=C_DIM)
+        right.append("  ·  ", style=C_DIM)
     right.append(time.strftime("%H:%M:%S"), style=C_CHIP_TIME)
 
     t.add_row(left, mid, right)
@@ -1013,8 +1649,10 @@ def render_sidebar(sessions: dict[int, AgentSession], current_id: Optional[int])
     def spacer(style):
         sess_tbl.add_row(blank, blank, blank, blank, blank, style=style)
     def preview(label, txt, style):
+        # C_DIM blends bg/fg at 0.35 — under SEL_BG on the active row the contrast
+        # collapses (e.g. tokyo-night). C_MUTED (0.55 blend) stays readable in both.
         sess_tbl.add_row(blank, blank,
-                         Text(f"{label}: {txt}", style=C_DIM, no_wrap=True, overflow="ellipsis"),
+                         Text(f"{label}: {txt}", style=C_MUTED, no_wrap=True, overflow="ellipsis"),
                          blank, blank, style=style)
     for sid, sess in sessions.items():
         active = sid == current_id
@@ -1047,10 +1685,10 @@ class HelpScreen(ModalScreen):
         max-width: 80;
         height: auto;
         max-height: 80%;
-        background: #21262d;
-        border: solid #30363d;
+        background: $ga-alt-bg;
+        border: solid $ga-border;
         padding: 1 2;
-        color: #c9d1d9;
+        color: $ga-fg;
     }
     """
     BINDINGS = [
@@ -1070,145 +1708,67 @@ class HelpScreen(ModalScreen):
         yield Static(self._content)
 
 
+class ThemePicker(ModalScreen):
+    # Live-preview theme picker: highlight applies the theme so the rest of the
+    # UI repaints behind the modal; Enter commits + persists, Esc reverts.
+    CSS = """
+    ThemePicker { align: center middle; }
+    ThemePicker > OptionList {
+        width: 36;
+        max-height: 80%;
+        background: $ga-alt-bg;
+        border: solid $ga-border;
+        padding: 0 1;
+        color: $ga-fg;
+    }
+    ThemePicker > OptionList > .option-list--option-highlighted {
+        background: $ga-sel-bg;
+        color: $ga-fg;
+    }
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("enter",  "commit", "Apply",  show=False),
+    ]
+
+    def __init__(self, themes: list[str], current: str) -> None:
+        super().__init__()
+        self._themes = themes
+        self._initial = current
+
+    def compose(self) -> ComposeResult:
+        ol = OptionList(*self._themes, id="theme-picker")
+        yield ol
+
+    def on_mount(self) -> None:
+        ol = self.query_one(OptionList)
+        try:
+            ol.highlighted = self._themes.index(self._initial)
+        except ValueError:
+            ol.highlighted = 0
+        ol.focus()
+
+    def on_option_list_option_highlighted(self, ev) -> None:
+        name = self._themes[ev.option_index]
+        if self.app.theme != name:
+            self.app.theme = name
+
+    def on_option_list_option_selected(self, ev) -> None:
+        self.action_commit()
+
+    def action_commit(self) -> None:
+        _save_settings({"theme": self.app.theme})
+        self.dismiss()
+
+    def action_cancel(self) -> None:
+        if self.app.theme != self._initial:
+            self.app.theme = self._initial
+        self.dismiss()
+
+
 class GenericAgentTUI(App[None]):
 
-    CSS = """
-    Screen { background: #0d1117; color: #c9d1d9; }
-
-    #topbar, #bottombar {
-        height: 1;
-        background: #0d1117;
-        padding: 0 2;
-    }
-
-    #body { height: 1fr; }
-
-    #sidebar {
-        width: 34;
-        height: 100%;
-        background: #0d1117;
-        padding: 1 2;
-        border-right: solid #21262d;
-    }
-    #sidebar.-hidden, #sidebar.-narrow { display: none; }
-
-    #main {
-        height: 100%;
-        padding: 1 6;
-        background: #0d1117;
-    }
-
-    #messages {
-        height: 1fr;
-        background: #0d1117;
-        /* horizontal hidden, 1-col vertical bar on right. */
-        scrollbar-size: 0 1;
-        scrollbar-background: #0d1117;
-        scrollbar-background-hover: #0d1117;
-        scrollbar-background-active: #0d1117;
-        scrollbar-color: #30363d;
-        scrollbar-color-hover: #484f58;
-        scrollbar-color-active: #6e7681;
-    }
-
-    /* `└ Tip:` footer — one dim row, never grows. */
-    #tipbar {
-        height: 1;
-        background: #0d1117;
-        padding: 0 2;
-        color: #6e7681;
-    }
-
-    /* Pickers — used by both ChoiceList (OptionList) and MultiChoiceList
-       (SelectionList). Same flat single-column look as the rest of the chat,
-       with a thin green left edge so the picker reads as an actionable card. */
-    OptionList.picker, SelectionList.picker {
-        height: auto;
-        max-height: 12;
-        margin: 0 0 1 0;
-        padding: 0 1;
-        background: #0d1117;
-        border: none;
-        border-left: thick #7ec27e;
-        scrollbar-size: 0 1;
-    }
-    OptionList.picker > .option-list--option-hover,
-    SelectionList.picker > .option-list--option-hover { background: #161b22; }
-    OptionList.picker > .option-list--option-highlighted,
-    SelectionList.picker > .option-list--option-highlighted {
-        background: #1f6feb 20%;
-        color: #c9d1d9;
-        text-style: none;
-    }
-    SelectionList.picker > .selection-list--button { color: #6e7681; }
-    SelectionList.picker > .selection-list--button-selected { color: #7ec27e; }
-    SelectionList.picker > .selection-list--button-highlighted { background: transparent; }
-
-    .role {
-        height: 1;
-        margin-top: 1;
-        margin-bottom: 0;
-    }
-    .msg {
-        height: auto;
-        margin-bottom: 0;
-    }
-    .fold-header:hover { background: #161b22; }
-    .spinner { height: 1; }
-
-    #palette {
-        height: auto;
-        max-height: 8;
-        background: #0d1117;
-        border: none;
-        padding: 0;
-        display: none;
-        margin-bottom: 1;
-        scrollbar-size: 0 0;
-    }
-    #palette.-visible { display: block; }
-    OptionList {
-        background: #0d1117;
-        border: none;
-        padding: 0;
-    }
-    OptionList > .option-list--option {
-        padding: 0 2;
-        background: #0d1117;
-        color: #c9d1d9;
-    }
-    OptionList > .option-list--option-highlighted {
-        background: #c9d1d9;
-        color: #0d1117;
-        text-style: bold;
-    }
-
-    ChoiceList {
-        height: auto;
-        max-height: 12;
-        background: #0d1117;
-        border: none;
-        padding: 0;
-        margin-bottom: 1;
-        scrollbar-size: 0 0;
-    }
-
-    #input {
-        height: 3;
-        min-height: 3;
-        max-height: 5;
-        /* min-width guards TextArea.render_lines against `range() arg 3 must not be zero`
-           when the content region collapses to ≤ 0 cols (narrow window + sidebar shown). */
-        min-width: 10;
-        background: #161b22;
-        border: none;
-        margin-bottom: 1;
-        padding: 1 2;
-        color: #c9d1d9;
-        scrollbar-size: 0 0;
-    }
-    #input:focus { border: none; }
-    """
+    CSS = _MAIN_CSS
 
     BINDINGS = [
         Binding("ctrl+c",     "handle_ctrl_c", "Stop/Quit", show=False, priority=True),
@@ -1231,6 +1791,7 @@ class GenericAgentTUI(App[None]):
         Binding("cmd+/",      "show_help", "Help", show=False),
         Binding("escape",     "escape",        "Close", show=False),
         Binding("tab",        "complete_command", "Complete", show=False, priority=True),
+        Binding("ctrl+t",     "pick_theme",    "Theme", show=False),
     ]
 
     def __init__(self, agent_factory: Optional[AgentFactory] = None) -> None:
@@ -1252,6 +1813,19 @@ class GenericAgentTUI(App[None]):
         self._title_frame: int = 0
         self._title_timer = None
         self._last_title: str = ""
+        # Register our github-dark palette as a first-class Textual theme; the other
+        # cycle entries are Textual built-ins (nord, gruvbox, dracula, tokyo-night,
+        # textual-light), whose ga-* CSS slots are derived in get_css_variables.
+        from textual.theme import Theme as _TxTheme
+        p = _DEFAULT_PALETTE
+        self.register_theme(_TxTheme(
+            name="ga-default", dark=True,
+            background=p["bg"], surface=p["alt_bg"], panel=p["sel_bg"],
+            foreground=p["fg"],
+            primary=p["green"], secondary=p["blue"], accent=p["purple"],
+        ))
+        saved = _load_settings().get("theme")
+        self.theme = saved if saved in _THEME_CYCLE else "ga-default"
         self._spinner_frame: int = 0
         self._spinner_timer = None
         self._handlers: dict = {
@@ -1616,6 +2190,65 @@ class GenericAgentTUI(App[None]):
         else:
             self.push_screen(HelpScreen(self._render_help()))
 
+    def action_pick_theme(self) -> None:
+        if isinstance(self.screen, ThemePicker):
+            return
+        self.push_screen(ThemePicker(list(_THEME_CYCLE), self.theme or "ga-default"))
+
+    def _resolve_palette(self) -> dict[str, str]:
+        theme = self.current_theme
+        if theme is not None and theme.name == "ga-default":
+            return dict(_DEFAULT_PALETTE)
+        base = super().get_css_variables()
+        dark = bool(getattr(theme, "dark", True)) if theme is not None else True
+        return _palette_from_resolved_vars(base, dark)
+
+    def get_css_variables(self) -> dict[str, str]:
+        base = super().get_css_variables()
+        p = self._resolve_palette()
+        for k, v in p.items():
+            base[f"ga-{k.replace('_', '-')}"] = v
+        return base
+
+    def watch_theme(self, _old_theme, _new_theme) -> None:
+        # Triggered by `self.theme = name`. Sync Python-side state (palette dict,
+        # C_* globals, cached widgets) so Rich Text and Markdown also follow.
+        theme = self.current_theme
+        if theme is None: return
+        global _palette, C_FG, C_MUTED, C_DIM, C_SEL_BG, C_GREEN, C_BLUE, C_PURPLE
+        global C_CHIP_NAME, C_CHIP_MODEL, C_CHIP_EFFORT, C_CHIP_TASKS, C_CHIP_TIME
+        _palette = self._resolve_palette()
+        C_FG, C_MUTED, C_DIM = _palette["fg"], _palette["muted"], _palette["dim"]
+        C_SEL_BG = _palette["sel_bg"]
+        C_GREEN, C_BLUE, C_PURPLE = _palette["green"], _palette["blue"], _palette["purple"]
+        C_CHIP_NAME   = _palette["chip_name"]
+        C_CHIP_MODEL  = _palette["chip_model"]
+        C_CHIP_EFFORT = _palette["chip_effort"]
+        C_CHIP_TASKS  = _palette["chip_tasks"]
+        C_CHIP_TIME   = _palette["chip_time"]
+        # watch_theme fires once during __init__ when we set ga-default — at that
+        # point sessions is empty and the DOM isn't composed yet. Skip the rebuild.
+        if not self.is_mounted or self.current_id is None:
+            return
+        # Cached Rich Text / Markdown captured the old hex values; force a remount.
+        for s in self.sessions.values():
+            for m in s.messages:
+                m._cache_key = None
+                m._cached_body = None
+                m._segment_widgets = []
+                m._segment_sig = ()
+                m._role_widget = None
+                m._body_widget = None
+                m._hint_widget = None
+                m._spinner_widget = None
+        try:
+            self._remount_current_session()
+            self._refresh_topbar()
+            self._refresh_sidebar()
+            self._refresh_bottombar()
+        except Exception:
+            pass
+
     def _render_help(self) -> Text:
         rows = [
             ("Enter",                   "发送"),
@@ -1633,6 +2266,7 @@ class GenericAgentTUI(App[None]):
             ("Tab",                     "命令面板可见时补全"),
             ("Esc",                     "取消选择 / 关闭面板 / 关闭帮助"),
             ("Esc Esc",                 "打开回退选择"),
+            ("Ctrl+T",                  "切换主题"),
             ("Ctrl+/",                  "显示 / 隐藏本帮助"),
         ]
         t = Text()
@@ -2929,31 +3563,39 @@ class GenericAgentTUI(App[None]):
     def _render_md(self, text: str, width: int):
         # Markdown via RichVisual loses segment.style.meta["offset"] so mouse selection
         # can't anchor; round-trip through ANSI → Text.from_ansi to restore selectability.
+        # A parallel wide render builds a wrap-free "source" string that
+        # SelectableStatic.get_selection uses, so copy never includes wrap newlines.
         try:
-            # Plan-mode / task-list polish: swap commonmark task-list source for
-            # unicode symbols before Markdown sees it. ☐/✔ are base-BMP and
-            # render on every terminal we target.
             text = _TASKLIST_OPEN_RE.sub(r"\1☐ ", text)
             text = _TASKLIST_DONE_RE.sub(r"\1✔ ", text)
-            # Tool-use envelopes get replaced wholesale — see _render_tool_use_block.
             text = _TOOL_USE_RE.sub(_render_tool_use_block, text)
+            text = _META_TAG_RE.sub("", text)
             from io import StringIO
             from rich.console import Console
-            # Render one column narrower so Rich horizontal rules don't wrap.
             render_w = max(1, width - 1)
             buf = StringIO()
             Console(file=buf, width=render_w, force_terminal=True,
-                    color_system="truecolor", legacy_windows=False
+                    color_system="truecolor", legacy_windows=False,
+                    theme=_markdown_rich_theme(_palette, minimal=(self.theme != "ga-default"))
                     ).print(HardBreakMarkdown(text), end="")
-            t = Text.from_ansi(buf.getvalue().rstrip("\n"))
-            # Completed task lines fade to muted gray so the eye lands on
-            # outstanding work. Done first so the green tick re-overrides next.
+            narrow_raw = buf.getvalue().rstrip("\n")
+            t = Text.from_ansi(narrow_raw)
             t.highlight_regex(r"✔[^\n]*", style=C_DIM)
             t.highlight_regex(r"☐", style=C_DIM)
             t.highlight_regex(r"✔", style=C_GREEN)
-            return t
+
+            wide_buf = StringIO()
+            Console(file=wide_buf, width=10000, force_terminal=False,
+                    legacy_windows=False).print(HardBreakMarkdown(text), end="")
+            wide_raw = wide_buf.getvalue().rstrip("\n")
+            narrow_plain = _ANSI_SGR_RE.sub("", narrow_raw)
+            source, starts, indents, lens = _align_md_renders(narrow_plain, wide_raw)
+            return _MdRender(text=t, source=source, line_starts=starts,
+                             line_indents=indents, line_lengths=lens)
         except Exception:
-            return Text(text, style=C_FG)
+            fallback = Text(text, style=C_FG)
+            return _MdRender(text=fallback, source=text,
+                             line_starts=[0], line_indents=[0], line_lengths=[len(text)])
 
     def _assistant_segments(self, m: ChatMessage, width: int) -> list[tuple]:
         """Return [(kind, body, fold_idx_or_None)]. kind ∈ {'text','fold-header','fold-body'}.
@@ -2975,7 +3617,7 @@ class GenericAgentTUI(App[None]):
         if m._seg_render_cache and any(k[1] != width for k in m._seg_render_cache):
             m._seg_render_cache.clear()
 
-        def cached_render(content: str) -> Text:
+        def cached_render(content: str) -> "_MdRender":
             k = (hash(content), width)
             v = m._seg_render_cache.get(k)
             if v is None:
@@ -2998,7 +3640,14 @@ class GenericAgentTUI(App[None]):
                     out.append(("fold-body", cached_render(seg.get("content", "")), i))
             else:
                 content = _TURN_MARKER_RE.sub("", seg.get("content", ""), count=1)
-                out.append(("text", cached_render(content), None))
+                # While streaming, the tail text segment grows every chunk — Markdown
+                # parsing it per chunk is the streaming-lag root cause. Render as plain
+                # Text during streaming; _stream_update_assistant swaps in the real
+                # Markdown render once m.done flips True.
+                if i == last_i and not m.done:
+                    out.append(("text", Text(content, style=C_FG), None))
+                else:
+                    out.append(("text", cached_render(content), None))
         if m.done:
             m._cached_body = out
             m._cache_key = key
@@ -3112,10 +3761,9 @@ class GenericAgentTUI(App[None]):
         # (in-place .update of last widget) vs. full remount (when folds appear/expand).
         return tuple((kind, idx) for kind, _, idx in segs)
 
-    _ROLE_COLOR = {"user": C_PURPLE, "system": C_BLUE, "assistant": C_GREEN}
-
     def _mount_message(self, container: VerticalScroll, m: ChatMessage) -> None:
-        color = self._ROLE_COLOR.get(m.role, C_GREEN)
+        # Looked up at call time (not class init) so theme switches propagate.
+        color = {"user": C_PURPLE, "system": C_BLUE, "assistant": C_GREEN}.get(m.role, C_GREEN)
         label = m.role.upper() if m.role != "assistant" else "AGENT"
         m._role_widget = SelectableStatic(f"[bold {color}]{label}[/]", classes="role")
         container.mount(m._role_widget)
@@ -3167,7 +3815,11 @@ class GenericAgentTUI(App[None]):
             if kind == "fold-header":
                 w = FoldHeader(body, m, fold_idx, classes="msg fold-header")
             else:
-                w = SelectableStatic(body, classes="msg")
+                if isinstance(body, _MdRender):
+                    w = SelectableStatic(body.text, classes="msg")
+                    w._ga_render = body
+                else:
+                    w = SelectableStatic(body, classes="msg")
             if anchor is None:
                 container.mount(w)
             else:
@@ -3211,7 +3863,20 @@ class GenericAgentTUI(App[None]):
             cleaned = _ANSI_CONTROL_RE.sub("", raw)
             last_seg = fold_turns(cleaned)[-1]
             last_text = _TURN_MARKER_RE.sub("", last_seg.get("content", ""), count=1)
-            m._segment_widgets[-1].update(self._render_md(last_text, width))
+            last_widget = m._segment_widgets[-1]
+            # During streaming use plain Text — Markdown parse per chunk is O(chunks ×
+            # turn_len). Only on the terminal `done` chunk do we render Markdown once
+            # and swap, restoring code blocks / lists / inline styling and clean-copy.
+            if m.done:
+                rendered = self._render_md(last_text, width)
+                if isinstance(rendered, _MdRender):
+                    last_widget._ga_render = rendered
+                    last_widget.update(rendered.text)
+                else:
+                    last_widget.update(rendered)
+            else:
+                last_widget._ga_render = None
+                last_widget.update(Text(last_text, style=C_FG))
             if m.done and m._spinner_widget is not None:
                 try: m._spinner_widget.remove()
                 except Exception: pass
