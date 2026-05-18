@@ -2084,6 +2084,20 @@ class GenericAgentTUI(App[None]):
         self.current_id = ids[(i + 1) % len(ids)]
         self._refresh_all()
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """Override Textual's OSC 52 clipboard (broken on macOS Terminal.app).
+        Use pbcopy on macOS, fall back to OSC 52 on other platforms."""
+        import sys, subprocess as _sp
+        if sys.platform == "darwin":
+            try:
+                _sp.Popen(["pbcopy"], stdin=_sp.PIPE, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL).communicate(text.encode("utf-8"))
+                self._clipboard = text
+                return
+            except Exception:
+                pass
+        # Non-macOS or pbcopy failed: fall back to Textual default (OSC 52)
+        super().copy_to_clipboard(text)
+
     def action_handle_ctrl_c(self) -> None:
         # Two-stage quit: when no task is running, first press clears input and arms;
         # second press within 2s exits.
