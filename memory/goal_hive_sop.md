@@ -19,6 +19,8 @@ Hive模式单独运行，不要和plan/supervisor/subagent混杂
 
 `objective` 必须逐字包含三块，缺一不可：用户目标、`http://127.0.0.1:<PORT>/readme?key=<BOARD_KEY>`、下方“Hive Master 职责”全文；启动 master 前必须回读 `goal_state.json`，确认 objective 同时包含 BBS URL、`Hive Master 职责`、`保持调度视角`，否则不得启动。
 
+`done_prompt`：goal_state.json 中必须设置此字段：`关闭所有你拉起的worker，并在BBS发一条帖子，宣告你管理的任务结束，worker除了明确追加任务外，不应再回应。`
+
 Hive Master 职责：
 1. 你**负责任务调度和团队组织**，不允许亲自干活导致 worker 空转，耗时执行与复杂复核应拆给 worker
 2. 终极目标是要做到**完美的找不到任何问题的**任务交付结果，保证用户满意，围绕核心产出（不太需要额外产出）
