@@ -7,6 +7,7 @@ GenericAgent — 交互式初始化向导 (configure.py)
     python configure.py
 """
 
+import ast
 import os
 import sys
 import re
@@ -1068,7 +1069,7 @@ def generate_mykey(llm_cfgs, platform_configs):
 
 def _write_config_fields(lines, cfg):
     """写入配置字典的键值对（缩进的 'key': value, 格式）"""
-    for key in ['name', 'apikey', 'apibase', 'model', 'api_mode',
+    for key in ['name', 'type', 'apikey', 'apibase', 'model', 'api_mode',
                 'fake_cc_system_prompt', 'thinking_type', 'thinking_budget_tokens',
                 'reasoning_effort', 'max_tokens', 'max_retries', 'connect_timeout',
                 'read_timeout', 'temperature', 'context_win',
@@ -1101,7 +1102,7 @@ def _write_platform_value(lines, key, val):
 def _parse_existing_mykey():
     """解析已有 mykey.py，返回 (model_names, platform_infos)
 
-    llm_cfgs: [{'name': str, 'type': str, ...}]  — 模型配置字典列表
+    model_names: [str]  — 模型名列表
     platform_infos: [{'id': str, 'vars': [{'key': str, 'val': ...}]}]  — 平台信息
     解析失败时返回 ([], [])
     """
@@ -1117,19 +1118,79 @@ def _parse_existing_mykey():
     if m:
         model_names = re.findall(r"'([^']+)'", m.group(1))
 
-    # 解析平台变量 → 平台 ID
-    platform_id_map = {
-        'tg_bot_token': 'telegram', 'qq_app_id': 'qq',
-        'fs_app_id': 'feishu', 'wecom_bot_id': 'wecom',
-        'dingtalk_client_id': 'dingtalk', 'dc_bot_token': 'discord',
-    }
+    # 先收集所有已知平台 env var key → 判断值类型
+    all_env_var_keys = {}
+    platform_env_keys = {}  # pid -> [var_key]
+    for p in PLATFORMS:
+        pid = p['id']
+        platform_env_keys.setdefault(pid, [])
+        for var in p.get('env_vars', []):
+            vkey = var['key']
+            all_env_var_keys[vkey] = var
+            platform_env_keys[pid].append(vkey)
+
+    # 逐平台解析所有已知变量
     platform_infos = []
-    for var_key, pid in platform_id_map.items():
-        m_var = re.search(rf"^{var_key}\s*=\s*'([^']*)'", content, re.MULTILINE)
-        if m_var:
-            platform_infos.append({'id': pid, 'vars': [{'key': var_key, 'val': m_var.group(1)}]})
+    for pid, env_keys in platform_env_keys.items():
+        vars_found = []
+        for vkey in env_keys:
+            var_def = all_env_var_keys[vkey]
+            val = None
+            if var_def.get('is_list'):
+                # 匹配 `xxx = [...]`
+                m_var = re.search(rf"^{vkey}\s*=\s*(\[[^\]]*\])", content, re.MULTILINE)
+                if m_var:
+                    try:
+                        val = ast.literal_eval(m_var.group(1))
+                    except (ValueError, SyntaxError):
+                        pass
+            else:
+                # 匹配 `xxx = '...'`
+                m_var = re.search(rf"^{vkey}\s*=\s*'([^']*)'", content, re.MULTILINE)
+                if m_var:
+                    val = m_var.group(1)
+            if val is not None:
+                vars_found.append({'key': vkey, 'val': val})
+        if vars_found:
+            platform_infos.append({'id': pid, 'vars': vars_found})
 
     return model_names, platform_infos
+
+
+def _parse_existing_llm_cfgs():
+    """解析已有 mykey.py，返回完整 LLM 配置字典列表 [{name, apikey, ...}]
+    解析失败时返回 []
+    """
+    if not os.path.exists(MYKPY_PATH):
+        return []
+
+    with open(MYKPY_PATH, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    cfgs = []
+    # 匹配所有 `xxx = {  ...  }` 顶层字典赋值
+    # 用简单状态机: 找 `\w+ = {` 然后匹配花括号
+    pattern = re.compile(r'^(\w+)\s*=\s*\{', re.MULTILINE)
+    for m in pattern.finditer(content):
+        brace_start = m.end() - 1  # '{' 的位置
+        depth = 1
+        i = brace_start + 1
+        while i < len(content) and depth > 0:
+            if content[i] == '{':
+                depth += 1
+            elif content[i] == '}':
+                depth -= 1
+            i += 1
+        if depth == 0:
+            dict_text = content[m.end():i - 1]
+            try:
+                d = ast.literal_eval('{' + dict_text + '}')
+                if isinstance(d, dict) and 'name' in d:
+                    cfgs.append(d)
+            except (ValueError, SyntaxError):
+                continue
+
+    return cfgs
 
 
 def _backup_with_name(model_names, platform_ids):
@@ -1142,6 +1203,8 @@ def _backup_with_name(model_names, platform_ids):
         if pid_clean not in parts:
             parts.append(pid_clean)
     safe_name = '_'.join(parts)
+    if safe_name == 'mykey':
+        safe_name = 'mykey_backup'  # 避免和源文件同名
     if len(safe_name) > 100:
         safe_name = safe_name[:100]
     backup_path = os.path.join(PROJECT_ROOT, f'{safe_name}.py')
@@ -1189,7 +1252,7 @@ def main():
 
         if mode == 'new':
             backup_path = _backup_with_name(model_names, [p['id'] for p in platform_infos])
-            print(f"  {C['green']}✓ 旧配置已备份至:{C['reset']} {C['dim']}{backup}{C['reset']}")
+            print(f"  {C['green']}✓ 旧配置已备份至:{C['reset']} {C['dim']}{backup_path}{C['reset']}")
             is_new = True
         else:
             is_modify = True
@@ -1212,8 +1275,12 @@ def main():
                         config_dict = {v['key']: v['val'] for v in pi['vars']}
                         platform_configs.append({'platform': p, 'config': config_dict})
             elif scope == 'platform' and model_names:
-                print(f"\n  {C['yellow']}⚠ 只修改平台时若未提供 LLM 配置将无法使用。{C['reset']}")
-                cprint(f"    建议两项都重新配置。", 'dim')
+                old_cfgs = _parse_existing_llm_cfgs()
+                if old_cfgs:
+                    llm_cfgs = old_cfgs
+                    print(f"\n  {C['green']}✓ 已保留现有 LLM 配置: {', '.join(c['name'] for c in old_cfgs)}{C['reset']}")
+                else:
+                    print(f"\n  {C['yellow']}⚠ 保留 LLM 配置失败，将生成空配置。建议两项都重新配置。{C['reset']}")
 
     if not is_modify:
         if is_new:
@@ -1245,6 +1312,12 @@ def main():
             platform_configs, platform_deps = configure_platforms()
             if ask_yesno("是否继续配置 LLM 模型？", default=True):
                 llm_cfgs = _do_llm()
+            elif os.path.exists(MYKPY_PATH):
+                # 新建+仅平台：从备份保留旧 LLM 配置
+                old_cfgs = _parse_existing_llm_cfgs()
+                if old_cfgs:
+                    llm_cfgs = old_cfgs
+                    print(f"\n  {C['green']}✓ 已保留备份中的 LLM 配置: {', '.join(c['name'] for c in old_cfgs)}{C['reset']}")
 
     # ── 生成 mykey.py ──
     if not llm_cfgs and not platform_configs:
@@ -1253,10 +1326,9 @@ def main():
 
     content = generate_mykey(llm_cfgs, platform_configs)
 
-    # 备份旧文件
-    if os.path.exists(MYKPY_PATH):
-        backup = os.path.join(PROJECT_ROOT, f'mykey.py.bak.{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-        shutil.copy2(MYKPY_PATH, backup)
+    # 备份旧文件（修改模式不备份，直接在原文件修改）
+    if os.path.exists(MYKPY_PATH) and not is_modify and not is_new:
+        backup = _backup_with_name(model_names, [p['id'] for p in platform_infos])
         print(f"\n  {C['green']}✓ 旧配置已备份至:{C['reset']} {C['dim']}{backup}{C['reset']}")
 
     # 写入
