@@ -857,6 +857,8 @@ def configure_platforms():
 
         if pid == 'feishu' and ask_yesno("使用一键扫码创建应用？（推荐）", default=True):
             env_vals = _feishu_scan(platform)
+        if pid == 'wechat' and ask_yesno("扫码登录微信 iLink？（推荐）", default=True):
+            env_vals = _wechat_scan()
 
         for var in platform['env_vars']:
             if var['key'] not in env_vals:
@@ -944,6 +946,39 @@ def _feishu_scan(platform):
     else:
         print(f"\n  {C['yellow']}⚠ 扫码创建未完成，降级为手动填写...{C['reset']}")
         return {}
+
+
+def _wechat_scan():
+    """微信 iLink 扫码登录，保存 token 到 ~/.wxbot/token.json，返回 env_vals"""
+    print(f"\n  {C['cyan']}📱 正在启动微信 iLink 扫码登录...{C['reset']}")
+    print(f"  {C['dim']}  请用微信扫描终端二维码，完成授权后自动获取凭据。{C['reset']}\n")
+
+    # 确保项目根在路径中，以便导入 frontends/wechatapp
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    try:
+        from frontends.wechatapp import WxBotClient
+    except ImportError as e:
+        print(f"\n  {C['yellow']}⚠ 无法导入 WxBotClient: {e}{C['reset']}")
+        return {}
+
+    try:
+        bot = WxBotClient()
+        if bot.token:
+            print(f"  {C['green']}✅ 已有有效 token (bot_id={bot.bot_id}){C['reset']}")
+            if ask_yesno("重新扫码登录？", default=False):
+                bot.token = ''
+            else:
+                return {}
+        bot.login_qr()
+        print(f"\n  {C['green']}✅ 微信 iLink 扫码登录成功！{C['reset']}")
+        print(f"  Bot ID: {C['bold']}{bot.bot_id}{C['reset']}")
+        print(f"  Token 已保存到: {C['dim']}{bot._tf}{C['reset']}")
+    except Exception as e:
+        print(f"\n  {C['red']}✗ 扫码登录失败: {e}{C['reset']}")
+        return {}
+
+    return {}
 
 
 
