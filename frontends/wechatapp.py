@@ -1,4 +1,4 @@
-import os, sys, re, threading, queue, time, socket, json, struct, base64, uuid, webbrowser, hashlib, math
+import os, sys, re, threading, queue, time, socket, json, struct, base64, uuid, hashlib, math
 from pathlib import Path
 from urllib.parse import quote
 import requests, qrcode
@@ -70,7 +70,7 @@ class WxBotClient:
         print(f'[QR登录] ID: {qr_id}')
         if url:
             img = self._tf.parent / 'wx_qr.png'
-            qrcode.make(url).save(str(img)); webbrowser.open(str(img))
+            qrcode.make(url).save(str(img))  # 保存到文件，不弹浏览器
             qr = qrcode.QRCode(border=1); qr.add_data(url); qr.make(fit=True); qr.print_ascii(invert=True)
         last = ''
         while True:
