@@ -244,6 +244,19 @@ class FoldSegment:
     is_last: bool = False
 
 
+@dataclass
+class Block:
+    """A unit of finalized scrollback history, stored as SOURCE (not rendered
+    lines). Resize replays each block through its renderer at the new width,
+    so width-baked structures (chip boxes, banner box) reflow correctly. The
+    actual scrollback bytes above the viewport stay frozen at the old width —
+    that's a terminal physics constraint — but the viewport and everything
+    new flows correctly."""
+    kind: str          # 'user' | 'assistant' | 'plain' | 'banner'
+    source: str        # source text (or '' for banner — regenerated on demand)
+    tool_n: int = 0    # tool count cached at last render (for stable tids)
+
+
 def sanitize_ansi(text: str) -> str:
     """Strip non-SGR ANSI escapes and incomplete sequences from streaming chunks."""
     text = _ANSI_DEC_PRIVATE_RE.sub('', text)
@@ -1054,7 +1067,20 @@ class SB:
         self._pstore: dict[int, str] = {}; self._imgs: list[str | None] = []; self._pc = 0
         self._t0 = 0.0; self._spin = 0
         self._painted: list[str] = []
-        self._history_lines: list[str] = []
+        self._blocks: list[Block] = []                  # block-based scrollback history;
+        self._streaming_block: Block | None = None     # the in-flight assistant block
+        # Self-pipe for SIGWINCH delivery. PEP 475 makes Python auto-retry
+        # os.read on EINTR even with siginterrupt(SIGWINCH, True) — especially
+        # under iTerm split panes where the signal can be delivered while the
+        # read is mid-syscall and silently dropped. The signal handler writes
+        # a byte to this pipe; the main select() polls both stdin and the
+        # pipe, so a resize always wakes the loop within select's timeout.
+        sr, sw = os.pipe()
+        import fcntl as _fcntl
+        for fd in (sr, sw):
+            fl = _fcntl.fcntl(fd, _fcntl.F_GETFL)
+            _fcntl.fcntl(fd, _fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        self._sig_r, self._sig_w = sr, sw
         self._last_render = 0.0
         self._asking: AskUserEvent | None = None
         self._quit = False
@@ -1395,41 +1421,160 @@ class SB:
         _w('\r' + (f'\x1b[{up}A' if up > 0 else '') + f'\x1b[{col}G')
         self._parked_up = up
 
-    def commit(self, lines: list[str]) -> None:
-        self._history_lines.extend(lines)
-        if len(self._history_lines) > 12000:
-            self._history_lines = self._history_lines[-8000:]
+    def commit(self, content) -> None:
+        """Append finalized history. Accepts either a Block (preferred — keeps
+        the source so resize can re-render at the new width) or a pre-rendered
+        list[str] (legacy: wrapped as a 'plain' block, which can reflow only
+        through _fit_rows — no un-rendering of width-baked structures). For
+        assistant blocks, _tool_base is anchored to the cumulative tool count
+        of prior blocks so chip tids continue the global sequence and stay
+        stable across resize repaints."""
         w = _term()[0]
+        if isinstance(content, Block):
+            blk = content
+            if blk.kind == 'assistant':
+                self._tool_base = sum(b.tool_n for b in self._blocks)
+            self._blocks.append(blk)
+            self._cap_blocks()
+            lines = self._render_block(blk, w)
+            if blk.kind == 'assistant':
+                self._tool_base += blk.tool_n            # advance for next message
+        else:
+            blk = Block('plain', '\n'.join(content))
+            self._blocks.append(blk)
+            self._cap_blocks()
+            lines = list(content)
+        self._emit_lines(lines, w)
+
+    def _cap_blocks(self) -> None:
+        if len(self._blocks) > 4000:
+            self._blocks = self._blocks[-3000:]
+            # streaming block (if any) is the last element by construction —
+            # the cap preserves it. Pre-streaming tool_base recompute will pick
+            # up the surviving blocks correctly.
+
+    def _emit_lines(self, lines: list[str], w: int) -> None:
+        """Write lines to scrollback, wiping any live region currently below."""
+        if not lines:
+            self._render_live(); return
         emit: list[str] = []
         for ln in lines:
             emit.extend(_fit_rows(ln, w))
         self._goto_top()
-        _w('\x1b[J')                            # wipe live region (infrequent)
+        _w('\x1b[J')
         _w('\r\n'.join(emit) + '\r\n')
         self._painted = []; self._live_rows = 0
         self._render_live()
 
-    def _repaint_screen(self) -> None:
-        """Rebuild the visible page from remembered transcript rows.
+    def _render_block(self, b: Block, w: int) -> list[str]:
+        """Render one block at width w. Mutates self._last_tool_n for
+        assistant blocks; callers needing stable tids must set _tool_base
+        before calling (see _render_all_blocks / _flow)."""
+        if b.kind == 'user':
+            parts = b.source.split('\n')
+            raw = [_MARK + ' ' + parts[0]] + [CONT + p for p in parts[1:]]
+            lines = [_tile(' ' + x, _TILE_U) for x in raw]
+            lines.append('')
+            return lines
+        if b.kind == 'assistant':
+            body = self._render_assistant(b.source, max(1, w - 2))
+            b.tool_n = self._last_tool_n            # cache for tool_base recompute
+            return _indent_rows(body, w) + ['']
+        if b.kind == 'banner':
+            return self._make_banner_lines(w)
+        # 'plain': pre-formatted ANSI (system messages, dividers, /help text…)
+        out: list[str] = []
+        for ln in b.source.split('\n'):
+            out.extend(_fit_rows(ln, w))
+        return out
 
-        Native terminal scrollback cannot reflow old rows after resize. This
-        redraw keeps the current viewport coherent by replaying remembered rows
-        through the current width, then painting the live input region below.
-        """
+    def _render_all_blocks(self, w: int) -> list[str]:
+        """Re-render every finalized block at width w with stable tool ids.
+        Tool ids are assigned per-block from a running tool_base, so a chip's
+        tid stays the same across resize repaints (otherwise /verbose would
+        de-sync from what the user sees)."""
+        out: list[str] = []
+        saved_base = self._tool_base
+        tool_base = 0
+        for blk in self._blocks:
+            if blk.kind == 'assistant':
+                self._tool_base = tool_base
+                out.extend(self._render_block(blk, w))
+                tool_base += blk.tool_n
+            else:
+                out.extend(self._render_block(blk, w))
+        self._tool_base = saved_base
+        return out
+
+    def _pre_streaming_tool_base(self) -> int:
+        """Cumulative tool count from blocks before the streaming block."""
+        total = 0
+        for blk in self._blocks:
+            if blk is self._streaming_block:
+                break
+            total += blk.tool_n
+        return total
+
+    def _make_banner_lines(self, w: int) -> list[str]:
+        """Regenerate the startup banner at the given width — called once at
+        run-start AND again on every resize via the 'banner' block kind."""
+        d, r = _DIM, _RST
+        cwd = os.getcwd().replace(os.path.expanduser('~'), '~')
+        name = self._bridge.llm_name if self._bridge else '?'
+        rows = [(_ACCENT + '>_' + _RST + ' GenericAgent', '>_ GenericAgent'),
+                ('', ''),
+                (f'{d}model:{r}       {name}   {d}/llm 切换{r}',
+                 f'model:       {name}   /llm 切换'),
+                (f'{d}directory:{r}   {cwd}', f'directory:   {cwd}'),
+                (f'{d}session:{r}     单会话 · scrollback', 'session:     单会话 · scrollback')]
+        top = _border('╭', '╮', w)
+        bot = _border('╰', '╯', w)
+        lines = ['', top]
+        lines += [self._boxln(p, c, w) for c, p in rows]
+        lines += [bot, '',
+                  f'  {d}Tip: Enter 发送 · Shift+Enter/Ctrl+J 换行 · ↑↓ 历史 · '
+                  f'cmd+⌫ 清行 · /help 全部命令{r}', '']
+        if self._bridge and not self._bridge._healthy:
+            lines.append(f'  {d}⚠ {self._bridge._init_error}{r}'); lines.append('')
+        return lines
+
+    def _repaint_screen(self) -> None:
+        """Wipe BOTH viewport and scrollback, then replay ALL blocks at the
+        current width. Lines that overflow the viewport scroll naturally into
+        the fresh scrollback at the new width — so the entire history reflows,
+        not just what's visible. \\x1b[3J (clear scrollback) is iTerm/xterm
+        specific but widely supported; on terminals that ignore it, viewport
+        still re-renders correctly and old scrollback simply stays put.
+
+        The in-flight stream's open portion (after the streaming block's safe
+        boundary) re-renders into _live_tail too so mid-stream resize snaps
+        to the new width."""
         w, h = _term()
+        if self._stream and self._streaming_block is not None:
+            safe_src = self._streaming_block.source
+            open_src = sanitize_ansi(self._stream)[len(safe_src):]
+            saved_base = self._tool_base
+            self._tool_base = self._pre_streaming_tool_base() + self._streaming_block.tool_n
+            open_body = self._render_assistant(open_src, max(1, w - 2)) if open_src.strip() else []
+            self._tool_base = saved_base
+            self._live_tail = _indent_rows(open_body[-8:], w)
         live = self._live_lines()
-        hist_budget = max(0, h - len(live))
-        hist = _tail_fit_rows(self._history_lines, w, hist_budget)
-        frame = hist + live
-        _w('\x1b[2J\x1b[H')
-        last = len(frame) - 1
-        for i, ln in enumerate(frame):
+        hist_all = self._render_all_blocks(w)
+        # Fold each rendered line to terminal width — long ANSI lines (e.g.
+        # plain blocks) reflow via _fit_rows so no soft-wrap drift.
+        hist_fit: list[str] = []
+        for ln in hist_all:
+            hist_fit.extend(_fit_rows(ln, w))
+        _w('\x1b[3J\x1b[2J\x1b[H')                # wipe scrollback + viewport
+        for ln in hist_fit:                        # write all history; overflow
+            _w('\x1b[2K' + ln + '\r\n')           # naturally scrolls to new scrollback
+        last = len(live) - 1
+        for i, ln in enumerate(live):
             _w('\x1b[2K' + ln + ('\r\n' if i != last else ''))
         self._painted = list(live)
         self._live_rows = len(live)
-        hist_rows = len(hist)
         row, col = self._cur
-        up = (len(frame) - 1) - (hist_rows + row)
+        up = (len(live) - 1) - row
         _w('\r' + (f'\x1b[{up}A' if up > 0 else '') + f'\x1b[{col}G')
         self._parked_up = up
 
@@ -1638,7 +1783,8 @@ class SB:
             from frontends import continue_cmd
             continue_cmd.reset_conversation(ag)
             _w('\x1b[2J\x1b[H'); self._painted = []; self._live_rows = 0
-            self._history_lines = []
+            self._blocks = []; self._streaming_block = None; self._sent = 0
+            self._tool_base = 0; self._tools = {}
             self.commit([_DIM + '🆕 新对话 · 上下文已清空' + _RST])
         elif name == 'rewind':
             n = int(arg) if arg.isdigit() else 1
@@ -1662,7 +1808,8 @@ class SB:
                 self._submit(prompt, [])
             else:
                 try:
-                    self.commit(_render(dq.get_nowait().get('done', ''), _term()[0], markdown=True))
+                    text = dq.get_nowait().get('done', '')
+                    self.commit(Block('assistant', text))   # markdown re-renders on resize
                 except queue.Empty:
                     self.commit(['(review 无输出)'])
         elif name == 'llm':
@@ -1719,7 +1866,7 @@ class SB:
         finally:
             self._running = False
         with self._lk:
-            self.commit(_render(ans or '(无回答)', _term()[0], markdown=True))
+            self.commit(Block('assistant', ans or '(无回答)'))   # markdown re-renders on resize
 
     def _verbose_view(self) -> None:
         """Tool-call audit on a TEMP alt-screen — main scrollback is never
@@ -1853,11 +2000,7 @@ class SB:
         self._render_live()
 
     def _commit_user(self, text: str) -> None:
-        parts = text.split('\n')
-        raw = [_MARK + ' ' + parts[0]] + [CONT + p for p in parts[1:]]
-        lines = [_tile(' ' + x, _TILE_U) for x in raw]   # user panel, near-black
-        lines.append('')                      # bare gap = the divider
-        self.commit(lines)
+        self.commit(Block('user', text))
 
     def _compress(self, t: str) -> str:
         """Capture each tool call as a structured ToolRecord (ids fixed at
@@ -1918,12 +2061,7 @@ class SB:
         return out
 
     def _commit_assistant(self, text: str) -> None:
-        w = _term()[0]
-        body = self._render_assistant(text, max(1, w - 2))
-        lines = _indent_rows(body, w)     # AI = plain white, no panel, no bar
-        lines.append('')                      # bare gap = the divider
-        self._tool_base += self._last_tool_n  # message done → ids advance
-        self.commit(lines)
+        self.commit(Block('assistant', text))   # commit() handles _tool_base
 
     def _safe_pos(self, stream: str) -> int:
         """Position up to which the stream is STRUCTURALLY stable — past this
@@ -1961,12 +2099,26 @@ class SB:
         w = _term()[0]
         stream = sanitize_ansi(self._stream)
 
+        if self._streaming_block is None and (stream.strip() or final):
+            self._streaming_block = Block('assistant', '')
+            self._blocks.append(self._streaming_block)
+            self._cap_blocks()
+            self._sent = 0
+
         if final:
+            if self._streaming_block is not None:
+                self._streaming_block.source = stream
+            base = self._pre_streaming_tool_base()
+            saved_base = self._tool_base; self._tool_base = base
             body = self._render_assistant(stream, max(1, w - 2))
-            new = _indent_rows(body[self._sent:], w) + ['']
+            if self._streaming_block is not None:
+                self._streaming_block.tool_n = self._last_tool_n
+            self._tool_base = saved_base + self._last_tool_n   # legacy tracker advance
+            full_lines = _indent_rows(body, w) + ['']
+            new = full_lines[self._sent:]
             self._live_tail = []
-            self._tool_base += self._last_tool_n
-            self.commit(new)
+            self._emit_lines(new, w)
+            self._streaming_block = None
             self._stream = ''; self._sent = 0; self._live_tail = []
             return
 
@@ -1974,19 +2126,27 @@ class SB:
         closed_text = stream[:safe]
         open_text = stream[safe:]
 
+        if self._streaming_block is not None:
+            self._streaming_block.source = closed_text         # block tracks committed src
+
+        base = self._pre_streaming_tool_base()
+        saved_base, saved_n = self._tool_base, self._last_tool_n
+        self._tool_base = base
         closed_body = self._render_assistant(closed_text, max(1, w - 2)) if closed_text.strip() else []
         closed_n = self._last_tool_n
+        if self._streaming_block is not None:
+            self._streaming_block.tool_n = closed_n
         if open_text.strip():
-            saved_base, saved_n = self._tool_base, self._last_tool_n
-            self._tool_base = saved_base + closed_n            # open tids don't collide
+            self._tool_base = base + closed_n                   # open tids don't collide
             open_body = self._render_assistant(open_text, max(1, w - 2))
-            self._tool_base = saved_base
-            self._last_tool_n = saved_n                         # finalize uses closed_n
         else:
             open_body = []
+        self._tool_base = saved_base
+        self._last_tool_n = saved_n                             # finalize uses closed_n
 
-        new = closed_body[self._sent:]
-        self._sent = len(closed_body)
+        closed_lines = _indent_rows(closed_body, w)
+        new = closed_lines[self._sent:]
+        self._sent = len(closed_lines)
         self._live_tail = _indent_rows(open_body[-8:], w)        # cap volatile region —
                                                                   # any larger and a growing
                                                                   # live region scrolls past
@@ -1994,7 +2154,7 @@ class SB:
                                                                   # paints into scrollback as
                                                                   # un-erasable "duplicates"
         if new:
-            self.commit(_indent_rows(new, w))
+            self._emit_lines(new, w)
         else:
             self._render_live()
 
@@ -2159,6 +2319,10 @@ class SB:
 
     def _on_resize(self, *_a) -> None:
         self._resized = True
+        try:
+            os.write(self._sig_w, b'r')   # wake the select() in run()
+        except (BlockingIOError, OSError):
+            pass                           # pipe full = pending wake already queued
 
     def run(self) -> None:
         self._bridge = AgentBridge()
@@ -2167,24 +2331,6 @@ class SB:
             cost_tracker.install()        # without this _trackers stays empty → no cost
         except Exception:
             pass
-        d, r = _DIM, _RST
-        w = _term()[0]
-        cwd = os.getcwd().replace(os.path.expanduser('~'), '~')
-        rows = [(_ACCENT + '>_' + _RST + ' GenericAgent', '>_ GenericAgent'),
-                ('', ''),
-                (f'{d}model:{r}       {self._bridge.llm_name}   {d}/llm 切换{r}',
-                 f'model:       {self._bridge.llm_name}   /llm 切换'),
-                (f'{d}directory:{r}   {cwd}', f'directory:   {cwd}'),
-                (f'{d}session:{r}     单会话 · scrollback', 'session:     单会话 · scrollback')]
-        top = _border('╭', '╮', w)
-        bot = _border('╰', '╯', w)
-        banner = ['', top]
-        banner += [self._boxln(p, c, w) for c, p in rows]
-        banner += [bot, '',
-                   f'  {d}Tip: Enter 发送 · Shift+Enter/Ctrl+J 换行 · ↑↓ 历史 · '
-                   f'cmd+⌫ 清行 · /help 全部命令{r}', '']
-        if not self._bridge._healthy:
-            banner.append(f'  {d}⚠ {self._bridge._init_error}{r}'); banner.append('')
         self._old = termios.tcgetattr(self._fd)
         signal.signal(signal.SIGWINCH, self._on_resize)
         signal.siginterrupt(signal.SIGWINCH, True)   # don't auto-retry os.read — let
@@ -2200,25 +2346,34 @@ class SB:
             _w('\x1b[?2004h')  # bracketed paste: multi-line paste won't pre-submit
             _w('\x1b[>4;1m')   # modifyOtherKeys: Shift+Enter becomes distinguishable
             _w('\x1b[2J\x1b[H')  # one-time fresh page (NOT alt-screen; scrollback intact)
-            self.commit(banner)
+            self.commit(Block('banner', ''))
             while True:
-                # 40ms gate: triggers when ANYTHING is pending (a held Esc, an
-                # _ingest holdback that contains a lone \x1b, or a deferred
-                # resize). On timeout _flush_esc drains them all in order.
-                if self._epend or self._resized or (self._rb and not self._bp):
-                    r, _, _ = select.select([self._fd], [], [], 0.04)
-                    if not r:
-                        self._flush_esc(); continue
-                try:
-                    data = os.read(self._fd, 4096)
-                except InterruptedError:              # SIGWINCH interrupted the read;
-                    if self._resized:                  # repaint at the new size
-                        with self._lk:                  # right now, don't wait for a
-                            self._resized = False       # keystroke
-                            self._redraw()
-                    continue
-                if not data or not self._feed(data):
-                    break
+                # Always select on BOTH stdin and the SIGWINCH self-pipe — under
+                # iTerm split panes, signal-driven InterruptedError on os.read
+                # is unreliable (PEP 475 auto-retries; on some macOS builds the
+                # signal can be coalesced/dropped during the read syscall). The
+                # self-pipe trick wakes select() deterministically whenever
+                # SIGWINCH fires, so a resize ALWAYS repaints within ~40ms even
+                # if the user never touches a key.
+                gated = self._epend or (self._rb and not self._bp)
+                timeout = 0.04 if gated else None
+                r, _, _ = select.select([self._fd, self._sig_r], [], [], timeout)
+                if self._sig_r in r:
+                    try: os.read(self._sig_r, 4096)
+                    except OSError: pass               # drain pending wake bytes
+                if self._resized:
+                    with self._lk:
+                        self._resized = False
+                        self._redraw()
+                if not r:
+                    self._flush_esc(); continue
+                if self._fd in r:
+                    try:
+                        data = os.read(self._fd, 4096)
+                    except InterruptedError:
+                        continue
+                    if not data or not self._feed(data):
+                        break
         finally:
             _w('\x1b[>4;0m')   # restore default key reporting
             _w('\x1b[?2004l')
