@@ -539,9 +539,22 @@ _MD_THEME = Theme({
 
 PROMPT = '❯ '
 CONT = '  '
-_DIM = '\x1b[2m'
+# macOS Terminal.app quantises ALL truecolor escapes to their nearest 256-color
+# slot, and the slot it picks for #5e6ad2 (iTerm lavender) is 62/#5f5fd7 — that's
+# the "blue" border the user sees. It also renders \x1b[2m as a heavy 30%-opacity
+# multiply instead of the gentle blend iTerm does — that's the "heavy shadow".
+# Branching on TERM_PROGRAM lets iTerm keep its truecolor + dim look, while
+# Apple_Terminal uses pinned 256-color slots that match iTerm's RENDERED result.
+_IS_APPLE_TERMINAL = os.environ.get('TERM_PROGRAM') == 'Apple_Terminal'
 _RST = '\x1b[0m'
-_ACCENT = '\x1b[38;2;94;106;210m'        # the ONE accent — Linear lavender #5e6ad2, mark only
+if _IS_APPLE_TERMINAL:
+    _DIM = '\x1b[38;5;244m'              # mid-gray — no \x1b[2m, no "shadow"
+    _ACCENT = '\x1b[38;5;105m'           # 256-slot light purple, closest to iTerm rendered look
+    _BORDER = '\x1b[38;5;146m'           # light lavender
+else:
+    _DIM = '\x1b[2m'
+    _ACCENT = '\x1b[38;2;94;106;210m'    # Linear lavender #5e6ad2
+    _BORDER = '\x1b[38;5;146m'
 _INK_U = '\x1b[38;5;234m'                # user ink — near-black, strong (as requested)
 # Linear surface ladder: user gets its own panel; AI = plain white surface.
 _TILE_U = '\x1b[48;5;251m' + _INK_U      # user panel (near-black ink)
@@ -558,7 +571,7 @@ def _tile(s: str, style: str) -> str:
     return style + s.replace(_RST, _RST + style) + '\x1b[K' + _RST
 
 
-def _border(left: str, right: str, width: int, style: str = _DIM) -> str:
+def _border(left: str, right: str, width: int, style: str = _BORDER) -> str:
     width = max(1, width)
     if width == 1:
         return style + left + _RST
@@ -1156,7 +1169,7 @@ class SB:
         plain_fit = _clip_cells(plain, inner)
         colored_fit = _clip_ansi_cells(colored, inner)
         pad = max(0, inner - cell_len(plain_fit))   # cell_len → CJK-safe alignment
-        return _DIM + '│ ' + _RST + colored_fit + ' ' * pad + _DIM + ' │' + _RST
+        return _BORDER + '│ ' + _RST + colored_fit + ' ' * pad + _BORDER + ' │' + _RST
 
     def _segs(self, iw: int) -> list[tuple[int, str]]:
         """Flatten buf into visual rows: (abs char start in buf, chunk text).
