@@ -712,12 +712,16 @@ function msgNode(msg) {
   const el = document.createElement('div');
   el.className = 'msg ' + (msg.role || 'system');
   if (msg.role === 'user') {
+    const shown = (typeof msg.display === 'string' && msg.display.length) ? msg.display : msg.content;
     const imgsHtml = (msg.images && msg.images.length)
       ? `<div class="bubble-imgs">${msg.images.map(im => `<img src="${im.dataUrl}" alt="">`).join('')}</div>`
       : '';
-    el.innerHTML = `<div class="bubble">${escapeHtml(msg.content)}</div>${imgsHtml}`;
+    el.innerHTML = `<div class="bubble">${escapeHtml(shown)}</div>${imgsHtml}`;
   }
-  else if (msg.role === 'assistant') el.innerHTML = `<div class="bubble md">${renderAssistant(msg.content)}</div>`;
+  else if (msg.role === 'assistant') {
+    const body = msg.stopped ? (msg.content + '\n\n_[' + t('status.stopped') + ']_') : msg.content;
+    el.innerHTML = `<div class="bubble md">${renderAssistant(body)}</div>`;
+  }
   else if (msg.role === 'error') el.innerHTML = `<div class="bubble err">${escapeHtml(msg.content)}</div>`;
   else el.innerHTML = `<div class="bubble sys">${escapeHtml(msg.content)}</div>`;
   return el;
@@ -875,7 +879,11 @@ convListEl.addEventListener('click', (e) => {
     return;
   }
   const it = e.target.closest('.conv-item');
-  if (it && it.dataset.id) setActiveSession(it.dataset.id);
+  if (it && it.dataset.id) {
+    setActiveSession(it.dataset.id);
+    const chatNav = nav.querySelector('.nav-item[data-page="chat"]');
+    if (chatNav && !chatNav.classList.contains('active')) chatNav.click();
+  }
 });
 convMenu.addEventListener('click', (e) => {
   e.stopPropagation();
@@ -907,7 +915,13 @@ document.addEventListener('click', () => { convMenu.hidden = true; });
 newConvBtn.addEventListener('click', (e) => { e.preventDefault(); newSession(); });
 
 /* ═══════════════ 轮询 + 流式 ═══════════════ */
-function normalize(m) { return { id: Number(m.id || 0), role: m.role || 'system', content: m.content || '' }; }
+function normalize(m) {
+  const o = { id: Number(m.id || 0), role: m.role || 'system', content: m.content || '' };
+  if (typeof m.display === 'string' && m.display.length) o.display = m.display;
+  if (m.stopped) o.stopped = true;
+  if (m.images) o.images = m.images;
+  return o;
+}
 function upsert(sess, raw, partial) {
   const m = normalize(raw); const r = rt(sess);
   if (partial && m.role === 'assistant') { r.draftText = m.content; if (isActive(sess)) renderDraft(sess); return; }
@@ -932,18 +946,7 @@ async function pollSession(sess) {
       setBusy(sess, busy);
       if (busy) await new Promise(z => setTimeout(z, 500));
       else {
-        // 退出 poll：若草稿还在(取消时 bridge 不发 final),把已流式输出的文本定稿,加 [已停止] 标记
-        if (r.draftEl) {
-          if (r.draftText && r.draftText.trim()) {
-            const m = { role:'assistant', content: r.draftText + '\n\n_[' + t('status.stopped') + ']_' };
-            sess.messages.push(m);
-            r.draftEl.remove(); r.draftEl = null; r.draftText = '';
-            if (isActive(sess)) appendMessage(sess, m);
-            saveSessions();
-          } else {
-            r.draftEl.remove(); r.draftEl = null;
-          }
-        }
+        if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
         break;
       }
     } while (true);
@@ -994,7 +997,7 @@ async function sendPrompt(text) {
         saveSessions();
       }
     }
-    const res = await window.ga.rpc('session/prompt', { sessionId: sid, prompt: composedPrompt, llmNo: state.llmNo });
+    const res = await window.ga.rpc('session/prompt', { sessionId: sid, prompt: composedPrompt, display: text, llmNo: state.llmNo });
     if (res?.error) throw new Error(res.error.message || res.error);
     state.pendingFiles = [];
     renderThumbStrip();
@@ -1592,8 +1595,11 @@ window.ga.onBridgeReady(async () => {
   await loadBridgeConfig();
   if (document.querySelector('.page[data-page="channels"].active')) renderChannelList(gaServiceStore.list());
   const sess = activeSess();
-  if (sess && sess.bridgeSessionId && !sess.messages.length) pollSession(sess);
+  if (sess && sess.bridgeSessionId && !sess.messages.length) await pollSession(sess);
+  delete document.documentElement.dataset.bootHasSessions;
+  if (sess) refreshEmptyState(sess);
 });
+setTimeout(() => { delete document.documentElement.dataset.bootHasSessions; }, 3000);
 window.ga.onBridgeNotification((msg) => {
   if (msg && msg.type === 'session-state') {
     for (const sess of state.sessions.values()) {

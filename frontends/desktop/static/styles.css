@@ -427,7 +427,6 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
   background:var(--panel);
 }
 .tb-left{ display:flex; align-items:center; gap:14px; font-size:12px; }
-.tb-right{ display:flex; align-items:center; gap:6px; }
 .pill{
   border:1px solid var(--line); background:var(--card); border-radius:20px;
   padding:5px 12px; font-size:12px; color:var(--txt-2); cursor:pointer;
@@ -506,6 +505,7 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
 
 /* 预设功能卡片（现在嵌在聊天空状态）*/
 .chat-start{ width:100%; max-width:560px; }
+html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .feature-head{ text-align:center; margin-bottom:22px; }
 .feature-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px; }
 .fcard{

@@ -354,7 +354,7 @@ class AgentManager:
         self._persist()
         return {"ok": True, "sessionId": sid}
 
-    def submit_prompt(self, sid: str, prompt: Any, images: Optional[list] = None, llm_no: Optional[int] = None) -> dict:
+    def submit_prompt(self, sid: str, prompt: Any, images: Optional[list] = None, llm_no: Optional[int] = None, display: Optional[str] = None) -> dict:
         prompt, image_ids = normalize_prompt(prompt, images)
         if llm_no is not None:
             self.config["llmNo"] = int(llm_no)
@@ -367,6 +367,8 @@ class AgentManager:
             extra = {}
             if image_ids:
                 extra["image_ids"] = image_ids
+            if isinstance(display, str) and display.strip() and display != prompt:
+                extra["display"] = display
             user_msg = self.add_message(sess, "user", prompt, **extra)
             sess.status = "running"
             sess.cancel_requested = False
@@ -479,6 +481,11 @@ class AgentManager:
             if sess.agent and hasattr(sess.agent, "abort"):
                 with contextlib.suppress(Exception):
                     sess.agent.abort()
+            partial_text = ""
+            if sess.partial:
+                partial_text = (sess.partial.get("content") or "").strip()
+            if partial_text:
+                self.add_message(sess, "assistant", partial_text, stopped=True)
             sess.status = "cancelled"
             sess.partial = None
             sess.updated_at = time.time()
@@ -1017,10 +1024,11 @@ async def prompt_handler(request):
     data = await read_json(request)
     prompt = data.get("prompt", data.get("content", data.get("message", "")))
     images = data.get("images") or []
+    display = data.get("display")
     llm_no = data.get("llmNo")
     if llm_no is not None:
         llm_no = int(llm_no)
-    return json_ok(manager.submit_prompt(sid, prompt, images, llm_no=llm_no))
+    return json_ok(manager.submit_prompt(sid, prompt, images, llm_no=llm_no, display=display))
 
 
 async def messages_handler(request):
