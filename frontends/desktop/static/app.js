@@ -292,6 +292,7 @@ const I18N = {
     'st.starting': '启动中…', 'st.stopping': '停止中…',
     'st.online': '在线', 'st.offline': '离线', 'st.error': '错误', 'st.running': '运行', 'st.abnormal': '异常',
     'act.configure': '配置', 'act.logs': '日志', 'act.restart': '重启', 'act.stop': '停止', 'act.start': '启动',
+    'act.copy': '复制', 'act.copied': '已复制', 'act.copyTex': 'TeX',
     'proc.imbotWechat': 'imbot · 微信', 'proc.imbotDing': 'imbot · 钉钉', 'proc.scheduler': '定时任务调度',
     'cm.scheduling': '调度中', 'cm.running': '执行中', 'cm.idleSt': '空闲',
     'cm.master': '已派 3 子任务', 'cm.w1': '子任务：抓取数据', 'cm.w2': '子任务：复核结果', 'cm.sub': '等待派单',
@@ -384,6 +385,7 @@ const I18N = {
     'st.starting': 'Starting…', 'st.stopping': 'Stopping…',
     'st.online': 'Online', 'st.offline': 'Offline', 'st.error': 'Error', 'st.running': 'Running', 'st.abnormal': 'Error',
     'act.configure': 'Configure', 'act.logs': 'Logs', 'act.restart': 'Restart', 'act.stop': 'Stop', 'act.start': 'Start',
+    'act.copy': 'Copy', 'act.copied': 'Copied', 'act.copyTex': 'TeX',
     'proc.imbotWechat': 'imbot · WeChat', 'proc.imbotDing': 'imbot · DingTalk', 'proc.scheduler': 'Scheduler',
     'cm.scheduling': 'Scheduling', 'cm.running': 'Running', 'cm.idleSt': 'Idle',
     'cm.master': 'Dispatched 3 subtasks', 'cm.w1': 'Subtask: fetch data', 'cm.w2': 'Subtask: review results', 'cm.sub': 'Waiting for tasks',
@@ -652,10 +654,10 @@ function postRenderEnhance(containerEl) {
     if (typeof hljs !== 'undefined') hljs.highlightElement(block);
     if (!block.parentElement.querySelector('.code-copy-btn')) {
       const btn = document.createElement('button');
-      btn.className = 'code-copy-btn'; btn.textContent = 'Copy';
+      btn.className = 'code-copy-btn'; btn.textContent = t('act.copy');
       btn.onclick = () => {
         navigator.clipboard.writeText(block.textContent).then(() => {
-          btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = 'Copy', 1500);
+          btn.textContent = t('act.copied'); setTimeout(() => btn.textContent = t('act.copy'), 1500);
         });
       };
       block.parentElement.style.position = 'relative';
@@ -668,10 +670,10 @@ function postRenderEnhance(containerEl) {
     const src = el.querySelector('annotation[encoding="application/x-tex"]');
     if (!src) return;
     const btn = document.createElement('button');
-    btn.className = 'latex-copy-btn'; btn.textContent = 'TeX';
+    btn.className = 'latex-copy-btn'; btn.textContent = t('act.copyTex');
     btn.onclick = () => {
       navigator.clipboard.writeText(src.textContent).then(() => {
-        btn.textContent = '✓'; setTimeout(() => btn.textContent = 'TeX', 1500);
+        btn.textContent = '✓'; setTimeout(() => btn.textContent = t('act.copyTex'), 1500);
       });
     };
     el.style.position = 'relative';
@@ -829,29 +831,24 @@ function renderDraft(sess) {
   if (!r.draftEl || r.draftEl.parentNode !== box) {
     r.draftEl = document.createElement('div'); r.draftEl.className = 'msg assistant'; box.appendChild(r.draftEl);
   }
-  // 打字机：逐步显示
   if (!r.twState) r.twState = { shown: 0, timer: null };
   const tw = r.twState;
-  const full = r.draftText || '';
-  // 每次 renderDraft 被调用时启动/继续 tick
   if (!tw.timer) {
     tw.timer = setInterval(() => {
-      if (tw.shown >= full.length) {
-        // 全部显示完毕，等待新内容
+      const cur = r.draftText || '';
+      if (tw.shown >= cur.length) {
         clearInterval(tw.timer); tw.timer = null;
         return;
       }
-      tw.shown = Math.min(tw.shown + TW_SPEED, full.length);
-      const visible = full.slice(0, tw.shown);
+      tw.shown = Math.min(tw.shown + TW_SPEED, cur.length);
+      const visible = cur.slice(0, tw.shown);
       r.draftEl.innerHTML = `<div class="bubble md">${renderAssistant(visible)}<span class="cursor"></span></div>`;
       postRenderEnhance(r.draftEl.querySelector('.bubble'));
       scrollBottom();
     }, TW_INTERVAL);
   }
-  // 如果新内容比已显示的长，timer 会继续追赶
-  // 如果是首次或 flush，立即渲染当前可见部分
-  const visible = full.slice(0, tw.shown || 0);
-  r.draftEl.innerHTML = `<div class="bubble md">${renderAssistant(visible || full)}<span class="cursor"></span></div>`;
+  const visible = (r.draftText || '').slice(0, tw.shown);
+  r.draftEl.innerHTML = `<div class="bubble md">${renderAssistant(visible)}<span class="cursor"></span></div>`;
   postRenderEnhance(r.draftEl.querySelector('.bubble'));
   refreshEmptyState(sess); scrollBottom();
 }

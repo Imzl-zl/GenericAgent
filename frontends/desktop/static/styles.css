@@ -153,6 +153,13 @@ html[data-appearance="dark"]{
   --shadow:0 1px 2px #01040966, 0 8px 24px #01040966;
   --shadow-pop:0 8px 24px #01040999;
   --shadow-modal:0 18px 50px #010409cc;
+  /* —— 折叠块（dark 覆盖） —— */
+  --fold-thinking-border:#6b5b30;
+  --fold-thinking-bg:#2a2418;
+  --fold-tool-border:#3a5066;
+  --fold-tool-bg:#16202b;
+  --fold-result-border:#3f6647;
+  --fold-result-bg:#15241a;
 }
 html[data-appearance="dark"][data-theme]{
   --blue-bg:color-mix(in srgb, var(--blue) 22%, var(--panel));
@@ -1082,7 +1089,7 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .hljs{ background:transparent !important; padding:0 !important; }
 /* ---- 打字机光标 ---- */
 .cursor-blink::after{
-  content:'▍'; animation:blink 1s step-end infinite; color:var(--accent);
+  content:'▍'; animation:blink 1s step-end infinite; color:var(--blue);
 }
 @keyframes blink{ 50%{ opacity:0; } }
 /* —— 最后一轮 summary 弱化显示 —— */
