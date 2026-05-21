@@ -19,14 +19,22 @@ HTTP API:
   POST   /session/{sid}/prompt
   GET    /session/{sid}/messages?after=0&limit=200
   POST   /session/{sid}/cancel
+  POST   /services/start        body: {"id":"frontends/qqapp.py"}
+  POST   /services/stop         body: {"id":"frontends/qqapp.py"}
+  GET    /services/logs?id=frontends/qqapp.py&tail=200
+  GET    /services/panel
+  GET    /services/mykey
+  POST   /services/mykey       body: {"content":"..."}
 
-WS API:
-  GET /ws -> events only, e.g.
-  {"type":"session-state","sessionId":"sess-...","state":"running","seq":3,"updatedAt":...}
+WS API (state sync):
+  GET /ws -> on connect sends services.snapshot; service.changed on updates
+  {"type":"services.snapshot","services":[...]}
+  {"type":"service.changed","service":{...}}
 """
 from __future__ import annotations
 
-import asyncio, contextlib, importlib, json, os, sys, re
+import asyncio, contextlib, importlib, json, os, re, subprocess, sys
+from collections import deque
 import threading, time, traceback, uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -520,7 +528,7 @@ manager = AgentManager()
 
 
 # ---------------------------------------------------------------------------
-# Transport layer: WS notification only
+# Transport layer: WS state push
 # ---------------------------------------------------------------------------
 
 class WsHub:
@@ -546,6 +554,252 @@ class WsHub:
 hub = WsHub()
 
 
+# ---------------------------------------------------------------------------
+# Service management (hub.pyw core + WS notify)
+# ---------------------------------------------------------------------------
+
+_SKIP = frozenset({"goal_mode.py", "chatapp_common.py", "tuiapp.py", "qtapp.py"})
+BRIDGE_ID = "__bridge__"
+
+_SERVICE_KEYS: Dict[str, tuple] = {
+    "frontends/qqapp.py": ("qq_app_id", "qq_app_secret"),
+    "frontends/dcapp.py": ("discord_bot_token",),
+    "frontends/dingtalkapp.py": ("dingtalk_client_id", "dingtalk_client_secret"),
+    "frontends/fsapp.py": ("fs_app_id", "fs_app_secret"),
+    "frontends/tgapp.py": ("tg_bot_token",),
+    "frontends/wecomapp.py": ("wecom_bot_id", "wecom_secret"),
+}
+
+
+def _load_mykeys(ga_root: Path) -> dict:
+    if not (ga_root / "mykey.py").exists():
+        return {}
+    root = str(ga_root.resolve())
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import mykey as mk
+    importlib.reload(mk)
+    return {k: v for k, v in vars(mk).items() if not k.startswith("_")}
+
+
+def discover_im_services(ga_root: Path) -> List[dict]:
+    out: List[dict] = []
+    d = ga_root / "frontends"
+    if not d.is_dir():
+        return out
+    for f in sorted(os.listdir(d)):
+        if "app" not in f or not f.endswith(".py") or f in _SKIP or "stapp" in f or "tuiapp" in f:
+            continue
+        rel = f"frontends/{f}"
+        out.append({"id": rel, "cmd": [sys.executable, str(d / f)]})
+    return out
+
+
+def discover_extra_services(ga_root: Path) -> List[dict]:
+    out: List[dict] = []
+    sched = ga_root / "reflect" / "scheduler.py"
+    if sched.is_file():
+        out.append({
+            "id": "reflect/scheduler.py",
+            "cmd": [sys.executable, "agentmain.py", "--reflect", "reflect/scheduler.py"],
+        })
+    return out
+
+
+def _mem_mb(pid: Optional[int]) -> Optional[int]:
+    if not pid:
+        return None
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not h:
+            return None
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(counters), counters.cb)
+        ctypes.windll.kernel32.CloseHandle(h)
+        return round(counters.WorkingSetSize / 1024 / 1024) if ok else None
+    status = Path(f"/proc/{pid}/status")
+    if status.is_file():
+        for line in status.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("VmRSS:"):
+                return round(int(line.split()[1]) / 1024)
+    return None
+
+
+def _cpu_pct(pid: Optional[int]) -> Optional[float]:
+    if not pid:
+        return None
+    try:
+        import psutil
+        return round(psutil.Process(pid).cpu_percent(0) or 0, 1)
+    except Exception:
+        return None
+
+
+class ServiceManager:
+    """hub.pyw ServiceManager + HTTP/WS glue."""
+
+    def __init__(self, ga_root: str, emit_fn):
+        self.ga_root = Path(ga_root)
+        self.procs: Dict[str, subprocess.Popen] = {}
+        self.buffers: Dict[str, deque] = {}
+        self._emit = emit_fn
+        im = discover_im_services(self.ga_root)
+        extra = discover_extra_services(self.ga_root)
+        self._im_catalog = {s["id"]: s for s in im}
+        self._catalog = {**self._im_catalog, **{s["id"]: s for s in extra}}
+        self._stopping: Set[str] = set()
+
+    def _is_configured(self, sid: str) -> bool:
+        keys = _SERVICE_KEYS.get(sid)
+        if not keys:
+            return True
+        mykeys = _load_mykeys(self.ga_root)
+        return all(str(mykeys.get(k) or "").strip() for k in keys)
+
+    def _log_tail(self, sid: str, n: int = 3) -> str:
+        buf = self.buffers.get(sid)
+        if not buf:
+            return ""
+        lines = [ln.strip() for ln in list(buf)[-n:] if ln.strip()]
+        return lines[-1][:300] if lines else ""
+
+    def _state(self, sid: str, *, err: str = "") -> dict:
+        proc = self.procs.get(sid)
+        running = proc is not None and proc.poll() is None
+        status = "running" if running else "offline"
+        last_error = err
+        if proc is not None and proc.poll() is not None:
+            if sid in self._stopping:
+                status, last_error = "offline", ""
+            else:
+                status = "error"
+                last_error = err or self._log_tail(sid) or f"exit code {proc.returncode}"
+        elif err:
+            status, running = "error", False
+        return {
+            "id": sid,
+            "status": status,
+            "running": running,
+            "pid": proc.pid if running else None,
+            "lastError": last_error,
+        }
+
+    def list_state(self) -> List[dict]:
+        return [self._state(sid) for sid in sorted(self._im_catalog)]
+
+    def _bridge_state(self) -> dict:
+        pid = os.getpid()
+        port = int(os.environ.get("BRIDGE_PORT", "14168"))
+        return {
+            "id": BRIDGE_ID,
+            "name": f"bridge (:{port})",
+            "status": "running",
+            "running": True,
+            "pid": pid,
+            "memMb": _mem_mb(pid),
+            "cpuPct": _cpu_pct(pid),
+            "managed": False,
+            "lastError": "",
+        }
+
+    def list_panel_state(self) -> List[dict]:
+        out = [self._bridge_state()]
+        for sid in sorted(self._catalog):
+            item = self._state(sid)
+            item["name"] = sid
+            item["memMb"] = _mem_mb(item.get("pid"))
+            item["cpuPct"] = _cpu_pct(item.get("pid"))
+            item["managed"] = True
+            out.append(item)
+        return out
+
+    def _notify(self, sid: str, *, err: str = "") -> None:
+        self._emit({"type": "service.changed", "service": self._state(sid, err=err)})
+
+    def _wait_started(self, proc: subprocess.Popen, timeout: float = 2.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.1)
+
+    def _reader(self, sid: str, proc: subprocess.Popen) -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            buf = self.buffers.get(sid)
+            if buf is not None:
+                buf.append(line)
+        self._notify(sid)
+
+    def start_service(self, sid: str) -> dict:
+        svc = self._catalog.get(sid)
+        if not svc:
+            raise KeyError(sid)
+        proc = self.procs.get(sid)
+        if proc is not None and proc.poll() is None:
+            return {"ok": True, "service": self._state(sid)}
+        if not self._is_configured(sid):
+            keys = ", ".join(_SERVICE_KEYS.get(sid, ()))
+            err = f"not configured in mykey.py ({keys})"
+            self._notify(sid, err=err)
+            return {"ok": False, "error": "not_configured", "service": self._state(sid, err=err)}
+        self.buffers[sid] = deque(maxlen=500)
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        kw: Dict[str, Any] = dict(
+            cwd=str(self.ga_root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=env,
+        )
+        if sys.platform == "win32":
+            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.Popen(svc["cmd"], **kw)
+        self.procs[sid] = proc
+        threading.Thread(target=self._reader, args=(sid, proc), daemon=True).start()
+        self._wait_started(proc)
+        item = self._state(sid)
+        self._notify(sid)
+        if item["status"] == "error":
+            return {"ok": False, "error": item["lastError"] or "start_failed", "service": item}
+        return {"ok": True, "service": item}
+
+    def stop_service(self, sid: str) -> dict:
+        if sid not in self._catalog:
+            raise KeyError(sid)
+        self._stopping.add(sid)
+        proc = self.procs.get(sid)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+        self.procs.pop(sid, None)
+        self._stopping.discard(sid)
+        item = self._state(sid)
+        self._notify(sid)
+        return {"ok": True, "service": item}
+
+    def read_logs(self, sid: str, tail: int = 200) -> dict:
+        if sid == BRIDGE_ID:
+            return {"ok": True, "lines": [f"GenericAgent bridge pid={os.getpid()}"]}
+        if sid not in self._catalog:
+            raise KeyError(sid)
+        tail = max(1, min(int(tail or 200), 2000))
+        buf = self.buffers.get(sid)
+        lines = [ln.rstrip("\n") for ln in list(buf or [])[-tail:]]
+        return {"ok": True, "lines": lines}
+
+
+services = ServiceManager(str(DEFAULT_GA_ROOT), hub.emit)
+
+
 def emit_session_state(sess: Session, state_name: str):
     hub.emit({
         "type": "session-state",
@@ -569,6 +823,10 @@ async def ws_handler(request):
         "http": True,
         "wsEventsOnly": True,
     }, ensure_ascii=False))
+    await ws.send_str(json.dumps({
+        "type": "services.snapshot",
+        "services": services.list_state(),
+    }, ensure_ascii=False, default=str))
     async for msg in ws:
         if msg.type == WSMsgType.TEXT:
             # WS is intentionally not a data/command channel anymore.
@@ -719,20 +977,101 @@ async def path_open_handler(request):
     kind = data.get("kind", "")
     if kind == "mykey":
         target = Path(manager.ga_root) / "mykey.py"
+        if not target.exists():
+            template = Path(manager.ga_root) / "mykey_template.py"
+            target = template if template.exists() else target
+    elif kind == "mykeyTemplate":
+        target = Path(manager.ga_root) / "mykey_template.py"
     else:
         target = Path(data.get("path") or data.get("target") or manager.ga_root)
     target = target.resolve()
     if not target.exists():
-        return json_ok({"ok": False, "error": f"File not found: {target}"})
-    # Actually open the file with the system default editor
-    import subprocess, platform
-    if platform.system() == "Windows":
-        os.startfile(str(target))
-    elif platform.system() == "Darwin":
-        subprocess.Popen(["open", str(target)])
-    else:
-        subprocess.Popen(["xdg-open", str(target)])
+        return json_ok({"ok": False, "error": f"File not found: {target}"}, status=404)
+    try:
+        _open_path_in_editor(target)
+    except OSError as e:
+        return json_ok({"ok": False, "error": str(e), "path": str(target)}, status=500)
     return json_ok({"ok": True, "path": str(target)})
+
+
+def _open_path_in_editor(target: Path) -> None:
+    """Open a file in the user's editor; Windows .py often has no default association."""
+    import platform
+    path = str(target.resolve())
+    if platform.system() == "Windows":
+        try:
+            os.startfile(path, "edit")
+            return
+        except OSError:
+            pass
+        for cmd in (["notepad.exe", path], ["cursor.cmd", path], ["code.cmd", path], ["cursor", path], ["code", path]):
+            try:
+                subprocess.Popen(cmd, close_fds=True)
+                return
+            except (FileNotFoundError, OSError):
+                continue
+        raise OSError(f"No editor available to open: {path}")
+    if platform.system() == "Darwin":
+        subprocess.Popen(["open", path])
+        return
+    subprocess.Popen(["xdg-open", path])
+
+
+def _mykey_file() -> Path:
+    root = Path(manager.ga_root)
+    target = root / "mykey.py"
+    if not target.is_file():
+        template = root / "mykey_template.py"
+        if template.is_file():
+            target.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+    return target
+
+
+async def mykey_get_handler(request):
+    target = _mykey_file()
+    content = target.read_text(encoding="utf-8") if target.is_file() else ""
+    return json_ok({"content": content, "path": str(target)})
+
+
+async def mykey_save_handler(request):
+    data = await read_json(request)
+    content = data.get("content")
+    if content is None:
+        return json_ok({"ok": False, "error": "missing_content"}, status=400)
+    target = _mykey_file()
+    target.write_text(str(content), encoding="utf-8")
+    return json_ok({"ok": True, "path": str(target)})
+
+
+async def service_start_handler(request):
+    body = await read_json(request)
+    sid = body.get("id") or request.query.get("id")
+    if not sid:
+        return json_ok({"ok": False, "error": "missing_id"}, status=400)
+    result = services.start_service(sid)
+    if not result.get("ok"):
+        return json_ok(result, status=400)
+    return json_ok(result)
+
+
+async def service_stop_handler(request):
+    body = await read_json(request)
+    sid = body.get("id") or request.query.get("id")
+    if not sid:
+        return json_ok({"ok": False, "error": "missing_id"}, status=400)
+    return json_ok(services.stop_service(sid))
+
+
+async def service_logs_handler(request):
+    sid = request.query.get("id")
+    if not sid:
+        return json_ok({"ok": False, "error": "missing_id"}, status=400)
+    tail = int(request.query.get("tail") or 200)
+    return json_ok(services.read_logs(sid, tail=tail))
+
+
+async def service_panel_handler(request):
+    return json_ok({"services": services.list_panel_state()})
 
 
 async def token_stats_handler(request):
@@ -776,12 +1115,21 @@ def create_app():
     app.router.add_post("/session/{sid}/cancel", cancel_handler)
     app.router.add_post("/path/open", path_open_handler)
     app.router.add_get("/token-stats", token_stats_handler)
+    app.router.add_post("/services/start", service_start_handler)
+    app.router.add_post("/services/stop", service_stop_handler)
+    app.router.add_get("/services/logs", service_logs_handler)
+    app.router.add_get("/services/panel", service_panel_handler)
+    app.router.add_get("/services/mykey", mykey_get_handler)
+    app.router.add_post("/services/mykey", mykey_save_handler)
 
     # Serve static frontend (desktop/static/)
     static_dir = APP_DIR / "desktop" / "static"
 
     async def index_handler(request):
-        return web.FileResponse(static_dir / "index.html")
+        return web.FileResponse(
+            static_dir / "index.html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     app.router.add_get("/", index_handler)
     app.router.add_static("/", static_dir, show_index=False)

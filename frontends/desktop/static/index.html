@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>GenericAgent</title>
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=5">
 <!-- DEV 脚手架(标注模式)：删本行 + 下方 annot.js 一行即可彻底移除 -->
 <link rel="stylesheet" href="annot.css">
 <script>
@@ -165,14 +165,8 @@
           <div class="page-pad">
             <div class="page-title" data-i18n="page.channels.title"></div>
             <div class="page-sub" data-i18n="page.channels.sub"></div>
-            <div class="list" id="chan-list">
-              <div class="list-row"><svg class="lr-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><b data-i18n="ch.wechat"></b><span class="lr-st on" data-i18n="st.online"></span><span class="grow"></span><button class="sw-mini on"><i></i></button><a class="link sm" data-i18n="act.configure"></a></div>
-              <div class="list-row"><svg class="lr-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><b data-i18n="ch.wecom"></b><span class="lr-st off" data-i18n="st.offline"></span><span class="grow"></span><button class="sw-mini"><i></i></button><a class="link sm" data-i18n="act.configure"></a></div>
-              <div class="list-row"><svg class="lr-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><b>QQ</b><span class="lr-st off" data-i18n="st.offline"></span><span class="grow"></span><button class="sw-mini"><i></i></button><a class="link sm" data-i18n="act.configure"></a></div>
-              <div class="list-row"><svg class="lr-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><b>Telegram</b><span class="lr-st on" data-i18n="st.online"></span><span class="grow"></span><button class="sw-mini on"><i></i></button><a class="link sm" data-i18n="act.configure"></a></div>
-              <div class="list-row"><svg class="lr-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><b data-i18n="ch.lark"></b><span class="lr-st off" data-i18n="st.offline"></span><span class="grow"></span><button class="sw-mini"><i></i></button><a class="link sm" data-i18n="act.configure"></a></div>
-              <div class="list-row"><svg class="lr-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><b data-i18n="ch.dingtalk"></b><span class="lr-st err" data-i18n="st.error"></span><span class="grow"></span><button class="sw-mini"><i></i></button><a class="link sm" data-i18n="act.configure"></a></div>
-            </div>
+            <div class="list" id="chan-list"></div>
+            <div class="list-empty" id="chan-empty" hidden data-i18n="ch.empty"></div>
           </div>
         </section>
 
@@ -181,12 +175,7 @@
           <div class="page-pad">
             <div class="page-title" data-i18n="page.status.title"></div>
             <div class="page-sub" data-i18n="page.status.sub"></div>
-            <div class="list">
-              <div class="list-row"><b>bridge (:14168)</b><span class="lr-st on" data-i18n="st.running"></span><span class="kv">PID 1234</span><span class="kv">35MB</span><span class="grow"></span><a class="link sm" data-i18n="act.logs"></a><a class="link sm" data-i18n="act.restart"></a></div>
-              <div class="list-row"><b data-i18n="proc.imbotWechat"></b><span class="lr-st on" data-i18n="st.running"></span><span class="kv">PID 1290</span><span class="kv">61MB</span><span class="grow"></span><a class="link sm" data-i18n="act.logs"></a><a class="link sm" data-i18n="act.stop"></a></div>
-              <div class="list-row"><b data-i18n="proc.scheduler"></b><span class="lr-st on" data-i18n="st.running"></span><span class="kv">PID 1305</span><span class="kv">22MB</span><span class="grow"></span><a class="link sm" data-i18n="act.logs"></a><a class="link sm" data-i18n="act.stop"></a></div>
-              <div class="list-row"><b data-i18n="proc.imbotDing"></b><span class="lr-st err" data-i18n="st.abnormal"></span><span class="kv">—</span><span class="kv">—</span><span class="grow"></span><a class="link sm" data-i18n="act.logs"></a><a class="link sm" data-i18n="act.start"></a></div>
-            </div>
+            <div class="list" id="status-list"></div>
           </div>
         </section>
 
@@ -348,6 +337,41 @@
     </div>
   </div>
 
+  <!-- 渠道日志 弹窗 -->
+  <div class="modal" id="chan-log-modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card modal-card-wide modal-card-inset" role="dialog">
+      <div class="modal-head">
+        <div class="modal-title" id="chan-log-title" data-i18n="modal.channelLogs"></div>
+        <button class="modal-x" data-close data-i18n-title="common.close" title="">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body modal-body-inset">
+        <pre class="chan-log-pre" id="chan-log-pre"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- mykey 配置 弹窗 -->
+  <div class="modal" id="chan-config-modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card modal-card-wide modal-card-inset" role="dialog">
+      <div class="modal-head">
+        <div class="modal-title" id="chan-config-title" data-i18n="modal.mykeyConfig"></div>
+        <button class="modal-x" data-close data-i18n-title="common.close" title="">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body modal-body-inset chan-config-body">
+        <textarea id="chan-config-editor" class="mykey-editor" spellcheck="false"></textarea>
+        <div class="chan-config-foot">
+          <button type="button" class="chan-config-save" id="chan-config-save" data-i18n="common.save"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- 配置 弹窗 -->
   <div class="modal" id="settings-modal" hidden>
     <div class="modal-backdrop" data-close></div>
@@ -408,9 +432,10 @@
   </div>
 </div>
 
+<div id="toast-root" class="toast-root" aria-live="polite"></div>
+
 <script src="vendor/marked.min.js"></script>
-<script src="ga-web.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=7"></script>
 <script src="annot.js"></script><!-- DEV 脚手架，可删 -->
 </body>
 </html>
