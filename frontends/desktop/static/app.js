@@ -269,7 +269,7 @@ const I18N = {
     'slash.unknown': '未知命令',
     'upload.hint': '上传文件：选择 / 拖拽 / 粘贴',
     'upload.button': '上传文件',
-    'upload.tooLarge': '文件过大或数量超限',
+    'upload.tooLarge': '文件过大或数量超限', 'upload.empty': '跳过空文件',
     'upload.failed': '上传失败',
     'upload.removeTitle': '移除',
     'upload.dropHint': '松开以上传文件',
@@ -362,7 +362,7 @@ const I18N = {
     'slash.unknown': 'Unknown command',
     'upload.hint': 'Upload file: pick / drag / paste',
     'upload.button': 'Upload file',
-    'upload.tooLarge': 'File too large or limit reached',
+    'upload.tooLarge': 'File too large or limit reached', 'upload.empty': 'Skipped empty file',
     'upload.failed': 'Upload failed',
     'upload.removeTitle': 'Remove',
     'upload.dropHint': 'Drop to upload files',
@@ -1572,14 +1572,17 @@ async function addFiles(fileList) {
   const files = Array.from(fileList || []);
   if (files.length === 0) return;
   let skipped = false;
+  let emptyHit = false;
   const accepted = [];
   for (const f of files) {
+    if (!f || f.size === 0) { emptyHit = true; continue; }
     if (f.size > MAX_UPLOAD_BYTES) { skipped = true; continue; }
     if (state.pendingFiles.length + accepted.length >= MAX_UPLOAD_FILES) { skipped = true; break; }
     accepted.push(f);
   }
+  if (emptyHit) showChanToast(t('upload.empty'), '', 'err');
   if (accepted.length === 0) {
-    if (skipped) showSystem(t('upload.tooLarge'));
+    if (skipped) showChanToast(t('upload.tooLarge'), '', 'err');
     return;
   }
   for (const f of accepted) {
@@ -1602,10 +1605,10 @@ async function addFiles(fileList) {
       insertPlaceholderInComposer(placeholderFor(entry));
       renderThumbStrip();
     } catch (e) {
-      showSystem(t('upload.failed') + ': ' + (e.message || e));
+      showChanToast(t('upload.failed'), e.message || String(e), 'err');
     }
   }
-  if (skipped) showSystem(t('upload.tooLarge'));
+  if (skipped) showChanToast(t('upload.tooLarge'), '', 'err');
 }
 
 if (uploadBtn && imgInput) uploadBtn.addEventListener('click', (e) => {

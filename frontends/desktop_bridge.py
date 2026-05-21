@@ -1081,7 +1081,14 @@ async def upload_handler(request):
     Body: {name: "<original filename>", dataUrl: "data:<mime>;base64,<...>"}
     Returns: {ok: true, path: "<abs path>"}
     """
-    data = await read_json(request)
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            data = {}
+    except web.HTTPRequestEntityTooLarge:
+        return json_ok({"ok": False, "error": "file too large for bridge body limit"})
+    except Exception as e:
+        return json_ok({"ok": False, "error": f"invalid request: {e}"})
     name = (data.get("name") or "file").strip().replace("/", "_").replace("\\", "_")
     data_url = data.get("dataUrl") or ""
     if "," in data_url:
@@ -1092,6 +1099,8 @@ async def upload_handler(request):
         blob = base64.b64decode(b64)
     except Exception as e:
         return json_ok({"ok": False, "error": f"decode failed: {e}"})
+    if not blob:
+        return json_ok({"ok": False, "error": "empty file"})
     safe_name = name or "file"
     fpath = _WEB_UPLOAD_DIR / f"{uuid.uuid4().hex[:12]}__{safe_name}"
     fpath.write_bytes(blob)
@@ -1216,7 +1225,7 @@ async def token_stats_handler(request):
 
 
 def create_app():
-    app = web.Application(middlewares=[cors_middleware])
+    app = web.Application(middlewares=[cors_middleware], client_max_size=1 * 1024 * 1024)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/status", status_handler)
     app.router.add_get("/config", get_config_handler)
