@@ -497,19 +497,17 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
   padding:5px 12px; font-size:12px; color:var(--txt-2); cursor:pointer;
 }
 .pill:hover{ border-color:var(--line-strong); }
+/* 纯状态展示组件（不可点）：就绪=绿，运行中=红 */
 .run-state{
   display:flex; align-items:center; gap:9px; height:30px; color:var(--ok);
   font-weight:600; font-size:12px; border:none; background:transparent;
-  padding:0; font-family:inherit; cursor:pointer; line-height:1;
+  padding:0; font-family:inherit; cursor:default; line-height:1;
 }
 .run-state .dot{
-  width:9px; height:9px; border-radius:50%; background:var(--ok);
-  flex:0 0 auto; transition:box-shadow .15s;
+  width:9px; height:9px; border-radius:50%; background:var(--ok); flex:0 0 auto;
 }
-.run-state:hover .dot{ box-shadow:0 0 0 7px var(--ok-ring); }
-.run-state.stopped{ color:var(--danger); }
-.run-state.stopped .dot{ background:var(--danger-dot); border-radius:2px; }
-.run-state.stopped:hover .dot{ box-shadow:0 0 0 7px var(--danger-ring); }
+.run-state.busy{ color:var(--danger); }
+.run-state.busy .dot{ background:var(--danger-dot); }
 .link{ color:var(--blue); cursor:pointer; }
 .muted{ color:var(--muted); }
 .ic-btn{
@@ -808,6 +806,14 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
   animation:ga-spin .65s linear infinite;
 }
 .send svg{ width:15px; height:15px; }
+/* 运行中：发送键变红色停止键（点击=暂停当前回合）。回车仍走发送（打断重发）。 */
+.send.is-stop{ background:var(--danger); cursor:pointer; }
+.send.is-stop:hover{ background:var(--danger-dot); }
+.send.is-stop svg{ display:none; }
+.send.is-stop::after{
+  content:''; width:12px; height:12px; border-radius:3px;
+  background:var(--on-accent);
+}
 
 /* ============ ④ 右侧会话面板 ============ */
 .rp-toggle, .sb-toggle{

@@ -304,7 +304,7 @@ const I18N = {
     'st.starting': '启动中…', 'st.stopping': '停止中…',
     'st.online': '在线', 'st.offline': '离线', 'st.error': '错误', 'st.running': '运行', 'st.abnormal': '异常',
     'act.configure': '配置', 'act.logs': '日志', 'act.restart': '重启', 'act.stop': '停止', 'act.start': '启动',
-    'act.copy': '复制', 'act.copied': '已复制', 'act.copyTex': 'TeX',
+    'act.copy': '复制', 'act.copied': '已复制', 'act.copyTex': 'TeX', 'act.send': '发送',
     'proc.imbotWechat': 'imbot · 微信', 'proc.imbotDing': 'imbot · 钉钉', 'proc.scheduler': '定时任务调度',
     'cm.scheduling': '调度中', 'cm.running': '执行中', 'cm.idleSt': '空闲',
     'cm.master': '已派 3 子任务', 'cm.w1': '子任务：抓取数据', 'cm.w2': '子任务：复核结果', 'cm.sub': '等待派单',
@@ -409,7 +409,7 @@ const I18N = {
     'st.starting': 'Starting…', 'st.stopping': 'Stopping…',
     'st.online': 'Online', 'st.offline': 'Offline', 'st.error': 'Error', 'st.running': 'Running', 'st.abnormal': 'Error',
     'act.configure': 'Configure', 'act.logs': 'Logs', 'act.restart': 'Restart', 'act.stop': 'Stop', 'act.start': 'Start',
-    'act.copy': 'Copy', 'act.copied': 'Copied', 'act.copyTex': 'TeX',
+    'act.copy': 'Copy', 'act.copied': 'Copied', 'act.copyTex': 'TeX', 'act.send': 'Send',
     'proc.imbotWechat': 'imbot · WeChat', 'proc.imbotDing': 'imbot · DingTalk', 'proc.scheduler': 'Scheduler',
     'cm.scheduling': 'Scheduling', 'cm.running': 'Running', 'cm.idleSt': 'Idle',
     'cm.master': 'Dispatched 3 subtasks', 'cm.w1': 'Subtask: fetch data', 'cm.w2': 'Subtask: review results', 'cm.sub': 'Waiting for tasks',
@@ -1041,22 +1041,19 @@ function statusLabel() {
   if (s && rt(s).busy) return t('status.running');
   return state.bridgeReady ? t('status.ready') : t('status.disconnected');
 }
-function refreshStatusLabel() { if (!runToggle.classList.contains('stopped')) runLabel.textContent = statusLabel(); }
+function refreshStatusLabel() { runLabel.textContent = statusLabel(); }
 function setBusy(sess, busy) {
   const r = rt(sess); r.busy = busy;
   if (!isActive(sess)) return;
-  runToggle.classList.remove('stopped');
   runToggle.classList.toggle('busy', busy);
   runLabel.textContent = busy ? t('status.running') : (state.bridgeReady ? t('status.ready') : t('status.disconnected'));
-}
-runToggle.addEventListener('click', async () => {
-  const sess = activeSess();
-  if (sess && rt(sess).busy) {
-    await cancelPrompt();
-    runLabel.textContent = t('status.stopped');
-    runToggle.classList.add('stopped');
+  if (sendBtn) {
+    sendBtn.classList.toggle('is-stop', busy);
+    sendBtn.setAttribute('aria-label', busy ? t('act.stop') : t('act.send'));
+    sendBtn.title = busy ? t('act.stop') : '';
   }
-});
+}
+// run-toggle 现为纯状态展示组件：运行中转红，不再响应点击（停止改由发送键的录制键承担）
 
 /* ═══════════════ 会话 ═══════════════ */
 function isUntitled(x) { return !x || /^(new chat|新对话|新会话)$/i.test(String(x).trim()); }
@@ -1406,7 +1403,12 @@ async function submitInput() {
     setComposerLocked(false);
   }
 }
-sendBtn.addEventListener('click', (e) => { e.preventDefault(); submitInput(); });
+sendBtn.addEventListener('click', (e) => {
+  e.preventDefault();
+  const sess = activeSess();
+  if (sess && rt(sess).busy) { cancelPrompt(); return; }  // 运行中：发送键是录制键 → 纯停止
+  submitInput();
+});
 inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitInput(); } });
 inputEl.addEventListener('input', () => {
   inputEl.style.height = 'auto';
