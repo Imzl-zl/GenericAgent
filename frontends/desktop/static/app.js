@@ -804,15 +804,20 @@ function refreshEmptyState(sess) {
 }
 
 /* ═══════════════ 消息渲染 ═══════════════ */
+function stripAttachPlaceholders(text) {
+  return String(text || '').replace(/\[(Image|File)\s+#\d+\]\s*/g, '').trim();
+}
 function msgNode(msg) {
   const el = document.createElement('div');
   el.className = 'msg ' + (msg.role || 'system');
   if (msg.role === 'user') {
     const shown = (typeof msg.display === 'string' && msg.display.length) ? msg.display : msg.content;
     const imgsHtml = (msg.images && msg.images.length)
-      ? `<div class="bubble-imgs">${msg.images.map(im => `<img src="${im.dataUrl}" alt="">`).join('')}</div>`
+      ? `<div class="user-imgs">${msg.images.map(im => `<img src="${im.dataUrl}" alt="">`).join('')}</div>`
       : '';
-    el.innerHTML = `<div class="bubble">${escapeHtml(shown)}</div>${imgsHtml}`;
+    const cleanText = stripAttachPlaceholders(shown);
+    const textHtml = cleanText ? `<div class="bubble">${escapeHtml(cleanText)}</div>` : '';
+    el.innerHTML = `<div class="user-stack">${imgsHtml}${textHtml}</div>`;
   }
   else if (msg.role === 'assistant') {
     const body = msg.stopped ? (msg.content + '\n\n_[' + t('status.stopped') + ']_') : msg.content;
@@ -1178,7 +1183,8 @@ async function sendPrompt(text) {
   sess.messages.push(userMsg); appendMessage(sess, userMsg);
   sess.lastActiveTs = Date.now();
   if (sess.untitled || isUntitled(sess.title)) {
-    sess.title = text.slice(0, 40) + (text.length > 40 ? '…' : '');
+    const titleText = stripAttachPlaceholders(text) || text;
+    sess.title = titleText.slice(0, 40) + (titleText.length > 40 ? '…' : '');
     sess.untitled = false; renderSessionList();
   }
   saveSessions();
@@ -2159,7 +2165,7 @@ document.addEventListener('keydown', (e) => {
 });
 if (msgArea) {
   msgArea.addEventListener('click', (e) => {
-    const img = e.target.closest('.bubble-imgs img');
+    const img = e.target.closest('.user-imgs img');
     if (img && img.src) openLightbox(img.src);
   });
 }

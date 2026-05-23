@@ -997,19 +997,24 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
   z-index:50;
 }
 
-/* ─── message bubble: image attachments ─── */
-.bubble-imgs{
-  display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;
+/* ─── message bubble: image attachments (Gemini-style: image floats free, text in its own bubble) ─── */
+.user-stack{
+  display:flex; flex-direction:column; align-items:flex-end;
+  gap:6px; max-width:80%;
 }
-.bubble-imgs img{
+.user-imgs{
+  display:flex; flex-wrap:wrap; gap:4px;
+  justify-content:flex-end;
+}
+.user-imgs img{
   width:120px; height:120px;
-  border-radius:8px;
-  border:1px solid var(--line);
+  border-radius:12px;
   background:var(--field-bg);
   object-fit:cover;
   cursor:zoom-in;
   display:block;
 }
+.user-stack .bubble{ max-width:100%; }
 
 /* ─── lightbox (image preview) ─── */
 .lightbox{
