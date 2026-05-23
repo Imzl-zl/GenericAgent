@@ -751,8 +751,8 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .send.is-busy::after{
   content:''; position:absolute; inset:0; margin:auto;
   width:16px; height:16px;
-  border:2px solid rgba(255,255,255,.35);
-  border-top-color:#fff; border-radius:50%;
+  border:2px solid color-mix(in srgb, var(--on-accent) 35%, transparent);
+  border-top-color:var(--on-accent); border-radius:50%;
   animation:ga-spin .65s linear infinite;
 }
 .send svg{ width:15px; height:15px; }
