@@ -286,7 +286,7 @@ const I18N = {
     'upload.removeTitle': '移除',
     'upload.dropHint': '松开以上传文件',
     'lightbox.closeTitle': '关闭',
-    'fold.thinking': '思考', 'fold.tool': '工具调用', 'fold.toolResult': '工具结果', 'fold.llm': 'LLM Running',
+    'fold.thinking': '思考', 'fold.tool': '工具调用', 'fold.toolResult': '工具结果', 'fold.llm': 'LLM Running', 'fold.turn': '第 {n} 轮',
     'model.auto': '自动选择',
     'model.menuLabel': '选择模型',
     'chip.plan': 'Plan',
@@ -391,7 +391,7 @@ const I18N = {
     'upload.removeTitle': 'Remove',
     'upload.dropHint': 'Drop to upload files',
     'lightbox.closeTitle': 'Close',
-    'fold.thinking': 'Thinking', 'fold.tool': 'Tool call', 'fold.toolResult': 'Tool result', 'fold.llm': 'LLM Running',
+    'fold.thinking': 'Thinking', 'fold.tool': 'Tool call', 'fold.toolResult': 'Tool result', 'fold.llm': 'LLM Running', 'fold.turn': 'Turn {n}',
     'model.auto': 'Auto',
     'model.menuLabel': 'Select model',
     'chip.plan': 'Plan',
@@ -765,22 +765,86 @@ function renderMarkdown(text) {
     return html;
   } catch (_) { return escapeHtml(text); }
 }
+function extractLastTurnForCopy(text) {
+  const src = String(text || '');
+  // 与 renderAssistant 同款分隔正则；取最后一个 mark 之后的 body
+  const turnRe = /\**LLM Running \(Turn (\d+)\) \.\.\.\**/g;
+  let lastEnd = 0, mm;
+  while ((mm = turnRe.exec(src)) !== null) lastEnd = mm.index + mm[0].length;
+  let body = src.slice(lastEnd);
+  // 去掉模型在最后一轮开头的 <summary>...</summary>
+  body = body.replace(/<summary>[\s\S]*?<\/summary>\s*/i, '');
+  return body.trim();
+}
 function renderAssistant(text) {
-  let s = String(text || '');
+  const src = String(text || '');
+  // 1) 按 "LLM Running (Turn N)..." 标记切分多轮；N 从原文捕获，无硬编码文案
+  const turnRe = /\**LLM Running \(Turn (\d+)\) \.\.\.\**/g;
+  const marks = [];
+  let mm;
+  while ((mm = turnRe.exec(src)) !== null) {
+    marks.push({ idx: mm.index, end: mm.index + mm[0].length, n: mm[1] });
+  }
+  const segs = [];
+  if (marks.length === 0) {
+    segs.push({ n: null, body: src });
+  } else {
+    if (marks[0].idx > 0) segs.push({ n: null, body: src.slice(0, marks[0].idx) });
+    for (let i = 0; i < marks.length; i++) {
+      const start = marks[i].end;
+      const stop = (i + 1 < marks.length) ? marks[i + 1].idx : src.length;
+      segs.push({ n: marks[i].n, body: src.slice(start, stop) });
+    }
+  }
+  // 2) 块级折叠：占位符使用 HTML 注释，避免与正文 F\d+ 冲突
   const folds = [];
-  const stash = (label, body, cls) => { folds.push({ label, body, cls: cls || '' }); return ` F${folds.length - 1} `; };
-  s = s.replace(/<thinking>[\s\S]*?<\/thinking>/gi, m => stash(t('fold.thinking'), m.replace(/<\/?thinking>/gi, ''), 'fold-thinking'));
-  s = s.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, m => stash(t('fold.tool'), m, 'fold-tool'));
-  s = s.replace(/<function_results>[\s\S]*?<\/function_results>/gi, m => stash(t('fold.toolResult'), m, 'fold-result'));
-  s = s.replace(/(\**LLM Running \(Turn \d+\) \.\.\.\**)/g, m => stash(t('fold.llm'), m, 'fold-turn'));
-  let html = renderMarkdown(s);
-  html = html.replace(/F(\d+)/g, (_, i) => {
-    const f = folds[Number(i)];
-    return `<details class="fold ${f.cls || ''}"><summary>${escapeHtml(f.label)}</summary><pre class="fold-pre">${escapeHtml(f.body)}</pre></details>`;
+  const stash = (label, body, cls) => { folds.push({ label, body, cls: cls || '' }); return `\n\n§§FOLD:${folds.length - 1}§§\n\n`; };
+  const foldBlocks = (body) => {
+    let s = body;
+    // thinking: 兼容 <thinking> XML 与 <details>...</details>（未来扩展）
+    s = s.replace(/<thinking>[\s\S]*?<\/thinking>/gi, m => stash(t('fold.thinking'), m.replace(/<\/?thinking>/gi, ''), 'fold-thinking'));
+    // 工具调用：agent_loop 实际格式 = "🛠️ Tool: `name`  📥 args:\n````text\n{json}\n````"
+    s = s.replace(/🛠️ Tool: `([^`]+)`[^\n]*\n````text\n([\s\S]*?)\n````/g,
+                  (_, name, json) => stash(`${t('fold.tool')}: ${name}`, json, 'fold-tool'));
+    // 工具结果：5 反引号围栏
+    s = s.replace(/`{5}\n([\s\S]*?)\n`{5}/g, (_, body) => stash(t('fold.toolResult'), body, 'fold-result'));
+    // 兼容旧 XML 标记（保险）
+    s = s.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, m => stash(t('fold.tool'), m, 'fold-tool'));
+    s = s.replace(/<function_results>[\s\S]*?<\/function_results>/gi, m => stash(t('fold.toolResult'), m, 'fold-result'));
+    // 模型在回复开头自带 <summary>...</summary>（非 <details> 子元素），转为弱化样式块
+    s = s.replace(/<summary>([\s\S]*?)<\/summary>/gi, (_, inner) => `<div class="turn-summary">${inner}</div>`);
+    return renderMarkdown(s);
+  };
+  // 3) 拼装：历史轮包 details 默认折叠，最后一轮平铺
+  const turnLabel = (n) => t('fold.turn').replace('{n}', n);
+  // 从原始 seg.body 中抽出该轮首个 <summary>...</summary> 文本，作为折叠头副标题
+  const extractTurnSummary = (raw) => {
+    const m = /<summary>([\s\S]*?)<\/summary>/i.exec(raw || '');
+    if (!m) return '';
+    return m[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+  };
+  const parts = segs.map((seg, i) => {
+    const inner = foldBlocks(seg.body);
+    const isLast = (i === segs.length - 1);
+    if (seg.n == null) return inner;
+    const sum = extractTurnSummary(seg.body);
+    const head = sum
+      ? `${escapeHtml(turnLabel(seg.n))}：<span class="turn-head-sum">${escapeHtml(sum)}</span>`
+      : escapeHtml(turnLabel(seg.n));
+    if (isLast) return `<div class="turn-summary">${head}</div>${inner}`;
+    return `<details class="fold fold-turn"><summary>${head}</summary>${inner}</details>`;
   });
-  return html;
+  // 4) 还原块级占位符
+  return parts.join('').replace(/(?:<p>\s*)?§§FOLD:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => {
+    const f = folds[Number(i)];
+    return `<details class="fold ${f.cls}"><summary>${escapeHtml(f.label)}</summary><pre class="fold-pre">${escapeHtml(f.body)}</pre></details>`;
+  });
 }
 /* ═══════════════ 渲染后增强 (PR移植) ═══════════════ */
+/* ───────────── 统一复制 SVG Icon ───────────── */
+const SVG_COPY_ICON = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+const SVG_CHECK_ICON = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+
 function postRenderEnhance(containerEl) {
   if (!containerEl) return;
   // 代码高亮 + 复制按钮
@@ -788,10 +852,11 @@ function postRenderEnhance(containerEl) {
     if (typeof hljs !== 'undefined') hljs.highlightElement(block);
     if (!block.parentElement.querySelector('.code-copy-btn')) {
       const btn = document.createElement('button');
-      btn.className = 'code-copy-btn'; btn.textContent = t('act.copy');
+      btn.className = 'code-copy-btn'; btn.innerHTML = SVG_COPY_ICON;
+      btn.title = t('act.copy');
       btn.onclick = () => {
         navigator.clipboard.writeText(block.textContent).then(() => {
-          btn.textContent = t('act.copied'); setTimeout(() => btn.textContent = t('act.copy'), 1500);
+          btn.innerHTML = SVG_CHECK_ICON; setTimeout(() => btn.innerHTML = SVG_COPY_ICON, 1500);
         });
       };
       block.parentElement.style.position = 'relative';
@@ -804,10 +869,11 @@ function postRenderEnhance(containerEl) {
     const src = el.querySelector('annotation[encoding="application/x-tex"]');
     if (!src) return;
     const btn = document.createElement('button');
-    btn.className = 'latex-copy-btn'; btn.textContent = t('act.copyTex');
+    btn.className = 'latex-copy-btn'; btn.innerHTML = SVG_COPY_ICON;
+    btn.title = t('act.copyTex');
     btn.onclick = () => {
       navigator.clipboard.writeText(src.textContent).then(() => {
-        btn.textContent = '✓'; setTimeout(() => btn.textContent = t('act.copyTex'), 1500);
+        btn.innerHTML = SVG_CHECK_ICON; setTimeout(() => btn.innerHTML = SVG_COPY_ICON, 1500);
       });
     };
     el.style.position = 'relative';
@@ -981,19 +1047,43 @@ function msgNode(msg) {
   }
   else if (msg.role === 'error') el.innerHTML = `<div class="bubble err">${escapeHtml(msg.content)}</div>`;
   else el.innerHTML = `<div class="bubble sys">${escapeHtml(msg.content)}</div>`;
+  if (msg.role === 'user' || msg.role === 'assistant') {
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'bubble-copy-btn';
+    copyBtn.title = t('act.copy');
+    copyBtn.innerHTML = SVG_COPY_ICON;
+    copyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const text = (msg.role === 'user')
+        ? stripAttachPlaceholders((typeof msg.display === 'string' && msg.display.length) ? msg.display : (msg.content || ''))
+        : extractLastTurnForCopy(msg.content || '');
+      navigator.clipboard.writeText(text).then(() => {
+        copyBtn.innerHTML = SVG_CHECK_ICON;
+        setTimeout(() => { copyBtn.innerHTML = SVG_COPY_ICON; }, 1500);
+      });
+    });
+    el.appendChild(copyBtn);
+  }
   return el;
 }
 function renderAllMessages(sess) {
   const box = ensureMsgs(); box.innerHTML = '';
   for (const m of sess.messages) box.appendChild(msgNode(m));
-  refreshEmptyState(sess); scrollBottom();
+  refreshEmptyState(sess); scrollBottom(true);
 }
 function appendMessage(sess, msg) {
   if (!isActive(sess)) return;
   ensureMsgs().appendChild(msgNode(msg));
-  refreshEmptyState(sess); scrollBottom();
+  refreshEmptyState(sess); scrollBottom(true);
 }
-function scrollBottom() { requestAnimationFrame(() => { msgArea.scrollTop = msgArea.scrollHeight; }); }
+function isNearBottom(threshold = 80) {
+  return msgArea.scrollHeight - msgArea.scrollTop - msgArea.clientHeight < threshold;
+}
+function scrollBottom(force) {
+  if (force || isNearBottom()) {
+    requestAnimationFrame(() => { msgArea.scrollTop = msgArea.scrollHeight; });
+  }
+}
 /* ═══════════════ 打字机效果 (PR移植) ═══════════════ */
 const TW_SPEED = 12;  // 每 tick 显示字符数
 const TW_INTERVAL = 30; // ms
@@ -1016,15 +1106,26 @@ function renderDraft(sess) {
       }
       tw.shown = Math.min(tw.shown + TW_SPEED, cur.length);
       const visible = cur.slice(0, tw.shown);
-      r.draftEl.innerHTML = `<div class="bubble md">${renderAssistant(visible)}<span class="cursor"></span></div>`;
-      postRenderEnhance(r.draftEl.querySelector('.bubble'));
-      scrollBottom();
+      rewriteDraftBubble(r, visible);
     }, TW_INTERVAL);
   }
   const visible = (r.draftText || '').slice(0, tw.shown);
+  rewriteDraftBubble(r, visible);
+  refreshEmptyState(sess);
+}
+
+// 重写打字机气泡：先记 near + 保存 <details> open 态；innerHTML 替换后恢复 open；仅当原先贴底才滚
+function rewriteDraftBubble(r, visible) {
+  const wasNear = isNearBottom();
+  const openIdx = [];
+  if (r.draftEl) {
+    r.draftEl.querySelectorAll('details').forEach((d, i) => { if (d.open) openIdx.push(i); });
+  }
   r.draftEl.innerHTML = `<div class="bubble md">${renderAssistant(visible)}<span class="cursor"></span></div>`;
   postRenderEnhance(r.draftEl.querySelector('.bubble'));
-  refreshEmptyState(sess); scrollBottom();
+  const dets = r.draftEl.querySelectorAll('details');
+  openIdx.forEach(i => { if (dets[i]) dets[i].open = true; });
+  if (wasNear) scrollBottom(true);
 }
 
 function flushTypewriter(sess) {
@@ -1409,7 +1510,7 @@ sendBtn.addEventListener('click', (e) => {
   if (sess && rt(sess).busy) { cancelPrompt(); return; }  // 运行中：发送键是录制键 → 纯停止
   submitInput();
 });
-inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitInput(); } });
+inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); submitInput(); } });
 inputEl.addEventListener('input', () => {
   inputEl.style.height = 'auto';
   inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
