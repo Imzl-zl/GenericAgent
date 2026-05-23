@@ -1190,7 +1190,7 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 /* ---- highlight.js 适配 ---- */
 .hljs{ background:transparent !important; padding:0 !important; }
 html[data-appearance="dark"] .bubble.md{
-  --md-link:color-mix(in srgb, var(--blue) 42%, #ffffff);
+  --md-link:color-mix(in srgb, var(--blue) 42%, var(--txt-strong));
 }
 html[data-appearance="dark"] .bubble.md .katex{ color:var(--txt); }
 html[data-appearance="dark"] .bubble.md a{ color:var(--md-link); }
