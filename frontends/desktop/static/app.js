@@ -264,6 +264,9 @@ const I18N = {
     'status.disconnected': '未连接', 'status.stopped': '已停止', 'status.idle': '空闲',
     'conv.emptyList': '暂无会话，点「＋ 新对话」开始', 'conv.defaultTitle': '新对话',
     'err.bridge': 'bridge 未连接', 'err.newSession': '新建会话失败', 'err.poll': '轮询失败', 'err.stop': '停止失败',
+    'err.interruptTimeout': '等待上一轮停止超时，请稍后再试',
+    'sys.interruptPrev.hint': '已停止上一轮，正在处理新消息',
+    'chat.interrupting': '正在停止上一轮…',
     'sys.stopRequested': '已请求停止',
     'slash.help': '可用命令：\n/new 新会话  /clear 清屏  /stop 停止  /settings 设置',
     'slash.unknown': '未知命令',
@@ -357,6 +360,9 @@ const I18N = {
     'status.disconnected': 'Disconnected', 'status.stopped': 'Stopped', 'status.idle': 'Idle',
     'conv.emptyList': 'No chats yet — click “＋ New chat”', 'conv.defaultTitle': 'New chat',
     'err.bridge': 'Bridge not connected', 'err.newSession': 'Failed to create session', 'err.poll': 'Polling failed', 'err.stop': 'Stop failed',
+    'err.interruptTimeout': 'Timed out waiting for the previous reply to stop — try again',
+    'sys.interruptPrev.hint': 'Previous reply stopped — processing new message',
+    'chat.interrupting': 'Stopping previous reply…',
     'sys.stopRequested': 'Stop requested',
     'slash.help': 'Commands:\n/new new chat  /clear clear  /stop stop  /settings settings',
     'slash.unknown': 'Unknown command',
@@ -730,7 +736,11 @@ const chatPage   = document.querySelector('.page[data-page="chat"]');
 const msgArea    = chatPage.querySelector('.msg-area');
 const chatStart  = msgArea.querySelector('.chat-start');
 const inputEl    = chatPage.querySelector('.input');
-const sendBtn    = chatPage.querySelector('.send');
+const sendBtn    = document.getElementById('send-btn');
+const composerEl = chatPage.querySelector('.composer');
+const msgLoading = document.getElementById('msg-loading');
+const MIN_MSG_LOADING_MS = 450;
+let _submitInFlight = false;
 const runToggle  = document.getElementById('run-toggle');
 const runLabel   = runToggle.querySelector('.rs-label');
 const convListEl = document.querySelector('.conv-list');
@@ -779,7 +789,11 @@ const modelNameEl= modelChip ? modelChip.querySelector('.model-name') : null;
 
 let msgsEl = null;
 function ensureMsgs() {
-  if (!msgsEl) { msgsEl = document.createElement('div'); msgsEl.className = 'msgs'; msgArea.appendChild(msgsEl); }
+  if (!msgsEl) {
+    msgsEl = document.createElement('div');
+    msgsEl.className = 'msgs';
+    msgArea.insertBefore(msgsEl, msgLoading || null);
+  }
   return msgsEl;
 }
 function refreshEmptyState(sess) {
@@ -874,7 +888,6 @@ function setBusy(sess, busy) {
   runToggle.classList.remove('stopped');
   runToggle.classList.toggle('busy', busy);
   runLabel.textContent = busy ? t('status.running') : (state.bridgeReady ? t('status.ready') : t('status.disconnected'));
-  sendBtn.disabled = busy;
 }
 runToggle.addEventListener('click', async () => {
   const sess = activeSess();
@@ -1072,14 +1085,85 @@ async function pollSession(sess) {
   }
 }
 
+function removeUsedPendingFiles(usedFiles) {
+  if (!usedFiles.length) return;
+  const usedSids = new Set(usedFiles.map(f => f.sid));
+  state.pendingFiles = state.pendingFiles.filter(f => !usedSids.has(f.sid));
+  renderThumbStrip();
+}
+
+function clearDraft(sess) {
+  flushTypewriter(sess);
+  const r = rt(sess);
+  if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
+}
+
+async function waitSessionIdle(sess, maxMs = 4000) {
+  const start = Date.now();
+  while (rt(sess).busy && Date.now() - start < maxMs) {
+    await new Promise(z => setTimeout(z, 100));
+  }
+  return !rt(sess).busy;
+}
+
+function setMsgLoading(on) {
+  if (msgArea) msgArea.classList.toggle('is-loading', !!on);
+  if (msgLoading) {
+    msgLoading.hidden = !on;
+    if (on) scrollBottom();
+  }
+}
+
+function setComposerLocked(on) {
+  if (composerEl) composerEl.classList.toggle('is-locked', !!on);
+  if (inputEl) inputEl.readOnly = !!on;
+  if (sendBtn) {
+    sendBtn.disabled = !!on;
+    sendBtn.classList.toggle('is-busy', !!on);
+    sendBtn.setAttribute('aria-busy', on ? 'true' : 'false');
+  }
+}
+
+/** stapp.py 同款：运行中再发 → cancel 当前轮次，等 idle 后再提交新 prompt */
+async function interruptBeforeSend(sess) {
+  if (!rt(sess).busy) return true;
+  const t0 = Date.now();
+  setMsgLoading(true);
+  try {
+    clearDraft(sess);
+    try {
+      const res = await window.ga.rpc('session/cancel', { sessionId: sess.bridgeSessionId || sess.id });
+      if (res?.error) throw new Error(res.error.message || res.error);
+    } catch (e) {
+      showChanToast(t('err.stop') + ': ' + (e.message || e), '', 'err');
+      return false;
+    }
+    showChanToast(t('sys.interruptPrev.hint'), '', 'info');
+    const idle = await waitSessionIdle(sess);
+    clearDraft(sess);
+    if (!idle) {
+      showChanToast(t('err.interruptTimeout'), '', 'err');
+      return false;
+    }
+    return true;
+  } finally {
+    const wait = Math.max(0, MIN_MSG_LOADING_MS - (Date.now() - t0));
+    if (wait) await new Promise(r => setTimeout(r, wait));
+    setMsgLoading(false);
+  }
+}
+
 /* ═══════════════ 发送 / 取消 ═══════════════ */
 async function sendPrompt(text) {
   text = String(text || '').trim();
-  if (!text) return;
-  if (!state.bridgeReady) { showError(t('err.bridge')); return; }
-  if (!state.activeId) { await newSession(); if (!state.activeId) return; }
+  if (!text) return false;
+  if (!state.bridgeReady) { showError(t('err.bridge')); return false; }
+  if (!state.activeId) { await newSession(); if (!state.activeId) return false; }
   const sess = activeSess(); const r = rt(sess);
-  if (r.busy) return;
+  if (r.busy) {
+    const interrupted = await interruptBeforeSend(sess);
+    if (!interrupted) return false;
+  }
   const planPrefix = state.planMode ? t('presetPrompt.planMode') : '';
   const autoPrefix = state.autoMode ? t('presetPrompt.autoMode') : '';
   const expandedText = expandFilePlaceholders(text);
@@ -1112,15 +1196,16 @@ async function sendPrompt(text) {
     }
     const res = await window.ga.rpc('session/prompt', { sessionId: sid, prompt: composedPrompt, display: text, llmNo: state.llmNo });
     if (res?.error) throw new Error(res.error.message || res.error);
-    state.pendingFiles = [];
-    renderThumbStrip();
+    removeUsedPendingFiles(usedFiles);
     const uid = Number(res.userMessageId || res.result?.userMessageId || 0);
     if (uid) { r.seen.add(uid); r.lastId = Math.max(r.lastId, uid); }
     pollSession(sess);
+    return true;
   } catch (e) {
     const em = { role: 'error', content: e.message || String(e) };
     sess.messages.push(em); appendMessage(sess, em);
     setBusy(sess, false);
+    return false;
   }
 }
 async function cancelPrompt() {
@@ -1134,12 +1219,28 @@ async function cancelPrompt() {
 }
 
 /* ═══════════════ 输入区 / slash / 预设 ═══════════════ */
-function submitInput() {
+async function submitInput() {
+  if (_submitInFlight) return;
   const text = inputEl.value;
   if (!text.trim()) return;
-  inputEl.value = ''; inputEl.style.height = 'auto';
-  if (text.trim().startsWith('/')) { handleSlash(text.trim()); return; }
-  sendPrompt(text);
+  if (text.trim().startsWith('/')) {
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+    handleSlash(text.trim());
+    return;
+  }
+  _submitInFlight = true;
+  setComposerLocked(true);
+  try {
+    const sent = await sendPrompt(text);
+    if (sent) {
+      inputEl.value = '';
+      inputEl.style.height = 'auto';
+    }
+  } finally {
+    _submitInFlight = false;
+    setComposerLocked(false);
+  }
 }
 sendBtn.addEventListener('click', (e) => { e.preventDefault(); submitInput(); });
 inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitInput(); } });
@@ -2105,7 +2206,7 @@ function showChanToast(title, detail, kind) {
   if (_chanToastTimer) clearTimeout(_chanToastTimer);
   root.innerHTML = '';
   const el = document.createElement('div');
-  el.className = `toast toast-${kind === 'ok' ? 'ok' : 'err'}`;
+  el.className = `toast toast-${kind === 'err' ? 'err' : kind === 'info' ? 'info' : 'ok'}`;
   const tEl = document.createElement('span');
   tEl.className = 'toast-title';
   tEl.textContent = title;

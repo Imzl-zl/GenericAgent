@@ -497,9 +497,33 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
 
 /* 聊天页 */
 .msg-area{
+  position:relative;
   flex:1; overflow:auto; display:flex; flex-direction:column;
   align-items:center; justify-content:center; gap:14px; padding:24px;
 }
+.msg-area.has-msgs .msg-loading{ margin-top:auto; }
+.msg-loading{
+  position:sticky; bottom:16px; align-self:center; z-index:20;
+  display:flex; align-items:center; gap:10px;
+  margin-top:12px; padding:10px 16px;
+  border-radius:999px; background:var(--card);
+  border:1px solid color-mix(in srgb, var(--blue) 35%, var(--line));
+  box-shadow:var(--shadow-pop);
+  font-size:13px; font-weight:600; color:var(--txt);
+  pointer-events:none;
+}
+.msg-loading[hidden]{ display:none !important; }
+.msg-area.is-loading .msg-loading{ animation:msg-loading-in .2s ease-out; }
+@keyframes msg-loading-in{
+  from{ opacity:0; transform:translateY(8px); }
+  to{ opacity:1; transform:translateY(0); }
+}
+.ga-spin{
+  width:20px; height:20px; flex:0 0 auto;
+  border:2.5px solid var(--line); border-top-color:var(--blue);
+  border-radius:50%; animation:ga-spin .65s linear infinite;
+}
+@keyframes ga-spin{ to{ transform:rotate(360deg); } }
 .msg-area.has-msgs{ align-items:stretch; justify-content:flex-start; }
 .conv-empty{ color:var(--muted2); font-size:12px; }
 
@@ -593,8 +617,19 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .toast-err{
   color:var(--danger-text); background:var(--danger-bg); border:1px solid var(--danger-ring);
 }
+.toast-info{
+  color:var(--muted); background:var(--card); border:1px solid var(--line);
+  box-shadow:var(--shadow); padding:6px 12px; min-width:0; font-size:12px;
+}
 .toast-title{ font-weight:600; display:block; margin-bottom:2px; }
 .toast-detail{ font-size:12px; opacity:.88; display:block; word-break:break-word; }
+.toast-info .toast-title{ font-weight:500; margin-bottom:0; }
+.composer.is-locked{
+  opacity:.55; pointer-events:none; filter:saturate(.75);
+}
+.composer.is-locked .input{
+  background:var(--field-bg); cursor:not-allowed;
+}
 .chan-log-pre{
   max-height:360px; overflow:auto; margin:0;
   font-family:inherit; font-size:13px; line-height:1.5;
@@ -706,9 +741,19 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .composer-bot{ display:flex; align-items:center; justify-content:space-between; margin-top:8px; }
 .cb-left{ display:flex; align-items:center; gap:4px; }
 .send{
+  position:relative;
   width:34px; height:34px; border-radius:50%; border:none; cursor:pointer;
   background:var(--blue); color:var(--on-accent);
   display:flex; align-items:center; justify-content:center;
+}
+.send:disabled{ opacity:.7; cursor:not-allowed; }
+.send.is-busy svg{ visibility:hidden; }
+.send.is-busy::after{
+  content:''; position:absolute; inset:0; margin:auto;
+  width:16px; height:16px;
+  border:2px solid rgba(255,255,255,.35);
+  border-top-color:#fff; border-radius:50%;
+  animation:ga-spin .65s linear infinite;
 }
 .send svg{ width:15px; height:15px; }
 
