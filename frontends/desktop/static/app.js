@@ -274,6 +274,15 @@ const I18N = {
     'upload.button': '上传文件',
     'upload.tooLarge': '文件过大或数量超限', 'upload.empty': '跳过空文件',
     'upload.failed': '上传失败',
+    'file.openFailed': '无法打开文件',
+    'file.kindGeneric': '文件',
+    'file.kindDoc': '文档',
+    'file.kindSheet': '表格',
+    'file.kindSlide': '幻灯片',
+    'file.kindCode': '代码',
+    'file.kindArchive': '压缩包',
+    'file.kindAudio': '音频',
+    'file.kindVideo': '视频',
     'upload.removeTitle': '移除',
     'upload.dropHint': '松开以上传文件',
     'lightbox.closeTitle': '关闭',
@@ -370,6 +379,15 @@ const I18N = {
     'upload.button': 'Upload file',
     'upload.tooLarge': 'File too large or limit reached', 'upload.empty': 'Skipped empty file',
     'upload.failed': 'Upload failed',
+    'file.openFailed': 'Cannot open file',
+    'file.kindGeneric': 'File',
+    'file.kindDoc': 'Document',
+    'file.kindSheet': 'Spreadsheet',
+    'file.kindSlide': 'Slides',
+    'file.kindCode': 'Code',
+    'file.kindArchive': 'Archive',
+    'file.kindAudio': 'Audio',
+    'file.kindVideo': 'Video',
     'upload.removeTitle': 'Remove',
     'upload.dropHint': 'Drop to upload files',
     'lightbox.closeTitle': 'Close',
@@ -917,6 +935,26 @@ function refreshEmptyState(sess) {
 function stripAttachPlaceholders(text) {
   return String(text || '').replace(/\[(Image|File)\s+#\d+\]\s*/g, '').trim();
 }
+function fileSubLabel(name) {
+  const m = String(name || '').match(/\.([^.]+)$/);
+  if (!m) return t('file.kindGeneric');
+  const ext = m[1].toLowerCase();
+  const docExts = ['pdf', 'doc', 'docx', 'rtf', 'odt', 'pages', 'tex'];
+  const sheetExts = ['xls', 'xlsx', 'csv', 'tsv', 'numbers', 'ods'];
+  const slideExts = ['ppt', 'pptx', 'key', 'odp'];
+  const codeExts = ['py', 'js', 'ts', 'tsx', 'jsx', 'java', 'c', 'cpp', 'h', 'hpp', 'rs', 'go', 'rb', 'php', 'sh', 'html', 'css', 'json', 'yaml', 'yml', 'xml', 'sql', 'md'];
+  const archiveExts = ['zip', 'tar', 'gz', 'rar', '7z', 'bz2'];
+  const audioExts = ['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a'];
+  const videoExts = ['mp4', 'mov', 'avi', 'mkv', 'webm', 'wmv'];
+  if (docExts.includes(ext)) return t('file.kindDoc');
+  if (sheetExts.includes(ext)) return t('file.kindSheet');
+  if (slideExts.includes(ext)) return t('file.kindSlide');
+  if (codeExts.includes(ext)) return t('file.kindCode') + ' · ' + ext.toUpperCase();
+  if (archiveExts.includes(ext)) return t('file.kindArchive');
+  if (audioExts.includes(ext)) return t('file.kindAudio');
+  if (videoExts.includes(ext)) return t('file.kindVideo');
+  return ext.toUpperCase();
+}
 function msgNode(msg) {
   const el = document.createElement('div');
   el.className = 'msg ' + (msg.role || 'system');
@@ -925,9 +963,16 @@ function msgNode(msg) {
     const imgsHtml = (msg.images && msg.images.length)
       ? `<div class="user-imgs">${msg.images.map(im => `<img src="${im.dataUrl}" alt="">`).join('')}</div>`
       : '';
+    const filesHtml = (msg.files && msg.files.length)
+      ? `<div class="user-files">${msg.files.map(f => {
+          const name = f.name || 'file';
+          const sub = fileSubLabel(name);
+          return `<div class="file-chip" data-path="${escapeHtml(f.path || '')}" data-name="${escapeHtml(name)}"><span class="fc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></span><span class="fc-meta"><span class="fc-name">${escapeHtml(name)}</span><span class="fc-sub">${escapeHtml(sub)}</span></span></div>`;
+        }).join('')}</div>`
+      : '';
     const cleanText = stripAttachPlaceholders(shown);
     const textHtml = cleanText ? `<div class="bubble">${escapeHtml(cleanText)}</div>` : '';
-    el.innerHTML = `<div class="user-stack">${imgsHtml}${textHtml}</div>`;
+    el.innerHTML = `<div class="user-stack">${filesHtml}${imgsHtml}${textHtml}</div>`;
   }
   else if (msg.role === 'assistant') {
     const body = msg.stopped ? (msg.content + '\n\n_[' + t('status.stopped') + ']_') : msg.content;
@@ -1161,6 +1206,7 @@ function normalize(m) {
   if (typeof m.display === 'string' && m.display.length) o.display = m.display;
   if (m.stopped) o.stopped = true;
   if (m.images) o.images = m.images;
+  if (m.files) o.files = m.files;
   return o;
 }
 function upsert(sess, raw, partial) {
@@ -1290,6 +1336,8 @@ async function sendPrompt(text) {
   const userMsg = { role: 'user', content: text };
   const previewImgs = usedFiles.filter(f => f.isImage && f.dataUrl).map(f => ({ id: 'f-' + f.sid, dataUrl: f.dataUrl }));
   if (previewImgs.length) userMsg.images = previewImgs;
+  const previewFiles = usedFiles.filter(f => !f.isImage).map(f => ({ id: 'f-' + f.sid, name: f.name, path: f.path }));
+  if (previewFiles.length) userMsg.files = previewFiles;
   sess.messages.push(userMsg); appendMessage(sess, userMsg);
   sess.lastActiveTs = Date.now();
   if (sess.untitled || isUntitled(sess.title)) {
@@ -1736,8 +1784,11 @@ function renderThumbStrip() {
     if (f.isImage && f.dataUrl) {
       return `<div class="thumb" data-sid="${f.sid}"><img src="${f.dataUrl}"><button class="x" data-sid="${f.sid}" data-i18n-title="upload.removeTitle" title="">×</button></div>`;
     }
-    const label = (f.name || 'file').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
-    return `<div class="file-chip" data-sid="${f.sid}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span class="fc-name">${label}</span><button class="x" data-sid="${f.sid}" data-i18n-title="upload.removeTitle" title="">×</button></div>`;
+    const name = f.name || 'file';
+    const label = name.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+    const sub = fileSubLabel(name).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+    const path = (f.path || '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+    return `<div class="file-chip pending" data-sid="${f.sid}" data-path="${path}"><span class="fc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></span><span class="fc-meta"><span class="fc-name">${label}</span><span class="fc-sub">${sub}</span></span><button class="x" data-sid="${f.sid}" data-i18n-title="upload.removeTitle" title="">×</button></div>`;
   }).join('');
   thumbStrip.hidden = false;
   applyI18n();
@@ -1865,6 +1916,12 @@ if (thumbStrip) thumbStrip.addEventListener('click', (e) => {
         }).catch(() => {});
       }
     }
+    return;
+  }
+  const fileChip = e.target.closest('.file-chip.pending');
+  if (fileChip) {
+    const path = fileChip.getAttribute('data-path');
+    if (path) openUploadFile(path);
     return;
   }
   const img = e.target.closest('img');
@@ -2285,8 +2342,27 @@ document.addEventListener('keydown', (e) => {
 if (msgArea) {
   msgArea.addEventListener('click', (e) => {
     const img = e.target.closest('.user-imgs img');
-    if (img && img.src) openLightbox(img.src);
+    if (img && img.src) { openLightbox(img.src); return; }
+    const fileChip = e.target.closest('.user-files .file-chip');
+    if (fileChip) {
+      const path = fileChip.getAttribute('data-path');
+      if (path) openUploadFile(path);
+    }
   });
+}
+
+async function openUploadFile(path) {
+  try {
+    const res = await fetch(`http://${location.hostname}:14168/path/open`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'upload', path }),
+    });
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.error || 'open failed');
+  } catch (e) {
+    showChanToast(t('file.openFailed'), e.message || String(e), 'err');
+  }
 }
 
 /* ═══════════════ 消息通道（复用 gaServiceStore + WS 同步） ═══════════════ */

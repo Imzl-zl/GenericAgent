@@ -1034,6 +1034,52 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 }
 .file-chip .x:hover{ color:var(--danger); }
 
+/* ─── thumb-strip 里的文件 chip：升级成卡片样式（与消息中一致） ─── */
+.thumb-strip .file-chip.pending{
+  height:auto;
+  min-height:52px;
+  padding:8px 32px 8px 8px;
+  gap:9px;
+  max-width:240px;
+  border-radius:10px;
+  background:var(--panel);
+  cursor:pointer;
+  transition:background .15s, border-color .15s, box-shadow .15s;
+}
+.thumb-strip .file-chip.pending:hover{
+  background:var(--hover-2);
+  border-color:var(--line-strong);
+  box-shadow:var(--shadow);
+}
+.thumb-strip .file-chip.pending .fc-icon{
+  width:32px; height:32px;
+  flex:0 0 auto;
+  border-radius:50%;
+  background:var(--blue-bg);
+  color:var(--blue);
+  display:flex; align-items:center; justify-content:center;
+}
+.thumb-strip .file-chip.pending .fc-icon svg{
+  width:16px; height:16px;
+  color:inherit;
+}
+.thumb-strip .file-chip.pending .fc-meta{
+  display:flex; flex-direction:column;
+  min-width:0;
+  line-height:1.25;
+}
+.thumb-strip .file-chip.pending .fc-name{
+  font-size:12px;
+  font-weight:600;
+  color:var(--txt-strong);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.thumb-strip .file-chip.pending .fc-sub{
+  font-size:11px;
+  color:var(--muted);
+  margin-top:1px;
+}
+
 /* ─── chat panel: drag-over overlay ─── */
 .main.dragover{ position:relative; }
 .main.dragover::after{
@@ -1065,6 +1111,55 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
   object-fit:cover;
   cursor:zoom-in;
   display:block;
+}
+.user-files{
+  display:flex; flex-direction:column; gap:6px;
+  align-items:flex-end;
+}
+.user-files .file-chip{
+  height:auto;
+  min-height:56px;
+  padding:10px 14px 10px 10px;
+  gap:10px;
+  max-width:280px;
+  border-radius:12px;
+  background:var(--panel);
+  cursor:pointer;
+  transition:background .15s, border-color .15s, box-shadow .15s, transform .15s;
+}
+.user-files .file-chip:hover{
+  background:var(--hover-2);
+  border-color:var(--line-strong);
+  box-shadow:var(--shadow);
+  transform:translateY(-1px);
+}
+.user-files .file-chip .fc-icon{
+  width:36px; height:36px;
+  flex:0 0 auto;
+  border-radius:50%;
+  background:var(--blue-bg);
+  color:var(--blue);
+  display:flex; align-items:center; justify-content:center;
+}
+.user-files .file-chip .fc-icon svg{
+  width:18px; height:18px;
+  color:inherit;
+}
+.user-files .file-chip .fc-meta{
+  display:flex; flex-direction:column;
+  min-width:0;
+  line-height:1.25;
+}
+.user-files .file-chip .fc-name{
+  font-size:13px;
+  font-weight:600;
+  color:var(--txt-strong);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.user-files .file-chip .fc-sub{
+  font-size:11px;
+  color:var(--muted);
+  margin-top:2px;
 }
 .user-stack .bubble{ max-width:100%; }
 

@@ -1083,6 +1083,15 @@ async def path_open_handler(request):
             target = template if template.exists() else target
     elif kind == "mykeyTemplate":
         target = Path(manager.ga_root) / "mykey_template.py"
+    elif kind == "upload":
+        raw = Path(data.get("path") or "")
+        try:
+            resolved = raw.resolve()
+            upload_root = _WEB_UPLOAD_DIR.resolve()
+            resolved.relative_to(upload_root)
+        except (ValueError, OSError):
+            return json_ok({"ok": False, "error": "path not in upload dir"}, status=403)
+        target = resolved
     else:
         target = Path(data.get("path") or data.get("target") or manager.ga_root)
     target = target.resolve()
