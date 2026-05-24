@@ -768,6 +768,7 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 }
 .tok-pager button:hover{ background:var(--hover-2); }
 .tok-pager button.active{ background:var(--blue); color:var(--on-accent); border-color:var(--blue); }
+.tok-deleted{ margin-left:6px; font-size:10px; font-weight:400; color:var(--muted2); background:var(--line-soft); border-radius:3px; padding:1px 5px; }
 .stat-row{ display:flex; gap:12px; margin:14px 0; }
 .stat{ flex:1; border:1px solid var(--line); border-radius:var(--radius); background:var(--card); padding:16px; text-align:center; }
 .s-n{ font-size:20px; font-weight:700; color:var(--txt-strong); }
