@@ -1099,6 +1099,7 @@ async def restore_handler(request):
 async def path_open_handler(request):
     data = await read_json(request)
     kind = data.get("kind", "")
+    mode = data.get("mode", "open")
     if kind == "mykey":
         target = Path(manager.ga_root) / "mykey.py"
         if not target.exists():
@@ -1121,7 +1122,10 @@ async def path_open_handler(request):
     if not target.exists():
         return json_ok({"ok": False, "error": f"File not found: {target}"}, status=404)
     try:
-        _open_path_in_editor(target)
+        if mode == "reveal":
+            _reveal_path_in_file_manager(target)
+        else:
+            _open_path_in_editor(target)
     except OSError as e:
         return json_ok({"ok": False, "error": str(e), "path": str(target)}, status=500)
     return json_ok({"ok": True, "path": str(target)})
@@ -1201,6 +1205,20 @@ def _open_path_in_editor(target: Path) -> None:
         subprocess.Popen(["open", path])
         return
     subprocess.Popen(["xdg-open", path])
+
+
+def _reveal_path_in_file_manager(target: Path) -> None:
+    """Open the system file manager and select/highlight the target file."""
+    import platform
+    path = str(target.resolve())
+    if platform.system() == "Windows":
+        subprocess.Popen(["explorer", "/select,", path])
+        return
+    if platform.system() == "Darwin":
+        subprocess.Popen(["open", "-R", path])
+        return
+    # Linux: no universal "select file" command; fall back to opening parent dir
+    subprocess.Popen(["xdg-open", str(target.parent)])
 
 
 def _mykey_file() -> Path:
