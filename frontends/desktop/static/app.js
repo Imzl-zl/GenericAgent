@@ -429,7 +429,7 @@ const I18N = {
   },
 };
 const LANGS = ['zh', 'en'];
-const STORE = { lang: 'ga_lang', theme: 'ga_theme', appearance: 'ga_appearance', plain: 'ga_plain', fontSize: 'ga_font_size', llmNo: 'ga_llm_no', sessions: 'ga_sessions', activeId: 'ga_active_id' };
+const STORE = { lang: 'ga_lang', theme: 'ga_theme', appearance: 'ga_appearance', plain: 'ga_plain', fontSize: 'ga_font_size', llmNo: 'ga_llm_no' };
 const APPEARANCE_IDS = ['light', 'dark'];
 const CHAT_FONT_MIN = 10;
 const CHAT_FONT_MAX = 20;
@@ -899,28 +899,26 @@ function rt(sess) {
 const activeSess = () => state.sessions.get(state.activeId) || null;
 const isActive = (sess) => sess && sess.id === state.activeId;
 
-function saveSessions() {
-  try {
-    const arr = [...state.sessions.values()].map(s => ({
-      id: s.id, bridgeSessionId: s.bridgeSessionId, title: s.title,
-      untitled: s.untitled, pinned: s.pinned,
-      lastActiveTs: s.lastActiveTs
-    }));
-    localStorage.setItem(STORE.sessions, JSON.stringify(arr));
-    if (state.activeId) localStorage.setItem(STORE.activeId, state.activeId);
-  } catch (_) {}
+function saveSessions() {}
+function patchSession(sess, fields) {
+  if (!sess.bridgeSessionId) return;
+  fetch(`http://${location.hostname}:14168/session/${encodeURIComponent(sess.bridgeSessionId)}`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(fields)
+  }).catch(() => {});
 }
-function loadSessions() {
+async function loadSessions() {
   try {
-    const raw = localStorage.getItem(STORE.sessions);
-    if (!raw) return;
-    const arr = JSON.parse(raw);
-    for (const s of arr) {
-      s.messages = s.messages || [];
-      state.sessions.set(s.id, s);
+    const res = await fetch(`http://${location.hostname}:14168/sessions`);
+    const data = await res.json();
+    if (!data.sessions) return;
+    for (const s of data.sessions) {
+      state.sessions.set(s.id, {
+        id: s.id, bridgeSessionId: s.id, title: s.title,
+        messages: [], untitled: s.untitled ?? true,
+        pinned: s.pinned ?? false, lastActiveTs: s.updatedAt || s.createdAt
+      });
     }
-    const savedActive = localStorage.getItem(STORE.activeId);
-    if (savedActive && state.sessions.has(savedActive)) state.activeId = savedActive;
+    if (data.activeSessionId && state.sessions.has(data.activeSessionId)) state.activeId = data.activeSessionId;
     else if (state.sessions.size) state.activeId = state.sessions.keys().next().value;
   } catch (_) {}
 }
@@ -1206,8 +1204,13 @@ async function newSession() {
   const localId = 'local-' + Date.now() + '-' + Math.random().toString(16).slice(2);
   const sess = { id: localId, bridgeSessionId: null, title: t('conv.defaultTitle'), messages: [], untitled: true, lastActiveTs: Date.now() };
   state.sessions.set(localId, sess);
-  try { await ensureBridgeSession(sess); } catch (e) { showError(t('err.newSession') + ': ' + (e.message || e)); }
-  setActiveSession(localId);
+  try {
+    await ensureBridgeSession(sess);
+    state.sessions.delete(localId);
+    sess.id = sess.bridgeSessionId;
+    state.sessions.set(sess.id, sess);
+  } catch (e) { showError(t('err.newSession') + ': ' + (e.message || e)); }
+  setActiveSession(sess.id);
   saveSessions();
   renderSessionList();
 }
@@ -1220,7 +1223,6 @@ function setActiveSession(id) {
   renderAllMessages(sess);
   setBusy(sess, rt(sess).busy);
   renderSessionList();
-  localStorage.setItem(STORE.activeId, id);
   if (sess.bridgeSessionId && !sess.messages.length && state.bridgeReady) {
     pollSession(sess);
   }
@@ -1289,6 +1291,7 @@ convMenu.addEventListener('click', (e) => {
       state.sessions = m;
     }
     saveSessions();
+    patchSession(sess, { pinned: sess.pinned });
     renderSessionList();
   } else if (sess && act === 'del') {
     closeSession(sess.id);
@@ -1442,6 +1445,7 @@ async function sendPrompt(text) {
     const titleText = stripAttachPlaceholders(text) || text;
     sess.title = titleText.slice(0, 40) + (titleText.length > 40 ? '…' : '');
     sess.untitled = false; renderSessionList();
+    patchSession(sess, { title: sess.title });
   }
   saveSessions();
   setBusy(sess, true);
@@ -1453,7 +1457,10 @@ async function sendPrompt(text) {
       if (/not found/i.test(restoreErr.message || '')) {
         sess.bridgeSessionId = null;
         sid = await ensureBridgeSession(sess);
-        saveSessions();
+        state.sessions.delete(sess.id);
+        sess.id = sess.bridgeSessionId;
+        state.sessions.set(sess.id, sess);
+        state.activeId = sess.id;
       }
     }
     const res = await window.ga.rpc('session/prompt', { sessionId: sid, prompt: composedPrompt, display: text, llmNo: state.llmNo });
@@ -2798,7 +2805,8 @@ if (chanListEl) {
 }
 
 /* ═══════════════ 启动 ═══════════════ */
-loadSessions();
+(async () => {
+await loadSessions();
 applyAppearance(appearance, plainUi, { persist: false });
 applyTheme(theme, { persist: false });
 initChatFontStepper();
@@ -2821,3 +2829,4 @@ if (state.activeId) setActiveSession(state.activeId);
 else refreshEmptyState(null);
 runLabel.textContent = t('status.connecting');
 window.ga.startBridge && window.ga.startBridge();
+})();
