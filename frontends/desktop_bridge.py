@@ -84,6 +84,8 @@ class Session:
     thread: Optional[threading.Thread] = None
     cancel_requested: bool = False
     last_error: str = ""
+    pinned: bool = False
+    untitled: bool = True
 
 
 class AgentManager:
@@ -108,7 +110,8 @@ class AgentManager:
                 for s in self.sessions.values():
                     arr.append({"id": s.id, "title": s.title, "cwd": s.cwd,
                                 "created_at": s.created_at, "updated_at": s.updated_at,
-                                "messages": s.messages, "msg_seq": s.msg_seq})
+                                "messages": s.messages, "msg_seq": s.msg_seq,
+                                "pinned": s.pinned, "untitled": s.untitled})
             self._sessions_file.write_text(json.dumps(arr, ensure_ascii=False, default=str), encoding="utf-8")
         except Exception as e:
             print(f"[bridge] persist sessions failed: {e}", file=sys.stderr)
@@ -125,6 +128,8 @@ class AgentManager:
                                updated_at=item.get("updated_at", time.time()),
                                messages=item.get("messages", []),
                                msg_seq=item.get("msg_seq", 0),
+                               pinned=item.get("pinned", False),
+                               untitled=item.get("untitled", True),
                                status="idle", agent=None)
                 self.sessions[sess.id] = sess
             if self.sessions:
@@ -306,6 +311,8 @@ class AgentManager:
             "updatedAt": sess.updated_at,
             "lastError": sess.last_error,
             "msgSeq": sess.msg_seq,
+            "pinned": sess.pinned,
+            "untitled": sess.untitled,
         }
         if include_messages:
             out["messages"] = list(sess.messages)
@@ -1044,6 +1051,22 @@ async def delete_session_handler(request):
     return json_ok(manager.delete_session(sid))
 
 
+async def patch_session_handler(request):
+    sid = request.match_info["sid"]
+    sess = manager.get_session(sid)
+    data = await read_json(request)
+    if "title" in data:
+        sess.title = data["title"]
+        sess.untitled = False
+    if "pinned" in data:
+        sess.pinned = bool(data["pinned"])
+    if "untitled" in data:
+        sess.untitled = bool(data["untitled"])
+    sess.updated_at = time.time()
+    manager._persist()
+    return json_ok({"ok": True, "session": manager.snapshot(sess, include_messages=False)})
+
+
 async def prompt_handler(request):
     sid = request.match_info["sid"]
     data = await read_json(request)
@@ -1273,6 +1296,7 @@ def create_app():
     app.router.add_post("/session/new", new_session_handler)
     app.router.add_get("/session/{sid}", get_session_handler)
     app.router.add_delete("/session/{sid}", delete_session_handler)
+    app.router.add_patch("/session/{sid}", patch_session_handler)
     app.router.add_post("/session/{sid}/prompt", prompt_handler)
     app.router.add_get("/session/{sid}/messages", messages_handler)
     app.router.add_post("/session/{sid}/cancel", cancel_handler)
