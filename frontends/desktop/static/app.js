@@ -1898,7 +1898,8 @@ function renderThumbStrip() {
     const label = name.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
     const sub = fileSubLabel(name).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
     const path = (f.path || '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
-    return `<div class="file-chip pending" data-sid="${f.sid}" data-path="${path}"><span class="fc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></span><span class="fc-meta"><span class="fc-name">${label}</span><span class="fc-sub">${sub}</span></span><button class="x" data-sid="${f.sid}" data-i18n-title="upload.removeTitle" title="">×</button></div>`;
+    const dataName = name.replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+    return `<div class="file-chip pending" data-sid="${f.sid}" data-path="${path}" data-name="${dataName}"><span class="fc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></span><span class="fc-meta"><span class="fc-name">${label}</span><span class="fc-sub">${sub}</span></span><button class="x" data-sid="${f.sid}" data-i18n-title="upload.removeTitle" title="">×</button></div>`;
   }).join('');
   thumbStrip.hidden = false;
   applyI18n();
@@ -2031,7 +2032,8 @@ if (thumbStrip) thumbStrip.addEventListener('click', (e) => {
   const fileChip = e.target.closest('.file-chip.pending');
   if (fileChip) {
     const path = fileChip.getAttribute('data-path');
-    if (path) openUploadFile(path);
+    const name = fileChip.getAttribute('data-name');
+    if (path) openUploadFile(path, name);
     return;
   }
   const img = e.target.closest('img');
@@ -2464,23 +2466,43 @@ if (msgArea) {
     const fileChip = e.target.closest('.user-files .file-chip');
     if (fileChip) {
       const path = fileChip.getAttribute('data-path');
-      if (path) openUploadFile(path);
+      const name = fileChip.getAttribute('data-name');
+      if (path) openUploadFile(path, name);
     }
   });
 }
 
-async function openUploadFile(path) {
+async function openUploadFile(path, name) {
+  const mode = isPreviewableByName(name || path) ? 'open' : 'reveal';
   try {
     const res = await fetch(`http://${location.hostname}:14168/path/open`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'upload', path }),
+      body: JSON.stringify({ kind: 'upload', path, mode }),
     });
     const j = await res.json();
     if (!j.ok) throw new Error(j.error || 'open failed');
   } catch (e) {
     showChanToast(t('file.openFailed'), e.message || String(e), 'err');
   }
+}
+
+const PREVIEWABLE_EXTS = new Set([
+  'pdf',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'heic', 'tiff',
+  'txt', 'md', 'log', 'json', 'yaml', 'yml', 'xml', 'csv', 'tsv', 'ini', 'toml', 'env', 'rtf',
+  'py', 'js', 'ts', 'tsx', 'jsx', 'java', 'c', 'cpp', 'h', 'hpp', 'rs', 'go', 'rb', 'php', 'sh', 'bash', 'zsh', 'fish', 'lua', 'pl', 'r', 'scala', 'kt', 'swift',
+  'html', 'htm', 'css', 'scss', 'sass', 'less', 'vue', 'svelte', 'sql',
+  'doc', 'docx', 'pages', 'odt',
+  'xls', 'xlsx', 'numbers', 'ods',
+  'ppt', 'pptx', 'key', 'odp',
+  'mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a',
+  'mp4', 'mov', 'avi', 'mkv', 'webm', 'wmv',
+]);
+function isPreviewableByName(name) {
+  const m = String(name || '').match(/\.([^./\\]+)$/);
+  if (!m) return false;
+  return PREVIEWABLE_EXTS.has(m[1].toLowerCase());
 }
 
 /* ═══════════════ 消息通道（复用 gaServiceStore + WS 同步） ═══════════════ */
