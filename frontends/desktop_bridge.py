@@ -1281,6 +1281,32 @@ async def token_stats_handler(request):
     return json_ok({"records": records})
 
 
+_TOKEN_HISTORY_FILE = None
+
+def _tok_file() -> Path:
+    global _TOKEN_HISTORY_FILE
+    if _TOKEN_HISTORY_FILE is None:
+        _TOKEN_HISTORY_FILE = Path(manager.ga_root) / "temp" / "desktop_token_history.json"
+    return _TOKEN_HISTORY_FILE
+
+async def get_token_history_handler(request):
+    f = _tok_file()
+    if f.is_file():
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return json_ok(data)
+        except Exception:
+            pass
+    return json_ok({"history": [], "snap": {}})
+
+async def post_token_history_handler(request):
+    data = await read_json(request)
+    f = _tok_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return json_ok({"ok": True})
+
+
 def create_app():
     app = web.Application(middlewares=[cors_middleware], client_max_size=1 * 1024 * 1024)
     app.router.add_get("/ws", ws_handler)
@@ -1305,6 +1331,8 @@ def create_app():
     app.router.add_post("/upload", upload_handler)
     app.router.add_delete("/upload", upload_delete_handler)
     app.router.add_get("/token-stats", token_stats_handler)
+    app.router.add_get("/token-history", get_token_history_handler)
+    app.router.add_post("/token-history", post_token_history_handler)
     app.router.add_post("/services/start", service_start_handler)
     app.router.add_post("/services/stop", service_stop_handler)
     app.router.add_get("/services/logs", service_logs_handler)

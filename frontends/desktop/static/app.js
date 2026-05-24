@@ -2134,7 +2134,8 @@ const tokTodayN = document.getElementById('tok-today-n');
 const tokCostN = document.getElementById('tok-cost-n');
 const TOK_PER_PAGE = 15;
 let _tokPage = 0;
-const TOK_STORE_KEY = 'ga_token_history';
+let _tokHistory = [];
+let _tokLastSnap = {};
 
 // Model price table: $/M tokens [input, output]
 const MODEL_PRICES = {
@@ -2174,17 +2175,25 @@ function modelPriceTip(model) {
   return lines.join('\n');
 }
 
-function tokLoadHistory() { try { return JSON.parse(localStorage.getItem(TOK_STORE_KEY)||'[]'); } catch(_) { return []; } }
-function tokSaveHistory(h) { localStorage.setItem(TOK_STORE_KEY, JSON.stringify(h)); }
+function tokLoadHistory() { return _tokHistory; }
+function tokSaveHistory(h) {
+  _tokHistory = h;
+  fetch(`http://${location.hostname}:14168/token-history`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({history:h, snap:_tokLastSnap})
+  }).catch(()=>{});
+}
 
-// Poll bridge and snapshot deltas into localStorage
-const TOK_SNAP_KEY = 'ga_token_snap';
-let _tokLastSnap = (() => { try { return JSON.parse(localStorage.getItem(TOK_SNAP_KEY)||'{}'); } catch(_) { return {}; } })();
 let _tokPolling = false;
 async function tokPollBridge() {
   if (_tokPolling) return;
   _tokPolling = true;
   try {
+    if (!_tokHistory.length) {
+      const stored = await bridgeFetch('/token-history');
+      if (stored.history?.length) _tokHistory = stored.history;
+      if (stored.snap) _tokLastSnap = stored.snap;
+    }
     const data = await bridgeFetch('/token-stats');
     const history = tokLoadHistory();
     for (const r of (data.records||[])) {
@@ -2201,7 +2210,6 @@ async function tokPollBridge() {
       }
       _tokLastSnap[key] = {input:r.input, output:r.output, cacheCreate:r.cacheCreate, cacheRead:r.cacheRead};
     }
-    localStorage.setItem(TOK_SNAP_KEY, JSON.stringify(_tokLastSnap));
     tokSaveHistory(history);
   } catch(_) {}
   _tokPolling = false;
