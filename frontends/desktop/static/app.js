@@ -824,10 +824,12 @@ function renderAssistant(text) {
     return m[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
   };
   const parts = segs.map((seg, i) => {
-    const inner = foldBlocks(seg.body);
     const isLast = (i === segs.length - 1);
-    if (seg.n == null) return inner;
+    if (seg.n == null) return foldBlocks(seg.body);
     const sum = extractTurnSummary(seg.body);
+    // Strip the <summary> tag from body before rendering to avoid duplication with head
+    const cleanBody = seg.body.replace(/<summary>[\s\S]*?<\/summary>\s*/i, '');
+    const inner = foldBlocks(cleanBody);
     const head = sum
       ? `${escapeHtml(turnLabel(seg.n))}：<span class="turn-head-sum">${escapeHtml(sum)}</span>`
       : escapeHtml(turnLabel(seg.n));
