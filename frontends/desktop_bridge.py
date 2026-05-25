@@ -532,78 +532,26 @@ class AgentManager:
 
 import base64
 
-# Image uploads live under GA's own temp dir (gitignored) so they survive
-# bridge restarts; stale ones are swept by the retention policy below
-# (see _sweep_stale_uploads).
-_UPLOAD_DIR = Path(DEFAULT_GA_ROOT) / "temp" / "desktop_image_uploads"
-_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _save_image_data(data_url: str, img_id: str) -> str:
-    """Save a data URL to disk, return absolute path."""
-    # data:image/png;base64,xxxxx
-    if "," in data_url:
-        header, b64 = data_url.split(",", 1)
-    else:
-        b64 = data_url
-        header = ""
-    ext = "png"
-    if "jpeg" in header or "jpg" in header:
-        ext = "jpg"
-    elif "webp" in header:
-        ext = "webp"
-    elif "gif" in header:
-        ext = "gif"
-    fpath = _UPLOAD_DIR / f"{img_id}.{ext}"
-    fpath.write_bytes(base64.b64decode(b64))
-    return str(fpath)
-
 
 def normalize_prompt(prompt: Any, images: Optional[list] = None):
-    """Normalize prompt and images.
-    
-    images: list of dicts {"id": "img-xxx", "dataUrl": "data:..."} or plain data URLs.
-    Returns: (prompt_text_with_image_tags, image_ids_list)
+    """Flatten a prompt (str or content-part list) to plain text.
+
+    Image/file attachments are handled by the frontend, which inlines the
+    uploaded file path into the prompt text (see expandFilePlaceholders) and
+    sends path-only metadata via files/imageMetas — so no per-prompt image
+    persistence happens here. The `images` arg is accepted for backward compat
+    and ignored; the returned image-id list is always empty.
     """
-    images = list(images or [])
     if isinstance(prompt, list):
         text_parts = []
         for part in prompt:
             if isinstance(part, str):
                 text_parts.append(part)
-            elif isinstance(part, dict):
-                if part.get("type") in ("text", "input_text"):
-                    text_parts.append(str(part.get("text") or part.get("content") or ""))
-                elif part.get("type") in ("image", "input_image"):
-                    url = part.get("image_url") or part.get("url") or part.get("data")
-                    if isinstance(url, dict):
-                        url = url.get("url")
-                    if url:
-                        images.append(url)
+            elif isinstance(part, dict) and part.get("type") in ("text", "input_text"):
+                text_parts.append(str(part.get("text") or part.get("content") or ""))
         prompt = "\n".join([p for p in text_parts if p])
 
-    # Process images: save to disk, build [image:path] tags
-    image_ids = []
-    image_tags = []
-    for img in images:
-        if isinstance(img, dict):
-            img_id = img.get("id") or f"img-{uuid.uuid4().hex[:8]}"
-            data_url = img.get("dataUrl") or img.get("data_url") or ""
-        else:
-            # Plain data URL string
-            img_id = f"img-{uuid.uuid4().hex[:8]}"
-            data_url = str(img)
-        if data_url:
-            path = _save_image_data(data_url, img_id)
-            image_tags.append(f"[image:{path}]")
-            image_ids.append(img_id)
-
-    # Append image tags to prompt
-    final_prompt = str(prompt or "")
-    if image_tags:
-        final_prompt = final_prompt + "\n" + "\n".join(image_tags)
-
-    return final_prompt, image_ids
+    return str(prompt or ""), []
 
 
 manager = AgentManager()
@@ -1154,16 +1102,15 @@ def _sweep_stale_uploads(retention_days: int = UPLOAD_RETENTION_DAYS) -> None:
     Replaces the old wholesale rmtree-on-startup so attachments persist across
     restarts while temp storage can't grow without bound."""
     cutoff = time.time() - retention_days * 86400
-    for d in (_UPLOAD_DIR, _WEB_UPLOAD_DIR):
-        try:
-            for f in d.iterdir():
-                try:
-                    if f.is_file() and f.stat().st_mtime < cutoff:
-                        f.unlink()
-                except OSError:
-                    pass
-        except OSError:
-            pass
+    try:
+        for f in _WEB_UPLOAD_DIR.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 _sweep_stale_uploads()
 
