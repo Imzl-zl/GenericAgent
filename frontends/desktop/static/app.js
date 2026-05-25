@@ -1948,11 +1948,11 @@ function collectUsedFiles(text) {
   return used;
 }
 
-async function uploadOne(name, dataUrl) {
+async function uploadOne(name, dataUrl, sid) {
   const res = await fetch(`http://${location.hostname}:14168/upload`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, dataUrl }),
+    body: JSON.stringify({ name, dataUrl, sid: sid || '' }),
   });
   const j = await res.json();
   if (!j.ok) throw new Error(j.error || 'upload failed');
@@ -1976,6 +1976,11 @@ async function addFiles(fileList) {
     if (skipped) showChanToast(t('upload.tooLarge'), '', 'err');
     return;
   }
+  // group uploads under the active session (create one if there's none yet)
+  let upSess = activeSess();
+  if (!upSess) { await newSession(); upSess = activeSess(); }
+  if (upSess && !upSess.bridgeSessionId) { try { await ensureBridgeSession(upSess); } catch (_) {} }
+  const uploadSid = (upSess && upSess.bridgeSessionId) || '';
   for (const f of accepted) {
     try {
       const dataUrl = await new Promise((resolve, reject) => {
@@ -1984,7 +1989,7 @@ async function addFiles(fileList) {
         r.onerror = () => reject(r.error);
         r.readAsDataURL(f);
       });
-      const path = await uploadOne(f.name || 'file', dataUrl);
+      const path = await uploadOne(f.name || 'file', dataUrl, uploadSid);
       state.fileSeq += 1;
       const sid = state.fileSeq;
       const isImage = isImageFile(f);

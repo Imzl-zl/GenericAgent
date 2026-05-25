@@ -359,6 +359,7 @@ class AgentManager:
                     sess.agent.abort()
         emit_session_state(sess, "closed")
         self._persist()
+        _purge_session_uploads(sid)
         return {"ok": True, "sessionId": sid}
 
     def submit_prompt(self, sid: str, prompt: Any, images: Optional[list] = None, llm_no: Optional[int] = None, display: Optional[str] = None, files_meta: Optional[list] = None, image_metas: Optional[list] = None) -> dict:
@@ -1097,27 +1098,57 @@ _WEB_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 UPLOAD_RETENTION_DAYS = 30
 
+
+def _safe_session_dir(sid: str) -> str:
+    """Sanitize a session id into a safe single-level folder name."""
+    s = re.sub(r"[^A-Za-z0-9_-]", "", str(sid or ""))
+    return s or "_misc"
+
+
+def _session_upload_dir(sid: str) -> Path:
+    """Per-session upload subdir under desktop_uploads/, created on demand."""
+    d = _WEB_UPLOAD_DIR / _safe_session_dir(sid)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _purge_session_uploads(sid: str) -> None:
+    """Best-effort: drop a session's whole upload subdir when the session is deleted."""
+    import shutil
+    with contextlib.suppress(Exception):
+        shutil.rmtree(_WEB_UPLOAD_DIR / _safe_session_dir(sid), ignore_errors=True)
+
+
 def _sweep_stale_uploads(retention_days: int = UPLOAD_RETENTION_DAYS) -> None:
-    """Best-effort: delete uploaded files older than retention_days (by mtime).
-    Replaces the old wholesale rmtree-on-startup so attachments persist across
-    restarts while temp storage can't grow without bound."""
+    """Best-effort: delete uploaded files older than retention_days (by mtime),
+    then drop empty session subdirs. Replaces the old wholesale rmtree-on-startup
+    so attachments persist across restarts while temp storage can't grow forever."""
     cutoff = time.time() - retention_days * 86400
     try:
-        for f in _WEB_UPLOAD_DIR.iterdir():
+        for f in _WEB_UPLOAD_DIR.rglob("*"):
             try:
                 if f.is_file() and f.stat().st_mtime < cutoff:
                     f.unlink()
             except OSError:
                 pass
+        for d in _WEB_UPLOAD_DIR.iterdir():
+            try:
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            except OSError:
+                pass
     except OSError:
         pass
+
 
 _sweep_stale_uploads()
 
 
 async def upload_handler(request):
     """Save a file uploaded by the web client and return its absolute path.
-    Body: {name: "<original filename>", dataUrl: "data:<mime>;base64,<...>"}
+    Body: {name: "<original filename>", dataUrl: "data:<mime>;base64,<...>", sid: "<session id>"}
+    Files are grouped per session under desktop_uploads/<sid>/ so deleting a
+    session can purge its attachments. Missing sid falls back to a _misc bucket.
     Returns: {ok: true, path: "<abs path>"}
     """
     try:
@@ -1141,7 +1172,7 @@ async def upload_handler(request):
     if not blob:
         return json_ok({"ok": False, "error": "empty file"})
     safe_name = name or "file"
-    fpath = _WEB_UPLOAD_DIR / f"{uuid.uuid4().hex[:12]}__{safe_name}"
+    fpath = _session_upload_dir(data.get("sid") or "") / f"{uuid.uuid4().hex[:12]}__{safe_name}"
     fpath.write_bytes(blob)
     return json_ok({"ok": True, "path": str(fpath)})
 
