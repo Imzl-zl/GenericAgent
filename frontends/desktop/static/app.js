@@ -820,10 +820,19 @@ function renderAssistant(text) {
   // 3) 拼装：历史轮包 details 默认折叠，最后一轮平铺
   const turnLabel = (n) => t('fold.turn').replace('{n}', n);
   // 从原始 seg.body 中抽出该轮首个 <summary>...</summary> 文本，作为折叠头副标题
+  // fallback: 若无 <summary> 标签，提取该轮调用的工具名列表
   const extractTurnSummary = (raw) => {
     const m = /<summary>([\s\S]*?)<\/summary>/i.exec(raw || '');
-    if (!m) return '';
-    return m[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    if (m) return m[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    // fallback: 提取工具名
+    const tools = [];
+    const toolRe = /🛠️\s*Tool:\s*`([^`]+)`/g;
+    let tm;
+    while ((tm = toolRe.exec(raw || '')) !== null) {
+      if (!tools.includes(tm[1])) tools.push(tm[1]);
+    }
+    if (tools.length) return tools.join(', ');
+    return '';
   };
   const parts = segs.map((seg, i) => {
     const isLast = (i === segs.length - 1);
