@@ -531,10 +531,11 @@ class AgentManager:
 
 
 import base64
-import tempfile
 
-# Shared temp dir for image uploads (persists for process lifetime)
-_UPLOAD_DIR = Path(tempfile.gettempdir()) / "ga_web2_uploads"
+# Image uploads live under GA's own temp dir (gitignored) so they survive
+# bridge restarts; stale ones are swept by the retention policy below
+# (see _sweep_stale_uploads).
+_UPLOAD_DIR = Path(DEFAULT_GA_ROOT) / "temp" / "desktop_image_uploads"
 _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -1140,10 +1141,31 @@ async def path_open_handler(request):
     return json_ok({"ok": True, "path": str(target)})
 
 
-_WEB_UPLOAD_DIR = Path(tempfile.gettempdir()) / "ga_web_uploads"
-import shutil as _shutil
-_shutil.rmtree(_WEB_UPLOAD_DIR, ignore_errors=True)
+# File attachments live under GA's own temp dir (gitignored), NOT the OS temp
+# dir, so they survive bridge restarts. Instead of wiping everything on startup,
+# we keep files for UPLOAD_RETENTION_DAYS and only sweep stale ones.
+_WEB_UPLOAD_DIR = Path(DEFAULT_GA_ROOT) / "temp" / "desktop_uploads"
 _WEB_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+UPLOAD_RETENTION_DAYS = 30
+
+def _sweep_stale_uploads(retention_days: int = UPLOAD_RETENTION_DAYS) -> None:
+    """Best-effort: delete uploaded files older than retention_days (by mtime).
+    Replaces the old wholesale rmtree-on-startup so attachments persist across
+    restarts while temp storage can't grow without bound."""
+    cutoff = time.time() - retention_days * 86400
+    for d in (_UPLOAD_DIR, _WEB_UPLOAD_DIR):
+        try:
+            for f in d.iterdir():
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+_sweep_stale_uploads()
 
 
 async def upload_handler(request):
