@@ -1073,7 +1073,34 @@ function msgNode(msg) {
 function renderAllMessages(sess) {
   const box = ensureMsgs(); box.innerHTML = '';
   for (const m of sess.messages) box.appendChild(msgNode(m));
+  // badge 恢复在 pollSession finally 中执行（此时 messages 已通过异步加载填充）
   refreshEmptyState(sess); scrollBottom(true);
+}
+// 遍历消息对，用 ts 差值恢复 badge；对运行中任务恢复 taskStartedAt
+function restoreElapsedBadges(sess, box) {
+  const msgs = sess.messages;
+  if (!msgs || !msgs.length) return;
+  const nodes = box.querySelectorAll('.msg');
+  let lastUserTs = null;
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].role === 'user') {
+      lastUserTs = msgs[i].ts ? msgs[i].ts * 1000 : null; // 无 ts 则重置
+    } else if (msgs[i].role === 'assistant') {
+      if (lastUserTs && msgs[i].ts) {
+        const elapsed = msgs[i].ts * 1000 - lastUserTs;
+        if (elapsed > 0 && nodes[i]) {
+          ensureTaskElapsedBadge(nodes[i], lastUserTs, msgs[i].ts * 1000);
+        }
+      }
+      lastUserTs = null;
+    }
+  }
+  // 运行中任务：最后一条是 user 且 session busy，恢复实时计时
+  if (lastUserTs && rt(sess).busy) {
+    const r = rt(sess);
+    r.taskStartedAt = lastUserTs;
+    r.taskEndedAt = null;
+  }
 }
 function appendMessage(sess, msg) {
   if (!isActive(sess)) return;
@@ -1198,7 +1225,15 @@ function ensureTaskElapsedBadge(wrap, startedAt, endedAt) {
 function startTaskTimer(sess) {
   const r = rt(sess);
   if (r.taskStartedAt) return;  // 已在计时，不重置
-  r.taskStartedAt = Date.now();
+  // 优先从消息时间戳恢复（刷新后持久化）
+  const msgs = sess.messages;
+  let restored = 0;
+  if (msgs && msgs.length) {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'user' && msgs[i].ts) { restored = msgs[i].ts * 1000; break; }
+    }
+  }
+  r.taskStartedAt = restored || Date.now();
   r.taskEndedAt = null;
   if (r.taskTimerId) clearInterval(r.taskTimerId);
   r.taskTimerId = setInterval(() => {
@@ -1393,6 +1428,7 @@ function normalize(m) {
   if (m.stopped) o.stopped = true;
   if (m.images) o.images = m.images;
   if (m.files) o.files = m.files;
+  if (m.ts) o.ts = m.ts;
   return o;
 }
 function upsert(sess, raw, partial) {
@@ -1428,6 +1464,8 @@ async function pollSession(sess) {
     setBusy(sess, false);
   } finally {
     r.polling = false; renderSessionList();
+    // 历史消息已全部加载，恢复已完成任务的耗时 badge
+    if (isActive(sess)) restoreElapsedBadges(sess, ensureMsgs());
     tokPollBridge();
   }
 }
@@ -1519,7 +1557,7 @@ async function sendPrompt(text) {
     .filter(Boolean)
     .join('\n\n');
   const usedFiles = collectUsedFiles(text);
-  const userMsg = { role: 'user', content: text };
+  const userMsg = { role: 'user', content: text, ts: Date.now() / 1000 };
   const previewImgs = usedFiles.filter(f => f.isImage).map(f => ({ id: 'f-' + f.sid, name: f.name, path: f.path, dataUrl: f.dataUrl || '' }));
   if (previewImgs.length) userMsg.images = previewImgs;
   const previewFiles = usedFiles.filter(f => !f.isImage).map(f => ({ id: 'f-' + f.sid, name: f.name, path: f.path }));

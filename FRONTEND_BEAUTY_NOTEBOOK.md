@@ -217,9 +217,11 @@ CSS: `.task-elapsed { color: var(--accent); font-size: 12px; font-weight: 600; }
 
 **问题：计时"已运行x"刷新后丢失**
 - 根因：`r.taskStartedAt` 仅存于内存 runtime Map，刷新后 runtime 重建；pollSession 重新检测 running → setBusy → startTaskTimer 设新 Date.now()，真正开始时间丢失
-- 修复方案（仅改 2 个函数，4 行新增）：
-  1. `startTaskTimer`：尝试从 `sessionStorage.getItem('ga_task_started_' + sess.id)` 恢复时间戳，若无则用 Date.now()；设置后写入 sessionStorage
-  2. `stopTaskTimer`：任务结束时 `sessionStorage.removeItem('ga_task_started_' + sess.id)`
-- 为什么用 sessionStorage：与标签页生命周期绑定，关闭标签自动清除，不残留脏数据
-- 为什么不需要 onBridgeReady 额外恢复：pollSession 检测到 running 后自动调 setBusy → startTaskTimer，此时 sessionStorage 中已有值会被读取恢复
-- 改动文件：app.js（startTaskTimer L1198-1205 / stopTaskTimer L1219-1225）
+- ❌ sessionStorage 方案失败（刷新后仍丢失）
+- ✅ 最终方案：基于消息 ts 时间戳恢复（2026-05-25 成功验证）
+  - 根因：消息对象本身有 `ts` 字段（API 返回），但 `normalize()` 函数丢弃了它
+  - 修复 3 处（仅 app.js）：
+    1. `normalize()` 增加 `if (m.ts) o.ts = m.ts;` — 保留时间戳
+    2. `restoreElapsedBadges(sess, box)` 从 `renderAllMessages` 移到 `pollSession` finally 块 — 确保消息已加载
+    3. `startTaskTimer(sess)` 从最后一条 user 消息的 ts 恢复 taskStartedAt — 运行中任务继续计时
+  - 验证结果：刷新后 badge 正确显示"已运行 17s"/"已运行 14s"，已完成任务静态显示，运行中任务实时计时
