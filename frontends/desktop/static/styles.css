@@ -83,13 +83,13 @@
   font-family:-apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   /* —— 折叠块 —— */
   --fold-thinking-border:#d4c090;
-  --fold-thinking-bg:#fefbf3;
+  --fold-thinking-bg:transparent;
   --fold-tool-border:#90b8d4;
-  --fold-tool-bg:#f3f8fe;
+  --fold-tool-bg:transparent;
   --fold-result-border:#a0d4a0;
-  --fold-result-bg:#f4fdf4;
+  --fold-result-bg:transparent;
   --fold-turn-border:var(--line);
-  --fold-turn-bg:var(--field-bg);
+  --fold-turn-bg:transparent;
   --fold-retry-border:var(--line-soft);
   --fold-retry-bg:transparent;
 }
@@ -155,11 +155,11 @@ html[data-appearance="dark"]{
   --shadow-modal:0 18px 50px #010409cc;
   /* —— 折叠块（dark 覆盖） —— */
   --fold-thinking-border:#6b5b30;
-  --fold-thinking-bg:#2a2418;
+  --fold-thinking-bg:transparent;
   --fold-tool-border:#3a5066;
-  --fold-tool-bg:#16202b;
+  --fold-tool-bg:transparent;
   --fold-result-border:#3f6647;
-  --fold-result-bg:#15241a;
+  --fold-result-bg:transparent;
 }
 html[data-appearance="dark"][data-theme]{
   --blue-bg:color-mix(in srgb, var(--blue) 22%, var(--panel));
@@ -596,9 +596,10 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
 .bubble.md table{ width:100%; border-collapse:collapse; margin:0 0 8px; font-size:.92em; }
 .bubble.md th,.bubble.md td{ border:1px solid var(--line); padding:6px 10px; text-align:left; }
 .bubble.md th{ background:var(--line-soft); color:var(--txt-strong); }
-.fold{ margin:6px 0; border:1px solid var(--line); border-radius:8px; background:var(--field-bg); }
-.bubble .fold summary{ cursor:pointer; padding:6px 10px; font-size:.86em; color:var(--muted); user-select:none; }
-.bubble .fold pre{ margin:0; padding:10px 12px; border:none; border-top:1px solid var(--line); background:transparent; font-size:.86em; overflow:auto; }
+.fold{ margin:4px 0; border:none; border-left:2px solid var(--line); border-radius:0; background:transparent; padding-left:12px; }
+.bubble .fold summary{ cursor:pointer; padding:4px 0; font-size:.82em; color:var(--muted); user-select:none; }
+.bubble .fold summary:hover{ color:var(--txt-2); }
+.bubble .fold pre{ margin:0; padding:6px 0; border:none; background:transparent; font-size:.8em; overflow:auto; }
 .cursor{ display:inline-block; width:7px; height:14px; background:var(--blue); vertical-align:-2px; margin-left:2px; animation:blink 1s steps(2) infinite; }
 @keyframes blink{ 50%{ opacity:0; } }
 .run-state.busy .dot{ animation:blink 1s steps(2) infinite; }
@@ -1263,16 +1264,17 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 
 /* ═══════════════ Markdown 渲染增强 (from PR) ═══════════════ */
 .fold-pre{ white-space:pre-wrap; word-break:break-word; max-height:300px; overflow:auto; }
-.fold.fold-thinking{ border-color:var(--fold-thinking-border); background:var(--fold-thinking-bg); }
-.fold.fold-tool{ border-color:var(--fold-tool-border); background:var(--fold-tool-bg); }
-.fold.fold-result{ border-color:var(--fold-result-border); background:var(--fold-result-bg); }
-.fold.fold-turn{ border-color:var(--fold-turn-border); background:var(--fold-turn-bg); }
+.fold.fold-thinking{ border-left-color:var(--fold-thinking-border); }
+.fold.fold-tool{ border-left-color:var(--fold-tool-border); }
+.fold.fold-result{ border-left-color:var(--fold-result-border); }
+.fold.fold-turn{ border-left-color:var(--fold-turn-border); }
 .fold.fold-turn > summary{ font-weight:600; color:var(--txt-2); }
-.fold.fold-retry{ border-color:var(--fold-retry-border); background:var(--fold-retry-bg); border-style:dashed; }
+.fold.fold-retry{ border-left-color:var(--fold-retry-border); border-left-style:dashed; }
 .fold.fold-retry > summary{ font-size:11px; color:var(--muted2); font-weight:400; }
 .fold.fold-retry pre{ font-size:11px; color:var(--muted); }
 /* ---- 代码块容器 + 复制按钮 ---- */
 .bubble.md pre{ position:relative; background:var(--field-bg); border-radius:8px; padding:12px; overflow-x:auto; }
+.bubble.md .fold pre{ position:static; background:transparent; border-radius:0; padding:6px 0; }
 .bubble.md pre code{ font-size:.92em; }
 .code-copy-btn{
   position:absolute; top:6px; right:6px; z-index:1;
