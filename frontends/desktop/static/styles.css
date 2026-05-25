@@ -571,12 +571,12 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
 .msg.assistant,.msg.error{ justify-content:flex-start; }
 .msg.system{ justify-content:center; }
 .bubble{
-  max-width:80%; padding:10px 14px; border-radius:12px; font-size:var(--chat-font);
+  max-width:85%; padding:8px 0; border-radius:0; font-size:var(--chat-font);
   line-height:1.6; white-space:pre-wrap; word-break:break-word;
-  background:var(--blue-bg); color:var(--txt-strong);
+  background:none; color:var(--txt-strong); font-weight:600;
 }
-.bubble.md{ white-space:normal; background:var(--line-soft); color:var(--txt); max-width:100%; width:100%; }
-.bubble.err{ background:var(--danger-bg); color:var(--danger-text); white-space:normal; }
+.bubble.md{ white-space:normal; background:none; color:var(--txt); max-width:100%; width:100%; font-weight:400; }
+.bubble.err{ background:var(--danger-bg); color:var(--danger-text); white-space:normal; padding:8px 14px; border-radius:8px; }
 .bubble.sys{ background:transparent; color:var(--muted); font-size:12px; padding:4px 8px; }
 .bubble.md p{ margin:0 0 8px; } .bubble.md p:last-child{ margin:0; }
 .bubble.md pre{ background:var(--field-bg); border:1px solid var(--line); border-radius:8px; padding:10px 12px; overflow:auto; font-size:.86em; }
