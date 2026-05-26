@@ -94,6 +94,10 @@ _TIPS = {
         "Tip: /new [name] starts a fresh session; /language switches the interface language.",
         "Tip: /export clip copies the last reply to your system clipboard; /export all prints the log path.",
         "Tip: Ctrl+O folds / unfolds all completed tool chips — each fold collapses to one line.",
+        "Tip: /update auto-runs git pull and audits the impact; /autorun seeds an autonomous run.",
+        "Tip: /morphling <target> absorbs an external skill.",
+        "Tip: /goal <goal> enters Goal mode (will ask for budget / worker cap); /hive <target> for multi-worker.",
+        "Tip: /scheduler lists reflect tasks and starts them via `/scheduler start a,b,c`.",
     ],
     'zh': [
         "Tip: 按 / 唤起命令面板 —— 方向键选择，Enter 落入输入框。",
@@ -1538,6 +1542,16 @@ def _cmds() -> list[tuple[str, str, str]]:
         ('/llm',      _t('cmd.llm.arg'),        _t('cmd.llm.desc')),
         ('/btw',      _t('cmd.btw.arg'),        _t('cmd.btw.desc')),
         ('/review',   _t('cmd.review.arg'),     _t('cmd.review.desc')),
+        # ── slash_cmds bundle (same set as v2; descriptions kept inline
+        # rather than going through _t() so a missing translation key never
+        # blanks the row).  /scheduler stays as an interactive multi-pick
+        # menu; the rest fold into prompt-injection turns.
+        ('/update',    '[note]',           'git pull GA & report impact'),
+        ('/autorun',   '[seed]',           'enter autonomous operation mode'),
+        ('/morphling', '[target]',         'distill / absorb external skills'),
+        ('/goal',      '[goal]',           'enter Goal mode (needs condition)'),
+        ('/hive',      '[target]',         'enter Hive multi-worker mode'),
+        ('/scheduler', '',                 'multi-pick reflect tasks / show cron'),
         ('/rewind',   _t('cmd.rewind.arg'),     _t('cmd.rewind.desc')),
         ('/continue', _t('cmd.continue.arg'),   _t('cmd.continue.desc')),
         ('/new',      _t('cmd.new.arg'),        _t('cmd.new.desc')),
@@ -1967,8 +1981,13 @@ class SB:
         self._menu_hint: str = ''
         self._menu_sel: int = 0
         self._menu_scroll: int = 0          # index of the first visible row in the viewport
-        self._menu_on_submit = None        # Callable[[int], None] | None
+        self._menu_on_submit = None        # Callable[[int|list[int]], None] | None
         self._menu_on_cancel = None        # Callable[[], None] | None
+        # Multi-select menus: Space toggles _menu_checked[i]; Enter calls
+        # on_submit(sorted(_menu_checked)).  Single-select (default) calls
+        # on_submit(_menu_sel) and ignores _menu_checked.
+        self._menu_multi: bool = False
+        self._menu_checked: set[int] = set()
         # Interactive command palette: index into _cmd_matches output when
         # buf starts with `/`.  ↑↓ steer the highlight, Tab completes the
         # highlighted command, Enter still executes whatever is in buf.
@@ -2227,23 +2246,38 @@ class SB:
         self._picker_checked = set()
 
     def _show_menu(self, title: str, options: list[str], on_submit,
-                   hint: str | None = None, on_cancel=None) -> None:
+                   hint: str | None = None, on_cancel=None,
+                   multi_select: bool = False) -> None:
         """Open a modal arrow-key menu in place of the input box.
 
         The menu takes over the live region; ↑↓ move the highlight, Enter
         invokes `on_submit(idx)`, Esc invokes `on_cancel()` (if provided).
         Submission auto-closes the menu before invoking the callback so the
-        callback is free to open another menu / commit / start a task."""
+        callback is free to open another menu / commit / start a task.
+
+        `multi_select=True` switches to checkbox mode: Space toggles the
+        highlighted row, the per-row prefix becomes `[x]/[ ]`, and Enter
+        delivers a sorted `list[int]` of all checked indices (may be empty
+        if the user submits with nothing ticked)."""
         if not options:
             return
         self._menu_active = True
         self._menu_options = list(options)
         self._menu_title = title
-        self._menu_hint = hint if hint is not None else _t('menu.hint')
+        # In multi-select mode show a Space-aware hint by default so the user
+        # discovers the toggle key without reading the docstring.
+        if hint is not None:
+            self._menu_hint = hint
+        elif multi_select:
+            self._menu_hint = _t('menu.hint.multi', default='Space toggle · ↑↓ move · Enter submit · Esc cancel')
+        else:
+            self._menu_hint = _t('menu.hint')
         self._menu_sel = 0
         self._menu_scroll = 0
         self._menu_on_submit = on_submit
         self._menu_on_cancel = on_cancel
+        self._menu_multi = bool(multi_select)
+        self._menu_checked = set()
         self._render_live()
 
     def _close_menu(self) -> None:
@@ -2255,6 +2289,8 @@ class SB:
         self._menu_scroll = 0
         self._menu_on_submit = None
         self._menu_on_cancel = None
+        self._menu_multi = False
+        self._menu_checked = set()
 
     @staticmethod
     def _scroll_window(sel: int, total: int, visible: int, scroll: int) -> int:
@@ -2271,12 +2307,17 @@ class SB:
     def _menu_submit(self) -> None:
         cb = self._menu_on_submit
         sel = self._menu_sel
+        multi = self._menu_multi
+        checked = sorted(self._menu_checked) if multi else None
         if not self._menu_active:
             return
         self._close_menu()
         if cb is not None:
             try:
-                cb(sel)
+                # Multi-select delivers a sorted list[int] (possibly empty)
+                # so callers can `if not picked: return` cleanly.  Single-
+                # select keeps the legacy `int` contract.
+                cb(checked if multi else sel)
             except Exception as e:
                 self.commit([_t('err.menu_cb', err=str(e))])
 
@@ -2544,7 +2585,15 @@ class SB:
             rows = [_clip_cells(self._menu_title, w)]
             for i in range(start, end):
                 marker = '▌' if i == self._menu_sel else ' '
-                rows.append(_clip_cells(f'{marker} {self._menu_options[i]}', w))
+                # In multi-select narrow mode prepend [x]/[ ] so the user can
+                # still tell what is ticked even when the box is too narrow
+                # for the bordered card.
+                if self._menu_multi:
+                    box = '[x]' if i in self._menu_checked else '[ ]'
+                    label_i = f'{marker} {box} {self._menu_options[i]}'
+                else:
+                    label_i = f'{marker} {self._menu_options[i]}'
+                rows.append(_clip_cells(label_i, w))
             return rows, 0, 1
         inner = max(8, w)
         content_w = max(1, inner - 4)
@@ -2573,7 +2622,14 @@ class SB:
         # signals position, so no "N more" indicator rows.
         for i in range(start, end):
             style = (_ACCENT + _BOLD) if i == self._menu_sel else ''
-            rows.extend(row(self._menu_options[i], style))
+            # Multi-select rows get a `[x]`/`[ ]` prefix so the user sees what
+            # is currently ticked.  Single-select keeps the legacy clean look
+            # (bold accent on the highlighted row is enough).
+            if self._menu_multi:
+                box = '[x]' if i in self._menu_checked else '[ ]'
+                rows.extend(row(f'{box} {self._menu_options[i]}', style))
+            else:
+                rows.extend(row(self._menu_options[i], style))
         rows.extend(row(''))
         rows.extend(row(self._menu_hint or _t('menu.hint'), _DIM))
         rows.append(bot)
@@ -3598,6 +3654,56 @@ class SB:
                     self.commit(Block('assistant', text))   # markdown re-renders on resize
                 except queue.Empty:
                     self.commit([_t('msg.review_empty')])
+        elif name in ('update', 'autorun', 'morphling', 'goal', 'hive'):
+            # slash_cmds bundle — build a long prompt and feed it back through
+            # _submit so the agent sees an ordinary user turn.  Keeps the
+            # frontend ignorant of SOP details; see frontends/slash_cmds.py.
+            from frontends import slash_cmds
+            prompt = slash_cmds.prompt_for('/' + name, arg or '')
+            if prompt:
+                self._submit(prompt, [])
+            else:
+                self.commit([f'❌ unknown command /{name}'])
+        elif name == 'scheduler':
+            from frontends import slash_cmds
+            parts = (arg or '').split(None, 1)
+            head = parts[0].lower() if parts else ''
+            if head in ('start', 'run'):
+                names = (parts[1] if len(parts) > 1 else '').replace(',', ' ').split()
+                if not names:
+                    self.commit(['Usage: /scheduler start <reflect>[,<reflect2>...]'])
+                else:
+                    lines = []
+                    for n in names:
+                        ok, msg = slash_cmds.start_reflect_task(n)
+                        lines.append(('✅ ' if ok else '❌ ') + msg)
+                    self.commit(lines)
+            else:
+                reflects = slash_cmds.list_reflect_tasks()
+                if not reflects:
+                    self.commit(['(reflect/ 目录下没有 *.py)']); return
+                options = []
+                for r in reflects:
+                    doc = f"  — {r['doc']}" if r['doc'] else ''
+                    options.append(f"{r['name']}{doc}")
+
+                # Multi-select menu: Space ticks, Enter starts every ticked
+                # task back-to-back.  Empty submit is a no-op (user pressed
+                # Enter without ticking anything).
+                def _pick_reflects(idxs: list[int]) -> None:
+                    if not idxs:
+                        self.commit(['(no reflect task picked)']); return
+                    lines = []
+                    for i in idxs:
+                        nm = reflects[i]['name']
+                        ok, msg = slash_cmds.start_reflect_task(nm)
+                        lines.append(('✅ ' if ok else '❌ ') + msg)
+                    self.commit(lines)
+
+                self._show_menu(
+                    'Pick reflect tasks to start  [Space toggle · Enter run · or /scheduler start a,b,c]',
+                    options, _pick_reflects, multi_select=True,
+                )
         elif name == 'llm':
             if arg:
                 self._bridge.switch_llm(int(arg) if arg.isdigit() else -1)
@@ -4211,6 +4317,16 @@ class SB:
                 if o == 0x0e:                                # ↓
                     if n:
                         self._menu_sel = min(n - 1, self._menu_sel + 1)
+                    self._render_live(); continue
+                if self._menu_multi and ch == ' ':            # Space toggles
+                    # Only meaningful in multi-select mode; in single mode we
+                    # swallow Space to keep "modal, no free-text" invariant.
+                    if n:
+                        i = self._menu_sel
+                        if i in self._menu_checked:
+                            self._menu_checked.discard(i)
+                        else:
+                            self._menu_checked.add(i)
                     self._render_live(); continue
                 if ch == '\r':                               # Enter
                     self._menu_submit(); continue
