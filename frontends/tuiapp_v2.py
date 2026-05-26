@@ -143,6 +143,10 @@ _TIPS = (
     "Tip: /branch [name] 从当前历史分裂出新会话，互不污染。",
     "Tip: ask_user 题目里写 [多选] 自动切到 SelectionList；任何 picker 都有 \"Type something\" 走自由输入。",
     "Tip: plan 模式下的 todo 会渲染在消息区与输入框之间的 📋 Plan 卡片，完成后自动消失。",
+    "Tip: /update 让主 agent 自动 git pull 并核查影响面；/autorun 进入 autonomous 自主模式。",
+    "Tip: /morphling <目标> 启用蒸馏吞噬外部技能。",
+    "Tip: /goal <目标> 进入 Goal 模式（缺 condition 时会回头问你预算 / worker 上限）。",
+    "Tip: /hive <目标> 进入 Hive 多 worker 协作；/scheduler 调出 reflect 任务多选启动器。",
 )
 
 
@@ -1075,6 +1079,14 @@ COMMANDS = [
     ("/llm",      "[n]",              "查看 / 切换模型"),
     ("/btw",      "<question>",       "side question — 不打断主 agent"),
     ("/review",   "[request]",         "in-session 代码审查（直接输出报告）"),
+    # ── slash_cmds bundle (prompt-injection + /scheduler picker).  Kept in
+    # the same table so /-completion + the palette pick them up for free.
+    ("/update",    "[note]",           "git pull 更新 GA 仓库并报告影响面"),
+    ("/autorun",   "[seed]",           "进入 autonomous_operation 自主模式"),
+    ("/morphling", "[target]",         "启用 Morphling 蒸馏 / 吞噬外部技能"),
+    ("/goal",      "[goal]",           "进入 Goal 模式（需 condition 约束）"),
+    ("/hive",      "[target]",         "进入 Hive 多 worker 协作模式"),
+    ("/scheduler", "",                 "多选启动 reflect 任务 / 查看 cron"),
     ("/continue", "[n|name]",         "列出 / 恢复历史会话"),
     ("/cost",     "[all]",            "显示当前会话 token 用量（all = 所有会话）"),
     ("/export",   "clip|<file>|all",  "导出最后回复"),
@@ -1966,6 +1978,14 @@ class GenericAgentTUI(App[None]):
             "restore": self._cmd_restore, "btw": self._cmd_btw, "review": self._cmd_review,
             "continue": self._cmd_continue, "cost": self._cmd_cost,
             "reload-keys": self._cmd_reload_keys,
+            # slash_cmds bundle — see frontends/slash_cmds.py for the prompt
+            # bodies + reflect/scheduler discovery.  All but /scheduler are
+            # thin shims that build a prompt and re-enter submit_user_message,
+            # so the agent processes them as ordinary turns.
+            "update": self._cmd_slash_inject, "autorun": self._cmd_slash_inject,
+            "morphling": self._cmd_slash_inject, "goal": self._cmd_slash_inject,
+            "hive": self._cmd_slash_inject,
+            "scheduler": self._cmd_scheduler,
             "quit": self._cmd_quit, "exit": self._cmd_quit,
         }
         try:
@@ -3393,6 +3413,98 @@ class GenericAgentTUI(App[None]):
     def _cmd_quit(self, args, raw):
         self._reset_terminal_title()
         self.exit()
+
+    # ---------------- slash_cmds bundle ----------------
+    def _cmd_slash_inject(self, args, raw):
+        """`/update /autorun /morphling /goal /hive` → prompt
+        injection.  We strip the leading slash command from `raw`, hand the
+        tail to `slash_cmds.prompt_for`, and re-enter `submit_user_message`
+        so the agent sees it as a normal user turn (display bubble still
+        shows the original `/cmd ...` for clarity).
+        """
+        from frontends import slash_cmds
+        text = (raw or "").strip()
+        # Pull just the leading token to look up the prompt builder.
+        head = text.split(None, 1)[0] if text else ""
+        if not head.startswith("/"):
+            self._system("❌ /slash 命令解析失败"); return
+        tail = text[len(head):].strip()
+        prompt = slash_cmds.prompt_for(head, tail)
+        if prompt is None:
+            self._system(f"❌ 未知命令 {head}"); return
+        sess = self.current
+        if sess.status == "running":
+            self._system(f"#{sess.agent_id} 正在跑，/stop 后再发。")
+            return
+        # Keep the user's original `/cmd ...` as the visible bubble so the
+        # transcript stays self-explanatory; the agent sees the long prompt.
+        self.submit_user_message(prompt, display_text=text or head)
+
+    def _cmd_scheduler(self, args, raw):
+        """`/scheduler` lists reflect/*.py + sche_tasks/*.json and starts the
+        chosen reflect task(s).  Usage:
+          /scheduler                — interactive multi-select picker
+                                      (Space toggles, Enter launches every
+                                      checked task in one batch)
+          /scheduler start <name>   — start one reflect task by stem (CLI)
+          /scheduler start a,b,c    — start several at once (CSV, CLI)
+        Cron-style sche_tasks/*.json are read-only here; the launch.pyw
+        scheduler daemon already owns them.
+        """
+        from frontends import slash_cmds
+        body = " ".join(args).strip()
+        parts = body.split(None, 1)
+        head = parts[0].lower() if parts else ""
+        if head in ("start", "run"):
+            names = (parts[1] if len(parts) > 1 else "").replace(",", " ").split()
+            if not names:
+                self._system("Usage: /scheduler start <reflect_name>[,<name2>...]"); return
+            self._launch_reflect_batch(names)
+            return
+        # Default: surface a MultiChoiceList picker for reflect/*.py so the
+        # user can tick several tasks at once (Space toggle, Enter submit).
+        # sche_tasks/*.json are read-only — shown below as a system advisory
+        # so the user still has visibility, but they can't be launched here.
+        reflects = slash_cmds.list_reflect_tasks()
+        sched = slash_cmds.list_scheduler_tasks()
+        if not reflects:
+            self._system("📋 reflect/ 目录下没有 *.py，无可启动任务"); return
+        choices = []
+        for r in reflects:
+            doc = f"  — {r['doc']}" if r['doc'] else ""
+            choices.append((f"{r['name']}{doc}", r['name']))
+        sess = self.current
+        msg = ChatMessage(
+            role="system",
+            content=("📋 选择要启动的 reflect 任务（Space 勾选 · Enter 提交 · Esc 取消）"
+                     "    多选支持 — 提交后批量启动并显示结果"),
+            kind="multi_choice",
+            choices=choices,
+            on_select=lambda names: self._launch_reflect_batch(names),
+        )
+        sess.messages.append(msg)
+        # Cron tasks as a separate read-only advisory line.
+        if sched:
+            lines = ["⏰ sche_tasks/ cron 任务（只读，由 scheduler daemon 调度）："]
+            for s in sched:
+                tag = "" if s["enabled"] else " [DISABLED]"
+                sch = f"  [{s['schedule']}]" if s["schedule"] else ""
+                lines.append(f"  • {s['name']}{sch}{tag}")
+            self._system("\n".join(lines))
+        self._refresh_messages()
+
+    def _launch_reflect_batch(self, names: list[str]) -> None:
+        """Shared by `/scheduler start ...` and the multi_choice picker.
+        Launches every requested reflect/<name>.py via slash_cmds and prints
+        a single ✅/❌ summary block."""
+        from frontends import slash_cmds
+        if not names:
+            self._system("（未选择任何 reflect 任务）"); return
+        lines = [f"🚀 批量启动 {len(names)} 个 reflect 任务："]
+        for n in names:
+            ok, msg = slash_cmds.start_reflect_task(n)
+            lines.append(("  ✅ " if ok else "  ❌ ") + msg)
+        self._system("\n".join(lines))
 
     def _reset_terminal_title(self) -> None:
         # Send via sys.__stdout__ — see _update_terminal_title for why.
