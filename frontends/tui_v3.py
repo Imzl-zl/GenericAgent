@@ -275,6 +275,19 @@ _I18N: dict[str, dict[str, str]] = {
         # llm picker
         'llm.title':            'Switch LLM',
 
+        # /scheduler picker (multi-pick reflect tasks / frontends)
+        'scheduler.pick.title':   'Pick services to start',
+        'scheduler.pick.hint':    'Space toggle · ↑↓ move · Enter next · Esc cancel · or /scheduler start a,b,c',
+        'scheduler.empty':        '(no startable services: both reflect/*.py and frontends/*app*.py are empty)',
+        'scheduler.no_pick':      '(no service picked)',
+        'scheduler.confirm.title':   'Ready to submit your answer?',
+        'scheduler.confirm.hint':    '←/→ pick · Enter confirm · Esc go back',
+        'scheduler.confirm.submit':  'Submit  ({n} service: {names})',
+        'scheduler.confirm.edit':    'Edit selection',
+        'scheduler.cancelled':       'Cancelled — no service started',
+        'scheduler.back_to_pick':    'Back to the picker',
+        'scheduler.usage_start':     'Usage: /scheduler start <service>[,<service2>...]',
+
         # export picker
         'export.title':         'Export the last reply',
         'export.opt.clip':      'Copy to clipboard',
@@ -452,6 +465,19 @@ _I18N: dict[str, dict[str, str]] = {
 
         # llm picker
         'llm.title':            '切换 LLM',
+
+        # /scheduler picker (multi-pick reflect tasks / frontends)
+        'scheduler.pick.title':   '挑选要启动的服务',
+        'scheduler.pick.hint':    'Space 勾选 · ↑↓ 移动 · Enter 下一步 · Esc 取消 · 或 /scheduler start a,b,c',
+        'scheduler.empty':        '（没有可启动的服务：reflect/*.py 与 frontends/*app*.py 均为空）',
+        'scheduler.no_pick':      '（未选择任何服务）',
+        'scheduler.confirm.title':   '确认提交你的选择？',
+        'scheduler.confirm.hint':    '←/→ 选择 · Enter 确认 · Esc 回退',
+        'scheduler.confirm.submit':  '提交（{n} 个服务：{names}）',
+        'scheduler.confirm.edit':    '回去修改选择',
+        'scheduler.cancelled':       '已取消，未启动任何服务',
+        'scheduler.back_to_pick':    '已回到选择界面',
+        'scheduler.usage_start':     '用法：/scheduler start <服务名>[,<服务名2>...]',
 
         # export picker
         'export.title':         '导出最后回复',
@@ -3700,7 +3726,7 @@ class SB:
             if head in ('start', 'run'):
                 names = (parts[1] if len(parts) > 1 else '').replace(',', ' ').split()
                 if not names:
-                    self.commit(['Usage: /scheduler start <service>[,<service2>...]'])
+                    self.commit([_t('scheduler.usage_start')])
                 else:
                     lines = []
                     for n in names:
@@ -3712,7 +3738,7 @@ class SB:
                 # apps, so the picker shows the same set as the GUI launcher.
                 services = slash_cmds.list_launchable_services()
                 if not services:
-                    self.commit(['(没有可启动的服务: reflect/*.py 与 frontends/*app*.py 均为空)']); return
+                    self.commit([_t('scheduler.empty')]); return
                 ordered = ([s for s in services if s['kind'] == 'reflect'] +
                            [s for s in services if s['kind'] == 'frontend'])
                 options = []
@@ -3720,31 +3746,65 @@ class SB:
                     doc = f"  — {s['doc']}" if s['doc'] else ''
                     options.append(f"{s['name']}{doc}")
 
-                # Two-step: Space ticks → Enter → commit-answer confirm → run.
-                # Empty submit is a no-op (Enter without ticking anything).
-                def _pick_services(idxs: list[int]) -> None:
-                    if not idxs:
-                        self.commit(['(no service picked)']); return
-                    chosen = [ordered[i]['name'] for i in idxs]
+                # Two-step ask_user-style flow:
+                #   picker → confirm card (Submit / Edit selection) → run
+                # Esc on the confirm card re-opens the picker, mirroring how
+                # ask_user's free-text submit-confirm rolls back on Esc.
+                def _open_picker(preset: set[int] | None = None) -> None:
+                    def _pick_services(idxs: list[int]) -> None:
+                        if not idxs:
+                            self.commit([_t('scheduler.no_pick')]); return
+                        chosen_idxs = list(idxs)
+                        chosen = [ordered[i]['name'] for i in chosen_idxs]
 
-                    def _confirm(ci: int) -> None:
-                        if ci != 0:
-                            self.commit(['已取消，未启动任何服务']); return
-                        lines = []
-                        for nm in chosen:
-                            ok, msg = slash_cmds.start_service(nm)
-                            lines.append(('✅ ' if ok else '❌ ') + msg)
-                        self.commit(lines)
+                        def _confirm(ci: int) -> None:
+                            if ci == 0:
+                                lines = []
+                                for nm in chosen:
+                                    ok, msg = slash_cmds.start_service(nm)
+                                    lines.append(('✅ ' if ok else '❌ ') + msg)
+                                self.commit(lines)
+                            elif ci == 1:
+                                # Edit selection → re-open the picker with the
+                                # previous ticks preserved.
+                                self.commit([_t('scheduler.back_to_pick')])
+                                _open_picker(preset=set(chosen_idxs))
+                            else:
+                                self.commit([_t('scheduler.cancelled')])
+
+                        def _confirm_cancel() -> None:
+                            # Esc on the confirm card → roll back to the
+                            # picker (ask_user-style), preserving the
+                            # selection so the user can keep editing.
+                            self.commit([_t('scheduler.back_to_pick')])
+                            _open_picker(preset=set(chosen_idxs))
+
+                        self._show_menu(
+                            _t('scheduler.confirm.title'),
+                            [
+                                _t('scheduler.confirm.submit',
+                                   n=len(chosen), names='、'.join(chosen)),
+                                _t('scheduler.confirm.edit'),
+                            ],
+                            _confirm,
+                            hint=_t('scheduler.confirm.hint'),
+                            on_cancel=_confirm_cancel,
+                            multi_select=False,
+                        )
 
                     self._show_menu(
-                        f'确认启动这 {len(chosen)} 个服务？  ' + '、'.join(chosen),
-                        ['✅ 确认启动', '取消'], _confirm, multi_select=False,
+                        _t('scheduler.pick.title'),
+                        options,
+                        _pick_services,
+                        hint=_t('scheduler.pick.hint'),
+                        multi_select=True,
                     )
+                    # Restore previous ticks when re-opening via "Edit selection".
+                    if preset:
+                        self._menu_checked = set(preset)
+                        self._render_live()
 
-                self._show_menu(
-                    'Pick services to start  [Space toggle · Enter next · or /scheduler start a,b,c]',
-                    options, _pick_services, multi_select=True,
-                )
+                _open_picker()
         elif name == 'llm':
             if arg:
                 self._bridge.switch_llm(int(arg) if arg.isdigit() else -1)
