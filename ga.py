@@ -91,25 +91,10 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         if code_type == "python" and tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
 
 
-def _normalize_ask_user_questions(questions):
-    norm = []
-    for q in questions:
-        if isinstance(q, str):
-            norm.append({"question": q, "options": []})
-        elif isinstance(q, dict):
-            opts = q.get("options") or q.get("candidates") or []
-            norm.append({"question": q.get("question", ""), "options": opts})
-    return [x for x in norm if str(x.get("question", "")).strip()]
-
-def ask_user(questions):
-    """questions: 必填数组，每项 {question, options?}。简单追问请直接在回复里问，不要调用本工具。"""
-    if not questions:
-        return {"status": "error", "msg": "questions 不能为空"}
-    norm = _normalize_ask_user_questions(questions)
-    if not norm:
-        return {"status": "error", "msg": "questions 中没有有效题目"}
+def ask_user(question, candidates=None):
+    """question: 向用户提出的问题。candidates: 可选的候选项列表"""
     return {"status": "INTERRUPT", "intent": "HUMAN_INTERVENTION",
-        "data": {"questions": norm}}
+        "data": {"question": question, "candidates": candidates or []}}
 
 import simphtml
 driver = None
@@ -321,16 +306,10 @@ class GenericAgentHandler(BaseHandler):
         return StepOutcome(result, next_prompt=next_prompt)
     
     def do_ask_user(self, args, response):
-        questions = args.get("questions")
-        if not questions:
-            return StepOutcome(
-                {"status": "error", "msg": "ask_user 必须提供 questions 数组。简单追问请直接在回复里问，不要调用本工具。"},
-                next_prompt="\n")
-        result = ask_user(questions)
-        if result.get("status") == "error":
-            return StepOutcome(result, next_prompt="\n")
-        n = len(result["data"]["questions"])
-        yield f"Waiting for your answers ({n} question(s)) ...\n"
+        question = args.get("question", "请提供输入：")
+        candidates = args.get("candidates", [])
+        result = ask_user(question, candidates)
+        yield f"Waiting for your answer ...\n"
         return StepOutcome(result, next_prompt="", should_exit=True)
     
     def do_web_scan(self, args, response):

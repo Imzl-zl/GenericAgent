@@ -126,11 +126,8 @@ def _compact_tool_args(name, args):
         if k in a: a[k] = os.path.basename(a[k])
     if name == 'update_working_checkpoint': s = a.get('key_info', ''); return (s[:60]+'...') if len(s)>60 else s
     if name == 'ask_user':
-        qs = a.get('questions') or []
-        if isinstance(qs, list) and qs:
-            n = len(qs)
-            head = qs[0].get('question', '') if isinstance(qs[0], dict) else str(qs[0])
-            head = (head[:50] + '...') if len(head) > 50 else head
-            return f'{n} question(s): {head}'
-        return 'questions required'
+        q = str(a.get('question', ''))
+        cs = a.get('candidates') or []
+        if cs: q += '\ncandidates:\n' + '\n'.join(f'- {c}' for c in cs)
+        return q
     s = json.dumps(a, ensure_ascii=False); return (s[:120]+'...') if len(s)>120 else s

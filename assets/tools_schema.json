@@ -61,14 +61,10 @@
   }},
   {"type": "function", "function": {
     "name": "ask_user",
-    "description": "Interrupt the task to collect structured user input. Use only for decisions, batched confirmations, or blockers—not for casual one-liners (ask those in plain reply). Must pass a questions array (length 1 for one question, up to 5). Each item is one question; user answers page-by-page then submits all at once.",
-    "parameters": {"type": "object", "required": ["questions"], "properties": {
-      "questions": {"type": "array", "minItems": 1, "maxItems": 5,
-        "description": "Question list; one object per question.",
-        "items": {"type": "object", "required": ["question"], "properties": {
-          "question": {"type": "string", "description": "Question text"},
-          "options": {"type": "array", "items": {"type": "string"},
-            "description": "Optional quick picks; omit for free-text-only answers in the card input"}}}}}}
+    "description": "Interrupt task to ask user when needing decisions, extra info, or facing unresolvable blockers",
+    "parameters": {"type": "object", "properties": {
+      "question": {"type": "string", "description": "Question for the user"},
+      "candidates": {"type": "array", "items": {"type": "string"}, "description": "Optional quick-select choices for the user"}}}
   }},
   {"type": "function", "function": {
     "name": "start_long_term_update",
