@@ -225,3 +225,58 @@ CSS: `.task-elapsed { color: var(--accent); font-size: 12px; font-weight: 600; }
     2. `restoreElapsedBadges(sess, box)` 从 `renderAllMessages` 移到 `pollSession` finally 块 — 确保消息已加载
     3. `startTaskTimer(sess)` 从最后一条 user 消息的 ts 恢复 taskStartedAt — 运行中任务继续计时
   - 验证结果：刷新后 badge 正确显示"已运行 17s"/"已运行 14s"，已完成任务静态显示，运行中任务实时计时
+
+
+---
+
+## 9. Feature: Flatpickr 日期选择器 (Token 统计页)
+
+**状态**：✅ 完成
+**分支**：`feat/flatpickr-datepicker`
+**Commit**：5e20cc7
+
+### 9.1 改动摘要
+
+| # | 文件 | 改动 | 行数 |
+|---|------|------|------|
+| 1 | index.html | +Flatpickr CDN (CSS + JS + zh locale)；input type="text" + class="tok-date" + readonly | +6/-2 |
+| 2 | styles.css | .tok-date 样式 + Flatpickr 主题覆盖（全用 CSS 变量，含暗色模式） | +30/-3 |
+| 3 | app.js | 替换原生 change 事件为 Flatpickr 初始化 + reset 用 fp.clear() | +6/-4 |
+
+**总计**：3 files, +44/-8
+
+### 9.2 关键决策
+
+- **dateFormat: `'Y-m-d\\TH:i'`** — 输出 ISO 格式（如 `2026-05-27T14:30`），Safari 兼容
+- **locale 判断**：`document.documentElement.lang==='en' ? 'default' : 'zh'`
+- **readonly**：禁止手动输入，只能通过日历选择
+- **Flatpickr 主题覆盖**：所有颜色走 CSS 变量（--bg, --txt, --blue, --hover-2 等），暗色用 `html[data-appearance="dark"]` 选择器
+
+### 9.3 关联代码图
+
+```
+index.html:199-201  →  <input .tok-date>
+styles.css:729-760  →  .tok-date + .flatpickr-calendar 主题覆盖
+app.js:2265-2266    →  tokSince / tokUntil 声明（未改）
+app.js:2353-2360    →  tokGetFiltered() 用 new Date(input.value) 解析（未改）
+app.js:2408-2413    →  Flatpickr 初始化 + reset 逻辑（新）
+```
+
+### 9.4 验证结果
+
+- ✅ Flatpickr 正常初始化（input 获得 `flatpickr-input` class）
+- ✅ 点击弹出日历
+- ✅ 用户手动测试选择日期成功
+- ✅ dateFormat ISO 兼容 tokGetFiltered 的 `new Date()` 解析
+- ✅ 无硬编码颜色/文本
+
+### 9.5 Code Review 自检
+
+| 检查项 | 通过 |
+|--------|------|
+| 无硬编码颜色 | ✅ 全走 CSS 变量 |
+| 无硬编码文本 | ✅ placeholder 走 data-i18n-ph |
+| 暗色模式兼容 | ✅ html[data-appearance="dark"] 覆盖 |
+| Safari 兼容 | ✅ ISO dateFormat |
+| 原有逻辑不变 | ✅ tokGetFiltered 未修改 |
+| 单分支隔离 | ✅ feat/flatpickr-datepicker |
