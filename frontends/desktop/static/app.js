@@ -322,12 +322,10 @@ const I18N = {
     'presetPrompt.hive': '启动 Goal Hive 模式：按 hive SOP 拉起多个 worker 协同完成我接下来的目标。',
     'presetPrompt.review': '进入监察者模式：对刚才的产出严格挑刺、逐项复核并报告问题。',
     'presetPrompt.mine': '抓取本周的 git 提交并写一份周报。',
-    'ask.title': '请选择一个回答',
-    'ask.titleNoOpts': 'Agent 向你提问',
-    'ask.hint': '点选项快速回答，或在下方输入自定义内容',
-    'ask.hintNoOpts': '在下方输入回答，Enter 或点确认提交',
-    'ask.confirm': '确认 ↵',
-    'ask.customPlaceholder': '或输入自定义回答…',
+    'ask.banner': 'Agent 等你回答',
+    'ask.replyHint': '在下方输入框回复',
+    'ask.placeholderOpen': '在此输入你的回答… (Enter 发送)',
+    'ask.placeholderOpts': '输入 {keys} 选择，或直接输入自定义回答 (Enter 发送)',
   },
   en: {
     'app.title': 'GenericAgent Desktop',
@@ -434,12 +432,10 @@ const I18N = {
     'presetPrompt.hive': 'Start Goal Hive mode: per the hive SOP, spawn multiple workers to collaboratively achieve the goal I describe next.',
     'presetPrompt.review': 'Enter reviewer mode: strictly scrutinize the previous output, review item by item and report issues.',
     'presetPrompt.mine': 'Collect this week\'s git commits and write a weekly report.',
-    'ask.title': 'Pick an answer',
-    'ask.titleNoOpts': 'Agent is asking',
-    'ask.hint': 'Click an option, or type a custom answer below',
-    'ask.hintNoOpts': 'Type your answer below, then Enter or Confirm',
-    'ask.confirm': 'Confirm ↵',
-    'ask.customPlaceholder': 'Or type a custom answer…',
+    'ask.banner': 'Agent is waiting for your answer',
+    'ask.replyHint': 'Reply in the input below',
+    'ask.placeholderOpen': 'Type your answer here… (Enter to send)',
+    'ask.placeholderOpts': 'Type {keys} to pick, or enter a custom answer (Enter to send)',
   },
 };
 const LANGS = ['zh', 'en'];
@@ -525,6 +521,7 @@ function applyI18n() {
   });
   document.querySelectorAll('[data-i18n-title]').forEach(el => { el.setAttribute('title', t(el.dataset.i18nTitle)); });
   renderLangList();
+  syncAskUserUi();
 }
 // 语言对应国旗 SVG(en 用美国旗,按要求)
 const FLAGS = {
@@ -872,7 +869,7 @@ function renderAssistant(text) {
   });
   // 4) 还原块级占位符
   return parts.join('')
-    .replace(/(?:<p>\s*)?§§ASK:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => renderAskUserCard(asks[Number(i)]))
+    .replace(/(?:<p>\s*)?§§ASK:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => renderAskUserNotice(asks[Number(i)]))
     .replace(/(?:<p>\s*)?§§FOLD:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => {
       const f = folds[Number(i)];
       return `<details class="fold ${f.cls}"><summary>${escapeHtml(f.label)}</summary><pre class="fold-pre">${escapeHtml(f.body)}</pre></details>`;
@@ -917,72 +914,102 @@ function normalizeAskUserData(data) {
   return { question, candidates };
 }
 
-const ASK_ICON_SVG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
-const ASK_CHEV_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>`;
-
-function escapeAttr(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;');
+/** 格式化 ask_user 题干：编号与正文同行；无空行时在 2./3. 前分段 */
+function formatAskUserQuestion(text) {
+  let s = String(text || '').trim();
+  if (!s) return s;
+  // 「1.\n正文」→「1. 正文」
+  s = s.replace(/^(\d+[.、:：)])\s*\n+\s*/gm, '$1 ');
+  s = s.replace(/(\n)(\d+[.、:：)])\s*\n+\s*/g, '$1$2 ');
+  s = s.replace(/(\n|^)(问题\s*\d+\s*[:：.、)]?)\s*\n+\s*/gi, '$1$2 ');
+  // 题与题之间：尚无空行时，仅在 2./3. 前插入空行（不动 1. 与题干）
+  if (!/\n\s*\n/.test(s)) {
+    s = s.replace(/(\S)\s+(?=问题\s*[2-9]\d*\s*[:：.、)]?\s*)/gi, '$1\n\n');
+    s = s.replace(/(\S)\s+(?=[2-9]\d*[.、:：)]\s+\S)/g, '$1\n\n');
+  }
+  return s;
 }
 
-function renderAskUserCard(data) {
+/** 预览模式：true = 始终显示 candidates；看完效果后改回 false */
+const ASK_USER_ALWAYS_SHOW_CANDIDATES = true;
+
+/** 题干已含选项/多题，或 candidates 无法与题干对应时，不再重复渲染底部列表 */
+function shouldShowAskCandidates(item) {
+  if (!item || !item.candidates.length) return false;
+  if (ASK_USER_ALWAYS_SHOW_CANDIDATES) return true;
+  const q = item.question;
+  if (/两个问题|多个问题|两道|两题/.test(q)) return false;
+  if ((q.match(/问题\s*\d/gi) || []).length >= 2) return false;
+  if ((q.match(/^[ \t]*\d+[.、:：)]\s+/gm) || []).length >= 2) return false;
+  if ((q.match(/^[ \t]*[A-Da-d][.)]\s/mg) || []).length >= 2) return false;
+  const comboN = item.candidates.filter(c => /\d+[A-Da-d]\s*\+\s*\d+[A-Da-d]/i.test(c)).length;
+  if (comboN >= Math.max(1, Math.ceil(item.candidates.length * 0.5))) return false;
+  // 题干里有多道问句，却把全部选项平铺在 candidates → 无法区分归属，不展示
+  const qMarks = (q.match(/[？?]/g) || []).length;
+  if (qMarks >= 2 && item.candidates.length > 4) return false;
+  return true;
+}
+
+const ASK_USER_TOOL_RE = /🛠️ Tool: `ask_user`[^\n]*\n````text\n([\s\S]*?)\n````/;
+
+function renderAskUserNotice(data) {
   const item = normalizeAskUserData(data);
   if (!item) return '';
-  const qHtml = renderMarkdown(item.question);
-  const optsHtml = item.candidates.length
-    ? `<div class="ask-options" role="listbox">${item.candidates.map((c, j) =>
-        `<button class="ask-option" data-ans="${escapeAttr(c)}" type="button" role="option" tabindex="0">
-          <span class="ask-option-key">${j + 1}</span>
-          <span class="ask-option-label">${escapeHtml(c)}</span>
-          <span class="ask-option-arrow" aria-hidden="true">${ASK_CHEV_SVG}</span>
-        </button>`).join('')}</div>`
+  const qHtml = renderMarkdown(formatAskUserQuestion(item.question));
+  const showCs = shouldShowAskCandidates(item);
+  const optsHtml = showCs
+    ? `<ul class="ask-candidates">${item.candidates.map((c, j) =>
+        `<li><span class="ask-candidate-key">${j + 1}.</span><span class="ask-candidate-label">${escapeHtml(c)}</span></li>`).join('')}</ul>`
     : '';
-  const titleText = item.candidates.length ? t('ask.title') : t('ask.titleNoOpts');
-  const hintText = item.candidates.length ? t('ask.hint') : t('ask.hintNoOpts');
-  return `<div class="ask-user-card" data-ask-user="1">
-    <div class="ask-user-head">
-      <span class="ask-user-icon" aria-hidden="true">${ASK_ICON_SVG}</span>
-      <span class="ask-user-title">${escapeHtml(titleText)}</span>
+  return `<div class="ask-user-notice" data-ask-user="1">
+    <div class="ask-user-banner">
+      <span class="ask-user-banner-text">${escapeHtml(t('ask.banner'))}</span>
+      <span class="ask-user-banner-sep" aria-hidden="true">·</span>
+      <span class="ask-user-banner-hint">${escapeHtml(t('ask.replyHint'))}</span>
     </div>
     ${qHtml ? `<div class="ask-user-body md">${qHtml}</div>` : ''}
     ${optsHtml}
-    <div class="ask-custom-row">
-      <input type="text" class="ask-custom-input" placeholder="${escapeHtml(t('ask.customPlaceholder'))}" autocomplete="off" />
-    </div>
-    <div class="ask-submit-row">
-      <button class="ask-submit-btn" type="button">${escapeHtml(t('ask.confirm'))}</button>
-    </div>
-    <div class="ask-user-hint">${escapeHtml(hintText)}</div>
   </div>`;
 }
 
-function syncAskComposerLock() {
-  const pending = document.querySelector('.ask-user-card:not(.is-answered)');
-  setComposerLocked(!!pending);
+function askUserPlaceholder(item) {
+  if (!item) return t('ask.placeholderOpen');
+  const cs = shouldShowAskCandidates(item) ? item.candidates : [];
+  if (!cs.length) return t('ask.placeholderOpen');
+  const keys = cs.slice(0, 9).map((_, i) => String(i + 1)).join('/');
+  return t('ask.placeholderOpts').replace('{keys}', keys);
 }
 
-function finalizeAskUserCards(scope) {
-  const root = scope || document;
-  const cards = [...root.querySelectorAll('.ask-user-card')];
-  if (!cards.length) { syncAskComposerLock(); return; }
-  const sess = activeSess();
-  const msgs = sess?.messages || [];
+function getPendingAskUser(sess) {
+  if (!sess || rt(sess).busy) return null;
+  const msgs = sess.messages || [];
   let lastAskIdx = -1;
+  let askData = null;
   for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === 'assistant' && /🛠️\s*Tool:\s*`ask_user`/m.test(msgs[i].content || '')) {
+    if (msgs[i].role !== 'assistant') continue;
+    const m = ASK_USER_TOOL_RE.exec(msgs[i].content || '');
+    if (m) {
       lastAskIdx = i;
+      askData = normalizeAskUserData(parseAskUserJson(m[1]));
       break;
     }
   }
-  const replied = lastAskIdx >= 0 && msgs.slice(lastAskIdx + 1).some(m => m.role === 'user');
-  cards.forEach((card, i) => {
-    if (i < cards.length - 1 || replied) {
-      card.classList.add('is-answered');
-      card.querySelectorAll('.ask-option, .ask-custom-input, .ask-submit-btn').forEach(el => {
-        if ('disabled' in el) el.disabled = true;
-      });
-    }
+  if (!askData) return null;
+  const replied = msgs.slice(lastAskIdx + 1).some(m => m.role === 'user');
+  return replied ? null : askData;
+}
+
+function syncAskUserUi() {
+  const sess = activeSess();
+  const pending = sess ? getPendingAskUser(sess) : null;
+  const notices = [...document.querySelectorAll('.ask-user-notice')];
+  notices.forEach((el, i) => {
+    const isLast = i === notices.length - 1;
+    el.classList.toggle('is-active', !!pending && isLast);
+    el.classList.toggle('is-answered', !pending || !isLast);
   });
-  syncAskComposerLock();
+  if (inputEl) inputEl.setAttribute('placeholder', pending ? askUserPlaceholder(pending) : t('composer.placeholder'));
+  if (composerEl) composerEl.classList.toggle('is-awaiting-answer', !!pending);
 }
 
 /* ═══════════════ 渲染后增强 (PR移植) ═══════════════ */
@@ -1024,7 +1051,7 @@ function postRenderEnhance(containerEl) {
     el.style.position = 'relative';
     el.appendChild(btn);
   });
-  finalizeAskUserCards(containerEl);
+  syncAskUserUi();
 }
 
 
@@ -1213,7 +1240,7 @@ function msgNode(msg) {
 function renderAllMessages(sess) {
   const box = ensureMsgs(); box.innerHTML = '';
   for (const m of sess.messages) box.appendChild(msgNode(m));
-  finalizeAskUserCards(box);
+  syncAskUserUi();
   // badge 恢复在 pollSession finally 中执行（此时 messages 已通过异步加载填充）
   refreshEmptyState(sess); scrollBottom(true);
 }
@@ -1255,6 +1282,7 @@ function appendMessage(sess, msg) {
     }
   }
   refreshEmptyState(sess); scrollBottom(true);
+  if (msg.role === 'assistant' || msg.role === 'user') syncAskUserUi();
 }
 function isNearBottom(threshold = 80) {
   return msgArea.scrollHeight - msgArea.scrollTop - msgArea.clientHeight < threshold;
@@ -1609,7 +1637,10 @@ async function pollSession(sess) {
   } finally {
     r.polling = false; renderSessionList();
     // 历史消息已全部加载，恢复已完成任务的耗时 badge
-    if (isActive(sess)) restoreElapsedBadges(sess, ensureMsgs());
+    if (isActive(sess)) {
+      restoreElapsedBadges(sess, ensureMsgs());
+      syncAskUserUi();
+    }
     tokPollBridge();
   }
 }
@@ -1683,8 +1714,7 @@ async function interruptBeforeSend(sess) {
 }
 
 /* ═══════════════ 发送 / 取消 ═══════════════ */
-// opts: { promptOverride?: string } — promptOverride 提供给 agent，聊天历史仍显示 text
-async function sendPrompt(text, opts) {
+async function sendPrompt(text) {
   text = String(text || '').trim();
   if (!text) return false;
   if (!state.bridgeReady) { showError(t('err.bridge')); return false; }
@@ -1696,10 +1726,7 @@ async function sendPrompt(text, opts) {
   }
   const planPrefix = state.planMode ? t('presetPrompt.planMode') : '';
   const autoPrefix = state.autoMode ? t('presetPrompt.autoMode') : '';
-  const promptCore = (opts && typeof opts.promptOverride === 'string' && opts.promptOverride)
-    ? opts.promptOverride
-    : expandFilePlaceholders(text);
-  const composedPrompt = [planPrefix, autoPrefix, promptCore]
+  const composedPrompt = [planPrefix, autoPrefix, expandFilePlaceholders(text)]
     .map(s => (s || '').trim())
     .filter(Boolean)
     .join('\n\n');
@@ -1758,39 +1785,6 @@ async function cancelPrompt() {
   } catch (e) { showError(t('err.stop') + ': ' + (e.message || e)); return false; }
 }
 
-function collectAskAnswer(card) {
-  if (!card) return '';
-  const inp = card.querySelector('.ask-custom-input');
-  const typed = inp ? String(inp.value || '').trim() : '';
-  if (typed) return typed;
-  const chosen = card.querySelector('.ask-option.is-chosen');
-  if (chosen) return String(chosen.dataset.ans || '').trim();
-  return '';
-}
-
-async function submitAskUserAnswer(card) {
-  if (_submitInFlight || !card || card.classList.contains('is-answered')) return;
-  const ans = collectAskAnswer(card);
-  if (!ans) {
-    const inp = card.querySelector('.ask-custom-input');
-    if (inp) inp.focus();
-    return;
-  }
-  card.classList.add('is-answered');
-  card.querySelectorAll('.ask-option, .ask-custom-input, .ask-submit-btn').forEach(el => {
-    if ('disabled' in el) el.disabled = true;
-  });
-  const promptOverride = `[ask_user 回复]\n${ans}\n\n[SYSTEM] 用户已回答，请按原计划继续。`;
-  _submitInFlight = true;
-  setComposerLocked(true);
-  try {
-    await sendPrompt(ans, { promptOverride });
-  } finally {
-    _submitInFlight = false;
-    syncAskComposerLock();
-  }
-}
-
 /* ═══════════════ 输入区 / slash / 预设 ═══════════════ */
 async function submitInput() {
   if (_submitInFlight) return;
@@ -1813,6 +1807,7 @@ async function submitInput() {
   } finally {
     _submitInFlight = false;
     setComposerLocked(false);
+    syncAskUserUi();
   }
 }
 sendBtn.addEventListener('click', (e) => {
@@ -2781,59 +2776,6 @@ if (msgArea) {
     }
   });
 }
-
-document.addEventListener('click', (e) => {
-  const optBtn = e.target.closest('.ask-option');
-  if (optBtn) {
-    const card = optBtn.closest('.ask-user-card');
-    if (!card || card.classList.contains('is-answered')) return;
-    card.querySelectorAll('.ask-option.is-chosen').forEach(b => b.classList.remove('is-chosen'));
-    optBtn.classList.add('is-chosen');
-    const inp = card.querySelector('.ask-custom-input');
-    if (inp) inp.value = '';
-    submitAskUserAnswer(card);
-    return;
-  }
-  const submitBtn = e.target.closest('.ask-submit-btn');
-  if (submitBtn) {
-    const card = submitBtn.closest('.ask-user-card');
-    if (card && !card.classList.contains('is-answered')) submitAskUserAnswer(card);
-  }
-});
-
-document.addEventListener('input', (e) => {
-  const inp = e.target.closest('.ask-custom-input');
-  if (!inp) return;
-  const card = inp.closest('.ask-user-card');
-  if (!card || card.classList.contains('is-answered')) return;
-  if (inp.value.trim()) {
-    card.querySelectorAll('.ask-option.is-chosen').forEach(b => b.classList.remove('is-chosen'));
-  }
-});
-
-document.addEventListener('keydown', (e) => {
-  const inp = e.target.closest('.ask-custom-input');
-  if (inp && e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-    e.preventDefault();
-    const card = inp.closest('.ask-user-card');
-    if (card && !card.classList.contains('is-answered')) submitAskUserAnswer(card);
-    return;
-  }
-  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-  if (!/^[1-9]$/.test(e.key)) return;
-  if (document.activeElement === inputEl && inputEl.value) return;
-  const tag = (document.activeElement && document.activeElement.tagName) || '';
-  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-  const cards = document.querySelectorAll('.ask-user-card:not(.is-answered)');
-  if (!cards.length) return;
-  const card = cards[cards.length - 1];
-  const opts = card.querySelectorAll('.ask-option');
-  const idx = Number(e.key) - 1;
-  if (idx >= 0 && idx < opts.length) {
-    e.preventDefault();
-    opts[idx].click();
-  }
-});
 
 function uploadRawUrl(path, download) {
   return `http://${location.hostname}:14168/upload/raw?path=${encodeURIComponent(path || '')}${download ? '&download=1' : ''}`;
