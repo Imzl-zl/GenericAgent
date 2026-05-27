@@ -737,7 +737,7 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 /* Flatpickr 主题覆盖 — 全部使用项目 CSS 变量 */
 .flatpickr-calendar{
   background:var(--card) !important; border:1px solid var(--line) !important; border-radius:var(--radius) !important;
-  box-shadow:var(--shadow-pop) !important; font-size:13px;
+  box-shadow:var(--shadow-pop) !important; font-family:inherit !important; font-size:13px !important;
 }
 .flatpickr-months .flatpickr-month,
 .flatpickr-current-month{ color:var(--txt) !important; fill:var(--txt) !important; }
