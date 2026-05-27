@@ -360,7 +360,6 @@ const I18N = {
     'ask.banner': 'GA 等你回答',
     'ask.replyHint': '在下方输入框回复',
     'ask.placeholderOpen': '在此输入你的回答… (Enter 发送)',
-    'ask.placeholderOpts': '输入 {keys} 选择，或直接输入自定义回答 (Enter 发送)',
   },
   en: {
     'app.title': 'GenericAgent Desktop',
@@ -505,7 +504,6 @@ const I18N = {
     'ask.banner': 'GA is waiting for your answer',
     'ask.replyHint': 'Reply in the input below',
     'ask.placeholderOpen': 'Type your answer here… (Enter to send)',
-    'ask.placeholderOpts': 'Type {keys} to pick, or enter a custom answer (Enter to send)',
   },
 };
 const LANGS = ['zh', 'en'];
@@ -1039,8 +1037,8 @@ function markAskOptionHtml(html) {
   return out;
 }
 
-/** 预览模式：true = 始终显示 candidates；看完效果后改回 false */
-const ASK_USER_ALWAYS_SHOW_CANDIDATES = true;
+/** 预览模式：true = 始终显示 candidates；false = 题干已含选项/多题时不重复渲染底部列表 */
+const ASK_USER_ALWAYS_SHOW_CANDIDATES = false;
 
 /** 题干已含选项/多题，或 candidates 无法与题干对应时，不再重复渲染底部列表 */
 function shouldShowAskCandidates(item) {
@@ -1064,12 +1062,10 @@ const ASK_USER_TOOL_RE = /🛠️ Tool: `ask_user`[^\n]*\n````text\n([\s\S]*?)\n
 function renderAskUserNotice(data) {
   const item = normalizeAskUserData(data);
   if (!item) return '';
-  const qHtml = markAskOptionHtml(renderMarkdown(formatAskUserQuestion(item.question)));
-  const showCs = shouldShowAskCandidates(item);
-  const optsHtml = showCs
-    ? `<ul class="ask-candidates">${item.candidates.map((c, j) =>
-        `<li><span class="ask-candidate-key">${j + 1}.</span><span class="ask-candidate-label">${escapeHtml(c)}</span></li>`).join('')}</ul>`
-    : '';
+  // 单题与多题统一处理：多题的选项本就内联在题干里；单题的选项放在 candidates 里，
+  // 这里把它折叠进题干，按同样的 A./B./C. 内联方式渲染，不再单独画一个编号列表。
+  const question = foldAskCandidates(item);
+  const qHtml = markAskOptionHtml(renderMarkdown(formatAskUserQuestion(question)));
   return `<div class="ask-user-notice" data-ask-user="1">
     <div class="ask-user-banner">
       <span class="ask-user-banner-text">${escapeHtml(t('ask.banner'))}</span>
@@ -1077,16 +1073,24 @@ function renderAskUserNotice(data) {
       <span class="ask-user-banner-hint">${escapeHtml(t('ask.replyHint'))}</span>
     </div>
     ${qHtml ? `<div class="ask-user-body md">${qHtml}</div>` : ''}
-    ${optsHtml}
   </div>`;
 }
 
+/** 单题的 candidates 折叠进题干（统一成 A./B./C. 内联选项）；多题或无法对应时原样返回题干 */
+function foldAskCandidates(item) {
+  if (!shouldShowAskCandidates(item)) return item.question;
+  const opts = item.candidates.map((c, j) => {
+    const label = String(c).replace(/^\s*(?:[A-Za-z]|\d{1,2})\s*[.)、:：]\s*/, '').trim();
+    return `${String.fromCharCode(65 + j)}. ${label}`;
+  }).join('\n');
+  // 用单换行（而非空行）拼进题干，让题干+选项渲染成同一个 <p>，每个选项都跟在 <br> 后面 —
+  // 与多题内联选项走完全一致的 .ask-option-line 缩进，避免首项 A 贴左边、B/C/D 缩进的错位。
+  return item.question.replace(/\s+$/, '') + '\n' + opts;
+}
+
 function askUserPlaceholder(item) {
-  if (!item) return t('ask.placeholderOpen');
-  const cs = shouldShowAskCandidates(item) ? item.candidates : [];
-  if (!cs.length) return t('ask.placeholderOpen');
-  const keys = cs.slice(0, 9).map((_, i) => String(i + 1)).join('/');
-  return t('ask.placeholderOpts').replace('{keys}', keys);
+  // 单题与多题统一：都用自由作答提示，不再针对单题单独显示「输入 1/2/3 选择」
+  return t('ask.placeholderOpen');
 }
 
 function getPendingAskUser(sess) {

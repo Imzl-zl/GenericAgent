@@ -1444,7 +1444,6 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
   font-size:14px; line-height:1.55; color:var(--txt);
   margin:0;
 }
-.ask-user-body + .ask-candidates{ margin-top:6px; }
 .ask-user-body strong{ color:var(--txt-strong); }
 .ask-user-body code{
   background:rgba(127,127,127,.14);
@@ -1470,13 +1469,11 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
   line-height:1.55;
 }
 .bubble.md .ask-user-notice .ask-user-body ul,
-.bubble.md .ask-user-notice .ask-user-body ol,
-.bubble.md .ask-user-notice .ask-candidates{
+.bubble.md .ask-user-notice .ask-user-body ol{
   margin:4px 0 0; padding:0; list-style:none;
 }
 .bubble.md .ask-user-notice .ask-user-body ul > li,
-.bubble.md .ask-user-notice .ask-user-body ol > li,
-.bubble.md .ask-user-notice .ask-candidates li{
+.bubble.md .ask-user-notice .ask-user-body ol > li{
   margin:0; padding:2px 0; padding-left:0;
 }
 .bubble.md .ask-user-notice .ask-user-body ol{
