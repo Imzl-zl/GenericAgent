@@ -15,6 +15,8 @@ from ultralytics import YOLO
 from PIL import Image, ImageDraw
 import numpy as np
 
+print('[UI DETECT] 截图分析后必须使用物理坐标，ljqCtrl也使用物理坐标！')
+
 DEFAULT_MODEL = str(Path(__file__).resolve().parent.parent / 'temp' / 'weights' / 'icon_detect' / 'model.pt')
 
 try:
@@ -128,7 +130,7 @@ def detect(image_path, mode='match', model_path=None, conf=0.25, iou_thresh=0.5)
         for i, (ox1, oy1, ox2, oy2, text, oc) in enumerate(ocr_items):
             if i not in matched_ocr:
                 elements.append({'bbox': [ox1,oy1,ox2,oy2], 'type': 'text', 'label': text, 'confidence': oc})
-
+    #if [x for x in elements if x['label'] is None]: print('[TIPS] crop grid + VLM to identify target no text icon if needed')
     return elements
 
 def visualize(image_path, elements, output_path=None):
