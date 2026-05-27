@@ -65,12 +65,20 @@ def detect(image_path, mode='crop', model_path=None, conf=0.25, iou_thresh=0.5):
     统一检测入口，返回元素列表:
     [{'bbox':[x1,y1,x2,y2], 'type':'icon'|'text', 'label':str|None, 'confidence':float}]
     mode: 'crop' = YOLO+逐块OCR | 'match' = YOLO+全图OCR空间匹配
+    支持 image_path: str 路径 或 PIL.Image 对象
     """
+    # 归一化：PIL Image → 临时文件
+    if isinstance(image_path, Image.Image):
+        import tempfile, os
+        tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+        image_path.save(tmp.name)
+        image_path = tmp.name
+    img = Image.open(image_path)
+
     yolo_boxes = _yolo(image_path, model_path, conf)
     elements = []
 
     if mode == 'crop':
-        img = Image.open(image_path)
         # YOLO元素逐块OCR
         for x1, y1, x2, y2, c in yolo_boxes:
             label = _ocr_crop(img, [x1, y1, x2, y2])
