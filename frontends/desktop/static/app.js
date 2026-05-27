@@ -2352,8 +2352,9 @@ async function tokPollBridge() {
 
 function tokGetFiltered() {
   let records = tokLoadHistory();
-  const since = tokSince?.value ? new Date(tokSince.value).getTime()/1000 : 0;
-  const until = tokUntil?.value ? new Date(tokUntil.value).getTime()/1000 : 0;
+  const parseD = v => v ? new Date(v.replace(/\s+/,'T')).getTime()/1000 : 0;
+  const since = parseD(tokSince?.value);
+  const until = parseD(tokUntil?.value);
   if (since) records = records.filter(r=>r.ts>=since);
   if (until) records = records.filter(r=>r.ts<=until);
   return records;
@@ -2406,7 +2407,7 @@ function tokRenderTable(records) {
 
 async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);}
 /* Flatpickr 初始化 */
-const _fpOpts = { enableTime:true, time_24hr:true, dateFormat:'Y-m-d\\TH:i', locale:window.flatpickr?.l10ns?.[document.documentElement.lang==='en'?'default':'zh']||'default', allowInput:false, onChange(){ _tokPage=0; loadTokenPage(); } };
+const _fpOpts = { enableTime:true, time_24hr:true, dateFormat:'Y-m-d  H:i', locale:window.flatpickr?.l10ns?.[document.documentElement.lang==='en'?'default':'zh']||'default', allowInput:false, onChange(){ _tokPage=0; loadTokenPage(); } };
 const fpSince = tokSince ? flatpickr(tokSince, _fpOpts) : null;
 const fpUntil = tokUntil ? flatpickr(tokUntil, _fpOpts) : null;
 const tokResetBtn=document.getElementById('tok-reset');
