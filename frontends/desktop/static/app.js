@@ -825,10 +825,36 @@ function sanitizeMarkdown(html) {
 const _latexSlots = [];
 function protectLatex(text) {
   _latexSlots.length = 0;
+  // 先保护代码围栏和行内代码，避免其中的 $ \( \[ 被误匹配
+  const _codeSlots = [];
+  // 代码围栏 ```...```
+  text = text.replace(/```[\s\S]*?```/g, (m) => {
+    const id = _codeSlots.length;
+    _codeSlots.push(m);
+    return `\x00CODE:${id}\x00`;
+  });
+  // 行内代码 `...`
+  text = text.replace(/`[^`\n]+`/g, (m) => {
+    const id = _codeSlots.length;
+    _codeSlots.push(m);
+    return `\x00CODE:${id}\x00`;
+  });
+  // 块级 \[...\]
+  text = text.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => {
+    const id = _latexSlots.length;
+    _latexSlots.push({ expr: expr.trim(), display: true });
+    return `<!--LATEX:${id}-->`;
+  });
   // 块级 $$...$$
   text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => {
     const id = _latexSlots.length;
     _latexSlots.push({ expr: expr.trim(), display: true });
+    return `<!--LATEX:${id}-->`;
+  });
+  // 行内 \(...\)
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => {
+    const id = _latexSlots.length;
+    _latexSlots.push({ expr: expr.trim(), display: false });
     return `<!--LATEX:${id}-->`;
   });
   // 行内 $...$（不贪婪，排除 $$ 和转义）
@@ -837,6 +863,8 @@ function protectLatex(text) {
     _latexSlots.push({ expr: expr.trim(), display: false });
     return `<!--LATEX:${id}-->`;
   });
+  // 恢复代码占位符
+  text = text.replace(/\x00CODE:(\d+)\x00/g, (_, i) => _codeSlots[Number(i)]);
   return text;
 }
 function restoreLatex(html) {
