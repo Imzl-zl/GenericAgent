@@ -2405,10 +2405,12 @@ function tokRenderTable(records) {
 }
 
 async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);}
-if(tokSince)tokSince.addEventListener('change',()=>{_tokPage=0;loadTokenPage();});
-if(tokUntil)tokUntil.addEventListener('change',()=>{_tokPage=0;loadTokenPage();});
+/* Flatpickr 初始化 */
+const _fpOpts = { enableTime:true, time_24hr:true, dateFormat:'Y-m-d\\TH:i', locale:window.flatpickr?.l10ns?.[document.documentElement.lang==='en'?'default':'zh']||'default', allowInput:false, onChange(){ _tokPage=0; loadTokenPage(); } };
+const fpSince = tokSince ? flatpickr(tokSince, _fpOpts) : null;
+const fpUntil = tokUntil ? flatpickr(tokUntil, _fpOpts) : null;
 const tokResetBtn=document.getElementById('tok-reset');
-if(tokResetBtn)tokResetBtn.addEventListener('click',()=>{if(tokSince)tokSince.value='';if(tokUntil)tokUntil.value='';_tokPage=0;loadTokenPage();});
+if(tokResetBtn)tokResetBtn.addEventListener('click',()=>{if(fpSince)fpSince.clear();if(fpUntil)fpUntil.clear();_tokPage=0;loadTokenPage();});
 nav.addEventListener('click',(e)=>{const item=e.target.closest('.nav-item');if(item&&item.dataset.page==='token')loadTokenPage();if(item&&item.dataset.page==='channels')renderChannelList(gaServiceStore.list());if(item&&item.dataset.page==='status')loadStatusPanel();});
 /* ═══════════════ 自定义预设 ═══════════════ */
 const CP_KEY = 'ga_custom_presets';
