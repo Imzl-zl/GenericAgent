@@ -801,7 +801,7 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .ph-chip{
   display:inline-flex; align-items:center; vertical-align:baseline;
   margin:0 2px; padding:1px 8px; border-radius:6px;
-  background:color-mix(in srgb, var(--blue) 16%, transparent); color:var(--blue);
+  background:color-mix(in srgb, var(--blue) 22%, transparent); color:var(--blue);
   font-size:.9em; white-space:nowrap; user-select:none; cursor:default;
 }
 .composer-bot{ display:flex; align-items:center; justify-content:space-between; margin-top:8px; }
