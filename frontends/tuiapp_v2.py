@@ -4043,7 +4043,6 @@ class GenericAgentTUI(App[None]):
         # sche_tasks/*.json are read-only — shown below as a system advisory
         # so the user still has visibility, but they can't be launched here.
         services = slash_cmds.list_launchable_services()
-        sched = slash_cmds.list_scheduler_tasks()
         if not services:
             self._system("📋 没有可启动的服务（reflect/*.py 与 frontends/*app*.py 均为空）"); return
         # Mirror hub.pyw: reflect tasks + frontend apps, grouped by kind so the
@@ -4063,14 +4062,6 @@ class GenericAgentTUI(App[None]):
             on_select=lambda names: self._scheduler_confirm(names),
         )
         sess.messages.append(msg)
-        # Cron tasks as a separate read-only advisory line.
-        if sched:
-            lines = ["⏰ sche_tasks/ cron 任务（只读，由 scheduler daemon 调度）："]
-            for s in sched:
-                tag = "" if s["enabled"] else " [DISABLED]"
-                sch = f"  [{s['schedule']}]" if s["schedule"] else ""
-                lines.append(f"  • {s['name']}{sch}{tag}")
-            self._system("\n".join(lines))
         self._refresh_messages()
 
     def _scheduler_confirm(self, names: list[str]) -> None:
