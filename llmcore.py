@@ -624,16 +624,23 @@ def _fix_messages(messages):
     fixed = []
     for m in messages:
         if fixed and m['role'] == fixed[-1]['role']:
-            fixed[-1] = {**fixed[-1], 'content': _wrap(fixed[-1]['content']) + [{"type": "text", "text": "\n"}] + _wrap(m['content'])}; continue
+            fixed[-1] = {**fixed[-1], 'content': _wrap(fixed[-1].get('content', [])) + [{"type": "text", "text": "\n"}] + _wrap(m.get('content', []))}; continue
         if fixed and fixed[-1]['role'] == 'assistant' and m['role'] == 'user':
-            uses = [b.get('id') for b in fixed[-1].get('content', []) if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('id')]
-            has = {b.get('tool_use_id') for b in _wrap(m['content']) if isinstance(b, dict) and b.get('type') == 'tool_result'}
-            miss = [uid for uid in uses if uid not in has]
-            if miss: m = {**m, 'content': [{"type": "tool_result", "tool_use_id": uid, "content": "(error)"} for uid in miss] + _wrap(m['content'])}
-            orphan = has - set(uses)
-            if orphan: m = {**m, 'content': [{"type":"text","text":str(b.get('content',''))} if isinstance(b,dict) and b.get('type')=='tool_result' and b.get('tool_use_id') in orphan else b for b in _wrap(m['content'])]}
+            uses = [b.get('id') for b in _wrap(fixed[-1].get('content', [])) if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('id')]
+            if uses:
+                got, rest = {}, []
+                for b in _wrap(m.get('content', [])):
+                    if isinstance(b, dict) and b.get('type') == 'tool_result':
+                        tid = b.get('tool_use_id')
+                        if tid in uses and tid not in got: got[tid] = b
+                        else: rest.append({"type":"text","text":str(b.get('content',''))})
+                    else: rest.append(b)
+                m = {**m, 'content': [got.get(uid) or {"type": "tool_result", "tool_use_id": uid, "content": "(error)"} for uid in uses] + rest}
+            else: m = {**m, 'content': [{"type":"text","text":str(b.get('content',''))} if isinstance(b,dict) and b.get('type')=='tool_result' else b for b in _wrap(m.get('content', []))]}
         fixed.append(m)
     while fixed and fixed[0]['role'] != 'user': fixed.pop(0)
+    if fixed and fixed[0]['role'] == 'user':
+        fixed[0] = {**fixed[0], 'content': [{"type":"text","text":str(b.get('content',''))} if isinstance(b,dict) and b.get('type')=='tool_result' else b for b in _wrap(fixed[0].get('content', []))]}
     return fixed
 
 class NativeClaudeSession(BaseSession):
