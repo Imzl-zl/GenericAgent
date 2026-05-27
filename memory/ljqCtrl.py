@@ -98,6 +98,7 @@ def Activate(hwnd):
 activate = Activate
 
 def GrabWindow(hwnd):
+	if isinstance(hwnd, str): hwnd = win32gui.FindWindow(None, hwnd); assert hwnd, f'窗口未找到'
 	Activate(hwnd); time.sleep(0.25)
 	bbox = tuple(int(v / dpi_scale) for v in win32gui.GetWindowRect(hwnd))
 	return ImageGrab.grab(bbox)
