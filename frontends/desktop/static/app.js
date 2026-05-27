@@ -1653,10 +1653,14 @@ sendBtn.addEventListener('click', (e) => {
   if (sess && rt(sess).busy) { cancelPrompt(); return; }  // 运行中：发送键是录制键 → 纯停止
   submitInput();
 });
-inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); submitInput(); } });
+inputEl.addEventListener('keydown', (e) => {
+  if (atomicPlaceholderDelete(e)) return;  // #2 紧邻占位符时整块删除
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); submitInput(); }
+});
 inputEl.addEventListener('input', () => {
   inputEl.style.height = 'auto';
   inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+  reconcilePendingFiles();  // #1 占位符被删/改坏 → 同步清理附件
 });
 function showSystem(text) {
   const sess = activeSess(); if (!sess) return;
@@ -2067,7 +2071,7 @@ function removePlaceholderFromComposer(file) {
 function expandFilePlaceholders(text) {
   return text.replace(/\[(Image|File) #(\d+)\]/g, (m, kind, n) => {
     const f = state.pendingFiles.find(x => x.sid === Number(n));
-    return (f && f.path) ? f.path : m;
+    return (f && f.path) ? f.path : '';  // #3 悬空占位符(无对应文件)→ 删掉,不把垃圾发给 agent
   });
 }
 
@@ -2079,6 +2083,59 @@ function collectUsedFiles(text) {
     return m;
   });
   return used;
+}
+
+// ── 附件占位符健壮性 ─────────────────────────────────────────────
+// 统一移除一个待发附件:出列 + (可选)抹占位符 + 重绘 + 删 bridge 上的文件
+function removePendingFile(sid, { stripPlaceholder = false } = {}) {
+  const idx = state.pendingFiles.findIndex(f => f.sid === sid);
+  if (idx < 0) return;
+  const removed = state.pendingFiles.splice(idx, 1)[0];
+  if (stripPlaceholder) removePlaceholderFromComposer(removed);
+  renderThumbStrip();
+  if (removed.path) {
+    fetch(`http://${location.hostname}:14168/upload`, {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: removed.path }),
+    }).catch(() => {});
+  }
+}
+// 文本里现存的"完整有效"占位符的 sid 集合
+function placeholderSidsInText(text) {
+  const ids = new Set(); const re = /\[(?:Image|File) #(\d+)\]/g; let m;
+  while ((m = re.exec(text)) !== null) ids.add(Number(m[1]));
+  return ids;
+}
+// #1 对账:占位符被删掉或改坏 → 同步移除对应附件(缩略图 + 磁盘文件)
+function reconcilePendingFiles() {
+  if (!state.pendingFiles.length) return;
+  const present = placeholderSidsInText(inputEl.value);
+  for (const f of state.pendingFiles.filter(x => !present.has(x.sid))) {
+    removePendingFile(f.sid, { stripPlaceholder: false });
+  }
+}
+// #2 原子删除:光标紧邻占位符时 Backspace/Delete 整块删(连同文件),杜绝"删一半"
+function atomicPlaceholderDelete(e) {
+  if (e.key !== 'Backspace' && e.key !== 'Delete') return false;
+  if (inputEl.selectionStart !== inputEl.selectionEnd) return false; // 有选区交给默认行为 + 对账兜底
+  const pos = inputEl.selectionStart;
+  const val = inputEl.value;
+  const re = /\[(?:Image|File) #(\d+)\]/g; let m;
+  while ((m = re.exec(val)) !== null) {
+    const start = m.index, end = start + m[0].length, sid = Number(m[1]);
+    const hit = e.key === 'Backspace' ? end === pos : start === pos;
+    if (!hit) continue;
+    e.preventDefault();
+    let s = start, eOut = end;             // 顺带吃掉紧邻的一个空格,避免残留双空格
+    if (e.key === 'Backspace' && val[s - 1] === ' ') s -= 1;
+    else if (e.key === 'Delete' && val[eOut] === ' ') eOut += 1;
+    inputEl.value = val.slice(0, s) + val.slice(eOut);
+    inputEl.setSelectionRange(s, s);
+    removePendingFile(sid, { stripPlaceholder: false });
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }
+  return false;
 }
 
 async function uploadOne(name, dataUrl, sid) {
@@ -2153,21 +2210,7 @@ if (imgInput) imgInput.addEventListener('change', () => {
 if (thumbStrip) thumbStrip.addEventListener('click', (e) => {
   const x = e.target.closest('.x');
   if (x) {
-    const sid = Number(x.dataset.sid);
-    const idx = state.pendingFiles.findIndex(f => f.sid === sid);
-    if (idx >= 0) {
-      const removed = state.pendingFiles[idx];
-      state.pendingFiles.splice(idx, 1);
-      removePlaceholderFromComposer(removed);
-      renderThumbStrip();
-      if (removed.path) {
-        fetch(`http://${location.hostname}:14168/upload`, {
-          method: 'DELETE',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: removed.path }),
-        }).catch(() => {});
-      }
-    }
+    removePendingFile(Number(x.dataset.sid), { stripPlaceholder: true });
     return;
   }
   const fileChip = e.target.closest('.file-chip.pending');
