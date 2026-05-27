@@ -1096,6 +1096,11 @@ class ChatMessage:
     kind: str = "text"   # "text" | "choice"
     choices: list = field(default_factory=list)   # [(label, value), ...]
     on_select: Optional[Callable] = field(default=None, repr=False)
+    # Optional Esc/cancel hook for choice cards. When set, _cancel_choice
+    # invokes this *after* removing the card (used by /scheduler's submit-
+    # confirm card to re-show the picker, mirroring ask_user's free-text
+    # "Esc rolls back to the previous picker" UX).
+    on_cancel: Optional[Callable] = field(default=None, repr=False)
     selected_label: Optional[str] = None
     # Optional lazy-render hints for choice pickers with huge option counts
     # (e.g. /continue across thousands of sessions). Default is empty / 0,
@@ -3241,6 +3246,14 @@ class GenericAgentTUI(App[None]):
             self.query_one("#input", InputArea).focus()
         except Exception:
             pass
+        # ask_user-style rollback hook: if the card declared an on_cancel
+        # callable (e.g. /scheduler submit-confirm wants Esc to re-show the
+        # picker), fire it after the card is gone.
+        cb = getattr(msg, "on_cancel", None)
+        if cb is not None:
+            try: cb()
+            except Exception as e:
+                self._system(f"on_cancel 异常: {type(e).__name__}: {e}")
 
     def _finalize_multi_choice(self, msg: ChatMessage, indices: list[int]) -> None:
         """User pressed Enter on a MultiChoiceList.
@@ -4065,8 +4078,15 @@ class GenericAgentTUI(App[None]):
         self._refresh_messages()
 
     def _scheduler_confirm(self, names: list[str]) -> None:
-        """Picker submitted → ask one more `commit answer` confirmation card
-        before actually launching anything (user-requested safety step)."""
+        """Picker submitted → ask one more ask_user-style submit-confirm card
+        before actually launching anything (user-requested safety step).
+
+        UX mirrors `ask_user`'s `Ready to submit your answer?` confirmation:
+          - No ✅ glyph on the choice labels (style consistency).
+          - ←/→ Enter Esc hint in the title.
+          - Esc / "Edit selection" → re-open the picker (rollback to previous
+            screen) just like Esc rolls back free-text typing to the picker.
+        """
         if not names:
             self._system("（未选择任何服务）"); return
         sess = self.current
@@ -4074,18 +4094,32 @@ class GenericAgentTUI(App[None]):
         joined = "、".join(names)
         confirm = ChatMessage(
             role="system",
-            content=(f"⚠️ 确认启动以下 {len(names)} 个服务？\n  {joined}"
-                     "    ←/→ 选择 · Enter 确认 · Esc 取消"),
+            content=(f"Ready to submit your selection?  ({len(names)} 个服务: {joined})"
+                     "    ←/→ 选择 · Enter 确认 · Esc 回退"),
             kind="choice",
-            choices=[("✅ 确认启动", "__SCHED_GO__"), ("取消", "__SCHED_CANCEL__")],
+            choices=[("Submit", "__SCHED_GO__"), ("Edit selection", "__SCHED_EDIT__")],
             on_select=lambda v, ns=list(names): self._scheduler_commit(v, ns),
+            # Esc on the confirm card → roll back to the picker (ask_user style).
+            on_cancel=lambda: self._cmd_scheduler([], ""),
         )
         sess.messages.append(confirm)
         self._refresh_messages()
 
     def _scheduler_commit(self, value: str, names: list[str]) -> str:
-        """on_select for the commit-answer card; returns the breadcrumb text
-        shown after the card collapses (see _collapse_choice)."""
+        """on_select for the submit-confirm card; returns the breadcrumb text
+        shown after the card collapses (see _collapse_choice).
+
+        - Submit (__SCHED_GO__) → fire the batch launcher.
+        - Edit selection (__SCHED_EDIT__) → re-open the picker (rollback).
+        """
+        if value == "__SCHED_EDIT__":
+            # Re-show the picker on the next tick so the breadcrumb settles
+            # first; using call_after_refresh keeps message order stable.
+            try:
+                self.call_after_refresh(self._cmd_scheduler, [], "")
+            except Exception:
+                self._cmd_scheduler([], "")
+            return "已回到选择界面"
         if value != "__SCHED_GO__":
             return "已取消，未启动任何服务"
         self._launch_service_batch(names)
