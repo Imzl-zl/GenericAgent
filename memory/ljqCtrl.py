@@ -2,7 +2,7 @@
 CRITICAL: 严禁在此工具链中 import pyautogui (会污染 win32api 导致逻辑冲突)。
 ljqCtrl Quick Reference:
 - dpi_scale: float (Logical = Physical * dpi_scale)
-- Click(x, y): Use Physical Coordinates (from screenshots)
+- Click(x, y, check=True): Use Physical Coordinates. check=True → 自动比前后像素变化，返回周边图像
 - SetCursorPos(z): Use Physical Coordinates z=(x, y)
 - Press(cmd, staytime=0): Keyboard shortcuts (e.g. 'ctrl+v')
 - FindBlock(fn, wrect=None, threshold=0.8) -> (obj_center_phys, is_found)
@@ -47,10 +47,19 @@ def SetCursorPos(z):
 	win32api.SetCursorPos(z)
 	time.sleep(0.05) 
 
-def Click(x, y=None):
+def Click(x, y=None, check=True):
 	if type(x) is type(tuple()): x, y = int(x[0]), int(x[1])
+	if check: before = ScreenCapAt(x, y)
 	SetCursorPos( (x, y) )
 	MouseClick()
+	if check:
+		time.sleep(0.3)
+		after = ScreenCapAt(x, y)
+		b, a = np.array(before), np.array(after)
+		diff = np.sum(np.any(b != a, axis=2))
+		total = b.shape[0] * b.shape[1]
+		print(f'[Click check] near 100px rect {diff}/{total} pixels changed ({diff/total*100:.1f}%)')
+		return after
 click = Click
 	
 def Press(cmd, staytime=0):
@@ -126,6 +135,11 @@ def FindBlock(fn, wrect=None, verbose=0, threshold=0.8):
 		sscr = scr.crop([oj, oi, oj+tsw, oi+tsh])
 		sscr.show()
 	return obj, max_val > threshold
+
+def ScreenCapAt(x, y, r=100):
+	"""物理坐标(x,y)为中心±r的屏幕截图 → PIL Image"""
+	from PIL import ImageGrab
+	return ImageGrab.grab((x-r, y-r, x+r, y+r))
 
 if __name__ == '__main__':
 	#time.sleep(3)

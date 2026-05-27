@@ -618,30 +618,40 @@ class LLMSession(BaseSession):
     def make_messages(self, raw_list): return _msgs_claude2oai(_fix_messages(raw_list))
 
 def _fix_messages(messages):
-    """修复 messages 符合 Claude API：交替、tool_use/tool_result 配对"""
     if not messages: return messages
-    _wrap = lambda c: c if isinstance(c, list) else [{"type": "text", "text": str(c)}]
-    fixed = []
+    W = lambda c: c if isinstance(c, list) else [{"type": "text", "text": str(c)}]
+    merged = []
     for m in messages:
-        if fixed and m['role'] == fixed[-1]['role']:
-            fixed[-1] = {**fixed[-1], 'content': _wrap(fixed[-1].get('content', [])) + [{"type": "text", "text": "\n"}] + _wrap(m.get('content', []))}; continue
-        if fixed and fixed[-1]['role'] == 'assistant' and m['role'] == 'user':
-            uses = [b.get('id') for b in _wrap(fixed[-1].get('content', [])) if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('id')]
-            if uses:
-                got, rest = {}, []
-                for b in _wrap(m.get('content', [])):
-                    if isinstance(b, dict) and b.get('type') == 'tool_result':
-                        tid = b.get('tool_use_id')
-                        if tid in uses and tid not in got: got[tid] = b
-                        else: rest.append({"type":"text","text":str(b.get('content',''))})
-                    else: rest.append(b)
-                m = {**m, 'content': [got.get(uid) or {"type": "tool_result", "tool_use_id": uid, "content": "(error)"} for uid in uses] + rest}
-            else: m = {**m, 'content': [{"type":"text","text":str(b.get('content',''))} if isinstance(b,dict) and b.get('type')=='tool_result' else b for b in _wrap(m.get('content', []))]}
-        fixed.append(m)
-    while fixed and fixed[0]['role'] != 'user': fixed.pop(0)
-    if fixed and fixed[0]['role'] == 'user':
-        fixed[0] = {**fixed[0], 'content': [{"type":"text","text":str(b.get('content',''))} if isinstance(b,dict) and b.get('type')=='tool_result' else b for b in _wrap(fixed[0].get('content', []))]}
-    return fixed
+        if m.get('role') not in ('user', 'assistant'): continue
+        blocks = W(m.get('content', []))
+        if merged and m['role'] == merged[-1]['role']:
+            merged[-1]['content'] += [{"type": "text", "text": "\n"}] + blocks
+        else:
+            merged.append({"role": m['role'], "content": list(blocks)})
+    while merged and merged[0]['role'] != 'user': merged.pop(0)
+    if not merged: return []
+    prev_uses = []
+    for m in merged:
+        c = m['content']
+        if m['role'] == 'assistant':
+            seen, out = set(), []
+            for b in c:
+                uid = b.get('id') if isinstance(b, dict) and b.get('type') == 'tool_use' else None
+                if uid and uid in seen: continue
+                if uid: seen.add(uid)
+                out.append(b)
+            m['content'] = out
+            prev_uses = [b.get('id') for b in out if isinstance(b, dict) and b.get('type') == 'tool_use']
+        else:
+            got, rest = {}, []
+            for b in c:
+                tid = b.get('tool_use_id') if isinstance(b, dict) and b.get('type') == 'tool_result' else None
+                if tid and tid in prev_uses and tid not in got: got[tid] = b
+                elif isinstance(b, dict) and b.get('type') == 'tool_result': rest.append({"type": "text", "text": str(b.get('content', ''))})
+                else: rest.append(b)
+            m['content'] = [got.get(u) or {"type": "tool_result", "tool_use_id": u, "content": "(error)"} for u in prev_uses] + rest
+            prev_uses = []
+    return merged
 
 class NativeClaudeSession(BaseSession):
     def __init__(self, cfg):
