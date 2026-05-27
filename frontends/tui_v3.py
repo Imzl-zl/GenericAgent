@@ -1491,12 +1491,7 @@ _SHELL_MARK = _SHELL_ACCENT + '!' + _RST
 # pair reads as one block in scrollback, matching cc-style.  Slightly
 # warmer than _TILE_U (55,55,55) so the two row kinds are distinguishable
 # when interleaved.  Black-terminal only — light themes get the bare band.
-#
-# BG-only on purpose: forcing a fg here would overwrite the dim `└` glyph
-# and re-color the command output (the user's terminal already paints
-# stdout in its default fg + any ANSI the command emits, and we want to
-# preserve that — only the band is ours).
-_TILE_SHELL = '\x1b[48;2;65;60;65m'
+_TILE_SHELL = '\x1b[48;2;65;60;65m\x1b[38;2;230;230;230m'
 _BG_TOK = {str(n) for n in list(range(40, 48)) + [49] + list(range(100, 108))}
 _SGR_RE = re.compile(r'\x1b\[([0-9;]*)m')
 _CSI_ERASE_RE = re.compile(r'\x1b\[[0-9;?]*[JK]')
@@ -3109,15 +3104,13 @@ class SB:
         body = (out.rstrip('\n') or _t('shell.empty')).split('\n')
         rows: list[str] = []
         for i, ln in enumerate(body):
-            # `└ ` only on the first line so multi-line output reads as a
-            # continuation block, not a sequence of separate hits.
-            # Keep _DIM on the gutter (`└`) and leave `ln` un-re-coloured
-            # so any ANSI the shell emitted survives — the bg-only tile
-            # paints the band underneath.
-            prefix = _DIM + ('  └ ' if i == 0 else '    ') + _RST
-            rows.append(_tile(' ' + prefix + ln, _TILE_SHELL, w))
-        rows.append('')   # bare blank gap separates the shell pair from
-                          #  the next chat block — no band on the gap row
+            # Output rows stay on bare terminal bg — only the `! cmd` echo
+            # carries the charcoal band so the eye reads it as "this is
+            # the command, that's its output" (cc-style).  `└ ` only on
+            # the first line so multi-line output reads as a continuation.
+            prefix = _DIM + '  └ ' + _RST if i == 0 else _DIM + '    ' + _RST
+            rows.append(prefix + ln)
+        rows.append('')   # blank gap separates the shell pair from the next chat block
         self.commit(rows)
         # Persist the exchange so the agent sees it on its next turn.
         # Splitting on `is_running` avoids racing the agent thread:
