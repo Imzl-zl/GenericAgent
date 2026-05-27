@@ -1405,6 +1405,18 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
 .bubble.md .ask-user-notice .ask-user-body p:last-child{
   margin-bottom:0;
 }
+.bubble.md .ask-user-notice .ask-user-body p.ask-option-line{
+  padding-left:1.25em;
+  margin:0;
+  font-weight:400;
+}
+.bubble.md .ask-user-notice .ask-user-body span.ask-option-line{
+  display:block;
+  padding-left:1.25em;
+  margin:0;
+  font-weight:400;
+  line-height:1.55;
+}
 .bubble.md .ask-user-notice .ask-user-body ul,
 .bubble.md .ask-user-notice .ask-user-body ol,
 .bubble.md .ask-user-notice .ask-candidates{
