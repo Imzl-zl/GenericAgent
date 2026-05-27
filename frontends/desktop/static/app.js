@@ -233,7 +233,7 @@ const I18N = {
     'preset.add.t': '自定义', 'preset.add.d': '任意一句话存为功能',
     'composer.placeholder': '输入消息… (Enter 发送, Shift+Enter 换行)',
     'search.placeholder': '搜索会话…', 'conv.new': '新对话',
-    'ctx.pin': '置顶', 'ctx.unpin': '取消置顶', 'ctx.del': '删除',
+    'ctx.pin': '置顶', 'ctx.unpin': '取消置顶', 'ctx.rename': '重命名', 'ctx.del': '删除',
     'common.close': '关闭', 'common.more': '更多', 'common.optional': '选填', 'common.save': '保存',
     'modal.preset': '预设功能', 'modal.addModel': '添加模型', 'modal.editModel': '编辑模型', 'modal.settings': '配置',
     'modal.customPreset': '自定义预设',
@@ -357,6 +357,10 @@ const I18N = {
     'presetPrompt.hive': '启动 Goal Hive 模式：按 hive SOP 拉起多个 worker 协同完成我接下来的目标。',
     'presetPrompt.review': '进入监察者模式：对刚才的产出严格挑刺、逐项复核并报告问题。',
     'presetPrompt.mine': '抓取本周的 git 提交并写一份周报。',
+    'ask.banner': 'GA 等你回答',
+    'ask.replyHint': '在下方输入框回复',
+    'ask.placeholderOpen': '在此输入你的回答… (Enter 发送)',
+    'ask.placeholderOpts': '输入 {keys} 选择，或直接输入自定义回答 (Enter 发送)',
   },
   en: {
     'app.title': 'GenericAgent Desktop',
@@ -374,7 +378,7 @@ const I18N = {
     'preset.add.t': 'Custom', 'preset.add.d': 'Save any prompt as a function',
     'composer.placeholder': 'Type a message… (Enter to send, Shift+Enter for newline)',
     'search.placeholder': 'Search chats…', 'conv.new': 'New chat',
-    'ctx.pin': 'Pin', 'ctx.unpin': 'Unpin', 'ctx.del': 'Delete',
+    'ctx.pin': 'Pin', 'ctx.unpin': 'Unpin', 'ctx.rename': 'Rename', 'ctx.del': 'Delete',
     'common.close': 'Close', 'common.more': 'More', 'common.optional': 'Optional', 'common.save': 'Save',
     'modal.preset': 'Presets', 'modal.addModel': 'Add model', 'modal.editModel': 'Edit model', 'modal.settings': 'Settings',
     'modal.customPreset': 'Custom preset',
@@ -498,6 +502,10 @@ const I18N = {
     'presetPrompt.hive': 'Start Goal Hive mode: per the hive SOP, spawn multiple workers to collaboratively achieve the goal I describe next.',
     'presetPrompt.review': 'Enter reviewer mode: strictly scrutinize the previous output, review item by item and report issues.',
     'presetPrompt.mine': 'Collect this week\'s git commits and write a weekly report.',
+    'ask.banner': 'GA is waiting for your answer',
+    'ask.replyHint': 'Reply in the input below',
+    'ask.placeholderOpen': 'Type your answer here… (Enter to send)',
+    'ask.placeholderOpts': 'Type {keys} to pick, or enter a custom answer (Enter to send)',
   },
 };
 const LANGS = ['zh', 'en'];
@@ -594,6 +602,7 @@ function applyI18n() {
   document.querySelectorAll('[data-i18n-title]').forEach(el => { el.setAttribute('title', t(el.dataset.i18nTitle)); });
   renderLangList();
   window.collabRetranslate?.();
+  syncAskUserUi();
 }
 // 语言对应国旗 SVG(en 用美国旗,按要求)
 const FLAGS = {
@@ -891,11 +900,20 @@ function renderAssistant(text) {
   }
   // 2) 块级折叠：占位符使用 HTML 注释，避免与正文 F\d+ 冲突
   const folds = [];
+  const asks = [];
   const stash = (label, body, cls) => { folds.push({ label, body, cls: cls || '' }); return `\n\n§§FOLD:${folds.length - 1}§§\n\n`; };
+  const stashAsk = (data) => { asks.push(data); return `\n\n§§ASK:${asks.length - 1}§§\n\n`; };
   const foldBlocks = (body) => {
     let s = body;
     // thinking: 兼容 <thinking> XML 与 <details>...</details>（未来扩展）
     s = s.replace(/<thinking>[\s\S]*?<\/thinking>/gi, m => stash(t('fold.thinking'), m.replace(/<\/?thinking>/gi, ''), 'fold-thinking'));
+    // ask_user：渲染为提问卡片（必须在通用工具规则之前匹配）
+    s = s.replace(/🛠️ Tool: `ask_user`[^\n]*\n````text\n([\s\S]*?)\n````/g,
+                  (m, json) => {
+                    const data = parseAskUserJson(json);
+                    if (data && normalizeAskUserData(data)) return stashAsk(data);
+                    return stash(`${t('fold.tool')}: ask_user`, json, 'fold-tool');
+                  });
     // 工具调用：agent_loop 实际格式 = "🛠️ Tool: `name`  📥 args:\n````text\n{json}\n````"
     s = s.replace(/🛠️ Tool: `([^`]+)`[^\n]*\n````text\n([\s\S]*?)\n````/g,
                   (_, name, json) => stash(`${t('fold.tool')}: ${name}`, json, 'fold-tool'));
@@ -941,11 +959,168 @@ function renderAssistant(text) {
     return `<details class="fold fold-turn"><summary>${head}</summary>${inner}</details>`;
   });
   // 4) 还原块级占位符
-  return parts.join('').replace(/(?:<p>\s*)?§§FOLD:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => {
-    const f = folds[Number(i)];
-    return `<details class="fold ${f.cls}"><summary>${escapeHtml(f.label)}</summary><pre class="fold-pre">${escapeHtml(f.body)}</pre></details>`;
-  });
+  return parts.join('')
+    .replace(/(?:<p>\s*)?§§ASK:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => renderAskUserNotice(asks[Number(i)]))
+    .replace(/(?:<p>\s*)?§§FOLD:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => {
+      const f = folds[Number(i)];
+      return `<details class="fold ${f.cls}"><summary>${escapeHtml(f.label)}</summary><pre class="fold-pre">${escapeHtml(f.body)}</pre></details>`;
+    });
 }
+
+function parseAskUserJson(raw) {
+  if (raw == null) return null;
+  const txt = String(raw).trim();
+  if (!txt) return null;
+  try { return JSON.parse(txt); } catch (_) {}
+  try {
+    let out = '';
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < txt.length; i++) {
+      const c = txt[i];
+      if (esc) { out += c; esc = false; continue; }
+      if (c === '\\') { out += c; esc = true; continue; }
+      if (c === '"') { inStr = !inStr; out += c; continue; }
+      if (inStr) {
+        if (c === '\n') out += '\\n';
+        else if (c === '\r') out += '\\r';
+        else if (c === '\t') out += '\\t';
+        else if (c.charCodeAt(0) < 0x20) out += '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0');
+        else out += c;
+      } else out += c;
+    }
+    return JSON.parse(out);
+  } catch (_) {}
+  return null;
+}
+
+function normalizeAskUserData(data) {
+  const raw = data || {};
+  const question = String(raw.question || '').trim();
+  if (!question) return null;
+  const cs = raw.candidates || [];
+  const candidates = Array.isArray(cs)
+    ? cs.map(x => String(x == null ? '' : x)).filter(x => x.trim())
+    : [];
+  return { question, candidates };
+}
+
+/** 格式化 ask_user 题干：编号与正文同行；无空行时在 2./3. 前分段 */
+function formatAskUserQuestion(text) {
+  let s = String(text || '').trim();
+  if (!s) return s;
+  // 「1.\n正文」→「1. 正文」
+  s = s.replace(/^(\d+[.、:：)])\s*\n+\s*/gm, '$1 ');
+  s = s.replace(/(\n)(\d+[.、:：)])\s*\n+\s*/g, '$1$2 ');
+  s = s.replace(/(\n|^)(问题\s*\d+\s*[:：.、)]?)\s*\n+\s*/gi, '$1$2 ');
+  // 题与题之间：尚无空行时，仅在 2./3. 前插入空行（不动 1. 与题干）
+  if (!/\n\s*\n/.test(s)) {
+    s = s.replace(/(\S)\s+(?=问题\s*[2-9]\d*\s*[:：.、)]?\s*)/gi, '$1\n\n');
+    s = s.replace(/(\S)\s+(?=[2-9]\d*[.、:：)]\s+\S)/g, '$1\n\n');
+  }
+  return boldAskQuestionLines(s);
+}
+
+function boldAskQuestionLines(text) {
+  return String(text || '').split('\n').map(line => {
+    const t = line.trim();
+    if (!t || /^\*\*.+\*\*$/.test(t)) return line;
+    if (/^\d+[.、:：)]\s+\S/.test(t)) return '**' + t + '**';
+    if (/^问题\s*\d+/i.test(t)) return '**' + t + '**';
+    if (/[？?]\s*$/.test(t) && !/^[A-Da-d][.)]\s/.test(t)) return '**' + t + '**';
+    return line;
+  }).join('\n');
+}
+
+function markAskOptionHtml(html) {
+  let out = String(html || '');
+  out = out.replace(/<p>([^<]*[A-Da-d][.)]\s[^<]*)<\/p>/gi, '<p class="ask-option-line">$1</p>');
+  out = out.replace(/(<br\s*\/?>)\s*([A-Da-d][.)]\s[^<]+)/gi, '<span class="ask-option-line">$2</span>');
+  return out;
+}
+
+/** 预览模式：true = 始终显示 candidates；看完效果后改回 false */
+const ASK_USER_ALWAYS_SHOW_CANDIDATES = true;
+
+/** 题干已含选项/多题，或 candidates 无法与题干对应时，不再重复渲染底部列表 */
+function shouldShowAskCandidates(item) {
+  if (!item || !item.candidates.length) return false;
+  if (ASK_USER_ALWAYS_SHOW_CANDIDATES) return true;
+  const q = item.question;
+  if (/两个问题|多个问题|两道|两题/.test(q)) return false;
+  if ((q.match(/问题\s*\d/gi) || []).length >= 2) return false;
+  if ((q.match(/^[ \t]*\d+[.、:：)]\s+/gm) || []).length >= 2) return false;
+  if ((q.match(/^[ \t]*[A-Da-d][.)]\s/mg) || []).length >= 2) return false;
+  const comboN = item.candidates.filter(c => /\d+[A-Da-d]\s*\+\s*\d+[A-Da-d]/i.test(c)).length;
+  if (comboN >= Math.max(1, Math.ceil(item.candidates.length * 0.5))) return false;
+  // 题干里有多道问句，却把全部选项平铺在 candidates → 无法区分归属，不展示
+  const qMarks = (q.match(/[？?]/g) || []).length;
+  if (qMarks >= 2 && item.candidates.length > 4) return false;
+  return true;
+}
+
+const ASK_USER_TOOL_RE = /🛠️ Tool: `ask_user`[^\n]*\n````text\n([\s\S]*?)\n````/;
+
+function renderAskUserNotice(data) {
+  const item = normalizeAskUserData(data);
+  if (!item) return '';
+  const qHtml = markAskOptionHtml(renderMarkdown(formatAskUserQuestion(item.question)));
+  const showCs = shouldShowAskCandidates(item);
+  const optsHtml = showCs
+    ? `<ul class="ask-candidates">${item.candidates.map((c, j) =>
+        `<li><span class="ask-candidate-key">${j + 1}.</span><span class="ask-candidate-label">${escapeHtml(c)}</span></li>`).join('')}</ul>`
+    : '';
+  return `<div class="ask-user-notice" data-ask-user="1">
+    <div class="ask-user-banner">
+      <span class="ask-user-banner-text">${escapeHtml(t('ask.banner'))}</span>
+      <span class="ask-user-banner-sep" aria-hidden="true">·</span>
+      <span class="ask-user-banner-hint">${escapeHtml(t('ask.replyHint'))}</span>
+    </div>
+    ${qHtml ? `<div class="ask-user-body md">${qHtml}</div>` : ''}
+    ${optsHtml}
+  </div>`;
+}
+
+function askUserPlaceholder(item) {
+  if (!item) return t('ask.placeholderOpen');
+  const cs = shouldShowAskCandidates(item) ? item.candidates : [];
+  if (!cs.length) return t('ask.placeholderOpen');
+  const keys = cs.slice(0, 9).map((_, i) => String(i + 1)).join('/');
+  return t('ask.placeholderOpts').replace('{keys}', keys);
+}
+
+function getPendingAskUser(sess) {
+  if (!sess || rt(sess).busy) return null;
+  const msgs = sess.messages || [];
+  let lastAskIdx = -1;
+  let askData = null;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role !== 'assistant') continue;
+    const m = ASK_USER_TOOL_RE.exec(msgs[i].content || '');
+    if (m) {
+      lastAskIdx = i;
+      askData = normalizeAskUserData(parseAskUserJson(m[1]));
+      break;
+    }
+  }
+  if (!askData) return null;
+  const replied = msgs.slice(lastAskIdx + 1).some(m => m.role === 'user');
+  return replied ? null : askData;
+}
+
+function syncAskUserUi() {
+  const sess = activeSess();
+  const pending = sess ? getPendingAskUser(sess) : null;
+  const notices = [...document.querySelectorAll('.ask-user-notice')];
+  notices.forEach((el, i) => {
+    const isLast = i === notices.length - 1;
+    el.classList.toggle('is-active', !!pending && isLast);
+    el.classList.toggle('is-answered', !pending || !isLast);
+  });
+  if (inputEl) inputEl.setAttribute('data-ph', pending ? askUserPlaceholder(pending) : t('composer.placeholder'));  // contenteditable 用 data-ph（无 placeholder 属性）
+  if (composerEl) composerEl.classList.toggle('is-awaiting-answer', !!pending);
+}
+
 /* ═══════════════ 渲染后增强 (PR移植) ═══════════════ */
 /* ───────────── 统一复制 SVG Icon ───────────── */
 const SVG_COPY_ICON = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
@@ -985,6 +1160,7 @@ function postRenderEnhance(containerEl) {
     el.style.position = 'relative';
     el.appendChild(btn);
   });
+  syncAskUserUi();
 }
 
 
@@ -1173,6 +1349,7 @@ function msgNode(msg) {
 function renderAllMessages(sess) {
   const box = ensureMsgs(); box.innerHTML = '';
   for (const m of sess.messages) box.appendChild(msgNode(m));
+  syncAskUserUi();
   // badge 恢复在 pollSession finally 中执行（此时 messages 已通过异步加载填充）
   refreshEmptyState(sess); scrollBottom(true);
 }
@@ -1214,6 +1391,7 @@ function appendMessage(sess, msg) {
     }
   }
   refreshEmptyState(sess); scrollBottom(true);
+  if (msg.role === 'assistant' || msg.role === 'user') syncAskUserUi();
 }
 function isNearBottom(threshold = 80) {
   return msgArea.scrollHeight - msgArea.scrollTop - msgArea.clientHeight < threshold;
@@ -1516,6 +1694,42 @@ convMenu.addEventListener('click', (e) => {
     saveSessions();
     patchSession(sess, { pinned: sess.pinned });
     renderSessionList();
+  } else if (sess && act === 'rename') {
+    convMenu.hidden = true;
+    const item = convListEl.querySelector(`.conv-item[data-id="${sess.id}"]`);
+    if (!item) return;
+    const titleEl = item.querySelector('.ci-title');
+    if (!titleEl) return;
+    const oldTitle = sess.title || '';
+    const inp = document.createElement('input');
+    inp.className = 'ci-rename-input';
+    inp.value = oldTitle;
+    titleEl.replaceWith(inp);
+    inp.focus();
+    inp.select();
+    const finish = (save) => {
+      if (inp._done) return;
+      inp._done = true;
+      const val = inp.value.trim();
+      if (save && val && val !== oldTitle) {
+        sess.title = val;
+        sess.untitled = false;
+        saveSessions();
+        patchSession(sess, { title: val, untitled: false });
+        const history = tokLoadHistory();
+        const sid = sess.bridgeSessionId || sess.id;
+        let changed = false;
+        history.forEach(h => { if (h.sessionId === sid) { h.title = val; changed = true; } });
+        if (changed) tokSaveHistory(history);
+      }
+      renderSessionList();
+    };
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    inp.addEventListener('blur', () => finish(true));
+    return;
   } else if (sess && act === 'del') {
     closeSession(sess.id);
   }
@@ -1568,7 +1782,10 @@ async function pollSession(sess) {
   } finally {
     r.polling = false; renderSessionList();
     // 历史消息已全部加载，恢复已完成任务的耗时 badge
-    if (isActive(sess)) restoreElapsedBadges(sess, ensureMsgs());
+    if (isActive(sess)) {
+      restoreElapsedBadges(sess, ensureMsgs());
+      syncAskUserUi();
+    }
     tokPollBridge();
   }
 }
@@ -1655,8 +1872,7 @@ async function sendPrompt(text) {
   }
   const planPrefix = state.planMode ? t('presetPrompt.planMode') : '';
   const autoPrefix = state.autoMode ? t('presetPrompt.autoMode') : '';
-  const expandedText = expandFilePlaceholders(text);
-  const composedPrompt = [planPrefix, autoPrefix, expandedText]
+  const composedPrompt = [planPrefix, autoPrefix, expandFilePlaceholders(text)]
     .map(s => (s || '').trim())
     .filter(Boolean)
     .join('\n\n');
@@ -1735,6 +1951,7 @@ async function submitInput() {
   } finally {
     _submitInFlight = false;
     setComposerLocked(false);
+    syncAskUserUi();
   }
 }
 sendBtn.addEventListener('click', (e) => {
@@ -3348,14 +3565,14 @@ window.ga.startBridge && window.ga.startBridge();
     cardMenu.className = 'ctx-menu';
     cardMenu.style.left = x + 'px';
     cardMenu.style.top = y + 'px';
-    cardMenu.innerHTML = '<div class="ctx-item danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>删除</div>';
-    cardMenu.querySelector('.ctx-item').onmousedown = (e) => {
+    cardMenu.innerHTML = `<div class="ctx-item danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>${esc(t('ctx.del'))}</div>`;
+    cardMenu.querySelector('.ctx-item').onclick = (e) => {
       e.stopPropagation();
       fetch(`http://${location.hostname}:8900/subagent/${sid}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill' }) });
       hideCardMenu();
     };
     document.body.appendChild(cardMenu);
-    setTimeout(() => document.addEventListener('mousedown', hideCardMenu, { once: true }), 0);
+    setTimeout(() => document.addEventListener('mousedown', (e) => { if (!cardMenu?.contains(e.target)) hideCardMenu(); }, { once: true }), 0);
   }
 
   let drawerEl = null;
