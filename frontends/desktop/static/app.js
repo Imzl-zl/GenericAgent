@@ -322,7 +322,7 @@ const I18N = {
     'presetPrompt.hive': '启动 Goal Hive 模式：按 hive SOP 拉起多个 worker 协同完成我接下来的目标。',
     'presetPrompt.review': '进入监察者模式：对刚才的产出严格挑刺、逐项复核并报告问题。',
     'presetPrompt.mine': '抓取本周的 git 提交并写一份周报。',
-    'ask.banner': 'Agent 等你回答',
+    'ask.banner': 'GA 等你回答',
     'ask.replyHint': '在下方输入框回复',
     'ask.placeholderOpen': '在此输入你的回答… (Enter 发送)',
     'ask.placeholderOpts': '输入 {keys} 选择，或直接输入自定义回答 (Enter 发送)',
@@ -432,7 +432,7 @@ const I18N = {
     'presetPrompt.hive': 'Start Goal Hive mode: per the hive SOP, spawn multiple workers to collaboratively achieve the goal I describe next.',
     'presetPrompt.review': 'Enter reviewer mode: strictly scrutinize the previous output, review item by item and report issues.',
     'presetPrompt.mine': 'Collect this week\'s git commits and write a weekly report.',
-    'ask.banner': 'Agent is waiting for your answer',
+    'ask.banner': 'GA is waiting for your answer',
     'ask.replyHint': 'Reply in the input below',
     'ask.placeholderOpen': 'Type your answer here… (Enter to send)',
     'ask.placeholderOpts': 'Type {keys} to pick, or enter a custom answer (Enter to send)',
@@ -927,7 +927,25 @@ function formatAskUserQuestion(text) {
     s = s.replace(/(\S)\s+(?=问题\s*[2-9]\d*\s*[:：.、)]?\s*)/gi, '$1\n\n');
     s = s.replace(/(\S)\s+(?=[2-9]\d*[.、:：)]\s+\S)/g, '$1\n\n');
   }
-  return s;
+  return boldAskQuestionLines(s);
+}
+
+function boldAskQuestionLines(text) {
+  return String(text || '').split('\n').map(line => {
+    const t = line.trim();
+    if (!t || /^\*\*.+\*\*$/.test(t)) return line;
+    if (/^\d+[.、:：)]\s+\S/.test(t)) return '**' + t + '**';
+    if (/^问题\s*\d+/i.test(t)) return '**' + t + '**';
+    if (/[？?]\s*$/.test(t) && !/^[A-Da-d][.)]\s/.test(t)) return '**' + t + '**';
+    return line;
+  }).join('\n');
+}
+
+function markAskOptionHtml(html) {
+  let out = String(html || '');
+  out = out.replace(/<p>([^<]*[A-Da-d][.)]\s[^<]*)<\/p>/gi, '<p class="ask-option-line">$1</p>');
+  out = out.replace(/(<br\s*\/?>)\s*([A-Da-d][.)]\s[^<]+)/gi, '<span class="ask-option-line">$2</span>');
+  return out;
 }
 
 /** 预览模式：true = 始终显示 candidates；看完效果后改回 false */
@@ -955,7 +973,7 @@ const ASK_USER_TOOL_RE = /🛠️ Tool: `ask_user`[^\n]*\n````text\n([\s\S]*?)\n
 function renderAskUserNotice(data) {
   const item = normalizeAskUserData(data);
   if (!item) return '';
-  const qHtml = renderMarkdown(formatAskUserQuestion(item.question));
+  const qHtml = markAskOptionHtml(renderMarkdown(formatAskUserQuestion(item.question)));
   const showCs = shouldShowAskCandidates(item);
   const optsHtml = showCs
     ? `<ul class="ask-candidates">${item.candidates.map((c, j) =>
