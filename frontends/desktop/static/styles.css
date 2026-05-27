@@ -684,6 +684,10 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .composer.is-locked .input{
   background:var(--field-bg); cursor:not-allowed;
 }
+.composer.is-awaiting-answer .input{
+  border-color:var(--blue);
+  box-shadow:0 0 0 2px var(--blue-bg);
+}
 .chan-log-pre{
   max-height:360px; overflow:auto; margin:0;
   font-family:inherit; font-size:13px; line-height:1.5;
@@ -944,6 +948,11 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
 .conv-item.idle .ci-dot{ background:var(--dot-idle); }
 .ci-main{ flex:1; min-width:0; }
 .ci-title{ font-size:13px; font-weight:600; color:var(--txt-strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ci-rename-input{
+  font-size:13px; font-weight:600; color:var(--txt-strong); width:100%;
+  border:1px solid var(--accent); border-radius:4px; padding:1px 4px;
+  background:var(--field-bg); outline:none;
+}
 .ci-pin{ width:14px; height:14px; color:var(--accent); margin-right:3px; vertical-align:-3px; flex:0 0 auto; display:inline-block; transform:rotate(45deg); transform-origin:50% 50%; }
 .ci-meta{ font-size:11px; color:var(--muted); margin-top:2px; }
 .ci-more{
@@ -1387,6 +1396,127 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
 /* 历史轮 <summary> 头部的副标题（来自模型 <summary> 抽取） */
 .fold-turn > summary .turn-head-sum{
   font-style:italic; color:var(--muted); font-weight:normal; margin-left:4px;
+}
+
+/* —— ask_user 显眼提醒 —— */
+.ask-user-notice{
+  margin:8px 0 4px;
+  border:1px solid var(--line);
+  border-left:3px solid var(--blue);
+  border-radius:var(--radius);
+  background:color-mix(in srgb, var(--blue-bg) 55%, var(--card));
+  padding:10px 12px;
+}
+.ask-user-notice.is-active{
+  border-color:color-mix(in srgb, var(--blue) 28%, var(--line));
+  background:color-mix(in srgb, var(--blue-bg) 72%, var(--card));
+}
+.ask-user-notice.is-answered{
+  opacity:.78;
+  background:var(--card);
+  border-color:var(--line);
+  border-left-color:var(--muted2);
+}
+.ask-user-banner{
+  display:flex; align-items:baseline; flex-wrap:wrap;
+  gap:4px 6px;
+  margin-bottom:8px;
+  line-height:1.4;
+}
+.ask-user-banner-text{
+  font-size:13px; font-weight:600;
+  color:var(--txt-strong);
+}
+.ask-user-notice.is-active .ask-user-banner-text{
+  color:var(--blue);
+}
+.ask-user-notice.is-answered .ask-user-banner-text{
+  color:var(--muted);
+}
+.ask-user-banner-sep{
+  color:var(--muted2);
+  font-size:12px; user-select:none;
+}
+.ask-user-banner-hint{
+  font-size:12px; font-weight:400; color:var(--muted);
+}
+.ask-user-body{
+  font-size:14px; line-height:1.55; color:var(--txt);
+  margin:0;
+}
+.ask-user-body + .ask-candidates{ margin-top:6px; }
+.ask-user-body strong{ color:var(--txt-strong); }
+.ask-user-body code{
+  background:rgba(127,127,127,.14);
+  padding:1px 5px; border-radius:4px; font-size:.92em;
+}
+/* 覆盖 .bubble.md ul/ol/p，题干内列表与正文左缘对齐 */
+.bubble.md .ask-user-notice .ask-user-body p{
+  margin:0 0 4px;
+}
+.bubble.md .ask-user-notice .ask-user-body p:last-child{
+  margin-bottom:0;
+}
+.bubble.md .ask-user-notice .ask-user-body p.ask-option-line{
+  padding-left:1.25em;
+  margin:0;
+  font-weight:400;
+}
+.bubble.md .ask-user-notice .ask-user-body span.ask-option-line{
+  display:block;
+  padding-left:1.25em;
+  margin:0;
+  font-weight:400;
+  line-height:1.55;
+}
+.bubble.md .ask-user-notice .ask-user-body ul,
+.bubble.md .ask-user-notice .ask-user-body ol,
+.bubble.md .ask-user-notice .ask-candidates{
+  margin:4px 0 0; padding:0; list-style:none;
+}
+.bubble.md .ask-user-notice .ask-user-body ul > li,
+.bubble.md .ask-user-notice .ask-user-body ol > li,
+.bubble.md .ask-user-notice .ask-candidates li{
+  margin:0; padding:2px 0; padding-left:0;
+}
+.bubble.md .ask-user-notice .ask-user-body ol{
+  counter-reset:ask-ol;
+}
+.bubble.md .ask-user-notice .ask-user-body ol > li{
+  counter-increment:ask-ol;
+  display:block;
+}
+.bubble.md .ask-user-notice .ask-user-body ol > li::before{
+  content:counter(ask-ol) ". ";
+  font-weight:600;
+  color:color-mix(in srgb, var(--txt) 38%, var(--muted));
+}
+.bubble.md .ask-user-notice .ask-user-body ol > li > p{
+  display:inline;
+  margin:0;
+}
+.ask-user-notice.is-active .ask-user-body ol > li::before{
+  color:color-mix(in srgb, var(--blue) 72%, var(--txt));
+}
+.ask-candidates{
+  display:flex; flex-direction:column; gap:0;
+}
+.ask-candidates li{
+  display:block;
+  font-size:14px; line-height:1.55; color:var(--txt);
+}
+.ask-candidate-key{
+  font-weight:600;
+  color:color-mix(in srgb, var(--txt) 38%, var(--muted));
+}
+.ask-user-notice.is-active .ask-candidate-key{
+  color:color-mix(in srgb, var(--blue) 72%, var(--txt));
+}
+.ask-user-notice.is-answered .ask-candidate-key{
+  color:var(--muted2);
+}
+.ask-candidate-label{
+  white-space:pre-wrap; word-break:break-word;
 }
 
 /* —— 消息计时 badge —— */
