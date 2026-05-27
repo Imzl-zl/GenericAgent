@@ -682,6 +682,10 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .composer.is-locked .input{
   background:var(--field-bg); cursor:not-allowed;
 }
+.composer.is-awaiting-answer .input{
+  border-color:var(--blue);
+  box-shadow:0 0 0 2px var(--blue-bg);
+}
 .chan-log-pre{
   max-height:360px; overflow:auto; margin:0;
   font-family:inherit; font-size:13px; line-height:1.5;
@@ -1342,148 +1346,114 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
   font-style:italic; color:var(--muted); font-weight:normal; margin-left:4px;
 }
 
-/* —— ask_user 提问卡片 —— */
-.ask-user-card{
-  margin:10px 0 4px;
+/* —— ask_user 显眼提醒 —— */
+.ask-user-notice{
+  margin:8px 0 4px;
   border:1px solid var(--line);
   border-left:3px solid var(--blue);
   border-radius:var(--radius);
+  background:color-mix(in srgb, var(--blue-bg) 55%, var(--card));
+  padding:10px 12px;
+}
+.ask-user-notice.is-active{
+  border-color:color-mix(in srgb, var(--blue) 28%, var(--line));
+  background:color-mix(in srgb, var(--blue-bg) 72%, var(--card));
+}
+.ask-user-notice.is-answered{
+  opacity:.78;
   background:var(--card);
-  padding:12px 14px 10px;
+  border-color:var(--line);
+  border-left-color:var(--muted2);
 }
-.ask-user-head{
-  display:flex; align-items:center; gap:8px;
-  color:var(--blue);
-  font-size:13px; font-weight:600;
+.ask-user-banner{
+  display:flex; align-items:baseline; flex-wrap:wrap;
+  gap:4px 6px;
   margin-bottom:8px;
+  line-height:1.4;
 }
-.ask-user-head .ask-user-icon{
-  display:inline-flex; align-items:center; justify-content:center;
+.ask-user-banner-text{
+  font-size:13px; font-weight:600;
+  color:var(--txt-strong);
+}
+.ask-user-notice.is-active .ask-user-banner-text{
+  color:var(--blue);
+}
+.ask-user-notice.is-answered .ask-user-banner-text{
+  color:var(--muted);
+}
+.ask-user-banner-sep{
+  color:var(--muted2);
+  font-size:12px; user-select:none;
+}
+.ask-user-banner-hint{
+  font-size:12px; font-weight:400; color:var(--muted);
 }
 .ask-user-body{
   font-size:14px; line-height:1.55; color:var(--txt);
-  margin:0 0 10px;
+  margin:0;
 }
-.ask-user-body p{ margin:4px 0; }
-.ask-user-body p:first-child{ margin-top:0; }
-.ask-user-body p:last-child{ margin-bottom:0; }
-.ask-user-body ul, .ask-user-body ol{ margin:6px 0; padding-left:22px; }
+.ask-user-body + .ask-candidates{ margin-top:6px; }
 .ask-user-body strong{ color:var(--txt-strong); }
 .ask-user-body code{
   background:rgba(127,127,127,.14);
   padding:1px 5px; border-radius:4px; font-size:.92em;
 }
-.ask-options{
-  display:flex; flex-direction:column; gap:6px;
-  margin:8px 0;
+/* 覆盖 .bubble.md ul/ol/p，题干内列表与正文左缘对齐 */
+.bubble.md .ask-user-notice .ask-user-body p{
+  margin:0 0 4px;
 }
-.ask-option{
-  display:flex; align-items:center; gap:10px;
-  width:100%; text-align:left;
-  padding:9px 12px;
-  border:1px solid var(--line);
-  border-radius:var(--radius-sm);
-  background:var(--card);
-  color:var(--txt);
-  font-size:13.5px; line-height:1.4;
-  cursor:pointer;
-  transition:border-color .12s ease, background .12s ease, transform .08s ease;
+.bubble.md .ask-user-notice .ask-user-body p:last-child{
+  margin-bottom:0;
 }
-.ask-option:hover{
-  border-color:var(--blue);
-  background:var(--blue-bg);
+.bubble.md .ask-user-notice .ask-user-body ul,
+.bubble.md .ask-user-notice .ask-user-body ol,
+.bubble.md .ask-user-notice .ask-candidates{
+  margin:4px 0 0; padding:0; list-style:none;
 }
-.ask-option:active{ transform:translateY(1px); }
-.ask-option:focus-visible{
-  outline:2px solid var(--blue);
-  outline-offset:1px;
+.bubble.md .ask-user-notice .ask-user-body ul > li,
+.bubble.md .ask-user-notice .ask-user-body ol > li,
+.bubble.md .ask-user-notice .ask-candidates li{
+  margin:0; padding:2px 0; padding-left:0;
 }
-.ask-option-key{
-  display:inline-flex; align-items:center; justify-content:center;
-  min-width:22px; height:22px; padding:0 6px;
-  border-radius:6px;
-  background:rgba(127,127,127,.14);
-  color:var(--muted);
-  font-size:11px; font-weight:600;
-  flex-shrink:0;
+.bubble.md .ask-user-notice .ask-user-body ol{
+  counter-reset:ask-ol;
 }
-.ask-option:hover .ask-option-key{
-  background:var(--blue);
-  color:var(--on-accent);
+.bubble.md .ask-user-notice .ask-user-body ol > li{
+  counter-increment:ask-ol;
+  display:block;
 }
-.ask-option-label{
-  flex:1 1 auto;
+.bubble.md .ask-user-notice .ask-user-body ol > li::before{
+  content:counter(ask-ol) ". ";
+  font-weight:600;
+  color:color-mix(in srgb, var(--txt) 38%, var(--muted));
+}
+.bubble.md .ask-user-notice .ask-user-body ol > li > p{
+  display:inline;
+  margin:0;
+}
+.ask-user-notice.is-active .ask-user-body ol > li::before{
+  color:color-mix(in srgb, var(--blue) 72%, var(--txt));
+}
+.ask-candidates{
+  display:flex; flex-direction:column; gap:0;
+}
+.ask-candidates li{
+  display:block;
+  font-size:14px; line-height:1.55; color:var(--txt);
+}
+.ask-candidate-key{
+  font-weight:600;
+  color:color-mix(in srgb, var(--txt) 38%, var(--muted));
+}
+.ask-user-notice.is-active .ask-candidate-key{
+  color:color-mix(in srgb, var(--blue) 72%, var(--txt));
+}
+.ask-user-notice.is-answered .ask-candidate-key{
+  color:var(--muted2);
+}
+.ask-candidate-label{
   white-space:pre-wrap; word-break:break-word;
 }
-.ask-option-arrow{
-  display:inline-flex; align-items:center;
-  color:var(--muted2);
-  opacity:.5; transition:opacity .12s ease, transform .12s ease;
-  flex-shrink:0;
-}
-.ask-option:hover .ask-option-arrow{
-  opacity:1; transform:translateX(2px); color:var(--blue);
-}
-.ask-user-card.is-answered{ opacity:.85; }
-.ask-user-card.is-answered .ask-option{
-  cursor:default; opacity:.55;
-}
-.ask-user-card.is-answered .ask-option:hover{
-  border-color:var(--line); background:var(--card);
-}
-.ask-user-card.is-answered .ask-option:hover .ask-option-key{
-  background:rgba(127,127,127,.14); color:var(--muted);
-}
-.ask-user-card.is-answered .ask-option:hover .ask-option-arrow{
-  opacity:.5; transform:none; color:var(--muted2);
-}
-.ask-user-card.is-answered .ask-option.is-chosen{
-  opacity:1;
-  border-color:var(--blue);
-  background:var(--blue-bg);
-}
-.ask-user-card.is-answered .ask-option.is-chosen .ask-option-key{
-  background:var(--blue); color:var(--on-accent);
-}
-.ask-user-hint{
-  margin-top:6px;
-  font-size:11.5px; color:var(--muted);
-  font-style:italic;
-}
-.ask-custom-row{ margin:8px 0 4px; }
-.ask-custom-input{
-  width:100%;
-  padding:8px 12px;
-  border:1px solid var(--line);
-  border-radius:var(--radius-sm);
-  background:var(--bg);
-  color:var(--txt);
-  font-size:13.5px;
-  outline:none;
-  transition:border-color .12s ease, box-shadow .12s ease;
-}
-.ask-custom-input:hover{ border-color:var(--line-strong); }
-.ask-custom-input:focus{
-  border-color:var(--blue);
-  box-shadow:0 0 0 2px var(--blue-bg);
-}
-.ask-submit-row{ margin-top:8px; }
-.ask-submit-btn{
-  padding:7px 16px;
-  border:1px solid var(--blue);
-  border-radius:var(--radius-sm);
-  background:var(--blue);
-  color:var(--on-accent);
-  font-size:13px; font-weight:600;
-  cursor:pointer;
-  transition:filter .12s ease;
-}
-.ask-submit-btn:hover:not(:disabled){ filter:brightness(1.06); }
-.ask-submit-btn:disabled{
-  opacity:.4; cursor:not-allowed;
-}
-.ask-user-card.is-answered .ask-custom-input{ cursor:not-allowed; }
-.ask-user-card.is-answered .ask-submit-btn{ cursor:not-allowed; opacity:.4; }
 
 /* —— 消息计时 badge —— */
 .task-elapsed{
