@@ -233,7 +233,7 @@ const I18N = {
     'preset.add.t': '自定义', 'preset.add.d': '任意一句话存为功能',
     'composer.placeholder': '输入消息… (Enter 发送, Shift+Enter 换行)',
     'search.placeholder': '搜索会话…', 'conv.new': '新对话',
-    'ctx.pin': '置顶', 'ctx.unpin': '取消置顶', 'ctx.del': '删除',
+    'ctx.pin': '置顶', 'ctx.unpin': '取消置顶', 'ctx.rename': '重命名', 'ctx.del': '删除',
     'common.close': '关闭', 'common.more': '更多', 'common.optional': '选填', 'common.save': '保存',
     'modal.preset': '预设功能', 'modal.addModel': '添加模型', 'modal.editModel': '编辑模型', 'modal.settings': '配置',
     'modal.customPreset': '自定义预设',
@@ -378,7 +378,7 @@ const I18N = {
     'preset.add.t': 'Custom', 'preset.add.d': 'Save any prompt as a function',
     'composer.placeholder': 'Type a message… (Enter to send, Shift+Enter for newline)',
     'search.placeholder': 'Search chats…', 'conv.new': 'New chat',
-    'ctx.pin': 'Pin', 'ctx.unpin': 'Unpin', 'ctx.del': 'Delete',
+    'ctx.pin': 'Pin', 'ctx.unpin': 'Unpin', 'ctx.rename': 'Rename', 'ctx.del': 'Delete',
     'common.close': 'Close', 'common.more': 'More', 'common.optional': 'Optional', 'common.save': 'Save',
     'modal.preset': 'Presets', 'modal.addModel': 'Add model', 'modal.editModel': 'Edit model', 'modal.settings': 'Settings',
     'modal.customPreset': 'Custom preset',
@@ -1692,6 +1692,42 @@ convMenu.addEventListener('click', (e) => {
     saveSessions();
     patchSession(sess, { pinned: sess.pinned });
     renderSessionList();
+  } else if (sess && act === 'rename') {
+    convMenu.hidden = true;
+    const item = convListEl.querySelector(`.conv-item[data-id="${sess.id}"]`);
+    if (!item) return;
+    const titleEl = item.querySelector('.ci-title');
+    if (!titleEl) return;
+    const oldTitle = sess.title || '';
+    const inp = document.createElement('input');
+    inp.className = 'ci-rename-input';
+    inp.value = oldTitle;
+    titleEl.replaceWith(inp);
+    inp.focus();
+    inp.select();
+    const finish = (save) => {
+      if (inp._done) return;
+      inp._done = true;
+      const val = inp.value.trim();
+      if (save && val && val !== oldTitle) {
+        sess.title = val;
+        sess.untitled = false;
+        saveSessions();
+        patchSession(sess, { title: val, untitled: false });
+        const history = tokLoadHistory();
+        const sid = sess.bridgeSessionId || sess.id;
+        let changed = false;
+        history.forEach(h => { if (h.sessionId === sid) { h.title = val; changed = true; } });
+        if (changed) tokSaveHistory(history);
+      }
+      renderSessionList();
+    };
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    inp.addEventListener('blur', () => finish(true));
+    return;
   } else if (sess && act === 'del') {
     closeSession(sess.id);
   }
@@ -3463,14 +3499,14 @@ window.ga.startBridge && window.ga.startBridge();
     cardMenu.className = 'ctx-menu';
     cardMenu.style.left = x + 'px';
     cardMenu.style.top = y + 'px';
-    cardMenu.innerHTML = '<div class="ctx-item danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>删除</div>';
-    cardMenu.querySelector('.ctx-item').onmousedown = (e) => {
+    cardMenu.innerHTML = `<div class="ctx-item danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>${esc(t('ctx.del'))}</div>`;
+    cardMenu.querySelector('.ctx-item').onclick = (e) => {
       e.stopPropagation();
       fetch(`http://${location.hostname}:8900/subagent/${sid}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill' }) });
       hideCardMenu();
     };
     document.body.appendChild(cardMenu);
-    setTimeout(() => document.addEventListener('mousedown', hideCardMenu, { once: true }), 0);
+    setTimeout(() => document.addEventListener('mousedown', (e) => { if (!cardMenu?.contains(e.target)) hideCardMenu(); }, { once: true }), 0);
   }
 
   let drawerEl = null;

@@ -901,6 +901,11 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .conv-item.idle .ci-dot{ background:var(--dot-idle); }
 .ci-main{ flex:1; min-width:0; }
 .ci-title{ font-size:13px; font-weight:600; color:var(--txt-strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ci-rename-input{
+  font-size:13px; font-weight:600; color:var(--txt-strong); width:100%;
+  border:1px solid var(--blue); border-radius:4px; padding:1px 4px;
+  background:var(--field-bg); outline:none;
+}
 .ci-pin{ width:14px; height:14px; color:var(--blue); margin-right:3px; vertical-align:-3px; flex:0 0 auto; display:inline-block; transform:rotate(45deg); transform-origin:50% 50%; }
 .ci-meta{ font-size:11px; color:var(--muted); margin-top:2px; }
 .ci-more{
