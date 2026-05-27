@@ -238,7 +238,33 @@ class AgentManager:
     def _save_mykey_text(self, text: str) -> list:
         self._mykey_file().write_text(text, encoding="utf-8")
         self._invalidate_mykey_cache()
+        self._reload_live_agents()
         return self.list_model_profiles()
+
+    def _reload_live_agents(self) -> None:
+        """mykey.py 改动后，强制所有活着的会话 agent 重建 LLM session，让新 key/模型
+        立即生效（无需重启）。重建保留对话 history（agentmain 内部用 oldhistory 接回）。
+
+        纯 bridge 侧实现，不改 agentmain：每次调 agent.load_llm_sessions() 前，把
+        llmcore 的全局 mtime 标志清空（与 _invalidate_mykey_cache 同一手法），使其内部
+        reload_mykeys() 报告 changed=True、从而真正重建——否则刷新模型列表等路径会先
+        消费掉变更标志，常驻 agent 的 load_llm_sessions 会因 changed=False 跳过重建。"""
+        self.ensure_ga_import_path()
+        try:
+            import llmcore
+        except Exception:
+            return
+        with self.lock:
+            agents = [s.agent for s in self.sessions.values() if getattr(s, "agent", None) is not None]
+        for agent in agents:
+            fn = getattr(agent, "load_llm_sessions", None)
+            if not callable(fn):
+                continue
+            try:
+                llmcore._mykey_mtime = None   # 让本次 reload_mykeys() 视为“已变更”，触发真正重建
+                fn()
+            except Exception as e:
+                print(f"[bridge] reload live agent failed: {e}", file=sys.stderr)
 
     def add_model_profile(self, data: dict) -> dict:
         cfg = self._build_cfg(data)
