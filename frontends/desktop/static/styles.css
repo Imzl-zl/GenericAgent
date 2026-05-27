@@ -740,7 +740,7 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
   box-shadow:var(--shadow-pop) !important; font-family:inherit !important; font-size:13px !important;
 }
 .flatpickr-months .flatpickr-month,
-.flatpickr-current-month{ color:var(--txt) !important; fill:var(--txt) !important; }
+.flatpickr-current-month{ color:var(--txt) !important; fill:var(--txt) !important; font-weight:600 !important; }
 .flatpickr-current-month .flatpickr-monthDropdown-months,
 .flatpickr-current-month input.cur-year{ color:var(--txt) !important; background:var(--field-bg) !important; }
 .flatpickr-weekdays{ background:var(--field-bg) !important; }
