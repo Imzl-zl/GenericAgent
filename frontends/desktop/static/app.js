@@ -825,10 +825,36 @@ function sanitizeMarkdown(html) {
 const _latexSlots = [];
 function protectLatex(text) {
   _latexSlots.length = 0;
+  // 先保护代码围栏和行内代码，避免其中的 $ \( \[ 被误匹配
+  const _codeSlots = [];
+  // 代码围栏 ```...```
+  text = text.replace(/```[\s\S]*?```/g, (m) => {
+    const id = _codeSlots.length;
+    _codeSlots.push(m);
+    return `\x00CODE:${id}\x00`;
+  });
+  // 行内代码 `...`
+  text = text.replace(/`[^`\n]+`/g, (m) => {
+    const id = _codeSlots.length;
+    _codeSlots.push(m);
+    return `\x00CODE:${id}\x00`;
+  });
+  // 块级 \[...\]
+  text = text.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => {
+    const id = _latexSlots.length;
+    _latexSlots.push({ expr: expr.trim(), display: true });
+    return `<!--LATEX:${id}-->`;
+  });
   // 块级 $$...$$
   text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => {
     const id = _latexSlots.length;
     _latexSlots.push({ expr: expr.trim(), display: true });
+    return `<!--LATEX:${id}-->`;
+  });
+  // 行内 \(...\)
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => {
+    const id = _latexSlots.length;
+    _latexSlots.push({ expr: expr.trim(), display: false });
     return `<!--LATEX:${id}-->`;
   });
   // 行内 $...$（不贪婪，排除 $$ 和转义）
@@ -837,6 +863,8 @@ function protectLatex(text) {
     _latexSlots.push({ expr: expr.trim(), display: false });
     return `<!--LATEX:${id}-->`;
   });
+  // 恢复代码占位符
+  text = text.replace(/\x00CODE:(\d+)\x00/g, (_, i) => _codeSlots[Number(i)]);
   return text;
 }
 function restoreLatex(html) {
@@ -862,6 +890,12 @@ function renderMarkdown(text) {
     const protected_ = protectLatex(String(text || ''));
     let html = sanitizeMarkdown(marked.parse(protected_));
     html = restoreLatex(html);
+    // TUI 风格代码块：包装 pre>code 为 .code-block 容器 + 语言头
+    html = html.replace(/<pre><code\b(?:\s+class="language-([^"]*)")?[^>]*>([\s\S]*?)<\/code><\/pre>/g,
+      (_, lang, body) => {
+        const label = lang || 'code';
+        return `<div class="code-block"><div class="code-block-head"><span class="code-block-lang">${escapeHtml(label)}</span><button class="code-block-copy" aria-label="Copy code">\u29C9</button></div><pre><code class="language-${escapeHtml(label)}">${body}</code></pre></div>`;
+      });
     return html;
   } catch (_) { return escapeHtml(text); }
 }
@@ -1134,9 +1168,10 @@ const SVG_CHECK_ICON = `<svg width="14" height="14" viewBox="0 0 24 24" fill="no
 
 function postRenderEnhance(containerEl) {
   if (!containerEl) return;
-  // 代码高亮 + 复制按钮
+  // 代码高亮 + 复制按钮（.code-block 容器已自带头部复制按钮，跳过）
   containerEl.querySelectorAll('pre code').forEach(block => {
     if (typeof hljs !== 'undefined') hljs.highlightElement(block);
+    if (block.closest('.code-block')) return; // TUI 风格容器已有复制按钮
     if (!block.parentElement.querySelector('.code-copy-btn')) {
       const btn = document.createElement('button');
       btn.className = 'code-copy-btn'; btn.innerHTML = SVG_COPY_ICON;
@@ -1150,17 +1185,30 @@ function postRenderEnhance(containerEl) {
       block.parentElement.appendChild(btn);
     }
   });
+  // TUI 代码块头部复制按钮绑定
+  containerEl.querySelectorAll('.code-block-copy').forEach(btn => {
+    if (btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    btn.onclick = () => {
+      const code = btn.closest('.code-block').querySelector('code');
+      if (!code) return;
+      navigator.clipboard.writeText(code.textContent.trim()).then(() => {
+        btn.textContent = '\u2713';
+        setTimeout(() => { btn.textContent = '\u29C9'; }, 1500);
+      });
+    };
+  });
   // KaTeX 复制按钮
   containerEl.querySelectorAll('.katex-block').forEach(el => {
     if (el.querySelector('.latex-copy-btn')) return;
     const src = el.querySelector('annotation[encoding="application/x-tex"]');
     if (!src) return;
     const btn = document.createElement('button');
-    btn.className = 'latex-copy-btn'; btn.innerHTML = SVG_COPY_ICON;
+    btn.className = 'latex-copy-btn'; btn.textContent = '\u29C9';
     btn.title = t('act.copyTex');
     btn.onclick = () => {
       navigator.clipboard.writeText(src.textContent).then(() => {
-        btn.innerHTML = SVG_CHECK_ICON; setTimeout(() => btn.innerHTML = SVG_COPY_ICON, 1500);
+        btn.textContent = '\u2713'; setTimeout(() => btn.textContent = '\u29C9', 1500);
       });
     };
     el.style.position = 'relative';
