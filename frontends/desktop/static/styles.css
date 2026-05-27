@@ -1527,7 +1527,7 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
   line-height:1.4;
 }
 .ask-user-banner-text{
-  font-size:13px; font-weight:600;
+  font-size:13px; font-weight:700;
   color:var(--txt-strong);
 }
 .ask-user-notice.is-active .ask-user-banner-text{
@@ -1545,7 +1545,7 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
 }
 .ask-user-body{
   font-size:14px; line-height:1.55; color:var(--txt);
-  margin:0;
+  font-weight:600; margin:0;
 }
 .ask-user-body strong{ color:var(--txt-strong); }
 .ask-user-body code{
