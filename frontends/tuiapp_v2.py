@@ -104,7 +104,7 @@ _ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Strip the leading turn marker that agent_loop yields per turn — covers
 # both the default `**LLM Running (Turn N) ...**` and the task-mode short
 # `**Turn N ...**` (agent_loop.py:52 switches when handler.parent.task_dir
-# is set; v2 now sets task_dir for the _intervene injection hook).
+# is set; v2 sets task_dir for the `_stop` / `_keyinfo` consume paths).
 # fold_turns still needs the marker in source content to split turns, so we only strip at
 # render time. Applies to the live (last) text segment, since folded turns don't include it.
 _TURN_MARKER_RE = re.compile(r"^\s*\**(?:LLM Running \()?Turn \d+\)?[^\n]*\**\s*", re.MULTILINE)
@@ -1190,12 +1190,8 @@ class AgentSession:
     # Boundary between restored history (≤ idx) and this run (> idx);
     # `/continue` bumps to `len(messages)` so old plan cards don't resurrect.
     plan_scan_baseline: int = 0
-    # Pending user inputs queued while this session was running.  Each
-    # submit appends to `_intervene` immediately; `pending` is the UI
-    # mirror.  The session's turn_end hook clears both at every turn
-    # boundary — non-exit boundaries inject the content into next_prompt;
-    # exit boundaries re-route via put_task so the user's text never
-    # silently disappears.  No timers — delivery anchored to agent turns.
+    # User messages queued while this session was running.  Drained as
+    # ONE fresh put_task when the agent goes idle (Codex/CC pattern).
     pending: list[str] = field(default_factory=list)
     pending_lk: threading.Lock = field(default_factory=threading.Lock)
 
@@ -2137,10 +2133,8 @@ class InputArea(TextArea):
         # 3) history browse: only at (0,0) for up / end-of-text for down, so in-line
         #    cursor movement is preserved.
         if event.key == "up" and self.cursor_location == (0, 0):
-            # Pending-queue recall removed: each Enter while running writes
-            # to `_intervene` immediately, so popping back into the composer
-            # would let a duplicate slip into next_prompt.  Esc clears the
-            # whole queue; that's the only take-back.
+            # Pending-queue recall removed — drain is post-turn now (Codex
+            # pattern), so Up just walks input history.  Esc clears queue.
             if self._history_up():
                 event.stop(); event.prevent_default(); return
         if event.key == "down":
@@ -2772,11 +2766,9 @@ class GenericAgentTUI(App[None]):
         agent = self.agent_factory()
         try: agent.inc_out = True
         except Exception: pass
-        # Give the agent a per-session task_dir so ga.turn_end_callback's
-        # `_intervene` file hook (ga.py:576) can fire — that's how pending
-        # user messages slip into the current turn's next LLM call instead
-        # of waiting for the whole run to end.  Dedicated PID+session dir
-        # so concurrent sessions don't share an intervene file.
+        # Per-session task_dir enables ga's `_stop` / `_keyinfo` consume
+        # paths (agentmain.py:158, ga.py:575).  PID+session scoped so
+        # concurrent sessions don't share signal files.
         try:
             agent.task_dir = os.path.join(FRONTENDS_DIR, '..', 'temp',
                                           f'_tui_v2_{os.getpid()}_{agent_id}')
@@ -2790,7 +2782,6 @@ class GenericAgentTUI(App[None]):
         self.sessions[agent_id] = sess
         self.current_id = agent_id
         self._install_ask_user_hook(sess)
-        self._install_intervene_replay_hook(sess)
         self._refresh_all()
         return sess
 
@@ -2997,7 +2988,6 @@ class GenericAgentTUI(App[None]):
                 with sess.pending_lk:
                     n = len(sess.pending)
                     sess.pending = []
-                self._clear_intervene(sess)
                 self._system(f"已清空 {n} 条待发送消息")
                 self._disarm_rewind()
                 return
@@ -4489,72 +4479,9 @@ class GenericAgentTUI(App[None]):
             pass
 
     # ---------------- agent task + stream ----------------
-    # Pending-queue transport:
-    #   Submit while running → append `_intervene` immediately (mid-turn).
-    #   Turn boundary (ga.turn_end_callback) consumes the file; our hook
-    #   reads `exit_reason` and re-routes via `put_task` when the agent
-    #   was about to exit (consume_file ran but next_prompt was discarded).
-
-    def _session_intervene_path(self, sess: AgentSession) -> Optional[str]:
-        td = getattr(sess.agent, 'task_dir', None)
-        if not td:
-            return None
-        try:
-            os.makedirs(td, exist_ok=True)
-        except Exception:
-            return None
-        return os.path.join(td, '_intervene')
-
-    def _inject_intervene(self, sess: AgentSession, text: str) -> bool:
-        """Append `text` to `<task_dir>/_intervene`.  Append-mode keeps us
-        idempotent under the consume_file race."""
-        if sess.status != "running":
-            return False
-        fp = self._session_intervene_path(sess)
-        if not fp:
-            return False
-        try:
-            sep = ''
-            try:
-                if os.path.getsize(fp) > 0: sep = '\n\n'
-            except OSError: pass
-            with open(fp, 'a', encoding='utf-8') as f:
-                f.write(sep + text)
-            return True
-        except Exception:
-            return False
-
-    def _clear_intervene(self, sess: AgentSession) -> None:
-        fp = self._session_intervene_path(sess)
-        if fp:
-            try: os.remove(fp)
-            except OSError: pass
-
-    def _install_intervene_replay_hook(self, sess: AgentSession) -> None:
-        """Turn-end hook: clears `sess.pending` at every boundary.  If the
-        boundary carries `exit_reason`, consume_file already ate the file
-        but next_prompt was discarded — re-route via put_task."""
-        agent = sess.agent
-        try:
-            hooks = getattr(agent, "_turn_end_hooks", None)
-            if hooks is None:
-                hooks = agent._turn_end_hooks = {}
-            def _hook(ctx, _s=sess):
-                with _s.pending_lk:
-                    if not _s.pending:
-                        return
-                    combined = "\n\n".join(_s.pending)
-                    _s.pending = []
-                if (ctx or {}).get("exit_reason"):
-                    try: _s.agent.put_task(combined, source="user")
-                    except Exception: pass
-                try: self.call_from_thread(self._refresh_messages)
-                except Exception: pass
-                try: self.call_from_thread(self._refresh_bottombar)
-                except Exception: pass
-            hooks[f"tui_v2_intervene_{sess.agent_id}"] = _hook
-        except Exception:
-            pass
+    # Pending-queue transport (Codex/CC pattern): submit while running →
+    # append to sess.pending; drain as ONE fresh put_task when the agent
+    # goes idle (in _on_stream done=True).  Never mid-turn injection.
 
     def submit_user_message(self, text: str, images: Optional[list[str]] = None, display_text: Optional[str] = None) -> int:
         sess = self.current
@@ -4562,22 +4489,19 @@ class GenericAgentTUI(App[None]):
         if self._maybe_intercept_free_text(sess, text):
             return -1
         if sess.status == "running":
-            if self._inject_intervene(sess, text):
-                visible = text if display_text is None else display_text
-                with sess.pending_lk:
-                    sess.pending.append(text)
-                    n = len(sess.pending)
-                sess.messages.append(ChatMessage(
-                    "system",
-                    f"[queued #{n}] {visible}",
-                    kind="system",
-                ))
-                if sess.agent_id == self.current_id:
-                    self._refresh_messages()
-                    self._refresh_bottombar()
-                return -1
-            # Status flipped to idle in the race — fall through to fresh
-            # put_task path below so the message isn't silently dropped.
+            visible = text if display_text is None else display_text
+            with sess.pending_lk:
+                sess.pending.append(text)
+                n = len(sess.pending)
+            sess.messages.append(ChatMessage(
+                "system",
+                f"[queued #{n}] {visible}",
+                kind="system",
+            ))
+            if sess.agent_id == self.current_id:
+                self._refresh_messages()
+                self._refresh_bottombar()
+            return -1
         sess.task_seq += 1
         tid = sess.task_seq
         sess.current_task_id = tid
@@ -4629,10 +4553,21 @@ class GenericAgentTUI(App[None]):
             s.status = "idle"
             s.current_display_queue = None
         self._update_assistant(agent_id, text, task_id=task_id, done=done, refresh_chrome=True)
-        # End-of-turn re-parse only; mid-stream `[...]` fragments would flash.
         if done:
             self._update_plan_state(s, text)
             self._drain_ask_user_events(s)
+            self._drain_pending_to_task(s)
+
+    def _drain_pending_to_task(self, sess: AgentSession) -> None:
+        """Codex/CC pattern: drain queued user messages as ONE fresh
+        put_task when the agent goes idle.  Never mid-turn injection —
+        that overpowers the model and makes it drop the original task."""
+        with sess.pending_lk:
+            if not sess.pending:
+                return
+            combined = "\n\n".join(sess.pending)
+            sess.pending = []
+        self.submit_user_message(combined, display_text=combined)
 
 
 
