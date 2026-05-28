@@ -1190,9 +1190,12 @@ class AgentSession:
     # Boundary between restored history (≤ idx) and this run (> idx);
     # `/continue` bumps to `len(messages)` so old plan cards don't resurrect.
     plan_scan_baseline: int = 0
-    # User messages queued while this session was running.  Drained as
-    # ONE fresh put_task when the agent goes idle (Codex/CC pattern).
+    # `pending`: raw user text for UI display ([queued #N] chip).
+    # `pending_wrapped`: same entries wrapped with the Claude-Code prompt
+    # phrasing, in the form actually appended to `_intervene`.  Replay
+    # uses these so the exit-turn re-put_task carries the wrap context.
     pending: list[str] = field(default_factory=list)
+    pending_wrapped: list[str] = field(default_factory=list)
     pending_lk: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -2133,8 +2136,9 @@ class InputArea(TextArea):
         # 3) history browse: only at (0,0) for up / end-of-text for down, so in-line
         #    cursor movement is preserved.
         if event.key == "up" and self.cursor_location == (0, 0):
-            # Pending-queue recall removed — drain is post-turn now (Codex
-            # pattern), so Up just walks input history.  Esc clears queue.
+            # Pending-queue recall removed: each Enter while running writes
+            # to `_intervene` immediately; popping back would leave a stale
+            # entry in the file.  Up just walks input history; Esc clears.
             if self._history_up():
                 event.stop(); event.prevent_default(); return
         if event.key == "down":
@@ -2782,6 +2786,7 @@ class GenericAgentTUI(App[None]):
         self.sessions[agent_id] = sess
         self.current_id = agent_id
         self._install_ask_user_hook(sess)
+        self._install_intervene_replay_hook(sess)
         self._refresh_all()
         return sess
 
@@ -2988,6 +2993,8 @@ class GenericAgentTUI(App[None]):
                 with sess.pending_lk:
                     n = len(sess.pending)
                     sess.pending = []
+                    sess.pending_wrapped = []
+                self._clear_intervene(sess)
                 self._system(f"已清空 {n} 条待发送消息")
                 self._disarm_rewind()
                 return
@@ -4479,9 +4486,90 @@ class GenericAgentTUI(App[None]):
             pass
 
     # ---------------- agent task + stream ----------------
-    # Pending-queue transport (Codex/CC pattern): submit while running →
-    # append to sess.pending; drain as ONE fresh put_task when the agent
-    # goes idle (in _on_stream done=True).  Never mid-turn injection.
+    # Pending-queue transport: submit while running → wrap text with
+    # Claude-Code phrasing ("...IMPORTANT: After completing your current
+    # task, you MUST address the user's message above. Do not ignore
+    # it.") and append to `_intervene` so ga.turn_end_callback prepends
+    # it to next_prompt as `[MASTER] ...` mid-turn.  The wrap makes the
+    # `[MASTER]` framing supplementary instead of overriding.  On an
+    # exit-turn boundary consume_file ate the file but next_prompt was
+    # discarded — the replay hook re-routes via put_task.
+
+    _INTERVENE_WRAP_EN = (
+        "The user sent a new message while you were working:\n{text}\n\n"
+        "IMPORTANT: After completing your current task, you MUST address "
+        "the user's message above. Do not ignore it."
+    )
+    _INTERVENE_WRAP_ZH = (
+        "用户在你工作时发来了一条新消息：\n{text}\n\n"
+        "重要：完成当前任务后，你必须处理上面的用户消息。不要忽略它。"
+    )
+
+    def _wrap_user_steer(self, text: str) -> str:
+        lang = (os.environ.get("GA_LANG", "") or "").lower()
+        tmpl = self._INTERVENE_WRAP_EN if lang == "en" else self._INTERVENE_WRAP_ZH
+        return tmpl.format(text=text)
+
+    def _session_intervene_path(self, sess: AgentSession) -> Optional[str]:
+        td = getattr(sess.agent, 'task_dir', None)
+        if not td:
+            return None
+        try: os.makedirs(td, exist_ok=True)
+        except Exception: return None
+        return os.path.join(td, '_intervene')
+
+    def _inject_intervene(self, sess: AgentSession, text: str) -> bool:
+        """Append `text` to `<task_dir>/_intervene`.  Append-mode keeps us
+        idempotent under the consume_file race."""
+        if sess.status != "running":
+            return False
+        fp = self._session_intervene_path(sess)
+        if not fp:
+            return False
+        try:
+            sep = ''
+            try:
+                if os.path.getsize(fp) > 0: sep = '\n\n'
+            except OSError: pass
+            with open(fp, 'a', encoding='utf-8') as f:
+                f.write(sep + text)
+            return True
+        except Exception:
+            return False
+
+    def _clear_intervene(self, sess: AgentSession) -> None:
+        fp = self._session_intervene_path(sess)
+        if fp:
+            try: os.remove(fp)
+            except OSError: pass
+
+    def _install_intervene_replay_hook(self, sess: AgentSession) -> None:
+        """At each turn boundary: non-exit → consume_file already delivered
+        our wrapped text into next_prompt (clear UI mirror).  Exit → file
+        was eaten but next_prompt was discarded; re-route the combined
+        wrapped text via put_task so the user's words aren't lost."""
+        agent = sess.agent
+        try:
+            hooks = getattr(agent, "_turn_end_hooks", None)
+            if hooks is None:
+                hooks = agent._turn_end_hooks = {}
+            def _hook(ctx, _s=sess):
+                with _s.pending_lk:
+                    if not _s.pending_wrapped:
+                        return
+                    combined = "\n\n".join(_s.pending_wrapped)
+                    _s.pending_wrapped = []
+                    _s.pending = []
+                if (ctx or {}).get("exit_reason"):
+                    try: _s.agent.put_task(combined, source="user")
+                    except Exception: pass
+                try: self.call_from_thread(self._refresh_messages)
+                except Exception: pass
+                try: self.call_from_thread(self._refresh_bottombar)
+                except Exception: pass
+            hooks[f"tui_v2_intervene_{sess.agent_id}"] = _hook
+        except Exception:
+            pass
 
     def submit_user_message(self, text: str, images: Optional[list[str]] = None, display_text: Optional[str] = None) -> int:
         sess = self.current
@@ -4489,19 +4577,23 @@ class GenericAgentTUI(App[None]):
         if self._maybe_intercept_free_text(sess, text):
             return -1
         if sess.status == "running":
-            visible = text if display_text is None else display_text
-            with sess.pending_lk:
-                sess.pending.append(text)
-                n = len(sess.pending)
-            sess.messages.append(ChatMessage(
-                "system",
-                f"[queued #{n}] {visible}",
-                kind="system",
-            ))
-            if sess.agent_id == self.current_id:
-                self._refresh_messages()
-                self._refresh_bottombar()
-            return -1
+            wrapped = self._wrap_user_steer(text)
+            if self._inject_intervene(sess, wrapped):
+                visible = text if display_text is None else display_text
+                with sess.pending_lk:
+                    sess.pending.append(text)
+                    sess.pending_wrapped.append(wrapped)
+                    n = len(sess.pending)
+                sess.messages.append(ChatMessage(
+                    "system",
+                    f"[queued #{n}] {visible}",
+                    kind="system",
+                ))
+                if sess.agent_id == self.current_id:
+                    self._refresh_messages()
+                    self._refresh_bottombar()
+                return -1
+            # Status flipped in the race — fall through to idle put_task.
         sess.task_seq += 1
         tid = sess.task_seq
         sess.current_task_id = tid
@@ -4556,20 +4648,6 @@ class GenericAgentTUI(App[None]):
         if done:
             self._update_plan_state(s, text)
             self._drain_ask_user_events(s)
-            self._drain_pending_to_task(s)
-
-    def _drain_pending_to_task(self, sess: AgentSession) -> None:
-        """Codex/CC pattern: drain queued user messages as ONE fresh
-        put_task when the agent goes idle.  Never mid-turn injection —
-        that overpowers the model and makes it drop the original task."""
-        with sess.pending_lk:
-            if not sess.pending:
-                return
-            combined = "\n\n".join(sess.pending)
-            sess.pending = []
-        self.submit_user_message(combined, display_text=combined)
-
-
 
     # Phrasing-based opt-in for multi-select picker (no core schema change).
     _MULTI_RE = re.compile(r"\[?(?:多选|multi(?:[-_ ]?select)?|select all)\]?", re.IGNORECASE)

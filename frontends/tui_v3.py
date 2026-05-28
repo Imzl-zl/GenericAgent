@@ -362,6 +362,14 @@ _I18N: dict[str, dict[str, str]] = {
         'pending.head_running':  'queued {n} · injecting at next turn boundary · Esc to clear',
         'pending.cleared':       'cleared {n} pending message(s)',
         'pending.queued_marker': '[queued] {text}',
+        # Claude Code's `wrapCommandText` wording — explicitly subordinates
+        # the new message to the in-flight task so the model doesn't
+        # abandon what it was doing.
+        'pending.inject_wrap':   ('The user sent a new message while you '
+                                  'were working:\n{text}\n\nIMPORTANT: After '
+                                  'completing your current task, you MUST '
+                                  'address the user\'s message above. Do '
+                                  'not ignore it.'),
 
         # shell-mode magic (`!` prefix)
         'shell.hint':           '! for shell mode',
@@ -606,6 +614,9 @@ _I18N: dict[str, dict[str, str]] = {
         'pending.head_running':  '已排队 {n} 条 · 下个 turn 边界注入 · Esc 清空',
         'pending.cleared':       '已清空 {n} 条待发送消息',
         'pending.queued_marker': '[排队] {text}',
+        'pending.inject_wrap':   ('用户在你工作时发来了一条新消息：\n{text}\n\n'
+                                  '重要：完成当前任务后，你必须处理上面的用户消息。'
+                                  '不要忽略它。'),
 
         # shell-mode magic (`!` prefix)
         'shell.hint':           '! 进入 shell 模式',
@@ -1320,6 +1331,13 @@ class AgentBridge:
         try: os.makedirs(self.agent.task_dir, exist_ok=True)
         except Exception: pass
         self.ask_user_queue: queue.Queue[AskUserEvent] = queue.Queue()
+        # Wrapped user messages we appended to `_intervene` since the last
+        # turn boundary.  At a non-exit boundary the file was consumed and
+        # next_prompt now carries our text — clear the list.  At an exit
+        # boundary the file was consumed but next_prompt is discarded —
+        # replay via put_task so the user's words aren't lost.
+        self._intervene_pending: list[str] = []
+        self._intervene_lk = threading.Lock()
         self._install_hook()
         self._healthy = True
         self._init_error: str | None = None
@@ -1329,12 +1347,14 @@ class AgentBridge:
         self._runner = threading.Thread(target=self._run_safe, daemon=True, name=f'ga-tui-agent')
         self._runner.start()
 
-    def inject_intervene(self, text: str) -> bool:
-        """Append `text` to `<task_dir>/_intervene` for `[MASTER] ...`
-        prefix injection at the next turn boundary.  Reserved for FACTUAL
-        context (e.g. `!cmd` shell output) — never for queued user
-        messages, which would overpower the model and cause it to abandon
-        the original task (Codex/CC queue instead drain post-turn)."""
+    def inject_intervene(self, text: str, *, track: bool = False) -> bool:
+        """Append `text` to `<task_dir>/_intervene`.  ga.turn_end_callback
+        consumes the file at the next turn boundary and prepends `[MASTER]
+        ...` to next_prompt.  Returns False when the agent is idle (caller
+        falls back to put_task).  Append-mode keeps us idempotent under
+        the consume_file race.  `track=True` records the text so the
+        turn_end hook can replay it on an exit boundary (used for queued
+        user messages — `!cmd` shell facts don't need replay)."""
         td = getattr(self.agent, 'task_dir', None)
         if not td or not getattr(self.agent, 'is_running', False):
             return False
@@ -1348,6 +1368,9 @@ class AgentBridge:
             except OSError: pass
             with open(fp, 'a', encoding='utf-8') as f:
                 f.write(sep + text)
+            if track:
+                with self._intervene_lk:
+                    self._intervene_pending.append(text)
             return True
         except Exception:
             return False
@@ -1368,6 +1391,16 @@ class AgentBridge:
         ev = _extract_ask_user(ctx)
         if ev:
             self.ask_user_queue.put(ev)
+        with self._intervene_lk:
+            if not self._intervene_pending:
+                return
+            if (ctx or {}).get('exit_reason'):
+                combined = '\n\n'.join(self._intervene_pending)
+                self._intervene_pending = []
+                try: self.agent.put_task(combined, source='user')
+                except Exception: pass
+            else:
+                self._intervene_pending = []
 
     def submit(self, query: str, images: list | None = None) -> queue.Queue:
         return self.agent.put_task(query, source='user', images=images)
@@ -2240,12 +2273,11 @@ class SB:
         self._quit = False
         self._cc_t = 0.0                # last bare-Ctrl+C time (arm-to-quit window)
         self._last_esc_t = 0.0          # last bare-Esc time (Esc Esc → /clear)
-        # Queued user messages (Codex/CC pattern): appended while running,
-        # drained as ONE fresh task when `is_running` flips False.  Never
-        # mid-injected via `_intervene` — that overpowers the model and
-        # makes it abandon the original task.
+        # Queued user messages: appended while running, written to the
+        # bridge's `_intervene` file with a Claude-Code-style wrapper that
+        # subordinates the new message to the running task.  Cleared when
+        # the bridge confirms consumption at the next turn boundary.
         self._pending: list[str] = []
-        self._was_running: bool = False
         self._epend = b''               # held trailing ESC (split-read disambiguation)
         self._undo: list[tuple[str, int]] = []   # buffer-edit history for Ctrl+Z
         self._redo: list[tuple[str, int]] = []   # cleared on any new edit
@@ -2775,6 +2807,13 @@ class SB:
         if self._pending:                             # cancel queued user messages
             n = len(self._pending)
             self._pending = []
+            if self._bridge:
+                td = getattr(self._bridge.agent, 'task_dir', None)
+                if td:
+                    try: os.remove(os.path.join(td, '_intervene'))
+                    except OSError: pass
+                with self._bridge._intervene_lk:
+                    self._bridge._intervene_pending = []
             self.commit([_DIM + _t('pending.cleared', n=n) + _RST])
             return
         if self._running and self._bridge:
@@ -3095,16 +3134,18 @@ class SB:
         except Exception:
             pass
 
-    def _drain_pending_to_task(self) -> None:
-        """Codex/CC pattern: when the agent goes idle, drain queued user
-        messages as ONE fresh task — never mid-turn injection.  Mid-turn
-        `[MASTER] ...` prefixes overpowered the model and caused it to
-        abandon the original task (see model_responses_042511.txt)."""
-        if not self._pending or not self._bridge:
-            return
-        combined = '\n\n'.join(self._pending)
-        self._pending = []
-        self._submit(combined, [])
+    def _sync_pending_from_bridge(self) -> None:
+        """Drop UI mirror entries the bridge has confirmed consumed.  The
+        bridge's turn_end hook clears `_intervene_pending` at every turn
+        boundary — that's our signal the model has now seen the wrapped
+        message (or that exit_reason kicked the replay)."""
+        if self._pending and self._bridge and not self._bridge_has_pending():
+            self._pending = []
+
+    def _bridge_has_pending(self) -> bool:
+        if not self._bridge: return False
+        with self._bridge._intervene_lk:
+            return bool(self._bridge._intervene_pending)
 
     def _input_box(self, w: int) -> list[str]:
         """A full-width bordered, padded input box (cc-style). Lives in the
@@ -3907,11 +3948,14 @@ class SB:
                 (int(m.group(1)) for m in _IMG_PH_RE.finditer(raw)) if i in self._imgs]
         expanded = self._expand(raw)
         if self._running:
-            self._pending.append(expanded)
-            self._commit_user(_t('pending.queued_marker', text=expanded))
-            self._pstore.clear(); self._fstore.clear(); self._imgs.clear()
-            self._render_live()
-            return
+            wrapped = _t('pending.inject_wrap', text=expanded)
+            if self._bridge and self._bridge.inject_intervene(wrapped, track=True):
+                self._pending.append(expanded)
+                self._commit_user(_t('pending.queued_marker', text=expanded))
+                self._pstore.clear(); self._fstore.clear(); self._imgs.clear()
+                self._render_live()
+                return
+            # Agent went idle in the race — fall through to put_task.
         self._commit_user(expanded)                # scrollback shows exactly what
         self._submit(expanded, imgs)               # the agent receives, not the
         self._pstore.clear(); self._fstore.clear(); self._imgs.clear()   # drop placeholders
@@ -5345,13 +5389,9 @@ class SB:
                     # restores itself once the 1s window lapses (the extra
                     # 0.1s margin guarantees one render past expiry).
                     dirty = True
-                now_running = bool(self._bridge and self._bridge.is_running)
-                if self._was_running and not now_running and self._pending:
-                    with self._lk:
-                        self._drain_pending_to_task()
-                    dirty = True
-                self._was_running = now_running
                 if self._pending:
+                    with self._lk:
+                        self._sync_pending_from_bridge()
                     dirty = True
                 if self._epend or (self._rb and not self._bp):
                     with self._lk:
