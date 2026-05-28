@@ -106,7 +106,7 @@ _ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Strip the leading turn marker that agent_loop yields per turn — covers
 # both the default `**LLM Running (Turn N) ...**` and the task-mode short
 # `**Turn N ...**` (agent_loop.py:52 switches when handler.parent.task_dir
-# is set; v2 now sets task_dir for the _intervene injection hook).
+# is set; v2 sets task_dir for the `_stop` / `_keyinfo` consume paths).
 # fold_turns still needs the marker in source content to split turns, so we only strip at
 # render time. Applies to the live (last) text segment, since folded turns don't include it.
 _TURN_MARKER_RE = re.compile(r"^\s*\**(?:LLM Running \()?Turn \d+\)?[^\n]*\**\s*", re.MULTILINE)
@@ -1273,12 +1273,14 @@ class AgentSession:
     # Boundary between restored history (≤ idx) and this run (> idx);
     # `/continue` bumps to `len(messages)` so old plan cards don't resurrect.
     plan_scan_baseline: int = 0
-    # Pending user inputs queued while this session was running (codex-style).
-    # Drained 300 ms after the current turn ends (`_pending_cooldown`).  The
-    # cooldown gives the user a chance to Esc-cancel or amend the most recent
-    # entry via the Up arrow (popped back into the input box).
+    # `pending`: raw user text for UI display ([queued #N] chip).
+    # `pending_wrapped`: same entries wrapped with the "complete current
+    # task first" supplementary phrasing, in the form actually appended
+    # to `_intervene`.  Replay uses these so the exit-turn put_task
+    # carries the wrap context.
     pending: list[str] = field(default_factory=list)
-    pending_drain_at: float = 0.0   # epoch deadline; 0 = no drain pending
+    pending_wrapped: list[str] = field(default_factory=list)
+    pending_lk: threading.Lock = field(default_factory=threading.Lock)
 
 
 def default_agent_factory() -> Any:
@@ -1889,14 +1891,12 @@ class InputArea(TextArea):
         Binding("cmd+v",       "paste", "Paste", show=False),
         # Ctrl+U: readline-style kill-line, repurposed here to clear the whole input.
         Binding("ctrl+u",      "clear_input", "ClearInput", show=False),
-        # Ctrl+S: toggle-stash the current draft (Claude Code muscle-memory).
-        # First press → stash text + clear input; second press on an empty
-        # input → restore the stashed draft. Independent of Up/Down history
-        # so a queued draft survives sending the previous one.
-        # NOTE: must use `self.reset()` (not `self.text = ""`) — assigning
-        # `.text` on a TextArea rebuilds the document + wrapped_document and
-        # blocks the UI for seconds on long pastes (cf. PR#479, user report
-        # 2026-05-27 "ctrl+s 完全卡死"). `reset()` clears in-place.
+        # Ctrl+S: toggle-stash the current draft.  First press → stash
+        # text + clear input; second press on empty input → restore the
+        # stashed draft.  Independent of Up/Down history so a queued
+        # draft survives sending the previous one.  reset() uses
+        # TextArea.clear() to avoid the document-rebuild path that
+        # blocked the UI for seconds on long sessions.
         Binding("ctrl+s",      "stash", "Stash", show=False),
         Binding("cmd+s",       "stash", "Stash", show=False),
     ]
@@ -1905,19 +1905,9 @@ class InputArea(TextArea):
         pass
 
     def action_stash(self) -> None:
-        """Stash/restore the input draft.
-
-        Long-session note (2026-05-28, 2nd pass): the previous fix tried to
-        keep `reset()` synchronous and only deferred the palette/resize
-        cleanup, but `reset()` itself still queues a Changed event behind
-        the streaming reactive cycle.  When the queue is saturated with
-        per-chunk repaints the visible clear never lands and the user sees
-        a frozen input.  Now we defer the reset itself: only the buffer
-        snapshot happens on the keystroke; the visible clear and layout
-        work both happen on the next event-loop tick via
-        `call_after_refresh`.  Trades a 1-frame delay for guaranteed
-        keystroke responsiveness.
-        """
+        """Stash/restore the input draft.  reset()/text restore both defer
+        to `call_after_refresh` so the layout cascade runs off the
+        keystroke event, leaving Ctrl+S itself snappy on long sessions."""
         current = self.text
         if current:
             self._draft_stash = current
@@ -1940,17 +1930,13 @@ class InputArea(TextArea):
                 self._stash_cleanup_restore(stashed)
 
     def _stash_cleanup_clear(self) -> None:
-        """Deferred companion to action_stash (clear path).
-
-        Runs OUTSIDE the keystroke event so the Textual layout cascade
-        triggered by reset() doesn't block the user from typing more.
-        `_skip_change_next` still short-circuits on_input_area_changed
-        so the cascade hits once (from `reset()` itself), not twice."""
+        """Deferred companion to action_stash (clear path).  The Changed
+        event posted by `clear()` is async-queued — set the flag and let
+        `on_text_area_changed` self-clear it when the event lands.  A
+        try/finally here clears the flag too early and lets the handler
+        re-run the heavy resize + palette path."""
         self._skip_change_next = True
-        try:
-            self.reset()
-        finally:
-            self._skip_change_next = False
+        self.reset()
         try: self.app._hide_palette()
         except Exception: pass
         try: self.app._resize_input(self)
@@ -2061,6 +2047,15 @@ class InputArea(TextArea):
         if not self._delete_placeholder("right"):
             super().action_delete_right()
 
+    async def _on_mouse_down(self, event: events.MouseDown) -> None:
+        # Right-button: short-circuit TextArea's default cursor-move so
+        # paste lands at the user's existing caret, not where their mouse
+        # happened to be — matches every native text-box right-click.
+        if getattr(event, "button", 0) == 3:
+            event.stop(); event.prevent_default()
+            return
+        await super()._on_mouse_down(event)
+
     async def _on_click(self, event: events.Click) -> None:
         if getattr(event, "button", 0) == 3 and not self.read_only:
             self.action_paste()
@@ -2142,7 +2137,15 @@ class InputArea(TextArea):
         return True
 
     def reset(self) -> None:
-        self.text = ""
+        # `self.text = ""` rebuilds Document + WrappedDocument and triggers
+        # a full re-wrap + `_refresh_size` layout cascade.  On long
+        # sessions (100+ message widgets in the scroll), that cascade
+        # blocks the UI for seconds — perceived as freeze on Ctrl+S.
+        # `clear()` deletes in place via the edit pipeline and only
+        # re-wraps the affected range, so empty-out is O(content-len)
+        # without rebuilding the document object.
+        if self.document.text:
+            self.clear()
         self._pastes.clear()
         self._paste_counter = 0
         self._history_index = -1
@@ -2220,29 +2223,9 @@ class InputArea(TextArea):
         # 3) history browse: only at (0,0) for up / end-of-text for down, so in-line
         #    cursor movement is preserved.
         if event.key == "up" and self.cursor_location == (0, 0):
-            # Pending-queue recall: Up on an empty input pops the most-
-            # recent queued message back into the composer for amendment
-            # (LIFO).  Re-submitting it appends at the tail again; Esc
-            # clears the whole queue.  Takes priority over history when
-            # there's nothing typed AND something is queued.
-            if not self.text:
-                try:
-                    sess = self.app.current
-                except Exception:
-                    sess = None
-                if sess is not None and sess.pending:
-                    self._suppress_palette_next_change()
-                    self.text = sess.pending.pop()
-                    if not sess.pending:
-                        sess.pending_drain_at = 0.0
-                    if sess.agent_id == self.app.current_id:
-                        try: self.app._refresh_bottombar()
-                        except Exception: pass
-                    try:
-                        self.cursor_location = self.document.end
-                    except Exception:
-                        pass
-                    event.stop(); event.prevent_default(); return
+            # Pending-queue recall removed: each Enter while running writes
+            # to `_intervene` immediately; popping back would leave a stale
+            # entry in the file.  Up just walks input history; Esc clears.
             if self._history_up():
                 event.stop(); event.prevent_default(); return
         if event.key == "down":
@@ -2786,7 +2769,6 @@ class GenericAgentTUI(App[None]):
         self.set_interval(0.5, self._tick)
         self._patch_auto_scroll_for_selection()
         self._start_plan_watcher()
-        self._start_pending_watcher()
         self._start_tip_rotator()
         self._apply_responsive_layout()
         # Disable alternate scroll mode (?1007). Textual enables ?1006 SGR mouse but doesn't
@@ -2879,11 +2861,9 @@ class GenericAgentTUI(App[None]):
         agent = self.agent_factory()
         try: agent.inc_out = True
         except Exception: pass
-        # Give the agent a per-session task_dir so ga.turn_end_callback's
-        # `_intervene` file hook (ga.py:576) can fire — that's how pending
-        # user messages slip into the current turn's next LLM call instead
-        # of waiting for the whole run to end.  Dedicated PID+session dir
-        # so concurrent sessions don't share an intervene file.
+        # Per-session task_dir enables ga's `_stop` / `_keyinfo` consume
+        # paths (agentmain.py:158, ga.py:575).  PID+session scoped so
+        # concurrent sessions don't share signal files.
         try:
             agent.task_dir = os.path.join(FRONTENDS_DIR, '..', 'temp',
                                           f'_tui_v2_{os.getpid()}_{agent_id}')
@@ -2897,6 +2877,7 @@ class GenericAgentTUI(App[None]):
         self.sessions[agent_id] = sess
         self.current_id = agent_id
         self._install_ask_user_hook(sess)
+        self._install_intervene_replay_hook(sess)
         self._refresh_all()
         return sess
 
@@ -3100,9 +3081,11 @@ class GenericAgentTUI(App[None]):
             except Exception:
                 inp_empty = True
             if inp_empty:
-                n = len(sess.pending)
-                sess.pending = []
-                sess.pending_drain_at = 0.0
+                with sess.pending_lk:
+                    n = len(sess.pending)
+                    sess.pending = []
+                    sess.pending_wrapped = []
+                self._clear_intervene(sess)
                 self._system(f"已清空 {n} 条待发送消息")
                 self._disarm_rewind()
                 return
@@ -4556,12 +4539,10 @@ class GenericAgentTUI(App[None]):
         self._reset_terminal_title()
 
     def _run_shell(self, cmd: str) -> None:
-        """`!cmd` magic: run `cmd` in the host shell, echo command + output
-        into the current session's scrollback, and append a `[!shell]` pair
-        to backend.history so the agent can reference it on the next turn.
-
-        Output capture is utf-8 / replace; 30 s timeout — anything longer
-        belongs in /conductor or a proper tool call, not a one-liner."""
+        """`!cmd` magic: run `cmd` in the user's shell (Git Bash / pwsh /
+        sh — see `detect_user_shell`), echo command + output into the
+        current session's scrollback, and append a `[!shell]` pair to
+        backend.history so the agent sees it on the next turn."""
         if not cmd:
             return
         sess = self.current
@@ -4569,10 +4550,12 @@ class GenericAgentTUI(App[None]):
                                          f"! {cmd}",
                                          kind="system"))
         import subprocess
+        from frontends.slash_cmds import detect_user_shell
+        shell_argv, shell_name = detect_user_shell()
         out = ''; rc = 0
         try:
             r = subprocess.run(
-                cmd, shell=True, capture_output=True,
+                shell_argv + [cmd], capture_output=True,
                 timeout=30, encoding='utf-8', errors='replace',
             )
             out = (r.stdout or '') + (r.stderr or '')
@@ -4587,41 +4570,51 @@ class GenericAgentTUI(App[None]):
         sess.messages.append(ChatMessage("system", formatted, kind="system"))
         if sess.agent_id == self.current_id:
             self._refresh_messages()
-        # Splice the exchange into LLM history.
         try:
             be = getattr(sess.agent, 'llmclient', None)
             be = getattr(be, 'backend', None) if be is not None else None
             if be is not None and hasattr(be, 'history'):
-                txt = f"[!shell] {cmd}\n```\n{out.rstrip()}\n```\n(exit {rc})"
+                txt = f"[!shell {shell_name}] {cmd}\n```\n{out.rstrip()}\n```\n(exit {rc})"
                 be.history.append({"role": "user",
                                    "content": [{"type": "text", "text": txt}]})
         except Exception:
             pass
 
     # ---------------- agent task + stream ----------------
-    # 5 s cooldown after the LAST user submit (cooldown resets per entry).
-    # Drain path:
-    #   running → write to <task_dir>/_intervene; ga.turn_end_callback
-    #             (ga.py:576) prepends it to next_prompt at the next
-    #             turn boundary — message lands mid-run.
-    #   idle    → fall back to put_task for a fresh turn.
-    _PENDING_COOLDOWN_SEC = 5.0
+    # Pending-queue transport: submit while running → wrap text with the
+    # "complete current task first, then address this" supplementary
+    # phrasing and append to `_intervene` so ga.turn_end_callback prepends
+    # it to next_prompt as `[MASTER] ...` mid-turn.  The wrap makes
+    # `[MASTER]` read as an envelope, not a directive override.  On an
+    # exit-turn boundary consume_file ate the file but next_prompt was
+    # discarded — the replay hook re-routes via put_task.
+
+    _INTERVENE_WRAP_EN = (
+        "The user sent a new message while you were working:\n{text}\n\n"
+        "IMPORTANT: After completing your current task, you MUST address "
+        "the user's message above. Do not ignore it."
+    )
+    _INTERVENE_WRAP_ZH = (
+        "用户在你工作时发来了一条新消息：\n{text}\n\n"
+        "重要：完成当前任务后，你必须处理上面的用户消息。不要忽略它。"
+    )
+
+    def _wrap_user_steer(self, text: str) -> str:
+        lang = (os.environ.get("GA_LANG", "") or "").lower()
+        tmpl = self._INTERVENE_WRAP_EN if lang == "en" else self._INTERVENE_WRAP_ZH
+        return tmpl.format(text=text)
 
     def _session_intervene_path(self, sess: AgentSession) -> Optional[str]:
         td = getattr(sess.agent, 'task_dir', None)
         if not td:
             return None
-        try:
-            os.makedirs(td, exist_ok=True)
-        except Exception:
-            return None
+        try: os.makedirs(td, exist_ok=True)
+        except Exception: return None
         return os.path.join(td, '_intervene')
 
     def _inject_intervene(self, sess: AgentSession, text: str) -> bool:
-        """Append `text` to `<task_dir>/_intervene` (append-mode so a
-        TOCTOU between our read-then-write and the agent's
-        `consume_file` (read+delete) can't duplicate already-consumed
-        content into the NEXT turn)."""
+        """Append `text` to `<task_dir>/_intervene`.  Append-mode keeps us
+        idempotent under the consume_file race."""
         if sess.status != "running":
             return False
         fp = self._session_intervene_path(sess)
@@ -4630,15 +4623,47 @@ class GenericAgentTUI(App[None]):
         try:
             sep = ''
             try:
-                if os.path.getsize(fp) > 0:
-                    sep = '\n\n'
-            except OSError:
-                pass   # file consumed mid-call → write into a fresh one
+                if os.path.getsize(fp) > 0: sep = '\n\n'
+            except OSError: pass
             with open(fp, 'a', encoding='utf-8') as f:
                 f.write(sep + text)
             return True
         except Exception:
             return False
+
+    def _clear_intervene(self, sess: AgentSession) -> None:
+        fp = self._session_intervene_path(sess)
+        if fp:
+            try: os.remove(fp)
+            except OSError: pass
+
+    def _install_intervene_replay_hook(self, sess: AgentSession) -> None:
+        """At each turn boundary: non-exit → consume_file already delivered
+        our wrapped text into next_prompt (clear UI mirror).  Exit → file
+        was eaten but next_prompt was discarded; re-route the combined
+        wrapped text via put_task so the user's words aren't lost."""
+        agent = sess.agent
+        try:
+            hooks = getattr(agent, "_turn_end_hooks", None)
+            if hooks is None:
+                hooks = agent._turn_end_hooks = {}
+            def _hook(ctx, _s=sess):
+                with _s.pending_lk:
+                    if not _s.pending_wrapped:
+                        return
+                    combined = "\n\n".join(_s.pending_wrapped)
+                    _s.pending_wrapped = []
+                    _s.pending = []
+                if (ctx or {}).get("exit_reason"):
+                    try: _s.agent.put_task(combined, source="user")
+                    except Exception: pass
+                try: self.call_from_thread(self._refresh_messages)
+                except Exception: pass
+                try: self.call_from_thread(self._refresh_bottombar)
+                except Exception: pass
+            hooks[f"tui_v2_intervene_{sess.agent_id}"] = _hook
+        except Exception:
+            pass
 
     def submit_user_message(self, text: str, images: Optional[list[str]] = None, display_text: Optional[str] = None) -> int:
         sess = self.current
@@ -4646,21 +4671,23 @@ class GenericAgentTUI(App[None]):
         if self._maybe_intercept_free_text(sess, text):
             return -1
         if sess.status == "running":
-            # Codex-style: don't reject, queue.  Cooldown resets per entry
-            # so a burst of edits coalesces into one inject.  Drain fires
-            # `_inject_intervene` (mid-turn) or `put_task` (idle).
-            visible = text if display_text is None else display_text
-            sess.pending.append(text)
-            sess.pending_drain_at = time.time() + self._PENDING_COOLDOWN_SEC
-            sess.messages.append(ChatMessage(
-                "system",
-                f"[queued #{len(sess.pending)}] {visible}",
-                kind="system",
-            ))
-            if sess.agent_id == self.current_id:
-                self._refresh_messages()
-                self._refresh_bottombar()
-            return -1
+            wrapped = self._wrap_user_steer(text)
+            if self._inject_intervene(sess, wrapped):
+                visible = text if display_text is None else display_text
+                with sess.pending_lk:
+                    sess.pending.append(text)
+                    sess.pending_wrapped.append(wrapped)
+                    n = len(sess.pending)
+                sess.messages.append(ChatMessage(
+                    "system",
+                    f"[queued #{n}] {visible}",
+                    kind="system",
+                ))
+                if sess.agent_id == self.current_id:
+                    self._refresh_messages()
+                    self._refresh_bottombar()
+                return -1
+            # Status flipped in the race — fall through to idle put_task.
         sess.task_seq += 1
         tid = sess.task_seq
         sess.current_task_id = tid
@@ -4711,37 +4738,10 @@ class GenericAgentTUI(App[None]):
         if done:
             s.status = "idle"
             s.current_display_queue = None
-            # NOTE: cooldown timer is armed on each user submit (see
-            # submit_user_message), NOT here on turn end.  This matches
-            # "5 s since LAST keystroke" semantics: if turn ends within
-            # the cooldown the timer keeps counting, drain fires whenever
-            # the deadline lapses (mid-turn → intervene; idle → put_task).
         self._update_assistant(agent_id, text, task_id=task_id, done=done, refresh_chrome=True)
-        # End-of-turn re-parse only; mid-stream `[...]` fragments would flash.
         if done:
             self._update_plan_state(s, text)
             self._drain_ask_user_events(s)
-
-    def _drain_pending(self, sess: AgentSession) -> None:
-        """Flush queued user messages.  Two paths:
-        - sess.status == 'running' → write to <task_dir>/_intervene; the
-          agent's turn_end_callback (ga.py:576) consumes it and prepends
-          to next_prompt, so the message lands inside the current run.
-        - idle → fall back to put_task for a fresh turn.
-        Combined into one payload because users usually queue clarifying
-        lines for a single logical follow-up; N separate turns would
-        force pointless handoffs."""
-        if not sess.pending:
-            return
-        combined = "\n\n".join(sess.pending)
-        sess.pending = []
-        sess.pending_drain_at = 0.0
-        if self._inject_intervene(sess, combined):
-            return
-        # Echo nothing — the [queued #N] system lines already landed when
-        # each entry was submitted; this just hands the combined text to
-        # the agent without an extra visual.
-        self.submit_user_message(combined, display_text=combined)
 
     # Phrasing-based opt-in for multi-select picker (no core schema change).
     _MULTI_RE = re.compile(r"\[?(?:多选|multi(?:[-_ ]?select)?|select all)\]?", re.IGNORECASE)
@@ -5058,31 +5058,6 @@ class GenericAgentTUI(App[None]):
         self._plan_mtime: dict = {}
         try: self._plan_timer = self.set_interval(1.0, self._poll_plan_files)
         except Exception: pass
-
-    def _start_pending_watcher(self) -> None:
-        """Pending-input drain poller — fires every 100 ms.  Walks all
-        sessions, fires `_drain_pending(sess)` when the post-turn cooldown
-        deadline lapses.  Idle on sessions with nothing queued."""
-        if getattr(self, "_pending_timer", None) is not None: return
-        try: self._pending_timer = self.set_interval(0.1, self._poll_pending)
-        except Exception: pass
-
-    def _poll_pending(self) -> None:
-        now = time.time()
-        for sess in list(self.sessions.values()):
-            # Drain regardless of running state — _drain_pending picks the
-            # right transport (intervene for mid-turn, put_task for idle).
-            if (sess.pending and sess.pending_drain_at > 0
-                    and now >= sess.pending_drain_at):
-                try:
-                    self._drain_pending(sess)
-                except Exception:
-                    # Swallow so a bad pending entry can't kill the timer.
-                    sess.pending = []
-                    sess.pending_drain_at = 0.0
-        # Repaint bottombar so the cooldown countdown ticks visibly.
-        if any(s.pending for s in self.sessions.values()):
-            self._refresh_bottombar()
 
     def _poll_plan_files(self) -> None:
         # Poll only the visible session — background sessions don't paint planbar.

@@ -359,17 +359,25 @@ _I18N: dict[str, dict[str, str]] = {
         'msg.answer_prefix':    '[ans] {text}',
 
         # pending input preview (queued while agent is busy)
-        'pending.head_running':  'queued {n} (agent busy) · ↑ amend · Esc clear',
-        'pending.head_cooldown': 'queued {n} · sending in {sec:.1f}s · ↑ amend · Esc cancel',
+        'pending.head_running':  'queued {n} · injecting at next turn boundary · Esc to clear',
         'pending.cleared':       'cleared {n} pending message(s)',
         'pending.queued_marker': '[queued] {text}',
+        # Wrap user steers with explicit "finish current task first"
+        # phrasing so the `[MASTER]` envelope (ga.py:578) reads as
+        # supplementary, not as a directive override that drops the
+        # original task.
+        'pending.inject_wrap':   ('The user sent a new message while you '
+                                  'were working:\n{text}\n\nIMPORTANT: After '
+                                  'completing your current task, you MUST '
+                                  'address the user\'s message above. Do '
+                                  'not ignore it.'),
 
         # shell-mode magic (`!` prefix)
         'shell.hint':           '! for shell mode',
         'shell.timeout':        '[shell: timeout {sec}s]',
         'shell.error':          '[shell error: {err}]',
         'shell.empty':          '(no output)',
-        'shell.history':        '[!shell] {cmd}\n```\n{out}\n```\n(exit {rc})',
+        'shell.history':        '[!shell {sh}] {cmd}\n```\n{out}\n```\n(exit {rc})',
 
         # /resume
         'cmd.resume.desc':      'list recent sessions and pick one to recover',
@@ -604,17 +612,19 @@ _I18N: dict[str, dict[str, str]] = {
         'msg.answer_prefix':    '[答] {text}',
 
         # pending input preview
-        'pending.head_running':  '已排队 {n} 条（agent 忙）· ↑ 回看修改 · Esc 清空',
-        'pending.head_cooldown': '已排队 {n} 条 · {sec:.1f}s 后发送 · ↑ 回看修改 · Esc 取消',
+        'pending.head_running':  '已排队 {n} 条 · 下个 turn 边界注入 · Esc 清空',
         'pending.cleared':       '已清空 {n} 条待发送消息',
         'pending.queued_marker': '[排队] {text}',
+        'pending.inject_wrap':   ('用户在你工作时发来了一条新消息：\n{text}\n\n'
+                                  '重要：完成当前任务后，你必须处理上面的用户消息。'
+                                  '不要忽略它。'),
 
         # shell-mode magic (`!` prefix)
         'shell.hint':           '! 进入 shell 模式',
         'shell.timeout':        '[shell：{sec}s 超时]',
         'shell.error':          '[shell 错误：{err}]',
         'shell.empty':          '（无输出）',
-        'shell.history':        '[!shell] {cmd}\n```\n{out}\n```\n（退出码 {rc}）',
+        'shell.history':        '[!shell {sh}] {cmd}\n```\n{out}\n```\n（退出码 {rc}）',
 
         # /resume
         'cmd.resume.desc':      '列出最近会话并恢复其中一个',
@@ -1089,8 +1099,8 @@ _ANSI_SGR_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 # agent_loop.py emits `**LLM Running (Turn N) ...**` by default but switches
 # to the short `**Turn N ...**` when `handler.parent.task_dir` is set
-# (agent_loop.py:52).  TUI v3 sets task_dir to enable the _intervene
-# injection hook, which silently activates the short form — match both.
+# (agent_loop.py:52).  TUI v3 sets task_dir (for `_stop` signal + `!cmd`
+# shell history via `_intervene`), so we must match both forms.
 _TURN_MARKER_RE = re.compile(r'\*\*(?:LLM Running \()?Turn (\d+)\)?[^\n]*?\*\*')
 _META_TAG_RE = re.compile(r'<(?:thinking|summary|tool_use|file_content)>.*?</(?:thinking|summary|tool_use|file_content)>', re.DOTALL)
 _TOOL_USE_BLOCK_RE = re.compile(r'```json\s*\{[^}]*"tool_name"[^}]*\}\s*```', re.DOTALL)
@@ -1318,15 +1328,20 @@ class AgentBridge:
             self.agent.llmclient = self.agent.llmclients[llm_no % len(self.agent.llmclients)]
         self.agent.inc_out = True
         self.agent.verbose = True
-        # Give the agent a `task_dir` so the per-turn `_intervene` file hook
-        # in ga.turn_end_callback (ga.py:576) can fire — that's how we
-        # smuggle pending user messages into the next LLM call while a
-        # turn is still in flight.  Dedicated PID-scoped dir so concurrent
-        # TUI v3 processes don't step on each other's intervene files.
+        # task_dir enables ga's `_stop` / `_keyinfo` / `_intervene` consume
+        # paths.  PID-scoped dir so concurrent v3 processes don't share
+        # signal files.
         self.agent.task_dir = os.path.join(_ROOT, 'temp', f'_tui_v3_{os.getpid()}')
         try: os.makedirs(self.agent.task_dir, exist_ok=True)
         except Exception: pass
         self.ask_user_queue: queue.Queue[AskUserEvent] = queue.Queue()
+        # Wrapped user messages we appended to `_intervene` since the last
+        # turn boundary.  At a non-exit boundary the file was consumed and
+        # next_prompt now carries our text — clear the list.  At an exit
+        # boundary the file was consumed but next_prompt is discarded —
+        # replay via put_task so the user's words aren't lost.
+        self._intervene_pending: list[str] = []
+        self._intervene_lk = threading.Lock()
         self._install_hook()
         self._healthy = True
         self._init_error: str | None = None
@@ -1336,39 +1351,30 @@ class AgentBridge:
         self._runner = threading.Thread(target=self._run_safe, daemon=True, name=f'ga-tui-agent')
         self._runner.start()
 
-    def inject_intervene(self, text: str) -> bool:
-        """Write `text` to `<task_dir>/_intervene`.  ga.turn_end_callback
-        consumes the file at the next turn boundary and APPENDS the content
-        to next_prompt as `[MASTER] ...`, so the agent sees it as part of
-        the upcoming user message without breaking the current turn.
-
-        Returns False if the agent isn't actually mid-turn (idle) — caller
-        should fall back to put_task in that case.
-
-        Append-mode write so that if the agent's `consume_file` reads and
-        deletes the file between our existence check and write, our text
-        lands in a freshly-created file (and fires the NEXT turn) instead
-        of duplicating already-consumed content from a read-modify-write
-        TOCTOU window.  The `\\n\\n` separator only goes in when the file
-        already has content right before we open it — race-narrow but
-        idempotent because the worst case is a leading blank line."""
+    def inject_intervene(self, text: str, *, track: bool = False) -> bool:
+        """Append `text` to `<task_dir>/_intervene`.  ga.turn_end_callback
+        consumes the file at the next turn boundary and prepends `[MASTER]
+        ...` to next_prompt.  Returns False when the agent is idle (caller
+        falls back to put_task).  Append-mode keeps us idempotent under
+        the consume_file race.  `track=True` records the text so the
+        turn_end hook can replay it on an exit boundary (used for queued
+        user messages — `!cmd` shell facts don't need replay)."""
         td = getattr(self.agent, 'task_dir', None)
         if not td or not getattr(self.agent, 'is_running', False):
             return False
-        try:
-            os.makedirs(td, exist_ok=True)
-        except Exception:
-            return False
+        try: os.makedirs(td, exist_ok=True)
+        except Exception: return False
         fp = os.path.join(td, '_intervene')
         try:
             sep = ''
             try:
-                if os.path.getsize(fp) > 0:
-                    sep = '\n\n'
-            except OSError:
-                pass   # file gone — fresh create on append, sep stays empty
+                if os.path.getsize(fp) > 0: sep = '\n\n'
+            except OSError: pass
             with open(fp, 'a', encoding='utf-8') as f:
                 f.write(sep + text)
+            if track:
+                with self._intervene_lk:
+                    self._intervene_pending.append(text)
             return True
         except Exception:
             return False
@@ -1389,6 +1395,16 @@ class AgentBridge:
         ev = _extract_ask_user(ctx)
         if ev:
             self.ask_user_queue.put(ev)
+        with self._intervene_lk:
+            if not self._intervene_pending:
+                return
+            if (ctx or {}).get('exit_reason'):
+                combined = '\n\n'.join(self._intervene_pending)
+                self._intervene_pending = []
+                try: self.agent.put_task(combined, source='user')
+                except Exception: pass
+            else:
+                self._intervene_pending = []
 
     def submit(self, query: str, images: list | None = None) -> queue.Queue:
         return self.agent.put_task(query, source='user', images=images)
@@ -1481,9 +1497,9 @@ else:
     _ACCENT = '\x1b[38;2;94;106;210m'    # Linear lavender #5e6ad2
     _BORDER = '\x1b[38;5;146m'
 _INK_U = '\x1b[38;5;234m'                # user ink — kept for legacy callers
-# User-prompt panel.  Claude-Code-style charcoal block (RGB 55,55,55) with
-# soft-white ink — full-row tile via _tile() means the band keeps its right
-# edge on every terminal regardless of wrap-width math.  Switched from xterm-
+# User-prompt panel.  Charcoal block (RGB 55,55,55) with soft-white ink —
+# full-row tile via _tile() means the band keeps its right edge on every
+# terminal regardless of wrap-width math.  Switched from xterm-
 # 256 inverse (which renders muddy on Win Terminal dark themes) to truecolor.
 _TILE_U = '\x1b[48;2;55;55;55m\x1b[38;2;230;230;230m'
 _MARK = _ACCENT + '❯' + _RST             # prompt mark — the single accent
@@ -2261,16 +2277,12 @@ class SB:
         self._quit = False
         self._cc_t = 0.0                # last bare-Ctrl+C time (arm-to-quit window)
         self._last_esc_t = 0.0          # last bare-Esc time (Esc Esc → /clear)
-        # Pending user inputs queued while the agent was busy (codex-style).
-        # Drained as ONE combined prompt 5 s after the LAST pending arrived
-        # (cooldown resets on each new queue entry).  During the cooldown
-        # the user can Esc-cancel or Up-amend.  When the timer lapses we
-        # try mid-turn injection via `_intervene` first (agent picks it up
-        # at the next turn boundary); fall back to put_task if the agent
-        # is idle.
+        # Queued user messages: appended while running, written to the
+        # bridge's `_intervene` file with a "finish current task first"
+        # wrapper that subordinates the new message to the running task.
+        # Cleared when the bridge confirms consumption at the next turn
+        # boundary.
         self._pending: list[str] = []
-        self._pending_drain_t: float = 0.0
-        self._pending_cooldown: float = 5.0
         self._epend = b''               # held trailing ESC (split-read disambiguation)
         self._undo: list[tuple[str, int]] = []   # buffer-edit history for Ctrl+Z
         self._redo: list[tuple[str, int]] = []   # cleared on any new edit
@@ -2819,13 +2831,15 @@ class SB:
             self._snap()                              # let Ctrl+Z restore the draft
             self.buf = ''; self.pos = 0; self._sel = None; return
         if self._pending:                             # cancel queued user messages
-            # Esc on an empty input drops the whole pending queue — gives
-            # the user a single-key abort if they no-longer want what they
-            # typed during the run.  Echoed as a system line so the
-            # disappearance of the preview block isn't silent.
             n = len(self._pending)
             self._pending = []
-            self._pending_drain_t = 0.0
+            if self._bridge:
+                td = getattr(self._bridge.agent, 'task_dir', None)
+                if td:
+                    try: os.remove(os.path.join(td, '_intervene'))
+                    except OSError: pass
+                with self._bridge._intervene_lk:
+                    self._bridge._intervene_pending = []
             self.commit([_DIM + _t('pending.cleared', n=n) + _RST])
             return
         if self._running and self._bridge:
@@ -3064,26 +3078,11 @@ class SB:
         return out
 
     def _pending_card(self, w: int) -> list[str]:
-        """Compact preview of user inputs queued while the agent was busy.
-        Renders as a dim accent strip above the input box, no border —
-        keeps the visual weight light because the messages already echoed
-        as `[queued] ...` lines into scrollback when they were submitted.
-
-        Header tells the user what's happening (busy / cooling-down) and
-        the bindings (Up amends last entry, Esc clears the lot)."""
         if not self._pending:
             return []
         n = len(self._pending)
-        cd = max(0.0, self._pending_drain_t - time.time())
-        if self._running:
-            head = _t('pending.head_running', n=n)
-        elif cd > 0:
-            head = _t('pending.head_cooldown', n=n, sec=cd)
-        else:
-            head = _t('pending.head_running', n=n)
+        head = _t('pending.head_running', n=n)
         rows = [_ACCENT + _BOLD + _clip_cells('  ↑ ' + head, w) + _RST]
-        # Inline preview — capped at three entries so the strip never eats
-        # more rows than the input box itself.
         body_w = max(20, w - 8)
         for i, msg in enumerate(self._pending[-3:], 1):
             preview = msg.replace('\n', ' ').strip()
@@ -3114,11 +3113,13 @@ class SB:
         head = _SHELL_ACCENT + '! ' + _RST + cmd
         self.commit([_tile(' ' + head, _TILE_SHELL, w)])
         import subprocess
+        from frontends.slash_cmds import detect_user_shell
+        shell_argv, shell_name = detect_user_shell()
         out = ''
         rc = 0
         try:
             r = subprocess.run(
-                cmd, shell=True, capture_output=True,
+                shell_argv + [cmd], capture_output=True,
                 timeout=30, encoding='utf-8', errors='replace',
             )
             out = (r.stdout or '') + (r.stderr or '')
@@ -3146,7 +3147,7 @@ class SB:
         #   idle    → direct append to backend.history is safe — there's
         #             no concurrent reader.
         try:
-            txt = _t('shell.history', cmd=cmd, out=out.rstrip(), rc=rc)
+            txt = _t('shell.history', sh=shell_name, cmd=cmd, out=out.rstrip(), rc=rc)
             if (self._bridge is not None
                     and getattr(self._bridge.agent, 'is_running', False)):
                 self._bridge.inject_intervene(txt)
@@ -3159,31 +3160,18 @@ class SB:
         except Exception:
             pass
 
-    def _drain_pending(self) -> None:
-        """Flush queued user messages.  Two paths:
+    def _sync_pending_from_bridge(self) -> None:
+        """Drop UI mirror entries the bridge has confirmed consumed.  The
+        bridge's turn_end hook clears `_intervene_pending` at every turn
+        boundary — that's our signal the model has now seen the wrapped
+        message (or that exit_reason kicked the replay)."""
+        if self._pending and self._bridge and not self._bridge_has_pending():
+            self._pending = []
 
-        - Agent still mid-turn → write to `<task_dir>/_intervene`.  GA's
-          `turn_end_callback` (ga.py:576) consumes the file at the next
-          turn boundary and prepends `[MASTER] …` to the upcoming user
-          prompt, which means the new message lands inside the SAME run
-          (no new task started) — exactly what the user asked for.
-        - Agent idle → no intervene hook available; submit as a fresh task
-          so it just becomes the next turn.
-
-        Combined into one payload (not per-message) because users queue
-        clarifying lines for one logical follow-up; N separate turns would
-        force the agent into pointless handoffs.  Caller must hold
-        `self._lk`."""
-        if not self._pending or not self._bridge:
-            return
-        combined = '\n\n'.join(self._pending)
-        self._pending = []
-        self._pending_drain_t = 0.0
-        # Mid-turn injection first; falls back to a new task if the agent
-        # is no longer running (e.g., turn ended between arming the timer
-        # and the timer firing).
-        if not self._bridge.inject_intervene(combined):
-            self._submit(combined, [])
+    def _bridge_has_pending(self) -> bool:
+        if not self._bridge: return False
+        with self._bridge._intervene_lk:
+            return bool(self._bridge._intervene_pending)
 
     def _input_box(self, w: int) -> list[str]:
         """A full-width bordered, padded input box (cc-style). Lives in the
@@ -3986,17 +3974,14 @@ class SB:
                 (int(m.group(1)) for m in _IMG_PH_RE.finditer(raw)) if i in self._imgs]
         expanded = self._expand(raw)
         if self._running:
-            # Queue rather than reject — frees the user from /stop just to
-            # tack on a follow-up.  The pending preview block above the
-            # input shows what's waiting; Up amends the last entry, Esc
-            # clears.  Each new entry resets the 5 s cooldown so a burst
-            # of quick edits coalesces into one inject.
-            self._pending.append(expanded)
-            self._pending_drain_t = time.time() + self._pending_cooldown
-            self._commit_user(_t('pending.queued_marker', text=expanded))
-            self._pstore.clear(); self._fstore.clear(); self._imgs.clear()
-            self._render_live()
-            return
+            wrapped = _t('pending.inject_wrap', text=expanded)
+            if self._bridge and self._bridge.inject_intervene(wrapped, track=True):
+                self._pending.append(expanded)
+                self._commit_user(_t('pending.queued_marker', text=expanded))
+                self._pstore.clear(); self._fstore.clear(); self._imgs.clear()
+                self._render_live()
+                return
+            # Agent went idle in the race — fall through to put_task.
         self._commit_user(expanded)                # scrollback shows exactly what
         self._submit(expanded, imgs)               # the agent receives, not the
         self._pstore.clear(); self._fstore.clear(); self._imgs.clear()   # drop placeholders
@@ -4751,13 +4736,10 @@ class SB:
                     _set_term_title(self._term_title())
 
     def _term_title(self) -> str:
-        """Compose terminal-window title — `⠇ <session> · GenericAgent`.
-        Spinner glyph appears only while an agent run is in flight; an
-        unnamed session falls back to literal 'session' so the title
-        always carries the session segment (parity with tuiapp_v2)."""
-        name = (self._session_name or '').strip() or 'session'
+        name = (self._session_name or '').strip()
         head = (_SPIN[self._spin % len(_SPIN)] + ' ') if self._running else ''
-        return f'{head}{name} · GenericAgent'
+        tail = f'{name} · GenericAgent' if name else 'GenericAgent'
+        return f'{head}{tail}'
 
     def _poll_ask(self, grace: float = 0.0) -> AskUserEvent | None:
         """Only pull a queued ask when none is currently being shown.
@@ -4817,11 +4799,6 @@ class SB:
                 elif isinstance(ev, (SystemEvent, ErrorEvent)):
                     self._finalize(getattr(ev, 'text', None) or getattr(ev, 'message', '')); break
         self._running = False
-        # Note: pending-drain timer is armed on each user submit (resets
-        # every time they add another), not on turn end — that matches
-        # the "5 s cooldown since LAST keystroke" intent.  Maintenance
-        # loop fires _drain_pending when the deadline lapses regardless
-        # of running state.
         # _ticker stops as soon as _running goes False so the title would
         # freeze on the last spinner frame.  Repaint it now to drop the
         # glyph and reveal a clean idle title.
@@ -5172,16 +5149,6 @@ class SB:
             elif o == 0x10:                       # ↑ visual-row up (history at top)
                 if self._palette_visible():
                     self._palette_sel = max(0, self._palette_sel - 1)
-                elif self._pending and not self.buf:
-                    # Empty input + pending → pop the most-recent queued
-                    # message back into the composer for amendment.  Re-
-                    # submitting it appends at the tail again; Esc clears
-                    # the whole queue.  Order preserved (LIFO recall).
-                    self.buf = self._pending.pop()
-                    self.pos = len(self.buf)
-                    if not self._pending:
-                        self._pending_drain_t = 0.0
-                    self._render_live()
                 else:
                     self._sel = None
                     line_no, total, ls, le = self._line_region()
@@ -5477,17 +5444,9 @@ class SB:
                     # restores itself once the 1s window lapses (the extra
                     # 0.1s margin guarantees one render past expiry).
                     dirty = True
-                if (self._pending and self._pending_drain_t > 0
-                        and self._asking is None):
-                    # Cooldown countdown — repaint so the "{sec:.1f}s" tick
-                    # is visible.  When the deadline lapses, drain:
-                    # if the agent is still mid-turn, _drain_pending writes
-                    # to _intervene and ga.turn_end_callback picks it up
-                    # at the next boundary; if idle, drain submits as a
-                    # new task.
-                    if time.time() >= self._pending_drain_t:
-                        with self._lk:
-                            self._drain_pending()
+                if self._pending:
+                    with self._lk:
+                        self._sync_pending_from_bridge()
                     dirty = True
                 if self._epend or (self._rb and not self._bp):
                     with self._lk:
@@ -5547,8 +5506,10 @@ class SB:
         _set_term_title(self._term_title())
         try:
             return self._run_prompt_toolkit()
+        except KeyboardInterrupt:
+            pass
         finally:
-            _set_term_title('GenericAgent')   # restore on quit (no spinner / session)
+            _set_term_title('GenericAgent')
 
 
 # sb.py's original `main()` and __main__ guard intentionally dropped — the
