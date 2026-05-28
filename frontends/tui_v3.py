@@ -4725,13 +4725,10 @@ class SB:
                     _set_term_title(self._term_title())
 
     def _term_title(self) -> str:
-        """Compose terminal-window title — `⠇ <session> · GenericAgent`.
-        Spinner glyph appears only while an agent run is in flight; an
-        unnamed session falls back to literal 'session' so the title
-        always carries the session segment (parity with tuiapp_v2)."""
-        name = (self._session_name or '').strip() or 'session'
+        name = (self._session_name or '').strip()
         head = (_SPIN[self._spin % len(_SPIN)] + ' ') if self._running else ''
-        return f'{head}{name} · GenericAgent'
+        tail = f'{name} · GenericAgent' if name else 'GenericAgent'
+        return f'{head}{tail}'
 
     def _poll_ask(self, grace: float = 0.0) -> AskUserEvent | None:
         """Only pull a queued ask when none is currently being shown.
@@ -5489,8 +5486,10 @@ class SB:
         _set_term_title(self._term_title())
         try:
             return self._run_prompt_toolkit()
+        except KeyboardInterrupt:
+            pass
         finally:
-            _set_term_title('GenericAgent')   # restore on quit (no spinner / session)
+            _set_term_title('GenericAgent')
 
 
 # sb.py's original `main()` and __main__ guard intentionally dropped — the
