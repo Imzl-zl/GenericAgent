@@ -362,9 +362,10 @@ _I18N: dict[str, dict[str, str]] = {
         'pending.head_running':  'queued {n} · injecting at next turn boundary · Esc to clear',
         'pending.cleared':       'cleared {n} pending message(s)',
         'pending.queued_marker': '[queued] {text}',
-        # Claude Code's `wrapCommandText` wording — explicitly subordinates
-        # the new message to the in-flight task so the model doesn't
-        # abandon what it was doing.
+        # Wrap user steers with explicit "finish current task first"
+        # phrasing so the `[MASTER]` envelope (ga.py:578) reads as
+        # supplementary, not as a directive override that drops the
+        # original task.
         'pending.inject_wrap':   ('The user sent a new message while you '
                                   'were working:\n{text}\n\nIMPORTANT: After '
                                   'completing your current task, you MUST '
@@ -1323,10 +1324,8 @@ class AgentBridge:
         self.agent.inc_out = True
         self.agent.verbose = True
         # task_dir enables ga's `_stop` / `_keyinfo` / `_intervene` consume
-        # paths.  We use `_intervene` only for factual context like `!cmd`
-        # shell output — queued user messages go through put_task (Codex
-        # pattern) to avoid overpowering the model.  PID-scoped dir so
-        # concurrent v3 processes don't share signal files.
+        # paths.  PID-scoped dir so concurrent v3 processes don't share
+        # signal files.
         self.agent.task_dir = os.path.join(_ROOT, 'temp', f'_tui_v3_{os.getpid()}')
         try: os.makedirs(self.agent.task_dir, exist_ok=True)
         except Exception: pass
@@ -1493,9 +1492,9 @@ else:
     _ACCENT = '\x1b[38;2;94;106;210m'    # Linear lavender #5e6ad2
     _BORDER = '\x1b[38;5;146m'
 _INK_U = '\x1b[38;5;234m'                # user ink — kept for legacy callers
-# User-prompt panel.  Claude-Code-style charcoal block (RGB 55,55,55) with
-# soft-white ink — full-row tile via _tile() means the band keeps its right
-# edge on every terminal regardless of wrap-width math.  Switched from xterm-
+# User-prompt panel.  Charcoal block (RGB 55,55,55) with soft-white ink —
+# full-row tile via _tile() means the band keeps its right edge on every
+# terminal regardless of wrap-width math.  Switched from xterm-
 # 256 inverse (which renders muddy on Win Terminal dark themes) to truecolor.
 _TILE_U = '\x1b[48;2;55;55;55m\x1b[38;2;230;230;230m'
 _MARK = _ACCENT + '❯' + _RST             # prompt mark — the single accent
@@ -2274,9 +2273,10 @@ class SB:
         self._cc_t = 0.0                # last bare-Ctrl+C time (arm-to-quit window)
         self._last_esc_t = 0.0          # last bare-Esc time (Esc Esc → /clear)
         # Queued user messages: appended while running, written to the
-        # bridge's `_intervene` file with a Claude-Code-style wrapper that
-        # subordinates the new message to the running task.  Cleared when
-        # the bridge confirms consumption at the next turn boundary.
+        # bridge's `_intervene` file with a "finish current task first"
+        # wrapper that subordinates the new message to the running task.
+        # Cleared when the bridge confirms consumption at the next turn
+        # boundary.
         self._pending: list[str] = []
         self._epend = b''               # held trailing ESC (split-read disambiguation)
         self._undo: list[tuple[str, int]] = []   # buffer-edit history for Ctrl+Z
