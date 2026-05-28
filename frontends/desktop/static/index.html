@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>GenericAgent</title>
 <link rel="stylesheet" href="assets/fonts/fonts.css">
-<link rel="stylesheet" href="styles.css?v=77">
+<link rel="stylesheet" href="styles.css?v=80">
 <!-- KaTeX: LaTeX 公式渲染 -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
 <!-- highlight.js: 代码高亮 -->
@@ -104,20 +104,16 @@
     <!-- 中间主区 -->
     <main class="main">
 
-      <div class="topbar">
-        <div class="tb-left">
-          <button class="run-state" id="run-toggle"
-           >
-            <i class="dot"></i> <span class="rs-label"></span>
-          </button>
-        </div>
-      </div>
-
       <div id="pages">
 
         <!-- 聊天 -->
         <section class="page active" data-page="chat"
                 >
+          <div class="page-top">
+            <button class="run-state" id="run-toggle">
+              <i class="dot"></i> <span class="rs-label"></span>
+            </button>
+          </div>
           <div class="msg-area">
             <div class="chat-start">
               <div class="feature-head">
@@ -144,14 +140,7 @@
             <input type="file" id="img-input" multiple hidden>
             <div class="thumb-strip" id="thumb-strip" hidden></div>
             <div class="composer-bot">
-              <div class="cb-left">
-                <button class="chip" id="model-chip" data-i18n-title="model.menuLabel" title=""><span class="model-name"></span> <span class="chip-ic" data-ga-icon="caretDown"></span></button>
-                <button class="chip sm" id="plan-chip"><span data-i18n="chip.plan"></span></button>
-                <button class="chip sm" id="auto-chip">
-                  <span class="chip-ic" data-ga-icon="lightning"></span>
-                  <span data-i18n="chip.auto"></span>
-                </button>
-              </div>
+              <button class="chip" id="model-chip" data-i18n-title="model.menuLabel" title=""><span class="model-name"></span> <span class="chip-ic" data-ga-icon="caretDown"></span></button>
               <button class="send" id="send-btn" type="button">
                 <span data-ga-icon="paperPlaneTilt"></span>
               </button>
@@ -184,7 +173,6 @@
             <button type="button" class="chip sm" id="collab-retry" data-i18n="collab.retry"></button>
           </div>
           <div class="collab-reconnect" id="collab-reconnect" hidden data-i18n="collab.reconnect"></div>
-          <div class="collab-sticky" id="collab-sticky" hidden></div>
           <div class="collab-body" id="collab-body">
             <aside class="collab-progress">
               <div class="collab-progress-stats" id="collab-progress-stats" hidden></div>
@@ -237,11 +225,12 @@
                 <input type="file" id="collab-img-input" multiple hidden>
                 <div class="thumb-strip" id="collab-thumb-strip" hidden></div>
                 <div class="composer-bot">
-                  <div class="cb-left"></div>
+                  <button class="chip" id="collab-model-chip" data-i18n-title="model.menuLabel" title=""><span class="model-name"></span> <span class="chip-ic" data-ga-icon="caretDown"></span></button>
                   <button class="send" id="collab-send" type="button" aria-label="send">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
                   </button>
                 </div>
+                <div class="ga-menu" id="collab-model-menu" hidden></div>
               </div>
             </div>
           </div>
@@ -517,7 +506,7 @@
 <!-- highlight.js -->
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" crossorigin="anonymous"></script>
 <script src="phosphor-icons.js"></script>
-<script src="app.js?v=63"></script>
+<script src="app.js?v=64"></script>
 <script src="annot.js"></script><!-- DEV 脚手架，可删 -->
 </body>
 </html>

@@ -524,6 +524,12 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
   justify-content:space-between; padding:0 16px; border-bottom:none;
   background:var(--panel);
 }
+/* 各页面自带的顶栏(融入页面、随页面切换),沿用旧 .topbar 视觉,但归属各 page */
+.page > .page-top{
+  height:46px; flex:0 0 46px; display:flex; align-items:center;
+  justify-content:space-between; padding:0 16px;
+  background:var(--panel);
+}
 .tb-left{ display:flex; align-items:center; gap:14px; font-size:12px; }
 .pill{
   border:1px solid var(--line); background:var(--card); border-radius:20px;
@@ -917,7 +923,10 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
   background:color-mix(in srgb, var(--accent) 22%, transparent); color:var(--accent);
   font-size:.9em; white-space:nowrap; user-select:none; cursor:default;
 }
-.composer-bot{ display:flex; align-items:center; justify-content:space-between; margin-top:8px; }
+.composer-bot{ display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:8px; }
+/* 标准模型 chip 紧贴发送键时,给个小圆角避免和方正发送键看起来割裂 */
+.composer-bot > #model-chip,
+.composer-bot > #collab-model-chip{ border-radius:4px; }
 .cb-left{
   display:inline-flex; align-items:stretch; gap:0;
   border:1px solid var(--line); border-radius:4px; overflow:hidden;

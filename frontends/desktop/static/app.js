@@ -225,6 +225,7 @@ const I18N = {
     'foot.settings': '配置', 'foot.ver': 'GenericAgent · 桌面版',
     'chat.startTitle': '开始对话', 'chat.startSub': '直接输入，或点预设功能一键启动',
     'preset.butler.t': 'Conductor', 'preset.butler.d': '复杂任务自动拆活，进度在 Conductor 查看',
+    'preset.plan.t': 'Plan 模式', 'preset.plan.d': '加载 Plan SOP，按探索→规划→执行→验证流程',
     'preset.goal.t': 'Goal 模式', 'preset.goal.d': '设定目标，自主完成',
     'preset.explore.t': '自主探索', 'preset.explore.d': '自动浏览并周期汇总',
     'preset.hive.t': 'Hive 协作', 'preset.hive.d': '多 worker 协同攻坚',
@@ -352,9 +353,8 @@ const I18N = {
     'tok.priceInput': '输入: $', 'tok.priceOutput': '输出: $',
     'tok.priceCacheW': '缓存写入: $', 'tok.priceCacheR': '缓存读取: $',
     'presetPrompt.goal': '进入 Goal 模式：读 L3 goal mode SOP，自主达成我接下来描述的目标。',
-    'presetPrompt.planMode': '进入 Plan 模式：读 L3 plan mode SOP，按其中的探索→规划→执行→验证流程完成我接下来描述的任务。',
+    'presetPrompt.plan': '进入 Plan 模式：先读 memory/plan_sop.md，按其中「探索→规划→执行→验证」流程，等我接下来描述要做的任务。',
     'presetPrompt.explore': '进入自主探索模式：自动浏览并定期向我汇总要点。',
-    'presetPrompt.autoMode': '进入 Auto 模式：读 L3 auto mode SOP，按其中规则在 cwd 内自主推进我接下来描述的任务。',
     'presetPrompt.hive': '启动 Goal Hive 模式：按 hive SOP 拉起多个 worker 协同完成我接下来的目标。',
     'presetPrompt.review': '进入监察者模式：对刚才的产出严格挑刺、逐项复核并报告问题。',
     'presetPrompt.mine': '抓取本周的 git 提交并写一份周报。',
@@ -370,6 +370,7 @@ const I18N = {
     'foot.settings': 'Settings', 'foot.ver': 'GenericAgent · Desktop',
     'chat.startTitle': 'Start a conversation', 'chat.startSub': 'Type a message, or pick a preset',
     'preset.butler.t': 'Conductor', 'preset.butler.d': 'Delegate complex tasks; track progress in Conductor',
+    'preset.plan.t': 'Plan mode', 'preset.plan.d': 'Load Plan SOP — explore→plan→execute→verify',
     'preset.goal.t': 'Goal mode', 'preset.goal.d': 'Set a goal, run autonomously',
     'preset.explore.t': 'Auto explore', 'preset.explore.d': 'Browse & summarize periodically',
     'preset.hive.t': 'Hive', 'preset.hive.d': 'Multi-worker collaboration',
@@ -497,9 +498,8 @@ const I18N = {
     'tok.priceInput': 'Input: $', 'tok.priceOutput': 'Output: $',
     'tok.priceCacheW': 'Cache write: $', 'tok.priceCacheR': 'Cache read: $',
     'presetPrompt.goal': 'Enter Goal mode: read the L3 goal-mode SOP and autonomously achieve the goal I describe next.',
-    'presetPrompt.planMode': 'Enter Plan mode: read the L3 plan-mode SOP and follow its explore→plan→execute→verify flow for the task I describe next.',
+    'presetPrompt.plan': 'Enter Plan mode: first read memory/plan_sop.md, follow its explore→plan→execute→verify flow, and wait for the task I describe next.',
     'presetPrompt.explore': 'Enter auto-explore mode: browse autonomously and periodically summarize key points to me.',
-    'presetPrompt.autoMode': 'Enter Auto mode: read the L3 auto-mode SOP and follow its rules to autonomously progress the task I describe next within the current working directory.',
     'presetPrompt.hive': 'Start Goal Hive mode: per the hive SOP, spawn multiple workers to collaboratively achieve the goal I describe next.',
     'presetPrompt.review': 'Enter reviewer mode: strictly scrutinize the previous output, review item by item and report issues.',
     'presetPrompt.mine': 'Collect this week\'s git commits and write a weekly report.',
@@ -1233,7 +1233,6 @@ const state = {
   sessions: new Map(), activeId: null, bridgeReady: false,
   llmNo: 0, modelProfiles: [], modelName: null,
   runtime: new Map(),
-  planMode: false, autoMode: false,
   pendingFiles: [],
   fileSeq: 0,
 };
@@ -1327,6 +1326,9 @@ bindResize(rpResize, rpPanel, -1, 160, 400);  // 右栏:cursor 左移 → 增宽
 bindResize(sbResize, sbPanel, +1, 180, 360);  // 左栏:cursor 右移 → 增宽
 const modelChip  = document.getElementById('model-chip');
 const modelNameEl= modelChip ? modelChip.querySelector('.model-name') : null;
+// conductor 页面也有一个独立的模型 chip,共用一份模型数据
+const collabModelChip   = document.getElementById('collab-model-chip');
+const collabModelNameEl = collabModelChip ? collabModelChip.querySelector('.model-name') : null;
 
 let msgsEl = null;
 function ensureMsgs() {
@@ -1655,7 +1657,7 @@ function renderSessionList() {
   const all = sortedSessions();
   const filtered = query
     ? all.filter(s => {
-        const title = (s.title || '').toLowerCase();
+        const title = displayTitle(s).toLowerCase();
         const hasMsg = s.messages && s.messages.some(m => (m.text || '').toLowerCase().includes(query));
         return title.includes(query) || hasMsg;
       })
@@ -1674,7 +1676,7 @@ function renderSessionList() {
     const pinSvg = sess.pinned ? GA_ICON('pushPinSimple', 'ci-pin') : '';
     item.innerHTML =
       `<span class="ci-dot"></span><div class="ci-main">` +
-      `<div class="ci-title">${pinSvg}${escapeHtml(sess.title || t('conv.defaultTitle'))}</div>` +
+      `<div class="ci-title">${pinSvg}${escapeHtml(displayTitle(sess))}</div>` +
       `<div class="ci-meta">${busy ? t('status.running') : t('status.idle')}</div></div>` +
       `<button class="ci-more" title="${escapeHtml(t('common.more'))}">${GA_ICON('dotsThreeVertical')}</button>`;
     convListEl.appendChild(item);
@@ -1688,9 +1690,42 @@ async function ensureBridgeSession(sess) {
   sess.bridgeSessionId = res.sessionId || res.result?.sessionId;
   return sess.bridgeSessionId;
 }
+// 仿 TUI(continue_cmd.py 的 _preview_text 思路):sess.title 只在用户手动 rename 时被填,
+// 平时为空;sidebar 显示名实时从消息派生 —— 优先取最后一段 assistant 输出里的 <summary>...</summary>,
+// 其次用首条用户消息纯文本,都没有时回退到 t('conv.defaultTitle')。
+function isAutoTitle(x) {
+  const s = String(x || '').trim();
+  if (!s) return true;
+  if (/^(new chat|新对话|新会话)$/i.test(s)) return true;
+  if (/^agent-\d+$/i.test(s)) return true;  // 兼容上一轮误存的 agent-N
+  return false;
+}
+function displayTitle(sess) {
+  if (sess && sess.title && !isAutoTitle(sess.title)) return sess.title;
+  const msgs = (sess && sess.messages) || [];
+  // 1) 优先:最后一段 assistant 文本里的 <summary>...</summary>
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m || m.role !== 'assistant') continue;
+    const txt = typeof m.content === 'string' ? m.content : '';
+    const sm = /<summary>([\s\S]*?)<\/summary>/i.exec(txt);
+    if (sm && sm[1].trim()) {
+      const line = sm[1].trim().split('\n')[0].trim();
+      if (line) return line.length > 60 ? line.slice(0, 60) + '…' : line;
+    }
+  }
+  // 2) 兜底:首条用户消息纯文本(去附件占位符)
+  for (const m of msgs) {
+    if (!m || m.role !== 'user') continue;
+    const raw = typeof m.content === 'string' ? m.content : (m.display || '');
+    const clean = stripAttachPlaceholders(raw).trim();
+    if (clean) return clean.length > 40 ? clean.slice(0, 40) + '…' : clean;
+  }
+  return t('conv.defaultTitle');
+}
 async function newSession() {
   const localId = 'local-' + Date.now() + '-' + Math.random().toString(16).slice(2);
-  const sess = { id: localId, bridgeSessionId: null, title: t('conv.defaultTitle'), messages: [], untitled: true, lastActiveTs: Date.now() };
+  const sess = { id: localId, bridgeSessionId: null, title: '', messages: [], untitled: true, lastActiveTs: Date.now() };
   state.sessions.set(localId, sess);
   try {
     await ensureBridgeSession(sess);
@@ -1960,12 +1995,8 @@ async function sendPrompt(text) {
     const interrupted = await interruptBeforeSend(sess);
     if (!interrupted) return false;
   }
-  const planPrefix = state.planMode ? t('presetPrompt.planMode') : '';
-  const autoPrefix = state.autoMode ? t('presetPrompt.autoMode') : '';
-  const composedPrompt = [planPrefix, autoPrefix, expandFilePlaceholders(text)]
-    .map(s => (s || '').trim())
-    .filter(Boolean)
-    .join('\n\n');
+  // PLAN/AUTO 现在是预设功能（preset 卡片）一次性发送，不再是常驻 prefix
+  const composedPrompt = expandFilePlaceholders(text).trim();
   const usedFiles = collectUsedFiles(text);
   const userMsg = { role: 'user', content: text, ts: Date.now() / 1000 };
   const previewImgs = usedFiles.filter(f => f.isImage).map(f => ({ id: 'f-' + f.sid, name: f.name, path: f.path, dataUrl: f.dataUrl || '' }));
@@ -1974,12 +2005,8 @@ async function sendPrompt(text) {
   if (previewFiles.length) userMsg.files = previewFiles;
   sess.messages.push(userMsg); appendMessage(sess, userMsg);
   sess.lastActiveTs = Date.now();
-  if (sess.untitled || isUntitled(sess.title)) {
-    const titleText = stripAttachPlaceholders(text) || text;
-    sess.title = titleText.slice(0, 40) + (titleText.length > 40 ? '…' : '');
-    sess.untitled = false; renderSessionList();
-    patchSession(sess, { title: sess.title });
-  }
+  // 仿 TUI:不再从首条消息自动改名 —— 标题在 newSession 时已设为 agent-N,
+  // 之后只接受用户手动 rename。
   saveSessions();
   setBusy(sess, true);
   try {
@@ -2113,7 +2140,9 @@ document.querySelectorAll('.feature-grid').forEach(grid => {
 
 /* ═══════════════ 模型 / 设置 ═══════════════ */
 function updateModelChip() {
-  if (modelNameEl) modelNameEl.textContent = state.modelName || '';
+  const name = state.modelName || '';
+  if (modelNameEl) modelNameEl.textContent = name;
+  if (collabModelNameEl) collabModelNameEl.textContent = name;
 }
 async function selectModel(id, name) {
   state.llmNo = id;
@@ -2250,58 +2279,68 @@ async function loadModelProfiles() {
     renderSettingsModels();
   } catch (_) {}
 }
-if (modelChip) modelChip.addEventListener('click', (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  openModelMenu();
-});
-
-/* ═══════════════ 模型菜单 ═══════════════ */
-const modelMenu = document.getElementById('model-menu');
-function renderModelMenu() {
-  if (!modelMenu) return;
+/* ═══════════════ 模型菜单(chat + conductor 共用一份逻辑,各自一个 DOM) ═══════════════ */
+const modelMenu       = document.getElementById('model-menu');
+const collabModelMenu = document.getElementById('collab-model-menu');
+function renderModelMenu(menuEl) {
+  if (!menuEl) return;
   const list = state.modelProfiles || [];
-  const rows = [];
-  list.forEach((p, i) => {
+  const rows = list.map((p, i) => {
     const no = (p.id ?? i);
     const isActive = (state.llmNo === no) ? ' active' : '';
-    const label = escapeHtml(p.name || '');
-    rows.push(`<div class="ga-menu-item${isActive}" data-llmno="${no}">${label}</div>`);
+    return `<div class="ga-menu-item${isActive}" data-llmno="${no}">${escapeHtml(p.name || '')}</div>`;
   });
-  modelMenu.innerHTML = rows.join('');
+  menuEl.innerHTML = rows.join('');
   applyI18n();
 }
-function openModelMenu() {
-  if (!modelMenu || !modelChip) return;
-  if (convMenu) convMenu.hidden = true;
-  renderModelMenu();
-  modelMenu.hidden = false;
-  const chipRect = modelChip.getBoundingClientRect();
-  const composer = modelChip.closest('.composer');
+function openModelMenu(chipEl, menuEl) {
+  if (!chipEl || !menuEl) return;
+  if (typeof convMenu !== 'undefined' && convMenu) convMenu.hidden = true;
+  closeAllModelMenus();
+  renderModelMenu(menuEl);
+  menuEl.hidden = false;
+  const chipRect = chipEl.getBoundingClientRect();
+  const composer = chipEl.closest('.composer');
   if (composer) {
     const composerRect = composer.getBoundingClientRect();
-    modelMenu.style.left = (chipRect.left - composerRect.left) + 'px';
-    modelMenu.style.bottom = (composerRect.bottom - chipRect.top + 4) + 'px';
+    menuEl.style.left = (chipRect.left - composerRect.left) + 'px';
+    menuEl.style.bottom = (composerRect.bottom - chipRect.top + 4) + 'px';
   }
 }
-function closeModelMenu() { if (modelMenu) modelMenu.hidden = true; }
-if (modelMenu) modelMenu.addEventListener('click', (e) => {
-  e.stopPropagation();
-  const item = e.target.closest('.ga-menu-item');
-  if (!item) return;
-  const no = parseInt(item.dataset.llmno, 10);
-  if (Number.isNaN(no)) return;
-  const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === no);
-  selectModel(no, (p && p.name) || '');
-  closeModelMenu();
+function closeAllModelMenus() {
+  if (modelMenu) modelMenu.hidden = true;
+  if (collabModelMenu) collabModelMenu.hidden = true;
+}
+function bindModelMenuItemClick(menuEl) {
+  if (!menuEl) return;
+  menuEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const item = e.target.closest('.ga-menu-item');
+    if (!item) return;
+    const no = parseInt(item.dataset.llmno, 10);
+    if (Number.isNaN(no)) return;
+    const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === no);
+    selectModel(no, (p && p.name) || '');
+    closeAllModelMenus();
+  });
+}
+bindModelMenuItemClick(modelMenu);
+bindModelMenuItemClick(collabModelMenu);
+if (modelChip) modelChip.addEventListener('click', (e) => {
+  e.preventDefault(); e.stopPropagation();
+  openModelMenu(modelChip, modelMenu);
+});
+if (collabModelChip) collabModelChip.addEventListener('click', (e) => {
+  e.preventDefault(); e.stopPropagation();
+  openModelMenu(collabModelChip, collabModelMenu);
 });
 document.addEventListener('click', (e) => {
-  if (!modelMenu || modelMenu.hidden) return;
-  if (e.target.closest('#model-menu') || e.target.closest('#model-chip')) return;
-  closeModelMenu();
+  if (e.target.closest('#model-menu') || e.target.closest('#model-chip') ||
+      e.target.closest('#collab-model-menu') || e.target.closest('#collab-model-chip')) return;
+  closeAllModelMenus();
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && modelMenu && !modelMenu.hidden) closeModelMenu();
+  if (e.key === 'Escape') closeAllModelMenus();
 });
 
 const themeSwatches = document.getElementById('theme-swatches');
@@ -2375,34 +2414,6 @@ if (addModelForm) addModelForm.addEventListener('submit', async (e) => {
   } catch (ex) {
     if (errEl) { errEl.textContent = (ex.message || t('err.modelSave')); errEl.hidden = false; }
   }
-});
-
-/* ═══════════════ Plan / Auto toggle ═══════════════ */
-const planChip = document.getElementById('plan-chip');
-const autoChip = document.getElementById('auto-chip');
-function applyToggleClass() {
-  if (planChip) planChip.classList.toggle('on', state.planMode);
-  if (autoChip) autoChip.classList.toggle('on', state.autoMode);
-}
-if (planChip) planChip.addEventListener('click', (e) => {
-  e.preventDefault();
-  state.planMode = !state.planMode;
-  if (state.planMode && state.autoMode) {
-    state.autoMode = false;
-    localStorage.setItem('ga_auto', '0');
-  }
-  localStorage.setItem('ga_plan', state.planMode ? '1' : '0');
-  applyToggleClass();
-});
-if (autoChip) autoChip.addEventListener('click', (e) => {
-  e.preventDefault();
-  state.autoMode = !state.autoMode;
-  if (state.autoMode && state.planMode) {
-    state.planMode = false;
-    localStorage.setItem('ga_plan', '0');
-  }
-  localStorage.setItem('ga_auto', state.autoMode ? '1' : '0');
-  applyToggleClass();
 });
 
 /* ═══════════════ 文件上传（图片+任意文件，tuiapp_v2 模式） ═══════════════ */
@@ -2957,6 +2968,8 @@ const HB_KEY = 'ga_hidden_builtins';
 const BUILTIN_PRESETS = [
   { key: 'butler', titleKey: 'preset.butler.t', descKey: 'preset.butler.d', navigate: 'collab',
     iconSvg: '<svg class="fc-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' },
+  { key: 'plan',   titleKey: 'preset.plan.t',   descKey: 'preset.plan.d',   promptKey: 'presetPrompt.plan',
+    iconSvg: '<svg class="fc-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="8" y1="18" x2="16" y2="18"/><circle cx="4" cy="6" r="1.5"/><circle cx="4" cy="12" r="1.5"/><circle cx="4" cy="18" r="1.5"/></svg>' },
   { key: 'goal',    titleKey: 'preset.goal.t',    descKey: 'preset.goal.d',    promptKey: 'presetPrompt.goal',
     iconSvg: '<svg class="fc-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4"/></svg>' },
   { key: 'explore', titleKey: 'preset.explore.t', descKey: 'preset.explore.d', promptKey: 'presetPrompt.explore',
@@ -3705,13 +3718,6 @@ applyTheme(theme, { persist: false });
 initChatFontStepper();
 applyChatFontSize(chatFontSize, { persist: false });
 syncHljsTheme();
-state.planMode = localStorage.getItem('ga_plan') === '1';
-state.autoMode = localStorage.getItem('ga_auto') === '1';
-if (state.planMode && state.autoMode) {
-  state.autoMode = false;
-  localStorage.setItem('ga_auto', '0');
-}
-applyToggleClass();
 applyI18n();
 updateModelChip();
 renderSessionList();
@@ -3993,12 +3999,13 @@ window.ga.startBridge && window.ga.startBridge();
     if (gen !== wsGen) return;
     if (data.type === 'hello') {
       S.historyReady = true;
-      S.messages = (data.chat || []).map(raw => ({ id: raw.id, role: raw.role || 'system', msg: raw.msg || '', ts: raw.ts, read: raw.read }));
+      S.messages = (data.chat || []).map(raw => ({ id: raw.id, role: raw.role || 'system', msg: raw.msg || '', ts: raw.ts, read: raw.read, files: raw.files || [], images: raw.images || [] }));
+      S.conductorTyping = !!data.running;
       setWorkers(data.subagents || []);
       syncMessages();
       setConnUi();
     } else if (data.type === 'subagents') setWorkers(data.items || []);
-    else if (data.type === 'chat') pushMsg({ id: data.item.id, role: data.item.role || 'system', msg: data.item.msg || '', ts: data.item.ts, read: data.item.read });
+    else if (data.type === 'chat') pushMsg({ id: data.item.id, role: data.item.role || 'system', msg: data.item.msg || '', ts: data.item.ts, read: data.item.read, files: data.item.files || [], images: data.item.images || [] });
   }
 
   function resetWs() {
@@ -4073,7 +4080,7 @@ window.ga.startBridge && window.ga.startBridge();
     S.messages.push({ id: `_local_${++localSeq}`, _local: true, role: 'user', msg: text, ts: Date.now() / 1000, images, files });
     S.conductorTyping = true;
     syncMessages();
-    ws.send(JSON.stringify({ msg: expand(text) }));
+    ws.send(JSON.stringify({ msg: expand(text), files, images }));
     clearUsed(text);
     const inp = $('collab-input');
     if (inp && window.gaComposerText && window.gaComposerText('collab').trim() === text) inp.innerHTML = '';

@@ -126,8 +126,8 @@ async def broadcast(payload: dict):
 def push_cards():
     schedule_broadcast({"type": "subagents", "items": subagent_snapshot()})
 
-def add_chat(msg: str, role: str = "conductor"):
-    item = {"id": short_id(), "role": role, "msg": msg, "ts": now_ms(), "read": role != "user"}
+def add_chat(msg: str, role: str = "conductor", files: list = None, images: list = None):
+    item = {"id": short_id(), "role": role, "msg": msg, "ts": now_ms(), "read": role != "user", "files": files or [], "images": images or []}
     chat_messages.append(item)
     if len(chat_messages) > 200:
         del chat_messages[:-200]
@@ -410,13 +410,14 @@ async def websocket(ws: WebSocket):
     await ws.accept()
     ws_clients.add(ws)
     try:
-        await ws.send_json({"type": "hello", "subagents": subagent_snapshot(), "chat": chat_messages})
+        running = any(s.status == "running" for s in subagents.values())
+        await ws.send_json({"type": "hello", "subagents": subagent_snapshot(), "chat": chat_messages, "running": running})
         while True:
             data = await ws.receive_json()
             msg = (data.get("msg") or "").strip()
             if not msg:
                 continue
-            add_chat(msg, role="user")
+            add_chat(msg, role="user", files=data.get("files") or [], images=data.get("images") or [])
             conductor_events.put({"type": "user_message", "msg": msg})
     except WebSocketDisconnect:
         pass
