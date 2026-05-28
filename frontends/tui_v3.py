@@ -1082,8 +1082,8 @@ _ANSI_SGR_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 # agent_loop.py emits `**LLM Running (Turn N) ...**` by default but switches
 # to the short `**Turn N ...**` when `handler.parent.task_dir` is set
-# (agent_loop.py:52).  TUI v3 sets task_dir to enable the _intervene
-# injection hook, which silently activates the short form — match both.
+# (agent_loop.py:52).  TUI v3 sets task_dir (for `_stop` signal + `!cmd`
+# shell history via `_intervene`), so we must match both forms.
 _TURN_MARKER_RE = re.compile(r'\*\*(?:LLM Running \()?Turn (\d+)\)?[^\n]*?\*\*')
 _META_TAG_RE = re.compile(r'<(?:thinking|summary|tool_use|file_content)>.*?</(?:thinking|summary|tool_use|file_content)>', re.DOTALL)
 _TOOL_USE_BLOCK_RE = re.compile(r'```json\s*\{[^}]*"tool_name"[^}]*\}\s*```', re.DOTALL)
@@ -1311,23 +1311,15 @@ class AgentBridge:
             self.agent.llmclient = self.agent.llmclients[llm_no % len(self.agent.llmclients)]
         self.agent.inc_out = True
         self.agent.verbose = True
-        # Give the agent a `task_dir` so the per-turn `_intervene` file hook
-        # in ga.turn_end_callback (ga.py:576) can fire — that's how we
-        # smuggle pending user messages into the next LLM call while a
-        # turn is still in flight.  Dedicated PID-scoped dir so concurrent
-        # TUI v3 processes don't step on each other's intervene files.
+        # task_dir enables ga's `_stop` / `_keyinfo` / `_intervene` consume
+        # paths.  We use `_intervene` only for factual context like `!cmd`
+        # shell output — queued user messages go through put_task (Codex
+        # pattern) to avoid overpowering the model.  PID-scoped dir so
+        # concurrent v3 processes don't share signal files.
         self.agent.task_dir = os.path.join(_ROOT, 'temp', f'_tui_v3_{os.getpid()}')
         try: os.makedirs(self.agent.task_dir, exist_ok=True)
         except Exception: pass
         self.ask_user_queue: queue.Queue[AskUserEvent] = queue.Queue()
-        # Lines we've appended to `_intervene` that haven't been confirmed
-        # consumed.  Cleared on a non-exit turn boundary (ga.turn_end_callback
-        # already prepended `[MASTER] ...` to next_prompt — we're done).
-        # On an exit turn boundary, consume_file ate the file but the return
-        # value is discarded — we re-route via put_task as a fresh task so
-        # the user's text never silently disappears.
-        self._intervene_pending: list[str] = []
-        self._intervene_lk = threading.Lock()
         self._install_hook()
         self._healthy = True
         self._init_error: str | None = None
@@ -1338,11 +1330,11 @@ class AgentBridge:
         self._runner.start()
 
     def inject_intervene(self, text: str) -> bool:
-        """Append `text` to `<task_dir>/_intervene`.  ga.turn_end_callback
-        consumes the file at the next turn boundary and prepends `[MASTER]
-        ...` to next_prompt.  Returns False if the agent is idle (caller
-        falls back to put_task).  Append-mode write keeps us idempotent
-        under the consume_file race."""
+        """Append `text` to `<task_dir>/_intervene` for `[MASTER] ...`
+        prefix injection at the next turn boundary.  Reserved for FACTUAL
+        context (e.g. `!cmd` shell output) — never for queued user
+        messages, which would overpower the model and cause it to abandon
+        the original task (Codex/CC queue instead drain post-turn)."""
         td = getattr(self.agent, 'task_dir', None)
         if not td or not getattr(self.agent, 'is_running', False):
             return False
@@ -1356,27 +1348,9 @@ class AgentBridge:
             except OSError: pass
             with open(fp, 'a', encoding='utf-8') as f:
                 f.write(sep + text)
-            with self._intervene_lk:
-                self._intervene_pending.append(text)
             return True
         except Exception:
             return False
-
-    def has_intervene_pending(self) -> bool:
-        with self._intervene_lk:
-            return bool(self._intervene_pending)
-
-    def get_pending_snapshot(self) -> list[str]:
-        with self._intervene_lk:
-            return list(self._intervene_pending)
-
-    def clear_intervene(self) -> None:
-        td = getattr(self.agent, 'task_dir', None)
-        if td:
-            try: os.remove(os.path.join(td, '_intervene'))
-            except OSError: pass
-        with self._intervene_lk:
-            self._intervene_pending = []
 
     def _run_safe(self):
         try:
@@ -1394,21 +1368,6 @@ class AgentBridge:
         ev = _extract_ask_user(ctx)
         if ev:
             self.ask_user_queue.put(ev)
-        with self._intervene_lk:
-            if not self._intervene_pending:
-                return
-            if (ctx or {}).get('exit_reason'):
-                # consume_file ran but next_prompt is discarded on exit.
-                # Re-route as a fresh task — agent.run()'s outer loop
-                # picks it up on the next iteration.
-                combined = '\n\n'.join(self._intervene_pending)
-                self._intervene_pending = []
-                try:
-                    self.agent.put_task(combined, source='user')
-                except Exception:
-                    pass
-            else:
-                self._intervene_pending = []
 
     def submit(self, query: str, images: list | None = None) -> queue.Queue:
         return self.agent.put_task(query, source='user', images=images)
@@ -2281,12 +2240,12 @@ class SB:
         self._quit = False
         self._cc_t = 0.0                # last bare-Ctrl+C time (arm-to-quit window)
         self._last_esc_t = 0.0          # last bare-Esc time (Esc Esc → /clear)
-        # UI mirror of bridge._intervene_pending.  Each Enter while running
-        # appends here and writes to `_intervene` immediately; the bridge's
-        # turn_end_hook clears its own list at every turn boundary, and our
-        # observer syncs `_pending` to match (no timers, no cooldowns —
-        # delivery is anchored to the agent's actual turn boundaries).
+        # Queued user messages (Codex/CC pattern): appended while running,
+        # drained as ONE fresh task when `is_running` flips False.  Never
+        # mid-injected via `_intervene` — that overpowers the model and
+        # makes it abandon the original task.
         self._pending: list[str] = []
+        self._was_running: bool = False
         self._epend = b''               # held trailing ESC (split-read disambiguation)
         self._undo: list[tuple[str, int]] = []   # buffer-edit history for Ctrl+Z
         self._redo: list[tuple[str, int]] = []   # cleared on any new edit
@@ -2816,8 +2775,6 @@ class SB:
         if self._pending:                             # cancel queued user messages
             n = len(self._pending)
             self._pending = []
-            if self._bridge:
-                self._bridge.clear_intervene()
             self.commit([_DIM + _t('pending.cleared', n=n) + _RST])
             return
         if self._running and self._bridge:
@@ -3138,17 +3095,16 @@ class SB:
         except Exception:
             pass
 
-    def _sync_pending_from_bridge(self) -> None:
-        """Mirror `bridge._intervene_pending` into `self._pending`.
-        Active mirror (not just clear-on-empty) so the UI tracks the bridge
-        list move-for-move — including the case where a turn boundary
-        clears the bridge between UI updates and a new submit arrives
-        before our next sync."""
-        if not self._bridge:
+    def _drain_pending_to_task(self) -> None:
+        """Codex/CC pattern: when the agent goes idle, drain queued user
+        messages as ONE fresh task — never mid-turn injection.  Mid-turn
+        `[MASTER] ...` prefixes overpowered the model and caused it to
+        abandon the original task (see model_responses_042511.txt)."""
+        if not self._pending or not self._bridge:
             return
-        new_state = self._bridge.get_pending_snapshot()
-        if self._pending != new_state:
-            self._pending = new_state
+        combined = '\n\n'.join(self._pending)
+        self._pending = []
+        self._submit(combined, [])
 
     def _input_box(self, w: int) -> list[str]:
         """A full-width bordered, padded input box (cc-style). Lives in the
@@ -3951,15 +3907,11 @@ class SB:
                 (int(m.group(1)) for m in _IMG_PH_RE.finditer(raw)) if i in self._imgs]
         expanded = self._expand(raw)
         if self._running:
-            if self._bridge and self._bridge.inject_intervene(expanded):
-                self._pending.append(expanded)
-                self._commit_user(_t('pending.queued_marker', text=expanded))
-                self._pstore.clear(); self._fstore.clear(); self._imgs.clear()
-                self._render_live()
-                return
-            # inject_intervene returned False — agent went idle in the
-            # race between UI spinner and bridge state.  Fall through to
-            # the idle submit below so the message isn't silently dropped.
+            self._pending.append(expanded)
+            self._commit_user(_t('pending.queued_marker', text=expanded))
+            self._pstore.clear(); self._fstore.clear(); self._imgs.clear()
+            self._render_live()
+            return
         self._commit_user(expanded)                # scrollback shows exactly what
         self._submit(expanded, imgs)               # the agent receives, not the
         self._pstore.clear(); self._fstore.clear(); self._imgs.clear()   # drop placeholders
@@ -5393,9 +5345,13 @@ class SB:
                     # restores itself once the 1s window lapses (the extra
                     # 0.1s margin guarantees one render past expiry).
                     dirty = True
-                if (self._pending or
-                        (self._bridge and self._bridge.has_intervene_pending())):
-                    self._sync_pending_from_bridge()
+                now_running = bool(self._bridge and self._bridge.is_running)
+                if self._was_running and not now_running and self._pending:
+                    with self._lk:
+                        self._drain_pending_to_task()
+                    dirty = True
+                self._was_running = now_running
+                if self._pending:
                     dirty = True
                 if self._epend or (self._rb and not self._bp):
                     with self._lk:
