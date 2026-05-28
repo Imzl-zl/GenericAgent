@@ -1191,9 +1191,10 @@ class AgentSession:
     # `/continue` bumps to `len(messages)` so old plan cards don't resurrect.
     plan_scan_baseline: int = 0
     # `pending`: raw user text for UI display ([queued #N] chip).
-    # `pending_wrapped`: same entries wrapped with the Claude-Code prompt
-    # phrasing, in the form actually appended to `_intervene`.  Replay
-    # uses these so the exit-turn re-put_task carries the wrap context.
+    # `pending_wrapped`: same entries wrapped with the "complete current
+    # task first" supplementary phrasing, in the form actually appended
+    # to `_intervene`.  Replay uses these so the exit-turn put_task
+    # carries the wrap context.
     pending: list[str] = field(default_factory=list)
     pending_wrapped: list[str] = field(default_factory=list)
     pending_lk: threading.Lock = field(default_factory=threading.Lock)
@@ -1807,14 +1808,12 @@ class InputArea(TextArea):
         Binding("cmd+v",       "paste", "Paste", show=False),
         # Ctrl+U: readline-style kill-line, repurposed here to clear the whole input.
         Binding("ctrl+u",      "clear_input", "ClearInput", show=False),
-        # Ctrl+S: toggle-stash the current draft (Claude Code muscle-memory).
-        # First press → stash text + clear input; second press on an empty
-        # input → restore the stashed draft. Independent of Up/Down history
-        # so a queued draft survives sending the previous one.
-        # NOTE: must use `self.reset()` (not `self.text = ""`) — assigning
-        # `.text` on a TextArea rebuilds the document + wrapped_document and
-        # blocks the UI for seconds on long pastes (cf. PR#479, user report
-        # 2026-05-27 "ctrl+s 完全卡死"). `reset()` clears in-place.
+        # Ctrl+S: toggle-stash the current draft.  First press → stash
+        # text + clear input; second press on empty input → restore the
+        # stashed draft.  Independent of Up/Down history so a queued
+        # draft survives sending the previous one.  reset() uses
+        # TextArea.clear() to avoid the document-rebuild path that
+        # blocked the UI for seconds on long sessions.
         Binding("ctrl+s",      "stash", "Stash", show=False),
         Binding("cmd+s",       "stash", "Stash", show=False),
     ]
@@ -1823,19 +1822,9 @@ class InputArea(TextArea):
         pass
 
     def action_stash(self) -> None:
-        """Stash/restore the input draft.
-
-        Long-session note (2026-05-28, 2nd pass): the previous fix tried to
-        keep `reset()` synchronous and only deferred the palette/resize
-        cleanup, but `reset()` itself still queues a Changed event behind
-        the streaming reactive cycle.  When the queue is saturated with
-        per-chunk repaints the visible clear never lands and the user sees
-        a frozen input.  Now we defer the reset itself: only the buffer
-        snapshot happens on the keystroke; the visible clear and layout
-        work both happen on the next event-loop tick via
-        `call_after_refresh`.  Trades a 1-frame delay for guaranteed
-        keystroke responsiveness.
-        """
+        """Stash/restore the input draft.  reset()/text restore both defer
+        to `call_after_refresh` so the layout cascade runs off the
+        keystroke event, leaving Ctrl+S itself snappy on long sessions."""
         current = self.text
         if current:
             self._draft_stash = current
@@ -1858,17 +1847,13 @@ class InputArea(TextArea):
                 self._stash_cleanup_restore(stashed)
 
     def _stash_cleanup_clear(self) -> None:
-        """Deferred companion to action_stash (clear path).
-
-        Runs OUTSIDE the keystroke event so the Textual layout cascade
-        triggered by reset() doesn't block the user from typing more.
-        `_skip_change_next` still short-circuits on_input_area_changed
-        so the cascade hits once (from `reset()` itself), not twice."""
+        """Deferred companion to action_stash (clear path).  The Changed
+        event posted by `clear()` is async-queued — set the flag and let
+        `on_text_area_changed` self-clear it when the event lands.  A
+        try/finally here clears the flag too early and lets the handler
+        re-run the heavy resize + palette path."""
         self._skip_change_next = True
-        try:
-            self.reset()
-        finally:
-            self._skip_change_next = False
+        self.reset()
         try: self.app._hide_palette()
         except Exception: pass
         try: self.app._resize_input(self)
@@ -2069,7 +2054,15 @@ class InputArea(TextArea):
         return True
 
     def reset(self) -> None:
-        self.text = ""
+        # `self.text = ""` rebuilds Document + WrappedDocument and triggers
+        # a full re-wrap + `_refresh_size` layout cascade.  On long
+        # sessions (100+ message widgets in the scroll), that cascade
+        # blocks the UI for seconds — perceived as freeze on Ctrl+S.
+        # `clear()` deletes in place via the edit pipeline and only
+        # re-wraps the affected range, so empty-out is O(content-len)
+        # without rebuilding the document object.
+        if self.document.text:
+            self.clear()
         self._pastes.clear()
         self._paste_counter = 0
         self._history_index = -1
@@ -4486,12 +4479,11 @@ class GenericAgentTUI(App[None]):
             pass
 
     # ---------------- agent task + stream ----------------
-    # Pending-queue transport: submit while running → wrap text with
-    # Claude-Code phrasing ("...IMPORTANT: After completing your current
-    # task, you MUST address the user's message above. Do not ignore
-    # it.") and append to `_intervene` so ga.turn_end_callback prepends
-    # it to next_prompt as `[MASTER] ...` mid-turn.  The wrap makes the
-    # `[MASTER]` framing supplementary instead of overriding.  On an
+    # Pending-queue transport: submit while running → wrap text with the
+    # "complete current task first, then address this" supplementary
+    # phrasing and append to `_intervene` so ga.turn_end_callback prepends
+    # it to next_prompt as `[MASTER] ...` mid-turn.  The wrap makes
+    # `[MASTER]` read as an envelope, not a directive override.  On an
     # exit-turn boundary consume_file ate the file but next_prompt was
     # discarded — the replay hook re-routes via put_task.
 

@@ -40,7 +40,7 @@ def detect_user_shell() -> tuple[list[str], str]:
 
     `!cmd` in tui_v2 / tui_v3 invokes this so commands like `ls`, pipes,
     globs, and shell builtins behave the way the user expects in whatever
-    shell launched the app — matching Claude Code / Codex CLI semantics.
+    shell launched the app, instead of hardcoding cmd.exe / /bin/sh.
 
     Resolution order:
       1. `$SHELL` if it points to an existing file (Unix, Git Bash, WSL)
