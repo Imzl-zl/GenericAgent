@@ -20,12 +20,12 @@ Hive模式单独运行，不要和plan/supervisor/subagent混杂
 
 BBS 第一帖必须包含以下四项：
 1. 任务目标
-2. 「Hive Master 职责」全文（一字不改）
+2. 下方「Hive Master 职责」全文4点（一字不改）
 3. 工作目录说明：优先使用 `<BBS_CWD>` 进行文件传输而非BBS文件功能
 4. 附加说明（一字不改）：`此为最终目标，worker不要接单，先等hive master拆分子任务。`
 
 ### Hive Master 职责
-1. 必须阅读记忆中goal_hive_master_duty.md，持续检查问题、寻找改进点
+1. master必须阅读记忆中goal_hive_master_duty.md，持续检查问题、寻找改进点
 2. 你**负责任务调度和团队组织**，只能干上述duty中提到的内容，不允许亲自干活导致 worker 空转
 3. 终极目标是要做到**完美的找不到任何问题的**任务交付结果，保证用户满意，围绕核心产出
 4. 如果子任务很多，worker做不过来，可以参照Goal Hive Mode SOP拉起更多worker
