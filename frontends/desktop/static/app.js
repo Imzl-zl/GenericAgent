@@ -2881,12 +2881,13 @@ async function tokPollBridge() {
     const history = tokLoadHistory();
     for (const r of (data.records||[])) {
       const key = r.thread;
+      const sid = key.replace('GA-','');
+      const sess = [...state.sessions.values()].find(s=>s.bridgeSessionId===sid);
+      if (sess && rt(sess).busy) continue;
       const prev = _tokLastSnap[key] || {input:0,output:0,cacheCreate:0,cacheRead:0};
       let di = r.input-prev.input, do_ = r.output-prev.output, dc = r.cacheCreate-prev.cacheCreate, dr = r.cacheRead-prev.cacheRead;
       if (di<0||do_<0||dc<0||dr<0) { di = r.input; do_ = r.output; dc = r.cacheCreate; dr = r.cacheRead; }
       if (di>0||do_>0||dc>0||dr>0) {
-        const sid = key.replace('GA-','');
-        const sess = [...state.sessions.values()].find(s=>s.bridgeSessionId===sid);
         const title = sess ? displayTitle(sess) : sid;
         history.push({sessionId:sid, title:title, input:di, output:do_, cacheCreate:dc, cacheRead:dr, model:r.model||'', ts:Date.now()/1000});
         if(sess?.title) history.forEach(h=>{if(h.sessionId===sid&&(!h.title||h.title===sid))h.title=sess.title;});
