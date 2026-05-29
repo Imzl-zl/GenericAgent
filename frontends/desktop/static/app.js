@@ -2978,6 +2978,7 @@ async function tokRenderConductorRow() {
   const gen = ++_conductorRowGen;
   tokTbody.querySelectorAll('.tok-row-conductor').forEach(el => el.remove());
   let curIn = 0, curOut = 0, curCc = 0, curCr = 0, curCost = 0;
+  let fetchOk = false;
   try {
     const data = await (await fetch(`http://${location.hostname}:8900/token-stats`)).json();
     if (gen !== _conductorRowGen) return;
@@ -2987,16 +2988,16 @@ async function tokRenderConductorRow() {
       curIn += r.input || 0; curOut += r.output || 0; curCc += r.cacheCreate || 0; curCr += r.cacheRead || 0;
       curCost += parseFloat(estCost(r.input || 0, r.output || 0, r.model || '', r.cacheRead || 0, r.cacheCreate || 0));
     }
+    fetchOk = true;
   } catch (_) {}
   if (gen !== _conductorRowGen) return;
   // Detect conductor restart: if current totals < last seen, accumulate last into history
   const hist = _condLoadHist();
   const last = _condLoadLast();
-  if (last && (curIn < last.input || curOut < last.output)) {
+  if (fetchOk && last && (curIn < last.input || curOut < last.output)) {
     hist.input += last.input; hist.output += last.output; hist.cacheCreate += last.cacheCreate; hist.cacheRead += last.cacheRead; hist.cost += last.cost;
   }
-  const newLast = (curIn > 0 || curOut > 0) ? {input:curIn, output:curOut, cacheCreate:curCc, cacheRead:curCr, cost:curCost} : last;
-  _condSave(hist, newLast);
+  if (fetchOk) _condSave(hist, {input:curIn, output:curOut, cacheCreate:curCc, cacheRead:curCr, cost:curCost});
   const tip = 'Conductor 消耗的 token 不计入累计 token 中';
   // Row 1: historical total
   const tr1 = document.createElement('tr'); tr1.className = 'tok-row-session tok-row-conductor'; tr1.title = tip;
