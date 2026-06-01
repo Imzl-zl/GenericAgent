@@ -220,7 +220,7 @@ const I18N = {
   zh: {
     'app.title': 'GenericAgent 桌面版',
     'brand.sub': '桌面终端',
-    'nav.chat': '聊天', 'nav.channels': '消息通道', 'nav.status': '状态面板',
+    'nav.chat': '聊天', 'nav.services': '后台服务', 'nav.channels': '消息通道', 'nav.status': '状态面板',
     'nav.collab': '指挥家', 'nav.token': 'Token 统计',
     'foot.settings': '配置', 'foot.ver': 'GenericAgent · 桌面版',
     'chat.startTitle': '开始对话', 'chat.startSub': '直接输入，或点预设功能一键启动',
@@ -258,6 +258,7 @@ const I18N = {
     'err.modelSave': '保存失败', 'err.modelRequired': '请填写模型、API Key 和 API 地址',
     'err.modelDelete': '删除失败', 'err.modelDeleteLast': '至少保留一个模型',
     'confirm.modelDelete': '确定删除该模型配置？',
+    'page.services.title': '后台服务', 'page.services.sub': 'IM 消息通道与后台进程，集中查看、启停与日志',
     'page.channels.title': '消息通道', 'page.channels.sub': '后台 IM 进程：列表、启停与日志（同 hub.pyw）',
     'page.status.title': '状态面板', 'page.status.sub': 'hub.pyw 管理的后台进程/服务，集中查看与启停',
     'page.collab.title': '指挥家', 'page.collab.sub': '交代目标，自动拆活与跟进',
@@ -347,7 +348,7 @@ const I18N = {
     'proc.imbotWechat': 'imbot · 微信', 'proc.imbotDing': 'imbot · 钉钉', 'proc.scheduler': '定时任务调度',
     'cm.scheduling': '调度中', 'cm.running': '执行中', 'cm.idleSt': '空闲',
     'cm.master': '已派 3 子任务', 'cm.w1': '子任务：抓取数据', 'cm.w2': '子任务：复核结果', 'cm.sub': '等待派单',
-    'tok.total': '累计 token', 'tok.cost': '估算成本', 'tok.today': '今日 token', 'tok.tabAll': '总体', 'tok.tabConductor': 'Subagent Token 消耗',
+    'tok.total': '累计 token', 'tok.cost': '估算成本', 'tok.today': '今日 token', 'tok.tabAll': '聊天', 'tok.tabConductor': 'Conductor', 'tok.condTotal': 'Conductor 累计', 'tok.condCurrent': 'Conductor 本次', 'tok.condTip': 'Conductor 消耗的 token 不计入聊天累计 token 中', 'tok.disclaimer': '不同 API 网站的计费价格可能会有差异，请以实际网站为准。', 'tok.chartToggle': '趋势图',
     'tok.colSession': '会话', 'tok.colIn': '输入', 'tok.colOut': '输出', 'tok.colCacheW': '缓存写入', 'tok.colCache': '缓存读取', 'tok.colCost': '成本',
     'tok.from': '从', 'tok.to': '到', 'tok.reset': '重置', 'tok.noData': '暂无记录', 'tok.deleted': '此会话已删除',
     'tok.pricingUnknown': '⚠ 此模型计费规则尚未明确，按默认估算',
@@ -366,7 +367,7 @@ const I18N = {
   en: {
     'app.title': 'GenericAgent Desktop',
     'brand.sub': 'Desktop terminal',
-    'nav.chat': 'Chat', 'nav.channels': 'Channels', 'nav.status': 'Status',
+    'nav.chat': 'Chat', 'nav.services': 'Services', 'nav.channels': 'Channels', 'nav.status': 'Status',
     'nav.collab': 'Conductor', 'nav.token': 'Token usage',
     'foot.settings': 'Settings', 'foot.ver': 'GenericAgent · Desktop',
     'chat.startTitle': 'Start a conversation', 'chat.startSub': 'Type a message, or pick a preset',
@@ -404,6 +405,7 @@ const I18N = {
     'err.modelSave': 'Save failed', 'err.modelRequired': 'Model, API Key and base URL are required',
     'err.modelDelete': 'Delete failed', 'err.modelDeleteLast': 'At least one model is required',
     'confirm.modelDelete': 'Delete this model profile?',
+    'page.services.title': 'Services', 'page.services.sub': 'IM channels and background processes — view, start/stop, logs',
     'page.channels.title': 'Channels', 'page.channels.sub': 'Background IM processes: list, start/stop, logs (hub.pyw style)',
     'page.status.title': 'Status', 'page.status.sub': 'Background processes/services managed by hub.pyw',
     'page.collab.title': 'Conductor', 'page.collab.sub': 'Describe a goal — split, delegate, and follow up',
@@ -493,7 +495,7 @@ const I18N = {
     'proc.imbotWechat': 'imbot · WeChat', 'proc.imbotDing': 'imbot · DingTalk', 'proc.scheduler': 'Scheduler',
     'cm.scheduling': 'Scheduling', 'cm.running': 'Running', 'cm.idleSt': 'Idle',
     'cm.master': 'Dispatched 3 subtasks', 'cm.w1': 'Subtask: fetch data', 'cm.w2': 'Subtask: review results', 'cm.sub': 'Waiting for tasks',
-    'tok.total': 'Total tokens', 'tok.cost': 'Est. cost', 'tok.today': 'Today tokens', 'tok.tabAll': 'Overall', 'tok.tabConductor': 'Subagent token usage',
+    'tok.total': 'Total tokens', 'tok.cost': 'Est. cost', 'tok.today': 'Today tokens', 'tok.tabAll': 'Chat', 'tok.tabConductor': 'Conductor', 'tok.condTotal': 'Conductor Total', 'tok.condCurrent': 'Conductor Current', 'tok.condTip': 'Conductor tokens are not included in chat totals', 'tok.disclaimer': 'Pricing may vary by API provider. Please refer to the actual website.', 'tok.chartToggle': 'Trend',
     'tok.colSession': 'Session', 'tok.colIn': 'Input', 'tok.colOut': 'Output', 'tok.colCacheW': 'Cache write', 'tok.colCache': 'Cache read', 'tok.colCost': 'Cost',
     'tok.from': 'From', 'tok.to': 'To', 'tok.reset': 'Reset', 'tok.noData': 'No records', 'tok.deleted': 'Session deleted',
     'tok.pricingUnknown': '⚠ Pricing not confirmed, using defaults',
@@ -632,8 +634,7 @@ function selectLang(code) {
   updateModelChip();
   renderSettingsModels();
   if (typeof renderAllPresets === 'function') renderAllPresets();
-  if (document.querySelector('.page[data-page="channels"].active')) renderChannelList(gaServiceStore.list());
-  if (document.querySelector('.page[data-page="status"].active')) loadStatusPanel();
+  if (isServicesPageActive()) refreshServicesPanel();
   void persistUiPrefs();
 }
 function syncChatFontSegments(value) {
@@ -2837,7 +2838,7 @@ window.ga.onBridgeReady(async () => {
   if (!state.activeId) { refreshStatusLabel(); refreshEmptyState(null); }
   await loadModelProfiles();
   await loadBridgeConfig();
-  if (document.querySelector('.page[data-page="channels"].active')) renderChannelList(gaServiceStore.list());
+  if (isServicesPageActive()) renderChannelList(gaServiceStore.list());
   const sess = activeSess();
   if (sess && sess.bridgeSessionId && !sess.messages.length) await pollSession(sess);
   delete document.documentElement.dataset.bootHasSessions;
@@ -3008,9 +3009,8 @@ function tokRenderTable(records) {
   if(tokPager){tokPager.innerHTML='';if(totalPages>1)for(let i=0;i<totalPages;i++){const b=document.createElement('button');b.textContent=i+1;if(i===_tokPage)b.className='active';b.addEventListener('click',()=>{_tokPage=i;tokRenderTable(records);});tokPager.appendChild(b);}}
 }
 
-async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);await tokRenderConductorRow();}
+async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);if(tokChartEl&&!tokChartEl.hidden)renderTokChart();}
 
-let _conductorRowGen = 0;
 const _COND_HIST_KEY = 'conductor_token_hist';
 const _COND_LAST_KEY = 'conductor_token_last';
 const _condZero = {input:0,output:0,cacheCreate:0,cacheRead:0,cost:0};
@@ -3025,48 +3025,12 @@ function _condSave(hist, last) {
   }).catch(()=>{});
 }
 
-async function tokRenderConductorRow() {
-  if (!tokTbody) return;
-  const gen = ++_conductorRowGen;
-  tokTbody.querySelectorAll('.tok-row-conductor').forEach(el => el.remove());
-  let curIn = 0, curOut = 0, curCc = 0, curCr = 0, curCost = 0;
-  let fetchOk = false;
-  try {
-    const data = await (await fetch(`http://${location.hostname}:8900/token-stats`)).json();
-    if (gen !== _conductorRowGen) return;
-    tokTbody.querySelectorAll('.tok-row-conductor').forEach(el => el.remove());
-    const recs = (data.records || []).filter(r => r.thread === 'conductor-agent' || r.thread.startsWith('subagent-'));
-    for (const r of recs) {
-      curIn += r.input || 0; curOut += r.output || 0; curCc += r.cacheCreate || 0; curCr += r.cacheRead || 0;
-      curCost += parseFloat(estCost(r.input || 0, r.output || 0, r.model || '', r.cacheRead || 0, r.cacheCreate || 0));
-    }
-    fetchOk = true;
-  } catch (_) {}
-  if (gen !== _conductorRowGen) return;
-  // Detect conductor restart: if current totals < last seen, accumulate last into history
-  const hist = _condLoadHist();
-  const last = _condLoadLast();
-  if (fetchOk && last && (curIn < last.input || curOut < last.output)) {
-    hist.input += last.input; hist.output += last.output; hist.cacheCreate += last.cacheCreate; hist.cacheRead += last.cacheRead; hist.cost += last.cost;
-  }
-  if (fetchOk) _condSave(hist, {input:curIn, output:curOut, cacheCreate:curCc, cacheRead:curCr, cost:curCost});
-  const tip = 'Conductor 消耗的 token 不计入累计 token 中';
-  // Row 1: historical total
-  const tr1 = document.createElement('tr'); tr1.className = 'tok-row-session tok-row-conductor'; tr1.title = tip;
-  const hIn = hist.input + curIn, hOut = hist.output + curOut, hCc = hist.cacheCreate + curCc, hCr = hist.cacheRead + curCr, hCost = hist.cost + curCost;
-  const _ci = `<svg width="14" height="14" ${CONDUCTOR_SVG_ATTRS} style="vertical-align:-2px;margin-right:4px">${CONDUCTOR_SVG_INNER}</svg>`;
-  tr1.innerHTML = `<td>${_ci}Conductor 累计</td><td>${fmtTok(hIn)}</td><td>${fmtTok(hOut)}</td><td>${fmtTok(hCc)}</td><td>${fmtTok(hCr)}</td><td>¥${hCost.toFixed(2)}</td>`;
-  // Row 2: current session
-  const tr2 = document.createElement('tr'); tr2.className = 'tok-row-session tok-row-conductor'; tr2.title = tip;
-  tr2.innerHTML = `<td>${_ci}Conductor 本次</td><td>${fmtTok(curIn)}</td><td>${fmtTok(curOut)}</td><td>${fmtTok(curCc)}</td><td>${fmtTok(curCr)}</td><td>¥${curCost.toFixed(2)}</td>`;
-  tokTbody.insertBefore(tr2, tokTbody.firstChild);
-  tokTbody.insertBefore(tr1, tokTbody.firstChild);
-}
-
-/* ─── Conductor token tab (disabled — pending time tracking) ─── */
-/*
-let _tokTab = 'all';
+/* ─── Token tab switching ─── */
+let _tokTab = 'chat';
 const tokTabs = document.getElementById('tok-tabs');
+const tokFilter = document.querySelector('.tok-filter');
+const tokStatRow = document.querySelector('.page[data-page="token"] .stat-row');
+const tokChartWrap = document.getElementById('tok-chart-wrap');
 if (tokTabs) tokTabs.addEventListener('click', e => {
   const btn = e.target.closest('.tok-tab');
   if (!btn || btn.classList.contains('active')) return;
@@ -3074,30 +3038,39 @@ if (tokTabs) tokTabs.addEventListener('click', e => {
   btn.classList.add('active');
   _tokTab = btn.dataset.tab;
   _tokPage = 0;
-  if (_tokTab === 'conductor') loadConductorTokens();
-  else loadTokenPage();
+  if (_tokTab === 'conductor') { if (tokFilter) tokFilter.style.display = 'none'; if (tokStatRow) tokStatRow.style.display = 'none'; if (tokChartWrap) tokChartWrap.style.display = 'none'; loadConductorTokens(); }
+  else { if (tokFilter) tokFilter.style.display = ''; if (tokStatRow) tokStatRow.style.display = ''; if (tokChartWrap) tokChartWrap.style.display = ''; loadTokenPage(); }
 });
 
 async function loadConductorTokens() {
+  let curIn = 0, curOut = 0, curCc = 0, curCr = 0, curCost = 0;
+  let fetchOk = false;
   try {
     const data = await (await fetch(`http://${location.hostname}:8900/token-stats`)).json();
-    const titles = data.titles || {};
-    const killedSet = new Set(data.killed || []);
-    const records = (data.records || []).filter(r => r.thread === 'conductor-agent' || r.thread.startsWith('subagent-')).map(r => {
-      let title = 'Conductor';
-      if (r.thread.startsWith('subagent-')) {
-        const prompt = titles[r.thread] || '';
-        title = prompt ? (prompt.length > 30 ? prompt.slice(0, 30) + '…' : prompt) : 'Sub ' + r.thread.replace('subagent-', '');
-      }
-      return { sessionId: r.thread, title, input: r.input || 0, output: r.output || 0, cacheCreate: r.cacheCreate || 0, cacheRead: r.cacheRead || 0, model: r.model || '', ts: Date.now() / 1000, _conductor: true, _killed: killedSet.has(r.thread) };
-    });
-    tokRenderStats(records, records);
-    tokRenderTable(records);
+    const recs = (data.records || []).filter(r => r.thread === 'conductor-agent' || r.thread.startsWith('subagent-'));
+    for (const r of recs) {
+      curIn += r.input || 0; curOut += r.output || 0; curCc += r.cacheCreate || 0; curCr += r.cacheRead || 0;
+      curCost += parseFloat(estCost(r.input || 0, r.output || 0, r.model || '', r.cacheRead || 0, r.cacheCreate || 0));
+    }
+    fetchOk = true;
   } catch (_) {
     if (tokTbody) tokTbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted)">无法连接 Conductor (8900)</td></tr>`;
+    return;
   }
+  const hist = _condLoadHist();
+  const last = _condLoadLast();
+  if (fetchOk && last && (curIn < last.input || curOut < last.output)) {
+    hist.input += last.input; hist.output += last.output; hist.cacheCreate += last.cacheCreate; hist.cacheRead += last.cacheRead; hist.cost += last.cost;
+  }
+  if (fetchOk) _condSave(hist, {input:curIn, output:curOut, cacheCreate:curCc, cacheRead:curCr, cost:curCost});
+  const hIn = hist.input + curIn, hOut = hist.output + curOut, hCc = hist.cacheCreate + curCc, hCr = hist.cacheRead + curCr, hCost = hist.cost + curCost;
+  if (!tokTbody) return;
+  const tip = t('tok.condTip');
+  const _ci = `<svg width="14" height="14" ${CONDUCTOR_SVG_ATTRS} style="vertical-align:-2px;margin-right:4px">${CONDUCTOR_SVG_INNER}</svg>`;
+  tokTbody.innerHTML = `<tr class="tok-row-conductor" title="${tip}"><td>${_ci}${t('tok.condTotal')}</td><td>${fmtTok(hIn)}</td><td>${fmtTok(hOut)}</td><td>${fmtTok(hCc)}</td><td>${fmtTok(hCr)}</td><td>¥${hCost.toFixed(2)}</td></tr><tr class="tok-row-conductor" title="${tip}"><td>${_ci}${t('tok.condCurrent')}</td><td>${fmtTok(curIn)}</td><td>${fmtTok(curOut)}</td><td>${fmtTok(curCc)}</td><td>${fmtTok(curCr)}</td><td>¥${curCost.toFixed(2)}</td></tr>`;
+  const pager = document.getElementById('tok-pager');
+  if (pager) pager.innerHTML = '';
 }
-*/
 
 /* Flatpickr 初始化 */
 const _fpOpts = { enableTime:true, time_24hr:true, dateFormat:'Y-m-d  H:i', locale:window.flatpickr?.l10ns?.[document.documentElement.lang==='en'?'default':'zh']||'default', allowInput:false, onChange(){ _tokPage=0; loadTokenPage(); } };
@@ -3105,7 +3078,56 @@ const fpSince = tokSince ? flatpickr(tokSince, _fpOpts) : null;
 const fpUntil = tokUntil ? flatpickr(tokUntil, _fpOpts) : null;
 const tokResetBtn=document.getElementById('tok-reset');
 if(tokResetBtn)tokResetBtn.addEventListener('click',()=>{if(fpSince)fpSince.clear();if(fpUntil)fpUntil.clear();_tokPage=0;loadTokenPage();});
-nav.addEventListener('click',(e)=>{const item=e.target.closest('.nav-item');if(item&&item.dataset.page==='token')loadTokenPage();if(item&&item.dataset.page==='channels')renderChannelList(gaServiceStore.list());if(item&&item.dataset.page==='status')loadStatusPanel();});
+
+/* ─── Token trend chart ─── */
+const tokChartToggle = document.getElementById('tok-chart-toggle');
+const tokChartEl = document.getElementById('tok-chart');
+if (tokChartToggle && tokChartEl) {
+  tokChartToggle.addEventListener('click', () => {
+    const open = tokChartEl.hidden;
+    tokChartEl.hidden = !open;
+    tokChartToggle.classList.toggle('open', open);
+    if (open) renderTokChart();
+  });
+}
+function renderTokChart() {
+  const history = tokGetFiltered();
+  if (!history.length || !tokChartEl) return;
+  const daily = {};
+  for (const r of history) {
+    const day = new Date(r.ts * 1000).toLocaleDateString('sv');
+    const cost = parseFloat(estCost(r.input||0, r.output||0, r.model||'', r.cacheRead||0, r.cacheCreate||0));
+    daily[day] = (daily[day] || 0) + cost;
+  }
+  const rawDays = Object.keys(daily).sort();
+  if (!rawDays.length) { tokChartEl.innerHTML = ''; return; }
+  // Fill gaps: include days with 0 cost between first and last
+  const days = [];
+  const d0 = new Date(rawDays[0]), d1 = new Date(rawDays[rawDays.length - 1]);
+  for (let d = new Date(d0); d <= d1; d.setDate(d.getDate() + 1)) {
+    days.push(d.toLocaleDateString('sv'));
+  }
+  const vals = days.map(d => daily[d] || 0);
+  const maxVal = Math.max(...vals, 0.01);
+  const W = 600, H = 260, PL = 48, PR = 30, PT = 14, PB = 28;
+  const cw = W - PL - PR, ch = H - PT - PB;
+  const step = days.length > 1 ? cw / (days.length - 1) : cw;
+  const pts = vals.map((v, i) => [PL + i * step, PT + ch - (v / maxVal) * ch]);
+  const polyline = pts.map(p => p.join(',')).join(' ');
+  const yLines = [0, 0.25, 0.5, 0.75, 1].map(f => {
+    const y = PT + ch - f * ch;
+    const label = '¥' + (maxVal * f).toFixed(1);
+    return `<line x1="${PL}" x2="${W-PR}" y1="${y}" y2="${y}" stroke="var(--line-soft)" stroke-width="0.5"/><text x="${PL-4}" y="${y+3}" text-anchor="end" font-size="9" fill="var(--muted)">${label}</text>`;
+  }).join('');
+  const xLabels = days.map((d, i) => {
+    if (days.length > 14 && i % Math.ceil(days.length / 7) !== 0 && i !== days.length - 1) return '';
+    return `<text x="${pts[i][0]}" y="${H-4}" text-anchor="middle" font-size="9" fill="var(--muted)">${d.slice(5)}</text>`;
+  }).join('');
+  const dots = pts.map((p, i) => `<circle cx="${p[0]}" cy="${p[1]}" r="3" fill="var(--blue)"><title>${days[i]}: ¥${vals[i].toFixed(2)}</title></circle>`).join('');
+  tokChartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${yLines}${xLabels}<polyline points="${polyline}" fill="none" stroke="var(--blue)" stroke-width="1.5"/>${dots}</svg>`;
+}
+
+nav.addEventListener('click',(e)=>{const item=e.target.closest('.nav-item');if(item&&item.dataset.page==='token'){if(_tokTab==='conductor')loadConductorTokens();else loadTokenPage();}if(item&&item.dataset.page==='services')refreshServicesPanel();});
 /* ═══════════════ 自定义预设 ═══════════════ */
 const CP_KEY = 'ga_custom_presets';
 const HB_KEY = 'ga_hidden_builtins';
@@ -3360,6 +3382,37 @@ function isPreviewableByName(name) {
   const m = String(name || '').match(/\.([^./\\]+)$/);
   if (!m) return false;
   return PREVIEWABLE_EXTS.has(m[1].toLowerCase());
+}
+
+/* ═══════════════ 后台服务页 Tab（消息通道 / 状态面板） ═══════════════ */
+let _svcTab = 'channels';
+const svcTabsEl = document.getElementById('svc-tabs');
+
+function isServicesPageActive() {
+  return !!document.querySelector('.page[data-page="services"].active');
+}
+function isSvcTab(tab) {
+  return isServicesPageActive() && _svcTab === tab;
+}
+function setSvcTab(tab) {
+  if (!tab || tab === _svcTab) return;
+  _svcTab = tab;
+  svcTabsEl?.querySelectorAll('.svc-tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('[data-svc-panel]').forEach((p) => p.classList.toggle('active', p.dataset.svcPanel === tab));
+  if (tab === 'channels') renderChannelList(gaServiceStore.list());
+  else loadStatusPanel();
+}
+function refreshServicesPanel() {
+  if (!isServicesPageActive()) return;
+  if (_svcTab === 'channels') renderChannelList(gaServiceStore.list());
+  else loadStatusPanel();
+}
+if (svcTabsEl) {
+  svcTabsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.svc-tab');
+    if (!btn) return;
+    setSvcTab(btn.dataset.tab);
+  });
 }
 
 /* ═══════════════ 消息通道（复用 gaServiceStore + WS 同步） ═══════════════ */
@@ -3830,14 +3883,14 @@ if (statusListEl) {
       if (actEl.disabled || _chanBusy) return;
       const running = actEl.classList.contains('on');
       await toggleChannel(id, running, actEl);
-      if (document.querySelector('.page[data-page="status"].active')) loadStatusPanel();
+      if (isSvcTab('status')) loadStatusPanel();
     }
   });
 }
 
 gaServiceStore.onServices((list) => {
-  if (document.querySelector('.page[data-page="channels"].active')) renderChannelList(list);
-  if (document.querySelector('.page[data-page="status"].active')) loadStatusPanel();
+  if (isSvcTab('channels')) renderChannelList(list);
+  if (isSvcTab('status')) loadStatusPanel();
 });
 if (chanListEl) {
   chanListEl.addEventListener('click', async (e) => {
