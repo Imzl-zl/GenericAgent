@@ -681,6 +681,23 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .fc-t{ font-weight:600; font-size:13px; margin-top:10px; font-family:var(--font-title-en); }
 .fc-d{ font-size:11px; color:var(--muted); margin-top:3px; }
 
+/* 后台服务页 — 下划线 Tab（消息通道 / 状态面板）*/
+.svc-tabs{
+  display:flex; gap:28px; margin-top:4px;
+  border-bottom:1px solid var(--line);
+}
+.svc-tab{
+  padding:12px 0 10px; margin-bottom:-1px;
+  font-size:14px; font-weight:600; border:none; background:transparent;
+  color:var(--muted); cursor:pointer;
+  border-bottom:2px solid transparent; transition:color .15s, border-color .15s;
+}
+.svc-tab:hover{ color:var(--txt); }
+.svc-tab.active{ color:var(--txt-strong); border-bottom-color:var(--txt-strong); }
+.svc-panel{ display:none; margin-top:16px; }
+.svc-panel.active{ display:block; }
+.svc-panel .list{ margin-top:0; }
+
 /* 通用列表（消息通道 / 状态面板 / token 明细）*/
 .list{ display:flex; flex-direction:column; gap:6px; margin-top:14px; }
 .list-row{
@@ -786,14 +803,29 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .cm-st.on{ color:var(--ok-strong); } .cm-st.idle{ color:var(--muted); }
 .cm-d{ font-size:11px; color:var(--muted); margin-top:4px; }
 
-/* token 汇总卡 */
-.tok-tabs{ display:flex; gap:4px; margin:10px 0 0; }
-.tok-tab{
-  padding:6px 14px; font-size:12px; font-weight:600; border:1px solid var(--line);
-  border-radius:6px; background:transparent; color:var(--muted); cursor:pointer;
+/* token 汇总卡 — tab 复用 .svc-tabs/.svc-tab 的下划线样式(原蓝色 pill 弃用) */
+.tok-tabs{
+  display:flex; gap:28px; margin:10px 0 0;
+  border-bottom:1px solid var(--line);
 }
-.tok-tab:hover{ background:var(--line-soft); }
-.tok-tab.active{ background:var(--blue-bg); color:var(--blue); border-color:var(--blue); }
+.tok-tab{
+  padding:12px 0 10px; margin-bottom:-1px;
+  font-size:14px; font-weight:600; border:none; background:transparent;
+  color:var(--muted); cursor:pointer;
+  border-bottom:2px solid transparent; transition:color .15s, border-color .15s;
+}
+.tok-tab:hover{ color:var(--txt); background:transparent; }
+.tok-tab.active{
+  color:var(--txt-strong); border-color:transparent; border-bottom-color:var(--txt-strong);
+  background:transparent;
+}
+.tok-chart-wrap{ margin:12px 0 0; }
+.tok-chart-toggle{ font-size:12px; color:var(--muted); background:none; border:none; cursor:pointer; padding:4px 0; }
+.tok-chart-toggle:hover{ color:var(--txt); }
+.tok-chart-toggle::before{ content:'▶'; display:inline-block; margin-right:4px; font-size:9px; transition:transform .15s; }
+.tok-chart-toggle.open::before{ transform:rotate(90deg); }
+.tok-chart{ margin-top:8px; height:280px; max-width:760px; position:relative; }
+.tok-chart svg{ width:100%; height:100%; }
 .tok-filter{ display:flex; align-items:center; gap:8px; margin:12px 0; flex-wrap:wrap; }
 .tok-filter label{ font-size:12px; color:var(--muted); }
 .tok-date{
@@ -845,9 +877,9 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
 .tok-row-session:hover td{ background:var(--hover-dim); }
 .tok-row-session td:first-child::before{ content:'▶'; margin-right:6px; font-size:10px; color:var(--muted2); transition:transform .15s; display:inline-block; }
 .tok-row-session.open td:first-child::before{ transform:rotate(90deg); }
-.tok-row-conductor{ cursor:default; background:var(--blue-soft); }
+.tok-row-conductor{ cursor:default; }
 .tok-row-conductor td:first-child::before{ content:''; margin:0; }
-.tok-row-conductor:hover td{ background:var(--blue-soft); }
+.tok-row-conductor:hover td{ background:var(--hover-dim); }
 .tok-detail td{ padding:5px 12px 5px 32px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--line-soft); background:var(--field-bg); }
 .tok-detail td:not(:first-child){ text-align:right; }
 .tok-detail[hidden]{ display:none; }

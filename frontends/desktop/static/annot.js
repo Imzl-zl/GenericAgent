@@ -10,8 +10,7 @@
     ['.topbar', '顶栏 · 仅运行状态'],
     ['.page[data-page="chat"]', '聊天页 · 消息流 GET /session/{sid}/messages，WS 通知新内容'],
     ['.composer', '② 输入区 · 发送=POST /session/{sid}/prompt'],
-    ['.page[data-page="channels"]', '③ imbot 渠道（融 hub.pyw）'],
-    ['.page[data-page="status"]', '③ 后台进程/服务状态（融 hub.pyw）'],
+    ['.page[data-page="services"]', '③ 后台服务（消息通道 + 状态面板，融 hub.pyw）'],
     ['.page[data-page="collab"]', '④ subagent / Hive 多体执行监控'],
     ['.page[data-page="token"]', '④ token 记录与成本'],
     ['.rightpanel', '④ 会话管理 · GET /sessions'],
@@ -38,8 +37,8 @@
   // 内联「该放什么」卡片：宿主选择器 -> [位置, HTML]
   const INLINES = [
     ['.page[data-page="chat"] .msg-area', 'prepend', '该放：用户/助手消息气泡、turn 折叠、工具调用详情、流式增量；<b>消息内容须支持 Markdown + LaTeX + 代码高亮</b>。空会话展示下方预设功能'],
-    ['.page[data-page="channels"] .page-pad', 'append', '每行该放：渠道名、连接状态、启停开关、配置入口；对应 hub.pyw 的 imbot 进程。真实版用各渠道品牌 logo'],
-    ['.page[data-page="status"] .page-pad', 'append', '每行该放：进程名、PID、状态、CPU/内存、启停/重启、日志；至少含 bridge、各 imbot、定时调度'],
+    ['.page[data-page="services"] .svc-panel[data-svc-panel="channels"]', 'append', '每行该放：渠道名、连接状态、启停开关、配置入口；对应 hub.pyw 的 imbot 进程。真实版用各渠道品牌 logo'],
+    ['.page[data-page="services"] .svc-panel[data-svc-panel="status"]', 'append', '每行该放：进程名、PID、状态、CPU/内存、启停/重启、日志；至少含 bridge、各 imbot、定时调度'],
     ['.page[data-page="collab"] .page-pad', 'append', '该放：worker 卡片 + BBS 帖子流 + 选中 worker 的 output 流。数据源 temp/hive_*/、output.txt、agent_bbs；参考 conductor.py'],
     ['.page[data-page="collab"] .page-pad', 'append', '下方：BBS 帖子流 + 选中项 output.txt 实时滚动'],
     ['.page[data-page="token"] .page-pad', 'append', '该放：汇总卡 + 按会话明细表 + 趋势图。数据来自 bridge 的用量记录（_record_usage）'],

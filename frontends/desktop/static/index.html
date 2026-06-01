@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>GenericAgent</title>
 <link rel="stylesheet" href="assets/fonts/fonts.css">
-<link rel="stylesheet" href="styles.css?v=92">
+<link rel="stylesheet" href="styles.css?v=94">
 <!-- KaTeX: LaTeX 公式渲染 -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
 <!-- highlight.js: 代码高亮 -->
@@ -66,18 +66,14 @@
           <span class="ic" data-ga-icon="chatTeardropText"></span>
           <span data-i18n="nav.chat"></span>
         </a>
-        <a class="nav-item" data-page="channels">
-          <span class="ic" data-ga-icon="broadcast"></span>
-          <span data-i18n="nav.channels"></span>
-        </a>
-        <a class="nav-item" data-page="status">
-          <span class="ic" data-ga-icon="chartBar"></span>
-          <span data-i18n="nav.status"></span>
-        </a>
         <a class="nav-item" data-page="collab">
           <span class="ic" aria-hidden="true"></span>
           <span data-i18n="nav.collab"></span>
           <span id="collab-badge" class="collab-nav-badge" hidden></span>
+        </a>
+        <a class="nav-item" data-page="services">
+          <span class="ic" data-ga-icon="broadcast"></span>
+          <span data-i18n="nav.services"></span>
         </a>
         <a class="nav-item" data-page="token">
           <span class="ic" data-ga-icon="coins"></span>
@@ -149,20 +145,22 @@
           </div>
         </section>
 
-        <!-- 消息通道 -->
-        <section class="page" data-page="channels">
+        <!-- 后台服务：消息通道 + 状态面板 -->
+        <section class="page" data-page="services">
           <div class="page-pad">
-            <div class="page-title" data-i18n="page.channels.title"></div>
-            <div class="list" id="chan-list"></div>
-            <div class="list-empty" id="chan-empty" hidden data-i18n="ch.empty"></div>
-          </div>
-        </section>
-
-        <!-- 状态面板 -->
-        <section class="page" data-page="status">
-          <div class="page-pad">
-            <div class="page-title" data-i18n="page.status.title"></div>
-            <div class="list" id="status-list"></div>
+            <div class="page-title" data-i18n="page.services.title"></div>
+            <div class="page-sub" data-i18n="page.services.sub"></div>
+            <div class="svc-tabs" id="svc-tabs">
+              <button type="button" class="svc-tab active" data-tab="channels" data-i18n="page.channels.title"></button>
+              <button type="button" class="svc-tab" data-tab="status" data-i18n="page.status.title"></button>
+            </div>
+            <div class="svc-panel active" data-svc-panel="channels">
+              <div class="list" id="chan-list"></div>
+              <div class="list-empty" id="chan-empty" hidden data-i18n="ch.empty"></div>
+            </div>
+            <div class="svc-panel" data-svc-panel="status">
+              <div class="list" id="status-list"></div>
+            </div>
           </div>
         </section>
 
@@ -274,12 +272,10 @@
         <section class="page" data-page="token">
           <div class="page-pad">
             <div class="page-title" data-i18n="page.token.title"></div>
-            <!-- tok-tabs disabled pending conductor time tracking
             <div class="tok-tabs" id="tok-tabs">
-              <button class="tok-tab active" data-tab="all" data-i18n="tok.tabAll"></button>
+              <button class="tok-tab active" data-tab="chat" data-i18n="tok.tabAll"></button>
               <button class="tok-tab" data-tab="conductor" data-i18n="tok.tabConductor"></button>
             </div>
-            -->
             <div class="tok-filter">
               <label data-i18n="tok.from"></label>
               <input type="text" id="tok-since" class="tok-date" readonly>
@@ -291,6 +287,10 @@
               <div class="stat"><div class="s-n" id="tok-total-n">0</div><div class="s-l" data-i18n="tok.total"></div></div>
               <div class="stat"><div class="s-n" id="tok-cost-n">¥ 0</div><div class="s-l" data-i18n="tok.cost"></div></div>
               <div class="stat"><div class="s-n" id="tok-today-n">0</div><div class="s-l" data-i18n="tok.today"></div></div>
+            </div>
+            <div class="tok-chart-wrap" id="tok-chart-wrap">
+              <button class="tok-chart-toggle" id="tok-chart-toggle" type="button" data-i18n="tok.chartToggle"></button>
+              <div class="tok-chart" id="tok-chart" hidden></div>
             </div>
             <table class="tok-table" id="tok-table">
               <thead><tr>
@@ -304,7 +304,7 @@
               <tbody id="tok-tbody"></tbody>
             </table>
             <div class="tok-pager" id="tok-pager"></div>
-            <p style="color:var(--muted);font-size:12px;margin-top:12px;text-align:center">不同 API 网站的计费价格可能会有差异，请以实际网站为准。</p>
+            <p style="color:var(--muted);font-size:12px;margin-top:12px;text-align:center" data-i18n="tok.disclaimer"></p>
           </div>
         </section>
 
@@ -547,7 +547,7 @@
 <!-- highlight.js -->
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" crossorigin="anonymous"></script>
 <script src="phosphor-icons.js"></script>
-<script src="app.js?v=80"></script>
+<script src="app.js?v=82"></script>
 <script src="annot.js"></script><!-- DEV 脚手架，可删 -->
 </body>
 </html>
