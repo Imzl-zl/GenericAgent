@@ -3109,7 +3109,7 @@ function renderTokChart() {
   }
   const vals = days.map(d => daily[d] || 0);
   const maxVal = Math.max(...vals, 0.01);
-  const W = 600, H = 140, PL = 48, PR = 30, PT = 10, PB = 25;
+  const W = 600, H = 260, PL = 48, PR = 30, PT = 14, PB = 28;
   const cw = W - PL - PR, ch = H - PT - PB;
   const step = days.length > 1 ? cw / (days.length - 1) : cw;
   const pts = vals.map((v, i) => [PL + i * step, PT + ch - (v / maxVal) * ch]);
