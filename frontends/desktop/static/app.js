@@ -347,7 +347,7 @@ const I18N = {
     'proc.imbotWechat': 'imbot · 微信', 'proc.imbotDing': 'imbot · 钉钉', 'proc.scheduler': '定时任务调度',
     'cm.scheduling': '调度中', 'cm.running': '执行中', 'cm.idleSt': '空闲',
     'cm.master': '已派 3 子任务', 'cm.w1': '子任务：抓取数据', 'cm.w2': '子任务：复核结果', 'cm.sub': '等待派单',
-    'tok.total': '累计 token', 'tok.cost': '估算成本', 'tok.today': '今日 token', 'tok.tabAll': '聊天', 'tok.tabConductor': 'Conductor', 'tok.condTotal': 'Conductor 累计', 'tok.condCurrent': 'Conductor 本次', 'tok.condTip': 'Conductor 消耗的 token 不计入聊天累计 token 中', 'tok.disclaimer': '不同 API 网站的计费价格可能会有差异，请以实际网站为准。',
+    'tok.total': '累计 token', 'tok.cost': '估算成本', 'tok.today': '今日 token', 'tok.tabAll': '聊天', 'tok.tabConductor': 'Conductor', 'tok.condTotal': 'Conductor 累计', 'tok.condCurrent': 'Conductor 本次', 'tok.condTip': 'Conductor 消耗的 token 不计入聊天累计 token 中', 'tok.disclaimer': '不同 API 网站的计费价格可能会有差异，请以实际网站为准。', 'tok.chartToggle': '趋势图',
     'tok.colSession': '会话', 'tok.colIn': '输入', 'tok.colOut': '输出', 'tok.colCacheW': '缓存写入', 'tok.colCache': '缓存读取', 'tok.colCost': '成本',
     'tok.from': '从', 'tok.to': '到', 'tok.reset': '重置', 'tok.noData': '暂无记录', 'tok.deleted': '此会话已删除',
     'tok.pricingUnknown': '⚠ 此模型计费规则尚未明确，按默认估算',
@@ -493,7 +493,7 @@ const I18N = {
     'proc.imbotWechat': 'imbot · WeChat', 'proc.imbotDing': 'imbot · DingTalk', 'proc.scheduler': 'Scheduler',
     'cm.scheduling': 'Scheduling', 'cm.running': 'Running', 'cm.idleSt': 'Idle',
     'cm.master': 'Dispatched 3 subtasks', 'cm.w1': 'Subtask: fetch data', 'cm.w2': 'Subtask: review results', 'cm.sub': 'Waiting for tasks',
-    'tok.total': 'Total tokens', 'tok.cost': 'Est. cost', 'tok.today': 'Today tokens', 'tok.tabAll': 'Chat', 'tok.tabConductor': 'Conductor', 'tok.condTotal': 'Conductor Total', 'tok.condCurrent': 'Conductor Current', 'tok.condTip': 'Conductor tokens are not included in chat totals', 'tok.disclaimer': 'Pricing may vary by API provider. Please refer to the actual website.',
+    'tok.total': 'Total tokens', 'tok.cost': 'Est. cost', 'tok.today': 'Today tokens', 'tok.tabAll': 'Chat', 'tok.tabConductor': 'Conductor', 'tok.condTotal': 'Conductor Total', 'tok.condCurrent': 'Conductor Current', 'tok.condTip': 'Conductor tokens are not included in chat totals', 'tok.disclaimer': 'Pricing may vary by API provider. Please refer to the actual website.', 'tok.chartToggle': 'Trend',
     'tok.colSession': 'Session', 'tok.colIn': 'Input', 'tok.colOut': 'Output', 'tok.colCacheW': 'Cache write', 'tok.colCache': 'Cache read', 'tok.colCost': 'Cost',
     'tok.from': 'From', 'tok.to': 'To', 'tok.reset': 'Reset', 'tok.noData': 'No records', 'tok.deleted': 'Session deleted',
     'tok.pricingUnknown': '⚠ Pricing not confirmed, using defaults',
@@ -3008,7 +3008,7 @@ function tokRenderTable(records) {
   if(tokPager){tokPager.innerHTML='';if(totalPages>1)for(let i=0;i<totalPages;i++){const b=document.createElement('button');b.textContent=i+1;if(i===_tokPage)b.className='active';b.addEventListener('click',()=>{_tokPage=i;tokRenderTable(records);});tokPager.appendChild(b);}}
 }
 
-async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);}
+async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);if(tokChartEl&&!tokChartEl.hidden)renderTokChart();}
 
 const _COND_HIST_KEY = 'conductor_token_hist';
 const _COND_LAST_KEY = 'conductor_token_last';
@@ -3029,6 +3029,7 @@ let _tokTab = 'chat';
 const tokTabs = document.getElementById('tok-tabs');
 const tokFilter = document.querySelector('.tok-filter');
 const tokStatRow = document.querySelector('.page[data-page="token"] .stat-row');
+const tokChartWrap = document.getElementById('tok-chart-wrap');
 if (tokTabs) tokTabs.addEventListener('click', e => {
   const btn = e.target.closest('.tok-tab');
   if (!btn || btn.classList.contains('active')) return;
@@ -3036,8 +3037,8 @@ if (tokTabs) tokTabs.addEventListener('click', e => {
   btn.classList.add('active');
   _tokTab = btn.dataset.tab;
   _tokPage = 0;
-  if (_tokTab === 'conductor') { if (tokFilter) tokFilter.style.display = 'none'; if (tokStatRow) tokStatRow.style.display = 'none'; loadConductorTokens(); }
-  else { if (tokFilter) tokFilter.style.display = ''; if (tokStatRow) tokStatRow.style.display = ''; loadTokenPage(); }
+  if (_tokTab === 'conductor') { if (tokFilter) tokFilter.style.display = 'none'; if (tokStatRow) tokStatRow.style.display = 'none'; if (tokChartWrap) tokChartWrap.style.display = 'none'; loadConductorTokens(); }
+  else { if (tokFilter) tokFilter.style.display = ''; if (tokStatRow) tokStatRow.style.display = ''; if (tokChartWrap) tokChartWrap.style.display = ''; loadTokenPage(); }
 });
 
 async function loadConductorTokens() {
@@ -3076,6 +3077,55 @@ const fpSince = tokSince ? flatpickr(tokSince, _fpOpts) : null;
 const fpUntil = tokUntil ? flatpickr(tokUntil, _fpOpts) : null;
 const tokResetBtn=document.getElementById('tok-reset');
 if(tokResetBtn)tokResetBtn.addEventListener('click',()=>{if(fpSince)fpSince.clear();if(fpUntil)fpUntil.clear();_tokPage=0;loadTokenPage();});
+
+/* ─── Token trend chart ─── */
+const tokChartToggle = document.getElementById('tok-chart-toggle');
+const tokChartEl = document.getElementById('tok-chart');
+if (tokChartToggle && tokChartEl) {
+  tokChartToggle.addEventListener('click', () => {
+    const open = tokChartEl.hidden;
+    tokChartEl.hidden = !open;
+    tokChartToggle.classList.toggle('open', open);
+    if (open) renderTokChart();
+  });
+}
+function renderTokChart() {
+  const history = tokGetFiltered();
+  if (!history.length || !tokChartEl) return;
+  const daily = {};
+  for (const r of history) {
+    const day = new Date(r.ts * 1000).toLocaleDateString('sv');
+    const cost = parseFloat(estCost(r.input||0, r.output||0, r.model||'', r.cacheRead||0, r.cacheCreate||0));
+    daily[day] = (daily[day] || 0) + cost;
+  }
+  const rawDays = Object.keys(daily).sort();
+  if (!rawDays.length) { tokChartEl.innerHTML = ''; return; }
+  // Fill gaps: include days with 0 cost between first and last
+  const days = [];
+  const d0 = new Date(rawDays[0]), d1 = new Date(rawDays[rawDays.length - 1]);
+  for (let d = new Date(d0); d <= d1; d.setDate(d.getDate() + 1)) {
+    days.push(d.toLocaleDateString('sv'));
+  }
+  const vals = days.map(d => daily[d] || 0);
+  const maxVal = Math.max(...vals, 0.01);
+  const W = 600, H = 140, PL = 48, PR = 30, PT = 10, PB = 25;
+  const cw = W - PL - PR, ch = H - PT - PB;
+  const step = days.length > 1 ? cw / (days.length - 1) : cw;
+  const pts = vals.map((v, i) => [PL + i * step, PT + ch - (v / maxVal) * ch]);
+  const polyline = pts.map(p => p.join(',')).join(' ');
+  const yLines = [0, 0.25, 0.5, 0.75, 1].map(f => {
+    const y = PT + ch - f * ch;
+    const label = '¥' + (maxVal * f).toFixed(1);
+    return `<line x1="${PL}" x2="${W-PR}" y1="${y}" y2="${y}" stroke="var(--line-soft)" stroke-width="0.5"/><text x="${PL-4}" y="${y+3}" text-anchor="end" font-size="9" fill="var(--muted)">${label}</text>`;
+  }).join('');
+  const xLabels = days.map((d, i) => {
+    if (days.length > 14 && i % Math.ceil(days.length / 7) !== 0 && i !== days.length - 1) return '';
+    return `<text x="${pts[i][0]}" y="${H-4}" text-anchor="middle" font-size="9" fill="var(--muted)">${d.slice(5)}</text>`;
+  }).join('');
+  const dots = pts.map((p, i) => `<circle cx="${p[0]}" cy="${p[1]}" r="3" fill="var(--blue)"><title>${days[i]}: ¥${vals[i].toFixed(2)}</title></circle>`).join('');
+  tokChartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${yLines}${xLabels}<polyline points="${polyline}" fill="none" stroke="var(--blue)" stroke-width="1.5"/>${dots}</svg>`;
+}
+
 nav.addEventListener('click',(e)=>{const item=e.target.closest('.nav-item');if(item&&item.dataset.page==='token'){if(_tokTab==='conductor')loadConductorTokens();else loadTokenPage();}if(item&&item.dataset.page==='channels')renderChannelList(gaServiceStore.list());if(item&&item.dataset.page==='status')loadStatusPanel();});
 /* ═══════════════ 自定义预设 ═══════════════ */
 const CP_KEY = 'ga_custom_presets';
