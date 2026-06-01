@@ -66,13 +66,9 @@
           <span class="ic" data-ga-icon="chatTeardropText"></span>
           <span data-i18n="nav.chat"></span>
         </a>
-        <a class="nav-item" data-page="channels">
+        <a class="nav-item" data-page="services">
           <span class="ic" data-ga-icon="broadcast"></span>
-          <span data-i18n="nav.channels"></span>
-        </a>
-        <a class="nav-item" data-page="status">
-          <span class="ic" data-ga-icon="chartBar"></span>
-          <span data-i18n="nav.status"></span>
+          <span data-i18n="nav.services"></span>
         </a>
         <a class="nav-item" data-page="collab">
           <span class="ic" aria-hidden="true"></span>
@@ -149,20 +145,22 @@
           </div>
         </section>
 
-        <!-- 消息通道 -->
-        <section class="page" data-page="channels">
+        <!-- 后台服务：消息通道 + 状态面板 -->
+        <section class="page" data-page="services">
           <div class="page-pad">
-            <div class="page-title" data-i18n="page.channels.title"></div>
-            <div class="list" id="chan-list"></div>
-            <div class="list-empty" id="chan-empty" hidden data-i18n="ch.empty"></div>
-          </div>
-        </section>
-
-        <!-- 状态面板 -->
-        <section class="page" data-page="status">
-          <div class="page-pad">
-            <div class="page-title" data-i18n="page.status.title"></div>
-            <div class="list" id="status-list"></div>
+            <div class="page-title" data-i18n="page.services.title"></div>
+            <div class="page-sub" data-i18n="page.services.sub"></div>
+            <div class="svc-tabs" id="svc-tabs">
+              <button type="button" class="svc-tab active" data-tab="channels" data-i18n="page.channels.title"></button>
+              <button type="button" class="svc-tab" data-tab="status" data-i18n="page.status.title"></button>
+            </div>
+            <div class="svc-panel active" data-svc-panel="channels">
+              <div class="list" id="chan-list"></div>
+              <div class="list-empty" id="chan-empty" hidden data-i18n="ch.empty"></div>
+            </div>
+            <div class="svc-panel" data-svc-panel="status">
+              <div class="list" id="status-list"></div>
+            </div>
           </div>
         </section>
 

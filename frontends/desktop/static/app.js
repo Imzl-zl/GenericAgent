@@ -220,7 +220,7 @@ const I18N = {
   zh: {
     'app.title': 'GenericAgent 桌面版',
     'brand.sub': '桌面终端',
-    'nav.chat': '聊天', 'nav.channels': '消息通道', 'nav.status': '状态面板',
+    'nav.chat': '聊天', 'nav.services': '后台服务', 'nav.channels': '消息通道', 'nav.status': '状态面板',
     'nav.collab': '指挥家', 'nav.token': 'Token 统计',
     'foot.settings': '配置', 'foot.ver': 'GenericAgent · 桌面版',
     'chat.startTitle': '开始对话', 'chat.startSub': '直接输入，或点预设功能一键启动',
@@ -258,6 +258,7 @@ const I18N = {
     'err.modelSave': '保存失败', 'err.modelRequired': '请填写模型、API Key 和 API 地址',
     'err.modelDelete': '删除失败', 'err.modelDeleteLast': '至少保留一个模型',
     'confirm.modelDelete': '确定删除该模型配置？',
+    'page.services.title': '后台服务', 'page.services.sub': 'IM 消息通道与后台进程，集中查看、启停与日志',
     'page.channels.title': '消息通道', 'page.channels.sub': '后台 IM 进程：列表、启停与日志（同 hub.pyw）',
     'page.status.title': '状态面板', 'page.status.sub': 'hub.pyw 管理的后台进程/服务，集中查看与启停',
     'page.collab.title': '指挥家', 'page.collab.sub': '交代目标，自动拆活与跟进',
@@ -366,7 +367,7 @@ const I18N = {
   en: {
     'app.title': 'GenericAgent Desktop',
     'brand.sub': 'Desktop terminal',
-    'nav.chat': 'Chat', 'nav.channels': 'Channels', 'nav.status': 'Status',
+    'nav.chat': 'Chat', 'nav.services': 'Services', 'nav.channels': 'Channels', 'nav.status': 'Status',
     'nav.collab': 'Conductor', 'nav.token': 'Token usage',
     'foot.settings': 'Settings', 'foot.ver': 'GenericAgent · Desktop',
     'chat.startTitle': 'Start a conversation', 'chat.startSub': 'Type a message, or pick a preset',
@@ -404,6 +405,7 @@ const I18N = {
     'err.modelSave': 'Save failed', 'err.modelRequired': 'Model, API Key and base URL are required',
     'err.modelDelete': 'Delete failed', 'err.modelDeleteLast': 'At least one model is required',
     'confirm.modelDelete': 'Delete this model profile?',
+    'page.services.title': 'Services', 'page.services.sub': 'IM channels and background processes — view, start/stop, logs',
     'page.channels.title': 'Channels', 'page.channels.sub': 'Background IM processes: list, start/stop, logs (hub.pyw style)',
     'page.status.title': 'Status', 'page.status.sub': 'Background processes/services managed by hub.pyw',
     'page.collab.title': 'Conductor', 'page.collab.sub': 'Describe a goal — split, delegate, and follow up',
@@ -632,8 +634,7 @@ function selectLang(code) {
   updateModelChip();
   renderSettingsModels();
   if (typeof renderAllPresets === 'function') renderAllPresets();
-  if (document.querySelector('.page[data-page="channels"].active')) renderChannelList(gaServiceStore.list());
-  if (document.querySelector('.page[data-page="status"].active')) loadStatusPanel();
+  if (isServicesPageActive()) refreshServicesPanel();
   void persistUiPrefs();
 }
 function syncChatFontSegments(value) {
@@ -2837,7 +2838,7 @@ window.ga.onBridgeReady(async () => {
   if (!state.activeId) { refreshStatusLabel(); refreshEmptyState(null); }
   await loadModelProfiles();
   await loadBridgeConfig();
-  if (document.querySelector('.page[data-page="channels"].active')) renderChannelList(gaServiceStore.list());
+  if (isServicesPageActive()) renderChannelList(gaServiceStore.list());
   const sess = activeSess();
   if (sess && sess.bridgeSessionId && !sess.messages.length) await pollSession(sess);
   delete document.documentElement.dataset.bootHasSessions;
@@ -3076,7 +3077,7 @@ const fpSince = tokSince ? flatpickr(tokSince, _fpOpts) : null;
 const fpUntil = tokUntil ? flatpickr(tokUntil, _fpOpts) : null;
 const tokResetBtn=document.getElementById('tok-reset');
 if(tokResetBtn)tokResetBtn.addEventListener('click',()=>{if(fpSince)fpSince.clear();if(fpUntil)fpUntil.clear();_tokPage=0;loadTokenPage();});
-nav.addEventListener('click',(e)=>{const item=e.target.closest('.nav-item');if(item&&item.dataset.page==='token'){if(_tokTab==='conductor')loadConductorTokens();else loadTokenPage();}if(item&&item.dataset.page==='channels')renderChannelList(gaServiceStore.list());if(item&&item.dataset.page==='status')loadStatusPanel();});
+nav.addEventListener('click',(e)=>{const item=e.target.closest('.nav-item');if(item&&item.dataset.page==='token'){if(_tokTab==='conductor')loadConductorTokens();else loadTokenPage();}if(item&&item.dataset.page==='services')refreshServicesPanel();});
 /* ═══════════════ 自定义预设 ═══════════════ */
 const CP_KEY = 'ga_custom_presets';
 const HB_KEY = 'ga_hidden_builtins';
@@ -3331,6 +3332,37 @@ function isPreviewableByName(name) {
   const m = String(name || '').match(/\.([^./\\]+)$/);
   if (!m) return false;
   return PREVIEWABLE_EXTS.has(m[1].toLowerCase());
+}
+
+/* ═══════════════ 后台服务页 Tab（消息通道 / 状态面板） ═══════════════ */
+let _svcTab = 'channels';
+const svcTabsEl = document.getElementById('svc-tabs');
+
+function isServicesPageActive() {
+  return !!document.querySelector('.page[data-page="services"].active');
+}
+function isSvcTab(tab) {
+  return isServicesPageActive() && _svcTab === tab;
+}
+function setSvcTab(tab) {
+  if (!tab || tab === _svcTab) return;
+  _svcTab = tab;
+  svcTabsEl?.querySelectorAll('.svc-tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('[data-svc-panel]').forEach((p) => p.classList.toggle('active', p.dataset.svcPanel === tab));
+  if (tab === 'channels') renderChannelList(gaServiceStore.list());
+  else loadStatusPanel();
+}
+function refreshServicesPanel() {
+  if (!isServicesPageActive()) return;
+  if (_svcTab === 'channels') renderChannelList(gaServiceStore.list());
+  else loadStatusPanel();
+}
+if (svcTabsEl) {
+  svcTabsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.svc-tab');
+    if (!btn) return;
+    setSvcTab(btn.dataset.tab);
+  });
 }
 
 /* ═══════════════ 消息通道（复用 gaServiceStore + WS 同步） ═══════════════ */
@@ -3801,14 +3833,14 @@ if (statusListEl) {
       if (actEl.disabled || _chanBusy) return;
       const running = actEl.classList.contains('on');
       await toggleChannel(id, running, actEl);
-      if (document.querySelector('.page[data-page="status"].active')) loadStatusPanel();
+      if (isSvcTab('status')) loadStatusPanel();
     }
   });
 }
 
 gaServiceStore.onServices((list) => {
-  if (document.querySelector('.page[data-page="channels"].active')) renderChannelList(list);
-  if (document.querySelector('.page[data-page="status"].active')) loadStatusPanel();
+  if (isSvcTab('channels')) renderChannelList(list);
+  if (isSvcTab('status')) loadStatusPanel();
 });
 if (chanListEl) {
   chanListEl.addEventListener('click', async (e) => {
