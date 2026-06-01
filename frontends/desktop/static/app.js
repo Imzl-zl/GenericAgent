@@ -347,7 +347,7 @@ const I18N = {
     'proc.imbotWechat': 'imbot · 微信', 'proc.imbotDing': 'imbot · 钉钉', 'proc.scheduler': '定时任务调度',
     'cm.scheduling': '调度中', 'cm.running': '执行中', 'cm.idleSt': '空闲',
     'cm.master': '已派 3 子任务', 'cm.w1': '子任务：抓取数据', 'cm.w2': '子任务：复核结果', 'cm.sub': '等待派单',
-    'tok.total': '累计 token', 'tok.cost': '估算成本', 'tok.today': '今日 token', 'tok.tabAll': '总体', 'tok.tabConductor': 'Subagent Token 消耗',
+    'tok.total': '累计 token', 'tok.cost': '估算成本', 'tok.today': '今日 token', 'tok.tabAll': '聊天', 'tok.tabConductor': 'Conductor',
     'tok.colSession': '会话', 'tok.colIn': '输入', 'tok.colOut': '输出', 'tok.colCacheW': '缓存写入', 'tok.colCache': '缓存读取', 'tok.colCost': '成本',
     'tok.from': '从', 'tok.to': '到', 'tok.reset': '重置', 'tok.noData': '暂无记录', 'tok.deleted': '此会话已删除',
     'tok.pricingUnknown': '⚠ 此模型计费规则尚未明确，按默认估算',
@@ -493,7 +493,7 @@ const I18N = {
     'proc.imbotWechat': 'imbot · WeChat', 'proc.imbotDing': 'imbot · DingTalk', 'proc.scheduler': 'Scheduler',
     'cm.scheduling': 'Scheduling', 'cm.running': 'Running', 'cm.idleSt': 'Idle',
     'cm.master': 'Dispatched 3 subtasks', 'cm.w1': 'Subtask: fetch data', 'cm.w2': 'Subtask: review results', 'cm.sub': 'Waiting for tasks',
-    'tok.total': 'Total tokens', 'tok.cost': 'Est. cost', 'tok.today': 'Today tokens', 'tok.tabAll': 'Overall', 'tok.tabConductor': 'Subagent token usage',
+    'tok.total': 'Total tokens', 'tok.cost': 'Est. cost', 'tok.today': 'Today tokens', 'tok.tabAll': 'Chat', 'tok.tabConductor': 'Conductor',
     'tok.colSession': 'Session', 'tok.colIn': 'Input', 'tok.colOut': 'Output', 'tok.colCacheW': 'Cache write', 'tok.colCache': 'Cache read', 'tok.colCost': 'Cost',
     'tok.from': 'From', 'tok.to': 'To', 'tok.reset': 'Reset', 'tok.noData': 'No records', 'tok.deleted': 'Session deleted',
     'tok.pricingUnknown': '⚠ Pricing not confirmed, using defaults',
@@ -3008,9 +3008,8 @@ function tokRenderTable(records) {
   if(tokPager){tokPager.innerHTML='';if(totalPages>1)for(let i=0;i<totalPages;i++){const b=document.createElement('button');b.textContent=i+1;if(i===_tokPage)b.className='active';b.addEventListener('click',()=>{_tokPage=i;tokRenderTable(records);});tokPager.appendChild(b);}}
 }
 
-async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);await tokRenderConductorRow();}
+async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);}
 
-let _conductorRowGen = 0;
 const _COND_HIST_KEY = 'conductor_token_hist';
 const _COND_LAST_KEY = 'conductor_token_last';
 const _condZero = {input:0,output:0,cacheCreate:0,cacheRead:0,cost:0};
@@ -3025,48 +3024,11 @@ function _condSave(hist, last) {
   }).catch(()=>{});
 }
 
-async function tokRenderConductorRow() {
-  if (!tokTbody) return;
-  const gen = ++_conductorRowGen;
-  tokTbody.querySelectorAll('.tok-row-conductor').forEach(el => el.remove());
-  let curIn = 0, curOut = 0, curCc = 0, curCr = 0, curCost = 0;
-  let fetchOk = false;
-  try {
-    const data = await (await fetch(`http://${location.hostname}:8900/token-stats`)).json();
-    if (gen !== _conductorRowGen) return;
-    tokTbody.querySelectorAll('.tok-row-conductor').forEach(el => el.remove());
-    const recs = (data.records || []).filter(r => r.thread === 'conductor-agent' || r.thread.startsWith('subagent-'));
-    for (const r of recs) {
-      curIn += r.input || 0; curOut += r.output || 0; curCc += r.cacheCreate || 0; curCr += r.cacheRead || 0;
-      curCost += parseFloat(estCost(r.input || 0, r.output || 0, r.model || '', r.cacheRead || 0, r.cacheCreate || 0));
-    }
-    fetchOk = true;
-  } catch (_) {}
-  if (gen !== _conductorRowGen) return;
-  // Detect conductor restart: if current totals < last seen, accumulate last into history
-  const hist = _condLoadHist();
-  const last = _condLoadLast();
-  if (fetchOk && last && (curIn < last.input || curOut < last.output)) {
-    hist.input += last.input; hist.output += last.output; hist.cacheCreate += last.cacheCreate; hist.cacheRead += last.cacheRead; hist.cost += last.cost;
-  }
-  if (fetchOk) _condSave(hist, {input:curIn, output:curOut, cacheCreate:curCc, cacheRead:curCr, cost:curCost});
-  const tip = 'Conductor 消耗的 token 不计入累计 token 中';
-  // Row 1: historical total
-  const tr1 = document.createElement('tr'); tr1.className = 'tok-row-session tok-row-conductor'; tr1.title = tip;
-  const hIn = hist.input + curIn, hOut = hist.output + curOut, hCc = hist.cacheCreate + curCc, hCr = hist.cacheRead + curCr, hCost = hist.cost + curCost;
-  const _ci = `<svg width="14" height="14" ${CONDUCTOR_SVG_ATTRS} style="vertical-align:-2px;margin-right:4px">${CONDUCTOR_SVG_INNER}</svg>`;
-  tr1.innerHTML = `<td>${_ci}Conductor 累计</td><td>${fmtTok(hIn)}</td><td>${fmtTok(hOut)}</td><td>${fmtTok(hCc)}</td><td>${fmtTok(hCr)}</td><td>¥${hCost.toFixed(2)}</td>`;
-  // Row 2: current session
-  const tr2 = document.createElement('tr'); tr2.className = 'tok-row-session tok-row-conductor'; tr2.title = tip;
-  tr2.innerHTML = `<td>${_ci}Conductor 本次</td><td>${fmtTok(curIn)}</td><td>${fmtTok(curOut)}</td><td>${fmtTok(curCc)}</td><td>${fmtTok(curCr)}</td><td>¥${curCost.toFixed(2)}</td>`;
-  tokTbody.insertBefore(tr2, tokTbody.firstChild);
-  tokTbody.insertBefore(tr1, tokTbody.firstChild);
-}
-
-/* ─── Conductor token tab (disabled — pending time tracking) ─── */
-/*
-let _tokTab = 'all';
+/* ─── Token tab switching ─── */
+let _tokTab = 'chat';
 const tokTabs = document.getElementById('tok-tabs');
+const tokFilter = document.querySelector('.tok-filter');
+const tokStatRow = document.querySelector('.page[data-page="token"] .stat-row');
 if (tokTabs) tokTabs.addEventListener('click', e => {
   const btn = e.target.closest('.tok-tab');
   if (!btn || btn.classList.contains('active')) return;
@@ -3074,30 +3036,39 @@ if (tokTabs) tokTabs.addEventListener('click', e => {
   btn.classList.add('active');
   _tokTab = btn.dataset.tab;
   _tokPage = 0;
-  if (_tokTab === 'conductor') loadConductorTokens();
-  else loadTokenPage();
+  if (_tokTab === 'conductor') { if (tokFilter) tokFilter.style.display = 'none'; if (tokStatRow) tokStatRow.style.display = 'none'; loadConductorTokens(); }
+  else { if (tokFilter) tokFilter.style.display = ''; if (tokStatRow) tokStatRow.style.display = ''; loadTokenPage(); }
 });
 
 async function loadConductorTokens() {
+  let curIn = 0, curOut = 0, curCc = 0, curCr = 0, curCost = 0;
+  let fetchOk = false;
   try {
     const data = await (await fetch(`http://${location.hostname}:8900/token-stats`)).json();
-    const titles = data.titles || {};
-    const killedSet = new Set(data.killed || []);
-    const records = (data.records || []).filter(r => r.thread === 'conductor-agent' || r.thread.startsWith('subagent-')).map(r => {
-      let title = 'Conductor';
-      if (r.thread.startsWith('subagent-')) {
-        const prompt = titles[r.thread] || '';
-        title = prompt ? (prompt.length > 30 ? prompt.slice(0, 30) + '…' : prompt) : 'Sub ' + r.thread.replace('subagent-', '');
-      }
-      return { sessionId: r.thread, title, input: r.input || 0, output: r.output || 0, cacheCreate: r.cacheCreate || 0, cacheRead: r.cacheRead || 0, model: r.model || '', ts: Date.now() / 1000, _conductor: true, _killed: killedSet.has(r.thread) };
-    });
-    tokRenderStats(records, records);
-    tokRenderTable(records);
+    const recs = (data.records || []).filter(r => r.thread === 'conductor-agent' || r.thread.startsWith('subagent-'));
+    for (const r of recs) {
+      curIn += r.input || 0; curOut += r.output || 0; curCc += r.cacheCreate || 0; curCr += r.cacheRead || 0;
+      curCost += parseFloat(estCost(r.input || 0, r.output || 0, r.model || '', r.cacheRead || 0, r.cacheCreate || 0));
+    }
+    fetchOk = true;
   } catch (_) {
     if (tokTbody) tokTbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted)">无法连接 Conductor (8900)</td></tr>`;
+    return;
   }
+  const hist = _condLoadHist();
+  const last = _condLoadLast();
+  if (fetchOk && last && (curIn < last.input || curOut < last.output)) {
+    hist.input += last.input; hist.output += last.output; hist.cacheCreate += last.cacheCreate; hist.cacheRead += last.cacheRead; hist.cost += last.cost;
+  }
+  if (fetchOk) _condSave(hist, {input:curIn, output:curOut, cacheCreate:curCc, cacheRead:curCr, cost:curCost});
+  const hIn = hist.input + curIn, hOut = hist.output + curOut, hCc = hist.cacheCreate + curCc, hCr = hist.cacheRead + curCr, hCost = hist.cost + curCost;
+  if (!tokTbody) return;
+  const tip = 'Conductor 消耗的 token 不计入聊天累计 token 中';
+  const _ci = `<svg width="14" height="14" ${CONDUCTOR_SVG_ATTRS} style="vertical-align:-2px;margin-right:4px">${CONDUCTOR_SVG_INNER}</svg>`;
+  tokTbody.innerHTML = `<tr class="tok-row-conductor" title="${tip}"><td>${_ci}Conductor 累计</td><td>${fmtTok(hIn)}</td><td>${fmtTok(hOut)}</td><td>${fmtTok(hCc)}</td><td>${fmtTok(hCr)}</td><td>¥${hCost.toFixed(2)}</td></tr><tr class="tok-row-conductor" title="${tip}"><td>${_ci}Conductor 本次</td><td>${fmtTok(curIn)}</td><td>${fmtTok(curOut)}</td><td>${fmtTok(curCc)}</td><td>${fmtTok(curCr)}</td><td>¥${curCost.toFixed(2)}</td></tr>`;
+  const pager = document.getElementById('tok-pager');
+  if (pager) pager.innerHTML = '';
 }
-*/
 
 /* Flatpickr 初始化 */
 const _fpOpts = { enableTime:true, time_24hr:true, dateFormat:'Y-m-d  H:i', locale:window.flatpickr?.l10ns?.[document.documentElement.lang==='en'?'default':'zh']||'default', allowInput:false, onChange(){ _tokPage=0; loadTokenPage(); } };
@@ -3105,7 +3076,7 @@ const fpSince = tokSince ? flatpickr(tokSince, _fpOpts) : null;
 const fpUntil = tokUntil ? flatpickr(tokUntil, _fpOpts) : null;
 const tokResetBtn=document.getElementById('tok-reset');
 if(tokResetBtn)tokResetBtn.addEventListener('click',()=>{if(fpSince)fpSince.clear();if(fpUntil)fpUntil.clear();_tokPage=0;loadTokenPage();});
-nav.addEventListener('click',(e)=>{const item=e.target.closest('.nav-item');if(item&&item.dataset.page==='token')loadTokenPage();if(item&&item.dataset.page==='channels')renderChannelList(gaServiceStore.list());if(item&&item.dataset.page==='status')loadStatusPanel();});
+nav.addEventListener('click',(e)=>{const item=e.target.closest('.nav-item');if(item&&item.dataset.page==='token'){if(_tokTab==='conductor')loadConductorTokens();else loadTokenPage();}if(item&&item.dataset.page==='channels')renderChannelList(gaServiceStore.list());if(item&&item.dataset.page==='status')loadStatusPanel();});
 /* ═══════════════ 自定义预设 ═══════════════ */
 const CP_KEY = 'ga_custom_presets';
 const HB_KEY = 'ga_hidden_builtins';
