@@ -681,6 +681,23 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
 .fc-t{ font-weight:600; font-size:13px; margin-top:10px; font-family:var(--font-title-en); }
 .fc-d{ font-size:11px; color:var(--muted); margin-top:3px; }
 
+/* 后台服务页 — 下划线 Tab（消息通道 / 状态面板）*/
+.svc-tabs{
+  display:flex; gap:28px; margin-top:4px;
+  border-bottom:1px solid var(--line);
+}
+.svc-tab{
+  padding:12px 0 10px; margin-bottom:-1px;
+  font-size:14px; font-weight:600; border:none; background:transparent;
+  color:var(--muted); cursor:pointer;
+  border-bottom:2px solid transparent; transition:color .15s, border-color .15s;
+}
+.svc-tab:hover{ color:var(--txt); }
+.svc-tab.active{ color:var(--txt-strong); border-bottom-color:var(--txt-strong); }
+.svc-panel{ display:none; margin-top:16px; }
+.svc-panel.active{ display:block; }
+.svc-panel .list{ margin-top:0; }
+
 /* 通用列表（消息通道 / 状态面板 / token 明细）*/
 .list{ display:flex; flex-direction:column; gap:6px; margin-top:14px; }
 .list-row{
