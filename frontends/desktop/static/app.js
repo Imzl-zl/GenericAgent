@@ -3,6 +3,17 @@
 // 动态用 t(key)。dev 标注层与发给 agent 的预设 prompt 不进 UI 字典。
 'use strict';
 
+/* ═══════════════ 端口/URL 常量 ═══════════════
+   bridge / conductor 的端口和 origin 都集中在这里。要换端口、要切同源、
+   要让 bridge 代理 conductor —— 改这一块即可,下面所有 URL 引用全都跟着走。
+   *_ORIGIN 不带尾巴 path,调用方自己拼 "/sessions" "/ws" 等。 */
+const BRIDGE_PORT = 14168;
+const CONDUCTOR_PORT = 8900;
+const BRIDGE_ORIGIN = `${location.protocol}//${location.hostname}:${BRIDGE_PORT}`;
+const BRIDGE_WS_ORIGIN = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:${BRIDGE_PORT}`;
+const CONDUCTOR_ORIGIN = `http://${location.hostname}:${CONDUCTOR_PORT}`;
+const CONDUCTOR_WS_ORIGIN = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:${CONDUCTOR_PORT}`;
+
 /* ═══════════════ 进程状态 store ═══════════════ */
 const _serviceById = {};
 const _serviceListeners = new Set();
@@ -44,8 +55,8 @@ const gaServiceStore = {
   const listeners = new Map();
   let ws = null;
   let cachedBridgeReady = null;
-  const bridgeBase = `${location.protocol}//${location.hostname}:14168`;
-  const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:14168/ws`;
+  const bridgeBase = BRIDGE_ORIGIN;
+  const wsUrl = `${BRIDGE_WS_ORIGIN}/ws`;
 
   function on(channel, cb) {
     if (typeof cb !== 'function') return () => {};
@@ -566,7 +577,7 @@ async function persistUiPrefs() {
     syncBootCache();
   } catch (_) {}
 }
-const bridgeHost = () => `${location.protocol}//${location.hostname}:14168`;
+const bridgeHost = () => BRIDGE_ORIGIN;
 async function bridgeFetch(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   const init = { ...opts, headers };
@@ -1251,13 +1262,13 @@ const isActive = (sess) => sess && sess.id === state.activeId;
 function saveSessions() {}
 function patchSession(sess, fields) {
   if (!sess.bridgeSessionId) return;
-  fetch(`http://${location.hostname}:14168/session/${encodeURIComponent(sess.bridgeSessionId)}`, {
+  fetch(`${BRIDGE_ORIGIN}/session/${encodeURIComponent(sess.bridgeSessionId)}`, {
     method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(fields)
   }).catch(() => {});
 }
 async function loadSessions() {
   try {
-    const res = await fetch(`http://${location.hostname}:14168/sessions`);
+    const res = await fetch(`${BRIDGE_ORIGIN}/sessions`);
     const data = await res.json();
     if (!data.sessions) return;
     for (const s of data.sessions) {
@@ -1785,7 +1796,7 @@ async function closeSession(id) {
   const sess = state.sessions.get(id);
   if (sess && sess.bridgeSessionId) {
     try { await window.ga.rpc('session/cancel', { sessionId: sess.bridgeSessionId }); } catch (_) {}
-    fetch(`http://${location.hostname}:14168/session/${sess.bridgeSessionId}`, { method: 'DELETE' }).catch(() => {});
+    fetch(`${BRIDGE_ORIGIN}/session/${sess.bridgeSessionId}`, { method: 'DELETE' }).catch(() => {});
   }
   state.sessions.delete(id); state.runtime.delete(id);
   if (state.activeId === id) {
@@ -2599,7 +2610,7 @@ function removePendingFile(sid, { stripPlaceholder = false } = {}) {
   if (stripPlaceholder) removePlaceholderFromComposer(removed);
   renderThumbStrip(fileCtx(removed));
   if (removed.path) {
-    fetch(`http://${location.hostname}:14168/upload`, {
+    fetch(`${BRIDGE_ORIGIN}/upload`, {
       method: 'DELETE', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: removed.path }),
     }).catch(() => {});
@@ -2616,7 +2627,7 @@ function reconcilePendingFiles(ctx = activeFileComposer) {
 }
 
 async function uploadOne(name, dataUrl, sid) {
-  const res = await fetch(`http://${location.hostname}:14168/upload`, {
+  const res = await fetch(`${BRIDGE_ORIGIN}/upload`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, dataUrl, sid: sid || '' }),
@@ -2691,7 +2702,7 @@ function handleThumbStripClick(e, ctx) {
       removePlaceholderFromComposer(removed);
       renderThumbStrip(ctx);
       if (removed.path) {
-        fetch(`http://${location.hostname}:14168/upload`, {
+        fetch(`${BRIDGE_ORIGIN}/upload`, {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: removed.path }),
@@ -2914,7 +2925,7 @@ function modelPriceTip(model) {
 function tokLoadHistory() { return _tokHistory; }
 function tokSaveHistory(h) {
   _tokHistory = h;
-  fetch(`http://${location.hostname}:14168/token-history`, {
+  fetch(`${BRIDGE_ORIGIN}/token-history`, {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({history:h, snap:_tokLastSnap, conductorHist:_condHist, conductorLast:_condLast})
   }).catch(()=>{});
@@ -3019,7 +3030,7 @@ function _condLoadHist() { return _condHist || {..._condZero}; }
 function _condLoadLast() { return _condLast; }
 function _condSave(hist, last) {
   _condHist = hist; _condLast = last;
-  fetch(`http://${location.hostname}:14168/token-history`, {
+  fetch(`${BRIDGE_ORIGIN}/token-history`, {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({history:_tokHistory, snap:_tokLastSnap, conductorHist:hist, conductorLast:last})
   }).catch(()=>{});
@@ -3046,7 +3057,7 @@ async function loadConductorTokens() {
   let curIn = 0, curOut = 0, curCc = 0, curCr = 0, curCost = 0;
   let fetchOk = false;
   try {
-    const data = await (await fetch(`http://${location.hostname}:8900/token-stats`)).json();
+    const data = await (await fetch(`${CONDUCTOR_ORIGIN}/token-stats`)).json();
     const recs = (data.records || []).filter(r => r.thread === 'conductor-agent' || r.thread.startsWith('subagent-'));
     for (const r of recs) {
       curIn += r.input || 0; curOut += r.output || 0; curCc += r.cacheCreate || 0; curCr += r.cacheRead || 0;
@@ -3337,7 +3348,7 @@ if (msgArea) {
 }
 
 function uploadRawUrl(path, download) {
-  return `http://${location.hostname}:14168/upload/raw?path=${encodeURIComponent(path || '')}${download ? '&download=1' : ''}`;
+  return `${BRIDGE_ORIGIN}/upload/raw?path=${encodeURIComponent(path || '')}${download ? '&download=1' : ''}`;
 }
 function bridgeIsLocal() {
   return location.hostname === '127.0.0.1' || location.hostname === 'localhost';
@@ -3354,7 +3365,7 @@ async function openUploadFile(path, name) {
   // 本地：bridge 与你同机，调系统默认程序打开 / 在文件夹显示
   const mode = isPreviewableByName(name || path) ? 'open' : 'reveal';
   try {
-    const res = await fetch(`http://${location.hostname}:14168/path/open`, {
+    const res = await fetch(`${BRIDGE_ORIGIN}/path/open`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'upload', path, mode }),
@@ -4043,7 +4054,7 @@ window.ga.startBridge && window.ga.startBridge();
 /* Conductor 页 — 直连 Conductor WS，不走 bridge session */
 (function () {
   'use strict';
-  const wsUrl = () => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8900/ws`;
+  const wsUrl = () => `${CONDUCTOR_WS_ORIGIN}/ws`;
   const FAIL_MAX = 5, RECON_BASE = 1200, RECON_MAX = 30000;
   const $ = id => document.getElementById(id);
   const t = k => (window.gaT && window.gaT(k)) || k;
@@ -4219,7 +4230,7 @@ window.ga.startBridge && window.ga.startBridge();
     cardMenu.innerHTML = `<div class="ctx-item danger">${GA_ICON('trash')}${esc(t('ctx.del'))}</div>`;
     cardMenu.querySelector('.ctx-item').onclick = (e) => {
       e.stopPropagation();
-      fetch(`http://${location.hostname}:8900/subagent/${sid}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill' }) });
+      fetch(`${CONDUCTOR_ORIGIN}/subagent/${sid}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill' }) });
       hideCardMenu();
     };
     document.body.appendChild(cardMenu);
