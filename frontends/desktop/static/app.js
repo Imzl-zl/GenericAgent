@@ -1948,19 +1948,33 @@ async function pollSession(sess) {
   const r = rt(sess);
   if (r.polling) return;
   r.polling = true;
+  /* 手机切后台再回前台时,第一拍 fetch 经常用着死连接秒挂(Failed to fetch),
+     但只要给链路 1-2 秒重建,后续就稳。原版一炸就 showError,体验糟。
+     改成:同一次 polling 循环里连续失败 ≥ MAX_ERRORS 次才放弃,
+     单次失败做指数退避(1s / 2s / 4s / 8s),够 ride through 一次后台恢复抖动。 */
+  const MAX_ERRORS = 5;
+  let consecutiveErrors = 0;
   try {
     do {
-      const res = await window.ga.pollSession(sess.bridgeSessionId || sess.id, r.lastId || 0);
-      if (res?.error) throw new Error(res.error.message || res.error);
-      const result = res.result || res;
-      for (const msg of (result.messages || [])) upsert(sess, msg, false);
-      if (result.partial) upsert(sess, result.partial, true);
-      const busy = result.status === 'running' || !!result.partial;
-      setBusy(sess, busy);
-      if (busy) await new Promise(z => setTimeout(z, 500));
-      else {
-        if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
-        break;
+      try {
+        const res = await window.ga.pollSession(sess.bridgeSessionId || sess.id, r.lastId || 0);
+        if (res?.error) throw new Error(res.error.message || res.error);
+        consecutiveErrors = 0;
+        const result = res.result || res;
+        for (const msg of (result.messages || [])) upsert(sess, msg, false);
+        if (result.partial) upsert(sess, result.partial, true);
+        const busy = result.status === 'running' || !!result.partial;
+        setBusy(sess, busy);
+        if (busy) await new Promise(z => setTimeout(z, 500));
+        else {
+          if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
+          break;
+        }
+      } catch (innerErr) {
+        consecutiveErrors++;
+        if (consecutiveErrors >= MAX_ERRORS) throw innerErr;
+        const backoff = Math.min(8000, 1000 * Math.pow(2, consecutiveErrors - 1));
+        await new Promise(z => setTimeout(z, backoff));
       }
     } while (true);
   } catch (e) {
