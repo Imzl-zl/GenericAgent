@@ -98,6 +98,17 @@ def _load_plan_baseline(item: dict, msgs: list) -> int:
     return max(0, base)
 
 
+def _sanitize_desktop_plan_path(session_id: str, plan_path: str) -> str:
+    """Desktop: drop shared plan_demo paths so sessions do not read the same file."""
+    import plan_state
+    p = (plan_path or "").strip()
+    if not p:
+        return ""
+    if plan_state.is_session_scoped_plan_path(p, session_id):
+        return p
+    return plan_state.default_session_plan_path(session_id)
+
+
 class AgentManager:
     def __init__(self):
         self.lock = threading.RLock()
@@ -144,7 +155,8 @@ class AgentManager:
                                pinned=item.get("pinned", False),
                                untitled=item.get("untitled", True),
                                plan_scan_baseline=_load_plan_baseline(item, msgs),
-                               plan_path=item.get("plan_path") or "",
+                               plan_path=_sanitize_desktop_plan_path(
+                                   item["id"], item.get("plan_path") or ""),
                                status="idle", agent=None)
                 self.sessions[sess.id] = sess
             if self.sessions:
@@ -426,6 +438,7 @@ class AgentManager:
             import plan_state
             if plan_state.is_plan_preset_prompt(prompt):
                 plan_state.bind_plan_session(sess, prompt)
+                self._persist()
             sess.status = "running"
             sess.cancel_requested = False
             sess.last_error = ""

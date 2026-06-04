@@ -359,7 +359,10 @@ const I18N = {
     'lightbox.closeTitle': '关闭',
     'fold.thinking': '思考', 'fold.tool': '工具调用', 'fold.toolResult': '工具结果', 'fold.llm': 'LLM Running', 'fold.turn': '第 {n} 轮',
     'plan.header': '计划 ({done}/{total})', 'plan.complete': '✓ 计划完成 ({n}/{n})',
+    'plan.running': '计划执行中', 'plan.completeTitle': '计划完成',
     'plan.placeholder': '计划模式已激活', 'plan.waiting': '等待写入 {path} …', 'plan.overflow': '还有 {n} 项',
+    'plan.current': '当前', 'plan.collapse': '收起', 'plan.expand': '展开', 'plan.details': '详情',
+    'plan.capsuleRunning': '运行中', 'plan.capsuleComplete': '已完成',
     'timing.elapsed': '已运行 {t}',
     'model.auto': '自动选择',
     'model.menuLabel': '选择模型',
@@ -508,7 +511,10 @@ const I18N = {
     'lightbox.closeTitle': 'Close',
     'fold.thinking': 'Thinking', 'fold.tool': 'Tool call', 'fold.toolResult': 'Tool result', 'fold.llm': 'LLM Running', 'fold.turn': 'Turn {n}',
     'plan.header': 'Plan ({done}/{total})', 'plan.complete': '✓ Plan complete ({n}/{n})',
+    'plan.running': 'Running plan', 'plan.completeTitle': 'Plan complete',
     'plan.placeholder': 'Plan mode activated', 'plan.waiting': 'waiting for {path} …', 'plan.overflow': '+{n} more',
+    'plan.current': 'Now', 'plan.collapse': 'Collapse', 'plan.expand': 'Expand', 'plan.details': 'Details',
+    'plan.capsuleRunning': 'Running', 'plan.capsuleComplete': 'Done',
     'timing.elapsed': 'Elapsed {t}',
     'model.auto': 'Auto',
     'model.menuLabel': 'Select model',
@@ -1470,7 +1476,7 @@ const state = {
 };
 function rt(sess) {
   let r = state.runtime.get(sess.id);
-  if (!r) { r = { polling:false, busy:false, lastId:0, seen:new Set(), draftEl:null, draftText:'', taskStartedAt:null, taskEndedAt:null, taskTimerId:null, planCompleteAt:null, planLostAt:null, planHoldItems:[], planLastPayload:null, planLastComplete:false, planHideTimer:null, planDismissedComplete:false }; state.runtime.set(sess.id, r); }
+  if (!r) { r = { polling:false, busy:false, lastId:0, seen:new Set(), draftEl:null, draftText:'', taskStartedAt:null, taskEndedAt:null, taskTimerId:null, planCompleteAt:null, planLostAt:null, planHoldItems:[], planLastPayload:null, planLastComplete:false, planHideTimer:null, planDismissedComplete:false, planCollapsed:false, planShowAll:false }; state.runtime.set(sess.id, r); }
   return r;
 }
 const activeSess = () => state.sessions.get(state.activeId) || null;
@@ -1515,6 +1521,11 @@ const msgLoading = document.getElementById('msg-loading');
 const MIN_MSG_LOADING_MS = 450;
 const PLAN_LOST_GRACE_MS = 1500;  // tuiapp_v2._PLAN_LOST_GRACE_SEC
 const PLAN_COMPLETE_GRACE_MS = 3000;  // tuiapp_v2._PLAN_GRACE_SEC
+
+function isPlanPresetPrompt(text) {
+  const p = String(text || '').toLowerCase();
+  return p.includes('plan_sop') || p.includes('plan 模式') || p.includes('plan mode');
+}
 let _submitInFlight = false;
 const runToggle  = document.getElementById('run-toggle');
 const chatStatus = pageStatusBar(runToggle);
@@ -1606,8 +1617,19 @@ function clearPlanGrace(r) {
   r.planCompleteAt = r.planLostAt = null;
   r.planHoldItems = [];
   r.planLastPayload = null;
+  r.planLastComplete = false;
   r.planDismissedComplete = false;
   if (r.planHideTimer) { clearTimeout(r.planHideTimer); r.planHideTimer = null; }
+}
+
+function schedulePlanCompleteDismiss(sess) {
+  const r = rt(sess);
+  if (r.planHideTimer) clearTimeout(r.planHideTimer);
+  r.planHideTimer = setTimeout(() => {
+    r.planHideTimer = null;
+    r.planDismissedComplete = true;
+    if (isActive(sess)) refreshPlanBar(null);
+  }, PLAN_COMPLETE_GRACE_MS);
 }
 
 /** tuiapp_v2._refresh_planbar：用 runtime 里缓存的 items / placeholder 重绘 */
@@ -1634,6 +1656,19 @@ function refreshPlanBarFromRuntime(sess) {
       refreshPlanBar(lp);
       return;
     }
+    const held = r.planHoldItems || [];
+    if (lp?.complete && (lp.items?.length || held.length)) {
+      refreshPlanBar({
+        active: true,
+        placeholder: false,
+        items: lp.items?.length ? lp.items : held,
+        done: lp.done ?? held.filter(it => it.status === 'done').length,
+        total: lp.total ?? (lp.items?.length || held.length),
+        complete: true,
+        step: lp.step || '',
+      });
+      return;
+    }
     refreshPlanBar(null);
     return;
   }
@@ -1643,7 +1678,7 @@ function refreshPlanBarFromRuntime(sess) {
     items,
     done: lp?.done ?? items.filter(it => it.status === 'done').length,
     total: lp?.total ?? items.length,
-    complete: !!lp?.complete,
+    complete: !!(lp?.complete || (items.length && items.every(it => it.status === 'done'))),
     step: lp?.step || '',
   });
 }
@@ -1660,29 +1695,44 @@ function applyPlanPayload(sess, raw) {
   const now = Date.now();
 
   if (raw?.active) {
+    if (raw.placeholder && !r.planLastPayload?.active) {
+      r.planCollapsed = false;
+      r.planShowAll = false;
+    }
     r.planLastPayload = raw;
     const items = raw.items || [];
     if (items.length) {
       r.planLostAt = null;
       r.planHoldItems = items;
-    } else if (!raw.placeholder && r.planHoldItems.length) {
+    } else if (!raw.placeholder && !raw.complete && r.planHoldItems.length) {
       if (!r.planLostAt) r.planLostAt = now;
     }
     const nowComplete = !!raw.complete && (items.length > 0 || r.planHoldItems.length > 0);
     const wasComplete = r.planLastComplete;
-    if (nowComplete && !wasComplete) r.planCompleteAt = now;
-    else if (!nowComplete) {
+    if (nowComplete && !wasComplete) {
+      r.planCompleteAt = now;
+      schedulePlanCompleteDismiss(sess);
+    } else if (!nowComplete) {
       r.planCompleteAt = null;
       r.planDismissedComplete = false;
+      if (r.planHideTimer) { clearTimeout(r.planHideTimer); r.planHideTimer = null; }
     }
     r.planLastComplete = nowComplete;
-  } else if (r.planHoldItems.length) {
+  } else if (r.planHoldItems.length && !r.planDismissedComplete) {
     if (!r.planLostAt) r.planLostAt = now;
-  } else {
+  } else if (!r.planDismissedComplete) {
     clearPlanGrace(r);
   }
 
   if (!isActive(sess)) return;
+  if (r.planDismissedComplete) {
+    refreshPlanBar(null);
+    return;
+  }
+  if (raw?.active && raw.placeholder) {
+    refreshPlanBar(raw);
+    return;
+  }
   if (raw?.active && raw.complete && (raw.items?.length || r.planHoldItems.length)) {
     refreshPlanBar({
       ...raw,
@@ -1693,54 +1743,195 @@ function applyPlanPayload(sess, raw) {
   refreshPlanBarFromRuntime(sess);
 }
 
+function planItemUi(status, isCurrent) {
+  const st = String(status || 'open').toLowerCase();
+  if (st === 'done') return { cls: 'plan-item--done', mark: '✓' };
+  if (st === 'error' || st === 'failed') return { cls: 'plan-item--error', mark: '✕' };
+  if (st === 'warn' || st === 'warning') return { cls: 'plan-item--warn', mark: '!' };
+  if (isCurrent) return { cls: 'plan-item--current', mark: '●' };
+  return { cls: 'plan-item--pending', mark: '○' };
+}
+
+function pickPlanWindow(items, stepText) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return { shown: [], curInShown: -1, overflow: 0 };
+  let cur = list.findIndex(it => it.status !== 'done');
+  if (cur < 0) cur = list.length - 1;
+  const step = String(stepText || '').trim();
+  if (step) {
+    const hit = list.findIndex(it => String(it.content || '').includes(step.slice(0, 24)));
+    if (hit >= 0) cur = hit;
+  }
+  let start, end;
+  if (cur <= 1) {
+    start = cur;
+    end = Math.min(list.length, cur + 3);
+  } else {
+    start = cur - 1;
+    end = Math.min(list.length, cur + 2);
+  }
+  const shown = list.slice(start, end);
+  return { shown, curInShown: cur - start, overflow: Math.max(0, list.length - shown.length) };
+}
+
+function planCapsuleLabel(plan) {
+  const step = plan.step ? String(plan.step).slice(0, 80) : '';
+  if (plan.complete) return { tag: t('plan.capsuleComplete'), step: step || planTpl(t('plan.complete'), { n: plan.total }) };
+  if (plan.placeholder) return { tag: t('plan.placeholder'), step: '' };
+  return { tag: t('plan.capsuleRunning'), step: step || planTpl(t('plan.header'), { done: plan.done, total: plan.total }) };
+}
+
+function bindPlanCardUiOnce() {
+  if (!planBarEl || planBarEl._planUiBound) return;
+  planBarEl._planUiBound = true;
+  planBarEl.addEventListener('click', (e) => {
+    const sess = activeSess();
+    if (!sess) return;
+    const r = rt(sess);
+    const payload = r.planLastPayload;
+    if (!payload?.active) return;
+    if (e.target.closest('[data-plan-expand]')) {
+      r.planCollapsed = false;
+      refreshPlanBar(payload);
+    } else if (e.target.closest('[data-plan-collapse]')) {
+      r.planCollapsed = true;
+      refreshPlanBar(payload);
+    } else if (e.target.closest('[data-plan-details]')) {
+      r.planShowAll = !r.planShowAll;
+      refreshPlanBar(payload);
+    }
+  });
+}
+
 function refreshPlanBar(plan) {
   if (!planBarEl) return;
-  if (!plan?.active) { planBarEl.hidden = true; planBarEl.replaceChildren(); return; }
+  bindPlanCardUiOnce();
+  if (!plan?.active) {
+    planBarEl.hidden = true;
+    planBarEl.replaceChildren();
+    planBarEl.className = 'plan-card';
+    return;
+  }
+  const sess = activeSess();
+  const r = sess ? rt(sess) : { planCollapsed: false, planShowAll: false };
+  const collapsed = !!r.planCollapsed;
+  const stepText = plan.step ? String(plan.step).slice(0, 120) : '';
+  const done = plan.done ?? (plan.items || []).filter(it => it.status === 'done').length;
+  const total = plan.total ?? (plan.items || []).length;
+  const mod = [
+    'plan-card',
+    collapsed ? 'plan-card--collapsed' : 'plan-card--expanded',
+    plan.complete ? 'plan-card--complete' : '',
+    plan.placeholder ? 'plan-card--placeholder' : '',
+  ].filter(Boolean).join(' ');
   planBarEl.hidden = false;
+  planBarEl.className = mod;
+
+  if (collapsed) {
+    const cap = planCapsuleLabel(plan);
+    planBarEl.innerHTML = '';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'plan-capsule';
+    btn.dataset.planExpand = '1';
+    const dot = document.createElement('span');
+    dot.className = 'plan-status-dot';
+    const txt = document.createElement('span');
+    txt.className = 'plan-capsule-text';
+    if (cap.step) txt.innerHTML = `${escapeHtml(cap.tag)} · <em>${escapeHtml(cap.step)}</em>`;
+    else txt.textContent = cap.tag;
+    btn.append(dot, txt);
+    planBarEl.append(btn);
+    return;
+  }
+
   const frag = document.createDocumentFragment();
   const head = document.createElement('div');
-  head.className = 'plan-head';
-  head.textContent = plan.placeholder ? `📋 ${t('plan.placeholder')}`
-    : plan.complete ? planTpl(t('plan.complete'), { n: plan.total })
-    : `📋 ${planTpl(t('plan.header'), { done: plan.done, total: plan.total })}`;
-  frag.appendChild(head);
-  const stepText = plan.step ? String(plan.step).slice(0, 120) : '';
-  if (stepText) {
-    const step = document.createElement('div');
-    step.className = 'plan-step';
-    step.textContent = `▸ ${stepText}`;
-    frag.appendChild(step);
+  head.className = 'plan-card-head';
+  const dot = document.createElement('span');
+  dot.className = 'plan-status-dot';
+  const title = document.createElement('span');
+  title.className = 'plan-title';
+  title.textContent = plan.placeholder ? t('plan.placeholder')
+    : plan.complete ? t('plan.completeTitle')
+    : t('plan.running');
+  head.append(dot, title);
+  if (!plan.placeholder && total > 0) {
+    const prog = document.createElement('span');
+    prog.className = 'plan-progress';
+    prog.textContent = `${done}/${total}`;
+    head.append(prog);
   }
+  const actions = document.createElement('div');
+  actions.className = 'plan-head-actions';
+  const collapseBtn = document.createElement('button');
+  collapseBtn.type = 'button';
+  collapseBtn.className = 'plan-btn';
+  collapseBtn.dataset.planCollapse = '1';
+  collapseBtn.textContent = t('plan.collapse');
+  actions.append(collapseBtn);
+  head.append(actions);
+  frag.append(head);
+
+  if (stepText) {
+    const cur = document.createElement('div');
+    cur.className = 'plan-current';
+    const lab = document.createElement('span');
+    lab.className = 'plan-current-label';
+    lab.textContent = `${t('plan.current')}：`;
+    const body = document.createElement('span');
+    body.className = 'plan-current-text';
+    body.textContent = stepText;
+    cur.append(lab, body);
+    frag.append(cur);
+  }
+
   if (plan.placeholder) {
     const wait = document.createElement('div');
     wait.className = 'plan-wait';
     wait.textContent = planTpl(t('plan.waiting'), { path: plan.pathHint || 'plan.md' });
-    frag.appendChild(wait);
+    frag.append(wait);
   } else {
     const list = plan.items || [];
-    const budget = 4 - (stepText ? 1 : 0);
-    const ordered = list.filter(it => it.status !== 'done').concat(list.filter(it => it.status === 'done'));
-    const bodyLines = ordered.length > budget ? budget - 1 : budget;
-    const shown = ordered.slice(0, bodyLines);
-    const overflow = ordered.length - shown.length;
-    for (const it of shown) {
-      const row = document.createElement('div');
-      row.className = 'plan-item' + (it.status === 'done' ? ' plan-item--done' : '');
-      const mark = document.createElement('span');
-      mark.className = 'plan-mark';
-      mark.textContent = it.status === 'done' ? '✔' : '☐';
-      const txt = document.createElement('span');
-      txt.className = 'plan-text';
-      txt.textContent = it.content || '';
-      row.append(mark, txt);
-      frag.appendChild(row);
+    const { shown, curInShown, overflow } = r.planShowAll
+      ? { shown: list, curInShown: list.findIndex(it => it.status !== 'done'), overflow: 0 }
+      : pickPlanWindow(list, stepText);
+    if (shown.length) {
+      const ul = document.createElement('ul');
+      ul.className = 'plan-items';
+      shown.forEach((it, i) => {
+        const ui = planItemUi(it.status, i === curInShown);
+        const li = document.createElement('li');
+        li.className = 'plan-item ' + ui.cls;
+        const mark = document.createElement('span');
+        mark.className = 'plan-item-mark';
+        mark.textContent = ui.mark;
+        const txt = document.createElement('span');
+        txt.className = 'plan-item-text';
+        txt.textContent = it.content || '';
+        li.append(mark, txt);
+        ul.append(li);
+      });
+      frag.append(ul);
     }
-    if (overflow > 0) {
-      const more = document.createElement('div');
-      more.className = 'plan-more';
-      more.textContent = `⋮ ${planTpl(t('plan.overflow'), { n: overflow })}`;
-      frag.appendChild(more);
+    const foot = document.createElement('div');
+    foot.className = 'plan-foot';
+    const moreN = r.planShowAll ? 0 : (overflow || Math.max(0, list.length - shown.length));
+    if (moreN > 0) {
+      const hint = document.createElement('span');
+      hint.className = 'plan-more-hint';
+      hint.textContent = planTpl(t('plan.overflow'), { n: moreN });
+      foot.append(hint);
     }
+    if (list.length > 3) {
+      const det = document.createElement('button');
+      det.type = 'button';
+      det.className = 'plan-btn';
+      det.dataset.planDetails = '1';
+      det.textContent = r.planShowAll ? t('plan.collapse') : t('plan.details');
+      foot.append(det);
+    }
+    if (foot.childNodes.length) frag.append(foot);
   }
   planBarEl.replaceChildren(frag);
 }
@@ -2261,7 +2452,7 @@ function setActiveSession(id) {
   renderAllMessages(sess);
   setBusy(sess, rt(sess).busy);
   renderSessionList();
-  applyPlanPayload(sess, null);
+  refreshPlanBar(null);
   syncPlanPollTimer();
   if (sess.bridgeSessionId && state.bridgeReady) {
     if (!sess.messages.length) pollSession(sess);
@@ -2545,6 +2736,16 @@ async function sendPrompt(text) {
   const previewFiles = usedFiles.filter(f => !f.isImage).map(f => ({ id: 'f-' + f.sid, name: f.name, path: f.path }));
   if (previewFiles.length) userMsg.files = previewFiles;
   sess.messages.push(userMsg); appendMessage(sess, userMsg);
+  if (isPlanPresetPrompt(text)) {
+    const pr = rt(sess);
+    pr.planCollapsed = false;
+    pr.planShowAll = false;
+    const sidHint = (sess.bridgeSessionId || sess.id || 'sess').replace(/\//g, '_');
+    applyPlanPayload(sess, {
+      active: true, placeholder: true, done: 0, total: 0, complete: false,
+      step: '', pathHint: `plan_${sidHint}/plan.md`, items: [],
+    });
+  }
   sess.lastActiveTs = Date.now();
   // 仿 TUI:不再从首条消息自动改名 —— 标题在 newSession 时已设为 agent-N,
   // 之后只接受用户手动 rename。
@@ -2571,6 +2772,7 @@ async function sendPrompt(text) {
     removeUsedPendingFiles(usedFiles);
     const uid = Number(res.userMessageId || res.result?.userMessageId || 0);
     if (uid) { r.seen.add(uid); r.lastId = Math.max(r.lastId, uid); }
+    planPoll(sess);
     pollSession(sess);
     return true;
   } catch (e) {
