@@ -1513,6 +1513,8 @@ const planBarEl = document.getElementById('plan-bar');
 const composerEl = document.getElementById('chat-composer');
 const msgLoading = document.getElementById('msg-loading');
 const MIN_MSG_LOADING_MS = 450;
+const PLAN_LOST_GRACE_MS = 1500;  // tuiapp_v2._PLAN_LOST_GRACE_SEC
+const PLAN_COMPLETE_GRACE_MS = 3000;  // tuiapp_v2._PLAN_GRACE_SEC
 let _submitInFlight = false;
 const runToggle  = document.getElementById('run-toggle');
 const chatStatus = pageStatusBar(runToggle);
@@ -1599,20 +1601,27 @@ function clearPlanGrace(r) {
 }
 
 function applyPlanPayload(sess, raw) {
-  if (!planBarEl || !sess) return;
+  if (!sess) return;
   const r = rt(sess);
-  if (!raw?.active) { clearPlanGrace(r); return refreshPlanBar(null); }
+  if (!raw?.active) {
+    clearPlanGrace(r);
+    if (isActive(sess)) refreshPlanBar(null);
+    return;
+  }
   let plan = raw;
   const items = plan.items || [];
   const now = Date.now();
   if (items.length) { r.planLostAt = null; r.planHoldItems = items; }
   else if (!plan.placeholder && r.planHoldItems.length) {
     if (!r.planLostAt) r.planLostAt = now;
-    if (now - r.planLostAt < 5000) plan = { ...plan, items: r.planHoldItems };
+    if (now - r.planLostAt < PLAN_LOST_GRACE_MS) plan = { ...plan, items: r.planHoldItems };
     else { r.planHoldItems = []; r.planLostAt = null; }
   }
   if (plan.complete) {
-    if (r.planDismissedComplete) return refreshPlanBar(null);
+    if (r.planDismissedComplete) {
+      if (isActive(sess)) refreshPlanBar(null);
+      return;
+    }
     if (!r.planCompleteAt) {
       r.planCompleteAt = now;
       clearTimeout(r.planHideTimer);
@@ -1620,13 +1629,14 @@ function applyPlanPayload(sess, raw) {
         r.planHideTimer = null;
         r.planDismissedComplete = true;
         if (isActive(sess)) refreshPlanBar(null);
-      }, 3000);
+      }, PLAN_COMPLETE_GRACE_MS);
     }
   } else {
     r.planCompleteAt = null;
     r.planDismissedComplete = false;
     if (r.planHideTimer) { clearTimeout(r.planHideTimer); r.planHideTimer = null; }
   }
+  if (!isActive(sess)) return;
   refreshPlanBar(plan);
 }
 
@@ -1683,14 +1693,12 @@ function refreshPlanBar(plan) {
 }
 
 async function planPoll(sess) {
-  if (!sess?.bridgeSessionId || !state.bridgeReady || !isActive(sess)) return applyPlanPayload(sess, null);
+  if (!sess?.bridgeSessionId || !state.bridgeReady || !isActive(sess)) return;
   try {
     const res = await window.ga.pollSession(sess.bridgeSessionId, rt(sess).lastId || 0);
     if (res?.error) throw new Error(res.error.message || res.error);
     applyPlanPayload(sess, (res.result || res).plan);
-  } catch (_) {
-    applyPlanPayload(sess, null);
-  }
+  } catch (_) { /* tui: failed file read does not hide the card */ }
 }
 
 /* ═══════════════ 消息渲染 ═══════════════ */

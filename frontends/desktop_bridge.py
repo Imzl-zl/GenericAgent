@@ -90,16 +90,9 @@ class Session:
 
 
 def _load_plan_baseline(item: dict, msgs: list) -> int:
-    """Default 0; repair baselines that hide in-session plan context (per-prompt bump was wrong)."""
-    try:
-        import plan_state
-        armed = plan_state._desktop_plan_armed
-    except Exception:
-        armed = None
+    """Persisted per-session baseline (tuiapp_v2: set on /continue, not on preset text)."""
     base = int(item.get("plan_scan_baseline", 0) or 0)
     if base >= len(msgs):
-        return 0
-    if base > 0 and armed and armed(msgs, 0) and not armed(msgs, base):
         return 0
     return max(0, base)
 
