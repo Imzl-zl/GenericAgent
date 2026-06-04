@@ -86,6 +86,22 @@ class Session:
     last_error: str = ""
     pinned: bool = False
     untitled: bool = True
+    plan_scan_baseline: int = 0
+
+
+def _load_plan_baseline(item: dict, msgs: list) -> int:
+    """Default 0; repair baselines that hide in-session plan context (per-prompt bump was wrong)."""
+    try:
+        import plan_state
+        armed = plan_state._desktop_plan_armed
+    except Exception:
+        armed = None
+    base = int(item.get("plan_scan_baseline", 0) or 0)
+    if base >= len(msgs):
+        return 0
+    if base > 0 and armed and armed(msgs, 0) and not armed(msgs, base):
+        return 0
+    return max(0, base)
 
 
 class AgentManager:
@@ -111,7 +127,8 @@ class AgentManager:
                     arr.append({"id": s.id, "title": s.title, "cwd": s.cwd,
                                 "created_at": s.created_at, "updated_at": s.updated_at,
                                 "messages": s.messages, "msg_seq": s.msg_seq,
-                                "pinned": s.pinned, "untitled": s.untitled})
+                                "pinned": s.pinned, "untitled": s.untitled,
+                                "plan_scan_baseline": s.plan_scan_baseline})
             self._sessions_file.write_text(json.dumps(arr, ensure_ascii=False, default=str), encoding="utf-8")
         except Exception as e:
             print(f"[bridge] persist sessions failed: {e}", file=sys.stderr)
@@ -122,14 +139,16 @@ class AgentManager:
                 return
             arr = json.loads(self._sessions_file.read_text(encoding="utf-8"))
             for item in arr:
+                msgs = item.get("messages", [])
                 sess = Session(id=item["id"], title=item.get("title", "New chat"),
                                cwd=item.get("cwd", self.ga_root),
                                created_at=item.get("created_at", time.time()),
                                updated_at=item.get("updated_at", time.time()),
-                               messages=item.get("messages", []),
+                               messages=msgs,
                                msg_seq=item.get("msg_seq", 0),
                                pinned=item.get("pinned", False),
                                untitled=item.get("untitled", True),
+                               plan_scan_baseline=_load_plan_baseline(item, msgs),
                                status="idle", agent=None)
                 self.sessions[sess.id] = sess
             if self.sessions:
@@ -1044,6 +1063,8 @@ async def patch_session_handler(request):
         sess.pinned = bool(data["pinned"])
     if "untitled" in data:
         sess.untitled = bool(data["untitled"])
+    if "plan_scan_baseline" in data:
+        sess.plan_scan_baseline = int(data["plan_scan_baseline"])
     sess.updated_at = time.time()
     manager._persist()
     return json_ok({"ok": True, "session": manager.snapshot(sess, include_messages=False)})

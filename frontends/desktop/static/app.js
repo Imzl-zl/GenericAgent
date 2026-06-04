@@ -141,6 +141,7 @@ const gaServiceStore = {
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden && (!ws || ws.readyState >= WebSocket.CLOSING)) {
         wsRetries = 0; connectWs();
+        emit('page-visible', {});
       }
     });
   }
@@ -237,6 +238,7 @@ const gaServiceStore = {
     onBridgeError: (cb) => on('bridge-error', cb),
     onBridgeClosed: (cb) => on('bridge-closed', cb),
     onBridgeReady: (cb) => on('bridge-ready', cb),
+    onPageVisible: (cb) => on('page-visible', cb),
     onBridgeLog: (cb) => on('bridge-log', cb),
     onServiceState: (cb) => on('service-state', cb),
     onOpenSearch: (cb) => on('open-search', cb),
@@ -825,7 +827,6 @@ bindClick('add-model-btn', (e) => {
   openAddModelForm();
 });
 bindClick('settings-btn',  (e) => { e.stopPropagation(); openSettings(); });
-bindClick('preset-btn',    (e) => { e.stopPropagation(); openModal('preset-modal'); });
 document.querySelectorAll('.modal').forEach(m =>
   m.addEventListener('click', (e) => {
     if (e.target.closest('[data-close]')) {
@@ -1470,7 +1471,7 @@ const state = {
 };
 function rt(sess) {
   let r = state.runtime.get(sess.id);
-  if (!r) { r = { polling:false, busy:false, lastId:0, seen:new Set(), draftEl:null, draftText:'', taskStartedAt:null, taskEndedAt:null, taskTimerId:null, planCompleteAt:null, planLostAt:null, planHoldItems:[], planHideTimer:null, planDismissedComplete:false }; state.runtime.set(sess.id, r); }
+  if (!r) { r = { polling:false, busy:false, lastId:0, seen:new Set(), draftEl:null, draftText:'', taskStartedAt:null, taskEndedAt:null, taskTimerId:null, planCompleteAt:null, planLostAt:null, planHoldItems:[], planHideTimer:null, planDismissedComplete:false, planCache:null, bridgePollPrimed:false, draftRichUpTo:0, draftRichAt:0, draftRichSnapshot:'', draftRichSyncTimer:null, twLoopId:null }; state.runtime.set(sess.id, r); }
   return r;
 }
 const activeSess = () => state.sessions.get(state.activeId) || null;
@@ -1507,10 +1508,10 @@ async function loadSessions() {
 const chatPage   = document.querySelector('.page[data-page="chat"]');
 const msgArea    = chatPage.querySelector('.msg-area');
 const chatStart  = msgArea.querySelector('.chat-start');
-const inputEl    = chatPage.querySelector('.input');
+const inputEl    = document.getElementById('chat-input');
 const sendBtn    = document.getElementById('send-btn');
 const planBarEl = document.getElementById('plan-bar');
-const composerEl = chatPage.querySelector('.composer');
+const composerEl = document.getElementById('chat-composer');
 const msgLoading = document.getElementById('msg-loading');
 const MIN_MSG_LOADING_MS = 450;
 let _submitInFlight = false;
@@ -1580,15 +1581,15 @@ function refreshEmptyState(sess) {
   if (msgsEl) msgsEl.style.display = has ? '' : 'none';
 }
 
-function planTpl(tpl, v) {
-  return String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => (v[k] != null ? String(v[k]) : `{${k}}`));
-}
-
 let planPollTimer;
 function syncPlanPollTimer() {
   const on = !!(activeSess()?.bridgeSessionId && state.bridgeReady);
   if (on && !planPollTimer) planPollTimer = setInterval(() => { const s = activeSess(); if (s && isActive(s)) planPoll(s); }, 1000);
   else if (!on && planPollTimer) { clearInterval(planPollTimer); planPollTimer = null; }
+}
+
+function planTpl(tpl, v) {
+  return String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => (v[k] != null ? String(v[k]) : `{${k}}`));
 }
 
 function clearPlanGrace(r) {
@@ -1599,8 +1600,10 @@ function clearPlanGrace(r) {
 }
 
 function applyPlanPayload(sess, raw) {
-  if (!planBarEl || !sess) return;
+  if (!sess) return;
   const r = rt(sess);
+  r.planCache = raw ?? null;
+  if (!planBarEl || !isActive(sess)) return;
   if (!raw?.active) { clearPlanGrace(r); return refreshPlanBar(null); }
   let plan = raw;
   const items = plan.items || [];
@@ -1683,14 +1686,12 @@ function refreshPlanBar(plan) {
 }
 
 async function planPoll(sess) {
-  if (!sess?.bridgeSessionId || !state.bridgeReady || !isActive(sess)) return applyPlanPayload(sess, null);
+  if (!sess?.bridgeSessionId || !state.bridgeReady || !isActive(sess)) return;
   try {
     const res = await window.ga.pollSession(sess.bridgeSessionId, rt(sess).lastId || 0);
     if (res?.error) throw new Error(res.error.message || res.error);
     applyPlanPayload(sess, (res.result || res).plan);
-  } catch (_) {
-    applyPlanPayload(sess, null);
-  }
+  } catch (_) { /* 保留 planCache，避免 poll 失败把卡片误清空 */ }
 }
 
 /* ═══════════════ 消息渲染 ═══════════════ */
@@ -1849,11 +1850,11 @@ function scrollBottom(force) {
     requestAnimationFrame(() => { msgArea.scrollTop = msgArea.scrollHeight; });
   }
 }
-/* ═══════════════ 打字机效果 (PR移植) ═══════════════ */
-const TW_SPEED = 12;  // 每 tick 显示字符数
-const TW_INTERVAL = 30; // ms
-const TW_RECOVER_MIN = 1200;  // 刷新恢复：partial 已有存量超过此值 → 直接对齐，不重播打字机
-const DRAFT_INTERACT_MS = 520; // 用户滚代码块/点折叠时暂缓 DOM 重写
+/* ═══════════════ 流式：匀速打字机 + 节流富渲染（不追 poll）═══════════════ */
+const TW_MS_PER_CHAR = 20;       // 固定 50 字/秒，不积压追赶
+const TW_RICH_SYNC_CHARS = 12;   // plain 尾缀累计到此长度再并进富层
+const TW_RICH_SYNC_MIN_MS = 150; // 富渲染最短间隔
+const DRAFT_INTERACT_MS = 520;
 
 function isDraftInteractFrozen(r) {
   return Date.now() < (r.draftFreezeUntil || 0);
@@ -1884,84 +1885,184 @@ function bindDraftInteractGuard(el, r) {
     if (e.target.matches('details')) arm();
   }, true);
 }
-/** 刷新/重连后已有大段 partial：一次性对齐到当前全文，仅对之后新增字做打字机 */
-function maybeRecoverDraftSeek(r) {
-  const total = (r.draftText || '').length;
-  const tw = r.twState;
-  if (!r.draftRecoverPending || !tw || tw.shown > 0 || total < TW_RECOVER_MIN) return;
-  tw.shown = total;
-  r.draftRecoverPending = false;
+
+function invalidateDraftRich(r) {
+  if (r.draftRichSyncTimer != null) {
+    clearTimeout(r.draftRichSyncTimer);
+    r.draftRichSyncTimer = null;
+  }
+  r.draftRichUpTo = 0;
+  r.draftRichAt = 0;
+  r.draftRichSnapshot = '';
 }
 
-function renderDraft(sess) {
+function ensureDraftEl(sess) {
   const r = rt(sess);
-  if (!isActive(sess)) return;
   const box = ensureMsgs();
   if (!r.draftEl || r.draftEl.parentNode !== box) {
-    r.draftEl = document.createElement('div'); r.draftEl.className = 'msg assistant'; box.appendChild(r.draftEl);
+    r.draftEl = document.createElement('div');
+    r.draftEl.className = 'msg assistant';
+    box.appendChild(r.draftEl);
     bindDraftInteractGuard(r.draftEl, r);
-    // 正在计时则立即挂载 badge，避免等 1s tick 后才出现导致跳动
     if (r.taskStartedAt) ensureTaskElapsedBadge(r.draftEl, r.taskStartedAt, null);
   }
-  if (!r.twState) r.twState = { shown: 0, timer: null };
-  const tw = r.twState;
-  maybeRecoverDraftSeek(r);
-  if (!tw.timer) {
-    tw.timer = setInterval(() => {
-      const cur = r.draftText || '';
-      if (tw.shown >= cur.length) {
-        clearInterval(tw.timer); tw.timer = null;
-        return;
-      }
-      if (isDraftInteractFrozen(r)) return;
-      tw.shown = Math.min(tw.shown + TW_SPEED, cur.length);
-      rewriteDraftBubble(r, cur.slice(0, tw.shown));
-    }, TW_INTERVAL);
-  }
-  if (!isDraftInteractFrozen(r)) {
-    rewriteDraftBubble(r, (r.draftText || '').slice(0, tw.shown));
-  }
-  refreshEmptyState(sess);
+  return r;
 }
 
-// 重写打字机气泡：先记 near + 保存 <details> open 态 + badge；innerHTML 替换后恢复；仅当原先贴底才滚
-function rewriteDraftBubble(r, visible) {
-  if (!r.draftEl) return;
-  if (isDraftInteractFrozen(r)) return;
+function ensureDraftBubbleDom(bubble) {
+  if (bubble.querySelector('.draft-rich')) return;
+  bubble.innerHTML =
+    '<div class="draft-rich"></div><span class="draft-tw-plain"></span><span class="cursor"></span>';
+}
 
-  const wasNear = isNearBottom();
-  const scrollTops = snapshotDraftScroll(r.draftEl);
-  const openIdx = [];
-  // 保存 badge（会被 innerHTML 覆盖）
-  const oldBadge = r.draftEl.querySelector(':scope > .task-elapsed');
-  const badgeText = oldBadge ? oldBadge.textContent : null;
-  r.draftEl.querySelectorAll('details').forEach((d, i) => { if (d.open) openIdx.push(i); });
-
-  r.draftEl.innerHTML = `<div class="bubble md">${renderAssistant(visible)}<span class="cursor"></span></div>`;
-  postRenderEnhance(r.draftEl.querySelector('.bubble'));
-  const dets = r.draftEl.querySelectorAll('details');
-  openIdx.forEach(i => { if (dets[i]) dets[i].open = true; });
-  restoreDraftScroll(r.draftEl, scrollTops);
-  // 恢复 badge
-  if (badgeText) {
-    const badge = document.createElement('div');
-    badge.className = 'task-elapsed';
-    badge.textContent = badgeText;
-    badge.dataset.live = '1';
-    r.draftEl.prepend(badge);
+function getDraftBubble(r) {
+  if (!r.draftEl) return null;
+  let bubble = r.draftEl.querySelector('.bubble.md');
+  if (!bubble) {
+    r.draftEl.innerHTML =
+      '<div class="bubble md"><div class="draft-rich"></div><span class="draft-tw-plain"></span><span class="cursor"></span></div>';
+    bubble = r.draftEl.querySelector('.bubble.md');
+  } else {
+    ensureDraftBubbleDom(bubble);
   }
+  return bubble;
+}
+
+function scrollDraftIfNeeded(r) {
+  const wasNear = isNearBottom();
   const inCodeScroll = document.activeElement?.closest?.('.code-block pre, .fold-pre')
     && r.draftEl.contains(document.activeElement);
   if (wasNear && !inCodeScroll) scrollBottom(true);
 }
 
+function updatePlainTail(r) {
+  if (!r.draftEl || !r.twState) return;
+  const bubble = getDraftBubble(r);
+  const tail = bubble.querySelector('.draft-tw-plain');
+  const shown = r.twState.shown;
+  const upTo = Math.min(r.draftRichUpTo || 0, shown);
+  const plain = (r.draftText || '').slice(upTo, shown);
+  tail.textContent = plain;
+  tail.hidden = !plain.length;
+  scrollDraftIfNeeded(r);
+}
+
+function syncDraftRich(r, { force = false } = {}) {
+  if (!r.draftEl || !r.twState || isDraftInteractFrozen(r)) return;
+  const shown = r.twState.shown;
+  const visible = (r.draftText || '').slice(0, shown);
+  if (!force && visible === (r.draftRichSnapshot || '')) return;
+  const bubble = getDraftBubble(r);
+  const scrollTops = snapshotDraftScroll(r.draftEl);
+  const openIdx = [];
+  r.draftEl.querySelectorAll('details').forEach((d, i) => { if (d.open) openIdx.push(i); });
+  const rich = bubble.querySelector('.draft-rich');
+  if (!rich) return;
+  rich.innerHTML = renderAssistant(visible);
+  postRenderEnhance(bubble);
+  r.draftRichUpTo = shown;
+  r.draftRichAt = Date.now();
+  r.draftRichSnapshot = visible;
+  const dets = bubble.querySelectorAll('details');
+  openIdx.forEach(i => { if (dets[i]) dets[i].open = true; });
+  restoreDraftScroll(r.draftEl, scrollTops);
+  if (r.taskStartedAt) ensureTaskElapsedBadge(r.draftEl, r.taskStartedAt, null);
+  updatePlainTail(r);
+}
+
+/** 非滑动 debounce：到时间就 sync，打字中不会永远推迟 */
+function maybeScheduleRichSync(r) {
+  const tw = r.twState;
+  if (!tw || tw.shown <= (r.draftRichUpTo || 0)) return;
+  const pending = tw.shown - r.draftRichUpTo;
+  if (pending < TW_RICH_SYNC_CHARS) return;
+  const now = Date.now();
+  const since = now - (r.draftRichAt || 0);
+  if (since >= TW_RICH_SYNC_MIN_MS) {
+    syncDraftRich(r, { force: true });
+    return;
+  }
+  if (r.draftRichSyncTimer != null) return;
+  r.draftRichSyncTimer = setTimeout(() => {
+    r.draftRichSyncTimer = null;
+    syncDraftRich(r, { force: true });
+  }, TW_RICH_SYNC_MIN_MS - since);
+}
+
+function stopTypewriterLoop(r) {
+  if (r.twLoopId != null) {
+    cancelAnimationFrame(r.twLoopId);
+    r.twLoopId = null;
+  }
+}
+
+/** 匀速 1 字/步，不根据 backlog 加速 */
+function advanceTypewriterStep(r) {
+  const text = r.draftText || '';
+  const tw = r.twState;
+  if (!tw || tw.shown >= text.length) return false;
+  const now = Date.now();
+  if (tw._lastAdv == null) tw._lastAdv = now;
+  if (now - tw._lastAdv < TW_MS_PER_CHAR) return false;
+  tw._lastAdv = now;
+  tw.shown += 1;
+  return true;
+}
+
+function ensureTypewriterLoop(sess) {
+  const r = rt(sess);
+  if (!isActive(sess) || r.twLoopId != null) return;
+  if (!r.twState) r.twState = { shown: 0 };
+  const tick = () => {
+    r.twLoopId = null;
+    if (!isActive(sess) || !r.draftEl || !r.twState) return;
+    const text = r.draftText || '';
+    const tw = r.twState;
+    if (tw.shown > text.length) tw.shown = text.length;
+    const behind = text.length - tw.shown;
+    if (!isDraftInteractFrozen(r)) {
+      if (behind > 0) advanceTypewriterStep(r);
+      if (tw.shown > (r.draftRichUpTo || 0)) {
+        updatePlainTail(r);
+        maybeScheduleRichSync(r);
+      } else if (!behind && text.length && tw.shown > (r.draftRichUpTo || 0)) {
+        syncDraftRich(r, { force: true });
+      }
+    }
+    if (rt(sess).busy || behind > 0) {
+      r.twLoopId = requestAnimationFrame(tick);
+    } else if (text.length && !isDraftInteractFrozen(r)) {
+      syncDraftRich(r, { force: true });
+    }
+  };
+  r.twLoopId = requestAnimationFrame(tick);
+}
+
+function renderDraft(sess) {
+  if (!isActive(sess)) return;
+  ensureDraftEl(sess);
+  if (!rt(sess).twState) rt(sess).twState = { shown: 0 };
+  ensureTypewriterLoop(sess);
+  refreshEmptyState(sess);
+}
+
+function renderDraftFull(sess) {
+  const r = ensureDraftEl(sess);
+  if (!isActive(sess)) return;
+  stopTypewriterLoop(r);
+  const full = r.draftText || '';
+  r.twState = { shown: full.length };
+  invalidateDraftRich(r);
+  getDraftBubble(r);
+  syncDraftRich(r, { force: true });
+  refreshEmptyState(sess);
+}
+
 function flushTypewriter(sess) {
   const r = rt(sess);
-  r.draftRecoverPending = false;
-  if (r.twState) {
-    if (r.twState.timer) clearInterval(r.twState.timer);
-    r.twState = null;
-  }
+  stopTypewriterLoop(r);
+  invalidateDraftRich(r);
+  r.twState = null;
 }
 
 /* ═══════════════ 运行状态 ═══════════════ */
@@ -2009,7 +2110,9 @@ function formatTaskElapsed(ms) {
 
 function ensureTaskElapsedBadge(wrap, startedAt, endedAt) {
   if (!wrap || !startedAt) return null;
-  let badge = wrap.querySelector(':scope > .task-elapsed');
+  const badges = wrap.querySelectorAll(':scope > .task-elapsed');
+  let badge = badges[0] || null;
+  for (let i = 1; i < badges.length; i++) badges[i].remove();
   if (!badge) {
     badge = document.createElement('div');
     badge.className = 'task-elapsed';
@@ -2037,7 +2140,7 @@ function startTaskTimer(sess) {
   if (r.taskTimerId) clearInterval(r.taskTimerId);
   r.taskTimerId = setInterval(() => {
     if (!r.taskStartedAt) return;
-    const el = r.draftEl || document.querySelector('.msg-list .msg.assistant:last-child');
+    const el = r.draftEl || ensureMsgs()?.querySelector('.msg.assistant:last-child');
     if (el) ensureTaskElapsedBadge(el, r.taskStartedAt, null);
     // 更新左上角状态栏显示实时耗时
     if (isActive(sess)) {
@@ -2168,22 +2271,39 @@ async function newSession() {
   saveSessions();
   renderSessionList();
 }
+function resetChatDraftRuntime(sess) {
+  const r = rt(sess);
+  flushTypewriter(sess);
+  r.draftEl = null;
+  r.draftText = '';
+  r.draftFreezeUntil = 0;
+}
+function syncSeenFromMessages(sess) {
+  const r = rt(sess);
+  r.seen = new Set();
+  r.lastId = 0;
+  for (const m of sess.messages || []) {
+    if (m.id != null) {
+      r.seen.add(m.id);
+      r.lastId = Math.max(r.lastId, m.id);
+    }
+  }
+}
 function setActiveSession(id) {
   state.activeId = id;
   if (id) localStorage.setItem('ga_active', id);  // 持久化当前会话，刷新后固定恢复它
   const sess = state.sessions.get(id);
   if (!sess) return;
+  resetChatDraftRuntime(sess);
+  rt(sess).bridgePollPrimed = false;
+  syncSeenFromMessages(sess);
   if (msgsEl) msgsEl.innerHTML = '';
-  rt(sess).draftEl = null;
   renderAllMessages(sess);
   setBusy(sess, rt(sess).busy);
   renderSessionList();
-  applyPlanPayload(sess, null);
+  applyPlanPayload(sess, rt(sess).planCache);
   syncPlanPollTimer();
-  if (sess.bridgeSessionId && state.bridgeReady) {
-    if (!sess.messages.length) pollSession(sess);
-    else planPoll(sess);
-  }
+  if (sess.bridgeSessionId && state.bridgeReady) syncSessionFromBridge(sess);
 }
 async function closeSession(id) {
   const sess = state.sessions.get(id);
@@ -2299,7 +2419,8 @@ newConvBtn.addEventListener('click', (e) => { e.preventDefault(); newSession(); 
 
 /* ═══════════════ 轮询 + 流式 ═══════════════ */
 function normalize(m) {
-  const o = { id: Number(m.id || 0), role: m.role || 'system', content: m.content || '' };
+  const o = { role: m.role || 'system', content: m.content || '' };
+  if (m.id != null && m.id !== '') o.id = Number(m.id);
   if (typeof m.display === 'string' && m.display.length) o.display = m.display;
   if (m.stopped) o.stopped = true;
   if (m.images) o.images = m.images;
@@ -2307,21 +2428,95 @@ function normalize(m) {
   if (m.ts) o.ts = m.ts;
   return o;
 }
+
+function clearPartialDraft(sess) {
+  const r = rt(sess);
+  flushTypewriter(sess);
+  r.draftText = '';
+  if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; }
+}
+
+/** 刷新/首次 hydrate：一次性灌入历史消息并全量渲染，避免逐条 append + 打字机重播 */
+function ingestPollBatch(sess, result) {
+  const r = rt(sess);
+  flushTypewriter(sess);
+  sess.messages = [];
+  r.seen.clear();
+  r.lastId = 0;
+  for (const raw of (result.messages || [])) {
+    const m = normalize(raw);
+    if (m.id == null || r.seen.has(m.id)) continue;
+    r.seen.add(m.id);
+    r.lastId = Math.max(r.lastId, m.id);
+    sess.messages.push(m);
+  }
+  if (isActive(sess)) {
+    r.draftEl = null;
+    renderAllMessages(sess);
+  }
+  if (result.partial) applyPartialDraft(sess, result.partial, { hydrate: true });
+  else clearPartialDraft(sess);
+  applyPlanPayload(sess, result.plan);
+}
+
+/** poll 只灌 draftText；刷新 hydrate 全量渲染；平时由打字机追 shown */
+function applyPartialDraft(sess, raw, { hydrate = false } = {}) {
+  const m = normalize(raw);
+  if (m.role !== 'assistant') return;
+  const r = rt(sess);
+  const prevLen = (r.draftText || '').length;
+  r.draftText = m.content || '';
+  if (!isActive(sess)) return;
+  if (hydrate) {
+    renderDraftFull(sess);
+    return;
+  }
+  ensureDraftEl(sess);
+  if (!r.twState) r.twState = { shown: 0 };
+  if (r.draftText.length < prevLen) {
+    r.twState.shown = Math.min(r.twState.shown, r.draftText.length);
+    invalidateDraftRich(r);
+  }
+  ensureTypewriterLoop(sess);
+}
+
+function syncSessionFromBridge(sess) {
+  if (!sess?.bridgeSessionId || !state.bridgeReady) return;
+  const r = rt(sess);
+  if (r.polling) return;
+  r.bridgePollPrimed = false;
+  pollSession(sess);
+}
+
 function upsert(sess, raw, partial) {
   const m = normalize(raw); const r = rt(sess);
   if (partial && m.role === 'assistant') {
-    const wasEmpty = !(r.draftText || '').length;
     r.draftText = m.content;
-    const tw = r.twState;
-    if (wasEmpty && r.draftText.length >= TW_RECOVER_MIN && (!tw || tw.shown === 0)) {
-      r.draftRecoverPending = true;
+    if (!r.twState) r.twState = { shown: 0 };
+    if (isActive(sess)) {
+      ensureDraftEl(sess);
+      ensureTypewriterLoop(sess);
     }
-    if (isActive(sess)) renderDraft(sess);
     return;
   }
-  if (!m.id || r.seen.has(m.id)) return;
+  if (m.id == null) return;
+  if (r.seen.has(m.id)) return;
+  // 乐观插入的 user 消息无 id，用 bridge 回包 id 认领，避免重复一轮
+  if (m.role === 'user') {
+    for (let i = sess.messages.length - 1; i >= 0; i--) {
+      const prev = sess.messages[i];
+      if (prev.role !== 'user') break;
+      if (prev.id == null) {
+        prev.id = m.id;
+        if (m.ts) prev.ts = m.ts;
+        r.seen.add(m.id);
+        r.lastId = Math.max(r.lastId, m.id);
+        return;
+      }
+    }
+  }
   r.seen.add(m.id); r.lastId = Math.max(r.lastId, m.id);
-  if (m.role === 'assistant' && r.draftEl) { flushTypewriter(sess); r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
+  if (m.role === 'assistant') clearPartialDraft(sess);
   sess.messages.push(m); appendMessage(sess, m);
   saveSessions();
 }
@@ -2342,14 +2537,29 @@ async function pollSession(sess) {
         if (res?.error) throw new Error(res.error.message || res.error);
         consecutiveErrors = 0;
         const result = res.result || res;
-        for (const msg of (result.messages || [])) upsert(sess, msg, false);
-        if (result.partial) upsert(sess, result.partial, true);
+        const batchMsgs = result.messages || [];
+        if (!r.bridgePollPrimed) {
+          r.bridgePollPrimed = true;
+          if (batchMsgs.length && !sess.messages.length) {
+            ingestPollBatch(sess, result);
+          } else {
+            for (const msg of batchMsgs) upsert(sess, msg, false);
+            const resuming = sess.messages.length > 0;
+            if (result.partial) applyPartialDraft(sess, result.partial, { hydrate: resuming });
+            else clearPartialDraft(sess);
+            applyPlanPayload(sess, result.plan);
+          }
+        } else {
+          for (const msg of batchMsgs) upsert(sess, msg, false);
+          if (result.partial) applyPartialDraft(sess, result.partial);
+          else clearPartialDraft(sess);
+          applyPlanPayload(sess, result.plan);
+        }
         const busy = result.status === 'running' || !!result.partial;
         setBusy(sess, busy);
-        if (isActive(sess)) applyPlanPayload(sess, result.plan);
         if (busy) await new Promise(z => setTimeout(z, 500));
         else {
-          if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
+          clearPartialDraft(sess);
           break;
         }
       } catch (innerErr) {
@@ -2382,9 +2592,7 @@ function removeUsedPendingFiles(usedFiles) {
 }
 
 function clearDraft(sess) {
-  flushTypewriter(sess);
-  const r = rt(sess);
-  if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
+  clearPartialDraft(sess);
 }
 
 async function waitSessionIdle(sess, maxMs = 4000) {
@@ -2487,7 +2695,11 @@ async function sendPrompt(text) {
     if (res?.error) throw new Error(res.error.message || res.error);
     removeUsedPendingFiles(usedFiles);
     const uid = Number(res.userMessageId || res.result?.userMessageId || 0);
-    if (uid) { r.seen.add(uid); r.lastId = Math.max(r.lastId, uid); }
+    if (uid) {
+      userMsg.id = uid;
+      r.seen.add(uid);
+      r.lastId = Math.max(r.lastId, uid);
+    }
     pollSession(sess);
     return true;
   } catch (e) {
@@ -2534,15 +2746,7 @@ async function submitInput() {
     syncAskUserUi();
   }
 }
-sendBtn.addEventListener('click', (e) => {
-  e.preventDefault();
-  const sess = activeSess();
-  if (sess && rt(sess).busy) { cancelPrompt(); return; }  // 运行中：发送键是录制键 → 纯停止
-  submitInput();
-});
-inputEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); submitInput(); }
-});
+// 聊天输入框 send/Enter/plus 菜单 — chatComposer IIFE（与 Conductor collabComposer 同构）
 // 输入框的 input/paste 监听统一在 bindComposerUpload(ctx) 里绑(chat + collab 通用)
 function showSystem(text) {
   const sess = activeSess(); if (!sess) return;
@@ -2754,6 +2958,7 @@ function renderModelMenu(menuEl) {
 function openModelMenu(chipEl, menuEl) {
   if (!chipEl || !menuEl) return;
   if (typeof convMenu !== 'undefined' && convMenu) convMenu.hidden = true;
+  window.chatComposer?.closeMenu?.();
   window.collabComposer?.closeMenu?.();
   closeAllModelMenus();
   renderModelMenu(menuEl);
@@ -2796,13 +3001,16 @@ if (collabModelChip) collabModelChip.addEventListener('click', (e) => {
 document.addEventListener('click', (e) => {
   if (e.target.closest('#model-menu') || e.target.closest('#model-chip') ||
       e.target.closest('#cdb-model-menu') || e.target.closest('#cdb-model-chip') ||
+      e.target.closest('#chat-menu') || e.target.closest('#chat-plus-btn') ||
       e.target.closest('#cdb-menu') || e.target.closest('#cdb-plus-btn')) return;
   closeAllModelMenus();
+  window.chatComposer?.closeMenu?.();
   window.collabComposer?.closeMenu?.();
 });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeAllModelMenus();
+    window.chatComposer?.closeMenu?.();
     window.collabComposer?.closeMenu?.();
   }
 });
@@ -2884,9 +3092,7 @@ if (addModelForm) addModelForm.addEventListener('submit', async (e) => {
 const MAX_UPLOAD_FILES = 10;
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
 const IMG_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
-const imgInput = document.getElementById('img-input');
 const thumbStrip = document.getElementById('thumb-strip');
-const uploadBtn = document.getElementById('upload-btn');
 const chatPanel = document.querySelector('main.main');
 let activeFileComposer = 'chat';
 
@@ -2903,7 +3109,13 @@ function composerCfg(ctx = activeFileComposer) {
       dropZone: document.querySelector('.page[data-page="collab"]'),
     };
   }
-  return { input: inputEl, strip: thumbStrip, uploadBtn, imgInput, dropZone: chatPanel };
+  return {
+    input: inputEl,
+    strip: thumbStrip,
+    uploadBtn: null,
+    imgInput: document.getElementById('chat-file-input'),
+    dropZone: chatPanel,
+  };
 }
 
 function renderThumbStrip(ctx = activeFileComposer) {
@@ -3261,16 +3473,20 @@ if (chatPanel) {
 }
 
 /* ═══════════════ bridge 事件 ═══════════════ */
+window.ga.onPageVisible(() => {
+  const sess = activeSess();
+  if (sess) syncSessionFromBridge(sess);
+});
+
 window.ga.onBridgeReady(async () => {
   state.bridgeReady = true;
-  syncPlanPollTimer();
   if (!state.activeId) { refreshStatusLabel(); refreshEmptyState(null); }
   await loadModelProfiles();
   await loadBridgeConfig();
   if (isServicesPageActive()) renderChannelList(gaServiceStore.list());
   const sess = activeSess();
-  if (sess && sess.bridgeSessionId && !sess.messages.length) await pollSession(sess);
-  else if (sess) planPoll(sess);
+  if (sess) syncSessionFromBridge(sess);
+  syncPlanPollTimer();
   delete document.documentElement.dataset.bootHasSessions;
   if (sess) refreshEmptyState(sess);
 });
@@ -3290,7 +3506,6 @@ window.ga.onBridgeNotification((msg) => {
 window.ga.onBridgeError((err) => { console.warn('[bridge error]', err); });
 window.ga.onBridgeClosed(() => {
   state.bridgeReady = false;
-  syncPlanPollTimer();
   const s = activeSess();
   if (s) applyPlanPayload(s, null);
   chatStatus.setDisconnected();
@@ -4049,7 +4264,7 @@ function showChanToast(title, detail, kind) {
   // Wait for DOM ready
   function setup() {
     // Contenteditable inputs (chat + collab)
-    const chatInput = document.querySelector('.input[contenteditable][data-i18n-ph="composer.placeholder"]');
+    const chatInput = document.getElementById('chat-input');
     const collabInput = document.getElementById('cdb-input');
     bindContentEditableLimit(chatInput, 20000);
     bindContentEditableLimit(collabInput, 20000);
@@ -4372,6 +4587,86 @@ chatStatus.setConnecting();
 window.ga.startBridge && window.ga.startBridge();
 })();
 
+/* 聊天输入框 — 与 Conductor collabComposer 同构（inset + 加号菜单 + Enter 发送） */
+(function () {
+  'use strict';
+  const root = document.getElementById('chat-composer');
+  if (!root) return;
+
+  const input = document.getElementById('chat-input');
+  const fileInput = document.getElementById('chat-file-input');
+  const plusBtn = document.getElementById('chat-plus-btn');
+  const menu = document.getElementById('chat-menu');
+  const sendBtnEl = document.getElementById('send-btn');
+
+  function closeMenu() {
+    if (!menu) return;
+    menu.hidden = true;
+    if (plusBtn) plusBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function openMenu() {
+    if (!menu || !plusBtn) return;
+    closeAllModelMenus?.();
+    window.collabComposer?.closeMenu?.();
+    menu.hidden = false;
+    plusBtn.setAttribute('aria-expanded', 'true');
+  }
+
+  function toggleMenu() {
+    if (!menu) return;
+    if (menu.hidden) openMenu();
+    else closeMenu();
+  }
+
+  function doSend() {
+    const sess = activeSess();
+    if (sess && rt(sess).busy) { cancelPrompt(); return; }
+    submitInput();
+  }
+
+  function bindOnce() {
+    if (root.dataset.bound) return;
+    root.dataset.bound = '1';
+
+    plusBtn?.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleMenu();
+    });
+
+    menu?.addEventListener('click', (e) => {
+      const item = e.target.closest('.ga-menu-item');
+      if (!item) return;
+      e.stopPropagation();
+      closeMenu();
+      if (item.id === 'chat-menu-upload') {
+        window.gaSetActiveFileComposer?.('chat');
+        fileInput?.click();
+        return;
+      }
+      if (item.id === 'chat-menu-preset') {
+        openModal('preset-modal');
+      }
+    });
+
+    input?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+        e.preventDefault();
+        doSend();
+      }
+    });
+
+    sendBtnEl?.addEventListener('click', (e) => {
+      e.preventDefault();
+      doSend();
+    });
+  }
+
+  bindOnce();
+  window.chatComposer = { closeMenu, focus: () => input?.focus() };
+})();
+
 /* Conductor 输入框 — 与主聊天 composer 解耦（cdb-* DOM，便于日后抽离） */
 (function () {
   'use strict';
@@ -4406,6 +4701,7 @@ window.ga.startBridge && window.ga.startBridge();
   function openMenu() {
     if (!menu || !plusBtn) return;
     closeAllModelMenus?.();
+    window.chatComposer?.closeMenu?.();
     menu.hidden = false;
     plusBtn.setAttribute('aria-expanded', 'true');
   }
