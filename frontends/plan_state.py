@@ -224,6 +224,15 @@ def default_session_plan_path(session_id: str) -> str:
     return f"temp/plan_{sid}/plan.md"
 
 
+def is_session_scoped_plan_path(path: str, session_id: str) -> bool:
+    """Desktop: only bind/adopt paths under this session's plan_{id}/ tree."""
+    if not path:
+        return False
+    sid = (session_id or "sess").replace("/", "_")
+    norm = path.replace("\\", "/").lstrip("./")
+    return f"plan_{sid}/" in norm or norm.endswith(f"plan_{sid}/plan.md")
+
+
 def is_plan_preset_prompt(prompt: str) -> bool:
     p = (prompt or "").lower()
     return "plan_sop" in p or "plan 模式" in p or "plan mode" in p
@@ -248,12 +257,11 @@ def sync_plan_path_from_text(sess: Any, text: str, root: str) -> None:
     raw = m.group(1).strip().strip("\"'")
     if not raw:
         return
-    if _resolve_stashed_at(raw, root) or not getattr(sess, "plan_path", ""):
-        sess.plan_path = raw.lstrip("./")
+    sess.plan_path = raw.lstrip("./")
 
 
 def session_plan_active(sess: Any, agent, messages, start_idx: int, root: str) -> bool:
-    """Active only when this session has a bound plan_path (not any plan_*/plan.md on disk)."""
+    """Desktop: active when this session has a bound plan_path (not global plan_*/ scan)."""
     bound = (getattr(sess, "plan_path", None) or "").strip()
     if not bound:
         return False
@@ -261,8 +269,10 @@ def session_plan_active(sess: Any, agent, messages, start_idx: int, root: str) -
         return True
     if _resolve_stashed_at(bound, root):
         return True
-    # Placeholder: plan preset submitted, assistant still booting plan mode
     if getattr(sess, "status", "") == "running":
+        return True
+    # Plan preset bound this session — keep placeholder until plan.md appears or path changes
+    if is_session_scoped_plan_path(bound, getattr(sess, "id", "")):
         return True
     return False
 
@@ -271,6 +281,17 @@ def session_plan_resolve(bound: str, root: str) -> Optional[str]:
     if not bound:
         return None
     return _resolve_stashed_at(bound.strip(), root)
+
+
+def _desktop_resolve_plan_file(sess: Any, bound: str, root: str, agent, messages, base: int) -> Optional[str]:
+    """Desktop read path: bound → agent stash → per-session message scan."""
+    path = session_plan_resolve(bound, root)
+    if path:
+        return path
+    if agent and (stash := _stashed_plan_path(agent)):
+        if p := _resolve_stashed_at(stash, root):
+            return p
+    return _find_path_at(messages, base, root)
 
 
 def desktop_plan_payload_from_session(sess: Any, ga_root: str = "") -> dict:
@@ -284,16 +305,17 @@ def desktop_plan_payload_from_session(sess: Any, ga_root: str = "") -> dict:
     partial = getattr(sess, "partial", None)
     if isinstance(partial, dict) and isinstance(partial.get("content"), str):
         sync_plan_path_from_text(sess, partial["content"], root)
+    sid = getattr(sess, "id", "") or ""
     if not (getattr(sess, "plan_path", None) or "").strip():
-        # Legacy sessions: adopt path only mentioned in this session's messages[baseline:]
         mentioned = plan_path_mention_in_messages(raw, base)
-        if mentioned:
+        if mentioned and is_session_scoped_plan_path(mentioned, sid):
             sess.plan_path = mentioned.lstrip("./")
         else:
             return {"active": False}
     if not session_plan_active(sess, agent, raw, base, root):
         return {"active": False}
-    path = session_plan_resolve(getattr(sess, "plan_path", ""), root)
+    bound = getattr(sess, "plan_path", "") or ""
+    path = _desktop_resolve_plan_file(sess, bound, root, agent, raw, base)
     items = []
     if path:
         try:

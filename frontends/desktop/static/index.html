@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>GenericAgent</title>
 <link rel="stylesheet" href="assets/fonts/fonts.css">
-<link rel="stylesheet" href="styles.css?v=112">
+<link rel="stylesheet" href="styles.css?v=117">
 <!-- KaTeX: LaTeX 公式渲染 -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
 <!-- highlight.js: 代码高亮 -->
@@ -124,8 +124,10 @@
               <span data-i18n="chat.interrupting"></span>
             </div>
           </div>
-          <div class="plan-bar" id="plan-bar" hidden aria-live="polite"></div>
-          <div class="composer" id="chat-composer">
+          <div class="composer-anchor" id="chat-composer-anchor">
+            <div class="composer" id="chat-composer">
+            <div class="composer-slot">
+            <div class="plan-card" id="plan-bar" hidden aria-live="polite"></div>
             <div class="composer-inset">
               <div class="thumb-strip" id="thumb-strip" hidden></div>
               <div class="input" id="chat-input" contenteditable="true" role="textbox" aria-multiline="true" data-i18n-ph="composer.placeholder"></div>
@@ -152,8 +154,10 @@
                 </button>
               </div>
             </div>
+            </div>
             <div class="ga-menu" id="model-menu" hidden></div>
             <input type="file" id="chat-file-input" multiple hidden>
+            </div>
           </div>
         </section>
 
@@ -584,6 +588,6 @@
 <!-- highlight.js -->
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" crossorigin="anonymous"></script>
 <script src="phosphor-icons.js"></script>
-<script src="app.js?v=154"></script>
+<script src="app.js?v=159"></script>
 </body>
 </html>

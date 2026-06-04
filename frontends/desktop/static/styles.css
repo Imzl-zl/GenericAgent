@@ -1198,28 +1198,227 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
 .ctx-item.danger{ color:var(--danger); }
 .ctx-item.danger:hover{ background:var(--danger-bg); }
 
-/* Plan todo 卡片：消息区与输入框之间（对齐 TUI #planbar） */
-.plan-bar{
+/* Plan 卡片：吸附在输入框左上方（半悬浮窄卡） */
+.composer-anchor{
+  position:relative;
   flex:0 0 auto;
-  margin:0 16px 8px;
-  padding:10px 12px;
-  border-left:3px solid var(--ok);
-  background:color-mix(in srgb, var(--ok) 8%, var(--card));
+  padding:0 16px 16px;
+  background:var(--panel);
+}
+.composer-anchor > .composer{
+  padding:0;
+  background:transparent;
+}
+.composer-slot{
+  position:relative;
+  width:100%;
+}
+.plan-card{
+  position:absolute;
+  left:10px;
+  bottom:100%;
+  margin-bottom:0;
+  z-index:13;
+  width:min(600px, calc(68% - 10px));
+  min-width:280px;
+  max-width:calc(68% - 10px);
+  box-sizing:border-box;
   font-size:12px;
   line-height:1.45;
   color:var(--txt);
-  max-height:7.5em;
-  overflow:hidden;
+  pointer-events:auto;
 }
-.plan-bar[hidden]{ display:none !important; }
-.plan-head{ font-weight:700; color:var(--ok); margin-bottom:4px; }
-.plan-step{ color:var(--muted); margin-bottom:4px; }
-.plan-wait{ color:var(--muted2); padding-left:1.25em; }
-.plan-item{ display:flex; gap:6px; align-items:flex-start; margin-top:2px; }
-.plan-item--done{ color:var(--muted); }
-.plan-mark{ flex:0 0 auto; width:1.2em; }
-.plan-text{ flex:1 1 auto; word-break:break-word; }
-.plan-more{ color:var(--muted2); margin-top:4px; }
+.plan-card[hidden]{ display:none !important; }
+.plan-card--expanded{
+  padding:10px 12px 8px;
+  background:var(--card);
+  border:1px solid var(--line);
+  border-bottom:none;
+  border-left:3px solid var(--accent);
+  border-radius:var(--radius-sm) var(--radius-sm) 0 0;
+  box-shadow:0 -4px 16px #14192812, 0 -1px 0 var(--line) inset;
+}
+.plan-card--collapsed{
+  width:auto;
+  min-width:0;
+  max-width:min(520px, 70%);
+  margin-bottom:0;
+}
+/* 吸附：卡片底与输入框顶共边，视觉上连成一体 */
+.composer-slot:has(.plan-card:not([hidden])) .composer-inset{
+  border-top-left-radius:0;
+  border-top-right-radius:0;
+}
+.composer-slot:has(.plan-card--collapsed:not([hidden])) .plan-capsule{
+  border-radius:var(--radius-sm) var(--radius-sm) 0 0;
+  border-bottom:1px solid var(--line);
+  box-shadow:0 -4px 12px #14192810;
+}
+.plan-card-head{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin-bottom:6px;
+}
+.plan-status-dot{
+  flex:0 0 auto;
+  width:7px; height:7px;
+  border-radius:50%;
+  background:var(--accent);
+}
+.plan-card--complete .plan-status-dot{ background:var(--success); }
+.plan-card--placeholder .plan-status-dot{
+  animation:plan-dot-pulse 1.4s ease-in-out infinite;
+}
+@keyframes plan-dot-pulse{
+  0%,100%{ opacity:1; transform:scale(1); }
+  50%{ opacity:.55; transform:scale(.92); }
+}
+.plan-title{
+  flex:1 1 auto;
+  font-weight:700;
+  font-size:12px;
+  color:var(--txt-strong);
+  min-width:0;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.plan-progress{
+  flex:0 0 auto;
+  font-weight:700;
+  font-size:12px;
+  color:var(--accent);
+  font-family:var(--font-num);
+  font-variant-numeric:var(--font-num-variant);
+}
+.plan-card--complete .plan-progress{ color:var(--success); }
+.plan-head-actions{
+  flex:0 0 auto;
+  display:flex;
+  align-items:center;
+  gap:4px;
+}
+.plan-btn{
+  border:0;
+  background:transparent;
+  padding:2px 6px;
+  font-size:11px;
+  font-weight:600;
+  color:var(--accent);
+  cursor:pointer;
+  border-radius:var(--radius-sm);
+  font-family:var(--font-body-en);
+}
+.plan-btn:hover{ background:var(--accent-soft); }
+.plan-current{
+  display:flex;
+  gap:4px;
+  align-items:flex-start;
+  margin-bottom:8px;
+  padding-left:15px;
+}
+.plan-current-label{
+  flex:0 0 auto;
+  color:var(--muted);
+  font-size:11px;
+}
+.plan-current-text{
+  flex:1 1 auto;
+  color:var(--accent);
+  font-weight:600;
+  word-break:break-word;
+}
+.plan-card--complete .plan-current-text{ color:var(--success); }
+.plan-wait{
+  color:var(--muted2);
+  padding:0 0 4px 15px;
+  font-size:11px;
+}
+.plan-items{
+  list-style:none;
+  margin:0;
+  padding:0 0 4px 15px;
+}
+.plan-item{
+  display:flex;
+  gap:6px;
+  align-items:flex-start;
+  margin-top:3px;
+}
+.plan-item-mark{
+  flex:0 0 auto;
+  width:1.1em;
+  text-align:center;
+  line-height:1.45;
+}
+.plan-item-text{
+  flex:1 1 auto;
+  word-break:break-word;
+}
+.plan-item--done .plan-item-mark,
+.plan-item--done .plan-item-text{
+  color:var(--muted);
+  opacity:.75;
+}
+.plan-item--done .plan-item-text{ text-decoration:line-through; }
+.plan-item--current .plan-item-mark{ color:var(--accent); }
+.plan-item--current .plan-item-text{ color:var(--accent); font-weight:600; }
+.plan-item--pending .plan-item-mark,
+.plan-item--pending .plan-item-text{ color:var(--muted); }
+.plan-item--error .plan-item-mark,
+.plan-item--error .plan-item-text{ color:var(--danger); }
+.plan-item--warn .plan-item-mark,
+.plan-item--warn .plan-item-text{ color:#c67600; }
+html[data-appearance="dark"] .plan-item--warn .plan-item-mark,
+html[data-appearance="dark"] .plan-item--warn .plan-item-text{ color:#f0a020; }
+.plan-foot{
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+  padding-top:4px;
+  border-top:1px solid var(--line-soft);
+  margin-top:4px;
+}
+.plan-more-hint{
+  flex:1 1 auto;
+  align-self:center;
+  font-size:11px;
+  color:var(--muted2);
+  text-align:left;
+}
+.plan-capsule{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  max-width:100%;
+  padding:6px 12px;
+  border:1px solid var(--line);
+  border-left:3px solid var(--accent);
+  border-radius:999px;
+  background:var(--card);
+  cursor:pointer;
+  font-size:12px;
+  font-weight:600;
+  color:var(--txt);
+  box-shadow:var(--shadow);
+  font-family:var(--font-body-en);
+}
+.plan-capsule:hover{ border-color:var(--line-strong); background:var(--field-bg); }
+.plan-capsule-text{
+  min-width:0;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  color:var(--txt-2);
+}
+.plan-capsule-text em{
+  font-style:normal;
+  color:var(--accent);
+  font-weight:700;
+}
+.plan-card--complete .plan-capsule{ border-left-color:var(--success); }
+.plan-card--complete .plan-capsule-text em{ color:var(--success); }
 
 /* ─── chat composer: Plan/Auto toggle ─── */
 .chip.on{
