@@ -1968,23 +1968,30 @@ function flushTypewriter(sess) {
 function pageStatusBar(btnEl) {
   const label = btnEl?.querySelector('.rs-label');
   return {
-    set(text, busy = false) {
+    /** state: 'ready' | 'busy' | 'offline' | 'connecting'；兼容旧调用 set(text, true) */
+    set(text, state = 'ready') {
       if (!btnEl) return;
-      btnEl.classList.toggle('busy', !!busy);
+      const mode = state === true ? 'busy' : (state === false ? 'ready' : state);
+      btnEl.classList.remove('busy', 'offline', 'connecting');
+      if (mode === 'busy') btnEl.classList.add('busy');
+      else if (mode === 'offline') btnEl.classList.add('offline');
+      else if (mode === 'connecting') btnEl.classList.add('connecting');
       if (label) label.textContent = text ?? '';
     },
-    setBusy(text) { this.set(text, true); },
-    setReady() { this.set(t('status.ready')); },
-    setDisconnected() { this.set(t('status.disconnected')); },
-    setConnecting() { this.set(t('status.connecting')); },
+    setBusy(text) { this.set(text, 'busy'); },
+    setReady() { this.set(t('status.ready'), 'ready'); },
+    setDisconnected() { this.set(t('status.disconnected'), 'offline'); },
+    setConnecting() { this.set(t('status.connecting'), 'connecting'); },
   };
 }
 function refreshStatusLabel() {
   const s = activeSess();
   if (s && rt(s).busy) {
     chatStatus.setBusy(formatTaskElapsed(Date.now() - (rt(s).taskStartedAt || Date.now())));
+  } else if (state.bridgeReady) {
+    chatStatus.setReady();
   } else {
-    chatStatus.set(state.bridgeReady ? t('status.ready') : t('status.disconnected'));
+    chatStatus.setDisconnected();
   }
 }
 
@@ -2052,8 +2059,10 @@ function setBusy(sess, busy) {
   if (!isActive(sess)) return;
   if (busy) {
     chatStatus.setBusy(formatTaskElapsed(Date.now() - (r.taskStartedAt || Date.now())));
+  } else if (state.bridgeReady) {
+    chatStatus.setReady();
   } else {
-    chatStatus.set(state.bridgeReady ? t('status.ready') : t('status.disconnected'));
+    chatStatus.setDisconnected();
   }
   if (sendBtn) {
     sendBtn.classList.toggle('is-stop', busy);
@@ -4479,13 +4488,17 @@ window.ga.startBridge && window.ga.startBridge();
     .replace(/\[(Image|File)\s+#\d+\]\s*/g, '')
     .replace(/[^\s]*desktop_uploads[^\s]*\s*/g, '')  // 兜底:去掉内联的本地上传路径,避免历史/回显消息把全路径甩出来
     .trim();
-  const ST_ICONS = {
-    running: '<span class="collab-st-ic collab-st-ic--spin" aria-hidden="true"></span>',
-    reported: '<span class="collab-st-ic collab-st-ic--ok" aria-hidden="true">✓</span>',
-    paused: '<span class="collab-st-ic collab-st-ic--pause" aria-hidden="true">⏸</span>',
-    failed: '<span class="collab-st-ic collab-st-ic--warn" aria-hidden="true">!</span>',
-    terminated: '<span class="collab-st-ic collab-st-ic--off" aria-hidden="true">×</span>',
-  };
+  const GA_STATUS_BREATHE_SM = '<span class="ga-status-breathe ga-status-breathe--sm" aria-hidden="true"><span class="ga-status-breathe__ring"></span><span class="ga-status-breathe__core"></span></span>';
+  function collabStatusMark(status) {
+    switch (status) {
+      case 'running': return GA_STATUS_BREATHE_SM;
+      case 'reported': return '<span class="collab-st-ic collab-st-ic--ok" aria-hidden="true">✓</span>';
+      case 'paused': return '<span class="collab-st-ic collab-st-ic--pause" aria-hidden="true">⏸</span>';
+      case 'failed': return '<span class="collab-st-ic collab-st-ic--warn" aria-hidden="true">!</span>';
+      case 'terminated': return '<span class="collab-st-ic collab-st-ic--off" aria-hidden="true">×</span>';
+      default: return '<span class="collab-dot" aria-hidden="true"></span>';
+    }
+  }
   const ST_KEYS = { running: 'collab.stRunning', reported: 'collab.stReported', paused: 'collab.stPaused', failed: 'collab.stFailed', terminated: 'collab.stTerminated' };
 
   const S = {
@@ -4496,7 +4509,7 @@ window.ga.startBridge && window.ga.startBridge();
   };
   let ws, connectTimer, reconnectTick, titleSeq = 0, wsGen = 0, localSeq = 0;
   const titleSeen = new Map();
-  let prevRail = { running: 0, done: 0, count: 0, sig: '' };
+  let prevRail = { running: 0, done: 0, issue: 0, count: 0, sig: '' };
   const prevUpdated = new Map();
   const collabStatus = window.gaPageStatusBar?.($('collab-run-toggle'));
 
@@ -4532,25 +4545,32 @@ window.ga.startBridge && window.ga.startBridge();
 
     const running = S.workers.filter(w => w.status === 'running').length;
     const done = S.workers.filter(w => w.status === 'reported').length;
+    const issue = S.workers.filter(w => w.status === 'failed').length;
     const runBadge = $('collab-rail-run');
     const doneBadge = $('collab-rail-done');
+    const issueBadge = $('collab-rail-issue');
     const runN = $('collab-rail-run-n');
     const doneN = $('collab-rail-done-n');
+    const issueN = $('collab-rail-issue-n');
 
     if (runBadge) runBadge.hidden = running <= 0;
     if (doneBadge) doneBadge.hidden = done <= 0;
+    if (issueBadge) issueBadge.hidden = issue <= 0;
     if (runN) runN.textContent = String(running);
     if (doneN) doneN.textContent = String(done);
+    if (issueN) issueN.textContent = String(issue);
 
     const sig = workerSig(S.workers);
     if (opts.pulse) {
       if (running > prevRail.running || S.workers.length > prevRail.count) pulseEl(runBadge);
       if (done > prevRail.done) pulseEl(doneBadge);
+      if (issue > prevRail.issue) pulseEl(issueBadge);
     } else if (sig !== prevRail.sig) {
       if (running !== prevRail.running) pulseEl(runBadge);
       if (done !== prevRail.done) pulseEl(doneBadge);
+      if (issue !== prevRail.issue) pulseEl(issueBadge);
     }
-    prevRail = { running, done, count: S.workers.length, sig };
+    prevRail = { running, done, issue, count: S.workers.length, sig };
     syncProgressDrawer();
   }
 
@@ -4676,7 +4696,7 @@ window.ga.startBridge && window.ga.startBridge();
     if (empty) empty.hidden = S.workers.length > 0;
     box.innerHTML = S.workers.map(w => `
       <article class="collab-card collab-card--${w.status}" data-sid="${esc(w.id)}">
-        <div class="collab-card-st">${ST_ICONS[w.status] || ''}<span class="collab-dot"></span>${esc(t(ST_KEYS[w.status] || 'collab.stPaused'))}${w.updatedAt ? `<span class="collab-card-time">${esc(relTime(w.updatedAt))}</span>` : ''}</div>
+        <div class="collab-card-st">${collabStatusMark(w.status)}${esc(t(ST_KEYS[w.status] || 'collab.stPaused'))}${w.updatedAt ? `<span class="collab-card-time">${esc(relTime(w.updatedAt))}</span>` : ''}</div>
         <div class="collab-card-title">${esc(w.title)}</div>
         <div class="collab-card-sum">${esc(w.summary)}</div>
       </article>`).join('');
@@ -4705,7 +4725,7 @@ window.ga.startBridge && window.ga.startBridge();
       stats.hidden = !has;
       if (has) {
         stats.innerHTML = [
-          running > 0 ? `<span class="collab-stat collab-stat--running"><span class="collab-rail-spin" aria-hidden="true"></span><span class="n">${running}</span> ${esc(t('collab.statRunning'))}</span>` : '',
+          running > 0 ? `<span class="collab-stat collab-stat--running">${GA_STATUS_BREATHE_SM}<span class="n">${running}</span> ${esc(t('collab.statRunning'))}</span>` : '',
           done > 0 ? `<span class="collab-stat collab-stat--done"><span class="collab-rail-dot" aria-hidden="true"></span><span class="n">${done}</span> ${esc(t('collab.statDone'))}</span>` : '',
         ].filter(Boolean).join('');
       }
