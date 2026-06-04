@@ -1668,15 +1668,14 @@ function applyPlanPayload(sess, raw) {
     } else if (!raw.placeholder && r.planHoldItems.length) {
       if (!r.planLostAt) r.planLostAt = now;
     }
-    const nowComplete = raw.complete && items.length > 0;
+    const nowComplete = !!raw.complete && (items.length > 0 || r.planHoldItems.length > 0);
     const wasComplete = r.planLastComplete;
     if (nowComplete && !wasComplete) r.planCompleteAt = now;
-    else if (!nowComplete) r.planCompleteAt = null;
-    r.planLastComplete = !!nowComplete;
-    if (!nowComplete) {
+    else if (!nowComplete) {
+      r.planCompleteAt = null;
       r.planDismissedComplete = false;
-      if (r.planHideTimer) { clearTimeout(r.planHideTimer); r.planHideTimer = null; }
     }
+    r.planLastComplete = nowComplete;
   } else if (r.planHoldItems.length) {
     if (!r.planLostAt) r.planLostAt = now;
   } else {
@@ -1684,6 +1683,10 @@ function applyPlanPayload(sess, raw) {
   }
 
   if (!isActive(sess)) return;
+  if (raw?.active && raw.complete && (raw.items?.length || r.planHoldItems.length)) {
+    refreshPlanBar(raw);
+    return;
+  }
   refreshPlanBarFromRuntime(sess);
 }
 
