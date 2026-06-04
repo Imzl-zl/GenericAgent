@@ -87,6 +87,7 @@ class Session:
     pinned: bool = False
     untitled: bool = True
     plan_scan_baseline: int = 0
+    plan_path: str = ""
 
 
 def _load_plan_baseline(item: dict, msgs: list) -> int:
@@ -121,7 +122,8 @@ class AgentManager:
                                 "created_at": s.created_at, "updated_at": s.updated_at,
                                 "messages": s.messages, "msg_seq": s.msg_seq,
                                 "pinned": s.pinned, "untitled": s.untitled,
-                                "plan_scan_baseline": s.plan_scan_baseline})
+                                "plan_scan_baseline": s.plan_scan_baseline,
+                                "plan_path": s.plan_path or ""})
             self._sessions_file.write_text(json.dumps(arr, ensure_ascii=False, default=str), encoding="utf-8")
         except Exception as e:
             print(f"[bridge] persist sessions failed: {e}", file=sys.stderr)
@@ -142,6 +144,7 @@ class AgentManager:
                                pinned=item.get("pinned", False),
                                untitled=item.get("untitled", True),
                                plan_scan_baseline=_load_plan_baseline(item, msgs),
+                               plan_path=item.get("plan_path") or "",
                                status="idle", agent=None)
                 self.sessions[sess.id] = sess
             if self.sessions:
@@ -420,6 +423,9 @@ class AgentManager:
             if image_metas:
                 extra["images"] = image_metas
             user_msg = self.add_message(sess, "user", prompt, **extra)
+            import plan_state
+            if plan_state.is_plan_preset_prompt(prompt):
+                plan_state.bind_plan_session(sess, prompt)
             sess.status = "running"
             sess.cancel_requested = False
             sess.last_error = ""
@@ -490,6 +496,8 @@ class AgentManager:
                 # Strip trailing [Info] Final response to user. marker
                 import re as _re
                 full = _re.sub(r'\n*`{5}\n*\[Info\] Final response to user\.\n*`{5}\s*$', '', full)
+                import plan_state
+                plan_state.sync_plan_path_from_text(sess, full, sess.cwd or self.ga_root)
                 self.add_message(sess, "assistant", full)
                 sess.status = "idle"
                 sess.last_error = ""
