@@ -730,6 +730,11 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
 .bubble .fold summary:hover{ color:var(--txt-2); }
 .bubble .fold pre{ margin:0; padding:10px 12px; border:none; background:transparent; font-size:.86em; overflow:auto; }
 .cursor{ display:inline-block; width:7px; height:14px; background:var(--accent); vertical-align:-2px; margin-left:2px; animation:blink 1s steps(2) infinite; }
+.draft-tw-plain{
+  white-space:pre-wrap; word-break:break-word;
+  font-family:inherit; font-size:inherit; line-height:inherit;
+}
+.draft-tw-plain:empty{ display:none; }
 @keyframes blink{ 50%{ opacity:0; } }
 
 /* 预设功能卡片（现在嵌在聊天空状态）*/
@@ -980,7 +985,6 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
   border-top:none;
   background:var(--panel);
 }
-.composer-top{ display:flex; gap:8px; margin-bottom:8px; }
 .chip{
   border:1px solid var(--line); background:transparent; border-radius:0;
   padding:0 11px; min-height:30px; font-size:12px; font-weight:700; color:var(--txt-2); cursor:pointer;
@@ -1013,18 +1017,36 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
 .cb-left .chip:first-child{ border-left:0; border-top-left-radius:4px; border-bottom-left-radius:4px; }
 .cb-left .chip:last-child{ border-right:0; border-top-right-radius:4px; border-bottom-right-radius:4px; }
 .cb-left .chip:only-child{ border-radius:4px; border-right:0; }
-.composer .input{
-  width:100%; min-height:58px; max-height:200px; overflow-y:auto;
+.composer-inset{
+  width:100%;
   border:1px solid var(--line); border-radius:var(--radius);
-  padding:12px 14px; font-size:var(--chat-font); line-height:1.5; outline:none;
-  font-family:inherit; background:var(--card); color:var(--txt);
+  background:var(--card);
+}
+.composer-inset:focus-within{ border-color:var(--accent); }
+.composer-inset .thumb-strip{ padding:8px 12px 0; }
+.composer-inset .input{
+  width:100%; min-height:58px; max-height:200px; overflow-y:auto;
+  border:none; border-radius:0; background:transparent;
+  padding:12px 14px 8px; font-size:var(--chat-font); line-height:1.5; outline:none;
+  font-family:inherit; color:var(--txt);
   white-space:pre-wrap; word-break:break-word;
 }
-.input:focus{ border-color:var(--accent); }
 /* contenteditable 空提示（textarea 的 placeholder 等价物）*/
-.composer .input:empty::before{
+.composer-inset .input:empty::before{
   content:attr(data-ph); color:var(--muted); pointer-events:none;
 }
+.composer-inset .composer-bot{
+  margin-top:0; padding:0 10px 10px; justify-content:flex-start;
+}
+.composer-inset .composer-bot .spacer{ flex:1; }
+.composer-plus-wrap{ position:relative; flex:0 0 auto; }
+.composer-plus-wrap .composer-menu,
+.composer-plus-wrap .cdb-menu{
+  left:0; right:auto; top:auto; bottom:calc(100% + 6px); min-width:180px;
+}
+.composer-plus{ width:34px; height:34px; }
+.composer-inset .composer-bot > #model-chip,
+.composer-inset .composer-bot > #cdb-model-chip{ border-radius:4px; }
 /* 原子附件 chip（像 @人，光标进不去、退格整块删）*/
 .ph-chip{
   display:inline-flex; align-items:center; vertical-align:baseline;
@@ -1032,9 +1054,7 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
   background:color-mix(in srgb, var(--accent) 22%, transparent); color:var(--accent);
   font-size:.9em; white-space:nowrap; user-select:none; cursor:default;
 }
-.composer-bot{ display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:8px; }
-/* 标准模型 chip 紧贴发送键时,给个小圆角避免和方正发送键看起来割裂 */
-.composer-bot > #model-chip{ border-radius:4px; }
+.composer-bot{ display:flex; align-items:center; justify-content:flex-end; gap:8px; }
 .cb-left{
   display:inline-flex; align-items:stretch; gap:0;
   border:1px solid var(--line); border-radius:4px; overflow:hidden;
@@ -1243,9 +1263,11 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
 }
 .ga-menu-item:hover{ background:var(--hover-2); }
 .ga-menu-item.active{ color:var(--accent); }
+.composer-menu .ga-menu-item,
 .cdb-menu .ga-menu-item{
   display:flex; align-items:center; gap:8px;
 }
+.composer-menu .ga-menu-item svg,
 .cdb-menu .ga-menu-item svg{ width:16px; height:16px; flex:0 0 auto; color:var(--icon); }
 
 /* ─── chat composer: image thumb strip ─── */
@@ -1986,27 +2008,6 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
 .page[data-page="collab"] .collab-quick{
   display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px;
 }
-.page[data-page="collab"] .cdb-inset{
-  width:100%;
-  border:1px solid var(--line); border-radius:var(--radius);
-  background:var(--card);
-}
-.page[data-page="collab"] .cdb-inset:focus-within{ border-color:var(--accent); }
-.page[data-page="collab"] .cdb-inset .thumb-strip{ padding:8px 12px 0; }
-.page[data-page="collab"] .cdb-inset .input{
-  border:none; border-radius:0; background:transparent;
-  padding-bottom:8px;
-}
-.page[data-page="collab"] .cdb-inset .composer-bot{
-  margin-top:0; padding:0 10px 10px; justify-content:flex-start;
-}
-.page[data-page="collab"] .cdb-inset .composer-bot .spacer{ flex:1; }
-.page[data-page="collab"] .cdb-plus-wrap{ position:relative; flex:0 0 auto; }
-.page[data-page="collab"] .cdb-plus-wrap .cdb-menu{
-  left:0; right:auto; top:auto; bottom:calc(100% + 6px); min-width:180px;
-}
-.page[data-page="collab"] .cdb-plus{ width:34px; height:34px; }
-.page[data-page="collab"] .cdb-inset .composer-bot > #cdb-model-chip{ border-radius:4px; }
 @media (max-width:900px){
   .collab-guide-steps{ grid-template-columns:repeat(2, minmax(0, 1fr)); gap:40px 32px; }
   .collab-guide-step{ gap:20px; }

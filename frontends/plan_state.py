@@ -182,6 +182,18 @@ def is_complete(items: list[tuple[str, str]]) -> bool:
 
 # --- Desktop bridge only (APIs above unchanged) ---
 _ENTER_PLAN_RE = re.compile(r"""enter_plan_mode\s*\(\s*["']([^"']+)["']""", re.I)
+_PLAN_ARMED_RE = re.compile(r"Plan\s*模式就绪|\[Plan\s*模式|进入\s*Plan\s*模式", re.I)
+
+
+def _desktop_plan_armed(messages, start_idx: int = 0) -> bool:
+    """Plan mode signaled in-stream before the first plan_XXX/plan.md path exists."""
+    for m in reversed(_slice(messages, start_idx)):
+        text = _msg_content(m)
+        if not text:
+            continue
+        if _ENTER_PLAN_RE.search(text) or _PLAN_ARMED_RE.search(text):
+            return True
+    return False
 
 
 def _msg_content(m) -> str:
@@ -228,23 +240,28 @@ def _desktop_plan_path(agent, msgs, root: str, start_idx: int = 0) -> Optional[s
 
 
 def desktop_plan_payload_from_session(sess: Any, ga_root: str = "") -> dict:
-    msgs = [t for t in (_msg_content(m) for m in getattr(sess, "messages", []) or []) if t]
-    if isinstance(p := getattr(sess, "partial", None), dict) and isinstance(c := p.get("content"), str) and c:
-        msgs.append(c)
+    """Per-session plan card facts. Honors `plan_scan_baseline` like TUI (no /continue bleed)."""
+    raw = list(getattr(sess, "messages", []) or [])
+    base = max(0, int(getattr(sess, "plan_scan_baseline", 0) or 0))
+    if base > len(raw):
+        base = len(raw)
     root = (getattr(sess, "cwd", None) or ga_root or "").strip()
     agent = getattr(sess, "agent", None)
-    if not (_stashed_plan_path(agent) or plan_path_mention_in_messages(msgs) or (root and _find_path_at(msgs, 0, root))):
+    if not (is_active(agent, messages=raw, start_idx=base) or _desktop_plan_armed(raw, base)):
         return {"active": False}
-    path = _desktop_plan_path(agent, msgs, root)
+    path = _desktop_plan_path(agent, raw, root, start_idx=base)
     items = []
     if path:
         try:
             items = [{"content": c, "status": st} for c, st in extract(open(path, encoding="utf-8", errors="replace").read())]
         except OSError:
             pass
-    step = current_step(msgs)
+    step_msgs = list(raw[base:])
+    if isinstance(p := getattr(sess, "partial", None), dict) and isinstance(c := p.get("content"), str) and c:
+        step_msgs.append({"content": c})
+    step = current_step(step_msgs, start_idx=0)
     if not items:
-        hp = _stashed_plan_path(agent) or plan_path_mention_in_messages(msgs) or ""
+        hp = _stashed_plan_path(agent) or plan_path_mention_in_messages(raw, base) or ""
         hint = "/".join(hp.replace("\\", "/").rstrip("/").split("/")[-2:]) if hp else "plan.md"
         return {"active": True, "placeholder": True, "done": 0, "total": 0, "complete": False, "step": step, "pathHint": hint, "items": []}
     pairs = [(x["content"], x["status"]) for x in items]
