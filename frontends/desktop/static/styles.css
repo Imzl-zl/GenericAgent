@@ -552,7 +552,7 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
   padding:5px 12px; font-size:12px; color:var(--txt-2); cursor:pointer;
 }
 .pill:hover{ border-color:var(--line-strong); }
-/* 纯状态展示组件（不可点）：就绪=绿，运行中=红 */
+/* 纯状态展示组件（不可点）：就绪/运行中=绿，未连接=红，连接中=灰 */
 .run-state{
   display:flex; align-items:center; gap:9px; height:30px; color:var(--ok);
   font-weight:600; font-size:12px; border:none; background:transparent;
@@ -561,8 +561,60 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
 .run-state .dot{
   width:9px; height:9px; border-radius:50%; background:var(--ok); flex:0 0 auto;
 }
-.run-state.busy{ color:var(--danger); }
-.run-state.busy .dot{ background:var(--danger-dot); }
+.run-state.connecting{ color:var(--muted); }
+.run-state.connecting .dot{ background:var(--muted2); }
+.run-state.offline{ color:var(--danger); }
+.run-state.offline .dot{ background:var(--danger-dot); }
+.run-state.busy{ color:var(--ok); }
+
+/* 呼吸灯：内圈常亮(容器 60%) + 中圈扩散（无转圈） */
+.ga-status-breathe,
+.run-state.busy .dot{
+  --breathe-color:var(--ok);
+  --breathe-box:12px;
+  --breathe-core:calc(var(--breathe-box) * 0.6);
+  position:relative;
+  display:inline-block;
+  width:var(--breathe-box);
+  height:var(--breathe-box);
+  flex:0 0 auto;
+  background:transparent !important;
+  border:none;
+  vertical-align:middle;
+}
+.ga-status-breathe--sm{ --breathe-box:10px; }
+.run-state.busy .dot{
+  width:var(--breathe-box);
+  height:var(--breathe-box);
+}
+.ga-status-breathe__core,
+.run-state.busy .dot::before{
+  content:'';
+  position:absolute;
+  left:50%; top:50%;
+  width:var(--breathe-core); height:var(--breathe-core);
+  transform:translate(-50%,-50%);
+  border-radius:50%;
+  background:var(--breathe-color);
+  z-index:2;
+}
+.ga-status-breathe__ring,
+.run-state.busy .dot::after{
+  content:'';
+  position:absolute;
+  left:50%; top:50%;
+  width:var(--breathe-core); height:var(--breathe-core);
+  transform:translate(-50%,-50%);
+  border-radius:50%;
+  border:1px solid color-mix(in srgb, var(--breathe-color) 52%, transparent);
+  z-index:1;
+  pointer-events:none;
+  animation:ga-status-breathe 1.75s ease-out infinite;
+}
+@keyframes ga-status-breathe{
+  0%{ transform:translate(-50%,-50%) scale(1); opacity:.55; }
+  100%{ transform:translate(-50%,-50%) scale(2.35); opacity:0; }
+}
 .link{ color:var(--accent); cursor:pointer; }
 .muted{ color:var(--muted); }
 .ic-btn{
@@ -679,7 +731,6 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
 .bubble .fold pre{ margin:0; padding:10px 12px; border:none; background:transparent; font-size:.86em; overflow:auto; }
 .cursor{ display:inline-block; width:7px; height:14px; background:var(--accent); vertical-align:-2px; margin-left:2px; animation:blink 1s steps(2) infinite; }
 @keyframes blink{ 50%{ opacity:0; } }
-.run-state.busy .dot{ animation:blink 1s steps(2) infinite; }
 
 /* 预设功能卡片（现在嵌在聊天空状态）*/
 .chat-start{ width:100%; max-width:560px; }
@@ -1729,7 +1780,7 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
 }
 .collab-offline[hidden], .collab-reconnect[hidden], #collab-welcome[hidden], .collab-msgs .msgs[hidden],
 .collab-rail[hidden], .collab-prog-stats[hidden],
-.collab-rail-run[hidden], .collab-rail-done[hidden]{ display:none !important; }
+.collab-rail-run[hidden], .collab-rail-done[hidden], .collab-rail-issue[hidden]{ display:none !important; }
 .collab-offline:not([hidden]), .collab-reconnect:not([hidden]){ display:flex; }
 .collab-reconnect{ background:color-mix(in srgb, var(--accent) 10%, var(--panel)); }
 .page[data-page="collab"] .msg-area.collab-msgs{ position:relative; overflow:hidden; padding:0; }
@@ -1786,13 +1837,24 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
   35%{ transform:scale(1.12); }
   100%{ transform:scale(1); }
 }
+/* 把手运行数：转圈与呼吸上下分开，转圈内不叠绿点 */
 .collab-rail-spin{
-  width:10px; height:10px; border:2px solid color-mix(in srgb, var(--ok) 25%, transparent);
-  border-top-color:var(--ok); border-radius:50%; animation:collab-spin .8s linear infinite;
+  display:block;
+  width:12px; height:12px;
+  margin:0 auto;
+  border-radius:50%;
+  background:transparent;
+  border:2px solid color-mix(in srgb, var(--ok) 22%, transparent);
+  border-top-color:var(--ok);
+  animation:collab-rail-spin .8s linear infinite;
 }
+@keyframes collab-rail-spin{ to{ transform:rotate(360deg); } }
 .collab-rail-dot{ width:6px; height:6px; border-radius:50%; background:var(--ok); flex:0 0 auto; }
 .collab-rail-run .n{ color:var(--ok); }
-.collab-rail-done .n{ color:var(--ok); }
+.collab-rail-done .n{ color:var(--muted); }
+.collab-rail-done .collab-rail-dot{ background:var(--muted2); }
+.collab-rail-issue .n{ color:var(--danger); }
+.collab-rail-dot--danger{ background:var(--danger-dot); }
 .collab-prog-panel{
   position:absolute; top:0; left:0; bottom:0; width:232px; z-index:12;
   display:flex; flex-direction:column; overflow:hidden;
@@ -1820,7 +1882,8 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
   font-size:11px; font-weight:600; padding:4px 8px; border-radius:var(--radius-sm);
 }
 .collab-stat--running{ color:var(--ok); background:color-mix(in srgb, var(--ok) 10%, var(--panel)); }
-.collab-stat--done{ color:var(--ok); background:color-mix(in srgb, var(--ok) 8%, var(--panel)); }
+.collab-stat--done{ color:var(--muted); background:color-mix(in srgb, var(--muted) 10%, var(--panel)); }
+.collab-stat--done .collab-rail-dot{ background:var(--muted2); }
 .collab-stat .n{ font-family:var(--font-num); font-variant-numeric:var(--font-num-variant); font-weight:700; }
 .collab-progress-empty{
   flex:0 0 auto; font-size:12px; color:var(--muted); line-height:1.5;
@@ -1845,18 +1908,9 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
 .collab-card--terminated{ --collab-st:var(--line-strong); }
 .collab-card-st{ display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); margin-bottom:6px; flex-wrap:wrap; }
 .collab-dot{ width:7px; height:7px; border-radius:50%; background:var(--collab-st); flex:0 0 auto; }
-.collab-card--running .collab-dot{ animation:collab-pulse 1.6s ease-in-out infinite; }
-@keyframes collab-pulse{
-  0%,100%{ opacity:1; transform:scale(1); box-shadow:0 0 0 0 color-mix(in srgb, var(--ok) 40%, transparent); }
-  50%{ opacity:.85; transform:scale(1.15); box-shadow:0 0 0 4px color-mix(in srgb, var(--ok) 0%, transparent); }
-}
 .collab-st-ic{ display:inline-flex; align-items:center; justify-content:center; width:14px; height:14px; font-size:10px; font-weight:700; flex:0 0 auto; }
-.collab-st-ic--spin{
-  width:12px; height:12px; border:2px solid color-mix(in srgb, var(--ok) 25%, transparent);
-  border-top-color:var(--ok); border-radius:50%; animation:collab-spin .8s linear infinite;
-}
-@keyframes collab-spin{ to{ transform:rotate(360deg); } }
 .collab-st-ic--ok{ color:var(--ok); }
+.collab-st-ic--done{ color:var(--muted); }
 .collab-st-ic--warn{ color:var(--danger); }
 .collab-st-ic--pause,.collab-st-ic--off{ color:var(--muted); }
 .collab-card-time{ margin-left:auto; font-size:10px; color:var(--muted); opacity:.85; }
