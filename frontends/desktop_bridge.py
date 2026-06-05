@@ -875,6 +875,18 @@ class ServiceManager:
             return {"ok": False, "error": item["lastError"] or "start_failed", "service": item}
         return {"ok": True, "service": item}
 
+    def autostart_extras(self) -> None:
+        """Auto-start non-IM services on bridge boot. Currently:
+          - reflect/scheduler.py (drives L4 archive cron every 12h).
+        IM services stay manual (need explicit mykey.py config + user opt-in)."""
+        for sid in sorted(set(self._catalog) - set(self._im_catalog)):
+            try:
+                res = self.start_service(sid)
+                tag = "ok" if res.get("ok") else f"fail: {res.get('error')}"
+            except Exception as e:
+                tag = f"exception {type(e).__name__}: {e}"
+            print(f"[autostart] {sid}: {tag}", file=sys.stderr)
+
     def stop_service(self, sid: str) -> dict:
         if sid not in self._catalog:
             raise KeyError(sid)
@@ -1508,6 +1520,7 @@ def create_app():
 
     async def on_startup(app):
         hub.loop = asyncio.get_running_loop()
+        services.autostart_extras()
 
     app.on_startup.append(on_startup)
     return app
