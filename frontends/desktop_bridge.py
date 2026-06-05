@@ -1460,7 +1460,7 @@ async def post_token_history_handler(request):
 
 
 def create_app():
-    app = web.Application(middlewares=[cors_middleware], client_max_size=1 * 1024 * 1024)
+    app = web.Application(middlewares=[cors_middleware], client_max_size=500 * 1024 * 1024)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/status", status_handler)
     app.router.add_get("/config", get_config_handler)

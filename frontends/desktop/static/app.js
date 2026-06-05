@@ -3170,7 +3170,7 @@ if (addModelForm) addModelForm.addEventListener('submit', async (e) => {
 
 /* ═══════════════ 文件上传（图片+任意文件，tuiapp_v2 模式） ═══════════════ */
 const MAX_UPLOAD_FILES = 10;
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+const MAX_UPLOAD_BYTES = 500 * 1024 * 1024; // 500 MB
 const IMG_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
 const thumbStrip = document.getElementById('thumb-strip');
 const chatPanel = document.querySelector('main.main');
