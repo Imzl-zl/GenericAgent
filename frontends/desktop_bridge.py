@@ -60,6 +60,13 @@ def find_default_ga_root() -> Path:
 
 DEFAULT_GA_ROOT = find_default_ga_root()
 
+_FINAL_INFO_RE = re.compile(r'\n*`{5}\n*\[Info\] Final response to user\.\n*`{5}\s*$')
+
+
+def strip_final_info_marker(text: Any) -> str:
+    return _FINAL_INFO_RE.sub('', str(text or ''))
+
+
 for _s in (sys.stdout, sys.stderr):
     with contextlib.suppress(Exception):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -451,7 +458,8 @@ class AgentManager:
             sess.status = "running"
             sess.cancel_requested = False
             sess.last_error = ""
-            sess.partial = {"id": sess.msg_seq + 1, "role": "assistant", "content": "", "ts": time.time(), "partial": True}
+            sess.partial = {"id": sess.msg_seq + 1, "role": "assistant", "content": "", "ts": time.time(), "partial": True,
+                            "curr_turn": 0, "turn_segs": []}  # turn_segs[i]=第i轮全文(权威结构化,前端按轮渲染);content保留双轨兜底
             t = threading.Thread(target=self.run_agent_turn, args=(sess, prompt, None, llm_no), daemon=True, name=f"Turn-{sid}")
             sess.thread = t
             t.start()
@@ -469,6 +477,7 @@ class AgentManager:
                 with contextlib.suppress(Exception):
                     agent.next_llm(int(no))
             full = ""
+            done_outputs = None  # done时agent给的全量轮文本(turn_resps.copy())
             if hasattr(agent, "put_task"):
                 display_q = agent.put_task(prompt, images=images or [])
                 pieces = []
@@ -489,19 +498,38 @@ class AgentManager:
                                     sess.partial["content"] = "".join(pieces) if getattr(agent, "inc_out", False) else text
                                     sess.partial["ts"] = time.time()
                                     sess.updated_at = time.time()
+                                    # 轨道2: bridge 归一化为前端直接可渲染的 0 基 turn_segs；outputs=turn_resps[-2:]
+                                    _t = int(item.get("turn", 0) or 0)
+                                    _outs = item.get("outputs") or []
+                                    _idx = max(0, _t - 1)
+                                    sess.partial["curr_turn"] = _idx
+                                    _segs = sess.partial["turn_segs"]
+                                    while len(_segs) <= _idx:
+                                        _segs.append("")
+                                    if _outs:
+                                        _segs[_idx] = str(_outs[-1])
+                                        if len(_outs) >= 2 and _idx >= 1:
+                                            _segs[_idx - 1] = str(_outs[-2])
                         if "done" in item:
-                            full = str(item.get("done") or "")
+                            full = strip_final_info_marker(item.get("done") or "")
+                            done_outputs = item.get("outputs")  # done时=turn_resps.copy()全量轮
+                            if done_outputs:
+                                done_outputs = [strip_final_info_marker(s) for s in done_outputs]
+                                with self.lock:
+                                    if sess.partial is not None:
+                                        sess.partial["content"] = full
+                                        sess.partial["ts"] = time.time()
+                                        sess.partial["updatedAt"] = sess.partial["ts"] if "updatedAt" in sess.partial else sess.partial.get("updatedAt")
+                                        sess.partial["curr_turn"] = max(0, len(done_outputs) - 1)
+                                        sess.partial["turn_segs"] = list(done_outputs)
+                                        sess.updated_at = time.time()
                             break
                     else:
                         pieces.append(str(item))
                 if not full and pieces:
                     full = pieces[-1] if not getattr(agent, "inc_out", False) else "".join(pieces)
-            elif hasattr(agent, "run"):
-                ret = agent.run(prompt)
-                if isinstance(ret, str):
-                    full = ret
             else:
-                full = "GenericAgent object has no put_task/run method"
+                full = "GenericAgent object has no put_task method"
             if not full:
                 full = "(completed)"
             if sess.cancel_requested:
@@ -515,12 +543,17 @@ class AgentManager:
                 return
             with self.lock:
                 sess.partial = None
-                # Strip trailing [Info] Final response to user. marker
-                import re as _re
-                full = _re.sub(r'\n*`{5}\n*\[Info\] Final response to user\.\n*`{5}\s*$', '', full)
+                full = strip_final_info_marker(full)
+                if done_outputs:
+                    done_outputs = [strip_final_info_marker(s) for s in done_outputs]
                 import plan_state
                 plan_state.sync_plan_path_from_text(sess, full, sess.cwd or self.ga_root)
-                self.add_message(sess, "assistant", full)
+                # 轨道2: 落库时带结构化全量轮(权威turn_segs),前端按轮渲染;content保留兜底
+                _final_segs = [str(s) for s in done_outputs] if done_outputs else None
+                if _final_segs:
+                    self.add_message(sess, "assistant", full, turn_segs=_final_segs)
+                else:
+                    self.add_message(sess, "assistant", full)
                 try: sess.llm_history = json.loads(json.dumps(agent.llmclient.backend.history, ensure_ascii=False, default=str))
                 except Exception: pass
                 sess.status = "idle"

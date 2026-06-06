@@ -957,18 +957,6 @@ function renderMarkdown(text) {
     return html;
   } catch (_) { return escapeHtml(text); }
 }
-function extractLastTurnForCopy(text) {
-  const src = String(text || '');
-  // 与 renderAssistant 同款分隔正则；取最后一个 mark 之后的 body
-  const turnRe = /\**LLM Running \(Turn (\d+)\) \.\.\.\**/g;
-  let lastEnd = 0, mm;
-  while ((mm = turnRe.exec(src)) !== null) lastEnd = mm.index + mm[0].length;
-  let body = src.slice(lastEnd);
-  // 去掉模型在最后一轮开头的 <summary>...</summary>
-  body = body.replace(/<summary>[\s\S]*?<\/summary>\s*/i, '');
-  return body.trim();
-}
-
 /**
  * Agent 流协议（与 agent_loop.py / continue_cmd 一致）按行解析：
  * - 工具调用：🛠️ 行 + 开围栏行 `` `{n}text `` + 正文 + 闭围栏行（仅 `{n}，取区间内最后一行）
@@ -1145,109 +1133,92 @@ function extractAskUserToolJson(content) {
   return null;
 }
 
-function renderAssistant(text) {
-  const src = String(text || '');
-  // 1) 按 "LLM Running (Turn N)..." 标记切分多轮；N 从原文捕获，无硬编码文案
-  const turnRe = /\**LLM Running \(Turn (\d+)\) \.\.\.\**/g;
-  const marks = [];
-  let mm;
-  while ((mm = turnRe.exec(src)) !== null) {
-    marks.push({ idx: mm.index, end: mm.index + mm[0].length, n: mm[1] });
-  }
-  const segs = [];
-  if (marks.length === 0) {
-    segs.push({ n: null, body: src });
-  } else {
-    if (marks[0].idx > 0) segs.push({ n: null, body: src.slice(0, marks[0].idx) });
-    for (let i = 0; i < marks.length; i++) {
-      const start = marks[i].end;
-      const stop = (i + 1 < marks.length) ? marks[i + 1].idx : src.length;
-      segs.push({ n: marks[i].n, body: src.slice(start, stop) });
-    }
-  }
-  // 2) 块级折叠：占位符使用 HTML 注释，避免与正文 F\d+ 冲突
+// ============================================================================
+// [turn_segs 数据结构层] —— 单轮渲染的纯函数，供 append-only draft 与静态消息复用
+// 设计：每个函数自包含（内部自建 folds/asks 占位栈，渲染完即还原），轮间零共享状态。
+// renderTurnBody(body)        : 单轮原文 → 该轮内层HTML（块级折叠thinking/tool/result）
+// renderTurnFold(body, turnIndex) : 单轮原文 → 旧轮的<details>折叠壳（内部下标0起，标题显示1起+summary副标题）
+// 结构化 turn_segs 渲染使用的纯函数：折叠工具块、ask_user 与轮摘要。
+// ============================================================================
+// 去除 GenericAgent 轮次分隔标记；turn_segs 已结构化，不应展示原始 marker
+function stripTurnMarker(body) {
+  return String(body || '')
+    .replace(/^\s*\**LLM Running \(Turn \d+\) \.\.\.\**\s*/i, '');
+}
+
+function renderTurnBody(body) {
+  // 自包含：每次调用独立的占位栈，渲染完立即还原，无跨调用共享状态
   const folds = [];
   const asks = [];
-  const stash = (label, body, cls, opts) => {
-    folds.push({ label, body, cls: cls || '', open: !!(opts && opts.open) });
+  const stash = (label, b, cls, opts) => {
+    folds.push({ label, body: b, cls: cls || '', open: !!(opts && opts.open) });
     return `\n\n§§FOLD:${folds.length - 1}§§\n\n`;
   };
   const stashAsk = (data) => { asks.push(data); return `\n\n§§ASK:${asks.length - 1}§§\n\n`; };
-  const foldBlocks = (body) => {
-    let s = body;
-    // thinking: 兼容 <thinking> XML 与 <details>...</details>（未来扩展）
-    s = s.replace(/<thinking>[\s\S]*?<\/thinking>/gi, m => stash(t('fold.thinking'), m.replace(/<\/?thinking>/gi, ''), 'fold-thinking'));
-    s = foldAgentProtocolBlocks(s, {
-      onTool(name, json, meta) {
-        if (name === 'ask_user' && !meta?.inFlight) {
-          const data = parseAskUserJson(json);
-          if (data && normalizeAskUserData(data)) return stashAsk(data);
-        }
-        const live = !!meta?.inFlight;
-        return stash(
-          `${t('fold.tool')}: ${name}${live ? ' …' : ''}`,
-          json,
-          live ? 'fold-tool fold-tool-live' : 'fold-tool',
-          { open: live },
-        );
-      },
-      onResult(body, meta) {
-        const live = !!meta?.inFlight;
-        return stash(
-          `${t('fold.toolResult')}${live ? ' …' : ''}`,
-          body,
-          live ? 'fold-result fold-tool-live' : 'fold-result',
-          { open: live },
-        );
-      },
-    });
-    // 兼容旧 XML 标记（保险）
-    s = s.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, m => stash(t('fold.tool'), m, 'fold-tool'));
-    s = s.replace(/<function_results>[\s\S]*?<\/function_results>/gi, m => stash(t('fold.toolResult'), m, 'fold-result'));
-    // 模型在回复开头自带 <summary>...</summary>（非 <details> 子元素），转为弱化样式块
-    s = s.replace(/<summary>([\s\S]*?)<\/summary>/gi, (_, inner) => `<div class="turn-summary">${inner}</div>`);
-    return renderMarkdown(s);
-  };
-  // 3) 拼装：历史轮包 details 默认折叠，最后一轮平铺
-  const turnLabel = (n) => t('fold.turn').replace('{n}', n);
-  // 从原始 seg.body 中抽出该轮首个 <summary>...</summary> 文本，作为折叠头副标题
-  // fallback: 若无 <summary> 标签，提取该轮调用的工具名列表
-  const extractTurnSummary = (raw) => {
-    const m = /<summary>([\s\S]*?)<\/summary>/i.exec(raw || '');
-    if (m) return m[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
-    // fallback: 提取工具名
-    const tools = [];
-    const toolRe = /🛠️\s*Tool:\s*`([^`]+)`/g;
-    let tm;
-    while ((tm = toolRe.exec(raw || '')) !== null) {
-      if (!tools.includes(tm[1])) tools.push(tm[1]);
-    }
-    if (tools.length) return tools.join(', ');
-    return '';
-  };
-  const parts = segs.map((seg, i) => {
-    const isLast = (i === segs.length - 1);
-    if (seg.n == null) return foldBlocks(seg.body);
-    const sum = extractTurnSummary(seg.body);
-    // Strip the <summary> tag from body to avoid duplication with head
-    const bodyForRender = sum
-      ? seg.body.replace(/<summary>[\s\S]*?<\/summary>\s*/i, '')
-      : seg.body;
-    const inner = foldBlocks(bodyForRender);
-    const head = sum
-      ? `${escapeHtml(turnLabel(seg.n))}：<span class="turn-head-sum">${escapeHtml(sum)}</span>`
-      : escapeHtml(turnLabel(seg.n));
-    if (isLast) return `<div class="turn-summary">${head}</div>${inner}`;
-    return `<details class="fold fold-turn"><summary>${head}</summary>${inner}</details>`;
+  let s = stripTurnMarker(body);
+  s = s.replace(/<thinking>[\s\S]*?<\/thinking>/gi, m => stash(t('fold.thinking'), m.replace(/<\/?thinking>/gi, ''), 'fold-thinking'));
+  s = foldAgentProtocolBlocks(s, {
+    onTool(name, json, meta) {
+      if (name === 'ask_user' && !meta?.inFlight) {
+        const data = parseAskUserJson(json);
+        if (data && normalizeAskUserData(data)) return stashAsk(data);
+      }
+      const live = !!meta?.inFlight;
+      return stash(`${t('fold.tool')}: ${name}${live ? ' …' : ''}`, json,
+        live ? 'fold-tool fold-tool-live' : 'fold-tool', { open: live });
+    },
+    onResult(b, meta) {
+      const live = !!meta?.inFlight;
+      return stash(`${t('fold.toolResult')}${live ? ' …' : ''}`, b,
+        live ? 'fold-result fold-tool-live' : 'fold-result', { open: live });
+    },
   });
-  // 4) 还原块级占位符
-  return parts.join('')
-    .replace(/(?:<p>\s*)?§§ASK:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => renderAskUserNotice(asks[Number(i)]))
-    .replace(/(?:<p>\s*)?§§FOLD:(\d+)§§(?:\s*<\/p>)?/g, (_, i) => {
+  s = s.replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, m => stash(t('fold.tool'), m, 'fold-tool'));
+  s = s.replace(/<function_results>[\s\S]*?<\/function_results>/gi, m => stash(t('fold.toolResult'), m, 'fold-result'));
+  s = s.replace(/<summary>([\s\S]*?)<\/summary>/gi, (_, inner) => `<div class="turn-summary">${inner}</div>`);
+  let html = renderMarkdown(s);
+  // 还原占位符
+  html = html
+    .replace(/§§ASK:(\d+)§§/g, (_, i) => {
+      const data = asks[Number(i)];
+      return data ? renderAskUserNotice(data) : '';
+    })
+    .replace(/§§FOLD:(\d+)§§/g, (_, i) => {
       const f = folds[Number(i)];
+      if (!f) return '';
       const openAttr = f.open ? ' open' : '';
       return `<details class="fold ${f.cls}"${openAttr}><summary>${escapeHtml(f.label)}</summary><pre class="fold-pre">${escapeHtml(f.body)}</pre></details>`;
     });
+  return html;
+}
+
+// 抽出该轮首个 <summary> 文本作为折叠头副标题；无则回退提取工具名列表
+function extractTurnSummaryPure(raw) {
+  const m = /<summary>([\s\S]*?)<\/summary>/i.exec(raw || '');
+  if (m) return m[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+  const tools = [];
+  const toolRe = /🛠️\s*Tool:\s*`([^`]+)`/g;
+  let tm;
+  while ((tm = toolRe.exec(raw || '')) !== null) {
+    if (!tools.includes(tm[1])) tools.push(tm[1]);
+  }
+  return tools.length ? tools.join(', ') : '';
+}
+
+// 旧轮折叠壳：内部 turnIndex 从 0 起；UI 标题显示为 1 起。调用方一律传内部下标。
+function turnDisplayNo(turnIndex) {
+  return Math.max(0, Number(turnIndex) || 0) + 1;
+}
+function renderTurnFold(body, turnIndex) {
+  const raw = stripTurnMarker(body);
+  const sum = extractTurnSummaryPure(raw);
+  const bodyForRender = sum ? raw.replace(/<summary>[\s\S]*?<\/summary>\s*/i, '') : raw;
+  const inner = renderTurnBody(bodyForRender);
+  const turnLabel = t('fold.turn').replace('{n}', turnDisplayNo(turnIndex));
+  const head = sum
+    ? `${escapeHtml(turnLabel)}：<span class="turn-head-sum">${escapeHtml(sum)}</span>`
+    : escapeHtml(turnLabel);
+  return `<details class="fold fold-turn"><summary>${head}</summary>${inner}</details>`;
 }
 
 function parseAskUserJson(raw) {
@@ -1377,6 +1348,12 @@ function askUserPlaceholder(item) {
   return t('ask.placeholderOpen');
 }
 
+function assistantStructuredText(msg) {
+  if (!msg || msg.role !== 'assistant') return '';
+  if (Array.isArray(msg.turn_segs) && msg.turn_segs.length) return msg.turn_segs.join('\n');
+  return typeof msg.content === 'string' ? msg.content : '';
+}
+
 function getPendingAskUser(sess) {
   if (!sess || rt(sess).busy) return null;
   const msgs = sess.messages || [];
@@ -1384,7 +1361,7 @@ function getPendingAskUser(sess) {
   let askData = null;
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i].role !== 'assistant') continue;
-    const json = extractAskUserToolJson(msgs[i].content || '');
+    const json = extractAskUserToolJson(assistantStructuredText(msgs[i]));
     if (json != null) {
       lastAskIdx = i;
       askData = normalizeAskUserData(parseAskUserJson(json));
@@ -1478,7 +1455,7 @@ const state = {
 };
 function rt(sess) {
   let r = state.runtime.get(sess.id);
-  if (!r) { r = { polling:false, busy:false, lastId:0, seen:new Set(), draftEl:null, draftText:'', taskStartedAt:null, taskEndedAt:null, taskTimerId:null, planCompleteAt:null, planLostAt:null, planHoldItems:[], planLastPayload:null, planLastComplete:false, planHideTimer:null, planDismissedComplete:false, planCollapsed:false, planShowAll:false }; state.runtime.set(sess.id, r); }
+  if (!r) { r = { polling:false, busy:false, lastId:0, seen:new Set(), draftEl:null, draftSegs:null, draftTurn:0, taskStartedAt:null, taskEndedAt:null, taskTimerId:null, planCompleteAt:null, planLostAt:null, planHoldItems:[], planLastPayload:null, planLastComplete:false, planHideTimer:null, planDismissedComplete:false, planCollapsed:false, planShowAll:false }; state.runtime.set(sess.id, r); }
   return r;
 }
 const activeSess = () => state.sessions.get(state.activeId) || null;
@@ -1997,6 +1974,59 @@ function fileSubLabel(name) {
   if (videoExts.includes(ext)) return t('file.kindVideo');
   return ext.toUpperCase();
 }
+function assistantTurnSegs(msg) {
+  if (Array.isArray(msg?.turn_segs) && msg.turn_segs.length) return msg.turn_segs;
+  if (typeof msg?.content === 'string' && msg.content.length) return [msg.content];
+  return [];
+}
+
+/** turn_segs 未就绪时回退 content（双轨兼容，不改 ljq 渲染主路径） */
+function draftSegsFromPartial(raw, m) {
+  const segs = Array.isArray(m.turn_segs) ? m.turn_segs : [];
+  if (segs.length && segs.some(s => (s || '').length > 0)) return segs;
+  const content = typeof raw.content === 'string' ? raw.content : (m.content || '');
+  return content ? [content] : segs;
+}
+function firstNonEmptyTurnIndex(segs) {
+  const arr = Array.isArray(segs) ? segs : [];
+  for (let i = 0; i < arr.length; i++) {
+    if ((arr[i] || '').length > 0) return i;
+  }
+  return 0;
+}
+// 后端 curr_turn 是内部 0-based 下标。展示时优先当前 turn；若该 turn 为空，回退到最后一个非空 turn。
+function resolveVisibleTurnIndex(segs, preferredTurn) {
+  const arr = Array.isArray(segs) ? segs : [];
+  const first = firstNonEmptyTurnIndex(arr);
+  const preferred = Number.isFinite(Number(preferredTurn)) ? Number(preferredTurn) : -1;
+  if (preferred >= 0 && (arr[preferred] || '').length > 0) return preferred;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if ((arr[i] || '').length > 0) return i;
+  }
+  return Math.max(first, preferred >= 0 ? preferred : (arr.length ? arr.length - 1 : first));
+}
+// 静态完整渲染：visibleTurn 之前的 seg 固化折叠；visibleTurn 作为当前正文展示。
+function renderAssistantTurnsHtml(segs, currTurn, withCursor = false) {
+  const arr = Array.isArray(segs) ? segs : [];
+  if (!arr.length) return '';
+  const first = firstNonEmptyTurnIndex(arr);
+  const curr = resolveVisibleTurnIndex(arr, currTurn);
+  let html = '';
+  for (let i = first; i < curr; i++) {
+    if ((arr[i] || '').length > 0) html += `<div class="turn-frozen" data-turn="${i}">${renderTurnFold(arr[i] || '', i)}</div>`;
+  }
+  html += `<div class="turn-cur" data-turn="${curr}">${renderTurnBody(arr[curr] || '')}${withCursor ? '<span class="cursor"></span>' : ''}</div>`;
+  return html;
+}
+function assistantCopyText(msg) {
+  const segs = assistantTurnSegs(msg);
+  if (segs.length) {
+    // 复制保持旧行为：只复制当前/最后可见 turn，不复制已折叠历史 turn。
+    const turn = resolveVisibleTurnIndex(segs, msg?.curr_turn);
+    return stripTurnMarker(segs[turn] || '').replace(/<summary>[\s\S]*?<\/summary>\s*/i, '').trim();
+  }
+  return '';
+}
 function msgNode(msg) {
   const el = document.createElement('div');
   el.className = 'msg ' + (msg.role || 'system');
@@ -2020,8 +2050,10 @@ function msgNode(msg) {
     el.innerHTML = `<div class="user-stack">${filesHtml}${imgsHtml}${textHtml}</div>`;
   }
   else if (msg.role === 'assistant') {
-    const body = msg.stopped ? (msg.content + '\n\n_[' + t('status.stopped') + ']_') : msg.content;
-    el.innerHTML = `<div class="bubble md">${renderAssistant(body)}</div>`;
+    const segs = assistantTurnSegs(msg);
+    let html = renderAssistantTurnsHtml(segs, msg.curr_turn, false);
+    if (msg.stopped) html += `<p><em>[${escapeHtml(t('status.stopped'))}]</em></p>`;
+    el.innerHTML = `<div class="bubble md">${html}</div>`;
     postRenderEnhance(el.querySelector('.bubble'));
   }
   else if (msg.role === 'error') el.innerHTML = `<div class="bubble err">${escapeHtml(msg.content)}</div>`;
@@ -2035,7 +2067,7 @@ function msgNode(msg) {
       e.stopPropagation();
       const text = (msg.role === 'user')
         ? stripAttachPlaceholders((typeof msg.display === 'string' && msg.display.length) ? msg.display : (msg.content || ''))
-        : extractLastTurnForCopy(msg.content || '');
+        : assistantCopyText(msg);
       navigator.clipboard.writeText(text).then(() => {
         copyBtn.innerHTML = SVG_CHECK_ICON;
         setTimeout(() => { copyBtn.innerHTML = SVG_COPY_ICON; }, 1500);
@@ -2053,7 +2085,7 @@ function collabItemToMsg(item) {
   if (item.role === 'user') {
     return { role: 'user', content: item.msg, display: item.msg, images: attach(item.images), files: attach(item.files) };
   }
-  if (item.role === 'conductor') return { role: 'assistant', content: item.msg || '' };
+  if (item.role === 'conductor') return { role: 'assistant', turn_segs: [item.msg || ''], curr_turn: 0 };
   if (item.role === 'error') return { role: 'error', content: item.msg || '' };
   return { role: 'system', content: item.msg || '' };
 }
@@ -2113,8 +2145,10 @@ function scrollBottom(force) {
   }
 }
 /* ═══════════════ 打字机效果 (PR移植) ═══════════════ */
-const TW_SPEED = 12;  // 每 tick 显示字符数
-const TW_INTERVAL = 30; // ms
+const TW_SPEED = 80000;  // 默认每 tick 字符数
+const TW_INTERVAL = 16; // ms；接近 60fps，比 30ms 更平滑
+const TW_CATCHUP_THRESHOLD = 300; // 残余超过阈值时进入追赶档
+const TW_CATCHUP_MULTIPLIER = 10; // 
 const TW_RECOVER_MIN = 1200;  // 刷新恢复：partial 已有存量超过此值 → 直接对齐，不重播打字机
 const DRAFT_INTERACT_MS = 520; // 用户滚代码块/点折叠时暂缓 DOM 重写
 
@@ -2149,9 +2183,13 @@ function bindDraftInteractGuard(el, r) {
 }
 /** 刷新/重连后已有大段 partial：一次性对齐到当前全文，仅对之后新增字做打字机 */
 function maybeRecoverDraftSeek(r) {
-  const total = (r.draftText || '').length;
+  const segs = Array.isArray(r.draftSegs) ? r.draftSegs : [];
   const tw = r.twState;
-  if (!r.draftRecoverPending || !tw || tw.shown > 0 || total < TW_RECOVER_MIN) return;
+  if (!tw) return;
+  const turn = tw.turn || 0;
+  const cur = segs[turn] || '';
+  const total = cur.length;
+  if (!r.draftRecoverPending || tw.shown > 0 || total < TW_RECOVER_MIN) return;
   tw.shown = total;
   r.draftRecoverPending = false;
 }
@@ -2165,76 +2203,106 @@ function renderDraft(sess) {
     bindDraftInteractGuard(r.draftEl, r);
     if (r.taskStartedAt) ensureTaskElapsedBadge(r.draftEl, r.taskStartedAt, null);
   }
-  if (!r.twState) r.twState = { shown: 0, timer: null };
+  if (!r.twState) r.twState = { turn: 0, shown: 0, timer: null };
   const tw = r.twState;
+  const backendTurn = Math.max(0, Number(r.draftTurn) || 0);
+  if (tw.turn == null || tw.turn < 0) tw.turn = 0;
+  if (tw.turn > backendTurn) tw.turn = backendTurn;
+  // 流式渲染模型：segs 是源数据；tw.turn 是正在打字的 turn；tw.turn 之前的 DOM 一旦 frozen 就不再动。
+  ensureDraftFrozenThrough(r, tw.turn);
   maybeRecoverDraftSeek(r);
-  if (!tw.timer) {
-    tw.timer = setInterval(() => {
-      const cur = r.draftText || '';
-      if (tw.shown >= cur.length) {
-        clearInterval(tw.timer); tw.timer = null;
-        return;
-      }
-      if (isDraftInteractFrozen(r)) return;
-      const t0 = performance.now();
-      // 每 tick 都全量重渲整段，渲染开销随正文增大而升高（实测 140k 字时
-      // 单次可达数百 ms）。步长按「上次渲染耗时」自适应：
-      //  - 轻文档（渲染便宜）：小步、设上限 → 平滑打字；大块到达时在数十帧内
-      //    快速「打」出来，而不是一帧瞬跳一大坨（瞬跳就是用户看到的“突然出一坨”）。
-      //  - 重文档（单次渲染已很贵）：加大步长，用更少次昂贵渲染把积压排空，
-      //    避免在某一帧卡死数百 ms。
-      const backlog = cur.length - tw.shown;
-      const last = tw.lastElapsed || 0;
-      let step;
-      if (last > 80) step = Math.max(TW_SPEED * 6, Math.ceil(backlog / 2));
-      else step = Math.min(Math.max(TW_SPEED, Math.ceil(backlog / 10)), 160);
-      tw.shown = Math.min(tw.shown + step, cur.length);
-      rewriteDraftBubble(r, cur.slice(0, tw.shown));
-      tw.lastElapsed = performance.now() - t0;
-    }, TW_INTERVAL);
-  }
-  if (!isDraftInteractFrozen(r)) {
-    rewriteDraftBubble(r, (r.draftText || '').slice(0, tw.shown));
-  }
+
+  const tick = () => {
+    const segs = Array.isArray(r.draftSegs) ? r.draftSegs : [];
+    const backendTurnNow = Math.max(0, Number(r.draftTurn) || 0);
+    if (tw.turn == null || tw.turn < 0) tw.turn = 0;
+    if (tw.turn > backendTurnNow) tw.turn = backendTurnNow;
+    r.streamTurn = tw.turn;
+    const cur = segs[tw.turn] || '';
+
+    // 当前 turn 打完，并且后端已进入后续 turn：当前 DOM 固化，然后打字机推进到下一 turn。
+    if (tw.shown >= cur.length && backendTurnNow > tw.turn) {
+      paintDraft(r, tw.turn, cur);
+      freezeCurrentTurnDom(r, tw.turn);
+      tw.turn += 1;
+      tw.shown = 0;
+      r.streamTurn = tw.turn;
+      return;
+    }
+
+    if (tw.shown >= cur.length) return; // 中途不停止 timer，等新 partial/done。
+    if (isDraftInteractFrozen(r)) return;
+
+    const backlog = cur.length - tw.shown;
+    const step = backlog > TW_CATCHUP_THRESHOLD ? TW_SPEED * TW_CATCHUP_MULTIPLIER : TW_SPEED;
+    tw.shown = Math.min(tw.shown + step, cur.length);
+    paintDraft(r, tw.turn, cur.slice(0, tw.shown));
+  };
+
+  if (!tw.timer) tw.timer = setInterval(tick, TW_INTERVAL);
+  if (!isDraftInteractFrozen(r)) tick();
   refreshEmptyState(sess);
 }
 
-// 重写打字机气泡：先记 near + 保存 <details> open 态 + badge；innerHTML 替换后恢复；仅当原先贴底才滚
-function rewriteDraftBubble(r, visible) {
+function ensureDraftFrozenThrough(r, currTurn) {
   if (!r.draftEl) return;
-  if (isDraftInteractFrozen(r)) return;
-
-  const wasNear = isNearBottom();
-  const scrollTops = snapshotDraftScroll(r.draftEl);
-  const openIdx = [];
-  // 保存 badge（会被 innerHTML 覆盖）
-  const oldBadge = r.draftEl.querySelector(':scope > .task-elapsed');
-  const badgeText = oldBadge ? oldBadge.textContent : null;
-  // 仅保留用户手动展开的折叠；流式 in-flight（fold-tool-live）由 render 决定，勿跨帧恢复
-  r.draftEl.querySelectorAll('details').forEach((d, i) => {
-    if (d.open && !d.classList.contains('fold-tool-live')) openIdx.push(i);
-  });
-
-  r.draftEl.innerHTML = `<div class="bubble md">${renderAssistant(visible)}<span class="cursor"></span></div>`;
-  postRenderEnhance(r.draftEl.querySelector('.bubble'));
-  const dets = r.draftEl.querySelectorAll('details');
-  // 程序化恢复 open 态会异步触发 toggle 事件；置标记让 guard 忽略，
-  // setTimeout(0) 在已排队的 toggle 任务之后清除（避免自冻结循环）。
-  r._suppressToggleFreeze = true;
-  openIdx.forEach(i => { if (dets[i]) dets[i].open = true; });
-  setTimeout(() => { r._suppressToggleFreeze = false; }, 0);
-  restoreDraftScroll(r.draftEl, scrollTops);
-  // 恢复 badge
-  if (badgeText) {
-    const badge = document.createElement('div');
-    badge.className = 'task-elapsed';
-    badge.textContent = badgeText;
-    badge.dataset.live = '1';
-    r.draftEl.prepend(badge);
+  const segs = Array.isArray(r.draftSegs) ? r.draftSegs : [];
+  const upto = Math.max(0, Number(currTurn) || 0);
+  let bubble = r.draftEl.querySelector(':scope > .bubble.md');
+  if (!bubble) {
+    bubble = document.createElement('div');
+    bubble.className = 'bubble md';
+    r.draftEl.appendChild(bubble);
   }
-  const inCodeScroll = document.activeElement?.closest?.('.code-block pre, .fold-pre')
-    && r.draftEl.contains(document.activeElement);
-  if (wasNear && !inCodeScroll) scrollBottom(true);
+  const cur = bubble.querySelector(':scope > .turn-cur');
+  for (let turn = 0; turn < upto; turn++) {
+    if (bubble.querySelector(`:scope > .turn-frozen[data-turn="${turn}"]`)) continue;
+    const frozen = document.createElement('div');
+    frozen.className = 'turn-frozen';
+    frozen.dataset.turn = turn;
+    frozen.innerHTML = renderTurnFold(segs[turn] || '', turn);
+    if (cur) bubble.insertBefore(frozen, cur);
+    else bubble.appendChild(frozen);
+    postRenderEnhance(frozen);
+  }
+}
+
+function freezeCurrentTurnDom(r, turn) {
+  if (!r.draftEl) return;
+  const bubble = r.draftEl.querySelector(':scope > .bubble.md');
+  if (!bubble) return;
+  const cur = bubble.querySelector(':scope > .turn-cur');
+  if (!cur) return;
+  cur.className = 'turn-frozen';
+  cur.dataset.turn = turn;
+  cur.innerHTML = renderTurnFold((r.draftSegs || [])[turn] || '', turn);
+  postRenderEnhance(cur);
+}
+
+function paintDraft(r, turn, visibleCurrBody) {
+  if (!r.draftEl || isDraftInteractFrozen(r)) return;
+  const wasNear = isNearBottom();
+  let bubble = r.draftEl.querySelector(':scope > .bubble.md');
+  if (!bubble) {
+    bubble = document.createElement('div');
+    bubble.className = 'bubble md';
+    r.draftEl.appendChild(bubble);
+  }
+  let cur = bubble.querySelector(':scope > .turn-cur');
+  if (!cur) {
+    cur = document.createElement('div');
+    cur.className = 'turn-cur';
+    bubble.appendChild(cur);
+  }
+  cur.dataset.turn = turn ?? 0;
+  cur.innerHTML = renderTurnBody(visibleCurrBody || '') + '<span class="cursor"></span>';
+  postRenderEnhance(cur);
+
+  if (wasNear) {
+    const inCodeScroll = document.activeElement?.closest?.('.code-block pre, .fold-pre')
+      && r.draftEl.contains(document.activeElement);
+    if (!inCodeScroll) scrollBottom(true);
+  }
 }
 
 function flushTypewriter(sess) {
@@ -2420,7 +2488,7 @@ function displayTitle(sess) {
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (!m || m.role !== 'assistant') continue;
-    const txt = typeof m.content === 'string' ? m.content : '';
+    const txt = assistantStructuredText(m);
     const sm = /<summary>([\s\S]*?)<\/summary>/i.exec(txt);
     if (sm && sm[1].trim()) {
       const line = sm[1].trim().split('\n')[0].trim();
@@ -2599,21 +2667,29 @@ newConvBtn.addEventListener('click', (e) => { e.preventDefault(); newSession(); 
 
 /* ═══════════════ 轮询 + 流式 ═══════════════ */
 function normalize(m) {
-  const o = { id: Number(m.id || 0), role: m.role || 'system', content: m.content || '' };
+  const o = { id: Number(m.id || 0), role: m.role || 'system' };
+  if (m.role !== 'assistant') o.content = m.content || '';
   if (typeof m.display === 'string' && m.display.length) o.display = m.display;
   if (m.stopped) o.stopped = true;
   if (m.images) o.images = m.images;
   if (m.files) o.files = m.files;
   if (m.ts) o.ts = m.ts;
+  // [turn_segs双轨] 透传结构化轮数组(若后端提供)；落库消息与 partial 都可能带
+  if (Array.isArray(m.turn_segs)) o.turn_segs = m.turn_segs;
+  if (typeof m.curr_turn === 'number') o.curr_turn = m.curr_turn;
+  if (m.role === 'assistant' && !o.turn_segs?.length && typeof m.content === 'string') o.content = m.content;
   return o;
 }
 function upsert(sess, raw, partial) {
   const m = normalize(raw); const r = rt(sess);
   if (partial && m.role === 'assistant') {
-    const wasEmpty = !(r.draftText || '').length;
-    r.draftText = m.content;
+    const prevLen = (Array.isArray(r.draftSegs) ? (r.draftSegs[r.draftTurn] || '') : '').length;
+    r.draftSegs = draftSegsFromPartial(raw, m);
+    r.draftTurn = (typeof m.curr_turn === 'number') ? m.curr_turn : Math.max(0, r.draftSegs.length - 1);
+    const curLen = (r.draftSegs[r.draftTurn] || '').length;
+    const wasEmpty = prevLen === 0;
     const tw = r.twState;
-    if (wasEmpty && r.draftText.length >= TW_RECOVER_MIN && (!tw || tw.shown === 0)) {
+    if (wasEmpty && curLen >= TW_RECOVER_MIN && (!tw || tw.shown === 0)) {
       r.draftRecoverPending = true;
     }
     if (isActive(sess)) renderDraft(sess);
@@ -2621,7 +2697,55 @@ function upsert(sess, raw, partial) {
   }
   if (!m.id || r.seen.has(m.id)) return;
   r.seen.add(m.id); r.lastId = Math.max(r.lastId, m.id);
-  if (m.role === 'assistant' && r.draftEl) { flushTypewriter(sess); r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
+  if (m.role === 'assistant' && r.draftEl) {
+    // done 收束：final message 的 turn_segs 是最后一次完整 draft 更新。
+    // 收到 done 就强制一次性重建 bubble：所有旧/未冻结 turn 直接冻结，只留下最后一个有效 turn 非冻结。
+    if (Array.isArray(m.turn_segs)) {
+      r.draftSegs = m.turn_segs;
+      r.draftTurn = resolveVisibleTurnIndex(r.draftSegs, m.curr_turn);
+      r.streamTurn = r.draftTurn;
+      if (!r.twState) r.twState = { shown: 0, timer: null };
+      if (r.twState.timer) { clearInterval(r.twState.timer); r.twState.timer = null; }
+      r.twState.turn = r.draftTurn;
+      r.twState.shown = (r.draftSegs[r.draftTurn] || '').length;
+      r.draftRecoverPending = false;
+      if (isActive(sess)) {
+        const bubble = r.draftEl.querySelector('.bubble');
+        if (bubble) bubble.innerHTML = renderAssistantTurnsHtml(r.draftSegs, r.draftTurn, false);
+      }
+    } else {
+      flushTypewriter(sess);
+    }
+    const cursor = r.draftEl.querySelector('.cursor');
+    if (cursor) cursor.remove();
+    // 补齐 elapsed badge（若有 taskStartedAt）
+    if (r.taskStartedAt) {
+      ensureTaskElapsedBadge(r.draftEl, r.taskStartedAt, r.taskEndedAt || Date.now());
+      r.taskStartedAt = null; r.taskEndedAt = null;
+    }
+    // 挂 copy 按钮（与 msgNode 一致）
+    if (!r.draftEl.querySelector('.bubble-copy-btn')) {
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'bubble-copy-btn';
+      copyBtn.title = t('act.copy');
+      copyBtn.innerHTML = SVG_COPY_ICON;
+      copyBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const text = assistantCopyText(m);
+        navigator.clipboard.writeText(text).then(() => {
+          copyBtn.innerHTML = SVG_CHECK_ICON;
+          setTimeout(() => { copyBtn.innerHTML = SVG_COPY_ICON; }, 1500);
+        });
+      });
+      r.draftEl.appendChild(copyBtn);
+    }
+    r.draftEl = null; r.draftSegs = null; r.draftTurn = 0; r.streamTurn = 0;
+    sess.messages.push(m);
+    refreshEmptyState(sess);
+    if (m.role === 'assistant' || m.role === 'user') syncAskUserUi();
+    saveSessions();
+    return;
+  }
   sess.messages.push(m); appendMessage(sess, m);
   saveSessions();
 }
@@ -2637,8 +2761,8 @@ async function fetchSessionPoll(sess, opts = {}) {
 }
 
 function applyPollResult(sess, result) {
-  for (const msg of (result.messages || [])) upsert(sess, msg, false);
   if (result.partial) upsert(sess, result.partial, true);
+  for (const msg of (result.messages || [])) upsert(sess, msg, false);
   const busy = result.status === 'running' || !!result.partial;
   setBusy(sess, busy);
   if (isActive(sess)) applyPlanPayload(sess, result.plan);
@@ -2681,7 +2805,7 @@ async function pollSession(sess) {
         const busy = applyPollResult(sess, result);
         if (busy) await new Promise(z => setTimeout(z, 500));
         else {
-          if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
+          if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftSegs = null; r.draftTurn = 0; }
           break;
         }
       } catch (innerErr) {
@@ -2716,7 +2840,7 @@ function removeUsedPendingFiles(usedFiles) {
 function clearDraft(sess) {
   flushTypewriter(sess);
   const r = rt(sess);
-  if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftText = ''; }
+  if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftSegs = null; r.draftTurn = 0; }
 }
 
 async function waitSessionIdle(sess, maxMs = 4000) {
@@ -3608,7 +3732,6 @@ Object.assign(window, {
   gaFileSubLabel: fileSubLabel,
   gaMsgNode: msgNode,
   gaCollabItemToMsg: collabItemToMsg,
-  gaRenderAssistant: renderAssistant,
   gaPostRenderEnhance: postRenderEnhance,
   gaEscapeHtml: escapeHtml,
 });
@@ -5077,8 +5200,8 @@ function bindComposerInRoot(root, opts) {
     drawerEl.innerHTML = `<div class="collab-drawer-backdrop"></div><aside class="collab-drawer"><div class="collab-drawer-head"><span class="collab-drawer-title">${esc(w.title)}</span><button class="modal-x collab-drawer-close">${GA_ICON('x')}</button></div><div class="collab-drawer-body"><div class="bubble md"></div></div></aside>`;
     const bubble = drawerEl.querySelector('.collab-drawer-body .bubble');
     if (bubble) {
-      bubble.innerHTML = (window.gaRenderAssistant || (s => esc(s)))(w.fullReply || t('collab.summaryWait'));
-      window.gaPostRenderEnhance?.(bubble);
+      bubble.innerHTML = renderTurnBody(w.fullReply || t('collab.summaryWait'));
+      enhanceMsg(bubble);
     }
     drawerEl.querySelector('.collab-drawer-backdrop').onclick = closeWorkerDrawer;
     drawerEl.querySelector('.collab-drawer-close').onclick = closeWorkerDrawer;
