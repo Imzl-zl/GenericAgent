@@ -2210,7 +2210,10 @@ function rewriteDraftBubble(r, visible) {
   // 保存 badge（会被 innerHTML 覆盖）
   const oldBadge = r.draftEl.querySelector(':scope > .task-elapsed');
   const badgeText = oldBadge ? oldBadge.textContent : null;
-  r.draftEl.querySelectorAll('details').forEach((d, i) => { if (d.open) openIdx.push(i); });
+  // 仅保留用户手动展开的折叠；流式 in-flight（fold-tool-live）由 render 决定，勿跨帧恢复
+  r.draftEl.querySelectorAll('details').forEach((d, i) => {
+    if (d.open && !d.classList.contains('fold-tool-live')) openIdx.push(i);
+  });
 
   r.draftEl.innerHTML = `<div class="bubble md">${renderAssistant(visible)}<span class="cursor"></span></div>`;
   postRenderEnhance(r.draftEl.querySelector('.bubble'));
