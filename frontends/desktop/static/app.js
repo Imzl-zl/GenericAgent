@@ -1522,6 +1522,7 @@ const composerEl = document.getElementById('chat-composer');
 const msgLoading = document.getElementById('msg-loading');
 const sessionLoadingEl = document.getElementById('session-loading');
 const MIN_MSG_LOADING_MS = 450;
+const HYDRATE_LOADING_TIMEOUT_MS = 10000;
 const PLAN_LOST_GRACE_MS = 1500;  // tuiapp_v2._PLAN_LOST_GRACE_SEC
 const PLAN_COMPLETE_GRACE_MS = 3000;  // tuiapp_v2._PLAN_GRACE_SEC
 
@@ -2449,7 +2450,19 @@ function sessionNeedsHydrate(sess) {
   return !!(sess?.bridgeSessionId && state.bridgeReady && !sess.messages.length);
 }
 
+function runSessionHydrate(sess) {
+  setSessionLoading(true);
+  const tid = setTimeout(() => {
+    if (isActive(sess)) setSessionLoading(false);
+  }, HYDRATE_LOADING_TIMEOUT_MS);
+  return hydrateSession(sess).finally(() => {
+    clearTimeout(tid);
+    if (isActive(sess)) setSessionLoading(false);
+  });
+}
+
 function setActiveSession(id) {
+  setSessionLoading(false);
   state.activeId = id;
   if (id) localStorage.setItem('ga_active', id);  // 持久化当前会话，刷新后固定恢复它
   const sess = state.sessions.get(id);
@@ -2463,10 +2476,7 @@ function setActiveSession(id) {
   syncPlanPollTimer();
   if (!sess.bridgeSessionId || !state.bridgeReady) return;
   if (sessionNeedsHydrate(sess)) {
-    setSessionLoading(true);
-    pollSession(sess).finally(() => {
-      if (isActive(sess)) setSessionLoading(false);
-    });
+    runSessionHydrate(sess);
   } else {
     planPoll(sess);
   }
@@ -2611,6 +2621,32 @@ function upsert(sess, raw, partial) {
   sess.messages.push(m); appendMessage(sess, m);
   saveSessions();
 }
+
+/** 首拍拉历史；不等 idle，running 续交给 pollSession */
+async function hydrateSession(sess) {
+  try {
+    const r = rt(sess);
+    const res = await window.ga.pollSession(sess.bridgeSessionId || sess.id, r.lastId || 0);
+    if (res?.error) throw new Error(res.error.message || res.error);
+    const result = res.result || res;
+    for (const msg of (result.messages || [])) upsert(sess, msg, false);
+    if (result.partial) upsert(sess, result.partial, true);
+    const busy = result.status === 'running' || !!result.partial;
+    setBusy(sess, busy);
+    if (isActive(sess)) applyPlanPayload(sess, result.plan);
+    if (busy && !r.polling) pollSession(sess);
+  } catch (e) {
+    showError(t('err.poll') + ': ' + (e.message || e));
+    setBusy(sess, false);
+  } finally {
+    if (isActive(sess)) {
+      restoreElapsedBadges(sess, ensureMsgs());
+      syncAskUserUi();
+    }
+    tokPollBridge();
+  }
+}
+
 async function pollSession(sess) {
   const r = rt(sess);
   if (r.polling) return;
@@ -3587,9 +3623,7 @@ window.ga.onBridgeReady(async () => {
   if (isServicesPageActive()) renderChannelList(gaServiceStore.list());
   const sess = activeSess();
   if (sess && sessionNeedsHydrate(sess)) {
-    setSessionLoading(true);
-    try { await pollSession(sess); }
-    finally { if (isActive(sess)) setSessionLoading(false); }
+    await runSessionHydrate(sess);
   } else if (sess) planPoll(sess);
   delete document.documentElement.dataset.bootHasSessions;
   if (sess) refreshEmptyState(sess);
