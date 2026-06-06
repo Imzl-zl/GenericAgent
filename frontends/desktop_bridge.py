@@ -88,6 +88,7 @@ class Session:
     untitled: bool = True
     plan_scan_baseline: int = 0
     plan_path: str = ""
+    llm_history: Optional[List[dict]] = None
 
 
 def _load_plan_baseline(item: dict, msgs: list) -> int:
@@ -129,12 +130,19 @@ class AgentManager:
             arr = []
             with self.lock:
                 for s in self.sessions.values():
+                    llm_hist = None
+                    if s.agent and hasattr(s.agent, 'llmclient'):
+                        try: llm_hist = s.agent.llmclient.backend.history
+                        except Exception: pass
+                    if llm_hist is None:
+                        llm_hist = s.llm_history
                     arr.append({"id": s.id, "title": s.title, "cwd": s.cwd,
                                 "created_at": s.created_at, "updated_at": s.updated_at,
                                 "messages": s.messages, "msg_seq": s.msg_seq,
                                 "pinned": s.pinned, "untitled": s.untitled,
                                 "plan_scan_baseline": s.plan_scan_baseline,
-                                "plan_path": s.plan_path or ""})
+                                "plan_path": s.plan_path or "",
+                                "llm_history": llm_hist})
             self._sessions_file.write_text(json.dumps(arr, ensure_ascii=False, default=str), encoding="utf-8")
         except Exception as e:
             print(f"[bridge] persist sessions failed: {e}", file=sys.stderr)
@@ -157,7 +165,8 @@ class AgentManager:
                                plan_scan_baseline=_load_plan_baseline(item, msgs),
                                plan_path=_sanitize_desktop_plan_path(
                                    item["id"], item.get("plan_path") or ""),
-                               status="idle", agent=None)
+                               status="idle", agent=None,
+                               llm_history=item.get("llm_history"))
                 self.sessions[sess.id] = sess
             if self.sessions:
                 self.active_session_id = max(self.sessions.values(), key=lambda s: s.updated_at).id
@@ -512,6 +521,8 @@ class AgentManager:
                 import plan_state
                 plan_state.sync_plan_path_from_text(sess, full, sess.cwd or self.ga_root)
                 self.add_message(sess, "assistant", full)
+                try: sess.llm_history = json.loads(json.dumps(agent.llmclient.backend.history, ensure_ascii=False, default=str))
+                except Exception: pass
                 sess.status = "idle"
                 sess.last_error = ""
             emit_session_state(sess, "idle")
@@ -584,23 +595,29 @@ class AgentManager:
             if sess.agent is not None:
                 return {"ok": True, "sessionId": sid, "restored": False, "reason": "agent already alive"}
         agent = self.make_agent(sess)
-        history = []
-        for m in sess.messages:
-            role = m.get("role")
-            content = m.get("content", "")
-            if role == "user":
-                history.append({"role": "user", "content": [{"type": "text", "text": content}]})
-            elif role == "assistant":
-                history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
-        if history:
+        if sess.llm_history:
             try:
-                agent.llmclient.backend.history = history
+                agent.llmclient.backend.history = sess.llm_history
             except Exception as e:
-                print(f"[bridge] inject history failed: {e}", file=sys.stderr)
+                print(f"[bridge] restore llm_history failed: {e}", file=sys.stderr)
+        else:
+            history = []
+            for m in sess.messages:
+                role = m.get("role")
+                content = m.get("content", "")
+                if role == "user":
+                    history.append({"role": "user", "content": [{"type": "text", "text": content}]})
+                elif role == "assistant":
+                    history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
+            if history:
+                try:
+                    agent.llmclient.backend.history = history
+                except Exception as e:
+                    print(f"[bridge] inject history failed: {e}", file=sys.stderr)
         with self.lock:
             sess.agent = agent
             sess.status = "idle"
-        return {"ok": True, "sessionId": sid, "restored": True, "messageCount": len(history)}
+        return {"ok": True, "sessionId": sid, "restored": True, "messageCount": len(sess.llm_history or sess.messages)}
 
 
 import base64
