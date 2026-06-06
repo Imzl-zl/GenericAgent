@@ -1923,7 +1923,7 @@ html[data-appearance="dark"] .plan-item--warn .plan-item-text{ color:#f0a020; }
 .fold.fold-tool-live > summary{ opacity:.85; font-style:italic; }
 .fold.fold-result{ border:none; background:transparent; }
 .fold.fold-turn{ border-color:var(--fold-turn-border); background:var(--fold-turn-bg); }
-.fold.fold-turn > summary{ font-weight:600; color:var(--txt-2); }
+.fold.fold-turn > summary{ font-weight:600; color:var(--txt-2); white-space:nowrap; overflow:hidden; }
 .fold.fold-retry{ border-color:var(--fold-retry-border); background:var(--fold-retry-bg); border-style:dashed; }
 .fold.fold-retry > summary{ font-size:11px; color:var(--muted2); font-weight:400; }
 .fold.fold-retry pre{ font-size:11px; color:var(--muted); }
@@ -1987,10 +1987,12 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
 .turn-summary{
   display:block; font-style:italic; color:var(--muted);
   font-size:12px; margin-bottom:6px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
 }
 /* 历史轮 <summary> 头部的副标题（来自模型 <summary> 抽取） */
 .fold-turn > summary .turn-head-sum{
   font-style:italic; color:var(--muted); font-weight:normal; margin-left:4px;
+  min-width:0; overflow:hidden; text-overflow:ellipsis;
 }
 
 /* —— ask_user 显眼提醒 —— */
