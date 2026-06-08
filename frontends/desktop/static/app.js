@@ -1221,6 +1221,35 @@ function renderTurnFold(body, turnIndex) {
   return `<details class="fold fold-turn"><summary>${head}</summary>${inner}</details>`;
 }
 
+function lastInflightBlockBody(body) {
+  const lines = String(body || '').split('\n');
+  let last = null;
+  for (let i = 0; i < lines.length; i++) {
+    const liveTool = parseInFlightToolCall(lines, i);
+    if (liveTool?.inFlight) { last = { body: liveTool.body }; i = liveTool.nextLine - 1; continue; }
+    const closedTool = parseToolCallBlock(lines, i);
+    if (closedTool) { last = null; i = closedTool.nextLine - 1; continue; }
+    const liveRes = parseInFlightToolResult(lines, i);
+    if (liveRes?.inFlight) { last = { body: liveRes.body }; i = liveRes.nextLine - 1; continue; }
+    const closedRes = parseToolResultBlock(lines, i);
+    if (closedRes) { last = null; i = closedRes.nextLine - 1; continue; }
+  }
+  return last;
+}
+
+function tryPatchInflightToolDom(curEl, body, prevBody) {
+  if (!prevBody || body.length < prevBody.length || !body.startsWith(prevBody)) return false;
+  if (!curEl.querySelector('details.fold-tool-live')) return false;
+  const prevBlock = lastInflightBlockBody(prevBody);
+  const curBlock = lastInflightBlockBody(body);
+  if (!curBlock || !prevBlock || !curBlock.body.startsWith(prevBlock.body)) return false;
+  const liveFolds = curEl.querySelectorAll('details.fold-tool-live');
+  const pre = liveFolds[liveFolds.length - 1]?.querySelector('.fold-pre');
+  if (!pre) return false;
+  pre.textContent = curBlock.body;
+  return true;
+}
+
 function parseAskUserJson(raw) {
   if (raw == null) return null;
   const txt = String(raw).trim();
@@ -1974,9 +2003,22 @@ function fileSubLabel(name) {
   if (videoExts.includes(ext)) return t('file.kindVideo');
   return ext.toUpperCase();
 }
+/** 无 turn_segs 时按 LLM Running 标记切轮（与 stapp.fold_turns 同源） */
+function splitContentTurnSegs(content) {
+  const src = String(content || '');
+  const parts = src.split(/\**LLM Running \(Turn \d+\) \.\.\.\**/);
+  const segs = [];
+  for (let i = 1; i < parts.length; i++) {
+    const body = parts[i] || '';
+    if (body.length || segs.length) segs.push(body);
+  }
+  if (segs.length > 1) return segs;
+  return src.length ? [src] : [];
+}
+
 function assistantTurnSegs(msg) {
   if (Array.isArray(msg?.turn_segs) && msg.turn_segs.length) return msg.turn_segs;
-  if (typeof msg?.content === 'string' && msg.content.length) return [msg.content];
+  if (typeof msg?.content === 'string' && msg.content.length) return splitContentTurnSegs(msg.content);
   return [];
 }
 
@@ -2145,11 +2187,11 @@ function scrollBottom(force) {
   }
 }
 /* ═══════════════ 打字机效果 (PR移植) ═══════════════ */
-const TW_SPEED = 80000;  // 默认每 tick 字符数
-const TW_INTERVAL = 16; // ms；接近 60fps，比 30ms 更平滑
-const TW_CATCHUP_THRESHOLD = 300; // 残余超过阈值时进入追赶档
-const TW_CATCHUP_MULTIPLIER = 10; // 
-const TW_RECOVER_MIN = 1200;  // 刷新恢复：partial 已有存量超过此值 → 直接对齐，不重播打字机
+const TW_SPEED = 10;  // 逐字步长；paintDraft 只重绘当前轮
+const TW_INTERVAL = 35; // ms
+const TW_CATCHUP_THRESHOLD = 480; // 积压过大时加速追平
+const TW_CATCHUP_MULTIPLIER = 8;
+const TW_RECOVER_MIN = 1200;  // 保留常量；刷新恢复改由 snapDraftRecover 一律对齐
 const DRAFT_INTERACT_MS = 520; // 用户滚代码块/点折叠时暂缓 DOM 重写
 
 function isDraftInteractFrozen(r) {
@@ -2181,17 +2223,30 @@ function bindDraftInteractGuard(el, r) {
     if (e.target.matches('details')) arm();
   }, true);
 }
-/** 刷新/重连后已有大段 partial：一次性对齐到当前全文，仅对之后新增字做打字机 */
-function maybeRecoverDraftSeek(r) {
-  const segs = Array.isArray(r.draftSegs) ? r.draftSegs : [];
-  const tw = r.twState;
-  if (!tw) return;
-  const turn = tw.turn || 0;
-  const cur = segs[turn] || '';
-  const total = cur.length;
-  if (!r.draftRecoverPending || tw.shown > 0 || total < TW_RECOVER_MIN) return;
-  tw.shown = total;
+function resetTypewriterState(r) {
+  if (r.twState?.timer) clearInterval(r.twState.timer);
+  r.twState = null;
   r.draftRecoverPending = false;
+  r.draftStreamBaseline = 0;
+  r._draftPaintBody = '';
+}
+
+/** 刷新/hydrate/重连：已有 partial 一次性对齐全文并单帧绘制，不重播打字机 */
+function snapDraftRecover(r) {
+  if (!r.draftRecoverPending || !r.draftEl) return false;
+  if (!r.twState) r.twState = { turn: 0, shown: 0, timer: null };
+  const tw = r.twState;
+  if (tw.timer) { clearInterval(tw.timer); tw.timer = null; }
+  const segs = Array.isArray(r.draftSegs) ? r.draftSegs : [];
+  const turn = Math.max(0, Number(r.draftTurn) || 0);
+  tw.turn = turn;
+  tw.shown = (segs[turn] || '').length;
+  r.draftRecoverPending = false;
+  r.draftStreamBaseline = tw.shown;
+  r._draftPaintBody = '';
+  ensureDraftFrozenThrough(r, turn);
+  paintDraft(r, turn, segs[turn] || '');
+  return true;
 }
 
 function renderDraft(sess) {
@@ -2210,7 +2265,6 @@ function renderDraft(sess) {
   if (tw.turn > backendTurn) tw.turn = backendTurn;
   // 流式渲染模型：segs 是源数据；tw.turn 是正在打字的 turn；tw.turn 之前的 DOM 一旦 frozen 就不再动。
   ensureDraftFrozenThrough(r, tw.turn);
-  maybeRecoverDraftSeek(r);
 
   const tick = () => {
     const segs = Array.isArray(r.draftSegs) ? r.draftSegs : [];
@@ -2233,11 +2287,22 @@ function renderDraft(sess) {
     if (tw.shown >= cur.length) return; // 中途不停止 timer，等新 partial/done。
     if (isDraftInteractFrozen(r)) return;
 
+    const t0 = performance.now();
     const backlog = cur.length - tw.shown;
-    const step = backlog > TW_CATCHUP_THRESHOLD ? TW_SPEED * TW_CATCHUP_MULTIPLIER : TW_SPEED;
+    let step = backlog > TW_CATCHUP_THRESHOLD ? TW_SPEED * TW_CATCHUP_MULTIPLIER : TW_SPEED;
+    const last = tw.lastElapsed || 0;
+    if (last > 60) step = Math.max(step, Math.ceil(backlog / 3));
+    else step = Math.min(step, 120);
     tw.shown = Math.min(tw.shown + step, cur.length);
     paintDraft(r, tw.turn, cur.slice(0, tw.shown));
+    tw.lastElapsed = performance.now() - t0;
   };
+
+  if (snapDraftRecover(r)) {
+    if (!tw.timer) tw.timer = setInterval(tick, TW_INTERVAL);
+    refreshEmptyState(sess);
+    return;
+  }
 
   if (!tw.timer) tw.timer = setInterval(tick, TW_INTERVAL);
   if (!isDraftInteractFrozen(r)) tick();
@@ -2295,23 +2360,25 @@ function paintDraft(r, turn, visibleCurrBody) {
     bubble.appendChild(cur);
   }
   cur.dataset.turn = turn ?? 0;
-  cur.innerHTML = renderTurnBody(visibleCurrBody || '') + '<span class="cursor"></span>';
-  postRenderEnhance(cur);
+  const body = visibleCurrBody || '';
+  const prevBody = r._draftPaintBody || '';
+  if (!tryPatchInflightToolDom(cur, body, prevBody)) {
+    cur.innerHTML = renderTurnBody(body) + '<span class="cursor"></span>';
+    postRenderEnhance(cur);
+  } else if (!cur.querySelector('.cursor')) {
+    cur.insertAdjacentHTML('beforeend', '<span class="cursor"></span>');
+  }
+  r._draftPaintBody = body;
 
   if (wasNear) {
     const inCodeScroll = document.activeElement?.closest?.('.code-block pre, .fold-pre')
       && r.draftEl.contains(document.activeElement);
-    if (!inCodeScroll) scrollBottom(true);
+    if (!inCodeScroll) scrollBottom();
   }
 }
 
 function flushTypewriter(sess) {
-  const r = rt(sess);
-  r.draftRecoverPending = false;
-  if (r.twState) {
-    if (r.twState.timer) clearInterval(r.twState.timer);
-    r.twState = null;
-  }
+  resetTypewriterState(rt(sess));
 }
 
 /* ═══════════════ 运行状态 ═══════════════ */
@@ -2404,7 +2471,9 @@ function stopTaskTimer(sess) {
 }
 
 function setBusy(sess, busy) {
-  const r = rt(sess); r.busy = busy;
+  const r = rt(sess);
+  if (r.busy && !busy) resetTypewriterState(r);
+  r.busy = busy;
   if (busy) startTaskTimer(sess); else stopTaskTimer(sess);
   if (!isActive(sess)) return;
   if (busy) {
@@ -2540,7 +2609,9 @@ function setActiveSession(id) {
   const sess = state.sessions.get(id);
   if (!sess) return;
   if (msgsEl) msgsEl.innerHTML = '';
-  rt(sess).draftEl = null;
+  const r = rt(sess);
+  r.draftEl = null;
+  resetTypewriterState(r);
   renderAllMessages(sess);
   setBusy(sess, rt(sess).busy);
   renderSessionList();
@@ -2683,15 +2754,22 @@ function normalize(m) {
 function upsert(sess, raw, partial) {
   const m = normalize(raw); const r = rt(sess);
   if (partial && m.role === 'assistant') {
+    if (!r.draftEl) resetTypewriterState(r);
     const prevLen = (Array.isArray(r.draftSegs) ? (r.draftSegs[r.draftTurn] || '') : '').length;
     r.draftSegs = draftSegsFromPartial(raw, m);
     r.draftTurn = (typeof m.curr_turn === 'number') ? m.curr_turn : Math.max(0, r.draftSegs.length - 1);
     const curLen = (r.draftSegs[r.draftTurn] || '').length;
     const wasEmpty = prevLen === 0;
-    const tw = r.twState;
-    if (wasEmpty && curLen >= TW_RECOVER_MIN && (!tw || tw.shown === 0)) {
+    // 新 draft（含刷新/停止后再开）：对齐已有 partial，避免从 0 重播打字机
+    if ((!r.draftEl || wasEmpty) && curLen > 0) {
       r.draftRecoverPending = true;
     }
+    const tw = r.twState;
+    if (tw && curLen > (r.draftStreamBaseline || 0)) {
+      const baseline = r.draftStreamBaseline || 0;
+      if (tw.shown < baseline) tw.shown = baseline;
+    }
+    r.draftStreamBaseline = curLen;
     if (isActive(sess)) renderDraft(sess);
     return;
   }
@@ -2769,11 +2847,28 @@ function applyPollResult(sess, result) {
   return busy;
 }
 
+/** hydrate 批量灌历史，避免逐条 appendMessage 触发全量重绘 */
+function hydrateHistoryMessages(sess, messages) {
+  const r = rt(sess);
+  for (const raw of (messages || [])) {
+    const m = normalize(raw);
+    if (!m.id || r.seen.has(m.id)) continue;
+    r.seen.add(m.id);
+    r.lastId = Math.max(r.lastId, m.id);
+    sess.messages.push(m);
+  }
+  if (isActive(sess)) renderAllMessages(sess);
+}
+
 /** 拉历史：limit=0 一次拿全量（bridge 不截断）；不等 idle，running 续交给 pollSession */
 async function hydrateSession(sess) {
   try {
     const result = await fetchSessionPoll(sess, { after: 0, limit: 0 });
-    const busy = applyPollResult(sess, result);
+    hydrateHistoryMessages(sess, result.messages);
+    if (result.partial) upsert(sess, result.partial, true);
+    const busy = result.status === 'running' || !!result.partial;
+    setBusy(sess, busy);
+    if (isActive(sess)) applyPlanPayload(sess, result.plan);
     if (busy && !rt(sess).polling) pollSession(sess);
   } catch (e) {
     showError(t('err.poll') + ': ' + (e.message || e));
@@ -2789,8 +2884,9 @@ async function hydrateSession(sess) {
 
 async function pollSession(sess) {
   const r = rt(sess);
-  if (r.polling) return;
+  if (r.polling) { r.pollAgain = true; return; }
   r.polling = true;
+  r.pollAgain = false;
   /* 手机切后台再回前台时,第一拍 fetch 经常用着死连接秒挂(Failed to fetch),
      但只要给链路 1-2 秒重建,后续就稳。原版一炸就 showError,体验糟。
      改成:同一次 polling 循环里连续失败 ≥ MAX_ERRORS 次才放弃,
@@ -2806,6 +2902,7 @@ async function pollSession(sess) {
         if (busy) await new Promise(z => setTimeout(z, 500));
         else {
           if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftSegs = null; r.draftTurn = 0; }
+          resetTypewriterState(r);
           break;
         }
       } catch (innerErr) {
@@ -2826,6 +2923,10 @@ async function pollSession(sess) {
       syncAskUserUi();
     }
     tokPollBridge();
+    if (r.pollAgain) {
+      r.pollAgain = false;
+      pollSession(sess);
+    }
   }
 }
 
@@ -2838,8 +2939,8 @@ function removeUsedPendingFiles(usedFiles) {
 }
 
 function clearDraft(sess) {
-  flushTypewriter(sess);
   const r = rt(sess);
+  resetTypewriterState(r);
   if (r.draftEl) { r.draftEl.remove(); r.draftEl = null; r.draftSegs = null; r.draftTurn = 0; }
 }
 
@@ -2983,6 +3084,8 @@ async function cancelPrompt() {
   try {
     const res = await window.ga.rpc('session/cancel', { sessionId: sess.bridgeSessionId || sess.id });
     if (res?.error) throw new Error(res.error.message || res.error);
+    clearDraft(sess);
+    rt(sess).pollAgain = true;
     return true;
   } catch (e) { showError(t('err.stop') + ': ' + (e.message || e)); return false; }
 }
@@ -5201,7 +5304,7 @@ function bindComposerInRoot(root, opts) {
     const bubble = drawerEl.querySelector('.collab-drawer-body .bubble');
     if (bubble) {
       bubble.innerHTML = renderTurnBody(w.fullReply || t('collab.summaryWait'));
-      enhanceMsg(bubble);
+      postRenderEnhance(bubble);
     }
     drawerEl.querySelector('.collab-drawer-backdrop').onclick = closeWorkerDrawer;
     drawerEl.querySelector('.collab-drawer-close').onclick = closeWorkerDrawer;

@@ -788,7 +788,8 @@ html[data-appearance="dark"] .swatch[data-theme="8"].sel::after{
   border-radius:50%; animation:ga-spin .65s linear infinite;
 }
 @keyframes ga-spin{ to{ transform:rotate(360deg); } }
-.msg-area.has-msgs{ align-items:stretch; justify-content:flex-start; }
+/* 有消息时必须顶对齐：父级 .page--chat-ui .msg-area 的 center 优先级更高，否则会滚不到顶部 */
+.page.page--chat-ui .msg-area.has-msgs{ align-items:stretch; justify-content:flex-start; }
 .conv-empty{ color:var(--muted2); font-size:12px; }
 
 /* 消息流 */
