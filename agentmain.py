@@ -54,7 +54,7 @@ class GenericAgent:
         self.history = []; self.handler = None; 
         self.task_queue = queue.Queue() 
         self.is_running = False; self.stop_sig = False; self.llm_no = 0;  
-        self.inc_out = False; self.verbose = True; self.show_mode = 'text'
+        self.inc_out = False; self.verbose = True
         self.peer_hint = True
         self.force_non_stream = False
         logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
@@ -140,7 +140,7 @@ class GenericAgent:
             if raw_query is None:
                 self.task_queue.task_done(); continue
             self.is_running = True
-            if len(raw_query) > 1500:
+            if len(raw_query) > 2000:
                 task_file = os.path.join(script_dir, 'temp', f'user_prompt_{int(time.time())}.md')
                 with open(task_file, 'w', encoding='utf-8') as f: f.write(raw_query)
                 raw_query = f'Long user prompt saved to {task_file}. Read and execute.'
