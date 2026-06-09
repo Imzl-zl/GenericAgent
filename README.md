@@ -389,16 +389,6 @@ For reCAPTCHA v3, `0.9` is not a "checkbox solved" result; it is the high-confid
 
 If this project helped you, please consider leaving a **Star!** 🙏
 
-You're also welcome to join the **GenericAgent Community Group** for discussion, feedback, and co-building 👏
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center"><strong>WeChat Group 21</strong><br/><img src="assets/images/wechat_group21.jpg" alt="WeChat Group 21 QR" width="240"/></td>
-    </tr>
-  </table>
-</div>
-
 ### 🚩 Friendly Links
 
 Thanks to the **LinuxDo** community for the support!
