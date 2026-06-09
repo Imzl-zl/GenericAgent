@@ -30,7 +30,7 @@ st.markdown("""
     z-index: 999;
     background: var(--background-color, #ffffff);
 }
-.stMainBlockContainer { padding-bottom: 7rem !important; }
+.stMainBlockContainer { padding-bottom: 10rem !important; }
 </style>
 """, unsafe_allow_html=True)
 

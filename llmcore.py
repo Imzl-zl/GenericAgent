@@ -684,7 +684,7 @@ class NativeClaudeSession(BaseSession):
         if self.api_key.startswith("sk-ant-"): headers["x-api-key"] = self.api_key
         else: headers["authorization"] = f"Bearer {self.api_key}"
         payload = {"model": model, "messages": messages, "max_tokens": self.max_tokens, "stream": self.stream}
-        if self.fake_cc_system_prompt: payload["max_tokens"] = 64000
+        #if self.fake_cc_system_prompt: payload["max_tokens"] = 64000
         if self.temperature != 1: payload["temperature"] = self.temperature
         self._apply_claude_thinking(payload)
         payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}; 
