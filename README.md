@@ -137,7 +137,7 @@ uv venv && uv pip install -e ".[ui]"
 cp mykey_template_en.py mykey.py   # fill in your LLM API key
 ```
 
-The agent core depends on just **one** library — `requests`. The other four lightweight packages (`beautifulsoup4`, `bottle`, `simple-websocket-server`, `aiohttp`) power TMWebdriver's local server. No Playwright, no LangChain, no browser binaries to download.
+Dependencies are deliberately tiered: the agent core needs only `requests`, plus four lightweight packages (`beautifulsoup4`, `bottle`, `simple-websocket-server`, `aiohttp`) for TMWebdriver's local server. The `[ui]` extra pulls in frontend libraries (Streamlit, `prompt_toolkit`/`rich` for the TUI, …) — install it for the bundled UIs, or skip it entirely and drive the agent headless. No Playwright, no LangChain, no browser binaries to download.
 
 Then launch:
 
