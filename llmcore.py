@@ -739,7 +739,7 @@ class NativeClaudeSession(BaseSession):
         return MockResponse(thinking, content, tool_calls, str(content_blocks))
 
 class NativeOAISession(NativeClaudeSession):
-    native_ua = "codex_cli_rs/0.1.2025062000 (Windows 11 10.0.26100; x86_64) Windows_Terminal"
+    native_ua = "codex_cli_rs/0.139.0 (Windows 10.0.26200; x86_64) unknown"
     def raw_ask(self, messages):
         messages = _fix_messages(messages)
         messages = _ensure_thinking_blocks(messages, self.model)
