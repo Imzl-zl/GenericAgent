@@ -87,10 +87,6 @@ memory/L4_raw_sessions/*
 # Morphling SOP
 !memory/morphling_sop.md
 
-# Skill Search SOP
-!memory/skill_search/
-!memory/skill_search/**
-
 
 # ADB UI tool
 !memory/adb_ui.py
