@@ -2,11 +2,11 @@
 
 ## 目标
 
-本轮测试主要关注三个结果：
+目前打算采用 git action 构建发布版，本轮测试主要关注三个结果：
 
-1. 当前系统能产出可用的环境配置脚本和桌面程序壳。
-2. 在干净环境/干净仓库中，测试员可以用脚本完成环境配置，并成功运行这个程序壳。
-3. 核心功能兼容性测试。
+1. 测试者优先验证已有 Release 产物是否能在目标系统运行。
+2. 若 Release 产物不可用，再记录失败原因，并考虑本地构建或调整 GitHub Action 构建方法。
+3. Release 产物能启动后，再做核心功能兼容性测试。
 
 ---
 
@@ -28,37 +28,58 @@
 
 ## 每个系统需要完成的任务
 
-### 任务 1：生成脚本和程序壳
+### 任务 1：下载并验证已有 Release 产物
 
-测试员需要在自己的系统上产出：
+测试员优先使用已有 Release，不要求先在本机生成程序壳。
 
-- 对应系统的环境配置脚本；
-- 对应系统的桌面程序壳（可执行程序）。
+当前测试 Release：
 
-脚本实现可以直接参考 Windows 版本：`desktop_release/scripts/windows/install_windows.ps1`。Linux 版本已有可用参考实现：`desktop_release/scripts/linux/install_linux.sh`，已在 Ubuntu 24.04.4 LTS x64 上做过初步试用，但仍需按清单做完整验证。核心做法是由脚本准备运行环境，并写入用户级桌面配置（如 `~/.ga_desktop_settings.json`），让程序壳能找到 `project_dir`、`python_path` 和 bridge 脚本。
+```text
+https://github.com/dd3xp/GenericAgent_Desktop/releases/tag/desktop-windows-test-3-1
+```
 
-Linux 参考流程：
+当前资产命名：
+
+```text
+GenericAgent-Desktop-Windows.exe
+GenericAgent-Desktop-Linux.AppImage
+SHA256SUMS.txt
+```
+
+测试步骤：
+
+1. 下载对应系统的 Release 产物和 `SHA256SUMS.txt`；
+2. 启动环境配置脚本
+3. 运行程序壳；
+4. 记录是否能打开主界面、是否能连上本地 bridge/后端；
+
+环境配置脚本 Windows 可参考：
+
+```powershell
+# 在仓库根目录执行
+.\desktop_release\scripts\windows\install_windows.ps1
+```
+
+环境配置脚本 Linux 可参考：
 
 ```bash
 chmod +x desktop_release/scripts/linux/install_linux.sh
 ./desktop_release/scripts/linux/install_linux.sh --mode PrepareOnly
-chmod +x GenericAgent_0.1.0_amd64.AppImage
-./GenericAgent_0.1.0_amd64.AppImage
+chmod +x GenericAgent-Desktop-Linux.AppImage
+./GenericAgent-Desktop-Linux.AppImage
 ```
 
+说明：Linux 脚本 `desktop_release/scripts/linux/install_linux.sh` 目前作为参考实现使用，已在 Ubuntu 24.04.4 LTS x64 上做过初步试用，但仍需按清单做完整验证。脚本核心做法是准备运行环境，并写入用户级桌面配置（如 `~/.ga_desktop_settings.json`），让程序壳能找到 `project_dir`、`python_path` 和 bridge 脚本。
 
+### 任务 2：Release 不可用时的升级路径
 
-### 任务 2：干净环境验证通过
+如果 Release 产物在目标系统不可用：
+1. 如果只是目标机缺少运行环境，优先修正环境配置脚本；
+2. 如果 Release 产物本身不兼容，尝试在目标系统本地构建；
+3. 如果本地构建可行，再考虑修改 GitHub Action 的 Linux/Windows 构建方法，让 CI 产物与本地成功产物保持一致。
 
-从干净仓库或尽量干净的测试目录开始，验证：
+### 任务 3：核心功能兼容性测试
 
-- 环境配置脚本可以成功运行；
-- 脚本能把运行桌面版需要的环境准备好；
-- 从 `frontends/` 标准位置启动程序壳可以正常打开；
-- 程序壳能连上本地 bridge/后端；
-
-如果方便，建议用全新 clone 再走一遍；
-
-### 任务 3：根据 CHECKLIST 测一下在不同平台下的界面使用兼容性 
+Release 产物可以启动并连上后端后，再根据 `desktop_release/CHECKLIST.md` 测试不同平台下的界面和核心功能兼容性。
 
 ---
