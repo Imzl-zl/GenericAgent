@@ -1,0 +1,102 @@
+name: Build Windows Desktop Test Release
+
+"on":
+  push:
+    branches:
+      - test
+    paths:
+      - "frontends/desktop/**"
+      - "desktop_release/**"
+      - ".github/workflows/windows-test-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows desktop shell
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontends/desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontends/desktop/src-tauri -> target
+
+      - name: Install desktop dependencies
+        working-directory: frontends/desktop
+        run: npm ci
+
+      - name: Build Windows bundle
+        working-directory: frontends/desktop
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Collect Windows bundles
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts/windows | Out-Null
+          $bundleRoot = "frontends/desktop/src-tauri/target/release/bundle"
+          Get-ChildItem -Path $bundleRoot -Recurse -File | Where-Object {
+            $_.Extension -in ".exe", ".msi", ".zip" -or $_.FullName -match "nsis"
+          } | ForEach-Object {
+            Copy-Item $_.FullName -Destination "artifacts/windows/$($_.Name)" -Force
+          }
+          Get-ChildItem -Path artifacts/windows -File | ForEach-Object {
+            $hash = Get-FileHash $_.FullName -Algorithm SHA256
+            "{0}  {1}" -f $hash.Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content -Encoding UTF8 artifacts/windows/SHA256SUMS.txt
+          Get-ChildItem -Path artifacts/windows -File | Format-Table Name, Length
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GenericAgent-Desktop-Windows-Test-${{ github.run_number }}
+          path: artifacts/windows/*
+          if-no-files-found: error
+
+      - name: Create test pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: desktop-windows-test-${{ github.run_number }}-${{ github.run_attempt }}
+          RELEASE_TITLE: GenericAgent Desktop Windows Test Build ${{ github.run_number }}
+        shell: pwsh
+        run: |
+          $body = @"
+          # GenericAgent Desktop Windows test build
+
+          **This is a test-only pre-release. Do not use it as a stable or production release.**
+
+          - Branch: `${{ github.ref_name }}`
+          - Commit: `${{ github.sha }}`
+          - Workflow run: `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+          - Platform built in this workflow: Windows only
+          - Bundle type: Tauri NSIS installer / Windows bundle
+
+          Notes:
+          - This release is used to collect Windows desktop shell artifacts for testing.
+          - macOS and Linux artifacts are intentionally not built by this first workflow.
+          - Testers should still verify installation, startup, and core desktop functions on real Windows machines.
+
+          SHA256 checksums are included in `SHA256SUMS.txt`.
+          "@
+
+          gh release create $env:TAG_NAME artifacts/windows/* `
+            --repo "${{ github.repository }}" `
+            --target "${{ github.sha }}" `
+            --title $env:RELEASE_TITLE `
+            --notes $body `
+            --prerelease
