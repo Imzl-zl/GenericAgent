@@ -253,7 +253,7 @@ const I18N = {
     'app.title': 'GenericAgent 桌面版',
     'brand.sub': '桌面终端',
     'nav.chat': '聊天', 'nav.services': '后台服务', 'nav.channels': '消息通道', 'nav.status': '状态面板',
-    'nav.collab': '指挥家', 'nav.token': 'Token 统计',
+    'nav.collab': '指挥家', 'nav.token': '用量',
     'foot.settings': '配置', 'foot.ver': 'GenericAgent · 桌面版',
     'chat.startTitle': '开始对话', 'chat.startSub': '直接输入，或点预设功能一键启动',
     'preset.butler.t': '指挥家', 'preset.butler.d': '复杂任务自动拆解，只需查看进度和简报',
@@ -264,7 +264,7 @@ const I18N = {
     'preset.review.t': '深度复核', 'preset.review.d': '挑刺式质量把关',
     'preset.mine.t': '我的·周报', 'preset.mine.d': '自定义：抓本周提交并写周报',
     'preset.add.t': '自定义', 'preset.add.d': '任意一句话存为功能',
-    'composer.placeholder': '输入消息… (Enter 发送, Shift+Enter 换行)',
+    'composer.placeholder': 'GA 能帮你做些什么？',
     'search.placeholder': '搜索会话…', 'conv.new': '新对话',
     'ctx.pin': '置顶', 'ctx.unpin': '取消置顶', 'ctx.rename': '重命名', 'ctx.del': '删除',
     'common.close': '关闭', 'common.more': '更多', 'common.optional': '选填', 'common.save': '保存',
@@ -326,6 +326,7 @@ const I18N = {
     'collab.switchMode': '切换模式',
     'collab.typing': '指挥家正在处理',
     'collab.offline': '无法连接 Conductor（8900）。请确认服务已启动且本地已穿透 8900 端口。',
+    'collab.offlineShort': '无法连接 Conductor（8900）',
     'collab.retry': '重试',
     'collab.reconnect': '连接断开，正在重连… 已保留上次任务进度。',
     'collab.reconnectIn': '{n} 秒后重试',
@@ -338,7 +339,7 @@ const I18N = {
     'collab.timeMin': '{n} 分钟前',
     'collab.timeHr': '{n} 小时前',
     'collab.timeDay': '{n} 天前',
-    'page.token.title': 'Token 统计', 'page.token.sub': '每会话与累计的 token 用量及缓存率',
+    'page.token.title': '用量', 'page.token.sub': '每会话与累计用量及缓存率',
     'status.connecting': '连接中…', 'status.ready': '就绪', 'status.running': '运行中',
     'status.disconnected': '未连接', 'status.stopped': '已停止', 'status.idle': '空闲',
     'conv.emptyList': '暂无会话，点「＋ 新对话」开始', 'conv.defaultTitle': '新对话',
@@ -395,7 +396,7 @@ const I18N = {
     'proc.imbotWechat': 'imbot · 微信', 'proc.imbotDing': 'imbot · 钉钉', 'proc.scheduler': '定时任务调度',
     'cm.scheduling': '调度中', 'cm.running': '执行中', 'cm.idleSt': '空闲',
     'cm.master': '已派 3 子任务', 'cm.w1': '子任务：抓取数据', 'cm.w2': '子任务：复核结果', 'cm.sub': '等待派单',
-    'tok.total': '累计 token', 'tok.cost': '缓存率', 'tok.today': '今日 token', 'tok.tabAll': '聊天', 'tok.tabConductor': '指挥家', 'tok.condTotal': '指挥家累计', 'tok.condCurrent': '指挥家本次', 'tok.condTip': '指挥家消耗的 token 不计入聊天累计 token 中', 'tok.condOffline': '无法连接指挥家（8900）', 'tok.disclaimer': '不同 API 网站的计费价格可能会有差异，请以实际网站为准。', 'tok.chartToggle': '趋势图',
+    'tok.total': '累计', 'tok.cost': '缓存率', 'tok.today': '今日', 'tok.tabAll': '聊天', 'tok.tabConductor': '指挥家', 'tok.condTotal': '指挥家累计', 'tok.condCurrent': '指挥家本次', 'tok.condTip': '指挥家消耗不计入聊天累计', 'tok.condOffline': '无法连接指挥家（8900）', 'tok.disclaimer': '不同 API 网站的计费价格可能会有差异，请以实际网站为准。', 'tok.chartToggle': '趋势图',
     'tok.colSession': '会话', 'tok.colIn': '输入', 'tok.colOut': '输出', 'tok.colCacheW': '缓存写入', 'tok.colCache': '缓存读取', 'tok.colCost': '成本',
     'tok.from': '从', 'tok.to': '到', 'tok.reset': '重置', 'tok.noData': '暂无记录', 'tok.deleted': '此会话已删除',
     'tok.pricingUnknown': '⚠ 此模型计费规则尚未明确，按默认估算',
@@ -415,7 +416,7 @@ const I18N = {
     'app.title': 'GenericAgent Desktop',
     'brand.sub': 'Desktop terminal',
     'nav.chat': 'Chat', 'nav.services': 'Services', 'nav.channels': 'Channels', 'nav.status': 'Status',
-    'nav.collab': 'Conductor', 'nav.token': 'Token usage',
+    'nav.collab': 'Conductor', 'nav.token': 'Usage',
     'foot.settings': 'Settings', 'foot.ver': 'GenericAgent · Desktop',
     'chat.startTitle': 'Start a conversation', 'chat.startSub': 'Type a message, or pick a preset',
     'preset.butler.t': 'Conductor', 'preset.butler.d': 'Auto-decompose complex tasks; just check progress and briefings',
@@ -426,7 +427,7 @@ const I18N = {
     'preset.review.t': 'Deep review', 'preset.review.d': 'Strict quality check',
     'preset.mine.t': 'My · Weekly', 'preset.mine.d': 'Custom: weekly report from commits',
     'preset.add.t': 'Custom', 'preset.add.d': 'Save any prompt as a function',
-    'composer.placeholder': 'Type a message… (Enter to send, Shift+Enter for newline)',
+    'composer.placeholder': 'What can GA do for you?',
     'search.placeholder': 'Search chats…', 'conv.new': 'New chat',
     'ctx.pin': 'Pin', 'ctx.unpin': 'Unpin', 'ctx.rename': 'Rename', 'ctx.del': 'Delete',
     'common.close': 'Close', 'common.more': 'More', 'common.optional': 'Optional', 'common.save': 'Save',
@@ -488,6 +489,7 @@ const I18N = {
     'collab.switchMode': 'Switch mode',
     'collab.typing': 'Conductor is working',
     'collab.offline': 'Cannot reach Conductor (8900). Start the service and forward port 8900.',
+    'collab.offlineShort': 'Cannot reach Conductor (8900)',
     'collab.retry': 'Retry',
     'collab.reconnect': 'Disconnected — reconnecting… Your last progress is kept.',
     'collab.reconnectIn': 'Retry in {n}s',
@@ -500,7 +502,7 @@ const I18N = {
     'collab.timeMin': '{n}m ago',
     'collab.timeHr': '{n}h ago',
     'collab.timeDay': '{n}d ago',
-    'page.token.title': 'Token usage', 'page.token.sub': 'Per-session and total token usage & cache rate',
+    'page.token.title': 'Usage', 'page.token.sub': 'Per-session and total usage & cache rate',
     'status.connecting': 'Connecting…', 'status.ready': 'Ready', 'status.running': 'Running',
     'status.disconnected': 'Disconnected', 'status.stopped': 'Stopped', 'status.idle': 'Idle',
     'conv.emptyList': 'No chats yet — click “＋ New chat”', 'conv.defaultTitle': 'New chat',
@@ -557,7 +559,7 @@ const I18N = {
     'proc.imbotWechat': 'imbot · WeChat', 'proc.imbotDing': 'imbot · DingTalk', 'proc.scheduler': 'Scheduler',
     'cm.scheduling': 'Scheduling', 'cm.running': 'Running', 'cm.idleSt': 'Idle',
     'cm.master': 'Dispatched 3 subtasks', 'cm.w1': 'Subtask: fetch data', 'cm.w2': 'Subtask: review results', 'cm.sub': 'Waiting for tasks',
-    'tok.total': 'Total tokens', 'tok.cost': 'Cache rate', 'tok.today': 'Today tokens', 'tok.tabAll': 'Chat', 'tok.tabConductor': 'Conductor', 'tok.condTotal': 'Conductor Total', 'tok.condCurrent': 'Conductor Current', 'tok.condTip': 'Conductor tokens are not included in chat totals', 'tok.condOffline': 'Cannot reach Conductor (8900)', 'tok.disclaimer': 'Pricing may vary by API provider. Please refer to the actual website.', 'tok.chartToggle': 'Trend',
+    'tok.total': 'Total', 'tok.cost': 'Cache rate', 'tok.today': 'Today', 'tok.tabAll': 'Chat', 'tok.tabConductor': 'Conductor', 'tok.condTotal': 'Conductor Total', 'tok.condCurrent': 'Conductor Current', 'tok.condTip': 'Conductor usage is not included in chat totals', 'tok.condOffline': 'Cannot reach Conductor (8900)', 'tok.disclaimer': 'Pricing may vary by API provider. Please refer to the actual website.', 'tok.chartToggle': 'Trend',
     'tok.colSession': 'Session', 'tok.colIn': 'Input', 'tok.colOut': 'Output', 'tok.colCacheW': 'Cache write', 'tok.colCache': 'Cache read', 'tok.colCost': 'Cost',
     'tok.from': 'From', 'tok.to': 'To', 'tok.reset': 'Reset', 'tok.noData': 'No records', 'tok.deleted': 'Session deleted',
     'tok.pricingUnknown': '⚠ Pricing not confirmed, using defaults',
@@ -4018,7 +4020,7 @@ window.ga.onBridgeClosed(() => {
   chatStatus.setDisconnected();
 });
 
-/* ═══════════════ Token 统计页 ═══════════════ */
+/* ═══════════════ Token 用量页 ═══════════════ */
 const tokTbody = document.getElementById('tok-tbody');
 const tokPager = document.getElementById('tok-pager');
 const tokSince = document.getElementById('tok-since');
@@ -4062,10 +4064,10 @@ function modelPriceTip(model) {
   const cacheWriteRate = isClaudeOrDS ? 1.25 : 1.0;
   const lines = [];
   if (!known) lines.push(t('tok.pricingUnknown'));
-  lines.push(t('tok.priceInput') + p[0] + ' /M tokens');
-  lines.push(t('tok.priceOutput') + p[1] + ' /M tokens');
-  lines.push(t('tok.priceCacheW') + (p[0] * cacheWriteRate).toFixed(2) + ' /M tokens');
-  lines.push(t('tok.priceCacheR') + (p[0] * cacheReadRate).toFixed(2) + ' /M tokens');
+  lines.push(t('tok.priceInput') + p[0] + ' /M');
+  lines.push(t('tok.priceOutput') + p[1] + ' /M');
+  lines.push(t('tok.priceCacheW') + (p[0] * cacheWriteRate).toFixed(2) + ' /M');
+  lines.push(t('tok.priceCacheR') + (p[0] * cacheReadRate).toFixed(2) + ' /M');
   return lines.join('\n');
 }
 
@@ -5425,20 +5427,15 @@ function bindComposerInRoot(root, opts) {
     if (S.conductorTyping && S.serviceAvailable) collabStatus.setBusy(t('status.running'));
     else if (S.serviceAvailable) collabStatus.setReady();
     else if (S.reconnecting || (!S.everConnected && S.failCount < FAIL_MAX)) collabStatus.setConnecting();
-    else collabStatus.setDisconnected();
+    else collabStatus.set(t('collab.offlineShort'), 'offline');  // 顶栏直接显示"无法连接 Conductor(8900)"取代"未连接"
   }
 
   function setConnUi() {
-    const off = $('collab-offline'), recon = $('collab-reconnect');
+    const retry = $('collab-retry');
     const avail = S.serviceAvailable;
     const trying = !avail && !S.everConnected && S.failCount < FAIL_MAX;
-    if (off) off.hidden = avail || S.reconnecting || trying;
-    if (recon) {
-      recon.hidden = !S.reconnecting;
-      recon.textContent = S.reconnecting && S.reconnectAt > Date.now()
-        ? t('collab.reconnect') + ' ' + t('collab.reconnectIn').replace('{n}', Math.ceil((S.reconnectAt - Date.now()) / 1000))
-        : t('collab.reconnect');
-    }
+    // 只有"真离线且不在自动重连"才显示刷新图标(右边的手动重试入口)
+    if (retry) retry.hidden = avail || S.reconnecting || trying;
     window.collabComposer?.setEnabled?.(avail);
     syncCollabStatus();
     syncDraft();
@@ -5693,4 +5690,25 @@ function bindComposerInRoot(root, opts) {
   };
   window.collabFocus = () => window.collabComposer?.focus?.();
   window.collabRetranslate = () => { renderWorkers(); syncMessages(); setConnUi(); };
+})();
+
+/* ═══════════════ Composer layout: inline / stacked ═══════════════ */
+(function initComposerLayout() {
+  const BREAKPOINT = 480;
+  const SINGLE_LINE = 36;
+
+  document.querySelectorAll('.composer-inset').forEach(inset => {
+    const input = inset.querySelector('.input');
+    if (!input) return;
+
+    function update() {
+      const wide = inset.offsetWidth >= BREAKPOINT;
+      const single = input.scrollHeight <= SINGLE_LINE;
+      inset.classList.toggle('is-inline', wide && single);
+    }
+
+    new ResizeObserver(update).observe(inset);
+    input.addEventListener('input', update);
+    update();
+  });
 })();
