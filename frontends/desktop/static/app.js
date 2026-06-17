@@ -324,6 +324,7 @@ const I18N = {
     'collab.switchMode': '切换模式',
     'collab.typing': '指挥家正在处理',
     'collab.offline': '无法连接 Conductor（8900）。请确认服务已启动且本地已穿透 8900 端口。',
+    'collab.offlineShort': '无法连接 Conductor（8900）',
     'collab.retry': '重试',
     'collab.reconnect': '连接断开，正在重连… 已保留上次任务进度。',
     'collab.reconnectIn': '{n} 秒后重试',
@@ -484,6 +485,7 @@ const I18N = {
     'collab.switchMode': 'Switch mode',
     'collab.typing': 'Conductor is working',
     'collab.offline': 'Cannot reach Conductor (8900). Start the service and forward port 8900.',
+    'collab.offlineShort': 'Cannot reach Conductor (8900)',
     'collab.retry': 'Retry',
     'collab.reconnect': 'Disconnected — reconnecting… Your last progress is kept.',
     'collab.reconnectIn': 'Retry in {n}s',
@@ -5382,20 +5384,15 @@ function bindComposerInRoot(root, opts) {
     if (S.conductorTyping && S.serviceAvailable) collabStatus.setBusy(t('status.running'));
     else if (S.serviceAvailable) collabStatus.setReady();
     else if (S.reconnecting || (!S.everConnected && S.failCount < FAIL_MAX)) collabStatus.setConnecting();
-    else collabStatus.setDisconnected();
+    else collabStatus.set(t('collab.offlineShort'), 'offline');  // 顶栏直接显示"无法连接 Conductor(8900)"取代"未连接"
   }
 
   function setConnUi() {
-    const off = $('collab-offline'), recon = $('collab-reconnect');
+    const retry = $('collab-retry');
     const avail = S.serviceAvailable;
     const trying = !avail && !S.everConnected && S.failCount < FAIL_MAX;
-    if (off) off.hidden = avail || S.reconnecting || trying;
-    if (recon) {
-      recon.hidden = !S.reconnecting;
-      recon.textContent = S.reconnecting && S.reconnectAt > Date.now()
-        ? t('collab.reconnect') + ' ' + t('collab.reconnectIn').replace('{n}', Math.ceil((S.reconnectAt - Date.now()) / 1000))
-        : t('collab.reconnect');
-    }
+    // 只有"真离线且不在自动重连"才显示刷新图标(右边的手动重试入口)
+    if (retry) retry.hidden = avail || S.reconnecting || trying;
     window.collabComposer?.setEnabled?.(avail);
     syncCollabStatus();
     syncDraft();

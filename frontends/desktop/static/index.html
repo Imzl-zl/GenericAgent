@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>GenericAgent</title>
 <link rel="stylesheet" href="assets/fonts/fonts.css?v=2">
-<link rel="stylesheet" href="styles.css?v=146">
+<link rel="stylesheet" href="styles.css?v=152">
 <!-- KaTeX: LaTeX 公式渲染 -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
 <!-- highlight.js: 代码高亮 -->
@@ -226,18 +226,18 @@
 
         <!-- 指挥家 Conductor（对话区结构复用 page--chat-ui / chat-shell） -->
         <section class="page page--chat-ui" data-page="collab">
-          <div class="collab-offline" id="collab-offline" hidden>
-            <span data-i18n="collab.offline"></span>
-            <button type="button" class="chip sm" id="collab-retry" data-i18n="collab.retry"></button>
-          </div>
-          <div class="collab-reconnect" id="collab-reconnect" hidden data-i18n="collab.reconnect"></div>
           <div class="page-top">
             <button type="button" class="pt-icon pt-sb-toggle" aria-label="toggle sidebar">
               <span data-ga-icon="caretLeft"></span>
             </button>
-            <button class="run-state" id="collab-run-toggle" type="button">
-              <i class="dot"></i> <span class="rs-label"></span>
-            </button>
+            <div class="page-top-center">
+              <button class="run-state" id="collab-run-toggle" type="button">
+                <i class="dot"></i> <span class="rs-label"></span>
+              </button>
+              <button type="button" class="pt-icon collab-retry-btn" id="collab-retry" hidden data-i18n-aria-label="collab.retry" aria-label="retry">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              </button>
+            </div>
             <button type="button" class="pt-icon pt-rp-toggle" aria-label="toggle conversations">
               <span data-ga-icon="caretRight"></span>
             </button>
@@ -638,6 +638,6 @@
 <!-- highlight.js -->
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" crossorigin="anonymous"></script>
 <script src="phosphor-icons.js"></script>
-<script src="app.js?v=184"></script>
+<script src="app.js?v=185"></script>
 </body>
 </html>

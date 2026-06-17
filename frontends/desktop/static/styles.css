@@ -2171,17 +2171,24 @@ html[data-appearance="dark"] .bubble.md pre code{ color:var(--txt-2); }
   border-radius:var(--radius-sm);
 }
 
-/* ---- Conductor（仅保留与主聊天不同的部分，布局见 .page--chat-ui） ---- */
-.collab-offline,.collab-reconnect{
-  flex:0 0 auto; padding:10px 16px; font-size:13px; text-align:center;
-  background:color-mix(in srgb, var(--amber) 12%, var(--panel));
-  border-bottom:1px solid var(--line); align-items:center; justify-content:center; gap:10px;
-}
-.collab-offline[hidden], .collab-reconnect[hidden], #collab-welcome[hidden], .collab-msgs .msgs[hidden],
+/* ---- Conductor(仅保留与主聊天不同的部分,布局见 .page--chat-ui) ---- */
+#collab-welcome[hidden], .collab-msgs .msgs[hidden],
 .collab-rail[hidden], .collab-prog-stats[hidden],
 .collab-rail-run[hidden], .collab-rail-done[hidden], .collab-rail-issue[hidden]{ display:none !important; }
-.collab-offline:not([hidden]), .collab-reconnect:not([hidden]){ display:flex; }
-.collab-reconnect{ background:color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+/* 顶栏中央:状态栏 + 离线时的刷新图标按钮(取代原本的 banner+重试) */
+.page > .page-top .page-top-center{
+  grid-column:2; display:flex; align-items:center; justify-content:center; gap:6px;
+  min-width:0;
+}
+/* 收尾按钮:跟 .new-conv 同款带底色,长得像 button 而不是 icon */
+.collab-retry-btn{
+  width:24px; height:24px;
+  border:1px solid var(--line); background:var(--line-soft); border-radius:4px;
+  opacity:1; color:var(--txt-2);
+}
+.collab-retry-btn:hover{ background:var(--hover-2); color:var(--txt); opacity:1; }
+.collab-retry-btn svg{ width:14px; height:14px; }
+.collab-retry-btn[hidden]{ display:none !important; }
 .page.page--chat-ui[data-page="collab"] .msg-area.collab-msgs{ overflow:hidden; padding:0; }
 .page.page--chat-ui[data-page="collab"] .collab-scroll{
   flex:1 1 0; min-height:0; overflow:auto;
