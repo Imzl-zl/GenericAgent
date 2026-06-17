@@ -486,6 +486,18 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 /* margin-top:6px 跟 .provider-quickstart 内部的 gap:6px 对齐,
    保证「通义千问 → 配置」和「pq-head → DeepSeek」间距一致 */
 .sidebar-foot{ border-top:none; padding-top:0; margin-top:6px; }
+.foot-status{
+  display:flex; align-items:center; gap:8px;
+  padding:8px 10px 4px; font-size:11px; font-weight:500; color:var(--ok);
+}
+.foot-status .dot{
+  width:7px; height:7px; border-radius:50%; background:var(--ok); flex:0 0 auto;
+}
+.foot-status.connecting{ color:var(--muted); }
+.foot-status.connecting .dot{ background:var(--muted2); }
+.foot-status.offline{ color:var(--danger); }
+.foot-status.offline .dot{ background:var(--danger-dot); }
+.foot-status.busy{ color:var(--ok); }
 .foot-row{
   display:flex; justify-content:space-between; align-items:center;
   padding:14px 10px; border-radius:var(--radius-sm); color:var(--txt-2); cursor:pointer;
@@ -493,10 +505,6 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 }
 .foot-row:hover{ background:var(--line-soft); }
 .chev{ width:14px; height:14px; color:var(--muted2); flex:0 0 auto; }
-.foot-ver{
-  font-size:10px; color:var(--muted2); padding:10px 10px 2px;
-  font-family:var(--font-num); font-variant-numeric:var(--font-num-variant);
-}
 
 /* ── 侧边栏「快速接入官方模型」:头部与「配置」按钮同款 foot-row 风格,
    左侧 lightning 图标 + 标题,右侧 caretRight 跟"配置"完全一致,
@@ -589,10 +597,6 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
   background:var(--panel);
   box-sizing:border-box;
 }
-.page > .page-top .run-state{
-  grid-column:2; justify-self:center;
-  height:var(--shell-head-h); max-height:var(--shell-head-h);
-}
 .page > .page-top .pt-sb-toggle{ grid-column:1; justify-self:start; }
 .page > .page-top .pt-rp-toggle{ grid-column:3; justify-self:end; }
 .page > .page-top .pt-spacer{ grid-column:2; }
@@ -633,7 +637,8 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 
 /* 呼吸灯：内圈常亮(容器 60%) + 中圈扩散（无转圈） */
 .ga-status-breathe,
-.run-state.busy .dot{
+.run-state.busy .dot,
+.foot-status.busy .dot{
   --breathe-color:var(--ok);
   --breathe-box:12px;
   --breathe-core:calc(var(--breathe-box) * 0.6);
@@ -647,12 +652,14 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
   vertical-align:middle;
 }
 .ga-status-breathe--sm{ --breathe-box:10px; }
-.run-state.busy .dot{
+.run-state.busy .dot,
+.foot-status.busy .dot{
   width:var(--breathe-box);
   height:var(--breathe-box);
 }
 .ga-status-breathe__core,
-.run-state.busy .dot::before{
+.run-state.busy .dot::before,
+.foot-status.busy .dot::before{
   content:'';
   position:absolute;
   left:50%; top:50%;
@@ -663,7 +670,8 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
   z-index:2;
 }
 .ga-status-breathe__ring,
-.run-state.busy .dot::after{
+.run-state.busy .dot::after,
+.foot-status.busy .dot::after{
   content:'';
   position:absolute;
   left:50%; top:50%;
