@@ -149,6 +149,15 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
+fn sanitize_python_command(cmd: &mut Command) {
+    // AppImage runtimes may set Python-specific environment variables that point
+    // inside the mounted AppImage (for example /tmp/.mount_*/usr). If those are
+    // inherited by the project venv Python, Python can look for its stdlib in the
+    // wrong place and fail during startup with "No module named 'encodings'".
+    cmd.env_remove("PYTHONHOME");
+    cmd.env_remove("PYTHONPATH");
+}
+
 fn start_bridge() {
     let script = find_bridge_script();
     if !script.exists() {
@@ -162,6 +171,7 @@ fn start_bridge() {
     let show_console = std::env::args().any(|a| a == "--console");
 
     let mut cmd = Command::new(&python);
+    sanitize_python_command(&mut cmd);
     cmd.arg(&script)
        .current_dir(script.parent().unwrap());
 
@@ -213,6 +223,7 @@ fn start_bridge_with_config(app_handle: tauri::AppHandle, python_path: String, p
         }
 
         let mut cmd = Command::new(&py);
+        sanitize_python_command(&mut cmd);
         cmd.arg(&script).current_dir(&dir);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -259,6 +270,7 @@ pub fn run() {
         let script = dir.join("frontends").join("desktop_bridge.py");
         if script.exists() {
             let mut cmd = Command::new(&py_str);
+            sanitize_python_command(&mut cmd);
             cmd.arg(&script).current_dir(&dir);
             #[cfg(windows)]
             cmd.creation_flags(0x08000000);
