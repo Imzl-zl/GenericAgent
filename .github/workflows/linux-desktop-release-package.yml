@@ -1,0 +1,174 @@
+name: Build Linux Desktop Release Package
+
+"on":
+  push:
+    branches:
+      - test
+    paths:
+      - ".github/workflows/linux-desktop-release-package.yml"
+      - "desktop_release/scripts/linux/install_linux.sh"
+      - "frontends/desktop/**"
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: "Also create/update a GitHub pre-release"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      release_tag:
+        description: "Release tag when upload_release=true, e.g. desktop-linux-test-123"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux AppImage package
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontends/desktop/src-tauri -> target
+
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install desktop dependencies
+        working-directory: frontends/desktop
+        run: npm install
+
+      - name: Build Linux AppImage
+        working-directory: frontends/desktop
+        run: npm run tauri build -- --bundles appimage
+
+      - name: Collect Linux release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPIMAGE_SRC="$(find frontends/desktop/src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
+          if [[ -z "$APPIMAGE_SRC" ]]; then
+            echo "No AppImage found" >&2
+            exit 1
+          fi
+
+          PKG_ROOT="artifacts/linux/GenericAgent-Desktop-Linux"
+          mkdir -p "$PKG_ROOT"
+
+          # Keep a stable internal file name so generated .desktop Exec= never changes on version upgrades.
+          cp "$APPIMAGE_SRC" "$PKG_ROOT/GenericAgent.AppImage"
+          chmod +x "$PKG_ROOT/GenericAgent.AppImage"
+
+          cp desktop_release/scripts/linux/install_linux.sh "$PKG_ROOT/install_linux.sh"
+          chmod +x "$PKG_ROOT/install_linux.sh"
+
+          cat > "$PKG_ROOT/README_LINUX.md" <<'EOF'
+          # GenericAgent Desktop Linux
+
+          ## Install
+
+          This package contains the Linux desktop shell and installer script.
+
+          Recommended project layout:
+
+          ```text
+          GenericAgent/
+          ├── agentmain.py
+          └── frontends/
+              ├── desktop_bridge.py
+              ├── GenericAgent.AppImage
+              └── install_linux.sh
+          ```
+
+          Copy `GenericAgent.AppImage` and `install_linux.sh` into your `GenericAgent/frontends/` directory, then run:
+
+          ```bash
+          cd /path/to/GenericAgent/frontends
+          chmod +x install_linux.sh
+          ./install_linux.sh
+          ```
+
+          The script creates/updates:
+
+          - `~/.ga_desktop_settings.json`
+          - `~/.local/share/applications/genericagent-desktop.desktop`
+          - `~/Desktop/GenericAgent Desktop.desktop` or `~/桌面/GenericAgent Desktop.desktop`
+
+          Start GenericAgent Desktop from the desktop icon or the application menu.
+          EOF
+          # Remove indentation added by YAML heredoc context if any shell preserves it.
+          sed -i 's/^          //' "$PKG_ROOT/README_LINUX.md"
+
+          (
+            cd "$PKG_ROOT"
+            sha256sum GenericAgent.AppImage install_linux.sh README_LINUX.md > SHA256SUMS.txt
+          )
+
+          mkdir -p artifacts/linux/out
+          tar -C artifacts/linux -czf artifacts/linux/out/GenericAgent-Desktop-Linux.tar.gz GenericAgent-Desktop-Linux
+          (
+            cd artifacts/linux/out
+            sha256sum GenericAgent-Desktop-Linux.tar.gz > SHA256SUMS.txt
+          )
+
+          echo "Package contents:"
+          tar -tzf artifacts/linux/out/GenericAgent-Desktop-Linux.tar.gz
+          ls -lh artifacts/linux/out
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GenericAgent-Desktop-Linux-Package-${{ github.run_number }}
+          path: |
+            artifacts/linux/out/GenericAgent-Desktop-Linux.tar.gz
+            artifacts/linux/out/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create or update Linux test pre-release
+        if: ${{ inputs.upload_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME="$INPUT_TAG"
+          if [[ -z "$TAG_NAME" ]]; then
+            TAG_NAME="desktop-linux-test-${{ github.run_number }}-${{ github.run_attempt }}"
+          fi
+          TITLE="GenericAgent Desktop Linux Test Build ${{ github.run_number }}"
+          NOTES="Linux desktop test package. Download GenericAgent-Desktop-Linux.tar.gz, copy its files into GenericAgent/frontends/, then run install_linux.sh."
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" artifacts/linux/out/* --clobber
+          else
+            gh release create "$TAG_NAME" artifacts/linux/out/* \
+              --target "${{ github.sha }}" \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              --prerelease
+          fi
