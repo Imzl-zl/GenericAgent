@@ -212,7 +212,14 @@ jobs:
           EOF
           )
           # Create the shared release if it does not exist yet (another OS job may win the race).
-          gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease || true
+          # Race-safe: the 3 OS jobs share ONE release. Retry create until the release
+          # actually exists (a simultaneous create from another job can fail), so the
+          # upload below never races a not-yet-created release.
+          for _ in $(seq 1 15); do
+            gh release view "$TAG_NAME" >/dev/null 2>&1 && break
+            gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease 2>/dev/null || true
+            sleep 3
+          done
           gh release upload "$TAG_NAME" artifacts/windows/out/* --clobber
 
   # ----------------------------------------------------------------------------
@@ -409,7 +416,14 @@ jobs:
           - 各包内附「安装使用说明_Install_Guide.txt」（中英）。Each package ships a bilingual install guide.
           EOF
           )
-          gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease || true
+          # Race-safe: the 3 OS jobs share ONE release. Retry create until the release
+          # actually exists (a simultaneous create from another job can fail), so the
+          # upload below never races a not-yet-created release.
+          for _ in $(seq 1 15); do
+            gh release view "$TAG_NAME" >/dev/null 2>&1 && break
+            gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease 2>/dev/null || true
+            sleep 3
+          done
           gh release upload "$TAG_NAME" artifacts/linux/out/* --clobber
 
   # ----------------------------------------------------------------------------
@@ -621,5 +635,12 @@ jobs:
           - 各包内附「安装使用说明_Install_Guide.txt」（中英）。Each package ships a bilingual install guide.
           EOF
           )
-          gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease || true
+          # Race-safe: the 3 OS jobs share ONE release. Retry create until the release
+          # actually exists (a simultaneous create from another job can fail), so the
+          # upload below never races a not-yet-created release.
+          for _ in $(seq 1 15); do
+            gh release view "$TAG_NAME" >/dev/null 2>&1 && break
+            gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease 2>/dev/null || true
+            sleep 3
+          done
           gh release upload "$TAG_NAME" artifacts/macos/out/* --clobber
