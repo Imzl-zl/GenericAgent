@@ -90,10 +90,13 @@ jobs:
           chmod +x "$RUNTIME/install_linux.sh"
 
           # Embedded Python (python-build-standalone, linux x86_64, 3.12)
+          # NOTE: the browser_download_url is URL-encoded ('+' -> '%2B'), so match loosely with '.*'.
+          # 'install_only\.tar\.gz' (literal) excludes the '..._stripped.tar.gz' variant.
           PBS_URL="$(curl -fsSL https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest \
             | grep -o '"browser_download_url": *"[^"]*"' \
-            | grep 'cpython-3\.12\.[0-9]*+[0-9]*-x86_64-unknown-linux-gnu-install_only\.tar\.gz' \
+            | grep 'cpython-3\.12\.[0-9].*x86_64-unknown-linux-gnu-install_only\.tar\.gz' \
             | head -1 | sed -E 's/.*"(https[^"]+)"/\1/')"
+          [[ -n "$PBS_URL" ]] || { echo "Could not resolve python-build-standalone download URL" >&2; exit 1; }
           echo "Python build-standalone: $PBS_URL"
           curl -fsSL -o /tmp/pbs.tar.gz "$PBS_URL"
           tar -xzf /tmp/pbs.tar.gz -C "$RUNTIME"   # extracts a 'python/' dir
