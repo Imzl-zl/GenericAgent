@@ -877,10 +877,7 @@ class ServiceManager:
 
     def list_panel_state(self) -> List[dict]:
         out = [self._bridge_state()]
-        # extras (conductor + scheduler) 排到 IM 前面 —— bridge / 系统服务 / 业务通道 三段
-        extras = sorted(set(self._catalog) - set(self._im_catalog))
-        ims = sorted(self._im_catalog)
-        for sid in extras + ims:
+        for sid in sorted(self._catalog, key=lambda s: (s in self._im_catalog, s)):
             item = self._state(sid)
             item["name"] = sid
             item["memMb"] = _mem_mb(item.get("pid"))
