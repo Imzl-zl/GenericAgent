@@ -1053,15 +1053,6 @@ html[data-boot-has-sessions] .chat-start{ display:none !important; }
   color:var(--txt-strong); border-color:transparent; border-bottom-color:var(--txt-strong);
   background:transparent;
 }
-.tok-chart-wrap{ margin:12px 0 0; }
-.tok-chart-toggle{ font-size:12px; color:var(--muted); background:none; border:none; cursor:pointer; padding:4px 0; }
-.tok-chart-toggle:hover{ color:var(--txt); }
-.tok-chart-toggle::before{ content:'▶'; display:inline-block; margin-right:4px; font-size:9px; transition:transform .15s; }
-.tok-chart-toggle.open::before{ transform:rotate(90deg); }
-/* 用 aspect-ratio 跟 SVG viewBox 600/260 对齐,避免容器拉伸导致字被压扁;
-   min-height 兜底:窄屏时也不会塌成一条 */
-.tok-chart{ margin-top:8px; aspect-ratio:600/260; max-width:760px; min-height:280px; position:relative; }
-.tok-chart svg{ width:100%; height:100%; display:block; }
 .tok-filter{ display:flex; align-items:center; gap:8px; margin:12px 0; flex-wrap:wrap; }
 .tok-filter label{ font-size:12px; color:var(--muted); }
 .tok-date{
@@ -1135,13 +1126,15 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
 .tok-model-tip{
   color:var(--accent);
 }
-.tok-pager{ display:flex; gap:4px; justify-content:center; margin-top:12px; }
+.tok-pager{ display:flex; gap:4px; justify-content:center; margin-top:12px; flex-wrap:wrap; align-items:center; }
 .tok-pager button{
   min-width:28px; height:28px; border:1px solid var(--line); border-radius:4px;
   background:var(--card); color:var(--txt-2); font-size:12px; cursor:pointer;
 }
-.tok-pager button:hover{ background:var(--hover-2); }
+.tok-pager button:hover:not(:disabled){ background:var(--hover-2); }
+.tok-pager button:disabled{ opacity:.4; cursor:default; }
 .tok-pager button.active{ background:var(--accent); color:var(--on-accent); border-color:var(--accent); }
+.tok-pager-gap{ color:var(--muted); padding:0 4px; font-size:12px; user-select:none; }
 .tok-deleted{ margin-left:6px; font-size:10px; font-weight:400; color:var(--muted2); background:var(--line-soft); border-radius:3px; padding:1px 5px; }
 .stat-row{ display:flex; gap:12px; margin:14px 0; }
 .stat{ flex:1; border:1px solid var(--line); border-radius:var(--radius); background:var(--card); padding:16px; text-align:center; }
