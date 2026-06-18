@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>GenericAgent</title>
 <link rel="stylesheet" href="assets/fonts/fonts.css?v=2">
-<link rel="stylesheet" href="styles.css?v=153">
+<link rel="stylesheet" href="styles.css?v=160">
 <!-- KaTeX: LaTeX 公式渲染 -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
 <!-- highlight.js: 代码高亮 -->
@@ -116,9 +116,7 @@
           </span>
           <span class="chev" data-ga-icon="caretRight"></span>
         </a>
-        <div class="foot-status" id="run-toggle">
-          <i class="dot"></i> <span class="rs-label"></span>
-        </div>
+        <div class="foot-ver" data-i18n="foot.ver"></div>
       </div>
     </aside>
     <div class="sb-resize" id="sb-resize"></div>
@@ -133,6 +131,9 @@
           <div class="page-top">
             <button type="button" class="pt-icon pt-sb-toggle" aria-label="toggle sidebar">
               <span data-ga-icon="caretLeft"></span>
+            </button>
+            <button class="run-state" id="run-toggle" type="button">
+              <i class="dot"></i> <span class="rs-label"></span>
             </button>
             <button type="button" class="pt-icon pt-rp-toggle" aria-label="toggle conversations">
               <span data-ga-icon="caretRight"></span>
@@ -374,10 +375,6 @@
               <div class="stat"><div class="s-n" id="tok-cost-n">0%</div><div class="s-l" data-i18n="tok.cost"></div></div>
               <div class="stat"><div class="s-n" id="tok-today-n">0</div><div class="s-l" data-i18n="tok.today"></div></div>
             </div>
-            <div class="tok-chart-wrap" id="tok-chart-wrap">
-              <button class="tok-chart-toggle" id="tok-chart-toggle" type="button" data-i18n="tok.chartToggle"></button>
-              <div class="tok-chart" id="tok-chart" hidden></div>
-            </div>
             <table class="tok-table" id="tok-table">
               <thead><tr>
                 <th data-i18n="tok.colSession"></th>
@@ -552,7 +549,7 @@
         </button>
       </div>
       <div class="modal-body modal-body-inset chan-config-body">
-        <textarea id="chan-config-editor" class="mykey-editor" spellcheck="false" maxlength="20000"></textarea>
+        <textarea id="chan-config-editor" class="mykey-editor" spellcheck="false" maxlength="1000000"></textarea>
         <div class="chan-config-foot">
           <button type="button" class="chan-config-save" id="chan-config-save" data-i18n="common.save"></button>
         </div>
@@ -637,6 +634,6 @@
 <!-- highlight.js -->
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" crossorigin="anonymous"></script>
 <script src="phosphor-icons.js?v=2"></script>
-<script src="app.js?v=186"></script>
+<script src="app.js?v=190"></script>
 </body>
 </html>
