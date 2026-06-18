@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use std::thread;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tauri::Manager;
 
 #[cfg(windows)]
@@ -76,28 +76,13 @@ fn bundle_python() -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
-/// Prepared virtualenv interpreter inside the bundle's runtime/app/.venv.
-fn bundle_venv_python() -> Option<PathBuf> {
-    let root = bundle_root()?;
-    #[cfg(windows)]
-    let candidates = [root.join("app").join(".venv").join("Scripts").join("python.exe")];
-    #[cfg(not(windows))]
-    let candidates = [
-        root.join("app").join(".venv").join("bin").join("python"),
-        root.join("app").join(".venv").join("bin").join("python3"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
-}
-
 /// Find python executable:
-/// 1. The prepared bundle virtualenv (runtime/app/.venv) so bridge deps are available.
-/// 2. The embedded bundle python (runtime/python) for first-run fallback.
-/// 3. .portable/uv-python/ 下找 python.exe (Windows) 或 python3 (Unix)
-/// 4. Fallback to system PATH
+/// 1. The embedded bundle python (runtime/python) — deps are installed directly into it
+///    (no venv), and its path is resolved relative to the bundle anchor at runtime, so the
+///    package stays relocatable (moving the folder doesn't break absolute venv paths).
+/// 2. .portable/uv-python/ 下找 python.exe (Windows) 或 python3 (Unix)
+/// 3. Fallback to system PATH
 fn find_python() -> String {
-    if let Some(p) = bundle_venv_python() {
-        return p.to_string_lossy().to_string();
-    }
     if let Some(p) = bundle_python() {
         return p.to_string_lossy().to_string();
     }
@@ -262,19 +247,18 @@ fn bundle_root() -> Option<PathBuf> {
     None
 }
 
-/// venv python created by the offline prepare step.
-fn venv_python(project_dir: &Path) -> PathBuf {
-    #[cfg(windows)]
-    { project_dir.join(".venv").join("Scripts").join("python.exe") }
-    #[cfg(not(windows))]
-    { project_dir.join(".venv").join("bin").join("python") }
+/// Marker written after a successful offline prepare. Lives under runtime/ so it travels
+/// with the bundle: a relocated folder stays "prepared" (deps live in the embedded python,
+/// which is itself relocatable) and won't re-run prepare.
+fn prepared_marker() -> Option<PathBuf> {
+    Some(bundle_root()?.join(".prepared"))
 }
 
 /// True when this is a self-contained bundle whose python env has not been prepared yet
-/// (embedded python present but app/.venv missing). project_dir must be the app/ folder.
+/// (embedded python present but deps not yet installed into it).
 fn needs_first_run_prepare(project_dir: &str) -> bool {
     if project_dir.is_empty() { return false; }
-    bundle_python().is_some() && !venv_python(Path::new(project_dir)).exists()
+    bundle_python().is_some() && prepared_marker().map(|m| !m.exists()).unwrap_or(false)
 }
 
 /// Clear env vars a host launcher injects pointing at its own runtime. The Linux AppImage exports
@@ -322,7 +306,9 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
             .arg("-ProjectDir").arg(project_dir)
             .arg("-WheelDir").arg(&wheels)
             .arg("-ExtraPipPackages").arg("fastapi uvicorn websockets")
-            .args(["-Mode", "PrepareOnly", "-SkipNpmInstall"]);
+            // -NoVenv: install deps straight into the embedded python (no venv) so the
+            // bundle is relocatable. See prepared_marker / find_python.
+            .args(["-Mode", "PrepareOnly", "-SkipNpmInstall", "-NoVenv"]);
         c
     };
     #[cfg(not(windows))]
@@ -333,7 +319,9 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
             .arg("--project-dir").arg(project_dir)
             .arg("--wheel-dir").arg(&wheels)
             .arg("--extra-packages").arg("fastapi uvicorn websockets")
-            .args(["--mode", "PrepareOnly"]);
+            // --no-venv: install deps straight into the embedded python (no venv) so the
+            // bundle is relocatable. See prepared_marker / find_python.
+            .args(["--mode", "PrepareOnly", "--no-venv"]);
         c
     };
 
@@ -361,6 +349,10 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
     let status = child.wait().map_err(|e| format!("prepare wait failed: {}", e))?;
     if !status.success() {
         return Err(format!("prepare exited with status {:?}", status.code()));
+    }
+    // Record success so later launches (and relocated copies) skip the prepare step.
+    if let Some(marker) = prepared_marker() {
+        let _ = std::fs::write(&marker, b"ok\n");
     }
     Ok(())
 }

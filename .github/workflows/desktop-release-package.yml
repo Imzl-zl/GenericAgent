@@ -190,7 +190,27 @@ jobs:
           set -euo pipefail
           TAG_NAME="${{ github.ref_name }}"
           TITLE="GenericAgent Desktop Portable ${TAG_NAME}"
-          NOTES="Self-contained desktop portable packages (Windows / Linux / macOS). Extract anywhere and run GenericAgent; the first launch prepares the bundled Python env offline."
+          NOTES=$(cat <<'EOF'
+          GenericAgent Desktop 便携版（自包含） / Portable (self-contained)
+
+          下载对应平台的包，解压即可运行——无需装 Python、无需联网装依赖、无需源码。
+          Download your platform's package, extract and run — no Python install, no internet for deps, no source.
+
+          ## 产物 / Downloads
+          - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
+          - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
+          - macOS: `GenericAgent-Desktop-macOS-Portable.zip` — 双击 / double-click `Start GenericAgent.command`
+
+          ## 首次启动 / First launch
+          首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
+          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are instant.
+
+          ## 说明 / Notes
+          - 想真正对话需在程序内配置模型 / API Key。Configure a model / API key in-app to start chatting.
+          - 便携包可整体移动到任意目录后继续使用。The whole folder can be moved anywhere and still works.
+          - 各包内附「安装使用说明_Install_Guide.txt」（中英）。Each package ships a bilingual install guide.
+          EOF
+          )
           # Create the shared release if it does not exist yet (another OS job may win the race).
           gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease || true
           gh release upload "$TAG_NAME" artifacts/windows/out/* --clobber
@@ -368,7 +388,27 @@ jobs:
           set -euo pipefail
           TAG_NAME="${{ github.ref_name }}"
           TITLE="GenericAgent Desktop Portable ${TAG_NAME}"
-          NOTES="Self-contained desktop portable packages (Windows / Linux / macOS). Extract anywhere and run GenericAgent; the first launch prepares the bundled Python env offline."
+          NOTES=$(cat <<'EOF'
+          GenericAgent Desktop 便携版（自包含） / Portable (self-contained)
+
+          下载对应平台的包，解压即可运行——无需装 Python、无需联网装依赖、无需源码。
+          Download your platform's package, extract and run — no Python install, no internet for deps, no source.
+
+          ## 产物 / Downloads
+          - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
+          - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
+          - macOS: `GenericAgent-Desktop-macOS-Portable.zip` — 双击 / double-click `Start GenericAgent.command`
+
+          ## 首次启动 / First launch
+          首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
+          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are instant.
+
+          ## 说明 / Notes
+          - 想真正对话需在程序内配置模型 / API Key。Configure a model / API key in-app to start chatting.
+          - 便携包可整体移动到任意目录后继续使用。The whole folder can be moved anywhere and still works.
+          - 各包内附「安装使用说明_Install_Guide.txt」（中英）。Each package ships a bilingual install guide.
+          EOF
+          )
           gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease || true
           gh release upload "$TAG_NAME" artifacts/linux/out/* --clobber
 
@@ -560,6 +600,26 @@ jobs:
           set -euo pipefail
           TAG_NAME="${{ github.ref_name }}"
           TITLE="GenericAgent Desktop Portable ${TAG_NAME}"
-          NOTES="Self-contained desktop portable packages (Windows / Linux / macOS). Extract anywhere and run GenericAgent; the first launch prepares the bundled Python env offline."
+          NOTES=$(cat <<'EOF'
+          GenericAgent Desktop 便携版（自包含） / Portable (self-contained)
+
+          下载对应平台的包，解压即可运行——无需装 Python、无需联网装依赖、无需源码。
+          Download your platform's package, extract and run — no Python install, no internet for deps, no source.
+
+          ## 产物 / Downloads
+          - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
+          - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
+          - macOS: `GenericAgent-Desktop-macOS-Portable.zip` — 双击 / double-click `Start GenericAgent.command`
+
+          ## 首次启动 / First launch
+          首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
+          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are instant.
+
+          ## 说明 / Notes
+          - 想真正对话需在程序内配置模型 / API Key。Configure a model / API key in-app to start chatting.
+          - 便携包可整体移动到任意目录后继续使用。The whole folder can be moved anywhere and still works.
+          - 各包内附「安装使用说明_Install_Guide.txt」（中英）。Each package ships a bilingual install guide.
+          EOF
+          )
           gh release create "$TAG_NAME" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES" --prerelease || true
           gh release upload "$TAG_NAME" artifacts/macos/out/* --clobber
