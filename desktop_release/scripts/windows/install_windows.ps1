@@ -162,9 +162,12 @@ function Install-Dependencies([string]$root, [string]$py) {
         Write-Ok "offline wheels: $wd"
         if ($extra.Count) { Write-Ok "extra packages: $($extra -join ', ')" }
         Write-Host "GAPROGRESS|deps"
-        Write-Step "Install GenericAgent minimal package and desktop bridge extras (offline)"
-        # setuptools/wheel are included in the wheel dir so the editable build resolves offline.
-        & $py -m pip install --no-index --find-links $wd -e $root psutil @extra
+        Write-Step "Install GenericAgent dependencies and desktop bridge extras (offline)"
+        # Install deps directly (NOT an editable -e of the source): an editable install bakes the
+        # project's absolute path into a .pth. With -NoVenv (deps go into the relocatable embedded
+        # python) this keeps the portable bundle movable. The bridge adds the source to sys.path
+        # itself (ensure_ga_import_path), so the project itself need not be installed.
+        & $py -m pip install --no-index --find-links $wd "requests>=2.28" "beautifulsoup4>=4.12" "bottle>=0.12" "simple-websocket-server>=0.4" "aiohttp>=3.9" psutil @extra
         if ($LASTEXITCODE -ne 0) { Fail "offline pip install failed (check wheels dir)." }
         Write-Host "GAPROGRESS|done"
         return
