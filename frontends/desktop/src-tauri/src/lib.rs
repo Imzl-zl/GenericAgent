@@ -10,7 +10,11 @@ use tauri::Manager;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+const BRIDGE_PORT: u16 = 14168;
+const CONDUCTOR_PORT: u16 = 8900;
+
 static BRIDGE_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+static SPAWNED_BRIDGE: Mutex<bool> = Mutex::new(false);
 
 /// Get project root (parent of frontends/)
 fn project_root() -> PathBuf {
@@ -355,14 +359,44 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
     Ok(())
 }
 
-fn is_bridge_running() -> bool {
-    TcpStream::connect(("127.0.0.1", 14168)).is_ok()
+fn is_port_open(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{}", port);
+    let Ok(sock_addr) = addr.parse() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&sock_addr, Duration::from_millis(300)).is_ok()
+}
+
+fn blocked_ports_label() -> Option<String> {
+    let mut busy = Vec::new();
+    if is_port_open(BRIDGE_PORT) {
+        busy.push(format!("{} (bridge)", BRIDGE_PORT));
+    }
+    if is_port_open(CONDUCTOR_PORT) {
+        busy.push(format!("{} (conductor)", CONDUCTOR_PORT));
+    }
+    if busy.is_empty() {
+        None
+    } else {
+        Some(busy.join(", "))
+    }
+}
+
+fn ensure_ports_free_for_start() -> Result<(), String> {
+    if let Some(ports) = blocked_ports_label() {
+        Err(format!(
+            "端口已被占用：{}。请先结束旧的 desktop_bridge / conductor 进程。",
+            ports
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if is_port_open(port) {
             return true;
         }
         thread::sleep(Duration::from_millis(100));
@@ -370,85 +404,89 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-fn start_bridge() {
-    let script = find_bridge_script();
-    if !script.exists() {
-        eprintln!("[tauri] bridge script not found: {:?}", script);
+fn request_bridge_shutdown() {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", BRIDGE_PORT).parse().unwrap(),
+        Duration::from_millis(800),
+    ) else {
         return;
-    }
-
-    let python = find_python();
-    eprintln!("[tauri] using python: {}", python);
-
-    let show_console = std::env::args().any(|a| a == "--console");
-
-    let mut cmd = Command::new(&python);
-    cmd.arg(&script)
-       .current_dir(script.parent().unwrap());
-
-    #[cfg(windows)]
-    if !show_console {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    match cmd.spawn() {
-        Ok(child) => {
-            eprintln!("[tauri] started bridge PID={}", child.id());
-            *BRIDGE_PROCESS.lock().unwrap() = Some(child);
-        }
-        Err(e) => {
-            eprintln!("[tauri] failed to start bridge: {} (python={})", e, python);
-            return;
-        }
-    }
-
-    if !wait_for_port(14168, Duration::from_secs(15)) {
-        eprintln!("[tauri] WARNING: bridge did not become ready within 15s");
-    }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
+    let req = b"POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(req);
+    let _ = stream.read(&mut [0u8; 512]);
 }
 
-fn ensure_bridge_running() {
-    if is_bridge_running() {
-        eprintln!("[tauri] bridge already running on 127.0.0.1:14168; reusing it");
+fn stop_spawned_bridge() {
+    if !*SPAWNED_BRIDGE.lock().unwrap() {
         return;
     }
-    start_bridge();
+    request_bridge_shutdown();
+    thread::sleep(Duration::from_millis(450));
+    if let Some(mut child) = BRIDGE_PROCESS.lock().unwrap().take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *SPAWNED_BRIDGE.lock().unwrap() = false;
+}
+
+fn mark_bridge_spawned(child: Child) {
+    *BRIDGE_PROCESS.lock().unwrap() = Some(child);
+    *SPAWNED_BRIDGE.lock().unwrap() = true;
+}
+
+fn spawn_bridge(py: &str, project_dir: &PathBuf) -> Result<(), String> {
+    ensure_ports_free_for_start()?;
+    let script = project_dir.join("frontends").join("desktop_bridge.py");
+    if !script.exists() {
+        return Err(format!("desktop_bridge.py not found at {:?}", script));
+    }
+
+    let mut cmd = Command::new(py);
+    cmd.arg(&script).current_dir(project_dir);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    let child = cmd.spawn().map_err(|e| format!("Failed to spawn bridge: {}", e))?;
+    eprintln!("[tauri] started bridge PID={}", child.id());
+    mark_bridge_spawned(child);
+    Ok(())
+}
+
+fn show_port_busy(handle: &tauri::AppHandle, ports: &str) {
+    let encoded: String = ports.chars().map(|c| match c {
+        ' ' => "%20".to_string(),
+        '(' => "%28".to_string(),
+        ')' => "%29".to_string(),
+        ',' => "%2C".to_string(),
+        _ => c.to_string(),
+    }).collect();
+    let url = tauri::Url::parse(&format!("port_busy.html?ports={}", encoded)).unwrap();
+    if let Some(w) = handle.get_webview_window("main") {
+        let _ = w.navigate(url);
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
 }
 
 #[tauri::command]
 fn start_bridge_with_config(app_handle: tauri::AppHandle, python_path: String, project_dir: String) -> Result<(), String> {
-    // Save to settings
     let path = settings_path();
     let obj = serde_json::json!({"python_path": python_path, "project_dir": project_dir});
     std::fs::write(&path, serde_json::to_string_pretty(&obj).unwrap())
         .map_err(|e| format!("Failed to write settings: {}", e))?;
 
-    // Start bridge only if it is not already accepting connections.
-    if !is_bridge_running() {
-        let py = PathBuf::from(&python_path);
-        let dir = PathBuf::from(&project_dir);
-        let script = dir.join("frontends").join("desktop_bridge.py");
-        if !script.exists() {
-            return Err(format!("desktop_bridge.py not found at {:?}", script));
-        }
+    let dir = PathBuf::from(&project_dir);
+    spawn_bridge(&python_path, &dir)?;
 
-        let mut cmd = Command::new(&py);
-        cmd.arg(&script).current_dir(&dir);
-        #[cfg(windows)]
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn: {}", e))?;
-        *BRIDGE_PROCESS.lock().unwrap() = Some(child);
-    }
-
-    // Wait for port
-    if !wait_for_port(14168, Duration::from_secs(20)) {
+    if !wait_for_port(BRIDGE_PORT, Duration::from_secs(20)) {
         return Err("Bridge did not become ready within 20s".into());
     }
 
-    // Navigate main window to bridge URL after the bridge is ready, then show it.
     if let Some(main_win) = app_handle.get_webview_window("main") {
-        let url = tauri::Url::parse("http://127.0.0.1:14168/").unwrap();
+        let url = tauri::Url::parse(&format!("http://127.0.0.1:{}/", BRIDGE_PORT)).unwrap();
         let _ = main_win.navigate(url);
         let _ = main_win.show();
         let _ = main_win.set_focus();
@@ -471,28 +509,16 @@ pub fn run() {
     let no_autostart = args.iter().any(|a| a == "--no-autostart");
     let dev_mode = args.iter().any(|a| a == "--dev");
 
-    // Self-contained bundle: detect whether the first-run offline prepare is still needed.
+    let port_blocked = blocked_ports_label();
     let project_dir = find_project_dir().unwrap_or_default();
     let needs_prepare = needs_first_run_prepare(&project_dir);
 
-    let bridge_ok = is_bridge_running();
     let mut spawned_bridge = false;
-    // Skip the early spawn when a first-run prepare is required (no venv yet);
-    // the setup thread prepares the env first and then starts the bridge.
-    if !bridge_ok && !no_autostart && !needs_prepare {
-        // Try to start bridge with saved/discovered config
+    if port_blocked.is_none() && !no_autostart && !needs_prepare {
         let (py_str, dir_str) = get_or_discover_config();
         let dir = PathBuf::from(&dir_str);
-        let script = dir.join("frontends").join("desktop_bridge.py");
-        if script.exists() {
-            let mut cmd = Command::new(&py_str);
-            cmd.arg(&script).current_dir(&dir);
-            #[cfg(windows)]
-            cmd.creation_flags(0x08000000);
-            if let Ok(child) = cmd.spawn() {
-                *BRIDGE_PROCESS.lock().unwrap() = Some(child);
-                spawned_bridge = true;
-            }
+        if !py_str.is_empty() && spawn_bridge(&py_str, &dir).is_ok() {
+            spawned_bridge = true;
         }
     }
 
@@ -514,7 +540,14 @@ pub fn run() {
 
             let handle = app.handle().clone();
             let project_dir = project_dir.clone();
+            let port_blocked_setup = port_blocked.clone();
             thread::spawn(move || {
+                if let Some(ports) = &port_blocked_setup {
+                    eprintln!("[tauri] ports blocked: {}", ports);
+                    show_port_busy(&handle, ports);
+                    return;
+                }
+
                 // Progress reporter: push status into the loading window (window.gaProgress).
                 let main_win = handle.get_webview_window("main");
                 let report = |pct: i32, msg: &str| {
@@ -539,19 +572,10 @@ pub fn run() {
                         return;
                     }
                     report(95, "starting");
-                    if !is_bridge_running() {
-                        let (py_str, dir_str) = get_or_discover_config();
-                        let dir = PathBuf::from(&dir_str);
-                        let script = dir.join("frontends").join("desktop_bridge.py");
-                        if script.exists() {
-                            let mut cmd = Command::new(&py_str);
-                            cmd.arg(&script).current_dir(&dir);
-                            #[cfg(windows)]
-                            cmd.creation_flags(0x08000000);
-                            if let Ok(child) = cmd.spawn() {
-                                *BRIDGE_PROCESS.lock().unwrap() = Some(child);
-                            }
-                        }
+                    let (py_str, dir_str) = get_or_discover_config();
+                    let dir = PathBuf::from(&dir_str);
+                    if let Err(e) = spawn_bridge(&py_str, &dir) {
+                        eprintln!("[tauri] bridge spawn after prepare failed: {}", e);
                     }
                 }
 
@@ -561,12 +585,12 @@ pub fn run() {
                 } else {
                     Duration::from_secs(2)
                 };
-                let bridge_ready = wait_for_port(14168, wait);
+                let bridge_ready = wait_for_port(BRIDGE_PORT, wait);
 
                 if bridge_ready {
                     // Navigate to the bridge HTTP only after it is ready.
                     if let Some(w) = handle.get_webview_window("main") {
-                        if let Ok(url) = tauri::Url::parse("http://127.0.0.1:14168/") {
+                        if let Ok(url) = tauri::Url::parse(&format!("http://127.0.0.1:{}/", BRIDGE_PORT)) {
                             let _ = w.navigate(url);
                         }
                         if dev_mode {
@@ -605,7 +629,7 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let label = window.label();
                 if label == "main" {
-                    // Main closed -> exit app
+                    stop_spawned_bridge();
                     window.app_handle().exit(0);
                 } else if label == "setup" {
                     // Setup closed -> exit if main is not visible
