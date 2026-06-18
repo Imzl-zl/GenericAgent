@@ -1108,12 +1108,20 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
 .tok-table td:nth-child(n+2):nth-child(-n+5){ width:80px; }
 .tok-table th:nth-child(6),
 .tok-table td:nth-child(6){ width:85px; }
+/* Conductor tab 只有两行汇总: 用自动列宽铺满,数字列均匀分布,不让首列吃掉所有空间 */
+.tok-table--conductor{ table-layout:auto; }
+.tok-table--conductor th:first-child, .tok-table--conductor td:first-child{ overflow:visible; white-space:nowrap; }
+.tok-table--conductor th:nth-child(n+2):nth-child(-n+5),
+.tok-table--conductor td:nth-child(n+2):nth-child(-n+5),
+.tok-table--conductor th:nth-child(6),
+.tok-table--conductor td:nth-child(6){ width:auto; }
 .tok-row-session{ cursor:pointer; }
 .tok-row-session:hover td{ background:var(--hover-dim); }
 .tok-row-session td:first-child::before{ content:'▶'; margin-right:6px; font-size:10px; color:var(--muted2); transition:transform .15s; display:inline-block; }
 .tok-row-session.open td:first-child::before{ transform:rotate(90deg); }
 .tok-row-conductor{ cursor:default; }
 .tok-row-conductor td:first-child::before{ content:''; margin:0; }
+.tok-cond-ico{ width:1em; height:1em; vertical-align:-0.15em; margin-right:5px; }
 .tok-row-conductor:hover td{ background:var(--hover-dim); }
 .tok-detail td{ padding:5px 12px 5px 32px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--line-soft); background:var(--field-bg); }
 .tok-detail td:not(:first-child){ text-align:right; }
