@@ -250,15 +250,15 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     let mut child = cmd.spawn().map_err(|e| format!("failed to launch prepare: {}", e))?;
 
-    // Map the script's ASCII progress keys to a percentage + human message (Chinese kept here
-    // to avoid console-encoding issues when the key crosses the process boundary).
+    // Forward the script's ASCII progress keys to the loading window, which localizes them
+    // (window.gaProgress maps key -> zh/en by navigator.language).
     if let Some(out) = child.stdout.take() {
         for line in BufReader::new(out).lines().flatten() {
             if let Some(key) = line.trim().strip_prefix("GAPROGRESS|") {
                 match key.trim() {
-                    "venv" => report(15, "正在创建运行环境…"),
-                    "deps" => report(45, "正在安装依赖…"),
-                    "done" => report(90, "依赖安装完成"),
+                    "venv" => report(15, "venv"),
+                    "deps" => report(45, "deps"),
+                    "done" => report(90, "done"),
                     _ => {}
                 }
             }
@@ -448,14 +448,14 @@ pub fn run() {
                 // First-run (self-contained bundle): prepare the embedded python env offline,
                 // then start the bridge with the freshly created venv.
                 if needs_prepare {
-                    report(5, "首次启动，正在准备运行环境…");
+                    report(5, "start");
                     if let Err(e) = run_offline_prepare(&project_dir, &report) {
                         eprintln!("[tauri] first-run prepare failed: {}", e);
                         if let Some(sw) = handle.get_webview_window("setup") { let _ = sw.show(); }
                         if let Some(mw) = handle.get_webview_window("main") { let _ = mw.hide(); }
                         return;
                     }
-                    report(95, "正在启动服务…");
+                    report(95, "starting");
                     if !is_bridge_running() {
                         let (py_str, dir_str) = get_or_discover_config();
                         let dir = PathBuf::from(&dir_str);
