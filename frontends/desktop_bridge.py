@@ -25,7 +25,8 @@ HTTP API:
   GET    /services/panel
   GET    /services/mykey
   POST   /services/mykey       body: {"content":"..."}
-  POST   /shutdown              stop autostart services and exit (127.0.0.1 only)
+  POST   /services/stop-extras   stop conductor + scheduler (127.0.0.1 only)
+  POST   /services/start-extras  start conductor + scheduler (127.0.0.1 only)
 
 WS API (state sync):
   GET /ws -> on connect sends services.snapshot; service.changed on updates
@@ -34,7 +35,7 @@ WS API (state sync):
 """
 from __future__ import annotations
 
-import asyncio, atexit, contextlib, importlib, json, os, re, signal, socket, subprocess, sys
+import asyncio, atexit, contextlib, importlib, json, os, re, subprocess, sys
 from collections import deque
 import threading, time, traceback, uuid
 from dataclasses import dataclass, field
@@ -756,7 +757,6 @@ def discover_extra_services(ga_root: Path) -> List[dict]:
         out.append({
             "id": "reflect/scheduler.py",
             "cmd": [sys.executable, "agentmain.py", "--reflect", "reflect/scheduler.py"],
-            "port": 45762,
         })
     # conductor 跟 scheduler 一样,bridge 启动时自动拉起。--no-browser 是关键:
     # conductor.py 默认会用 webbrowser.open 在用户浏览器弹一个 8900 端口 UI,
@@ -766,122 +766,8 @@ def discover_extra_services(ga_root: Path) -> List[dict]:
         out.append({
             "id": "frontends/conductor.py",
             "cmd": [sys.executable, "frontends/conductor.py", "--no-browser"],
-            "port": 8900,
         })
     return out
-
-
-def _port_is_open(host: str, port: int) -> bool:
-    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.settimeout(0.25)
-        return s.connect_ex((host, int(port))) == 0
-
-
-def _listener_pid(port: int, host: str = "127.0.0.1") -> Optional[int]:
-    try:
-        import psutil
-        for conn in psutil.net_connections(kind="tcp"):
-            if conn.status != psutil.CONN_LISTEN or not conn.laddr:
-                continue
-            if conn.laddr.port != int(port):
-                continue
-            lip = conn.laddr.ip
-            if lip in (host, "0.0.0.0", "::", "::1", ""):
-                return conn.pid
-    except Exception:
-        pass
-    if sys.platform == "win32":
-        try:
-            out = subprocess.run(
-                ["netstat", "-ano"], capture_output=True, text=True, timeout=3,
-            )
-            for line in (out.stdout or "").splitlines():
-                if "LISTENING" not in line.upper():
-                    continue
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-                local, pid_s = parts[1], parts[-1]
-                if local.endswith(f":{port}") and pid_s.isdigit():
-                    return int(pid_s)
-        except Exception:
-            pass
-        return None
-    if sys.platform == "darwin":
-        try:
-            out = subprocess.run(
-                ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
-                capture_output=True, text=True, timeout=3,
-            )
-            for line in (out.stdout or "").splitlines():
-                if line.strip().isdigit():
-                    return int(line.strip())
-        except Exception:
-            pass
-        return None
-    try:
-        out = subprocess.run(
-            ["ss", "-tlnp"], capture_output=True, text=True, timeout=3,
-        )
-        needle = f":{int(port)}"
-        for line in (out.stdout or "").splitlines():
-            if "LISTEN" not in line or needle not in line:
-                continue
-            m = re.search(r"pid=(\d+)", line)
-            if m:
-                return int(m.group(1))
-    except Exception:
-        pass
-    return None
-
-
-def _terminate_pid(pid: int, timeout: float = 4.0) -> None:
-    if pid <= 0 or pid == os.getpid():
-        return
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True, timeout=timeout,
-            )
-            return
-        os.kill(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        return
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        except OSError:
-            return
-        time.sleep(0.1)
-    with contextlib.suppress(ProcessLookupError, OSError):
-        os.kill(pid, signal.SIGKILL)
-
-
-def _require_listen_port_free(port: int, *, host: str = "127.0.0.1", label: str = "") -> bool:
-    if not _port_is_open(host, port):
-        return True
-    pid = _listener_pid(port, host)
-    tag = label or str(port)
-    msg = f"[service] {tag}: port {port} already in use"
-    if pid:
-        msg += f" (pid={pid})"
-    print(msg, file=sys.stderr)
-    return False
-
-
-def _preflight_required_ports(ports: List[int], *, host: str = "127.0.0.1") -> Optional[str]:
-    busy: List[str] = []
-    for port in ports:
-        if _port_is_open(host, int(port)):
-            pid = _listener_pid(int(port), host)
-            busy.append(f"{port}" + (f" pid={pid}" if pid else ""))
-    if not busy:
-        return None
-    return "ports in use: " + ", ".join(busy)
 
 
 def _mem_mb(pid: Optional[int]) -> Optional[int]:
@@ -936,7 +822,6 @@ class ServiceManager:
         extra = discover_extra_services(self.ga_root)
         self._im_catalog = {s["id"]: s for s in im}
         self._catalog = {**self._im_catalog, **{s["id"]: s for s in extra}}
-        self._ports = {s["id"]: int(s["port"]) for s in self._catalog.values() if s.get("port")}
         self._stopping: Set[str] = set()
 
     def _is_configured(self, sid: str) -> bool:
@@ -1033,13 +918,6 @@ class ServiceManager:
             err = f"not configured in mykey.py ({keys})"
             self._notify(sid, err=err)
             return {"ok": False, "error": "not_configured", "service": self._state(sid, err=err)}
-        port = self._ports.get(sid)
-        if port is not None and not _require_listen_port_free(port, label=sid):
-            err = f"port {port} already in use"
-            self._notify(sid, err=err)
-            return {"ok": False, "error": "port_in_use", "service": self._state(sid, err=err)}
-        if proc is not None and proc.poll() is not None:
-            self.procs.pop(sid, None)
         self.buffers[sid] = deque(maxlen=500)
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         kw: Dict[str, Any] = dict(
@@ -1063,10 +941,6 @@ class ServiceManager:
           - reflect/scheduler.py (drives L4 archive cron every 12h).
         IM services stay manual (need explicit mykey.py config + user opt-in)."""
         for sid in sorted(set(self._catalog) - set(self._im_catalog)):
-            port = self._ports.get(sid)
-            if port is not None and not _require_listen_port_free(port, label=sid):
-                print(f"[autostart] {sid}: fail: port {port} in use", file=sys.stderr)
-                continue
             try:
                 res = self.start_service(sid)
                 tag = "ok" if res.get("ok") else f"fail: {res.get('error')}"
@@ -1085,9 +959,8 @@ class ServiceManager:
         self._stopping.add(sid)
         proc = self.procs.get(sid)
         if proc and proc.poll() is None:
-            _terminate_pid(proc.pid)
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=3)
+            proc.terminate()
+            proc.wait()
         self.procs.pop(sid, None)
         self._stopping.discard(sid)
         item = self._state(sid)
@@ -1114,13 +987,6 @@ def _bridge_shutdown_services() -> None:
 
 
 atexit.register(_bridge_shutdown_services)
-
-if hasattr(signal, "SIGTERM"):
-    def _on_sigterm(signum, frame):
-        _bridge_shutdown_services()
-        raise SystemExit(0)
-
-    signal.signal(signal.SIGTERM, _on_sigterm)
 
 
 def emit_session_state(sess: Session, state_name: str):
@@ -1637,17 +1503,17 @@ def _is_local_peer(peer: str) -> bool:
     return p in ("127.0.0.1", "::1") or p.startswith("::ffff:127.0.0.1")
 
 
-async def shutdown_handler(request):
+async def stop_extras_handler(request):
     if not _is_local_peer(request.remote or ""):
         return json_ok({"ok": False, "error": "forbidden"}, status=403)
     services.stop_all_extras()
+    return json_ok({"ok": True})
 
-    def _exit_bridge() -> None:
-        with contextlib.suppress(Exception):
-            services.stop_all_extras()
-        os._exit(0)
 
-    asyncio.get_running_loop().call_later(0.05, _exit_bridge)
+async def start_extras_handler(request):
+    if not _is_local_peer(request.remote or ""):
+        return json_ok({"ok": False, "error": "forbidden"}, status=403)
+    services.autostart_extras()
     return json_ok({"ok": True})
 
 
@@ -1732,7 +1598,8 @@ def create_app():
     app.router.add_get("/services/panel", service_panel_handler)
     app.router.add_get("/services/mykey", mykey_get_handler)
     app.router.add_post("/services/mykey", mykey_save_handler)
-    app.router.add_post("/shutdown", shutdown_handler)
+    app.router.add_post("/services/stop-extras", stop_extras_handler)
+    app.router.add_post("/services/start-extras", start_extras_handler)
 
     # Serve static frontend (desktop/static/)
     static_dir = APP_DIR / "desktop" / "static"
@@ -1761,10 +1628,5 @@ def create_app():
 if __name__ == "__main__":
     host = os.environ.get("BRIDGE_HOST", "127.0.0.1")
     port = int(os.environ.get("BRIDGE_PORT", "14168"))
-    preflight = [port, 8900, 45762]
-    blocked = _preflight_required_ports(preflight, host=host if host != "0.0.0.0" else "127.0.0.1")
-    if blocked:
-        print(f"[bridge] cannot start: {blocked}", file=sys.stderr)
-        sys.exit(1)
     print(f"GenericAgent Web2 bridge: http://{host}:{port}  ws://{host}:{port}/ws", file=sys.stderr)
     web.run_app(create_app(), host=host, port=port, print=None)
