@@ -391,55 +391,32 @@ fn extras_ports_busy_label() -> Option<String> {
     }
 }
 
-fn blocking_alert(msg: &str) {
-    #[cfg(windows)]
-    {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use std::ptr::null_mut;
-        #[link(name = "user32")]
-        extern "system" {
-            fn MessageBoxW(
-                hwnd: *mut std::ffi::c_void,
-                text: *const u16,
-                caption: *const u16,
-                utype: u32,
-            ) -> i32;
-        }
-        const MB_OK: u32 = 0x0000_0000;
-        const MB_ICONWARNING: u32 = 0x0000_0030;
-        fn to_wide(s: &str) -> Vec<u16> {
-            OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
-        }
-        let text = to_wide(msg);
-        let caption = to_wide("GenericAgent Desktop");
-        unsafe {
-            MessageBoxW(
-                null_mut(),
-                text.as_ptr(),
-                caption.as_ptr(),
-                MB_OK | MB_ICONWARNING,
-            );
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        eprintln!("[tauri] {}", msg);
-    }
+fn alert_extras_ports_busy(win: &tauri::WebviewWindow, ports: &str) {
+    let msg = format!(
+        "Conductor/Scheduler 端口已被占用：{}\n请结束占用进程后点「确定」重新检测。",
+        ports
+    );
+    let js = format!(
+        "alert({})",
+        serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".to_string())
+    );
+    let _ = win.eval(&js);
 }
 
-fn wait_until_extras_ports_free() {
-    loop {
-        let Some(ports) = extras_ports_busy_label() else {
-            return;
-        };
+/// Browser alert on loading.html; re-prompt if ports stay busy after dismiss.
+fn wait_until_extras_ports_free(win: Option<&tauri::WebviewWindow>) {
+    while let Some(ports) = extras_ports_busy_label() {
         eprintln!("[tauri] extras ports busy: {}", ports);
-        let msg = format!(
-            "Conductor/Scheduler 端口已被占用：{}\n请结束占用进程后点「确定」重新检测。",
-            ports
-        );
-        blocking_alert(&msg);
-        thread::sleep(Duration::from_millis(200));
+        if let Some(w) = win {
+            alert_extras_ports_busy(w, &ports);
+        }
+        let wait_start = Instant::now();
+        while extras_ports_busy_label().is_some() {
+            if wait_start.elapsed() > Duration::from_secs(3) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
     }
 }
 
@@ -637,6 +614,8 @@ pub fn run() {
             thread::spawn(move || {
                 // Progress reporter: push status into the loading window (window.gaProgress).
                 let main_win = handle.get_webview_window("main");
+                wait_until_extras_ports_free(main_win.as_ref());
+
                 let report = |pct: i32, msg: &str| {
                     if let Some(w) = &main_win {
                         let js = format!(
@@ -685,8 +664,20 @@ pub fn run() {
                 let bridge_ready = wait_for_port(14168, wait);
 
                 if bridge_ready {
-                    wait_until_extras_ports_free();
+                    wait_until_extras_ports_free(main_win.as_ref());
                     request_start_extras();
+                    if !wait_for_port(14168, Duration::from_secs(15)) {
+                        eprintln!("[tauri] bridge not reachable before navigate");
+                        if let Some(w) = &main_win {
+                            let msg = "无法连接 bridge (127.0.0.1:14168)，请关闭程序后重试。";
+                            let js = format!(
+                                "alert({})",
+                                serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string())
+                            );
+                            let _ = w.eval(&js);
+                        }
+                        return;
+                    }
                     // Navigate to the bridge HTTP only after it is ready.
                     if let Some(w) = handle.get_webview_window("main") {
                         if let Ok(url) = tauri::Url::parse("http://127.0.0.1:14168/") {
