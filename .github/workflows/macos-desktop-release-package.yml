@@ -49,6 +49,8 @@ jobs:
 
       - name: Assemble portable package
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           PKG_ROOT="artifacts/macos/GenericAgent-Desktop-macOS"
@@ -64,9 +66,13 @@ jobs:
 
           # Embedded Python (python-build-standalone, macOS universal2 preferred, 3.12 install_only).
           PBS_URL="$(python3 - <<'PY'
-          import json, urllib.request
+          import json, os, urllib.request
           api='https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest'
-          data=json.load(urllib.request.urlopen(api, timeout=60))
+          req=urllib.request.Request(api)
+          token=os.environ.get('GH_TOKEN')
+          if token:
+              req.add_header('Authorization', 'Bearer ' + token)
+          data=json.load(urllib.request.urlopen(req, timeout=60))
           assets=data.get('assets', [])
           patterns=[
             ('aarch64-apple-darwin', 'install_only.tar.gz'),
