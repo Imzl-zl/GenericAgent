@@ -4,10 +4,12 @@ name: Build Windows Desktop Portable Package
   push:
     branches:
       - test
+      - test_yiqi
     paths:
       - ".github/workflows/windows-desktop-release-package.yml"
       - "desktop_release/scripts/windows/install_windows.ps1"
       - "frontends/desktop/**"
+      - "frontends/conductor.py"
   workflow_dispatch:
     inputs:
       upload_release:
