@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>GenericAgent — 端口占用</title>
+<style>
+:root{--bg:#fff;--text:#0a0a0a;--muted:#6b6b6b;--line:#e8e8e8;--font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#1a1a1a;--text:#ededed;--muted:#a0a0a0;--line:#2a2a2a}}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font-family:var(--font);background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center}
+.card{max-width:520px;width:90%;padding:2rem 2.2rem;border:1px solid var(--line);border-radius:10px;text-align:center}
+h1{font-size:1.25rem;margin:0 0 .75rem}
+p{color:var(--muted);font-size:.92rem;margin:.45rem 0;line-height:1.55}
+.ports{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--text);font-size:.88rem;margin:1rem 0}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>端口已被占用</h1>
+  <p>检测到 GenericAgent 所需端口正在使用中，已停止启动 bridge 与 Conductor。</p>
+  <p class="ports" id="ports"></p>
+  <p>请先结束旧的 <code>desktop_bridge.py</code> / <code>conductor.py</code> 进程，或关闭占用端口的程序后重试。</p>
+  <p style="font-size:.82rem;margin-top:1.2rem">Port in use — close the existing bridge (14168) and conductor (8900) processes, then restart the app.</p>
+</div>
+<script>
+const q = new URLSearchParams(location.search);
+document.getElementById('ports').textContent = q.get('ports') || '14168, 8900';
+</script>
+</body>
+</html>
