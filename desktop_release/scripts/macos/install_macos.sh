@@ -124,6 +124,19 @@ install_deps() {
   fi
 }
 
+ensure_mykey() {
+  local mykey="$PROJECT_DIR/mykey.py"
+  local tpl="$PROJECT_DIR/mykey_template.py"
+  if [[ -f "$mykey" ]]; then
+    log_ok "mykey.py exists"
+  elif [[ -f "$tpl" ]]; then
+    cp "$tpl" "$mykey"
+    log_warn "Created mykey.py from mykey_template.py. Please fill API keys before model calls."
+  else
+    log_warn "mykey.py and mykey_template.py are missing. Model config may need manual setup."
+  fi
+}
+
 write_settings() {
   local py="$1"
   local settings_path="$HOME/.ga_desktop_settings.json"
@@ -157,6 +170,7 @@ ensure_venv
 RUNTIME_PY="$(venv_python)"
 if [[ "$NO_VENV" == "1" ]]; then RUNTIME_PY="$PYTHON_PATH"; fi
 install_deps "$RUNTIME_PY"
+ensure_mykey
 write_settings "$RUNTIME_PY"
 progress done
 
