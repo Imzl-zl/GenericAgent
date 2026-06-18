@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::{Command, Child, Stdio};
 use std::io::{BufRead, BufReader};
 use std::sync::Mutex;
@@ -12,6 +13,7 @@ use std::os::windows::process::CommandExt;
 
 const BRIDGE_PORT: u16 = 14168;
 const CONDUCTOR_PORT: u16 = 8900;
+const SCHEDULER_LOCK_PORT: u16 = 45762;
 
 static BRIDGE_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 static SPAWNED_BRIDGE: Mutex<bool> = Mutex::new(false);
@@ -377,6 +379,29 @@ fn is_port_open(port: u16) -> bool {
     TcpStream::connect_timeout(&sock_addr, Duration::from_millis(300)).is_ok()
 }
 
+fn startup_log(msg: &str) {
+    eprintln!("{}", msg);
+    let path = bundle_anchor_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ga-startup.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
+/// Run WebView/window updates on the UI thread (required on Windows WebView2).
+fn dispatch_ui<F>(handle: &tauri::AppHandle, f: F)
+where
+    F: FnOnce(&tauri::AppHandle) + Send + 'static,
+{
+    let app = handle.clone();
+    let _ = app.clone().run_on_main_thread(move || f(&app));
+}
+
 fn blocked_ports_label() -> Option<String> {
     let mut busy = Vec::new();
     if is_port_open(BRIDGE_PORT) {
@@ -384,6 +409,9 @@ fn blocked_ports_label() -> Option<String> {
     }
     if is_port_open(CONDUCTOR_PORT) {
         busy.push(format!("{} (conductor)", CONDUCTOR_PORT));
+    }
+    if is_port_open(SCHEDULER_LOCK_PORT) {
+        busy.push(format!("{} (scheduler)", SCHEDULER_LOCK_PORT));
     }
     if busy.is_empty() {
         None
@@ -412,6 +440,14 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
         thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+fn bridge_child_exited() -> bool {
+    if let Some(child) = BRIDGE_PROCESS.lock().unwrap().as_mut() {
+        matches!(child.try_wait(), Ok(Some(_)))
+    } else {
+        false
+    }
 }
 
 fn request_bridge_shutdown() {
@@ -475,11 +511,13 @@ fn show_port_busy(handle: &tauri::AppHandle, ports: &str) {
         _ => c.to_string(),
     }).collect();
     let url = tauri::Url::parse(&format!("port_busy.html?ports={}", encoded)).unwrap();
-    if let Some(w) = handle.get_webview_window("main") {
-        let _ = w.navigate(url);
-        let _ = w.show();
-        let _ = w.set_focus();
-    }
+    dispatch_ui(handle, move |app| {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.navigate(url);
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    });
 }
 
 /// True when required ports are taken. Shows port_busy on the main window when blocked.
@@ -494,32 +532,34 @@ fn ports_blocked_or_show(handle: &tauri::AppHandle) -> bool {
 }
 
 fn open_bridge_ui(handle: &tauri::AppHandle, dev_mode: bool) {
-    if let Some(w) = handle.get_webview_window("main") {
-        if let Ok(url) = tauri::Url::parse(&format!("http://127.0.0.1:{}/", BRIDGE_PORT)) {
-            let _ = w.navigate(url);
-        }
-        if dev_mode {
-            w.open_devtools();
-        } else {
-            let _ = w.eval(r#"
-                document.addEventListener('keydown', function(e) {
-                    if (e.key === 'F12' || e.key === 'F5' ||
-                        (e.ctrlKey && e.key === 'r') ||
-                        (e.ctrlKey && e.shiftKey && e.key === 'I')) {
+    dispatch_ui(handle, move |app| {
+        if let Some(w) = app.get_webview_window("main") {
+            if let Ok(url) = tauri::Url::parse(&format!("http://127.0.0.1:{}/", BRIDGE_PORT)) {
+                let _ = w.navigate(url);
+            }
+            if dev_mode {
+                w.open_devtools();
+            } else {
+                let _ = w.eval(r#"
+                    document.addEventListener('keydown', function(e) {
+                        if (e.key === 'F12' || e.key === 'F5' ||
+                            (e.ctrlKey && e.key === 'r') ||
+                            (e.ctrlKey && e.shiftKey && e.key === 'I')) {
+                            e.preventDefault();
+                        }
+                    });
+                    document.addEventListener('contextmenu', function(e) {
                         e.preventDefault();
-                    }
-                });
-                document.addEventListener('contextmenu', function(e) {
-                    e.preventDefault();
-                });
-            "#);
+                    });
+                "#);
+            }
+            let _ = w.show();
+            let _ = w.set_focus();
         }
-        let _ = w.show();
-        let _ = w.set_focus();
-    }
-    if let Some(sw) = handle.get_webview_window("setup") {
-        let _ = sw.hide();
-    }
+        if let Some(sw) = app.get_webview_window("setup") {
+            let _ = sw.hide();
+        }
+    });
 }
 
 #[tauri::command]
@@ -561,6 +601,10 @@ pub fn run() {
     let port_blocked = blocked_ports_label();
     let project_dir = find_project_dir().unwrap_or_default();
     let needs_prepare = needs_first_run_prepare(&project_dir);
+    startup_log(&format!(
+        "[tauri] startup project_dir={:?} needs_prepare={} port_blocked={:?}",
+        project_dir, needs_prepare, port_blocked
+    ));
 
     let mut spawned_bridge = false;
     if port_blocked.is_none() && !no_autostart && !needs_prepare {
@@ -590,40 +634,50 @@ pub fn run() {
                 let _ = w.show();
             }
 
+            if let Some(ports) = &port_blocked {
+                startup_log(&format!("[tauri] ports blocked at setup: {}", ports));
+                show_port_busy(app.handle(), ports);
+                return Ok(());
+            }
+
             let handle = app.handle().clone();
             let project_dir = project_dir.clone();
-            let port_blocked_setup = port_blocked.clone();
             thread::spawn(move || {
                 let mut spawned_bridge = spawned_bridge;
 
-                if let Some(ports) = &port_blocked_setup {
-                    show_port_busy(&handle, ports);
-                    return;
-                }
-
                 // Progress reporter: push status into the loading window (window.gaProgress).
-                let main_win = handle.get_webview_window("main");
-                let report = |pct: i32, msg: &str| {
-                    if let Some(w) = &main_win {
-                        let js = format!(
-                            "window.gaProgress && window.gaProgress({}, {})",
-                            pct,
-                            serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string())
-                        );
-                        let _ = w.eval(&js);
-                    }
+                let handle_report = handle.clone();
+                let report = move |pct: i32, msg: &str| {
+                    let js = format!(
+                        "window.gaProgress && window.gaProgress({}, {})",
+                        pct,
+                        serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string())
+                    );
+                    dispatch_ui(&handle_report, move |app| {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.eval(&js);
+                        }
+                    });
                 };
 
                 // First-run (self-contained bundle): prepare the embedded python env offline,
                 // then start the bridge with the freshly created venv.
                 if needs_prepare {
+                    startup_log("[tauri] first-run prepare starting");
                     report(5, "start");
                     if let Err(e) = run_offline_prepare(&project_dir, &report) {
-                        eprintln!("[tauri] first-run prepare failed: {}", e);
-                        if let Some(sw) = handle.get_webview_window("setup") { let _ = sw.show(); }
-                        if let Some(mw) = handle.get_webview_window("main") { let _ = mw.hide(); }
+                        startup_log(&format!("[tauri] first-run prepare failed: {}", e));
+                        dispatch_ui(&handle, move |app| {
+                            if let Some(sw) = app.get_webview_window("setup") {
+                                let _ = sw.show();
+                            }
+                            if let Some(mw) = app.get_webview_window("main") {
+                                let _ = mw.hide();
+                            }
+                        });
                         return;
                     }
+                    startup_log("[tauri] first-run prepare done");
                     report(95, "starting");
                     if ports_blocked_or_show(&handle) {
                         return;
@@ -641,6 +695,16 @@ pub fn run() {
                     }
                 }
 
+                if spawned_bridge {
+                    thread::sleep(Duration::from_millis(500));
+                    if bridge_child_exited() {
+                        startup_log("[tauri] bridge child exited right after spawn");
+                        spawned_bridge = false;
+                        *SPAWNED_BRIDGE.lock().unwrap() = false;
+                        BRIDGE_PROCESS.lock().unwrap().take();
+                    }
+                }
+
                 // First run (prepare) and cold bridge start may take a while; allow up to 60s.
                 let wait = if needs_prepare || spawned_bridge {
                     Duration::from_secs(60)
@@ -648,23 +712,30 @@ pub fn run() {
                     Duration::from_secs(2)
                 };
                 let bridge_ready = wait_for_port(BRIDGE_PORT, wait);
+                startup_log(&format!(
+                    "[tauri] bridge_ready={} spawned_bridge={}",
+                    bridge_ready, spawned_bridge
+                ));
 
                 if bridge_ready && spawned_bridge {
+                    startup_log("[tauri] opening bridge UI");
                     open_bridge_ui(&handle, dev_mode);
                 } else if ports_blocked_or_show(&handle) {
-                    // port_busy.html shown — do not attach to an orphan bridge.
+                    startup_log("[tauri] showing port_busy");
                 } else {
-                    // Bridge never came up -> let the user fix paths in the setup window.
-                    if let Some(sw) = handle.get_webview_window("setup") {
-                        if dev_mode {
-                            let _ = sw.open_devtools();
+                    startup_log("[tauri] showing setup fallback");
+                    dispatch_ui(&handle, move |app| {
+                        if let Some(sw) = app.get_webview_window("setup") {
+                            if dev_mode {
+                                let _ = sw.open_devtools();
+                            }
+                            let _ = sw.show();
+                            let _ = sw.set_focus();
                         }
-                        let _ = sw.show();
-                        let _ = sw.set_focus();
-                    }
-                    if let Some(mw) = handle.get_webview_window("main") {
-                        let _ = mw.hide();
-                    }
+                        if let Some(mw) = app.get_webview_window("main") {
+                            let _ = mw.hide();
+                        }
+                    });
                 }
             });
             Ok(())
