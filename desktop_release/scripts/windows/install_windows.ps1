@@ -9,6 +9,14 @@ Usage examples:
   powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -Mode DesktopBuildOnly
   powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -Mode DesktopDevOnly
 
+Mirror examples (default to China mirrors for faster downloads):
+  # use the built-in defaults (Tsinghua PyPI + npmmirror)
+  powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
+  # use a different pip mirror
+  powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -PipIndexUrl https://mirrors.aliyun.com/pypi/simple/
+  # disable mirrors, fall back to official PyPI / npm registry
+  powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -PipIndexUrl "" -NpmRegistry ""
+
 What this script does:
   1. Locate GenericAgent project dir, which must contain agentmain.py.
   2. Locate a supported Python, or create/use .venv.
@@ -33,7 +41,14 @@ param(
     [switch]$NoVenv,
     [switch]$SkipPipInstall,
     [switch]$SkipNpmInstall,
-    [switch]$SkipWebView2Check
+    [switch]$SkipWebView2Check,
+    # Package mirrors. Default to China mirrors for speed; pass "" to use the official source.
+    [string]$PipIndexUrl = "https://pypi.tuna.tsinghua.edu.cn/simple",
+    [string]$NpmRegistry = "https://registry.npmmirror.com",
+    # Offline install: when set, pip installs from local wheels only (no network). Used by the portable bundle.
+    [string]$WheelDir = "",
+    # Extra packages to install beyond the core deps (e.g. "fastapi uvicorn websockets" for the conductor service).
+    [string]$ExtraPipPackages = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -125,6 +140,7 @@ function Ensure-Venv([string]$root, [string]$basePython) {
     $venvDir = Join-Path $root ".venv"
     $venvPy = Join-Path $venvDir "Scripts\python.exe"
     if (-not (Test-Path $venvPy)) {
+        Write-Host "GAPROGRESS|venv"
         Write-Step "Create virtual environment: $venvDir"
         & $basePython -m venv $venvDir
         if ($LASTEXITCODE -ne 0) { Fail "Failed to create venv." }
@@ -135,14 +151,41 @@ function Ensure-Venv([string]$root, [string]$basePython) {
 
 function Install-Dependencies([string]$root, [string]$py) {
     if ($SkipPipInstall) { Write-Warn "SkipPipInstall is set; dependencies are not installed."; return }
+
+    # Extra packages (e.g. conductor service deps) appended to the core install.
+    $extra = @()
+    if ($ExtraPipPackages) { $extra = $ExtraPipPackages.Split(" ", [StringSplitOptions]::RemoveEmptyEntries) }
+
+    # Offline mode (portable bundle): install from local wheels only, no network, no pip self-upgrade.
+    if ($WheelDir) {
+        $wd = (Resolve-Path $WheelDir -ErrorAction Stop).Path
+        Write-Ok "offline wheels: $wd"
+        if ($extra.Count) { Write-Ok "extra packages: $($extra -join ', ')" }
+        Write-Host "GAPROGRESS|deps"
+        Write-Step "Install GenericAgent minimal package and desktop bridge extras (offline)"
+        # setuptools/wheel are included in the wheel dir so the editable build resolves offline.
+        & $py -m pip install --no-index --find-links $wd -e $root psutil @extra
+        if ($LASTEXITCODE -ne 0) { Fail "offline pip install failed (check wheels dir)." }
+        Write-Host "GAPROGRESS|done"
+        return
+    }
+
+    # Online mode: use a pip index mirror when -PipIndexUrl is set (default: Tsinghua). Pass -PipIndexUrl "" for official PyPI.
+    $pipIndexArgs = @()
+    if ($PipIndexUrl) {
+        $pipIndexArgs = @("-i", $PipIndexUrl)
+        Write-Ok "pip index mirror: $PipIndexUrl"
+    } else {
+        Write-Warn "No pip mirror set; using official PyPI."
+    }
     Write-Step "Upgrade pip"
-    & $py -m pip install --upgrade pip
+    & $py -m pip install @pipIndexArgs --upgrade pip
     if ($LASTEXITCODE -ne 0) { Fail "pip upgrade failed." }
 
     Write-Step "Install GenericAgent minimal package and desktop bridge extras"
     # pyproject.toml already includes: requests, beautifulsoup4, bottle, simple-websocket-server, aiohttp.
     # desktop_bridge.py additionally imports psutil.
-    & $py -m pip install -e $root psutil
+    & $py -m pip install @pipIndexArgs -e $root psutil @extra
     if ($LASTEXITCODE -ne 0) { Fail "pip install failed." }
 }
 
@@ -214,10 +257,16 @@ function Install-DesktopNpm([string]$root) {
     if ($SkipNpmInstall) { Write-Warn "SkipNpmInstall is set; desktop npm dependencies are not installed."; return }
     $desktop = Find-DesktopDir $root
     Ensure-NodeAndNpm
+    # Use an npm registry mirror when -NpmRegistry is set (default: npmmirror). Pass -NpmRegistry "" for official registry.
+    $npmRegArgs = @()
+    if ($NpmRegistry) {
+        $npmRegArgs = @("--registry", $NpmRegistry)
+        Write-Ok "npm registry mirror: $NpmRegistry"
+    }
     Write-Step "Install Tauri desktop npm dependencies: $desktop"
     Push-Location $desktop
     try {
-        & cmd /c npm install
+        & cmd /c npm install @npmRegArgs
         if ($LASTEXITCODE -ne 0) { Fail "npm install failed in $desktop" }
         & cmd /c npx tauri --version
         if ($LASTEXITCODE -ne 0) { Fail "npx tauri --version failed after npm install" }

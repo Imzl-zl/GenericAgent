@@ -1,9 +1,10 @@
-use std::process::{Command, Child};
+use std::process::{Command, Child, Stdio};
+use std::io::{BufRead, BufReader};
 use std::sync::Mutex;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use std::thread;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 #[cfg(windows)]
@@ -29,10 +30,39 @@ fn find_bridge_script() -> PathBuf {
         .join("desktop_bridge.py")
 }
 
+/// Directory next to which a self-contained bundle keeps its runtime/ folder.
+/// Windows: the exe's folder. Linux: the .AppImage's folder ($APPIMAGE) when launched as an
+/// AppImage (current_exe would otherwise point inside the read-only squashfs mount).
+fn bundle_anchor_dir() -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        if let Some(p) = std::env::var_os("APPIMAGE") {
+            if let Some(d) = PathBuf::from(p).parent() {
+                return Some(d.to_path_buf());
+            }
+        }
+    }
+    Some(std::env::current_exe().ok()?.parent()?.to_path_buf())
+}
+
+/// Embedded interpreter inside the bundle's runtime/python (base python, before venv).
+fn bundle_python() -> Option<PathBuf> {
+    let root = bundle_root()?;
+    #[cfg(windows)]
+    let p = root.join("python").join("python.exe");
+    #[cfg(not(windows))]
+    let p = root.join("python").join("bin").join("python3");
+    if p.exists() { Some(p) } else { None }
+}
+
 /// Find python executable:
-/// 1. .portable/uv-python/ 下找 python.exe (Windows) 或 python3 (Unix)
-/// 2. Fallback to system PATH
+/// 1. The embedded bundle python (runtime/python).
+/// 2. .portable/uv-python/ 下找 python.exe (Windows) 或 python3 (Unix)
+/// 3. Fallback to system PATH
 fn find_python() -> String {
+    if let Some(p) = bundle_python() {
+        return p.to_string_lossy().to_string();
+    }
     let root = project_root();
     let portable_python_dir = root.join(".portable").join("uv-python");
 
@@ -69,11 +99,20 @@ fn find_python() -> String {
     { "python3".to_string() }
 }
 
-/// Find project directory by searching upward from exe for agentmain.py
+/// Find the project directory (folder containing agentmain.py).
+/// Bundle layout: <exe dir>/runtime/app/agentmain.py. Dev layout: walk up from the exe.
 fn find_project_dir() -> Option<String> {
+    // Bundle layout: source tucked under <anchor>/runtime/app/
+    if let Some(anchor) = bundle_anchor_dir() {
+        let app = anchor.join("runtime").join("app");
+        if app.join("agentmain.py").exists() {
+            return Some(app.to_string_lossy().to_string());
+        }
+    }
+
+    // Dev/source layout: walk up to 8 levels from the exe location.
     let exe = std::env::current_exe().ok()?;
-    let mut dir = exe.parent();
-    // Walk up to 8 levels from exe location
+    let mut dir = Some(exe.parent()?);
     for _ in 0..8 {
         match dir {
             Some(d) => {
@@ -134,6 +173,105 @@ pub fn get_or_discover_config() -> (String, String) {
     (python, project)
 }
 
+/// Self-contained bundle support dir: holds python/, wheels/, install_windows.ps1 and app/.
+/// Typical portable layout keeps only the exe (+README) at the top level and tucks everything
+/// else under <exe dir>/runtime/. Returns None when this is not a bundle (e.g. dev build).
+fn bundle_root() -> Option<PathBuf> {
+    let runtime = bundle_anchor_dir()?.join("runtime");
+    if runtime.join("app").join("agentmain.py").exists() {
+        return Some(runtime);
+    }
+    None
+}
+
+/// venv python created by the offline prepare step.
+fn venv_python(project_dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    { project_dir.join(".venv").join("Scripts").join("python.exe") }
+    #[cfg(not(windows))]
+    { project_dir.join(".venv").join("bin").join("python") }
+}
+
+/// True when this is a self-contained bundle whose python env has not been prepared yet
+/// (embedded python present but app/.venv missing). project_dir must be the app/ folder.
+fn needs_first_run_prepare(project_dir: &str) -> bool {
+    if project_dir.is_empty() { return false; }
+    bundle_python().is_some() && !venv_python(Path::new(project_dir)).exists()
+}
+
+/// Run the offline prepare (install_windows.ps1 -Mode PrepareOnly) using bundled python + wheels.
+/// Streams the script's stdout and forwards GAPROGRESS markers to `report(pct, message)`.
+/// Blocking; intended to run on a background thread. Writes ~/.ga_desktop_settings.json.
+fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<(), String> {
+    let root = bundle_root().ok_or("cannot locate bundle root")?;
+    let wheels = root.join("wheels");
+
+    #[cfg(windows)]
+    let (script, py) = (
+        root.join("install_windows.ps1"),
+        root.join("python").join("python.exe"),
+    );
+    #[cfg(not(windows))]
+    let (script, py) = (
+        root.join("install_linux.sh"),
+        root.join("python").join("bin").join("python3"),
+    );
+
+    if !script.exists() || !py.exists() || !wheels.exists() {
+        return Err(format!("prepare resources missing under {:?}", root));
+    }
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("powershell.exe");
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script)
+            .arg("-PythonPath").arg(&py)
+            .arg("-ProjectDir").arg(project_dir)
+            .arg("-WheelDir").arg(&wheels)
+            .arg("-ExtraPipPackages").arg("fastapi uvicorn websockets")
+            .args(["-Mode", "PrepareOnly", "-SkipNpmInstall"]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new("bash");
+        c.arg(&script)
+            .arg("--python-path").arg(&py)
+            .arg("--project-dir").arg(project_dir)
+            .arg("--wheel-dir").arg(&wheels)
+            .arg("--extra-packages").arg("fastapi uvicorn websockets")
+            .args(["--mode", "PrepareOnly"]);
+        c
+    };
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = cmd.spawn().map_err(|e| format!("failed to launch prepare: {}", e))?;
+
+    // Map the script's ASCII progress keys to a percentage + human message (Chinese kept here
+    // to avoid console-encoding issues when the key crosses the process boundary).
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().flatten() {
+            if let Some(key) = line.trim().strip_prefix("GAPROGRESS|") {
+                match key.trim() {
+                    "venv" => report(15, "正在创建运行环境…"),
+                    "deps" => report(45, "正在安装依赖…"),
+                    "done" => report(90, "依赖安装完成"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("prepare wait failed: {}", e))?;
+    if !status.success() {
+        return Err(format!("prepare exited with status {:?}", status.code()));
+    }
+    Ok(())
+}
+
 fn is_bridge_running() -> bool {
     TcpStream::connect(("127.0.0.1", 14168)).is_ok()
 }
@@ -149,15 +287,6 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-fn sanitize_python_command(cmd: &mut Command) {
-    // AppImage runtimes may set Python-specific environment variables that point
-    // inside the mounted AppImage (for example /tmp/.mount_*/usr). If those are
-    // inherited by the project venv Python, Python can look for its stdlib in the
-    // wrong place and fail during startup with "No module named 'encodings'".
-    cmd.env_remove("PYTHONHOME");
-    cmd.env_remove("PYTHONPATH");
-}
-
 fn start_bridge() {
     let script = find_bridge_script();
     if !script.exists() {
@@ -171,7 +300,6 @@ fn start_bridge() {
     let show_console = std::env::args().any(|a| a == "--console");
 
     let mut cmd = Command::new(&python);
-    sanitize_python_command(&mut cmd);
     cmd.arg(&script)
        .current_dir(script.parent().unwrap());
 
@@ -223,7 +351,6 @@ fn start_bridge_with_config(app_handle: tauri::AppHandle, python_path: String, p
         }
 
         let mut cmd = Command::new(&py);
-        sanitize_python_command(&mut cmd);
         cmd.arg(&script).current_dir(&dir);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -261,16 +388,21 @@ pub fn run() {
     let no_autostart = args.iter().any(|a| a == "--no-autostart");
     let dev_mode = args.iter().any(|a| a == "--dev");
 
+    // Self-contained bundle: detect whether the first-run offline prepare is still needed.
+    let project_dir = find_project_dir().unwrap_or_default();
+    let needs_prepare = needs_first_run_prepare(&project_dir);
+
     let bridge_ok = is_bridge_running();
     let mut spawned_bridge = false;
-    if !bridge_ok && !no_autostart {
+    // Skip the early spawn when a first-run prepare is required (no venv yet);
+    // the setup thread prepares the env first and then starts the bridge.
+    if !bridge_ok && !no_autostart && !needs_prepare {
         // Try to start bridge with saved/discovered config
         let (py_str, dir_str) = get_or_discover_config();
         let dir = PathBuf::from(&dir_str);
         let script = dir.join("frontends").join("desktop_bridge.py");
         if script.exists() {
             let mut cmd = Command::new(&py_str);
-            sanitize_python_command(&mut cmd);
             cmd.arg(&script).current_dir(&dir);
             #[cfg(windows)]
             cmd.creation_flags(0x08000000);
@@ -291,46 +423,99 @@ pub fn run() {
         }))
         .invoke_handler(tauri::generate_handler![start_bridge_with_config, get_config])
         .setup(move |app| {
-            let bridge_wait = if spawned_bridge {
-                Duration::from_secs(20)
-            } else {
-                Duration::from_secs(2)
-            };
-            let bridge_ready = wait_for_port(14168, bridge_wait);
-            if bridge_ready {
-                // Navigate to bridge HTTP only after it is ready; the window starts on loading.html
-                // so WebView never caches an early "connection refused" error page.
-                if let Some(w) = app.get_webview_window("main") {
-                    let url = tauri::Url::parse("http://127.0.0.1:14168/").unwrap();
-                    let _ = w.navigate(url);
-                    if dev_mode {
-                        w.open_devtools();
-                    } else {
-                        // Disable F5/F12/Ctrl+R/right-click in production
-                        let _ = w.eval(r#"
-                            document.addEventListener('keydown', function(e) {
-                                if (e.key === 'F12' || e.key === 'F5' ||
-                                    (e.ctrlKey && e.key === 'r') ||
-                                    (e.ctrlKey && e.shiftKey && e.key === 'I')) {
-                                    e.preventDefault();
-                                }
-                            });
-                            document.addEventListener('contextmenu', function(e) {
-                                e.preventDefault();
-                            });
-                        "#);
-                    }
-                    let _ = w.show();
-                }
-            } else {
-                // Show setup window
-                if let Some(w) = app.get_webview_window("setup") {
-                    if dev_mode {
-                        w.open_devtools();
-                    }
-                    let _ = w.show();
-                }
+            // Show the loading window immediately so the first-run prepare isn't a blank screen.
+            // The window starts on loading.html (a local page), so no "connection refused" flash.
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
             }
+
+            let handle = app.handle().clone();
+            let project_dir = project_dir.clone();
+            thread::spawn(move || {
+                // Progress reporter: push status into the loading window (window.gaProgress).
+                let main_win = handle.get_webview_window("main");
+                let report = |pct: i32, msg: &str| {
+                    if let Some(w) = &main_win {
+                        let js = format!(
+                            "window.gaProgress && window.gaProgress({}, {})",
+                            pct,
+                            serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string())
+                        );
+                        let _ = w.eval(&js);
+                    }
+                };
+
+                // First-run (self-contained bundle): prepare the embedded python env offline,
+                // then start the bridge with the freshly created venv.
+                if needs_prepare {
+                    report(5, "首次启动，正在准备运行环境…");
+                    if let Err(e) = run_offline_prepare(&project_dir, &report) {
+                        eprintln!("[tauri] first-run prepare failed: {}", e);
+                        if let Some(sw) = handle.get_webview_window("setup") { let _ = sw.show(); }
+                        if let Some(mw) = handle.get_webview_window("main") { let _ = mw.hide(); }
+                        return;
+                    }
+                    report(95, "正在启动服务…");
+                    if !is_bridge_running() {
+                        let (py_str, dir_str) = get_or_discover_config();
+                        let dir = PathBuf::from(&dir_str);
+                        let script = dir.join("frontends").join("desktop_bridge.py");
+                        if script.exists() {
+                            let mut cmd = Command::new(&py_str);
+                            cmd.arg(&script).current_dir(&dir);
+                            #[cfg(windows)]
+                            cmd.creation_flags(0x08000000);
+                            if let Ok(child) = cmd.spawn() {
+                                *BRIDGE_PROCESS.lock().unwrap() = Some(child);
+                            }
+                        }
+                    }
+                }
+
+                // First run (prepare) and cold bridge start may take a while; allow up to 60s.
+                let wait = if needs_prepare || spawned_bridge {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_secs(2)
+                };
+                let bridge_ready = wait_for_port(14168, wait);
+
+                if bridge_ready {
+                    // Navigate to the bridge HTTP only after it is ready.
+                    if let Some(w) = handle.get_webview_window("main") {
+                        if let Ok(url) = tauri::Url::parse("http://127.0.0.1:14168/") {
+                            let _ = w.navigate(url);
+                        }
+                        if dev_mode {
+                            w.open_devtools();
+                        } else {
+                            // Disable F5/F12/Ctrl+R/right-click in production
+                            let _ = w.eval(r#"
+                                document.addEventListener('keydown', function(e) {
+                                    if (e.key === 'F12' || e.key === 'F5' ||
+                                        (e.ctrlKey && e.key === 'r') ||
+                                        (e.ctrlKey && e.shiftKey && e.key === 'I')) {
+                                        e.preventDefault();
+                                    }
+                                });
+                                document.addEventListener('contextmenu', function(e) {
+                                    e.preventDefault();
+                                });
+                            "#);
+                        }
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                    if let Some(sw) = handle.get_webview_window("setup") { let _ = sw.hide(); }
+                } else {
+                    // Bridge never came up -> let the user fix paths in the setup window.
+                    if let Some(sw) = handle.get_webview_window("setup") {
+                        if dev_mode { sw.open_devtools(); }
+                        let _ = sw.show();
+                    }
+                    if let Some(mw) = handle.get_webview_window("main") { let _ = mw.hide(); }
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {

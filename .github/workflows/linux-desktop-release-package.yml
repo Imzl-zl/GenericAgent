@@ -83,49 +83,95 @@ jobs:
           cp "$APPIMAGE_SRC" "$PKG_ROOT/GenericAgent.AppImage"
           chmod +x "$PKG_ROOT/GenericAgent.AppImage"
 
-          cp desktop_release/scripts/linux/install_linux.sh "$PKG_ROOT/install_linux.sh"
-          chmod +x "$PKG_ROOT/install_linux.sh"
+          # ---- Self-contained portable runtime: embedded python + offline wheels + source ----
+          RUNTIME="$PKG_ROOT/runtime"
+          mkdir -p "$RUNTIME"
+          cp desktop_release/scripts/linux/install_linux.sh "$RUNTIME/install_linux.sh"
+          chmod +x "$RUNTIME/install_linux.sh"
+
+          # Embedded Python (python-build-standalone, linux x86_64, 3.12)
+          PBS_URL="$(curl -fsSL https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest \
+            | grep -o '"browser_download_url": *"[^"]*"' \
+            | grep 'cpython-3\.12\.[0-9]*+[0-9]*-x86_64-unknown-linux-gnu-install_only\.tar\.gz' \
+            | head -1 | sed -E 's/.*"(https[^"]+)"/\1/')"
+          echo "Python build-standalone: $PBS_URL"
+          curl -fsSL -o /tmp/pbs.tar.gz "$PBS_URL"
+          tar -xzf /tmp/pbs.tar.gz -C "$RUNTIME"   # extracts a 'python/' dir
+          PY="$RUNTIME/python/bin/python3"
+          "$PY" --version
+
+          # Offline wheels (native linux wheels for the embedded python)
+          mkdir -p "$RUNTIME/wheels"
+          "$PY" -m pip download --dest "$RUNTIME/wheels" \
+            "requests>=2.28" "beautifulsoup4>=4.12" "bottle>=0.12" "simple-websocket-server>=0.4" "aiohttp>=3.9" psutil \
+            fastapi uvicorn websockets pydantic setuptools wheel
+
+          # Runtime source (project root minus heavy/dev/build dirs)
+          mkdir -p "$RUNTIME/app"
+          tar \
+            --exclude='./.git' --exclude='./.github' \
+            --exclude='./frontends/desktop/src-tauri' \
+            --exclude='./frontends/desktop/node_modules' \
+            --exclude='./desktop_release' --exclude='./docs' \
+            --exclude='./assets/demo' --exclude='./assets/images' \
+            --exclude='./assets/GenericAgent_Technical_Report.pdf' \
+            --exclude='./artifacts' \
+            --exclude='*/node_modules' --exclude='*/target' \
+            --exclude='*/.venv' --exclude='./.venv' \
+            --exclude='*/__pycache__' --exclude='*.pyc' \
+            -cf - . | tar -xf - -C "$RUNTIME/app"
+          test -f "$RUNTIME/app/agentmain.py"
+          test -f "$RUNTIME/app/frontends/desktop_bridge.py"
+          test -f "$RUNTIME/app/frontends/desktop/static/index.html"
+
+          # Drop python debug/cache bits to slim the package
+          find "$RUNTIME/python" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
           cat > "$PKG_ROOT/README_LINUX.md" <<'EOF'
-          # GenericAgent Desktop Linux
+          # GenericAgent Desktop — Linux 便携版（自包含）
 
-          ## Install
+          无需安装 Python、无需联网装依赖、无需源码仓库——全部已内置。
 
-          This package contains the Linux desktop shell and installer script.
+          ## 前置条件
+          - Linux x86_64（glibc，常见发行版即可）
+          - 桌面环境 + FUSE（运行 AppImage 所需；多数发行版自带）
 
-          Recommended project layout:
-
-          ```text
-          GenericAgent/
-          ├── agentmain.py
-          └── frontends/
-              ├── desktop_bridge.py
-              ├── GenericAgent.AppImage
-              └── install_linux.sh
-          ```
-
-          Copy `GenericAgent.AppImage` and `install_linux.sh` into your `GenericAgent/frontends/` directory, then run:
-
+          ## 使用
+          1. 解压本压缩包到任意目录（路径建议不含特殊字符）。
+          2. 给 AppImage 执行权限并运行：
           ```bash
-          cd /path/to/GenericAgent/frontends
-          chmod +x install_linux.sh
-          ./install_linux.sh
+          chmod +x GenericAgent.AppImage
+          ./GenericAgent.AppImage
           ```
+          3. 首次启动会自动离线准备环境（建虚拟环境、装依赖），界面显示进度，完成后进入主界面。
+          4. 之后启动直接秒进。
 
-          The script creates/updates:
+          > 想真正对话，仍需在程序里配置模型 / API Key。
 
-          - `~/.ga_desktop_settings.json`
-          - `~/.local/share/applications/genericagent-desktop.desktop`
-          - `~/Desktop/GenericAgent Desktop.desktop` or `~/桌面/GenericAgent Desktop.desktop`
+          ## 功能
+          - 核心聊天（内置 bridge，端口 14168）。
+          - 指挥家 / 协作（conductor，端口 8900）：随程序自动启动，已内置 fastapi/uvicorn 等依赖。
 
-          Start GenericAgent Desktop from the desktop icon or the application menu.
+          ## 说明
+          - 首次准备完成后不要移动本文件夹；若已移动，删除 `runtime/app/.venv` 后重新启动即可重建。
+          - `runtime/` 是内置运行环境与源码，正常使用无需改动。
+
+          ## 目录结构
+          ```text
+          GenericAgent-Desktop-Linux/
+          ├── GenericAgent.AppImage   ← 运行这个
+          ├── README_LINUX.md
+          └── runtime/
+              ├── python/   wheels/   install_linux.sh
+              └── app/      运行所需源码（含 conductor）
+          ```
           EOF
           # Remove indentation added by YAML heredoc context if any shell preserves it.
           sed -i 's/^          //' "$PKG_ROOT/README_LINUX.md"
 
           (
             cd "$PKG_ROOT"
-            sha256sum GenericAgent.AppImage install_linux.sh README_LINUX.md > SHA256SUMS.txt
+            sha256sum GenericAgent.AppImage README_LINUX.md > SHA256SUMS.txt
           )
 
           mkdir -p artifacts/linux/out
