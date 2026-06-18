@@ -172,6 +172,21 @@ fn settings_path() -> PathBuf {
         .join(".ga_desktop_settings.json")
 }
 
+/// True when this binary is running from inside a macOS .app bundle (packaged build).
+/// Used to refuse stale ~/.ga_desktop_settings.json that could point at an old checkout
+/// when App Translocation hides our own runtime/ from current_exe().
+#[cfg(target_os = "macos")]
+fn running_inside_app_bundle() -> bool {
+    std::env::current_exe()
+        .ok()
+        .map(|p| {
+            p.components().any(|c| {
+                c.as_os_str().to_string_lossy().ends_with(".app")
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Read config from settings file, or auto-discover and save.
 /// Self-contained bundles always prefer their own runtime/app over stale user settings,
 /// otherwise an old ~/.ga_desktop_settings.json can silently point the UI at a different checkout.
@@ -191,8 +206,18 @@ pub fn get_or_discover_config() -> (String, String) {
         }
     }
 
-    // Try reading existing settings
-    if path.exists() {
+    // Try reading existing settings.
+    // On macOS, a packaged .app must never trust ~/.ga_desktop_settings.json: App
+    // Translocation can run the bundle from a random read-only copy where bundle_root()
+    // fails to see our own runtime/, and an old settings file would then silently point
+    // the bridge at a previously installed checkout. In that case fall through to
+    // auto-discovery (which still resolves the bundle via .app-relative search below).
+    #[cfg(target_os = "macos")]
+    let trust_settings = !running_inside_app_bundle();
+    #[cfg(not(target_os = "macos"))]
+    let trust_settings = true;
+
+    if trust_settings && path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                 let python = val.get("python_path")
