@@ -93,7 +93,7 @@ venv_python() {
 }
 
 ensure_venv() {
-  if [[ "$NO_VENV" == "1" ]]; then printf '%s\n' "$PYTHON_PATH"; return; fi
+  if [[ "$NO_VENV" == "1" ]]; then return; fi
   local vpy
   vpy="$(venv_python)"
   if [[ ! -x "$vpy" ]]; then
@@ -101,7 +101,6 @@ ensure_venv() {
     log_step "Create venv: $PROJECT_DIR/.venv"
     "$PYTHON_PATH" -m venv "$PROJECT_DIR/.venv"
   fi
-  printf '%s\n' "$vpy"
 }
 
 install_deps() {
@@ -154,7 +153,9 @@ launch_app() {
   fi
 }
 
-RUNTIME_PY="$(ensure_venv)"
+ensure_venv
+RUNTIME_PY="$(venv_python)"
+if [[ "$NO_VENV" == "1" ]]; then RUNTIME_PY="$PYTHON_PATH"; fi
 install_deps "$RUNTIME_PY"
 write_settings "$RUNTIME_PY"
 progress done
