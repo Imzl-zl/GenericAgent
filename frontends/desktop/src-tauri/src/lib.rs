@@ -277,6 +277,15 @@ fn needs_first_run_prepare(project_dir: &str) -> bool {
     bundle_python().is_some() && !venv_python(Path::new(project_dir)).exists()
 }
 
+/// Clear env vars a host launcher injects pointing at its own runtime. The Linux AppImage exports
+/// PYTHONHOME/PYTHONPATH (-> bundled python crashes with "No module named 'encodings'") and
+/// LD_LIBRARY_PATH (-> wrong shared libs). Our bundled python / prepare / bridge must run clean.
+fn sanitize_bundle_env(cmd: &mut Command) {
+    cmd.env_remove("PYTHONHOME");
+    cmd.env_remove("PYTHONPATH");
+    cmd.env_remove("LD_LIBRARY_PATH");
+}
+
 /// Run the offline prepare (install_windows.ps1 -Mode PrepareOnly) using bundled python + wheels.
 /// Streams the script's stdout and forwards GAPROGRESS markers to `report(pct, message)`.
 /// Blocking; intended to run on a background thread. Writes ~/.ga_desktop_settings.json.
@@ -329,6 +338,7 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
     };
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    sanitize_bundle_env(&mut cmd);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     let mut child = cmd.spawn().map_err(|e| format!("failed to launch prepare: {}", e))?;
@@ -435,6 +445,7 @@ fn start_bridge_with_config(app_handle: tauri::AppHandle, python_path: String, p
 
         let mut cmd = Command::new(&py);
         cmd.arg(&script).current_dir(&dir);
+        sanitize_bundle_env(&mut cmd);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         let child = cmd.spawn().map_err(|e| format!("Failed to spawn: {}", e))?;
@@ -487,6 +498,7 @@ pub fn run() {
         if script.exists() {
             let mut cmd = Command::new(&py_str);
             cmd.arg(&script).current_dir(&dir);
+            sanitize_bundle_env(&mut cmd);
             #[cfg(windows)]
             cmd.creation_flags(0x08000000);
             if let Ok(child) = cmd.spawn() {
@@ -546,6 +558,7 @@ pub fn run() {
                         if script.exists() {
                             let mut cmd = Command::new(&py_str);
                             cmd.arg(&script).current_dir(&dir);
+                            sanitize_bundle_env(&mut cmd);
                             #[cfg(windows)]
                             cmd.creation_flags(0x08000000);
                             if let Ok(child) = cmd.spawn() {

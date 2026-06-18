@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The desktop AppImage injects PYTHONHOME/PYTHONPATH/LD_LIBRARY_PATH pointing at its own
+# read-only mount, which breaks the bundled python ("No module named 'encodings'"). Always
+# run with a clean python env so the embedded interpreter uses its own stdlib/libs.
+unset PYTHONHOME PYTHONPATH LD_LIBRARY_PATH
+
 # GenericAgent Desktop Linux installer.
 # Expected normal location: GenericAgent/frontends/install_linux.sh
 # Expected AppImage:        GenericAgent/frontends/GenericAgent.AppImage
