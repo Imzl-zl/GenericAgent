@@ -4,10 +4,12 @@ name: Build Linux Desktop Release Package
   push:
     branches:
       - test
+      - test_yiqi
     paths:
       - ".github/workflows/linux-desktop-release-package.yml"
       - "desktop_release/scripts/linux/install_linux.sh"
       - "frontends/desktop/**"
+      - "frontends/conductor.py"
   workflow_dispatch:
     inputs:
       upload_release:

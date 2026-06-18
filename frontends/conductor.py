@@ -18,6 +18,30 @@ PORT = 8900
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conductor.html")
 
 
+def _desktop_llm_no() -> Optional[int]:
+    """Read the model index the user picked in the desktop UI.
+    Persisted by the bridge at ~/.ga_desktop_settings.json under ui.llmNo.
+    Returns None when unavailable, so callers keep the agent's default model."""
+    try:
+        from pathlib import Path
+        doc = json.loads((Path.home() / ".ga_desktop_settings.json").read_text(encoding="utf-8"))
+        no = (doc.get("ui") or {}).get("llmNo")
+        return int(no) if no is not None else None
+    except Exception:
+        return None
+
+
+def _apply_desktop_model(agent: "GenericAgent") -> None:
+    """Switch a freshly built agent to the desktop-selected model (if any)."""
+    no = _desktop_llm_no()
+    if no is None:
+        return
+    try:
+        agent.next_llm(int(no))
+    except Exception as e:
+        print(f"[conductor] failed to apply desktop model #{no}: {e}", file=sys.stderr)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 服务启动（事件循环已就绪）：捕获 loop 供工作线程跨线程推 WS 广播，并起主agent
@@ -197,6 +221,7 @@ class SubagentPool:
         agent.inc_out = True
         agent.verbose = False
         agent.no_print = True
+        _apply_desktop_model(agent)
         th = start_agent_runner(agent, f"subagent-{sid}")
         state = SubAgentState(id=sid, agent=agent, prompt=prompt, status="running", thread=th)
         with self.lock: self.subagents[sid] = state
@@ -346,6 +371,9 @@ API: {base}；先requests，GET /readme查用法，GET /chat读未读对话，GE
                     break
             try:
                 prompt = self._build_prompt(events)
+                # Follow the desktop-selected model live: re-read before each task
+                # so switching models in the UI takes effect without restarting.
+                _apply_desktop_model(self.agent)
                 dq = self.agent.put_task(prompt, source="conductor")
                 self._drain(dq, events)
             except Exception as e: print(f"Conductor error: {e}")

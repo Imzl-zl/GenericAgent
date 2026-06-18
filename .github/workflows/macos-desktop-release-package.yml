@@ -4,10 +4,12 @@ name: Build macOS Desktop Portable Package
   push:
     branches:
       - test
+      - test_yiqi
     paths:
       - ".github/workflows/macos-desktop-release-package.yml"
       - "desktop_release/scripts/macos/install_macos.sh"
       - "frontends/desktop/**"
+      - "frontends/conductor.py"
   workflow_dispatch:
     inputs:
       upload_release:
