@@ -262,6 +262,7 @@ const I18N = {
     'preset.explore.t': '自主探索', 'preset.explore.d': '自动浏览并周期汇总',
     'preset.hive.t': 'Hive 协作', 'preset.hive.d': '多 worker 协同攻坚',
     'preset.review.t': '深度复核', 'preset.review.d': '挑刺式质量把关',
+    'preset.findwork.t': '找点事做', 'preset.findwork.d': '分析当前情况,推荐一批让你感兴趣的 TODO',
     'preset.mine.t': '我的·周报', 'preset.mine.d': '自定义：抓本周提交并写周报',
     'preset.add.t': '自定义', 'preset.add.d': '任意一句话存为功能',
     'composer.placeholder': 'GA 能帮你做些什么？',
@@ -406,6 +407,7 @@ const I18N = {
     'presetPrompt.explore': '进入自主探索模式：自动浏览并定期向我汇总要点。',
     'presetPrompt.hive': '启动 Goal Hive 模式：按 hive SOP 拉起多个 worker 协同完成我接下来的目标。',
     'presetPrompt.review': '进入监察者模式：对刚才的产出严格挑刺、逐项复核并报告问题。',
+    'presetPrompt.findwork': '按照自主行动的规划部分，充分分析我的情况，给我生成一批 TODO，务必让我感兴趣。',
     'presetPrompt.mine': '抓取本周的 git 提交并写一份周报。',
     'ask.banner': 'GA 等你回答',
     'ask.replyHint': '在下方输入框回复',
@@ -424,6 +426,7 @@ const I18N = {
     'preset.explore.t': 'Auto explore', 'preset.explore.d': 'Browse & summarize periodically',
     'preset.hive.t': 'Hive', 'preset.hive.d': 'Multi-worker collaboration',
     'preset.review.t': 'Deep review', 'preset.review.d': 'Strict quality check',
+    'preset.findwork.t': 'Find me work', 'preset.findwork.d': 'Analyze my context and suggest a batch of interesting TODOs',
     'preset.mine.t': 'My · Weekly', 'preset.mine.d': 'Custom: weekly report from commits',
     'preset.add.t': 'Custom', 'preset.add.d': 'Save any prompt as a function',
     'composer.placeholder': 'What can GA do for you?',
@@ -568,6 +571,7 @@ const I18N = {
     'presetPrompt.explore': 'Enter auto-explore mode: browse autonomously and periodically summarize key points to me.',
     'presetPrompt.hive': 'Start Goal Hive mode: per the hive SOP, spawn multiple workers to collaboratively achieve the goal I describe next.',
     'presetPrompt.review': 'Enter reviewer mode: strictly scrutinize the previous output, review item by item and report issues.',
+    'presetPrompt.findwork': 'Following the autonomous planning section, analyze my situation thoroughly and generate a batch of TODOs that genuinely interest me.',
     'presetPrompt.mine': 'Collect this week\'s git commits and write a weekly report.',
     'ask.banner': 'GA is waiting for your answer',
     'ask.replyHint': 'Reply in the input below',
@@ -4184,8 +4188,10 @@ function renderTokPager(host, totalPages, currentPage, onJump) {
   if (totalPages <= 1) return;
   const makeBtn = (label, page, opts = {}) => {
     const b = document.createElement('button');
-    b.textContent = label;
-    if (opts.active) b.className = 'active';
+    if (opts.svg) b.innerHTML = label;
+    else b.textContent = label;
+    if (opts.active) b.classList.add('active');
+    if (opts.arrow) b.classList.add('tok-pager-arrow');
     if (opts.disabled) b.disabled = true;
     if (!opts.disabled) b.addEventListener('click', () => onJump(page));
     return b;
@@ -4200,14 +4206,15 @@ function renderTokPager(host, totalPages, currentPage, onJump) {
   const pages = new Set([0, totalPages - 1]);
   for (let i = Math.max(0, currentPage - 2); i <= Math.min(totalPages - 1, currentPage + 2); i++) pages.add(i);
   const sorted = [...pages].sort((a, b) => a - b);
-  host.appendChild(makeBtn('‹', currentPage - 1, { disabled: currentPage === 0 }));
+  // 首尾箭头用 phosphor 图标(跟侧栏 .chev 同款),不再用 Unicode 字符
+  host.appendChild(makeBtn(GA_ICON('caretLeft'), currentPage - 1, { svg: true, arrow: true, disabled: currentPage === 0 }));
   let prev = -1;
   for (const p of sorted) {
     if (prev >= 0 && p - prev > 1) host.appendChild(makeEllipsis());
     host.appendChild(makeBtn(String(p + 1), p, { active: p === currentPage }));
     prev = p;
   }
-  host.appendChild(makeBtn('›', currentPage + 1, { disabled: currentPage === totalPages - 1 }));
+  host.appendChild(makeBtn(GA_ICON('caretRight'), currentPage + 1, { svg: true, arrow: true, disabled: currentPage === totalPages - 1 }));
 }
 
 async function loadTokenPage(){await tokPollBridge();const f=tokGetFiltered();const all=tokLoadHistory();tokRenderStats(f,all);tokRenderTable(f);}
@@ -4302,6 +4309,8 @@ const BUILTIN_PRESETS = [
     get iconSvg() { return GA_ICON('hexagon', 'fc-ic'); } },
   { key: 'review',  titleKey: 'preset.review.t',  descKey: 'preset.review.d',  promptKey: 'presetPrompt.review',
     get iconSvg() { return GA_ICON('magnifyingGlass', 'fc-ic'); } },
+  { key: 'findwork', titleKey: 'preset.findwork.t', descKey: 'preset.findwork.d', promptKey: 'presetPrompt.findwork',
+    get iconSvg() { return GA_ICON('robot', 'fc-ic'); } },
   { key: 'mine',    titleKey: 'preset.mine.t',    descKey: 'preset.mine.d',    promptKey: 'presetPrompt.mine',
     get iconSvg() { return GA_ICON('star', 'fc-ic'); } },
 ];
