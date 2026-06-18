@@ -25,6 +25,8 @@ HTTP API:
   GET    /services/panel
   GET    /services/mykey
   POST   /services/mykey       body: {"content":"..."}
+  POST   /services/stop-extras   stop conductor + scheduler (127.0.0.1 only)
+  POST   /services/start-extras  start conductor + scheduler (127.0.0.1 only)
 
 WS API (state sync):
   GET /ws -> on connect sends services.snapshot; service.changed on updates
@@ -33,7 +35,7 @@ WS API (state sync):
 """
 from __future__ import annotations
 
-import asyncio, contextlib, importlib, json, os, re, subprocess, sys
+import asyncio, atexit, contextlib, importlib, json, os, re, subprocess, sys
 from collections import deque
 import threading, time, traceback, uuid
 from dataclasses import dataclass, field
@@ -946,6 +948,11 @@ class ServiceManager:
                 tag = f"exception {type(e).__name__}: {e}"
             print(f"[autostart] {sid}: {tag}", file=sys.stderr)
 
+    def stop_all_extras(self) -> None:
+        for sid in sorted(set(self._catalog) - set(self._im_catalog)):
+            with contextlib.suppress(Exception):
+                self.stop_service(sid)
+
     def stop_service(self, sid: str) -> dict:
         if sid not in self._catalog:
             raise KeyError(sid)
@@ -972,6 +979,14 @@ class ServiceManager:
 
 
 services = ServiceManager(str(DEFAULT_GA_ROOT), hub.emit)
+
+
+def _bridge_shutdown_services() -> None:
+    with contextlib.suppress(Exception):
+        services.stop_all_extras()
+
+
+atexit.register(_bridge_shutdown_services)
 
 
 def emit_session_state(sess: Session, state_name: str):
@@ -1483,6 +1498,25 @@ async def service_panel_handler(request):
     return json_ok({"services": services.list_panel_state()})
 
 
+def _is_local_peer(peer: str) -> bool:
+    p = (peer or "").strip()
+    return p in ("127.0.0.1", "::1") or p.startswith("::ffff:127.0.0.1")
+
+
+async def stop_extras_handler(request):
+    if not _is_local_peer(request.remote or ""):
+        return json_ok({"ok": False, "error": "forbidden"}, status=403)
+    services.stop_all_extras()
+    return json_ok({"ok": True})
+
+
+async def start_extras_handler(request):
+    if not _is_local_peer(request.remote or ""):
+        return json_ok({"ok": False, "error": "forbidden"}, status=403)
+    services.autostart_extras()
+    return json_ok({"ok": True})
+
+
 async def token_stats_handler(request):
     try:
         sys.path.insert(0, str(APP_DIR)) if str(APP_DIR) not in sys.path else None
@@ -1564,6 +1598,8 @@ def create_app():
     app.router.add_get("/services/panel", service_panel_handler)
     app.router.add_get("/services/mykey", mykey_get_handler)
     app.router.add_post("/services/mykey", mykey_save_handler)
+    app.router.add_post("/services/stop-extras", stop_extras_handler)
+    app.router.add_post("/services/start-extras", start_extras_handler)
 
     # Serve static frontend (desktop/static/)
     static_dir = APP_DIR / "desktop" / "static"
@@ -1581,7 +1617,11 @@ def create_app():
         hub.loop = asyncio.get_running_loop()
         services.autostart_extras()
 
+    async def on_shutdown(app):
+        services.stop_all_extras()
+
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     return app
 
 

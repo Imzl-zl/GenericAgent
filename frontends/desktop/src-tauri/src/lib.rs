@@ -357,6 +357,91 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
     Ok(())
 }
 
+const CONDUCTOR_PORT: u16 = 8900;
+const SCHEDULER_LOCK_PORT: u16 = 45762;
+
+fn is_port_open(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{}", port);
+    let Ok(sock_addr) = addr.parse() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&sock_addr, Duration::from_millis(300)).is_ok()
+}
+
+fn extras_ports_busy_label() -> Option<String> {
+    let mut busy = Vec::new();
+    if is_port_open(CONDUCTOR_PORT) {
+        busy.push(format!("{} (conductor)", CONDUCTOR_PORT));
+    }
+    if is_port_open(SCHEDULER_LOCK_PORT) {
+        busy.push(format!("{} (scheduler)", SCHEDULER_LOCK_PORT));
+    }
+    if busy.is_empty() {
+        None
+    } else {
+        Some(busy.join(", "))
+    }
+}
+
+fn alert_extras_ports_busy(win: &tauri::WebviewWindow, ports: &str) {
+    let msg = format!(
+        "Conductor/Scheduler 端口已被占用：{}\n请结束占用进程后点「确定」重新检测。",
+        ports
+    );
+    let js = format!(
+        "alert({})",
+        serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".to_string())
+    );
+    let _ = win.eval(&js);
+}
+
+/// Browser alert on loading.html; re-prompt if ports stay busy after dismiss.
+fn wait_until_extras_ports_free(win: Option<&tauri::WebviewWindow>) {
+    while let Some(ports) = extras_ports_busy_label() {
+        eprintln!("[tauri] extras ports busy: {}", ports);
+        if let Some(w) = win {
+            alert_extras_ports_busy(w, &ports);
+        }
+        let wait_start = Instant::now();
+        while extras_ports_busy_label().is_some() {
+            if wait_start.elapsed() > Duration::from_secs(3) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+    }
+}
+
+fn request_stop_extras() {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &"127.0.0.1:14168".parse().unwrap(),
+        Duration::from_millis(800),
+    ) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
+    let req = b"POST /services/stop-extras HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(req);
+    let _ = stream.read(&mut [0u8; 512]);
+}
+
+fn request_start_extras() {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &"127.0.0.1:14168".parse().unwrap(),
+        Duration::from_millis(800),
+    ) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
+    let req = b"POST /services/start-extras HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(req);
+    let _ = stream.read(&mut [0u8; 512]);
+}
+
 fn is_bridge_running() -> bool {
     TcpStream::connect(("127.0.0.1", 14168)).is_ok()
 }
@@ -521,6 +606,8 @@ pub fn run() {
             thread::spawn(move || {
                 // Progress reporter: push status into the loading window (window.gaProgress).
                 let main_win = handle.get_webview_window("main");
+                wait_until_extras_ports_free(main_win.as_ref());
+
                 let report = |pct: i32, msg: &str| {
                     if let Some(w) = &main_win {
                         let js = format!(
@@ -569,6 +656,20 @@ pub fn run() {
                 let bridge_ready = wait_for_port(14168, wait);
 
                 if bridge_ready {
+                    wait_until_extras_ports_free(main_win.as_ref());
+                    request_start_extras();
+                    if !wait_for_port(14168, Duration::from_secs(15)) {
+                        eprintln!("[tauri] bridge not reachable before navigate");
+                        if let Some(w) = &main_win {
+                            let msg = "无法连接 bridge (127.0.0.1:14168)，请关闭程序后重试。";
+                            let js = format!(
+                                "alert({})",
+                                serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string())
+                            );
+                            let _ = w.eval(&js);
+                        }
+                        return;
+                    }
                     // Navigate to the bridge HTTP only after it is ready.
                     if let Some(w) = handle.get_webview_window("main") {
                         if let Ok(url) = tauri::Url::parse("http://127.0.0.1:14168/") {
@@ -610,7 +711,7 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let label = window.label();
                 if label == "main" {
-                    // Main closed -> exit app
+                    request_stop_extras();
                     window.app_handle().exit(0);
                 } else if label == "setup" {
                     // Setup closed -> exit if main is not visible
