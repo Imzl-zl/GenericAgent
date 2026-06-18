@@ -4030,6 +4030,7 @@ window.ga.onBridgeClosed(() => {
 
 /* ═══════════════ Token 用量页 ═══════════════ */
 const tokTbody = document.getElementById('tok-tbody');
+const tokTable = document.getElementById('tok-table');
 const tokPager = document.getElementById('tok-pager');
 const tokSince = document.getElementById('tok-since');
 const tokUntil = document.getElementById('tok-until');
@@ -4245,8 +4246,8 @@ if (tokTabs) tokTabs.addEventListener('click', e => {
   btn.classList.add('active');
   _tokTab = btn.dataset.tab;
   _tokPage = 0;
-  if (_tokTab === 'conductor') { if (tokFilter) tokFilter.style.display = 'none'; if (tokStatRow) tokStatRow.style.display = 'none'; loadConductorTokens(); }
-  else { if (tokFilter) tokFilter.style.display = ''; if (tokStatRow) tokStatRow.style.display = ''; loadTokenPage(); }
+  if (_tokTab === 'conductor') { if (tokFilter) tokFilter.style.display = 'none'; if (tokStatRow) tokStatRow.style.display = 'none'; if (tokTable) tokTable.classList.add('tok-table--conductor'); loadConductorTokens(); }
+  else { if (tokFilter) tokFilter.style.display = ''; if (tokStatRow) tokStatRow.style.display = ''; if (tokTable) tokTable.classList.remove('tok-table--conductor'); loadTokenPage(); }
 });
 
 async function loadConductorTokens() {
@@ -4273,7 +4274,7 @@ async function loadConductorTokens() {
   const hIn = hist.input + curIn, hOut = hist.output + curOut, hCc = hist.cacheCreate + curCc, hCr = hist.cacheRead + curCr, hCost = hist.cost + curCost;
   if (!tokTbody) return;
   const tip = t('tok.condTip');
-  const _ci = GA_ICON('gitFork');
+  const _ci = GA_ICON('gitFork', 'tok-cond-ico');
   const hCacheBase = hIn + hCr + hCc;
   const hCacheRate = hCacheBase > 0 ? (hCr / hCacheBase * 100).toFixed(1) + '%' : '0%';
   const curCacheBase = curIn + curCr + curCc;
