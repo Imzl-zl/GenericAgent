@@ -1,9 +1,21 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set "SCRIPT_DIR=%~dp0"
-for %%I in ("%SCRIPT_DIR%..\..\..") do set "PROJECT_DIR=%%~fI"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%install_windows.ps1" -ProjectDir "%PROJECT_DIR%" -Mode PrepareOnly -SkipNpmInstall %*
+echo GenericAgent Desktop Windows setup
 echo.
-echo If the installer failed, copy the error above and send it to the developer.
+echo Recommended location: put this whole folder under GenericAgent\frontends\
+echo Example: GenericAgent\frontends\GenericAgent-Desktop-Windows\install.bat
+echo This script will prepare Python/.venv, install minimal dependencies, and write %%USERPROFILE%%\.ga_desktop_settings.json.
+echo.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_windows.ps1" -Mode PrepareOnly -SkipNpmInstall %*
+if errorlevel 1 (
+  echo.
+  echo Setup failed. If the project root was not found, run:
+  echo powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -ProjectDir D:\path\to\GenericAgent -Mode PrepareOnly -SkipNpmInstall
+  echo.
+  pause
+  exit /b 1
+)
+echo.
+echo Setup finished. You can now run start_windows.bat.
 pause

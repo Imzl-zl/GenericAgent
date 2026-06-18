@@ -26,6 +26,8 @@ MODE="PrepareOnly"
 NO_VENV=0
 SKIP_PIP_INSTALL=0
 APPIMAGE_PATH=""
+WHEEL_DIR=""
+EXTRA_PACKAGES=""
 
 log_step() { printf '\n==> %s\n' "$*" >&2; }
 log_ok() { printf '[OK] %s\n' "$*" >&2; }
@@ -54,6 +56,12 @@ while [[ $# -gt 0 ]]; do
       NO_VENV=1; shift ;;
     --skip-pip-install)
       SKIP_PIP_INSTALL=1; shift ;;
+    --wheel-dir)
+      [[ $# -ge 2 ]] || fail "Missing value for $1"
+      WHEEL_DIR="$2"; shift 2 ;;
+    --extra-packages)
+      [[ $# -ge 2 ]] || fail "Missing value for $1"
+      EXTRA_PACKAGES="$2"; shift 2 ;;
     --help|-h)
       usage; exit 0 ;;
     *)
@@ -164,6 +172,7 @@ ensure_venv() {
   local venv="$root/.venv"
   local vpy="$venv/bin/python"
   if [[ ! -x "$vpy" ]]; then
+    printf 'GAPROGRESS|venv\n'
     log_step "Create virtual environment: $venv"
     "$base_py" -m venv "$venv" || fail "Failed to create venv. On Debian/Ubuntu install python3-venv."
   fi
@@ -179,9 +188,20 @@ install_dependencies() {
     return
   fi
 
-  log_step "Install/refresh minimal Python dependencies"
-  "$py" -m pip install --upgrade pip setuptools wheel || fail "pip bootstrap failed."
-  "$py" -m pip install -e "$root" psutil || fail "pip install failed."
+  printf 'GAPROGRESS|deps\n'
+  if [[ -n "$WHEEL_DIR" ]]; then
+    # Offline (portable bundle): install from local wheels only, no network, no pip self-upgrade.
+    log_step "Install dependencies offline from $WHEEL_DIR"
+    # shellcheck disable=SC2086
+    "$py" -m pip install --no-index --find-links "$WHEEL_DIR" -e "$root" psutil $EXTRA_PACKAGES \
+      || fail "Offline pip install failed (check wheel dir)."
+  else
+    log_step "Install/refresh minimal Python dependencies"
+    "$py" -m pip install --upgrade pip setuptools wheel || fail "pip bootstrap failed."
+    # shellcheck disable=SC2086
+    "$py" -m pip install -e "$root" psutil $EXTRA_PACKAGES || fail "pip install failed."
+  fi
+  printf 'GAPROGRESS|done\n'
 }
 
 ensure_mykey() {
@@ -353,11 +373,19 @@ log_step "Resolve project root"
 ROOT="$(find_project_root "$SCRIPT_ROOT")"
 log_ok "Project root: $ROOT"
 
-log_step "Resolve AppImage"
-APPIMAGE="$(find_appimage "$ROOT" "$SCRIPT_ROOT")"
-[[ -n "$APPIMAGE" ]] || fail "GenericAgent.AppImage not found. Put it next to install_linux.sh in GenericAgent/frontends/."
-chmod +x "$APPIMAGE"
-log_ok "AppImage: $APPIMAGE"
+# Portable self-prepare (offline, --wheel-dir set): the AppImage is already running and
+# manages itself, so skip AppImage discovery and desktop-launcher creation.
+PORTABLE_PREPARE=0
+[[ -n "$WHEEL_DIR" ]] && PORTABLE_PREPARE=1
+
+APPIMAGE=""
+if [[ "$PORTABLE_PREPARE" -eq 0 ]]; then
+  log_step "Resolve AppImage"
+  APPIMAGE="$(find_appimage "$ROOT" "$SCRIPT_ROOT")"
+  [[ -n "$APPIMAGE" ]] || fail "GenericAgent.AppImage not found. Put it next to install_linux.sh in GenericAgent/frontends/."
+  chmod +x "$APPIMAGE"
+  log_ok "AppImage: $APPIMAGE"
+fi
 
 log_step "Resolve Python"
 BASE_PY="$(find_python)"
@@ -369,7 +397,9 @@ log_ok "Runtime Python: $PY"
 install_dependencies "$ROOT" "$PY"
 ensure_mykey "$ROOT"
 write_desktop_settings "$ROOT" "$PY"
-install_desktop_launchers "$ROOT" "$APPIMAGE"
+if [[ "$PORTABLE_PREPARE" -eq 0 ]]; then
+  install_desktop_launchers "$ROOT" "$APPIMAGE"
+fi
 
 case "$MODE" in
   PrepareOnly)
