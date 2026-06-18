@@ -16,7 +16,6 @@ html,body{height:100%;margin:0;display:flex;align-items:center;justify-content:c
 #ga-bar{height:100%;width:0;background:currentColor;border-radius:99px;transition:width .3s ease}
 #ga-bar.indet{width:35%;animation:indet 1.1s ease-in-out infinite}
 @keyframes indet{0%{margin-left:-35%}100%{margin-left:100%}}
-#ga-sub{margin-top:8px;font-size:11px;opacity:.6}
 </style>
 <script>
 window.gaProgress = function(pct, msg){
@@ -29,8 +28,6 @@ window.gaProgress = function(pct, msg){
     if (pct < 0){ fill.classList.add('indet'); }
     else { fill.classList.remove('indet'); fill.style.width = Math.max(0, Math.min(100, pct)) + '%'; }
   }
-  var sub = document.getElementById('ga-sub');
-  if (sub) sub.textContent = '首次启动正在准备运行环境，仅此一次';
 };
 </script>
 </head>
@@ -39,7 +36,6 @@ window.gaProgress = function(pct, msg){
     <div class="spinner"></div>
     <div id="ga-status">正在启动 GenericAgent…</div>
     <div class="bar"><div id="ga-bar"></div></div>
-    <div id="ga-sub"></div>
   </div>
 </body>
 </html>
