@@ -1,6 +1,6 @@
 use std::process::{Command, Child, Stdio};
 use std::io::{BufRead, BufReader};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use std::thread;
@@ -404,6 +404,24 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
+fn bridge_child_exited() -> bool {
+    if let Some(child) = BRIDGE_PROCESS.lock().unwrap().as_mut() {
+        matches!(child.try_wait(), Ok(Some(_)))
+    } else {
+        false
+    }
+}
+
+fn show_port_busy_if_blocked(handle: &tauri::AppHandle) -> bool {
+    if let Some(ports) = blocked_ports_label() {
+        eprintln!("[tauri] ports blocked: {}", ports);
+        show_port_busy(handle, &ports);
+        true
+    } else {
+        false
+    }
+}
+
 fn request_bridge_shutdown() {
     use std::io::{Read, Write};
     let Ok(mut stream) = TcpStream::connect_timeout(
@@ -479,9 +497,20 @@ fn start_bridge_with_config(app_handle: tauri::AppHandle, python_path: String, p
         .map_err(|e| format!("Failed to write settings: {}", e))?;
 
     let dir = PathBuf::from(&project_dir);
-    spawn_bridge(&python_path, &dir)?;
+    if let Err(e) = spawn_bridge(&python_path, &dir) {
+        let _ = show_port_busy_if_blocked(&app_handle);
+        return Err(e);
+    }
+
+    thread::sleep(Duration::from_millis(400));
+    if bridge_child_exited() && show_port_busy_if_blocked(&app_handle) {
+        return Err("Bridge exited immediately (ports in use)".into());
+    }
 
     if !wait_for_port(BRIDGE_PORT, Duration::from_secs(20)) {
+        if show_port_busy_if_blocked(&app_handle) {
+            return Err("Bridge ports in use".into());
+        }
         return Err("Bridge did not become ready within 20s".into());
     }
 
@@ -509,16 +538,28 @@ pub fn run() {
     let no_autostart = args.iter().any(|a| a == "--no-autostart");
     let dev_mode = args.iter().any(|a| a == "--dev");
 
-    let port_blocked = blocked_ports_label();
     let project_dir = find_project_dir().unwrap_or_default();
     let needs_prepare = needs_first_run_prepare(&project_dir);
 
+    let early_port_busy: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut spawned_bridge = false;
-    if port_blocked.is_none() && !no_autostart && !needs_prepare {
-        let (py_str, dir_str) = get_or_discover_config();
-        let dir = PathBuf::from(&dir_str);
-        if !py_str.is_empty() && spawn_bridge(&py_str, &dir).is_ok() {
-            spawned_bridge = true;
+    if !no_autostart && !needs_prepare {
+        if let Some(ports) = blocked_ports_label() {
+            *early_port_busy.lock().unwrap() = Some(ports);
+        } else {
+            let (py_str, dir_str) = get_or_discover_config();
+            let dir = PathBuf::from(&dir_str);
+            if !py_str.is_empty() {
+                match spawn_bridge(&py_str, &dir) {
+                    Ok(()) => spawned_bridge = true,
+                    Err(e) => {
+                        eprintln!("[tauri] early bridge spawn failed: {}", e);
+                        if let Some(ports) = blocked_ports_label() {
+                            *early_port_busy.lock().unwrap() = Some(ports);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -540,11 +581,14 @@ pub fn run() {
 
             let handle = app.handle().clone();
             let project_dir = project_dir.clone();
-            let port_blocked_setup = port_blocked.clone();
+            let early_port_busy = early_port_busy.clone();
             thread::spawn(move || {
-                if let Some(ports) = &port_blocked_setup {
-                    eprintln!("[tauri] ports blocked: {}", ports);
-                    show_port_busy(&handle, ports);
+                let mut spawned_bridge = spawned_bridge;
+                if let Some(ports) = early_port_busy.lock().unwrap().take() {
+                    show_port_busy(&handle, &ports);
+                    return;
+                }
+                if show_port_busy_if_blocked(&handle) {
                     return;
                 }
 
@@ -572,10 +616,26 @@ pub fn run() {
                         return;
                     }
                     report(95, "starting");
+                    if show_port_busy_if_blocked(&handle) {
+                        return;
+                    }
                     let (py_str, dir_str) = get_or_discover_config();
                     let dir = PathBuf::from(&dir_str);
-                    if let Err(e) = spawn_bridge(&py_str, &dir) {
-                        eprintln!("[tauri] bridge spawn after prepare failed: {}", e);
+                    match spawn_bridge(&py_str, &dir) {
+                        Ok(()) => spawned_bridge = true,
+                        Err(e) => {
+                            eprintln!("[tauri] bridge spawn after prepare failed: {}", e);
+                            if show_port_busy_if_blocked(&handle) {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                if spawned_bridge {
+                    thread::sleep(Duration::from_millis(400));
+                    if bridge_child_exited() && show_port_busy_if_blocked(&handle) {
+                        return;
                     }
                 }
 
@@ -614,6 +674,8 @@ pub fn run() {
                         let _ = w.set_focus();
                     }
                     if let Some(sw) = handle.get_webview_window("setup") { let _ = sw.hide(); }
+                } else if show_port_busy_if_blocked(&handle) {
+                    // Ports taken by an orphan bridge/conductor — port_busy.html already shown.
                 } else {
                     // Bridge never came up -> let the user fix paths in the setup window.
                     if let Some(sw) = handle.get_webview_window("setup") {
