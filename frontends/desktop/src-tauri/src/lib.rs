@@ -76,11 +76,28 @@ fn bundle_python() -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
+/// Prepared virtualenv interpreter inside the bundle's runtime/app/.venv.
+fn bundle_venv_python() -> Option<PathBuf> {
+    let root = bundle_root()?;
+    #[cfg(windows)]
+    let candidates = [root.join("app").join(".venv").join("Scripts").join("python.exe")];
+    #[cfg(not(windows))]
+    let candidates = [
+        root.join("app").join(".venv").join("bin").join("python"),
+        root.join("app").join(".venv").join("bin").join("python3"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
 /// Find python executable:
-/// 1. The embedded bundle python (runtime/python).
-/// 2. .portable/uv-python/ 下找 python.exe (Windows) 或 python3 (Unix)
-/// 3. Fallback to system PATH
+/// 1. The prepared bundle virtualenv (runtime/app/.venv) so bridge deps are available.
+/// 2. The embedded bundle python (runtime/python) for first-run fallback.
+/// 3. .portable/uv-python/ 下找 python.exe (Windows) 或 python3 (Unix)
+/// 4. Fallback to system PATH
 fn find_python() -> String {
+    if let Some(p) = bundle_venv_python() {
+        return p.to_string_lossy().to_string();
+    }
     if let Some(p) = bundle_python() {
         return p.to_string_lossy().to_string();
     }
