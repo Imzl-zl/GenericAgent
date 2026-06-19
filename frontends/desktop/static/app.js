@@ -282,6 +282,7 @@ let bridgeUiOffline = false;
     getServicePanel: () => rpc('services/panel', {}),
     getMykeyContent: () => rpc('services/mykey/get', {}),
     saveMykeyContent: (content) => rpc('services/mykey/save', { content }),
+    tauriInvoke,
     setBridgeUiOffline: (offline) => { bridgeUiOffline = !!offline; },
     pollSession: (sessionId, afterId = 0) => rpc('session/poll', { sessionId, afterId }),
     rpc,
@@ -950,7 +951,7 @@ async function exportMykeyToDir() {
   if (!content.trim()) throw new Error(t('err.mykeyExport'));
   // WebView2：独立缓存 + 无目录选择/下载；走 Tauri 原生另存为
   if (window.__TAURI__?.core?.invoke) {
-    const path = await tauriInvoke('export_mykey', { content });
+    const path = await window.ga.tauriInvoke('export_mykey', { content });
     if (!path) return;
     showChanToast(t('sys.mykeyExported'), path, 'ok');
     return;
