@@ -114,13 +114,20 @@ def render_sidebar():
         st.session_state['_inject_prompt'] = T('suggest_prompt')
         st.rerun(scope="app")
     st.divider()
+    st.markdown("""<style>
+    [data-testid="stSidebar"] .stTextArea textarea {
+        field-sizing: content; min-height: 1.6em !important; height: auto !important;
+    }
+    </style>""", unsafe_allow_html=True)
+    def _sync_loop_prompt():
+        st.session_state.loop_prompt = st.session_state.loop_prompt_input
+    loop_prompt = st.text_area("Loop prompt", value=st.session_state.get('loop_prompt', "继续" if LANG=='zh' else 'next'), key="loop_prompt_input", height=1, on_change=_sync_loop_prompt)
     if st.session_state.get('loop_enabled'):
         if st.button("⏹️ Stop Loop"):
             st.session_state.loop_enabled = False
             st.toast("⏹️ Loop stopped"); st.rerun(scope="app")
         st.caption("🔁 Looping")
     else:
-        loop_prompt = st.text_input("Loop prompt", value="继续" if LANG=='zh' else 'next', key="loop_prompt_input")
         if st.button("🔁 Loop!"):
             st.session_state.loop_enabled = True
             st.session_state.loop_prompt = loop_prompt
