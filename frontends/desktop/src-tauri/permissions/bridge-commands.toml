@@ -12,3 +12,8 @@ commands.allow = ["start_bridge_with_config"]
 identifier = "allow-get-config"
 description = "Read saved bridge spawn configuration."
 commands.allow = ["get_config"]
+
+[[permission]]
+identifier = "allow-export-mykey"
+description = "Save mykey.py via native file dialog."
+commands.allow = ["export_mykey"]
