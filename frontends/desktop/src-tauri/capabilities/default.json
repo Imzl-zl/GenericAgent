@@ -13,6 +13,9 @@
     "core:window:allow-set-focus",
     "core:window:allow-close",
     "core:window:allow-get-all-windows",
-    "core:webview:default"
+    "core:webview:default",
+    "allow-start-bridge",
+    "allow-start-bridge-with-config",
+    "allow-get-config"
   ]
 }

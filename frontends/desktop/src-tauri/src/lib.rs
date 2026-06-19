@@ -348,6 +348,71 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
     Ok(())
 }
 
+/// GET /services/identity from a running bridge; returns the ga_root it serves (or None
+/// when the endpoint is absent — i.e. an older/foreign bridge).
+fn bridge_reported_ga_root() -> Option<String> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect_timeout(
+        &"127.0.0.1:14168".parse().unwrap(),
+        Duration::from_millis(800),
+    ).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
+    let req = b"GET /services/identity HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    stream.write_all(req).ok()?;
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split("\r\n\r\n").nth(1)?;
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    v.get("ga_root")?.as_str().map(|s| s.to_string())
+}
+
+fn norm_path(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().to_string())
+        .unwrap_or_else(|_| p.to_string())
+}
+
+fn bridge_identity_matches(project_dir: &str) -> bool {
+    let Some(reported) = bridge_reported_ga_root() else { return false; };
+    let (a, b) = (norm_path(&reported), norm_path(project_dir));
+    #[cfg(windows)]
+    { a.eq_ignore_ascii_case(&b) }
+    #[cfg(not(windows))]
+    { a == b }
+}
+
+fn request_bridge_shutdown() {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &"127.0.0.1:14168".parse().unwrap(),
+        Duration::from_millis(800),
+    ) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
+    let req = b"POST /services/bridge/exit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(req);
+    let _ = stream.read(&mut [0u8; 512]);
+}
+
+fn takeover_stale_bridge(project_dir: &str) {
+    if project_dir.is_empty() || !is_bridge_running() {
+        return;
+    }
+    if bridge_identity_matches(project_dir) {
+        return;
+    }
+    eprintln!("[tauri] a different/stale bridge holds 127.0.0.1:14168; taking over");
+    request_bridge_shutdown();
+    let start = Instant::now();
+    while is_bridge_running() && start.elapsed() < Duration::from_secs(10) {
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn is_bridge_running() -> bool {
     TcpStream::connect(("127.0.0.1", 14168)).is_ok()
 }
@@ -438,10 +503,11 @@ pub fn run() {
     let dev_mode = args.iter().any(|a| a == "--dev");
 
     let project_dir = find_project_dir().unwrap_or_default();
+    let needs_prepare = needs_first_run_prepare(&project_dir);
+
+    takeover_stale_bridge(&project_dir);
+
     let bridge_ok = is_bridge_running();
-    // If any bridge is already present, attach to it immediately. Prepare is only needed before
-    // this app starts a bridge from its own bundled runtime.
-    let needs_prepare = !bridge_ok && needs_first_run_prepare(&project_dir);
     let mut spawned_bridge = false;
     // Skip the early spawn when a first-run prepare is required (no venv yet);
     // the setup thread prepares the env first and then starts the bridge.

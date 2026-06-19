@@ -50,6 +50,8 @@ const gaServiceStore = {
   get: (id) => _serviceById[id],
 };
 
+let bridgeUiOffline = false;
+
 /* ═══════════════ Bridge 适配（HTTP 命令 + WS 状态） ═══════════════ */
 (function initGaBridge() {
   const listeners = new Map();
@@ -238,13 +240,17 @@ const gaServiceStore = {
     return res;
   }
 
-  async function startBridge() {
+  async function spawnBridge() {
     connectWs();
     try {
-      return await http('/status');
+      const status = await http('/status');
+      bridgeUiOffline = false;
+      return status;
     } catch (_) {
       await tauriInvoke('start_bridge');
-      return waitBridgeStatus();
+      const status = await waitBridgeStatus();
+      bridgeUiOffline = false;
+      return status;
     }
   }
 
@@ -259,7 +265,8 @@ const gaServiceStore = {
 
   window.ga = {
     platform: navigator.platform.toLowerCase().includes('mac') ? 'darwin' : 'win32',
-    startBridge,
+    startBridge: async () => { connectWs(); return http('/status'); },
+    spawnBridge,
     stopBridge: async () => ({ ok: true }),
     exitBridge,
     checkStatus: () => rpc('app/status', {}),
@@ -275,6 +282,7 @@ const gaServiceStore = {
     getServicePanel: () => rpc('services/panel', {}),
     getMykeyContent: () => rpc('services/mykey/get', {}),
     saveMykeyContent: (content) => rpc('services/mykey/save', { content }),
+    setBridgeUiOffline: (offline) => { bridgeUiOffline = !!offline; },
     pollSession: (sessionId, afterId = 0) => rpc('session/poll', { sessionId, afterId }),
     rpc,
     onBridgeMessage: (cb) => on('bridge-message', cb),
@@ -323,7 +331,7 @@ const I18N = {
     'customPreset.removeTitle': '删除',
     'customPreset.editTitle': '编辑',
     'builtinPreset.restoreBtn': '恢复默认预设',
-    'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型', 'set.serviceManager': '后台服务管理',
+    'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型', 'set.features': '功能', 'set.importMykey': '导入已有 mykey.py', 'set.serviceManager': '后台服务管理',
     'appearance.light': '浅色', 'appearance.dark': '深色',
     'set.noModels': '暂无模型，点击下方添加',
     'lang.zh': '简体中文', 'lang.en': 'English',
@@ -429,11 +437,13 @@ const I18N = {
     'ch.loading': '加载中…', 'ch.empty': '未发现 IM 进程脚本',
     'ch.logEmpty': '暂无日志',
     'err.channelLoad': '加载失败', 'err.channelStart': '启动失败', 'err.channelStop': '停止失败',
+    'err.mykeyImport': '导入 mykey.py 失败',
     'err.channelNotConfigured': '请先在 mykey.py 中配置该平台',
     'sys.channelStarted': '已启动', 'sys.channelStopped': '已停止',
     'modal.channelLogs': '进程日志',
     'modal.mykeyConfig': 'mykey.py 配置',
     'sys.configSaved': '配置已保存',
+    'sys.mykeyImported': 'mykey.py 已导入',
     'st.starting': '启动中…', 'st.stopping': '停止中…', 'st.online': '在线', 'st.offline': '离线', 'st.error': '错误', 'st.running': '运行', 'st.abnormal': '异常',
     'act.configure': '配置', 'act.logs': '日志', 'act.restart': '重启', 'act.stop': '停止', 'act.start': '启动', 'act.exit': '退出',
     'act.copy': '复制', 'act.copied': '已复制', 'act.copyTex': 'TeX', 'act.send': '发送',
@@ -486,7 +496,7 @@ const I18N = {
     'customPreset.removeTitle': 'Delete',
     'customPreset.editTitle': 'Edit',
     'builtinPreset.restoreBtn': 'Restore defaults',
-    'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model', 'set.serviceManager': 'Service manager',
+    'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model', 'set.features': 'Features', 'set.importMykey': 'Import mykey.py', 'set.serviceManager': 'Service manager',
     'appearance.light': 'Light', 'appearance.dark': 'Dark',
     'set.noModels': 'No models yet — add one below',
     'lang.zh': '简体中文', 'lang.en': 'English',
@@ -592,11 +602,13 @@ const I18N = {
     'ch.loading': 'Loading…', 'ch.empty': 'No IM process scripts found',
     'ch.logEmpty': 'No log output yet',
     'err.channelLoad': 'Failed to load', 'err.channelStart': 'Start failed', 'err.channelStop': 'Stop failed',
+    'err.mykeyImport': 'Failed to import mykey.py',
     'err.channelNotConfigured': 'Configure this platform in mykey.py first',
     'sys.channelStarted': 'Started', 'sys.channelStopped': 'Stopped',
     'modal.channelLogs': 'Process logs',
     'modal.mykeyConfig': 'mykey.py',
     'sys.configSaved': 'Configuration saved',
+    'sys.mykeyImported': 'mykey.py imported',
     'st.starting': 'Starting…', 'st.stopping': 'Stopping…', 'st.online': 'Online', 'st.offline': 'Offline', 'st.error': 'Error', 'st.running': 'Running', 'st.abnormal': 'Error',
     'act.configure': 'Configure', 'act.logs': 'Logs', 'act.restart': 'Restart', 'act.stop': 'Stop', 'act.start': 'Start', 'act.exit': 'Exit',
     'act.copy': 'Copy', 'act.copied': 'Copied', 'act.copyTex': 'TeX', 'act.send': 'Send',
@@ -902,6 +914,32 @@ bindClick('add-model-btn', (e) => {
 });
 bindClick('settings-btn',  (e) => { e.stopPropagation(); openSettings(); });
 bindClick('settings-services-btn', (e) => { e.stopPropagation(); openServiceManagerFromSettings(); });
+
+const importMykeyInput = document.getElementById('import-mykey-input');
+async function importMykeyFromFile(file) {
+  if (!file) return;
+  const text = await file.text();
+  if (!text.trim()) throw new Error(t('err.mykeyImport'));
+  await window.ga.saveMykeyContent(text);
+  await loadModelProfiles();
+}
+bindClick('import-mykey-btn', (e) => {
+  e.stopPropagation();
+  if (importMykeyInput) importMykeyInput.click();
+});
+if (importMykeyInput) {
+  importMykeyInput.addEventListener('change', async () => {
+    const file = importMykeyInput.files && importMykeyInput.files[0];
+    importMykeyInput.value = '';
+    if (!file) return;
+    try {
+      await importMykeyFromFile(file);
+      showChanToast(t('sys.mykeyImported'), '', 'ok');
+    } catch (err) {
+      showChanToast(t('err.mykeyImport'), err.message || String(err), 'err');
+    }
+  });
+}
 // 侧边栏「快速接入」：点击官方模型按钮 → 打开预填好的添加模型表单
 const pqEl = document.getElementById('provider-quickstart');
 if (pqEl) pqEl.addEventListener('click', (e) => {
@@ -5143,10 +5181,16 @@ function renderStatusPanel(services) {
 
 async function loadStatusPanel() {
   if (!statusListEl) return;
+  if (bridgeUiOffline) {
+    renderStatusPanel(bridgeOfflinePanelServices());
+    return;
+  }
   try {
     const res = await window.ga.getServicePanel();
     renderStatusPanel(res.services || []);
   } catch (_) {
+    window.ga.setBridgeUiOffline(true);
+    gaServiceStore.applySnapshot(bridgeOfflinePanelServices());
     renderStatusPanel(bridgeOfflinePanelServices());
   }
 }
@@ -5178,7 +5222,7 @@ if (statusListEl) {
       _chanBusy = true;
       actEl.disabled = true;
       try {
-        await window.ga.startBridge();
+        await window.ga.spawnBridge();
         await loadStatusPanel();
         showChanToast(t('sys.channelStarted') + ' · bridge', '', 'ok');
       } catch (err) {
@@ -5194,8 +5238,10 @@ if (statusListEl) {
       _chanBusy = true;
       actEl.disabled = true;
       try {
-        await window.ga.exitBridge();
+        window.ga.setBridgeUiOffline(true);
+        gaServiceStore.applySnapshot(bridgeOfflinePanelServices());
         renderStatusPanel(bridgeOfflinePanelServices());
+        await window.ga.exitBridge();
         showChanToast(t('sys.channelStopped') + ' · bridge', '', 'ok');
       } catch (err) {
         showChanToast(t('err.channelStop') + ' · bridge', err.message || String(err), 'err');
@@ -5229,7 +5275,10 @@ if (statusListEl) {
 
 gaServiceStore.onServices((list) => {
   if (isSvcTab('channels')) renderChannelList(list);
-  if (isSvcTab('status')) loadStatusPanel();
+  if (isSvcTab('status')) {
+    if (bridgeUiOffline) renderStatusPanel(bridgeOfflinePanelServices());
+    else loadStatusPanel();
+  }
 });
 if (chanListEl) {
   chanListEl.addEventListener('click', async (e) => {
