@@ -437,15 +437,15 @@ const I18N = {
     'ch.loading': '加载中…', 'ch.empty': '未发现 IM 进程脚本',
     'ch.logEmpty': '暂无日志',
     'err.channelLoad': '加载失败', 'err.channelStart': '启动失败', 'err.channelStop': '停止失败',
-    'err.mykeyImport': '导入 mykey.py 失败',
-    'err.mykeyExport': '导出 mykey.py 失败',
+    'err.mykeyImport': '导入模型配置失败',
+    'err.mykeyExport': '导出模型配置失败',
     'err.channelNotConfigured': '请先在 mykey.py 中配置该平台',
     'sys.channelStarted': '已启动', 'sys.channelStopped': '已停止',
     'modal.channelLogs': '进程日志',
     'modal.mykeyConfig': 'mykey.py 配置',
     'sys.configSaved': '配置已保存',
-    'sys.mykeyImported': 'mykey.py 已导入',
-    'sys.mykeyExported': 'mykey.py 已导出',
+    'sys.mykeyImported': '模型配置已导入',
+    'sys.mykeyExported': '模型配置已导出',
     'st.starting': '启动中…', 'st.stopping': '停止中…', 'st.online': '在线', 'st.offline': '离线', 'st.error': '错误', 'st.running': '运行', 'st.abnormal': '异常',
     'act.configure': '配置', 'act.logs': '日志', 'act.restart': '重启', 'act.stop': '停止', 'act.start': '启动', 'act.exit': '退出',
     'act.copy': '复制', 'act.copied': '已复制', 'act.copyTex': 'TeX', 'act.send': '发送',
@@ -604,15 +604,15 @@ const I18N = {
     'ch.loading': 'Loading…', 'ch.empty': 'No IM process scripts found',
     'ch.logEmpty': 'No log output yet',
     'err.channelLoad': 'Failed to load', 'err.channelStart': 'Start failed', 'err.channelStop': 'Stop failed',
-    'err.mykeyImport': 'Failed to import mykey.py',
-    'err.mykeyExport': 'Failed to export mykey.py',
+    'err.mykeyImport': 'Failed to import model config',
+    'err.mykeyExport': 'Failed to export model config',
     'err.channelNotConfigured': 'Configure this platform in mykey.py first',
     'sys.channelStarted': 'Started', 'sys.channelStopped': 'Stopped',
     'modal.channelLogs': 'Process logs',
     'modal.mykeyConfig': 'mykey.py',
     'sys.configSaved': 'Configuration saved',
-    'sys.mykeyImported': 'mykey.py imported',
-    'sys.mykeyExported': 'mykey.py exported',
+    'sys.mykeyImported': 'Model config imported',
+    'sys.mykeyExported': 'Model config exported',
     'st.starting': 'Starting…', 'st.stopping': 'Stopping…', 'st.online': 'Online', 'st.offline': 'Offline', 'st.error': 'Error', 'st.running': 'Running', 'st.abnormal': 'Error',
     'act.configure': 'Configure', 'act.logs': 'Logs', 'act.restart': 'Restart', 'act.stop': 'Stop', 'act.start': 'Start', 'act.exit': 'Exit',
     'act.copy': 'Copy', 'act.copied': 'Copied', 'act.copyTex': 'TeX', 'act.send': 'Send',
@@ -948,13 +948,20 @@ async function exportMykeyToDir() {
   const res = await window.ga.getMykeyContent();
   const content = (res && res.content) ? String(res.content) : '';
   if (!content.trim()) throw new Error(t('err.mykeyExport'));
+  // WebView2：独立缓存 + 无目录选择/下载；走 Tauri 原生另存为
+  if (window.__TAURI__?.core?.invoke) {
+    const path = await tauriInvoke('export_mykey', { content });
+    if (!path) return;
+    showChanToast(t('sys.mykeyExported'), path, 'ok');
+    return;
+  }
   if (typeof window.showDirectoryPicker === 'function') {
     const dir = await window.showDirectoryPicker();
     const handle = await dir.getFileHandle('mykey.py', { create: true });
     const writable = await handle.createWritable();
     await writable.write(content);
     await writable.close();
-    showChanToast(t('sys.mykeyExported'), 'mykey.py', 'ok');
+    showChanToast(t('sys.mykeyExported'), '', 'ok');
     return;
   }
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
@@ -967,7 +974,7 @@ async function exportMykeyToDir() {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
-  showChanToast(t('sys.mykeyExported'), 'mykey.py', 'ok');
+  showChanToast(t('sys.mykeyExported'), '', 'ok');
 }
 bindClick('export-mykey-btn', async (e) => {
   e.stopPropagation();

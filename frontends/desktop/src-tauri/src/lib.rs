@@ -496,6 +496,21 @@ fn get_config() -> (String, String) {
     get_or_discover_config()
 }
 
+#[tauri::command]
+fn export_mykey(content: String) -> Result<Option<String>, String> {
+    let path = rfd::FileDialog::new()
+        .set_file_name("mykey.py")
+        .add_filter("Python", &["py"])
+        .save_file();
+    match path {
+        Some(p) => {
+            std::fs::write(&p, content.as_bytes()).map_err(|e| e.to_string())?;
+            Ok(Some(p.to_string_lossy().into_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
@@ -537,7 +552,7 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }))
-        .invoke_handler(tauri::generate_handler![start_bridge_with_config, start_bridge, get_config])
+        .invoke_handler(tauri::generate_handler![start_bridge_with_config, start_bridge, get_config, export_mykey])
         .setup(move |app| {
             // Show the loading window immediately so the first-run prepare isn't a blank screen.
             // The window starts on loading.html (a local page), so no "connection refused" flash.

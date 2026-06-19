@@ -16,6 +16,7 @@
     "core:webview:default",
     "allow-start-bridge",
     "allow-start-bridge-with-config",
-    "allow-get-config"
+    "allow-get-config",
+    "allow-export-mykey"
   ]
 }
