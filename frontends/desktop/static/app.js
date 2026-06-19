@@ -331,7 +331,7 @@ const I18N = {
     'customPreset.removeTitle': '删除',
     'customPreset.editTitle': '编辑',
     'builtinPreset.restoreBtn': '恢复默认预设',
-    'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型', 'set.features': '功能', 'set.importMykey': '导入已有 mykey.py', 'set.serviceManager': '后台服务管理',
+    'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型', 'set.features': '功能', 'set.importMykey': '导入已有模型配置（mykey.py）', 'set.exportMykey': '导出当前模型配置', 'set.serviceManager': '后台服务管理',
     'appearance.light': '浅色', 'appearance.dark': '深色',
     'set.noModels': '暂无模型，点击下方添加',
     'lang.zh': '简体中文', 'lang.en': 'English',
@@ -438,12 +438,14 @@ const I18N = {
     'ch.logEmpty': '暂无日志',
     'err.channelLoad': '加载失败', 'err.channelStart': '启动失败', 'err.channelStop': '停止失败',
     'err.mykeyImport': '导入 mykey.py 失败',
+    'err.mykeyExport': '导出 mykey.py 失败',
     'err.channelNotConfigured': '请先在 mykey.py 中配置该平台',
     'sys.channelStarted': '已启动', 'sys.channelStopped': '已停止',
     'modal.channelLogs': '进程日志',
     'modal.mykeyConfig': 'mykey.py 配置',
     'sys.configSaved': '配置已保存',
     'sys.mykeyImported': 'mykey.py 已导入',
+    'sys.mykeyExported': 'mykey.py 已导出',
     'st.starting': '启动中…', 'st.stopping': '停止中…', 'st.online': '在线', 'st.offline': '离线', 'st.error': '错误', 'st.running': '运行', 'st.abnormal': '异常',
     'act.configure': '配置', 'act.logs': '日志', 'act.restart': '重启', 'act.stop': '停止', 'act.start': '启动', 'act.exit': '退出',
     'act.copy': '复制', 'act.copied': '已复制', 'act.copyTex': 'TeX', 'act.send': '发送',
@@ -496,7 +498,7 @@ const I18N = {
     'customPreset.removeTitle': 'Delete',
     'customPreset.editTitle': 'Edit',
     'builtinPreset.restoreBtn': 'Restore defaults',
-    'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model', 'set.features': 'Features', 'set.importMykey': 'Import mykey.py', 'set.serviceManager': 'Service manager',
+    'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model', 'set.features': 'Features', 'set.importMykey': 'Import model config (mykey.py)', 'set.exportMykey': 'Export current model config', 'set.serviceManager': 'Service manager',
     'appearance.light': 'Light', 'appearance.dark': 'Dark',
     'set.noModels': 'No models yet — add one below',
     'lang.zh': '简体中文', 'lang.en': 'English',
@@ -603,12 +605,14 @@ const I18N = {
     'ch.logEmpty': 'No log output yet',
     'err.channelLoad': 'Failed to load', 'err.channelStart': 'Start failed', 'err.channelStop': 'Stop failed',
     'err.mykeyImport': 'Failed to import mykey.py',
+    'err.mykeyExport': 'Failed to export mykey.py',
     'err.channelNotConfigured': 'Configure this platform in mykey.py first',
     'sys.channelStarted': 'Started', 'sys.channelStopped': 'Stopped',
     'modal.channelLogs': 'Process logs',
     'modal.mykeyConfig': 'mykey.py',
     'sys.configSaved': 'Configuration saved',
     'sys.mykeyImported': 'mykey.py imported',
+    'sys.mykeyExported': 'mykey.py exported',
     'st.starting': 'Starting…', 'st.stopping': 'Stopping…', 'st.online': 'Online', 'st.offline': 'Offline', 'st.error': 'Error', 'st.running': 'Running', 'st.abnormal': 'Error',
     'act.configure': 'Configure', 'act.logs': 'Logs', 'act.restart': 'Restart', 'act.stop': 'Stop', 'act.start': 'Start', 'act.exit': 'Exit',
     'act.copy': 'Copy', 'act.copied': 'Copied', 'act.copyTex': 'TeX', 'act.send': 'Send',
@@ -940,6 +944,40 @@ if (importMykeyInput) {
     }
   });
 }
+async function exportMykeyToDir() {
+  const res = await window.ga.getMykeyContent();
+  const content = (res && res.content) ? String(res.content) : '';
+  if (!content.trim()) throw new Error(t('err.mykeyExport'));
+  if (typeof window.showDirectoryPicker === 'function') {
+    const dir = await window.showDirectoryPicker();
+    const handle = await dir.getFileHandle('mykey.py', { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(content);
+    await writable.close();
+    showChanToast(t('sys.mykeyExported'), 'mykey.py', 'ok');
+    return;
+  }
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'mykey.py';
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showChanToast(t('sys.mykeyExported'), 'mykey.py', 'ok');
+}
+bindClick('export-mykey-btn', async (e) => {
+  e.stopPropagation();
+  try {
+    await exportMykeyToDir();
+  } catch (err) {
+    if (err && (err.name === 'AbortError' || err.code === 20)) return;
+    showChanToast(t('err.mykeyExport'), err.message || String(err), 'err');
+  }
+});
 // 侧边栏「快速接入」：点击官方模型按钮 → 打开预填好的添加模型表单
 const pqEl = document.getElementById('provider-quickstart');
 if (pqEl) pqEl.addEventListener('click', (e) => {
