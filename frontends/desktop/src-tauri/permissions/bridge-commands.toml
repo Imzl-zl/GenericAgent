@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-start-bridge"
+description = "Spawn bridge from the services panel when bridge was stopped."
+commands.allow = ["start_bridge"]
+
+[[permission]]
+identifier = "allow-start-bridge-with-config"
+description = "Spawn bridge from setup with explicit python/project paths."
+commands.allow = ["start_bridge_with_config"]
+
+[[permission]]
+identifier = "allow-get-config"
+description = "Read saved bridge spawn configuration."
+commands.allow = ["get_config"]

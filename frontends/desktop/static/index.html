@@ -605,13 +605,21 @@
           <div class="set-sec-t" data-i18n="set.lang"></div>
           <div class="model-list lang-list" id="lang-list"></div>
         </div>
-        <div>
+        <div class="set-block">
           <div class="set-sec-t" data-i18n="set.model"></div>
           <div class="model-list" id="model-list"></div>
           <button class="set-btn" id="add-model-btn" type="button">
             <span data-ga-icon="plus"></span>
             <span data-i18n="set.addModel"></span>
           </button>
+        </div>
+        <div class="set-block">
+          <div class="set-sec-t" data-i18n="set.features"></div>
+          <button class="set-btn" id="import-mykey-btn" type="button">
+            <span data-ga-icon="fileText"></span>
+            <span data-i18n="set.importMykey"></span>
+          </button>
+          <input type="file" id="import-mykey-input" accept=".py,text/plain" hidden>
           <button class="set-btn set-btn-follow" id="settings-services-btn" type="button">
             <span data-ga-icon="broadcast"></span>
             <span data-i18n="set.serviceManager"></span>
@@ -637,6 +645,6 @@
 <!-- highlight.js -->
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" crossorigin="anonymous"></script>
 <script src="phosphor-icons.js?v=2"></script>
-<script src="app.js?v=191"></script>
+<script src="app.js?v=194"></script>
 </body>
 </html>
