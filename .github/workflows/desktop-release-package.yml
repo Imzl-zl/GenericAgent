@@ -283,6 +283,9 @@ jobs:
           chmod +x "$PKG/GenericAgent.AppImage"
           cp desktop_release/scripts/linux/install_linux.sh "$RUNTIME/install_linux.sh"
           chmod +x "$RUNTIME/install_linux.sh"
+          # Uninstaller: top-level entry next to the AppImage.
+          cp desktop_release/scripts/linux/uninstall.sh "$PKG/uninstall.sh"
+          chmod +x "$PKG/uninstall.sh"
 
           # Embedded Python (python-build-standalone, linux x86_64, 3.12 install_only).
           PBS_URL="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest \
@@ -479,6 +482,9 @@ jobs:
 
           cp desktop_release/scripts/macos/install_macos.sh "$RUNTIME/install_macos.sh"
           chmod +x "$RUNTIME/install_macos.sh"
+          # Uninstaller: double-clickable .command next to the .app.
+          cp desktop_release/scripts/macos/uninstall.command "$PKG/uninstall.command"
+          chmod +x "$PKG/uninstall.command"
 
           # Embedded Python (python-build-standalone, macOS, 3.12 install_only; aarch64 preferred).
           PBS_URL="$(python3 - <<'PY'
