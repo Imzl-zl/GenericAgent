@@ -221,33 +221,44 @@ fn ensure_desktop_shortcut() {
 #[cfg(not(windows))]
 fn ensure_desktop_shortcut() {}
 
-/// First-run shortcut handling. Windows portable bundles only. Asks once via a native dialog,
-/// remembers the choice, and self-heals the shortcut path on every enabled launch.
+/// First-run shortcut handling. Windows portable bundles only. Self-heals the shortcut path on
+/// every enabled launch (cheap, no UI). The first-run ASK is driven by the frontend (see the
+/// `shortcut_should_ask` / `shortcut_decide` commands): a native dialog from this background
+/// startup thread has no parent window and gets buried behind the main window on first launch,
+/// so the prompt is owned by the web UI instead, which always renders on top.
 fn maybe_setup_shortcut() {
-    // Only for the self-contained Windows portable bundle; skip dev builds and other platforms.
-    #[cfg(not(windows))]
-    { return; }
-
     #[cfg(windows)]
     {
         if bundle_root().is_none() {
             return;
         }
-        match read_shortcut_pref() {
-            Some(true) => ensure_desktop_shortcut(),
-            Some(false) => {}
-            None => {
-                let create = rfd::MessageDialog::new()
-                    .set_title("GenericAgent")
-                    .set_description("是否在桌面创建 GenericAgent 快捷方式？\nCreate a desktop shortcut for GenericAgent?")
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show();
-                let enabled = matches!(create, rfd::MessageDialogResult::Yes);
-                write_shortcut_pref(enabled);
-                if enabled {
-                    ensure_desktop_shortcut();
-                }
-            }
+        // Only self-heal when the user already opted in. Never prompt here.
+        if read_shortcut_pref() == Some(true) {
+            ensure_desktop_shortcut();
+        }
+    }
+}
+
+/// Frontend asks whether to show the first-run "create desktop shortcut?" prompt.
+/// True only on a Windows portable bundle whose preference has never been set.
+#[tauri::command]
+fn shortcut_should_ask() -> bool {
+    #[cfg(windows)]
+    {
+        return bundle_root().is_some() && read_shortcut_pref().is_none();
+    }
+    #[cfg(not(windows))]
+    { false }
+}
+
+/// Frontend reports the user's choice. Persists it and creates the shortcut when enabled.
+#[tauri::command]
+fn shortcut_decide(create: bool) {
+    write_shortcut_pref(create);
+    #[cfg(windows)]
+    {
+        if create {
+            ensure_desktop_shortcut();
         }
     }
 }
@@ -651,7 +662,7 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }))
-        .invoke_handler(tauri::generate_handler![start_bridge_with_config, start_bridge, get_config, export_mykey])
+        .invoke_handler(tauri::generate_handler![start_bridge_with_config, start_bridge, get_config, export_mykey, shortcut_should_ask, shortcut_decide])
         .setup(move |app| {
             // Show the loading window immediately so the first-run prepare isn't a blank screen.
             // The window starts on loading.html (a local page), so no "connection refused" flash.

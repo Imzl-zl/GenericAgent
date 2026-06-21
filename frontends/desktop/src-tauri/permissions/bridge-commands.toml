@@ -17,3 +17,13 @@ commands.allow = ["get_config"]
 identifier = "allow-export-mykey"
 description = "Save mykey.py via native file dialog."
 commands.allow = ["export_mykey"]
+
+[[permission]]
+identifier = "allow-shortcut-should-ask"
+description = "Check whether to show the first-run desktop-shortcut prompt."
+commands.allow = ["shortcut_should_ask"]
+
+[[permission]]
+identifier = "allow-shortcut-decide"
+description = "Persist the user's desktop-shortcut choice and create it if enabled."
+commands.allow = ["shortcut_decide"]
