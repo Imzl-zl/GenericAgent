@@ -17,6 +17,8 @@
     "allow-start-bridge",
     "allow-start-bridge-with-config",
     "allow-get-config",
-    "allow-export-mykey"
+    "allow-export-mykey",
+    "allow-shortcut-should-ask",
+    "allow-shortcut-decide"
   ]
 }

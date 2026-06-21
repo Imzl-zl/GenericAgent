@@ -73,6 +73,9 @@ jobs:
           # exe at the top level, named GenericAgent (typical portable form)
           cp "$EXE_SRC" "$PKG/GenericAgent.exe"
           cp desktop_release/scripts/windows/install_windows.ps1 "$RUNTIME/install_windows.ps1"
+          # Uninstaller: double-click entry at top level, worker script under runtime/.
+          cp desktop_release/scripts/windows/uninstall.bat "$PKG/uninstall.bat"
+          cp desktop_release/scripts/windows/uninstall_windows.ps1 "$RUNTIME/uninstall_windows.ps1"
 
           # Embedded Python (python-build-standalone, windows x86_64, 3.12 install_only).
           # browser_download_url is URL-encoded ('+' -> '%2B'); match loosely with '.*'.
