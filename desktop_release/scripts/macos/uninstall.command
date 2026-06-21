@@ -41,10 +41,13 @@ curl -fsS -m 3 -X POST "http://127.0.0.1:14168/services/bridge/exit" >/dev/null 
 sleep 1
 
 # Kill any process whose command line lives inside this bundle (no /proc on macOS,
-# so match on the full argv via ps). Scoped to the bundle path → other installs untouched.
+# so match on the full argv via ps; -ww disables column truncation so a deep bundle
+# path is never cut off). Scoped to the bundle path → other installs untouched.
+# Skip our own shell ($$) and its parent (the Terminal-spawned launcher).
 selfpid=$$
-ps -axo pid=,command= 2>/dev/null | while read -r pid cmd; do
+ps -axww -o pid=,command= 2>/dev/null | while read -r pid cmd; do
   [ "$pid" = "$selfpid" ] && continue
+  [ "$pid" = "$PPID" ] && continue
   case "$cmd" in
     *"$BUNDLE"*) kill -9 "$pid" 2>/dev/null && echo "     killed PID $pid" ;;
   esac
