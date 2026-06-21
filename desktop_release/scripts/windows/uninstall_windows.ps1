@@ -62,10 +62,10 @@ foreach ($port in 14168, 8900) {
     }
 }
 
-# Kill any remaining GenericAgent.exe / python.exe whose image is inside this bundle
-# (e.g. the desktop shell itself, or a child python not bound to the two ports).
-foreach ($p in (Get-Process -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -in @('GenericAgent', 'python', 'pythonw') })) {
+# Kill ANY process whose executable image lives inside this bundle, regardless of name
+# (GenericAgent.exe, python.exe, or any child tool it spawned). Limiting to the bundle path
+# means we never touch a second installed copy.
+foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
     if (Path-IsInsideBundle $p.Path) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         Write-Info "killed PID $($p.Id) ($($p.ProcessName))"
@@ -104,11 +104,24 @@ if (Test-Path -LiteralPath $settings) {
 }
 
 # ── 4. Schedule deletion of the bundle folder ────────────────────────────────
-# The folder cannot remove itself while this script runs from inside it. Spawn a
-# detached cmd that waits for our process tree to exit, then deletes the folder.
+# The folder cannot remove itself while this script (and the uninstall.bat that
+# launched it) run from inside it. Spawn a detached cmd that waits for our process
+# tree to fully exit, then retries the delete a few times in case a handle lingers.
 Write-Step "Scheduling removal of the bundle folder"
-$cmd = "cd /d `"$env:TEMP`" & ping 127.0.0.1 -n 3 >nul & rd /s /q `"$bundle`""
-Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmd -WindowStyle Hidden | Out-Null
+$deleter = @"
+cd /d "%TEMP%"
+for /l %%i in (1,1,20) do (
+  rd /s /q "$bundle" 2>nul
+  if not exist "$bundle" goto done
+  ping 127.0.0.1 -n 2 >nul
+)
+:done
+"@
+$deleterPath = Join-Path $env:TEMP ("ga_uninstall_{0}.bat" -f ([guid]::NewGuid().ToString('N')))
+Set-Content -LiteralPath $deleterPath -Value $deleter -Encoding ASCII
+# Start detached so it survives this script + uninstall.bat exiting. The retry loop
+# (20 tries x ~1s) covers the brief window where the parent processes release handles.
+Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "`"$deleterPath`"" -WindowStyle Hidden | Out-Null
 Write-Ok "bundle folder will be deleted after exit: $bundle"
 
 Write-Host ""
