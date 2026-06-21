@@ -418,6 +418,9 @@ fn sanitize_bundle_env(cmd: &mut Command) {
     cmd.env_remove("PYTHONHOME");
     cmd.env_remove("PYTHONPATH");
     cmd.env_remove("LD_LIBRARY_PATH");
+    // Stamp the bridge we spawn with this build's id so a later app launch can tell whether the
+    // bridge holding :14168 is ours (see bridge_identity_matches / GET /services/identity).
+    cmd.env("GA_BUILD_ID", env!("GA_BUILD_ID"));
 }
 
 /// Run the offline prepare (install_windows.ps1 -Mode PrepareOnly) using bundled python + wheels.
@@ -507,9 +510,9 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
     Ok(())
 }
 
-/// GET /services/identity from a running bridge; returns the ga_root it serves (or None
-/// when the endpoint is absent — i.e. an older/foreign bridge).
-fn bridge_reported_ga_root() -> Option<String> {
+/// GET /services/identity from a running bridge; returns the parsed JSON (or None when the
+/// endpoint is absent — i.e. an older/foreign bridge).
+fn bridge_reported_identity() -> Option<serde_json::Value> {
     use std::io::{Read, Write};
     let mut stream = TcpStream::connect_timeout(
         &"127.0.0.1:14168".parse().unwrap(),
@@ -523,8 +526,7 @@ fn bridge_reported_ga_root() -> Option<String> {
     let _ = stream.read_to_end(&mut buf);
     let text = String::from_utf8_lossy(&buf);
     let body = text.split("\r\n\r\n").nth(1)?;
-    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-    v.get("ga_root")?.as_str().map(|s| s.to_string())
+    serde_json::from_str(body.trim()).ok()
 }
 
 fn norm_path(p: &str) -> String {
@@ -533,13 +535,54 @@ fn norm_path(p: &str) -> String {
         .unwrap_or_else(|_| p.to_string())
 }
 
+/// A running bridge is "ours" only when it serves the same install path AND was spawned by the
+/// same build. The build id (commit+timestamp, see build.rs) changes on every build, so an
+/// in-place upgrade or a same-version re-publish still counts as a different bridge → take over.
+/// An old bridge with no /identity (None) or no build_id field ("") never matches → taken over.
 fn bridge_identity_matches(project_dir: &str) -> bool {
-    let Some(reported) = bridge_reported_ga_root() else { return false; };
-    let (a, b) = (norm_path(&reported), norm_path(project_dir));
+    let Some(id) = bridge_reported_identity() else { return false; };
+    let reported_root = id.get("ga_root").and_then(|v| v.as_str()).unwrap_or("");
+    let reported_build = id.get("build_id").and_then(|v| v.as_str()).unwrap_or("");
+    if reported_build != env!("GA_BUILD_ID") {
+        return false;
+    }
+    let (a, b) = (norm_path(reported_root), norm_path(project_dir));
     #[cfg(windows)]
     { a.eq_ignore_ascii_case(&b) }
     #[cfg(not(windows))]
     { a == b }
+}
+
+/// Last resort when a stale bridge ignores POST /services/bridge/exit (e.g. an old build with
+/// no such endpoint): force-kill whatever process is listening on :14168 so the new bridge can
+/// bind it. Only called after an identity mismatch, so we never kill a bridge that is ours.
+fn force_free_bridge_port() {
+    #[cfg(windows)]
+    {
+        // netstat -ano: last column is the PID for the :14168 LISTENING row.
+        if let Ok(out) = Command::new("netstat").args(["-ano", "-p", "tcp"]).output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if line.contains(":14168") && line.to_uppercase().contains("LISTENING") {
+                    if let Some(pid) = line.split_whitespace().last() {
+                        let mut c = Command::new("taskkill");
+                        c.args(["/F", "/PID", pid]);
+                        c.creation_flags(0x08000000);
+                        let _ = c.status();
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // lsof prints the listening PIDs; kill -9 each.
+        if let Ok(out) = Command::new("lsof").args(["-ti", "tcp:14168", "-sTCP:LISTEN"]).output() {
+            for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                let _ = Command::new("kill").args(["-9", pid]).status();
+            }
+        }
+    }
 }
 
 fn request_bridge_shutdown() {
@@ -569,6 +612,16 @@ fn takeover_stale_bridge(project_dir: &str) {
     let start = Instant::now();
     while is_bridge_running() && start.elapsed() < Duration::from_secs(10) {
         thread::sleep(Duration::from_millis(200));
+    }
+    // Old bridges have no /services/bridge/exit endpoint and ignore the request above — if the
+    // port is still held, force-kill the listener so our fresh bridge can bind it.
+    if is_bridge_running() {
+        eprintln!("[tauri] stale bridge did not exit; force-freeing :14168");
+        force_free_bridge_port();
+        let start = Instant::now();
+        while is_bridge_running() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(200));
+        }
     }
 }
 

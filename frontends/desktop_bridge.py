@@ -1688,7 +1688,8 @@ async def start_extras_handler(request):
 
 
 async def identity_handler(request):
-    return json_ok({"ga_root": str(DEFAULT_GA_ROOT), "app_dir": str(APP_DIR), "pid": os.getpid()})
+    return json_ok({"ga_root": str(DEFAULT_GA_ROOT), "app_dir": str(APP_DIR), "pid": os.getpid(),
+                    "build_id": os.environ.get("GA_BUILD_ID", "")})
 
 
 def _exit_bridge() -> None:
