@@ -37,7 +37,7 @@ WS API (state sync):
 from __future__ import annotations
 
 import asyncio, atexit, contextlib, importlib, json, os, re, subprocess, sys
-from collections import deque
+from collections import Counter, deque
 import threading, time, traceback, uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -271,14 +271,27 @@ class AgentManager:
         apikey = str(data.get("apikey") or "").strip() or str((existing or {}).get("apikey") or "").strip()
         if require_key and not apikey:
             raise ValueError("apikey is required")
-        cfg: Dict[str, Any] = {"apikey": apikey, "apibase": apibase, "model": model}
-        if name := str(data.get("name") or "").strip():
-            cfg["name"] = name
+        # 从 existing 起步：保留表单未覆盖的高级字段（proxy / temperature / api_mode /
+        # reasoning_effort / fake_cc_system_prompt / thinking_type …），避免 GUI 编辑时丢失
+        cfg: Dict[str, Any] = dict(existing or {})
+        cfg.update({"apikey": apikey, "apibase": apibase, "model": model})
+        if "name" in data:
+            name = str(data.get("name") or "").strip()
+            if name:
+                cfg["name"] = name
+            else:
+                cfg.pop("name", None)
         for k in ("max_retries", "connect_timeout", "read_timeout"):
             if data.get(k) is not None and str(data.get(k)).strip() != "":
                 cfg[k] = int(data[k])
-            elif existing and k in existing:
-                cfg[k] = existing[k]
+        # 流式开关：默认 True 不写（保持 mykey 干净），仅显式非流式才落 'stream': False
+        if "stream" in data:
+            s = data["stream"]
+            stream = s if isinstance(s, bool) else str(s).strip().lower() not in ("false", "0", "no", "off")
+            if stream:
+                cfg.pop("stream", None)
+            else:
+                cfg["stream"] = False
         return cfg
 
     def _save_mykey_text(self, text: str) -> list:
@@ -322,7 +335,9 @@ class AgentManager:
     def get_model_profile(self, profile_id: int) -> dict:
         var, cfg = self._profile_at(profile_id)
         ks = ("model", "apibase", "apikey", "name", "max_retries", "connect_timeout", "read_timeout")
-        return {"id": profile_id, "varName": var, **{k: cfg.get(k, d) for k, d in zip(ks, ("", "", "", "", 5, 15, 300))}}
+        out = {"id": profile_id, "varName": var, **{k: cfg.get(k, d) for k, d in zip(ks, ("", "", "", "", 5, 15, 300))}}
+        out["stream"] = cfg.get("stream", True)
+        return out
 
     def update_model_profile(self, profile_id: int, data: dict) -> dict:
         var, existing = self._profile_at(profile_id)
@@ -333,8 +348,17 @@ class AgentManager:
     def delete_model_profile(self, profile_id: int) -> dict:
         if len(self._profile_keys()) <= 1:
             raise ValueError("cannot delete the last profile")
-        var, _ = self._profile_at(profile_id)
-        profiles = self._save_mykey_text(self._patch_var_block(self._mykey_file().read_text(encoding="utf-8"), var).rstrip() + "\n")
+        var, cfg = self._profile_at(profile_id)
+        text = self._patch_var_block(self._mykey_file().read_text(encoding="utf-8"), var).rstrip() + "\n"
+        # 顺手把它从聚合渠道里摘掉，避免 llm_nos 残留指向已删除的模型（会让 Mixin 构建失败）
+        name = str(cfg.get("name") or cfg.get("model") or "").strip()
+        keys, mk = self._mykey_vars()
+        mvar, mcfg = self._mixin_entry(keys, mk)
+        if mcfg and mvar is not None and name in [str(m) for m in (mcfg.get("llm_nos") or [])]:
+            mcfg = {**mcfg, "llm_nos": [str(m) for m in (mcfg.get("llm_nos") or []) if str(m) != name]}
+            if self._find_var_block_span(text, mvar):
+                text = self._patch_var_block(text, mvar, mcfg)
+        profiles = self._save_mykey_text(text)
         return {"profileId": profile_id, "profiles": profiles}
 
     def ensure_ga_import_path(self) -> Path:
@@ -361,16 +385,131 @@ class AgentManager:
             with contextlib.suppress(Exception):
                 os.chdir(old_cwd)
 
-    def list_model_profiles(self):
+    @staticmethod
+    def _base_display_name(var: str, cfg: Optional[dict]) -> str:
+        c = cfg or {}
+        return str(c.get("name") or c.get("model") or var)
+
+    def _mykey_vars(self):
+        """(keys, mk)：mykey 里的模型变量名（按定义顺序，与 agentmain.llmclients 索引
+        一一对齐）和原始 dict。过滤规则与 _profile_keys / load_llm_sessions 完全一致，
+        因此 id == llmclients 下标，前端选中 llmNo 能正确激活对应 client。"""
+        self._mykey_file()   # 确保 mykey.py 存在（首次从模板生成空配置），否则全新安装时
+                             # reload_mykeys 找不到 mykey 会返回空，空聚合渠道就不显示了
         self.ensure_ga_import_path()
+        from llmcore import reload_mykeys
+        mk = reload_mykeys()[0]
+        keys = [k for k in mk if any(x in k for x in ("api", "config", "cookie"))]
+        return keys, mk
+
+    def _mixin_entry(self, keys, mk):
+        """返回 (mixin_var, mixin_cfg_dict) 或 (None, None)。单一主聚合渠道，只取第一个。"""
+        for k in keys:
+            if "mixin" in k and isinstance(mk.get(k), dict):
+                return k, dict(mk[k])
+        return None, None
+
+    def list_model_profiles(self):
+        """直接读 mykey.py 结构（不依赖能否成功构建出 client），这样空聚合渠道、
+        未填 key 的模型也能如实展示。聚合渠道(kind=mixin)带 members；基本模型
+        (kind=native)带 inMixin/group。"""
         try:
-            agentmain = importlib.import_module("agentmain")
-            agent = agentmain.GenericAgent()
-            if hasattr(agent, "list_llms"):
-                return [{"id": i, "name": name, "active": active} for i, name, active in agent.list_llms()]
+            keys, mk = self._mykey_vars()
         except Exception as e:
             print(f"get model profiles failed: {e}", file=sys.stderr)
-        return []
+            return []
+        _, mcfg = self._mixin_entry(keys, mk)
+        members = [str(m) for m in (mcfg.get("llm_nos") or [])] if mcfg else []
+        active = self.config.get("llmNo", 0)
+        out = []
+        for i, k in enumerate(keys):
+            cfg = mk.get(k) if isinstance(mk.get(k), dict) else {}
+            if "mixin" in k:
+                out.append({"id": i, "varName": k, "kind": "mixin", "name": "",
+                            "members": members, "active": i == active})
+            else:
+                name = self._base_display_name(k, cfg)
+                out.append({"id": i, "varName": k, "kind": "native", "name": name,
+                            "model": cfg.get("model", ""),
+                            "group": "native" if "native" in k else "std",
+                            "inMixin": name in members, "active": i == active})
+        return out
+
+    def add_to_mixin(self, profile_id: int) -> dict:
+        """把一个基本模型加入主聚合渠道：把它的 name 追加进 mixin_config['llm_nos']。
+        坑1：校验 Native 一致性（聚合内必须全 Native 或全非 Native）。
+        坑2：加入前若该模型没有显式 name，先把 name 写进它的配置块（保证引用稳定）。"""
+        var, cfg = self._profile_at(profile_id)   # 对 mixin 会抛错（只接受 native）
+        name = str(cfg.get("name") or cfg.get("model") or "").strip()
+        if not name:
+            raise ValueError("this model needs a name or model before joining the channel")
+        keys, mk = self._mykey_vars()
+        mvar, mcfg = self._mixin_entry(keys, mk)
+        new_is_native = "native" in var
+        name2var = {self._base_display_name(k, mk.get(k) if isinstance(mk.get(k), dict) else {}): k
+                    for k in keys if "mixin" not in k}
+        existing = [str(m) for m in (mcfg.get("llm_nos") or [])] if mcfg else []
+        for m in existing:
+            mv = name2var.get(m)
+            if mv is not None and ("native" in mv) != new_is_native:
+                raise ValueError("aggregation channel requires all-Native or all-non-Native models")
+        text = self._mykey_file().read_text(encoding="utf-8")
+        if not cfg.get("name"):
+            text = self._patch_var_block(text, var, {**cfg, "name": name})
+        if mcfg is None:
+            mcfg, mvar, existing = {"llm_nos": [], "max_retries": 10, "base_delay": 0.5}, "mixin_config", []
+        if name not in existing:
+            existing.append(name)
+        mcfg = {**mcfg, "llm_nos": existing}
+        if self._find_var_block_span(text, mvar):
+            text = self._patch_var_block(text, mvar, mcfg)
+        else:
+            text = text.rstrip() + f"\n{mvar} = {self._format_py_dict(mcfg)}\n"
+        return {"profiles": self._save_mykey_text(text)}
+
+    def remove_from_mixin(self, profile_id: int) -> dict:
+        """把一个基本模型移出主聚合渠道。"""
+        var, cfg = self._profile_at(profile_id)
+        name = str(cfg.get("name") or cfg.get("model") or "").strip()
+        keys, mk = self._mykey_vars()
+        mvar, mcfg = self._mixin_entry(keys, mk)
+        if not mcfg or mvar is None:
+            return {"profiles": self.list_model_profiles()}
+        members = [str(m) for m in (mcfg.get("llm_nos") or []) if str(m) != name]
+        mcfg = {**mcfg, "llm_nos": members}
+        text = self._patch_var_block(self._mykey_file().read_text(encoding="utf-8"), mvar, mcfg)
+        return {"profiles": self._save_mykey_text(text)}
+
+    def reorder_mixin(self, members: list) -> dict:
+        """按前端拖拽后的顺序重写主渠道组 llm_nos。只接受当前成员的重排，不增删。"""
+        keys, mk = self._mykey_vars()
+        mvar, mcfg = self._mixin_entry(keys, mk)
+        if not mcfg or mvar is None:
+            raise ValueError("mixin channel not found")
+        old = [str(m) for m in (mcfg.get("llm_nos") or [])]
+        new = [str(m) for m in (members or [])]
+        if len(new) != len(old) or Counter(new) != Counter(old):
+            raise ValueError("reorder must contain the same channel members")
+        if new == old:
+            return {"profiles": self.list_model_profiles()}
+        mcfg = {**mcfg, "llm_nos": new}
+        text = self._patch_var_block(self._mykey_file().read_text(encoding="utf-8"), mvar, mcfg)
+        return {"profiles": self._save_mykey_text(text)}
+
+    @staticmethod
+    def _live_model(sess: Session) -> Optional[dict]:
+        """该会话 agent 当前真正在用的模型（渠道组会随故障转移变化）。
+        agent 还没建（没跑过 turn）时返回 None，前端回退到静态显示。"""
+        ag = getattr(sess, "agent", None)
+        if ag is None:
+            return None
+        try:
+            back = ag.llmclient.backend
+            if "Mixin" in type(back).__name__:
+                return {"current": back.current_name, "isMixin": True}
+            return {"current": back.name, "isMixin": False}
+        except Exception:
+            return None
 
     def snapshot(self, sess: Session, include_messages: bool = True) -> dict:
         out = {
@@ -385,6 +524,7 @@ class AgentManager:
             "msgSeq": sess.msg_seq,
             "pinned": sess.pinned,
             "untitled": sess.untitled,
+            "model": self._live_model(sess),
         }
         if include_messages:
             out["messages"] = list(sess.messages)
@@ -590,6 +730,7 @@ class AgentManager:
                 "msgSeq": sess.msg_seq,
                 "updatedAt": sess.updated_at,
                 "lastError": sess.last_error,
+                "model": self._live_model(sess),
             }
 
     def plan_snapshot(self, sid: str) -> dict:
@@ -1035,7 +1176,7 @@ async def ws_handler(request):
 def cors_headers():
     return {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+        "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
     }
 
@@ -1135,6 +1276,32 @@ async def model_profiles_handler(request):
         if request.method == "POST":
             return json_ok({"ok": True, **manager.add_model_profile(await read_json(request))})
         return json_ok({"profiles": manager.list_model_profiles()})
+    except ValueError as e:
+        return json_ok({"ok": False, "error": str(e)}, status=400)
+    except Exception as e:
+        return json_ok({"ok": False, "error": str(e)}, status=500)
+
+
+async def mixin_handler(request):
+    """聚合渠道成员管理：POST 加入 / DELETE 移出 主聚合渠道。"""
+    try:
+        profile_id = int(request.match_info.get("id"))
+        if request.method == "POST":
+            return json_ok({"ok": True, **manager.add_to_mixin(profile_id)})
+        if request.method == "DELETE":
+            return json_ok({"ok": True, **manager.remove_from_mixin(profile_id)})
+        return json_ok({"ok": False, "error": "method not allowed"}, status=405)
+    except ValueError as e:
+        return json_ok({"ok": False, "error": str(e)}, status=400)
+    except Exception as e:
+        return json_ok({"ok": False, "error": str(e)}, status=500)
+
+
+async def mixin_order_handler(request):
+    """渠道组成员拖拽排序：PUT {members:[name,...]}。"""
+    try:
+        data = await read_json(request)
+        return json_ok({"ok": True, **manager.reorder_mixin(data.get("members") or [])})
     except ValueError as e:
         return json_ok({"ok": False, "error": str(e)}, status=400)
     except Exception as e:
@@ -1592,6 +1759,9 @@ def create_app():
     app.router.add_post("/config", save_config_handler)
     app.router.add_get("/model-profiles", model_profiles_handler)
     app.router.add_post("/model-profiles", model_profiles_handler)
+    app.router.add_put("/model-profiles/mixin/order", mixin_order_handler)
+    app.router.add_post("/model-profiles/{id}/mixin", mixin_handler)
+    app.router.add_delete("/model-profiles/{id}/mixin", mixin_handler)
     app.router.add_get("/model-profiles/{id}", model_profiles_handler)
     app.router.add_put("/model-profiles/{id}", model_profiles_handler)
     app.router.add_delete("/model-profiles/{id}", model_profiles_handler)

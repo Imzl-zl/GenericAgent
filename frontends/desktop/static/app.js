@@ -340,6 +340,7 @@ const I18N = {
     'model.apikey': 'API Key', 'model.apikeyPh': 'sk-...', 'model.apikeyKeep': '留空则保持原 Key 不变',
     'model.apibase': 'API 地址', 'model.apibasePh': 'https://.../v1/messages',
     'model.protocol': '协议', 'model.protocolPick': '请选择…', 'model.protocolOai': 'OpenAI 兼容 (chat/completions)', 'model.protocolClaude': 'Anthropic (Claude /v1/messages)',
+    'model.stream': '响应方式', 'model.streamOn': '流式', 'model.streamOff': '非流式',
     'model.model': '模型', 'model.modelPh': 'model 参数名',
     'model.modelHint': '须与中转站/官方文档中的 model 字段完全一致',
     'model.retries': '重试 (次)', 'model.connTimeout': '连接超时 (s)', 'model.readTimeout': '读取超时 (s)',
@@ -354,6 +355,10 @@ const I18N = {
     'err.modelSave': '保存失败', 'err.modelRequired': '请填写模型、API Key 和 API 地址',
     'err.modelDelete': '删除失败', 'err.modelDeleteLast': '至少保留一个模型',
     'confirm.modelDelete': '确定删除该模型配置？',
+    'model.aggregation': '渠道组（自动故障转移）', 'model.aggregationShort': '渠道组', 'model.aggregationDesc': '按顺序尝试，失败自动切换到下一个',
+    'model.emptyMixin': '尚未加入模型',
+    'model.addToMixin': '加入渠道组', 'model.inMixin': '已在渠道组', 'model.removeFromMixin': '移出渠道组', 'model.alreadyInMixin': '已在渠道组中', 'model.dragReorder': '拖拽调整顺序',
+    'err.mixinFailed': '操作失败',
     'page.services.title': '后台服务', 'page.services.sub': 'IM 消息通道与后台进程，集中查看、启停与日志',
     'page.channels.title': '消息通道', 'page.channels.sub': '后台 IM 进程：列表、启停与日志（同 hub.pyw）',
     'page.status.title': '状态面板', 'page.status.sub': 'hub.pyw 管理的后台进程/服务，集中查看与启停',
@@ -507,6 +512,7 @@ const I18N = {
     'model.apikey': 'API Key', 'model.apikeyPh': 'sk-...', 'model.apikeyKeep': 'Leave blank to keep the current key',
     'model.apibase': 'API base URL', 'model.apibasePh': 'https://.../v1/messages',
     'model.protocol': 'Protocol', 'model.protocolPick': 'Select…', 'model.protocolOai': 'OpenAI-compatible (chat/completions)', 'model.protocolClaude': 'Anthropic (Claude /v1/messages)',
+    'model.stream': 'Response', 'model.streamOn': 'Stream', 'model.streamOff': 'Non-stream',
     'model.model': 'Model', 'model.modelPh': 'model parameter name',
     'model.modelHint': 'Must match the model field in your provider docs exactly',
     'model.retries': 'Retries (×)', 'model.connTimeout': 'Connect (s)', 'model.readTimeout': 'Read (s)',
@@ -521,6 +527,10 @@ const I18N = {
     'err.modelSave': 'Save failed', 'err.modelRequired': 'Model, API Key and base URL are required',
     'err.modelDelete': 'Delete failed', 'err.modelDeleteLast': 'At least one model is required',
     'confirm.modelDelete': 'Delete this model profile?',
+    'model.aggregation': 'Channel group (auto failover)', 'model.aggregationShort': 'Channel group', 'model.aggregationDesc': 'Tries in order, switches to the next on failure',
+    'model.emptyMixin': 'No models added yet',
+    'model.addToMixin': 'Add to channel', 'model.inMixin': 'In channel', 'model.removeFromMixin': 'Remove from channel', 'model.alreadyInMixin': 'Already in the channel', 'model.dragReorder': 'Drag to reorder',
+    'err.mixinFailed': 'Operation failed',
     'page.services.title': 'Services', 'page.services.sub': 'IM channels and background processes — view, start/stop, logs',
     'page.channels.title': 'Channels', 'page.channels.sub': 'Background IM processes: list, start/stop, logs (hub.pyw style)',
     'page.status.title': 'Status', 'page.status.sub': 'Background processes/services managed by hub.pyw',
@@ -731,6 +741,11 @@ function applyI18n() {
   });
   document.querySelectorAll('[data-i18n-title]').forEach(el => { el.setAttribute('title', t(el.dataset.i18nTitle)); });
   renderLangList();
+  // 语言切换后重算激活模型 chip 文案；若当前会话已有渠道组运行态模型，保留运行态而非退回首选项
+  const _ap = (state.modelProfiles || []).find(p => (p.id ?? 0) === state.llmNo);
+  if (_ap) state.modelName = modelDisplayName(_ap);
+  if (_ap?.kind === 'mixin' && state.liveModel?.sessionId === state.activeId) applyLiveModel(state.liveModel);
+  else if (typeof updateModelChip === 'function') updateModelChip();
   window.gaRefreshModelGuide?.();
   window.collabRetranslate?.();
   syncAskUserUi();
@@ -3040,8 +3055,20 @@ function applyPollResult(sess, result) {
   for (const msg of (result.messages || [])) upsert(sess, msg, false);
   const busy = result.status === 'running' || !!result.partial;
   setBusy(sess, busy);
-  if (isActive(sess)) applyPlanPayload(sess, result.plan);
+  if (isActive(sess)) {
+    applyPlanPayload(sess, result.plan);
+    applyLiveModel(result.model, sess);
+  }
   return busy;
+}
+
+/** 渠道组随故障转移变化时，用运行态当前子模型刷新 chip（非渠道组/无 agent 时不动，保持静态显示） */
+function applyLiveModel(live, sess = activeSess()) {
+  const selected = (state.modelProfiles || []).find(p => (p.id ?? 0) === state.llmNo);
+  if (!selected || selected.kind !== 'mixin' || !live || !live.isMixin || !live.current) return;
+  state.liveModel = { ...live, sessionId: sess?.id || state.activeId };
+  const label = `${t('model.aggregationShort')}${lang === 'en' ? ' (' : '（'}${profileLabel(live.current) || live.current}${lang === 'en' ? ')' : '）'}`;
+  if (state.modelName !== label) { state.modelName = label; updateModelChip(); }
 }
 
 /** hydrate 批量灌历史，避免逐条 appendMessage 触发全量重绘 */
@@ -3334,6 +3361,15 @@ function showError(text) {
   if (sess) { const m = { role: 'error', content: text }; sess.messages.push(m); appendMessage(sess, m); }
   else console.error(text);
 }
+let _toastTimer = null;
+function showToast(text) {
+  let el = document.getElementById('ga-toast');
+  if (!el) { el = document.createElement('div'); el.id = 'ga-toast'; el.className = 'ga-toast'; document.body.appendChild(el); }
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+}
 async function handleSlash(cmd) {
   const name = cmd.slice(1).split(/\s+/)[0];
   switch (name) {
@@ -3389,12 +3425,115 @@ function updateModelChip() {
   if (modelNameEl) modelNameEl.textContent = name;
   if (collabModelNameEl) collabModelNameEl.textContent = name;
 }
+function modelDisplayName(p, fallbackName) {
+  if (p && p.kind === 'mixin') {
+    // 静态回退显示「渠道组（首选模型名）」；运行后由 applyLiveModel 切到真实当前子模型。
+    const primary = (p.members || [])[0];
+    if (!primary) return t('model.aggregation');
+    const open = lang === 'en' ? ' (' : '（', close = lang === 'en' ? ')' : '）';
+    return `${t('model.aggregationShort')}${open}${profileLabel(primary) || primary}${close}`;
+  }
+  return profileLabel(fallbackName ?? (p && p.name)) || (fallbackName ?? (p && p.name)) || null;
+}
 async function selectModel(id, name) {
   state.llmNo = id;
-  state.modelName = profileLabel(name) || name || null;
+  state.liveModel = null;
+  const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === id);
+  state.modelName = modelDisplayName(p, name);
   updateModelChip();
   renderSettingsModels();
   await persistUiPrefs();
+}
+async function addToMixin(id) {
+  try {
+    const res = await bridgeFetch(`/model-profiles/${id}/mixin`, { method: 'POST', body: {} });
+    if (res?.ok === false || res?.error) throw new Error(res.error || t('err.mixinFailed'));
+    state.modelProfiles = normalizeProfiles(res.profiles || []);
+    renderSettingsModels();
+  } catch (ex) { alert(ex.message || t('err.mixinFailed')); }
+}
+async function removeFromMixin(id) {
+  try {
+    const res = await bridgeFetch(`/model-profiles/${id}/mixin`, { method: 'DELETE', body: {} });
+    if (res?.ok === false || res?.error) throw new Error(res.error || t('err.mixinFailed'));
+    state.modelProfiles = normalizeProfiles(res.profiles || []);
+    renderSettingsModels();
+  } catch (ex) { alert(ex.message || t('err.mixinFailed')); }
+}
+async function reorderMixin(members) {
+  try {
+    const res = await bridgeFetch('/model-profiles/mixin/order', { method: 'PUT', body: { members } });
+    if (res?.ok === false || res?.error) throw new Error(res.error || t('err.mixinFailed'));
+    state.modelProfiles = normalizeProfiles(res.profiles || []);
+    renderSettingsModels();
+    const active = state.modelProfiles.find(p => (p.id ?? 0) === state.llmNo);
+    if (active) { state.modelName = modelDisplayName(active); updateModelChip(); }
+  } catch (ex) { alert(ex.message || t('err.mixinFailed')); renderSettingsModels(); }
+}
+function flipReorder(container, mutate) {
+  const rows = [...container.querySelectorAll('.model-member:not(.dragging)')];
+  const first = new Map(rows.map(el => [el, el.getBoundingClientRect()]));
+  mutate();
+  rows.forEach(el => {
+    const a = first.get(el), b = el.getBoundingClientRect();
+    if (!a) return;
+    const dx = a.left - b.left, dy = a.top - b.top;
+    if (!dx && !dy) return;
+    el.style.transition = 'none';
+    el.style.transform = `translate(${dx}px, ${dy}px)`;
+    requestAnimationFrame(() => {
+      el.style.transition = 'transform .14s cubic-bezier(.2,.8,.2,1)';
+      el.style.transform = '';
+    });
+  });
+}
+function bindMixinDrag(body, members) {
+  let drag = null;
+  const clear = () => {
+    body.querySelectorAll('.model-member').forEach(x => x.classList.remove('dragging', 'drag-over'));
+    document.body.classList.remove('mixin-dragging');
+  };
+  body.addEventListener('pointerdown', (e) => {
+    const handle = e.target.closest('.model-member-drag');
+    if (!handle || e.button !== 0) return;
+    const row = handle.closest('.model-member');
+    if (!row) return;
+    e.preventDefault();
+    handle.setPointerCapture?.(e.pointerId);
+    drag = { handle, row, name: row.dataset.member, order: [...members], original: [...members], pointerId: e.pointerId, over: null };
+    row.classList.add('dragging');
+    document.body.classList.add('mixin-dragging');
+  });
+  body.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const over = document.elementFromPoint(e.clientX, e.clientY)?.closest('.model-member');
+    if (!over || !body.contains(over) || over === drag.row) return;
+    const rect = over.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    const overKey = `${over.dataset.member}:${after ? 'after' : 'before'}`;
+    if (overKey === drag.over) return;
+    drag.over = overKey;
+    const from = drag.order.indexOf(drag.name), overIdx = drag.order.indexOf(over.dataset.member);
+    if (from < 0 || overIdx < 0) return;
+    const [moved] = drag.order.splice(from, 1);
+    let insertAt = drag.order.indexOf(over.dataset.member) + (after ? 1 : 0);
+    drag.order.splice(insertAt, 0, moved);
+    flipReorder(body, () => {
+      if (after) body.insertBefore(drag.row, over.nextSibling);
+      else body.insertBefore(drag.row, over);
+    });
+  });
+  const finish = (e) => {
+    if (!drag) return;
+    drag.handle.releasePointerCapture?.(drag.pointerId);
+    const changed = JSON.stringify(drag.order) !== JSON.stringify(drag.original);
+    const next = drag.order;
+    drag = null;
+    clear();
+    if (changed) reorderMixin(next);
+  };
+  body.addEventListener('pointerup', finish);
+  body.addEventListener('pointercancel', finish);
 }
 const MODEL_ACT_EDIT = GA_ICON('pencilSimple');
 const MODEL_ACT_DEL = GA_ICON('trash');
@@ -3515,6 +3654,10 @@ async function openEditModelForm(id) {
       const pv = /claude/i.test(p.varName || '') ? 'claude' : 'oai';
       const pr = form.querySelector(`input[name="protocol"][value="${pv}"]`);
       if (pr) pr.checked = true;
+      // 回填流式开关(默认流式)
+      const sv = (p.stream === false) ? 'false' : 'true';
+      const sr = form.querySelector(`input[name="stream"][value="${sv}"]`);
+      if (sr) sr.checked = true;
     }
     setModelApikeyMode(false);
     openModal('add-model-modal');
@@ -3551,26 +3694,79 @@ function renderSettingsModels() {
   if (!box) return;
   box.innerHTML = '';
   const list = state.modelProfiles || [];
-  if (!list.length) {
+  const mixin = list.find(p => p.kind === 'mixin');
+  const natives = list.filter(p => p.kind !== 'mixin');
+  const byName = new Map(natives.map(p => [p.name, p]));
+
+  // ── 渠道组（自动故障转移）：可展开组；本身也可被选为激活模型 ──
+  if (mixin) {
+    const gid = mixin.id ?? 0;
+    const members = mixin.members || [];
+    const expanded = state.mixinExpanded !== false; // 默认展开
+    const group = document.createElement('div');
+    group.className = 'model-group';
+    const head = document.createElement('label');
+    head.className = 'model-row model-row--mixin' + (state.llmNo === gid ? ' sel' : '');
+    head.innerHTML = `<input type="radio" name="model-pick"${state.llmNo === gid ? ' checked' : ''}><span class="model-mixin-caret" data-act="toggle">${GA_ICON(expanded ? 'caretDown' : 'caretRight')}</span><span class="model-row-name">${escapeHtml(t('model.aggregation'))}</span>`;
+    head.querySelector('[data-act="toggle"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); state.mixinExpanded = !expanded; renderSettingsModels(); });
+    head.addEventListener('click', (e) => { if (e.target.closest('[data-act="toggle"]')) return; e.preventDefault(); selectModel(gid, mixin.name); });
+    group.appendChild(head);
+    if (expanded) {
+      const body = document.createElement('div');
+      body.className = 'model-mixin-body';
+      if (!members.length) {
+        const em = document.createElement('div');
+        em.className = 'model-mixin-empty'; em.textContent = t('model.emptyMixin');
+        body.appendChild(em);
+      } else {
+        members.forEach((mName, i) => {
+          const mp = byName.get(mName);
+          const row = document.createElement('div');
+          row.className = 'model-member';
+          row.dataset.member = mName;
+          row.innerHTML = `<button type="button" class="model-member-drag" data-act="drag" title="${escapeHtml(t('model.dragReorder'))}" aria-label="${escapeHtml(t('model.dragReorder'))}"><span class="grip-dot"></span></button><span class="model-member-name">${escapeHtml(profileLabel(mName) || mName)}</span><button type="button" class="model-act model-act-del" data-act="unmix" title="${escapeHtml(t('model.removeFromMixin'))}">${GA_ICON('x')}</button>`;
+          row.querySelector('[data-act="unmix"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); if (mp) removeFromMixin(mp.id ?? 0); });
+          body.appendChild(row);
+        });
+        bindMixinDrag(body, members);
+      }
+      group.appendChild(body);
+    }
+    box.appendChild(group);
+  }
+
+  // ── 独立模型（聚合渠道组已自带分隔，这里不再单列标题）──
+  if (!natives.length) {
     const empty = document.createElement('div');
     empty.className = 'set-empty'; empty.textContent = t('set.noModels');
-    box.appendChild(empty); return;
+    box.appendChild(empty);
+  } else {
+    for (const p of natives) {
+      const id = p.id ?? 0;
+      const label = profileLabel(p.name) || p.name || ('#' + id);
+      const row = document.createElement('label');
+      row.className = 'model-row' + (state.llmNo === id ? ' sel' : '');
+      // 独立列表按钮统一为「加入渠道组」（➕）；移除只在渠道组展开区做。
+      // 已在渠道组的，按钮仍是「加入」，但点击只提示「已在渠道组中」，并用 is-in 给个淡淡的视觉区分。
+      const mixToggle = !mixin ? '' : `<button type="button" class="model-act model-act-addmix${p.inMixin ? ' is-in' : ''}" data-act="addmix" title="${escapeHtml(p.inMixin ? t('model.alreadyInMixin') : t('model.addToMixin'))}">${GA_ICON('plus')}</button>`;
+      row.innerHTML = `<input type="radio" name="model-pick"${state.llmNo === id ? ' checked' : ''}><span class="model-row-name">${escapeHtml(label)}</span><span class="model-row-actions">${mixToggle}<button type="button" class="model-act" data-act="edit" title="${escapeHtml(t('common.edit'))}">${MODEL_ACT_EDIT}</button><button type="button" class="model-act model-act-del" data-act="delete" title="${escapeHtml(t('common.delete'))}">${MODEL_ACT_DEL}</button></span>`;
+      row.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); openEditModelForm(id); });
+      row.querySelector('[data-act="delete"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); deleteModel(id, p.name); });
+      const addBtn = row.querySelector('[data-act="addmix"]');
+      if (addBtn) addBtn.addEventListener('click', (e) => {
+        e.stopPropagation(); e.preventDefault();
+        if (p.inMixin) showToast(t('model.alreadyInMixin'));
+        else addToMixin(id);
+      });
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.model-row-actions')) return;
+        e.preventDefault();
+        selectModel(id, p.name);
+      });
+      box.appendChild(row);
+    }
   }
-  for (const p of list) {
-    const id = p.id ?? 0;
-    const label = profileLabel(p.name) || p.name || ('#' + id);
-    const row = document.createElement('label');
-    row.className = 'model-row' + (state.llmNo === id ? ' sel' : '');
-    row.innerHTML = `<input type="radio" name="model-pick"${state.llmNo === id ? ' checked' : ''}><span class="model-row-name">${escapeHtml(label)}</span><span class="model-row-actions"><button type="button" class="model-act" data-act="edit" title="${escapeHtml(t('common.edit'))}">${MODEL_ACT_EDIT}</button><button type="button" class="model-act model-act-del" data-act="delete" title="${escapeHtml(t('common.delete'))}">${MODEL_ACT_DEL}</button></span>`;
-    row.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); openEditModelForm(id); });
-    row.querySelector('[data-act="delete"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); deleteModel(id, p.name); });
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('.model-row-actions')) return;
-      e.preventDefault();
-      selectModel(id, p.name);
-    });
-    box.appendChild(row);
-  }
+  applyI18n();
 }
 function openSettings() {
   openModal('settings-modal');
@@ -3588,7 +3784,7 @@ async function loadModelProfiles() {
     const active = state.modelProfiles.find(p => p.active) || state.modelProfiles[0];
     if (active) {
       state.llmNo = active.id ?? 0;
-      state.modelName = profileLabel(active.name) || active.name || null;
+      state.modelName = modelDisplayName(active);
     }
     updateModelChip();
     renderSettingsModels();
@@ -3603,7 +3799,8 @@ function renderModelMenu(menuEl) {
   const rows = list.map((p, i) => {
     const no = (p.id ?? i);
     const isActive = (state.llmNo === no) ? ' active' : '';
-    return `<div class="ga-menu-item${isActive}" data-llmno="${no}">${escapeHtml(p.name || '')}</div>`;
+    const label = (isActive && p.kind === 'mixin' && state.modelName) ? state.modelName : modelDisplayName(p);
+    return `<div class="ga-menu-item${isActive}" data-llmno="${no}">${escapeHtml(label || '')}</div>`;
   });
   menuEl.innerHTML = rows.join('');
   applyI18n();
@@ -3699,7 +3896,7 @@ async function loadBridgeConfig() {
       const p = state.modelProfiles.find(x => (x.id ?? 0) === cfg.llmNo);
       if (p) {
         state.llmNo = cfg.llmNo;
-        state.modelName = profileLabel(p.name) || p.name || null;
+        state.modelName = modelDisplayName(p);
         updateModelChip();
         renderSettingsModels();
       }

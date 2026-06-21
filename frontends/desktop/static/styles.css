@@ -16,7 +16,7 @@
 :root{
   --font-sans:-apple-system,BlinkMacSystemFont,system-ui,"Segoe UI Variable","Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei UI","Microsoft YaHei",sans-serif,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",emoji;
   --font-brand:"GA Azonix",var(--font-sans);
-  --font-mono:"GA JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+  --font-mono:"GA JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Monaco,Consolas,"Liberation Mono","Courier New","PingFang SC","Hiragino Sans GB","Microsoft YaHei UI","Microsoft YaHei",monospace;
   --font-num:var(--font-mono);
   --font-num-variant:lining-nums tabular-nums;
   --chat-col-w:760px;
@@ -326,14 +326,15 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 .chat-font-scale-max{ grid-column:11; justify-self:end; }
 
 /* 颜色色盘已删除(只保留灰色亮色主题) */
-.model-list{ display:flex; flex-direction:column; gap:4px; margin-bottom:10px; max-height:160px; overflow:auto; }
+.model-list{ display:flex; flex-direction:column; gap:4px; margin-bottom:10px; max-height:340px; overflow:auto; }
 .model-row{
   display:flex; align-items:center; gap:10px; padding:8px 10px;
   border:1px solid var(--line); border-radius:4px; background:var(--field-bg);
   cursor:pointer; font-size:13px; color:var(--txt-2); transition:.12s;
 }
 .model-row:hover{ background:var(--line-soft); border-color:var(--line-strong); }
-.model-row.sel{ background:var(--accent-bg); border-color:var(--accent); color:var(--accent); font-weight:500; }
+/* 选中态：文字用强调色 --txt-strong（而非偏灰的 --accent），保证选中后只会更清晰、不会变淡 */
+.model-row.sel{ background:var(--accent-bg); border-color:var(--accent); color:var(--txt-strong); }
 .model-row input{ accent-color:var(--accent); flex:0 0 auto; pointer-events:none; }
 .flag{ width:20px; height:14px; flex:0 0 auto; border-radius:2px; box-shadow:0 0 0 1px var(--line); display:inline-block; }
 .model-row-name{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -351,6 +352,46 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 .model-act-del:hover{ color:var(--danger-text); }
 .model-act svg{ width:14px; height:14px; pointer-events:none; }
 .set-empty{ font-size:12px; color:var(--muted); padding:6px 0; }
+/* 聚合渠道分组：与独立模型同款行样式，仅多一个折叠箭头，且紧贴下方独立模型 */
+.model-group{ display:flex; flex-direction:column; gap:4px; }
+.model-mixin-caret{ display:flex; align-items:center; justify-content:center; flex:0 0 auto; height:28px; color:var(--muted); cursor:pointer; }
+/* 渠道组是中文标签而非代码标识符，用界面 sans 字体，避免落到等宽字体的中文回退 */
+.model-row--mixin .model-row-name{ font-family:var(--font-sans); }
+.model-mixin-caret svg{ width:13px; height:13px; pointer-events:none; }
+.model-mixin-body{ display:flex; flex-direction:column; gap:3px; margin:2px 0 2px 14px; padding-left:10px; border-left:1px dashed var(--line-strong); }
+.model-mixin-empty{ font-size:12px; color:var(--muted); padding:4px 2px; }
+.model-member{ display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:4px; font-size:12px; color:var(--txt-2); background:var(--field-bg); border:1px solid var(--line); }
+.model-member:hover{ background:var(--line-soft); }
+.model-member.dragging{ opacity:.78; box-shadow:0 3px 12px rgba(0,0,0,.12); }
+.model-member-drag{
+  width:16px; height:20px; flex:0 0 auto; border:none; background:transparent; color:var(--muted);
+  border-radius:4px; display:flex; align-items:center; justify-content:center; padding:0;
+  cursor:grab; touch-action:none; user-select:none;
+}
+.model-member-drag:active{ cursor:grabbing; }
+.grip-dot{
+  width:2px; height:2px; border-radius:50%; background:currentColor;
+  box-shadow:0 -4px 0 currentColor, 0 4px 0 currentColor, 5px -4px 0 currentColor, 5px 0 0 currentColor, 5px 4px 0 currentColor;
+  transform:translateX(-2.5px); opacity:.68;
+}
+.model-member:hover .model-member-drag{ color:var(--txt-2); background:var(--hover-dim); }
+.mixin-dragging{ cursor:grabbing; }
+.model-member-name{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.model-member .model-act{ width:22px; height:22px; opacity:.6; }
+.model-member:hover .model-act{ opacity:1; }
+.model-act-addmix:hover{ color:var(--accent); }
+/* 已在渠道组：➕ 仍是「加入」按钮，但给个淡淡的 accent 提示，点击只弹「已在渠道组中」 */
+.model-act-addmix.is-in{ color:var(--accent); opacity:.5; }
+.model-act-addmix.is-in:hover{ opacity:.8; }
+/* 轻提示 toast（屏幕顶部）*/
+.ga-toast{
+  position:fixed; left:50%; top:72px; transform:translateX(-50%) translateY(-8px);
+  background:var(--card); color:var(--txt); border:1px solid var(--line-strong);
+  border-radius:6px; padding:10px 18px; font-size:13px; font-family:var(--font-sans);
+  box-shadow:0 8px 28px rgba(0,0,0,.24); opacity:0; pointer-events:none;
+  transition:opacity .18s, transform .18s; z-index:9999;
+}
+.ga-toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
 .set-btn{
   width:100%; display:flex; align-items:center; gap:8px;
   border:1px solid var(--line); background:var(--card); color:var(--txt-2);
@@ -1669,7 +1710,7 @@ html[data-appearance="dark"] .plan-item--warn .plan-item-text{ color:#f0a020; }
   font-variant-numeric:var(--font-num-variant);
 }
 .ga-menu-item:hover{ background:var(--hover-2); }
-.ga-menu-item.active{ color:var(--accent); }
+.ga-menu-item.active{ color:var(--txt-strong); }  /* 选中项用强调色而非发灰的 --accent，避免变淡 */
 .composer-menu .ga-menu-item{
   display:flex; align-items:center; gap:8px;
 }
