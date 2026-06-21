@@ -218,48 +218,87 @@ fn ensure_desktop_shortcut() {
     let _ = cmd.status();
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn ensure_desktop_shortcut() {
+    // Launch target: the AppImage path when running as one, else the current exe. Writing the
+    // current path on every enabled launch keeps a relocated bundle's launcher valid.
+    let Some(target) = std::env::var_os("APPIMAGE").map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok()) else { return; };
+    let exec = target.to_string_lossy().replace('"', "");
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=GenericAgent\nComment=GenericAgent Desktop\n\
+         Exec=\"{exec}\"\nIcon={exec}\nTerminal=false\nCategories=Utility;Development;\n",
+        exec = exec
+    );
+    let write_desktop = |path: &std::path::Path| {
+        if std::fs::write(path, &entry).is_ok() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+        }
+    };
+    if let Some(home) = dirs::home_dir() {
+        let apps = home.join(".local/share/applications");
+        let _ = std::fs::create_dir_all(&apps);
+        write_desktop(&apps.join("GenericAgent.desktop"));
+    }
+    if let Some(desktop) = dirs::desktop_dir() {
+        let _ = std::fs::create_dir_all(&desktop);
+        let f = desktop.join("GenericAgent.desktop");
+        write_desktop(&f);
+        // GNOME marks unknown launchers "untrusted"; flag ours so it runs on double-click. Best effort.
+        let _ = Command::new("gio")
+            .args(["set", &f.to_string_lossy(), "metadata::trusted", "true"])
+            .status();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_desktop_shortcut() {
+    // The .app is the launchable unit; drop a symlink to it on the Desktop.
+    let Ok(exe) = std::env::current_exe() else { return; };
+    let mut app: Option<PathBuf> = None;
+    let mut d = exe.parent();
+    while let Some(dir) = d {
+        if dir.extension().and_then(|s| s.to_str()) == Some("app") { app = Some(dir.to_path_buf()); break; }
+        d = dir.parent();
+    }
+    let (Some(app), Some(desktop)) = (app, dirs::desktop_dir()) else { return; };
+    let link = desktop.join("GenericAgent.app");
+    let _ = std::fs::remove_file(&link);
+    let _ = std::os::unix::fs::symlink(&app, &link);
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 fn ensure_desktop_shortcut() {}
 
-/// First-run shortcut handling. Windows portable bundles only. Self-heals the shortcut path on
-/// every enabled launch (cheap, no UI). The first-run ASK is driven by the frontend (see the
-/// `shortcut_should_ask` / `shortcut_decide` commands): a native dialog from this background
-/// startup thread has no parent window and gets buried behind the main window on first launch,
-/// so the prompt is owned by the web UI instead, which always renders on top.
+/// First-run shortcut handling for portable bundles (all platforms). Self-heals the shortcut
+/// path on every enabled launch (cheap, no UI). The first-run ASK is driven by the frontend
+/// (see the `shortcut_should_ask` / `shortcut_decide` commands): a native dialog from this
+/// background startup thread has no parent window and gets buried behind the main window on
+/// first launch, so the prompt is owned by the web UI instead, which always renders on top.
 fn maybe_setup_shortcut() {
-    #[cfg(windows)]
-    {
-        if bundle_root().is_none() {
-            return;
-        }
-        // Only self-heal when the user already opted in. Never prompt here.
-        if read_shortcut_pref() == Some(true) {
-            ensure_desktop_shortcut();
-        }
+    if bundle_root().is_none() {
+        return;
+    }
+    // Only self-heal when the user already opted in. Never prompt here.
+    if read_shortcut_pref() == Some(true) {
+        ensure_desktop_shortcut();
     }
 }
 
 /// Frontend asks whether to show the first-run "create desktop shortcut?" prompt.
-/// True only on a Windows portable bundle whose preference has never been set.
+/// True only on a portable bundle whose preference has never been set.
 #[tauri::command]
 fn shortcut_should_ask() -> bool {
-    #[cfg(windows)]
-    {
-        return bundle_root().is_some() && read_shortcut_pref().is_none();
-    }
-    #[cfg(not(windows))]
-    { false }
+    bundle_root().is_some() && read_shortcut_pref().is_none()
 }
 
 /// Frontend reports the user's choice. Persists it and creates the shortcut when enabled.
 #[tauri::command]
 fn shortcut_decide(create: bool) {
     write_shortcut_pref(create);
-    #[cfg(windows)]
-    {
-        if create {
-            ensure_desktop_shortcut();
-        }
+    if create {
+        ensure_desktop_shortcut();
     }
 }
 
