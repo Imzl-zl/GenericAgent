@@ -333,6 +333,7 @@ const I18N = {
     'customPreset.editTitle': '编辑',
     'builtinPreset.restoreBtn': '恢复默认预设',
     'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型', 'set.features': '功能', 'set.importMykey': '导入已有模型配置（mykey.py）', 'set.exportMykey': '导出当前模型配置', 'set.serviceManager': '后台服务管理',
+    'shortcut.askConfirm': '是否在桌面创建 GenericAgent 快捷方式？',
     'appearance.light': '浅色', 'appearance.dark': '深色',
     'set.noModels': '暂无模型，点击下方添加',
     'lang.zh': '简体中文', 'lang.en': 'English',
@@ -505,6 +506,7 @@ const I18N = {
     'customPreset.editTitle': 'Edit',
     'builtinPreset.restoreBtn': 'Restore defaults',
     'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model', 'set.features': 'Features', 'set.importMykey': 'Import model config (mykey.py)', 'set.exportMykey': 'Export current model config', 'set.serviceManager': 'Service manager',
+    'shortcut.askConfirm': 'Create a desktop shortcut for GenericAgent?',
     'appearance.light': 'Light', 'appearance.dark': 'Dark',
     'set.noModels': 'No models yet — add one below',
     'lang.zh': '简体中文', 'lang.en': 'English',
@@ -5163,6 +5165,20 @@ function showChanToast(title, detail, kind) {
     // Preset form: 每字段独立内联提示（标题/Prompt 各自独立,互不串扰）
     bindFieldInlineLimit(document.getElementById('cp-title'));
     bindFieldInlineLimit(document.getElementById('cp-prompt'));
+
+    // First-run desktop-shortcut prompt (Windows portable bundle only). Driven from the web UI
+    // so the dialog always renders on top — a native dialog from the Rust startup thread had no
+    // parent window and got buried behind the main window on first launch.
+    maybeAskDesktopShortcut();
+  }
+
+  async function maybeAskDesktopShortcut() {
+    try {
+      const should = await window.ga.tauriInvoke('shortcut_should_ask');
+      if (!should) return;
+      const create = window.confirm(t('shortcut.askConfirm'));
+      await window.ga.tauriInvoke('shortcut_decide', { create });
+    } catch (_) { /* not in tauri / not a bundle — ignore */ }
   }
 
   if (document.readyState === 'loading') {
