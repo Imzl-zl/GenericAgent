@@ -53,6 +53,7 @@ memory/L4_raw_sessions/*
 # ljqCtrl related tools
 !memory/ljqCtrl.py
 !memory/ljqCtrl_sop.md
+!memory/macljqCtrl.py
 !memory/computer_use.md
 
 # procmem_scanner related tools
@@ -86,10 +87,6 @@ memory/L4_raw_sessions/*
 
 # Morphling SOP
 !memory/morphling_sop.md
-
-# Skill Search SOP
-!memory/skill_search/
-!memory/skill_search/**
 
 
 # ADB UI tool
@@ -146,6 +143,9 @@ frontends/conductor_im_plugins/config.local.json
 **/__pycache__/
 
 .claude/
+
+# Project Mode SOP
+!memory/project_mode_sop.md
 
 # 本地 bug / 局限报告草稿（交给维护者参考，不进仓库）
 /BUG_*.md

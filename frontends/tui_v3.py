@@ -32,6 +32,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 from rich.theme import Theme
 from typing import Callable
+from frontends import at_complete, workspace_cmd   # @ 补全 + /workspace（与 v2 共用）
 
 # ════════════════════════════════════════════════════════════════════════════
 # i18n — minimal dict-based zh/en translation layer (inlined; was tui_v3_i18n.py)
@@ -295,6 +296,10 @@ _I18N: dict[str, dict[str, str]] = {
         # menu / picker / palette
         'menu.default_title':   'Pick',
         'menu.hint':            '↑↓ pick · Enter confirm · Esc cancel',
+        'menu.hint.filter':     'type to filter · ↑↓ pick · Enter confirm · Esc cancel',
+        'menu.search':          'filter workspaces, or type an abs path + Enter to create one',
+        'menu.no_match':        'no match',
+        'menu.free.hint':       'Enter to create/enter this path',
         'ask.default_q':        'answer:',
         'ask.title':            '◉ answer',
         'ask.pending':          '  +{n} pending',
@@ -304,6 +309,19 @@ _I18N: dict[str, dict[str, str]] = {
 
         # continue picker
         'continue.title':       'Restore historical session',
+        'continue.occupied.title':  'Session in use (pid {p}) — copy it and continue?',
+        'continue.occupied.copy':   'Copy & continue',
+        'continue.occupied.cancel': 'Cancel',
+        # /workspace (parity with v2; backed by workspace_cmd.py)
+        'cmd.workspace.arg':    '[path|off]',
+        'cmd.workspace.desc':   'set working dir (abs path) and enter project mode',
+        'ws.entered':           '✅ entered workspace「{n}」',
+        'ws.fail':              '❌ workspace failed: {e}',
+        'ws.exited':            'left workspace (project mode off; junction & files kept)',
+        'ws.inactive':          'not in a workspace right now',
+        'ws.none':              'no registered workspace yet; /workspace <abs path> to create/enter',
+        'ws.pick.title':        'Pick a workspace (↑↓ choose · Enter confirm · Esc cancel)',
+        'ws.restored':          'restored working dir: {t}',
         'continue.row.fmt':     '{rel:>4}  {rounds:>3}r  {preview}',
         'continue.unit.round':  'r',
 
@@ -545,6 +563,10 @@ _I18N: dict[str, dict[str, str]] = {
         # menu / picker / palette
         'menu.default_title':   '选择',
         'menu.hint':            '↑↓ 选 · Enter 确认 · Esc 取消',
+        'menu.hint.filter':     '输入过滤 · ↑↓ 选 · Enter 确认 · Esc 取消',
+        'menu.search':          '输入筛选工作区或输入绝对路径回车新建工作区',
+        'menu.no_match':        '无匹配',
+        'menu.free.hint':       '回车以该路径新建/进入',
         'ask.default_q':        '请回答:',
         'ask.title':            '◉ 请回答',
         'ask.pending':          '  +{n} 待答',
@@ -554,6 +576,19 @@ _I18N: dict[str, dict[str, str]] = {
 
         # continue picker
         'continue.title':       '恢复历史会话',
+        'continue.occupied.title':  '该会话正被占用（pid {p}）—— 从原会话拷贝一份继续？',
+        'continue.occupied.copy':   '拷贝一份继续',
+        'continue.occupied.cancel': '取消',
+        # /workspace（与 v2 一致；后端 workspace_cmd.py）
+        'cmd.workspace.arg':    '[path|off]',
+        'cmd.workspace.desc':   '设定工作目录(绝对路径)并进入项目模式',
+        'ws.entered':           '✅ 已进入 workspace「{n}」',
+        'ws.fail':              '❌ workspace 设定失败: {e}',
+        'ws.exited':            '已退出 workspace（项目模式关闭；junction 与文件保留）',
+        'ws.inactive':          '当前未处于 workspace 模式',
+        'ws.none':              '暂无已登记 workspace；用 /workspace <绝对路径> 新建/进入',
+        'ws.pick.title':        '选择 workspace（↑↓ 选择，Enter 确认，Esc 取消）',
+        'ws.restored':          '已恢复工作目录: {t}',
         'continue.row.fmt':     '{rel:>4}  {rounds:>3}轮  {preview}',
         'continue.unit.round':  '轮',
 
@@ -842,10 +877,12 @@ def _ptk_keypress_to_bytes(kp) -> bytes:
         return b'\x02'
     if has('right'):
         return b'\x06'
+    # Home/End get dedicated bytes — 0x01 is already Ctrl+A (select-all) and
+    # 0x05 has no editor handler, so reusing them would break/no-op the keys.
     if has('home'):
-        return b'\x01'
+        return b'\x07'
     if has('end'):
-        return b'\x05'
+        return b'\x14'
     if has('delete'):
         return b'\x7f'
     if has('backspace') or data == '\x7f' or data == '\x08':
@@ -1336,6 +1373,12 @@ class AgentBridge:
             self.agent.llmclient = self.agent.llmclients[llm_no % len(self.agent.llmclients)]
         self.agent.inc_out = True
         self.agent.verbose = True
+        from frontends.slash_cmds import COMMIT_SIGNATURE_PROMPT
+        self.agent.extra_sys_prompts.append(COMMIT_SIGNATURE_PROMPT)
+        # 默认普通模式：设 None 让 project_mode 插件不读 pid 文件锚（与 v2 一致）。
+        # /workspace 绑定时改为项目名 + 真实路径。
+        self.agent._ga_project_mode_name = None
+        self.agent._ga_project_mode_workspace_path = ''
         # task_dir path enables ga's `_keyinfo` / `_intervene` consume paths.
         # PID-scoped so concurrent v3 processes don't share signal files.
         # Only the *path* is set here; the dir is created lazily by the writer
@@ -1363,6 +1406,12 @@ class AgentBridge:
         if not getattr(self.agent, 'llmclient', None):
             self._healthy = False
             self._init_error = _t('err.no_llm')
+        # 原地复原:本会话出生即持有自己日志的锁,使占用检测对它可见(别的会话据此判活)。
+        try:
+            from frontends import continue_cmd as _cc
+            _cc.acquire_birth_lock(self.agent)
+        except Exception:
+            pass
         self._runner = threading.Thread(target=self._run_safe, daemon=True, name=f'ga-tui-agent')
         self._runner.start()
 
@@ -1450,6 +1499,15 @@ class AgentBridge:
             return self.agent.get_llm_name()
         except Exception:
             return '?'
+
+    @property
+    def llm_model(self) -> str:
+        """The concrete model id in use (e.g. claude-opus-4-8), not the
+        channel group `llm_name` returns. Empty string when unavailable."""
+        try:
+            return self.agent.get_llm_name(model=True) or ''
+        except Exception:
+            return ''
 
     def list_llms(self) -> list[tuple[int, str, bool]]:
         return self.agent.list_llms()
@@ -1587,7 +1645,9 @@ def _strip_bg(s: str) -> str:
             out.append(t); i += 1
         return '\x1b[' + ';'.join(out) + 'm' if out else '\x1b[0m'
     return _SGR_RE.sub(repl, s)
-_ESC_RE = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b.')
+# CSI (`\x1b[…`) or SS3 (`\x1bO…`, application-cursor mode for Home/End/arrows)
+# as whole sequences, else any 2-byte `\x1b.` — order matters so SS3 wins over `\x1b.`.
+_ESC_RE = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1bO[@-~]|\x1b.')
 _FILE_REF_RE = re.compile(r'@([\w./\-~]+)')
 _PASTE_PH_RE = re.compile(r'\[Pasted text #(\d+) \+\d+ lines\]')
 _FILE_PH_RE = re.compile(r'\[File #(\d+)\]')
@@ -1841,6 +1901,8 @@ def _cmds() -> list[tuple[str, str, str]]:
         ('/scheduler', '',                       _t('cmd.scheduler.desc')),
         ('/rewind',   _t('cmd.rewind.arg'),     _t('cmd.rewind.desc')),
         ('/continue', _t('cmd.continue.arg'),   _t('cmd.continue.desc')),
+        ('/workspace', _t('cmd.workspace.arg', default='[path|off]'),
+                       _t('cmd.workspace.desc', default='设定工作目录(绝对路径)并进入项目模式')),
         ('/new',      _t('cmd.new.arg'),        _t('cmd.new.desc')),
         ('/rename',   _t('cmd.rename.arg'),     _t('cmd.rename.desc')),
         ('/clear',    '',                       _t('cmd.clear.desc')),
@@ -2060,6 +2122,13 @@ def _esc_repl(m: re.Match) -> bytes:
         return b'\x1d'   # Shift+↓ → extend selection down
     if s in (b'\x1b[27;2;13~', b'\x1b[13;2u'):
         return b'\n'      # Shift+Enter (modifyOtherKeys / kitty) → newline
+    # Home/End arrive as raw VT sequences via PTK's KeyPress.data (special keys
+    # carry their original escape bytes), so _ptk_keypress_to_bytes returns them
+    # verbatim and they must be decoded here like the arrows above.
+    if s in (b'\x1b[H', b'\x1b[1~', b'\x1b[7~', b'\x1bOH'):
+        return b'\x07'    # Home → internal jump-to-line-start
+    if s in (b'\x1b[F', b'\x1b[4~', b'\x1b[8~', b'\x1bOF'):
+        return b'\x14'    # End → internal jump-to-line-end
     return b''            # swallow every other escape sequence
 
 
@@ -2203,6 +2272,46 @@ def _clip_cells(s: str, width: int) -> str:
             break
         out += ch; cw += c
     return out
+
+
+def _cell_head(s: str, n: int) -> str:
+    """Keep the head within n cells, suffix … if truncated (省略末尾 — names)."""
+    if cell_len(s) <= n:
+        return s
+    if n <= 1:
+        return '…'
+    out, w = '', 0
+    for ch in s:
+        c = cell_len(ch)
+        if w + c > n - 1:
+            break
+        out += ch; w += c
+    return out + '…'
+
+
+def _cell_mid(s: str, n: int) -> str:
+    """Keep head+tail within n cells, … in the middle (省略中间 — paths: project
+    root and leaf both stay visible). CJK counts as 2 via cell_len."""
+    if cell_len(s) <= n:
+        return s
+    if n <= 1:
+        return '…'
+    avail = n - 1
+    head_budget = avail - avail // 2
+    tail_budget = avail // 2
+    head, w = '', 0
+    for ch in s:
+        c = cell_len(ch)
+        if w + c > head_budget:
+            break
+        head += ch; w += c
+    tail_rev, w = '', 0
+    for ch in reversed(s):
+        c = cell_len(ch)
+        if w + c > tail_budget:
+            break
+        tail_rev += ch; w += c
+    return head + '…' + tail_rev[::-1]
 
 
 def _term_safe_text(s: str) -> str:
@@ -2380,11 +2489,25 @@ class SB:
         # on_submit(_menu_sel) and ignores _menu_checked.
         self._menu_multi: bool = False
         self._menu_checked: set[int] = set()
+        # opt-in 可过滤菜单（/workspace 用）：输入过滤 + free_input 提交原文。
+        self._menu_filterable: bool = False
+        self._menu_free: bool = False
+        self._menu_on_free = None
+        self._menu_query: str = ''
+        self._menu_all_labels: list[str] = []   # 未过滤的全部显示行
+        self._menu_filter_keys: list[str] = []  # 与 all_labels 等长的可搜索文本（完整，不省略）
+        self._menu_map: list[int] = []          # 可见行 idx → all_labels 原始 idx
         # Interactive command palette: index into _cmd_matches output when
         # buf starts with `/`.  ↑↓ steer the highlight, Tab completes the
         # highlighted command, Enter still executes whatever is in buf.
         self._palette_sel: int = 0
         self._palette_scroll: int = 0       # viewport offset into the matches list
+        # workspace 绑定（单会话 → 进程级一个）。空 = 普通模式。
+        self._ws_name: str = ''
+        self._ws_path: str = ''
+        self._ws_link: str = ''
+        # @ 候选缓存：(buf, pos) → list[path]，避免每次按键重算 fuzzy_rank。
+        self._at_cache: tuple | None = None
 
     # ── live region ──
     #
@@ -2395,7 +2518,9 @@ class SB:
     # in callers are harmless legacy resets (they zero state PTK ignores).
 
     def _status_line(self, w: int) -> str:
-        name = self._bridge.llm_name if self._bridge else '?'
+        # Show the concrete model id; fall back to the channel group only when
+        # the model is unavailable (e.g. a mixin without a single .model).
+        name = (self._bridge.llm_model or self._bridge.llm_name) if self._bridge else '?'
         if self._asking:
             state = _t('status.asking')
         elif self._running:
@@ -2409,7 +2534,12 @@ class SB:
         else:
             state = _t('status.ready')
         cost = _cost_str(self._bridge.agent) if self._bridge else ''
-        return f'[main] {name} │ {state}{cost}'
+        ws = ''
+        if self._ws_name:
+            disp = (os.path.basename((self._ws_path or '').rstrip('/\\'))
+                    or re.sub(r'-[0-9a-f]{8}$', '', self._ws_name))
+            ws = f' │ ⌂ {_cell_head(disp, 18)}'
+        return f'[main] {name} │ {state}{cost}{ws}'
 
     # v2-style plan card budget: 5 rows max — header(1) + optional step(1) +
     # tasks(rest) + optional overflow(1).  Grace periods avoid flicker when the
@@ -2658,7 +2788,9 @@ class SB:
     def _show_menu(self, title: str, options: list[str], on_submit,
                    hint: str | None = None, on_cancel=None,
                    multi_select: bool = False,
-                   pre_checked: set[int] | None = None) -> None:
+                   pre_checked: set[int] | None = None,
+                   filterable: bool = False, free_input: bool = False,
+                   on_free=None, filter_keys: list[str] | None = None) -> None:
         """Open a modal arrow-key menu in place of the input box.
 
         The menu takes over the live region; ↑↓ move the highlight, Enter
@@ -2676,11 +2808,23 @@ class SB:
         worked logically but left a one-frame window where PTK could render
         the menu with the wrong state — observed as /scheduler picker
         rendering all unchecked even though `reflect/scheduler.py` was alive.
-        Passing the set up-front makes the open atomic."""
+        Passing the set up-front makes the open atomic.
+
+        `filterable=True` adds a search box: printable chars / backspace edit a
+        live query that filters rows by `filter_keys` (defaults to the visible
+        labels; pass the full untruncated text so an elided middle still
+        matches). `free_input=True` + `on_free` lets Enter on a query with NO
+        match commit the raw query (e.g. an abs path → new workspace)."""
         if not options:
-            return
+            if not (filterable and free_input):
+                return                       # 空列表但允许 free_input → 仍打开（可输路径新建）
         self._menu_active = True
-        self._menu_options = list(options)
+        self._menu_filterable = bool(filterable)
+        self._menu_free = bool(free_input)
+        self._menu_on_free = on_free
+        self._menu_query = ''
+        self._menu_all_labels = list(options)
+        self._menu_filter_keys = list(filter_keys) if filter_keys else list(options)
         self._menu_title = title
         # In multi-select mode show a Space-aware hint by default so the user
         # discovers the toggle key without reading the docstring.
@@ -2688,15 +2832,37 @@ class SB:
             self._menu_hint = hint
         elif multi_select:
             self._menu_hint = _t('menu.hint.multi', default='Space toggle · ↑↓ move · Enter submit · Esc cancel')
+        elif filterable:
+            self._menu_hint = _t('menu.hint.filter', default='输入过滤 · ↑↓ 选择 · Enter 确认 · Esc 取消')
         else:
             self._menu_hint = _t('menu.hint')
-        self._menu_sel = 0
-        self._menu_scroll = 0
         self._menu_on_submit = on_submit
         self._menu_on_cancel = on_cancel
         self._menu_multi = bool(multi_select)
         self._menu_checked = set(pre_checked) if pre_checked else set()
+        self._menu_apply_filter()            # 设 _menu_options + _menu_map（初始 query 为空 → 全量）
         self._render_live()
+
+    def _menu_apply_filter(self) -> None:
+        """Recompute visible rows (`_menu_options`) + map-to-original
+        (`_menu_map`) from the live query. No-op shape when not filterable."""
+        q = self._menu_query.strip().lower()
+        if not self._menu_filterable or not q:
+            self._menu_options = list(self._menu_all_labels)
+            self._menu_map = list(range(len(self._menu_all_labels)))
+        else:
+            terms = q.split()
+            self._menu_options, self._menu_map = [], []
+            for i, key in enumerate(self._menu_filter_keys):
+                kl = key.lower()
+                if all(t in kl for t in terms):
+                    self._menu_options.append(self._menu_all_labels[i])
+                    self._menu_map.append(i)
+        # Focus model (filterable): -1 = the input row itself (a selectable
+        # object in the ↑↓ ring, v2-continue style); 0..n-1 = a candidate.
+        # Typing keeps focus on the input row. Non-filterable menus start at 0.
+        self._menu_sel = -1 if self._menu_filterable else 0
+        self._menu_scroll = 0
 
     def _close_menu(self) -> None:
         self._menu_active = False
@@ -2709,6 +2875,13 @@ class SB:
         self._menu_on_cancel = None
         self._menu_multi = False
         self._menu_checked = set()
+        self._menu_filterable = False
+        self._menu_free = False
+        self._menu_on_free = None
+        self._menu_query = ''
+        self._menu_all_labels = []
+        self._menu_filter_keys = []
+        self._menu_map = []
 
     @staticmethod
     def _scroll_window(sel: int, total: int, visible: int, scroll: int) -> int:
@@ -2729,6 +2902,36 @@ class SB:
         checked = sorted(self._menu_checked) if multi else None
         if not self._menu_active:
             return
+        # Filterable: map the visible selection back to the original index; or,
+        # when the query matches nothing, commit it verbatim via on_free
+        # (free_input — e.g. a typed abs path → new workspace).
+        if self._menu_filterable:
+            mp = self._menu_map
+            on_free = self._menu_on_free
+            q = self._menu_query.strip()
+            # 焦点在某个候选 → 选它（映射回原始 idx）。
+            if sel >= 0 and self._menu_options:
+                orig = mp[sel] if 0 <= sel < len(mp) else mp[0]
+                self._close_menu()
+                if cb is not None:
+                    try: cb(orig)
+                    except Exception as e: self.commit([_t('err.menu_cb', err=str(e))])
+                return
+            # 焦点在输入框（sel<0）：有 query → free 提交（当作路径新建/进入）。
+            if self._menu_free and q and on_free is not None:
+                self._close_menu()
+                try: on_free(q)
+                except Exception as e: self.commit([_t('err.menu_cb', err=str(e))])
+                return
+            # 输入框空 + 有候选 → 选第一个（便捷）。
+            if self._menu_options:
+                orig = mp[0]
+                self._close_menu()
+                if cb is not None:
+                    try: cb(orig)
+                    except Exception as e: self.commit([_t('err.menu_cb', err=str(e))])
+                return
+            return                                  # 无 query 无候选 → 维持菜单
         self._close_menu()
         if cb is not None:
             try:
@@ -2767,14 +2970,50 @@ class SB:
             return ae.candidates[self._picker_sel]
         return None
 
+    def _at_root(self) -> str:
+        # @ 索引根 = workspace（绑定时真实路径），否则 agent 实际工作目录
+        # _ROOT/temp（file_read/code_run 都相对它），而非飘忽的 os.getcwd()。
+        return self._ws_path or os.path.join(_ROOT, "temp")
+
+    def _at_active(self):
+        """@ 补全：返回 (query, at_pos_in_buf) 或 None。基于光标前、当前逻辑行的
+        @token（@ 可在任意行任意位置；菜单 / ask 态不触发）。"""
+        if self._asking is not None or self._menu_active:
+            return None
+        ls = self.buf.rfind('\n', 0, self.pos) + 1
+        tok = at_complete.find_at_token(self.buf[ls:self.pos])
+        if tok is None:
+            return None
+        query, at_in_line = tok
+        return query, ls + at_in_line
+
+    def _at_candidates(self) -> list:
+        """当前 @token 的候选（带 (buf,pos) 缓存，避免每键重算 fuzzy）。"""
+        act = self._at_active()
+        if act is None:
+            self._at_cache = None
+            return []
+        key = (self.buf, self.pos)
+        if self._at_cache is not None and self._at_cache[0] == key:
+            return self._at_cache[1]
+        # 未绑 workspace → 索引根是 temp，相对路径不直观，候选用绝对路径（_hint_lines
+        # 本就整条显示）；绑了用相对（短）。
+        items = at_complete.candidates_for(act[0], self._at_root(), absolute=not self._ws_path)
+        self._at_cache = (key, items)
+        return items
+
+    def _palette_total(self) -> int:
+        # 当前 palette 候选数（↓ 键越界判断用）：slash 命令 or @ 文件。
+        if self._slash_visible():
+            return len(self._cmd_matches(self.buf))
+        return len(self._at_candidates())
+
     def _cmd_matches(self, prefix: str) -> list[tuple[str, str, str]]:
         p = prefix.strip().lower()
         return [c for c in _cmds() if c[0].startswith(p)]
 
-    def _palette_visible(self) -> bool:
-        """True when the live `/`-command palette should appear and own ↑↓/Tab."""
-        if self._asking is not None or self._menu_active:
-            return False
+    def _slash_visible(self) -> bool:
+        """True when the buffer is a live `/`-command prefix with matches."""
         if '\n' in self.buf or not self.buf.startswith('/'):
             return False
         ms = self._cmd_matches(self.buf)
@@ -2784,19 +3023,29 @@ class SB:
             return False
         return True
 
+    def _palette_visible(self) -> bool:
+        """True when the live palette should appear and own ↑↓/Tab — either the
+        `/`-command palette (buf starts with /) or the `@` file palette (cursor
+        sits in an @token). Same machinery, two candidate sources."""
+        if self._asking is not None or self._menu_active:
+            return False
+        return self._slash_visible() or bool(self._at_candidates())
+
     def _hint_lines(self, w: int) -> list[str]:
-        """Live `/`-command palette: scrollback-style list with an arrow-key
-        highlight + scrolling viewport.  ↑↓ move the highlight (handled in
-        `_keys`), Tab completes the highlighted command, Enter completes into
-        the input box.  Long match lists scroll the visible window as sel walks
-        past the edges (no wrap-around, no "N more" chrome)."""
+        """Live palette: scrollback-style list with an arrow-key highlight +
+        scrolling viewport.  ↑↓ move the highlight (handled in `_keys`), Tab /
+        Enter complete the highlighted entry into the input box.  Renders the
+        `/`-command set when buf starts with `/`, else the `@` file candidates."""
         if not self._palette_visible():
             return []
-        ms = self._cmd_matches(self.buf)
-        total = len(ms)
+        if self._slash_visible():
+            rows = [f'  {n:<11} {a:<8} {d}' if a else f'  {n:<11}          {d}'
+                    for n, a, d in self._cmd_matches(self.buf)]
+        else:
+            rows = ['  @ ' + p for p in self._at_candidates()]
+        total = len(rows)
         # Cap palette viewport to 6 rows so it doesn't squeeze the input box.
         visible = min(total, 6)
-        # Clamp sel + slide scroll so sel is in-window.
         if self._palette_sel < 0 or self._palette_sel >= total:
             self._palette_sel = 0
         self._palette_scroll = self._scroll_window(self._palette_sel, total, visible, self._palette_scroll)
@@ -2804,21 +3053,27 @@ class SB:
         end = min(total, start + visible)
         out: list[str] = []
         for i in range(start, end):
-            n, a, d = ms[i]
-            # `<11` + literal space guarantees a visible gap between the
-            # 10-char names (/conductor, /morphling, /scheduler) and their
-            # `[arg]` placeholder — without it they render as `/conductor[task]`.
-            row = f'  {n:<11} {a:<8} {d}' if a else f'  {n:<11}          {d}'
-            if i == self._palette_sel:
-                out.append(_ACCENT + _BOLD + _clip_cells(row, w) + _RST)
-            else:
-                out.append(_DIM + _clip_cells(row, w) + _RST)
+            styled = (_ACCENT + _BOLD) if i == self._palette_sel else _DIM
+            out.append(styled + _clip_cells(rows[i], w) + _RST)
         return out
 
     def _tab(self) -> None:
         if self._asking is not None or self._menu_active:
             return
-        if '\n' in self.buf or not self.buf.startswith('/'):
+        # @ 文件补全：用选中候选替换光标处的 @token（format_pick 加引号/尾空格）。
+        if not self._slash_visible():
+            items = self._at_candidates()
+            act = self._at_active()
+            if not items or act is None:
+                return
+            idx = self._palette_sel if 0 <= self._palette_sel < len(items) else 0
+            rep = at_complete.format_pick(items[idx])
+            at_pos = act[1]
+            self.buf = self.buf[:at_pos] + rep + self.buf[self.pos:]
+            self.pos = at_pos + len(rep)
+            self._palette_sel = 0
+            self._palette_scroll = 0
+            self._at_cache = None
             return
         ms = self._cmd_matches(self.buf)
         if not ms:
@@ -3008,9 +3263,14 @@ class SB:
         # Use PTK's current viewport height (set on SB._h by the render loop).
         h = max(8, getattr(self, '_h', 24))
         visible = min(total, self._menu_visible_count(h))
-        # Clamp sel and recompute scroll so sel is in-window.
-        self._menu_sel = max(0, min(total - 1, self._menu_sel)) if total else 0
-        self._menu_scroll = self._scroll_window(self._menu_sel, total, visible, self._menu_scroll)
+        # Clamp sel and recompute scroll so sel is in-window. Filterable menus
+        # allow sel == -1 (focus on the input row); clamp candidates to range
+        # but leave -1 intact. _scroll_window treats -1 as "top".
+        if self._menu_filterable:
+            self._menu_sel = -1 if self._menu_sel < 0 else (min(total - 1, self._menu_sel) if total else -1)
+        else:
+            self._menu_sel = max(0, min(total - 1, self._menu_sel)) if total else 0
+        self._menu_scroll = self._scroll_window(max(0, self._menu_sel), total, visible, self._menu_scroll)
         start = self._menu_scroll
         end = min(total, start + visible)
 
@@ -3051,6 +3311,22 @@ class SB:
             return r
 
         rows = [top]
+        # Filterable menu: a search line above the rows, showing the live query
+        # with a caret. Empty match set renders a hint instead of blank.
+        if self._menu_filterable:
+            q = self._menu_query
+            focused = (self._menu_sel < 0)           # 焦点在输入框（可被 ↑↓ 选中的对象）
+            # 整行单一 style（纯文本交给 row，颜色走 style 参）——内嵌 ANSI 会让
+            # row() 的 pad=content_w-cell_len(ch) 把转义算进宽度，右边框就错位。
+            # focused → 整行 accent（箭头+占位/输入都高亮，焦点明显）；否则 dim。
+            if q:
+                text = '› ' + q + ('▏' if focused else '')
+            else:
+                text = '› ' + _t('menu.search')
+            rows.extend(row(text, _ACCENT if focused else _DIM))
+            if not self._menu_options:
+                hint = (_t('menu.free.hint') if (self._menu_free and q.strip()) else _t('menu.no_match'))
+                rows.extend(row(hint, _DIM))
         # Viewport scrolls as sel walks past the edges; the title's N/total tag
         # signals position, so no "N more" indicator rows.
         for i in range(start, end):
@@ -3997,12 +4273,20 @@ class SB:
             self._run_shell(raw[1:].strip())
             return
         if raw.startswith('/'):
+            # Expand pasted/file/image placeholders BEFORE dispatch so a command
+            # carries the real pasted text, not a `[Pasted text #N]` marker — e.g.
+            # `/morphling <pasted multi-line target>`. Without this the command
+            # path returned here before the expansion below ever ran, so the agent
+            # got the literal placeholder. `self.hist` already kept the raw input.
+            expanded = self._expand(raw)
             # /btw owns its own live-region panel — keep the command itself
             # out of the main scrollback.
-            cmd0 = (raw[1:].split(None, 1)[0] or '').lower()
+            cmd0 = (expanded[1:].split(None, 1)[0] or '').lower()
             if cmd0 != 'btw':
-                self._commit_user(raw)
-            self._cmd(raw); return
+                self._commit_user(expanded)
+            self._cmd(expanded)
+            self._pstore.clear(); self._fstore.clear(); self._imgs.clear()
+            return
         # Expand placeholders FIRST so the agent receives the resolved text,
         # not the [Image #N] / [Pasted #N] markers.  This matches the idle
         # submit path below — keeping the form identical means a queued
@@ -4010,17 +4294,20 @@ class SB:
         imgs = [self._imgs[i] for i in
                 (int(m.group(1)) for m in _IMG_PH_RE.finditer(raw)) if i in self._imgs]
         expanded = self._expand(raw)
+        # @ mentions: agent 收绝对路径（file_read 相对自身 cwd，否则找不到），
+        # scrollback 显示相对（简洁）。仅改路径根、不读内容。
+        agent_text = at_complete.absolutize_mentions(expanded, self._at_root()) if "@" in expanded else expanded
         if self._running:
-            wrapped = _t('pending.inject_wrap', text=expanded)
+            wrapped = _t('pending.inject_wrap', text=agent_text)
             if self._bridge and self._bridge.inject_intervene(wrapped, track=True):
-                self._pending.append(expanded)
+                self._pending.append(agent_text)
                 self._commit_user(_t('pending.queued_marker', text=expanded))
                 self._pstore.clear(); self._fstore.clear(); self._imgs.clear()
                 self._render_live()
                 return
             # Agent went idle in the race — fall through to put_task.
-        self._commit_user(expanded)                # scrollback shows exactly what
-        self._submit(expanded, imgs)               # the agent receives, not the
+        self._commit_user(expanded)                # scrollback 显示相对
+        self._submit(agent_text, imgs)             # agent 收绝对
         self._pstore.clear(); self._fstore.clear(); self._imgs.clear()   # drop placeholders
 
     def _cost_section(self, tname: str, t, be) -> list[str]:
@@ -4060,10 +4347,97 @@ class SB:
         """Wipe the conversation: drop LLM history, clear the screen and every
         rendered block.  Shared by /clear and /new."""
         from frontends import continue_cmd
-        continue_cmd.reset_conversation(ag)
+        continue_cmd.begin_fresh_session(ag)   # 切走:旧日志留作空闲会话 + 铸新 logid(不存快照)
         _w('\x1b[2J\x1b[H'); self._painted = []; self._live_rows = 0
         self._blocks = []; self._streaming_block = None; self._sent = 0
         self._tool_base = 0; self._tools = {}
+
+    # ── workspace（与 v2 共用 workspace_cmd；单会话 → 进程级一个绑定）─────────
+    def _bind_workspace(self, info, persist: bool = True) -> None:
+        """绑定 / 解绑 workspace。info=prepare() 的结果 dict → 绑定；None → 解绑。
+        同步 agent 的 project_mode 属性（插件据此注入项目上下文），刷新 @ 索引根。
+
+        persist=False: 仅刷新内存绑定状态，不写 session→ws 映射表。续接时的
+        reset(_bind_workspace(None)) 用它——原地续后 agent.log_path==被续文件，
+        若持久化会把本会话映射抹成 ""(= 已 off)，反而毁掉自动恢复。映射表只应由
+        显式 /workspace、/workspace off 与成功的续接恢复来写。"""
+        ag = self._bridge.agent if self._bridge else None
+        if info:
+            self._ws_name = info.get('name') or ''
+            self._ws_path = info.get('target') or info.get('path') or ''
+            self._ws_link = info.get('link') or ''
+            pm_name, pm_path = (self._ws_name or None), self._ws_path
+        else:
+            self._ws_name = self._ws_path = self._ws_link = ''
+            pm_name, pm_path = None, ''
+        self._at_cache = None        # 索引根可能变了，@ 候选缓存失效
+        if ag is not None:
+            try:
+                ag._ga_project_mode_name = pm_name
+                ag._ga_project_mode_workspace_path = pm_path
+            except Exception:
+                pass
+            # 持久化绑定/off → /continue 即时恢复，不必先聊一轮留 PROJECT MODE 块。
+            if persist:
+                workspace_cmd.session_ws_set(getattr(ag, "log_path", "") or "", pm_path or "")
+        at_complete.get_index(self._at_root()).warm()   # 预热新根（或 CWD）
+
+    def _do_workspace_activate(self, path: str) -> str:
+        r = workspace_cmd.prepare(path)
+        if not r.get('ok'):
+            return _t('ws.fail', default='❌ workspace 设定失败: {e}').format(e=r.get('error'))
+        self._bind_workspace(r)
+        # 显示名去 hash：真实目录 basename，退回剥 name 尾 hash。
+        disp = (os.path.basename((r.get('target') or '').rstrip('/\\'))
+                or re.sub(r'-[0-9a-f]{8}$', '', r.get('name') or ''))
+        out = _t('ws.entered', default='✅ 已进入 workspace「{n}」').format(n=disp)
+        if r.get('warning'):
+            out += '  ⚠ ' + r['warning']
+        return out
+
+    def _cmd_workspace(self, arg: str) -> None:
+        arg = (arg or '').strip()
+        if arg.lower() == 'off':
+            if self._ws_name:
+                self._bind_workspace(None)
+                self.commit([_DIM + _t('ws.exited',
+                            default='已退出 workspace（项目模式关闭；junction 与文件保留）') + _RST])
+            else:
+                self.commit([_DIM + _t('ws.inactive', default='当前未处于 workspace 模式') + _RST])
+            return
+        if arg:                                  # 直接路径：设定/进入
+            self.commit([self._do_workspace_activate(arg)])
+            return
+        # 无参 → 菜单选已登记 workspace（去 hash / 名称末尾省略 / 路径中间省略）。
+        items = workspace_cmd.registry_list()
+        if not items:
+            self.commit([_DIM + _t('ws.none',
+                        default='暂无已登记 workspace；用 /workspace <绝对路径> 新建/进入') + _RST])
+            return
+        options: list[str] = []
+        paths: list[str] = []
+        fkeys: list[str] = []
+        for it in items:
+            disp = (os.path.basename((it['path'] or '').rstrip('/\\'))
+                    or re.sub(r'-[0-9a-f]{8}$', '', it['name']))
+            age = _rel(it['last_used']) if it['last_used'] else '—'
+            mem = (f"{it['mem_lines']}行" if it['mem_lines'] else '空')
+            flag = ' ⚠' if it['dangling'] else ''
+            options.append(f"{_cell_head(disp, 22)} · {_cell_mid(it['path'], 46)} · {age} · {mem}{flag}")
+            paths.append(it['path'])
+            # 搜索键含完整路径（显示中间省略，但搜索看完整 — 与 v2 _filter_choices 一致）。
+            fkeys.append(f"{disp} {it['path']}")
+
+        def _pick(idx: int) -> None:
+            self.commit([self._do_workspace_activate(paths[idx])])
+
+        def _free(q: str) -> None:                  # 输入框内回车一个绝对路径 → 新建/进入
+            self.commit([self._do_workspace_activate(q)])
+
+        self._show_menu(_t('ws.pick.title',
+                        default='选择 workspace（输入过滤 / 绝对路径回车新建 · ↑↓ 选 · Esc 取消）'),
+                        options, _pick, filterable=True, free_input=True,
+                        on_free=_free, filter_keys=fkeys)
 
     def _cmd(self, raw: str) -> None:
         assert self._bridge is not None
@@ -4146,14 +4520,15 @@ class SB:
         #     self.commit([_t('err.multi_session', name=name)])
         elif name == 'continue':
             from frontends import continue_cmd
-            sess = continue_cmd.list_sessions(exclude_pid=os.getpid())
+            sess = continue_cmd.list_sessions(exclude_log=os.path.basename(getattr(ag, "log_path", "") or ""))
             if not sess:
                 self.commit([_DIM + _t('msg.no_history') + _RST]); return
 
-            def _do_restore(path: str) -> None:
-                msg, _ = continue_cmd.restore(ag, path)
+            def _rc_finish(path: str, msg: str) -> None:
+                # restore 后:重放对话到 scrollback + 恢复 workspace。读 ag.log_path
+                # (原地=源文件本身;拷贝=内容相同的新副本),内容一致。
                 self.commit([_DIM + '┄┄ ' + _t('msg.continue_loading', name=os.path.basename(path)) + ' ┄┄' + _RST])
-                for mm in continue_cmd.extract_ui_messages(path):
+                for mm in continue_cmd.extract_ui_messages(getattr(ag, 'log_path', '') or path):
                     c = (mm.get('content') or '').strip()
                     if not c:
                         continue
@@ -4162,6 +4537,47 @@ class SB:
                     else:
                         self._commit_assistant(c)
                 self.commit([_DIM + '┄┄ ' + _t('msg.continue_ready', msg=msg) + ' ┄┄' + _RST])
+                # 自动恢复 workspace：续接的会话若在某个已登记 workspace 里工作过，
+                # 重新绑定（必要时重建 junction），不触碰 project_mode 的进程锚。
+                # persist=False：reset 绑定绝不写 session→ws 映射表——原地续把
+                # agent.log_path 指回 path，若持久化会把本会话映射抹成 ""，在读回
+                # 之前就毁掉自动恢复。
+                self._bind_workspace(None, persist=False)
+                try:
+                    rec = workspace_cmd.session_ws_get(path)   # 路径 / "" (off) / None(无记录)
+                    if rec is not None:
+                        ws_path = rec or None                  # "" → 该会话已 off，明确不恢复
+                    else:
+                        info = workspace_cmd.workspace_from_log(path)   # 老会话：回退扫日志
+                        ws_path = info['path'] if info else None
+                    if ws_path:
+                        r = workspace_cmd.prepare(ws_path)
+                        if r.get('ok'):
+                            self._bind_workspace(r)
+                            self.commit([_DIM + '⌂ ' + _t('ws.restored',
+                                         default='已恢复工作目录: {t}').format(t=r['target']) + _RST])
+                except Exception:
+                    pass
+
+            def _do_restore(path: str) -> None:
+                # 默认原地续。快照只能拷贝续;若被活进程占用 → 弹窗问是否拷贝一份。
+                if continue_cmd.is_snapshot(path):
+                    msg, _ = continue_cmd.continue_copy(ag, path)
+                    _rc_finish(path, msg); return
+                occ = continue_cmd.session_occupant(path)
+                if occ is not None:
+                    def _pick(i):
+                        if i == 0:
+                            msg, _ = continue_cmd.continue_copy(ag, path)
+                            _rc_finish(path, msg)
+                    self._show_menu(
+                        _t('continue.occupied.title', p=occ.get('pid', '?')),
+                        [_t('continue.occupied.copy'),
+                         _t('continue.occupied.cancel')],
+                        _pick)
+                    return
+                msg, _ = continue_cmd.continue_inplace(ag, path)
+                _rc_finish(path, msg)
 
             if arg:
                 # Direct numeric argument still supported for power users / scripts.
@@ -4199,6 +4615,8 @@ class SB:
                 _do_restore(sess[idx][0])
 
             self._show_menu(_t('continue.title'), options, _pick_session)
+        elif name == 'workspace':
+            self._cmd_workspace(arg)
         elif name == 'clear':
             self._reset_session(ag)
             self.commit([_DIM + _t('msg.cleared') + _RST])
@@ -5121,11 +5539,28 @@ class SB:
             if self._menu_active:
                 n = len(self._menu_options)
                 if o == 0x10:                                # ↑
-                    if n:
+                    if self._menu_filterable:
+                        # ring [input(-1), 0..n-1]: ↑ from input → last cand;
+                        # ↑ from first cand → input; else step up.
+                        if self._menu_sel < 0:
+                            self._menu_sel = n - 1 if n else -1
+                        elif self._menu_sel == 0:
+                            self._menu_sel = -1
+                        else:
+                            self._menu_sel -= 1
+                    elif n:
                         self._menu_sel = max(0, self._menu_sel - 1)
                     self._render_live(); continue
                 if o == 0x0e:                                # ↓
-                    if n:
+                    if self._menu_filterable:
+                        # ↓ from input → first cand; ↓ from last cand → input.
+                        if self._menu_sel < 0:
+                            self._menu_sel = 0 if n else -1
+                        elif self._menu_sel >= n - 1:
+                            self._menu_sel = -1
+                        else:
+                            self._menu_sel += 1
+                    elif n:
                         self._menu_sel = min(n - 1, self._menu_sel + 1)
                     self._render_live(); continue
                 if self._menu_multi and ch == ' ':            # Space toggles
@@ -5148,6 +5583,19 @@ class SB:
                     # a one-handed rollback without reaching for Esc.
                     # Menus with no on_cancel just dismiss.
                     self._menu_cancel(); continue
+                # Filterable menu (e.g. /workspace): printable chars + Backspace
+                # edit a live query that filters rows; everything else (arrows
+                # 0x10/0x0e/0x02/0x06 are < 0x20) still falls through to swallow.
+                if self._menu_filterable:
+                    if o in (0x08, 0x7f):                     # Backspace / Del
+                        if self._menu_query:
+                            self._menu_query = self._menu_query[:-1]
+                            self._menu_apply_filter()
+                        self._render_live(); continue
+                    if o >= 0x20 and o != 0x7f:               # printable → append to query
+                        self._menu_query += ch
+                        self._menu_apply_filter()
+                        self._render_live(); continue
                 # swallow everything else while the menu is up
                 continue
             # ── ask_user picker key intercept ───────────────────────────────
@@ -5220,7 +5668,7 @@ class SB:
                 self._stash_draft()
             elif o == 0x0e:                       # ↓ visual-row down (history at bottom)
                 if self._palette_visible():
-                    n = len(self._cmd_matches(self.buf))
+                    n = self._palette_total()
                     self._palette_sel = min(n - 1, self._palette_sel + 1) if n else 0
                 else:
                     self._sel = None
@@ -5253,6 +5701,14 @@ class SB:
             elif o == 0x01:                       # Ctrl+A — select all
                 if self.buf:
                     self._sel = 0; self.pos = len(self.buf)
+            elif o == 0x07:                       # Home — jump to line start
+                self._sel = None
+                _, _, ls, _ = self._line_region()
+                self.pos = ls
+            elif o == 0x14:                       # End — jump to line end
+                self._sel = None
+                _, _, _, le = self._line_region()
+                self.pos = le
             elif o == 0x18:                       # Ctrl+X — cut selection
                 r = self._sel_range()
                 if r:
@@ -5581,6 +6037,11 @@ def main(argv: list[str] | None = None) -> int:
         print(_t('err.no_tty'))
         return 1
     _sweep_stale_task_dirs()  # clear empty signal dirs left by prior runs
+    try: workspace_cmd.cleanup()  # remove dangling/unregistered workspace junctions
+    except Exception: pass
+    try: workspace_cmd.session_map_prune()  # drop session→ws entries whose log is gone
+    except Exception: pass
+    at_complete.get_index(os.path.join(_ROOT, "temp")).warm()   # @ 补全：预热未绑时的默认根（temp）
     SB().run()
     return 0
 
