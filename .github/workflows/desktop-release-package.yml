@@ -192,26 +192,29 @@ jobs:
         run: |
           set -euo pipefail
           TAG_NAME="${{ github.ref_name }}"
-          TITLE="GenericAgent Desktop Portable ${TAG_NAME}"
+          TITLE="GenericAgent Desktop ${TAG_NAME}"
           cat > "${RUNNER_TEMP:-/tmp}/ga_notes.md" <<'EOF'
-          GenericAgent Desktop 便携版（自包含） / Portable (self-contained)
+          GenericAgent Desktop 桌面版 / Desktop
 
-          下载对应平台的包，解压即可运行——无需装 Python、无需联网装依赖、无需源码。
-          Download your platform's package, extract and run — no Python install, no internet for deps, no source.
+          无需自行安装 Python、无需联网安装依赖、无需源码；首次启动会自动准备内置运行环境。
+          No separate Python install, no internet for dependencies, no source checkout required; the bundled runtime is prepared on first launch.
 
-          ## 产物 / Downloads
-          - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
-          - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
-          - macOS: `GenericAgent-Desktop-macOS.dmg`（标准安装）或 `GenericAgent-Desktop-macOS-Portable.zip`（便携版）
+          ## 安装方法 / Installation
+          - Windows: 下载 `GenericAgent-Desktop-Windows-Portable.zip`，解压后双击 `GenericAgent.exe` 启动。卸载时先退出应用，再双击包内 `uninstall.bat`，最后删除整个解压目录。
+            Download `GenericAgent-Desktop-Windows-Portable.zip`, extract it, then double-click `GenericAgent.exe`. To uninstall, quit the app, double-click `uninstall.bat`, then delete the extracted folder.
+          - Linux: 下载 `GenericAgent-Desktop-Linux-Portable.tar.gz`，解压后执行 `chmod +x GenericAgent.AppImage`，再运行 `./GenericAgent.AppImage`。卸载时先退出应用，再运行 `./uninstall.sh`，最后删除整个解压目录。
+            Download `GenericAgent-Desktop-Linux-Portable.tar.gz`, extract it, run `chmod +x GenericAgent.AppImage`, then launch `./GenericAgent.AppImage`. To uninstall, quit the app, run `./uninstall.sh`, then delete the extracted folder.
+          - macOS: 下载 `GenericAgent-Desktop-macOS.dmg`，双击打开 DMG，把 `GenericAgent.app` 拖入 `Applications`，之后在“应用程序 / Applications”中启动。卸载时先退出应用，再从 Applications 删除 `GenericAgent.app`。
+            Download `GenericAgent-Desktop-macOS.dmg`, open it, drag `GenericAgent.app` to `Applications`, then launch it from Applications. To uninstall, quit the app, then delete `GenericAgent.app` from Applications.
 
           ## 首次启动 / First launch
-          首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
-          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are instant.
+          首次启动会自动离线准备运行环境（安装依赖），有进度条，完成后进入主界面；之后启动会更快。
+          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are faster.
 
           ## 说明 / Notes
           - 想真正对话需在程序内配置模型 / API Key。Configure a model / API key in-app to start chatting.
-          - 便携包可整体移动到任意目录后继续使用。The whole folder can be moved anywhere and still works.
-          - 各包内附「安装使用说明_Install_Guide.txt」（中英）。Each package ships a bilingual install guide.
+          - Windows/Linux 为便携包，可整体移动到任意目录后继续使用。Windows/Linux packages are portable and can be moved as a whole folder.
+          - Windows/Linux 包内附「安装使用说明_Install_Guide.txt」（中英）。Windows/Linux packages include a bilingual install guide.
           EOF
           # Create the shared release if it does not exist yet (another OS job may win the race).
           # Race-safe: the 3 OS jobs share ONE release. Retry create until the release
@@ -401,26 +404,29 @@ jobs:
         run: |
           set -euo pipefail
           TAG_NAME="${{ github.ref_name }}"
-          TITLE="GenericAgent Desktop Portable ${TAG_NAME}"
+          TITLE="GenericAgent Desktop ${TAG_NAME}"
           cat > "${RUNNER_TEMP:-/tmp}/ga_notes.md" <<'EOF'
-          GenericAgent Desktop 便携版（自包含） / Portable (self-contained)
+          GenericAgent Desktop 桌面版 / Desktop
 
-          下载对应平台的包，解压即可运行——无需装 Python、无需联网装依赖、无需源码。
-          Download your platform's package, extract and run — no Python install, no internet for deps, no source.
+          无需自行安装 Python、无需联网安装依赖、无需源码；首次启动会自动准备内置运行环境。
+          No separate Python install, no internet for dependencies, no source checkout required; the bundled runtime is prepared on first launch.
 
-          ## 产物 / Downloads
-          - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
-          - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
-          - macOS: `GenericAgent-Desktop-macOS.dmg`（标准安装）或 `GenericAgent-Desktop-macOS-Portable.zip`（便携版）
+          ## 安装方法 / Installation
+          - Windows: 下载 `GenericAgent-Desktop-Windows-Portable.zip`，解压后双击 `GenericAgent.exe` 启动。卸载时先退出应用，再双击包内 `uninstall.bat`，最后删除整个解压目录。
+            Download `GenericAgent-Desktop-Windows-Portable.zip`, extract it, then double-click `GenericAgent.exe`. To uninstall, quit the app, double-click `uninstall.bat`, then delete the extracted folder.
+          - Linux: 下载 `GenericAgent-Desktop-Linux-Portable.tar.gz`，解压后执行 `chmod +x GenericAgent.AppImage`，再运行 `./GenericAgent.AppImage`。卸载时先退出应用，再运行 `./uninstall.sh`，最后删除整个解压目录。
+            Download `GenericAgent-Desktop-Linux-Portable.tar.gz`, extract it, run `chmod +x GenericAgent.AppImage`, then launch `./GenericAgent.AppImage`. To uninstall, quit the app, run `./uninstall.sh`, then delete the extracted folder.
+          - macOS: 下载 `GenericAgent-Desktop-macOS.dmg`，双击打开 DMG，把 `GenericAgent.app` 拖入 `Applications`，之后在“应用程序 / Applications”中启动。卸载时先退出应用，再从 Applications 删除 `GenericAgent.app`。
+            Download `GenericAgent-Desktop-macOS.dmg`, open it, drag `GenericAgent.app` to `Applications`, then launch it from Applications. To uninstall, quit the app, then delete `GenericAgent.app` from Applications.
 
           ## 首次启动 / First launch
-          首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
-          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are instant.
+          首次启动会自动离线准备运行环境（安装依赖），有进度条，完成后进入主界面；之后启动会更快。
+          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are faster.
 
           ## 说明 / Notes
           - 想真正对话需在程序内配置模型 / API Key。Configure a model / API key in-app to start chatting.
-          - 便携包可整体移动到任意目录后继续使用。The whole folder can be moved anywhere and still works.
-          - 各包内附「安装使用说明_Install_Guide.txt」（中英）。Each package ships a bilingual install guide.
+          - Windows/Linux 为便携包，可整体移动到任意目录后继续使用。Windows/Linux packages are portable and can be moved as a whole folder.
+          - Windows/Linux 包内附「安装使用说明_Install_Guide.txt」（中英）。Windows/Linux packages include a bilingual install guide.
           EOF
           # Race-safe: the 3 OS jobs share ONE release. Retry create until the release
           # actually exists (a simultaneous create from another job can fail), so the
@@ -434,7 +440,7 @@ jobs:
 
   # ----------------------------------------------------------------------------
   build-macos:
-    name: macOS portable
+    name: macOS DMG
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event.inputs.target == 'all' || github.event.inputs.target == 'macos' }}
     runs-on: macos-latest
     steps:
@@ -588,7 +594,6 @@ jobs:
             find GenericAgent.app runtime -type f -print0 | sort -z | xargs -0 shasum -a 256 >> SHA256SUMS-macos.txt )
 
           mkdir -p artifacts/macos/out
-          ( cd artifacts/macos && zip -qry out/GenericAgent-Desktop-macOS-Portable.zip GenericAgent-Desktop-macOS-Portable )
           hdiutil create \
             -volname "GenericAgent Desktop" \
             -srcfolder "$DMG_STAGE" \
@@ -607,7 +612,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GenericAgent-Desktop-macOS-Portable-${{ github.run_number }}
+          name: GenericAgent-Desktop-macOS-DMG-${{ github.run_number }}
           path: artifacts/macos/out/*
           if-no-files-found: error
 
@@ -619,26 +624,29 @@ jobs:
         run: |
           set -euo pipefail
           TAG_NAME="${{ github.ref_name }}"
-          TITLE="GenericAgent Desktop Portable ${TAG_NAME}"
+          TITLE="GenericAgent Desktop ${TAG_NAME}"
           cat > "${RUNNER_TEMP:-/tmp}/ga_notes.md" <<'EOF'
-          GenericAgent Desktop 便携版（自包含） / Portable (self-contained)
+          GenericAgent Desktop 桌面版 / Desktop
 
-          下载对应平台的包，解压即可运行——无需装 Python、无需联网装依赖、无需源码。
-          Download your platform's package, extract and run — no Python install, no internet for deps, no source.
+          无需自行安装 Python、无需联网安装依赖、无需源码；首次启动会自动准备内置运行环境。
+          No separate Python install, no internet for dependencies, no source checkout required; the bundled runtime is prepared on first launch.
 
-          ## 产物 / Downloads
-          - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
-          - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
-          - macOS: `GenericAgent-Desktop-macOS.dmg`（标准安装）或 `GenericAgent-Desktop-macOS-Portable.zip`（便携版）
+          ## 安装方法 / Installation
+          - Windows: 下载 `GenericAgent-Desktop-Windows-Portable.zip`，解压后双击 `GenericAgent.exe` 启动。卸载时先退出应用，再双击包内 `uninstall.bat`，最后删除整个解压目录。
+            Download `GenericAgent-Desktop-Windows-Portable.zip`, extract it, then double-click `GenericAgent.exe`. To uninstall, quit the app, double-click `uninstall.bat`, then delete the extracted folder.
+          - Linux: 下载 `GenericAgent-Desktop-Linux-Portable.tar.gz`，解压后执行 `chmod +x GenericAgent.AppImage`，再运行 `./GenericAgent.AppImage`。卸载时先退出应用，再运行 `./uninstall.sh`，最后删除整个解压目录。
+            Download `GenericAgent-Desktop-Linux-Portable.tar.gz`, extract it, run `chmod +x GenericAgent.AppImage`, then launch `./GenericAgent.AppImage`. To uninstall, quit the app, run `./uninstall.sh`, then delete the extracted folder.
+          - macOS: 下载 `GenericAgent-Desktop-macOS.dmg`，双击打开 DMG，把 `GenericAgent.app` 拖入 `Applications`，之后在“应用程序 / Applications”中启动。卸载时先退出应用，再从 Applications 删除 `GenericAgent.app`。
+            Download `GenericAgent-Desktop-macOS.dmg`, open it, drag `GenericAgent.app` to `Applications`, then launch it from Applications. To uninstall, quit the app, then delete `GenericAgent.app` from Applications.
 
           ## 首次启动 / First launch
-          首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
-          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are instant.
+          首次启动会自动离线准备运行环境（安装依赖），有进度条，完成后进入主界面；之后启动会更快。
+          The first launch prepares the runtime offline (installs deps) with a progress bar, then opens the main window; later launches are faster.
 
           ## 说明 / Notes
           - 想真正对话需在程序内配置模型 / API Key。Configure a model / API key in-app to start chatting.
-          - 便携包可整体移动到任意目录后继续使用。The whole folder can be moved anywhere and still works.
-          - 各包内附「安装使用说明_Install_Guide.txt」（中英）。Each package ships a bilingual install guide.
+          - Windows/Linux 为便携包，可整体移动到任意目录后继续使用。Windows/Linux packages are portable and can be moved as a whole folder.
+          - Windows/Linux 包内附「安装使用说明_Install_Guide.txt」（中英）。Windows/Linux packages include a bilingual install guide.
           EOF
           # Race-safe: the 3 OS jobs share ONE release. Retry create until the release
           # actually exists (a simultaneous create from another job can fail), so the
