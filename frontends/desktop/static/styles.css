@@ -16,7 +16,7 @@
 :root{
   --font-sans:-apple-system,BlinkMacSystemFont,system-ui,"Segoe UI Variable","Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei UI","Microsoft YaHei",sans-serif,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",emoji;
   --font-brand:"GA Azonix",var(--font-sans);
-  --font-mono:"GA JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+  --font-mono:"GA JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Monaco,Consolas,"Liberation Mono","Courier New","PingFang SC","Hiragino Sans GB","Microsoft YaHei UI","Microsoft YaHei",monospace;
   --font-num:var(--font-mono);
   --font-num-variant:lining-nums tabular-nums;
   --chat-col-w:760px;
@@ -61,14 +61,16 @@
   --ok-strong:#2f9e54;
   --ok-bg:#e9f7ee;
   --ok-ring:#39a85a33;
-  /* 墨绿:发送键专用 */
-  --ink-green:#1f6f53;
-  --ink-green-hover:#175a44;
+  /* 发送键专用：浅色=黑色，深色在 dark 块里覆盖为深蓝 */
+  --ink-green:#1a1a1a;
+  --ink-green-hover:#000000;
   --danger:#d64545;
   --danger-dot:#e23b3b;
   --danger-text:#d3514f;
   --danger-bg:#fdeceb;
   --danger-ring:#e23b3b38;
+  --confirm-primary-bg:#1a1a1a;
+  --confirm-primary-fg:#ffffff;
   --success:var(--ok-strong);
   --success-bg:var(--ok-bg);
   --success-ring:var(--ok-ring);
@@ -159,6 +161,8 @@ html[data-appearance="dark"]{
   --danger-text:#ff7b72;
   --danger-bg:#2d1515;
   --danger-ring:#f8514938;
+  --confirm-primary-bg:#e6edf3;
+  --confirm-primary-fg:#161b22;
   --overlay:#010409a6;
   --shadow:0 1px 2px #01040966, 0 8px 24px #01040966;
   --shadow-pop:0 8px 24px #01040999;
@@ -172,6 +176,9 @@ html[data-appearance="dark"]{
   --fold-result-bg:#15241a;
   --divider-base:#569cd6;
   --divider:var(--divider-base);
+  /* 发送键：深色用鲜亮深蓝 */
+  --ink-green:#2559d8;
+  --ink-green-hover:#3a6ef0;
 }
 html[data-appearance="dark"][data-theme]{
   --accent-bg:color-mix(in srgb, var(--accent) 22%, var(--panel));
@@ -194,6 +201,7 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 .modal[hidden]{ display:none; }
 /* 添加模型是从「配置」里二级弹出，需盖在配置之上 */
 #add-model-modal{ z-index:600; }
+#confirm-modal{ z-index:700; }
 .modal-backdrop{ position:absolute; inset:0; background:var(--overlay); }
 .modal-card{
   position:relative; width:420px; max-width:92vw; max-height:86vh; overflow:hidden;
@@ -326,14 +334,15 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 .chat-font-scale-max{ grid-column:11; justify-self:end; }
 
 /* 颜色色盘已删除(只保留灰色亮色主题) */
-.model-list{ display:flex; flex-direction:column; gap:4px; margin-bottom:10px; max-height:160px; overflow:auto; }
+.model-list{ display:flex; flex-direction:column; gap:4px; margin-bottom:10px; max-height:340px; overflow:auto; }
 .model-row{
   display:flex; align-items:center; gap:10px; padding:8px 10px;
   border:1px solid var(--line); border-radius:4px; background:var(--field-bg);
   cursor:pointer; font-size:13px; color:var(--txt-2); transition:.12s;
 }
 .model-row:hover{ background:var(--line-soft); border-color:var(--line-strong); }
-.model-row.sel{ background:var(--accent-bg); border-color:var(--accent); color:var(--accent); font-weight:500; }
+/* 选中态：文字用强调色 --txt-strong（而非偏灰的 --accent），保证选中后只会更清晰、不会变淡 */
+.model-row.sel{ background:var(--accent-bg); border-color:var(--accent); color:var(--txt-strong); }
 .model-row input{ accent-color:var(--accent); flex:0 0 auto; pointer-events:none; }
 .flag{ width:20px; height:14px; flex:0 0 auto; border-radius:2px; box-shadow:0 0 0 1px var(--line); display:inline-block; }
 .model-row-name{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -351,6 +360,46 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 .model-act-del:hover{ color:var(--danger-text); }
 .model-act svg{ width:14px; height:14px; pointer-events:none; }
 .set-empty{ font-size:12px; color:var(--muted); padding:6px 0; }
+/* 聚合渠道分组：与独立模型同款行样式，仅多一个折叠箭头，且紧贴下方独立模型 */
+.model-group{ display:flex; flex-direction:column; gap:4px; }
+.model-mixin-caret{ display:flex; align-items:center; justify-content:center; flex:0 0 auto; height:28px; color:var(--muted); cursor:pointer; }
+/* 渠道组是中文标签而非代码标识符，用界面 sans 字体，避免落到等宽字体的中文回退 */
+.model-row--mixin .model-row-name{ font-family:var(--font-sans); }
+.model-mixin-caret svg{ width:13px; height:13px; pointer-events:none; }
+.model-mixin-body{ display:flex; flex-direction:column; gap:3px; margin:2px 0 2px 14px; padding-left:10px; border-left:1px dashed var(--line-strong); }
+.model-mixin-empty{ font-size:12px; color:var(--muted); padding:4px 2px; }
+.model-member{ display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:4px; font-size:12px; color:var(--txt-2); background:var(--field-bg); border:1px solid var(--line); }
+.model-member:hover{ background:var(--line-soft); }
+.model-member.dragging{ opacity:.78; box-shadow:0 3px 12px rgba(0,0,0,.12); }
+.model-member-drag{
+  width:16px; height:20px; flex:0 0 auto; border:none; background:transparent; color:var(--muted);
+  border-radius:4px; display:flex; align-items:center; justify-content:center; padding:0;
+  cursor:grab; touch-action:none; user-select:none;
+}
+.model-member-drag:active{ cursor:grabbing; }
+.grip-dot{
+  width:2px; height:2px; border-radius:50%; background:currentColor;
+  box-shadow:0 -4px 0 currentColor, 0 4px 0 currentColor, 5px -4px 0 currentColor, 5px 0 0 currentColor, 5px 4px 0 currentColor;
+  transform:translateX(-2.5px); opacity:.68;
+}
+.model-member:hover .model-member-drag{ color:var(--txt-2); background:var(--hover-dim); }
+.mixin-dragging{ cursor:grabbing; }
+.model-member-name{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.model-member .model-act{ width:22px; height:22px; opacity:.6; }
+.model-member:hover .model-act{ opacity:1; }
+.model-act-addmix:hover{ color:var(--accent); }
+/* 已在渠道组：➕ 仍是「加入」按钮，但给个淡淡的 accent 提示，点击只弹「已在渠道组中」 */
+.model-act-addmix.is-in{ color:var(--accent); opacity:.5; }
+.model-act-addmix.is-in:hover{ opacity:.8; }
+/* 轻提示 toast（屏幕顶部）*/
+.ga-toast{
+  position:fixed; left:50%; top:72px; transform:translateX(-50%) translateY(-8px);
+  background:var(--card); color:var(--txt); border:1px solid var(--line-strong);
+  border-radius:6px; padding:10px 18px; font-size:13px; font-family:var(--font-sans);
+  box-shadow:0 8px 28px rgba(0,0,0,.24); opacity:0; pointer-events:none;
+  transition:opacity .18s, transform .18s; z-index:9999;
+}
+.ga-toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
 .set-btn{
   width:100%; display:flex; align-items:center; gap:8px;
   border:1px solid var(--line); background:var(--card); color:var(--txt-2);
@@ -359,9 +408,12 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 }
 .set-btn svg{ width:15px; height:15px; flex:0 0 auto; color:var(--accent); }
 .set-btn:hover{ background:var(--line-soft); border-color:var(--line-strong); }
-.set-btn.primary{ background:var(--accent); color:var(--on-accent); border-color:var(--accent); }
+.set-btn.primary{ background:var(--confirm-primary-bg); color:var(--confirm-primary-fg); border-color:var(--confirm-primary-bg); }
 .set-btn.primary:hover{ filter:brightness(1.05); }
+.set-btn.danger{ background:var(--danger-bg); color:var(--danger-text); border-color:var(--danger-ring); }
+.set-btn.danger:hover{ background:var(--danger-bg); border-color:var(--danger-text); }
 .set-btn.ghost{ background:transparent; }
+.set-btn-follow{ margin-top:8px; }
 .model-form-body{ min-height:0; }
 .model-form{ padding:18px; display:flex; flex-direction:column; gap:12px; }
 .model-form label{ display:flex; flex-direction:column; gap:5px; font-size:12px; font-weight:500; color:var(--txt-2); }
@@ -571,7 +623,13 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
   display:flex; align-items:center; justify-content:center; cursor:pointer;
 }
 .model-guide-copy:hover{ color:var(--accent); border-color:var(--accent); }
+.model-guide-copy svg{ width:14px; height:14px; display:block; }
 .model-guide-tip{ margin:8px 0 0; font-size:11px; color:var(--muted); line-height:1.35; }
+.confirm-card{ width:360px; }
+.confirm-body{ min-height:0; padding:18px; }
+.confirm-message{ white-space:pre-wrap; color:var(--txt-2); font-size:13px; line-height:1.55; }
+.confirm-actions{ display:flex; gap:10px; margin-top:18px; }
+.confirm-actions .set-btn{ flex:1; justify-content:center; }
 
 /* ============ 中间主区 ============ */
 .main{
@@ -1109,12 +1167,20 @@ span.flatpickr-weekday{ color:var(--muted) !important; font-size:11px; }
 .tok-table td:nth-child(n+2):nth-child(-n+5){ width:80px; }
 .tok-table th:nth-child(6),
 .tok-table td:nth-child(6){ width:85px; }
+/* Conductor tab 只有两行汇总: 用自动列宽铺满,数字列均匀分布,不让首列吃掉所有空间 */
+.tok-table--conductor{ table-layout:auto; }
+.tok-table--conductor th:first-child, .tok-table--conductor td:first-child{ overflow:visible; white-space:nowrap; }
+.tok-table--conductor th:nth-child(n+2):nth-child(-n+5),
+.tok-table--conductor td:nth-child(n+2):nth-child(-n+5),
+.tok-table--conductor th:nth-child(6),
+.tok-table--conductor td:nth-child(6){ width:auto; }
 .tok-row-session{ cursor:pointer; }
 .tok-row-session:hover td{ background:var(--hover-dim); }
 .tok-row-session td:first-child::before{ content:'▶'; margin-right:6px; font-size:10px; color:var(--muted2); transition:transform .15s; display:inline-block; }
 .tok-row-session.open td:first-child::before{ transform:rotate(90deg); }
 .tok-row-conductor{ cursor:default; }
 .tok-row-conductor td:first-child::before{ content:''; margin:0; }
+.tok-cond-ico{ width:1em; height:1em; vertical-align:-0.15em; margin-right:5px; }
 .tok-row-conductor:hover td{ background:var(--hover-dim); }
 .tok-detail td{ padding:5px 12px 5px 32px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--line-soft); background:var(--field-bg); }
 .tok-detail td:not(:first-child){ text-align:right; }
@@ -1660,7 +1726,17 @@ html[data-appearance="dark"] .plan-item--warn .plan-item-text{ color:#f0a020; }
   font-variant-numeric:var(--font-num-variant);
 }
 .ga-menu-item:hover{ background:var(--hover-2); }
-.ga-menu-item.active{ color:var(--accent); }
+.ga-menu-item.active{ color:var(--txt-strong); }  /* 选中项用强调色而非发灰的 --accent，避免变淡 */
+/* 浅色模式：模型下拉里选中项仅靠文字色区分太弱——加背景 + 加粗，一眼可辨 */
+html[data-appearance="light"] .ga-menu-item.active{
+  background:color-mix(in srgb, var(--accent) 16%, var(--panel));
+  font-weight:700;
+}
+/* 深色模式：同样处理 */
+html[data-appearance="dark"] .ga-menu-item.active{
+  background:color-mix(in srgb, var(--accent) 22%, var(--panel));
+  font-weight:700;
+}
 .composer-menu .ga-menu-item{
   display:flex; align-items:center; gap:8px;
 }
