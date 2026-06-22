@@ -1714,16 +1714,14 @@ html[data-appearance="dark"] .plan-item--warn .plan-item-text{ color:#f0a020; }
 }
 .ga-menu-item:hover{ background:var(--hover-2); }
 .ga-menu-item.active{ color:var(--txt-strong); }  /* 选中项用强调色而非发灰的 --accent，避免变淡 */
-/* 浅色模式：模型下拉里选中项仅靠文字色区分太弱——加背景 + accent 竖条 + 加粗，一眼可辨 */
+/* 浅色模式：模型下拉里选中项仅靠文字色区分太弱——加背景 + 加粗，一眼可辨 */
 html[data-appearance="light"] .ga-menu-item.active{
   background:color-mix(in srgb, var(--accent) 16%, var(--panel));
-  box-shadow:inset 3px 0 0 0 var(--accent);
   font-weight:700;
 }
-/* 深色模式：同样处理，竖条用偏暗的白 */
+/* 深色模式：同样处理 */
 html[data-appearance="dark"] .ga-menu-item.active{
   background:color-mix(in srgb, var(--accent) 22%, var(--panel));
-  box-shadow:inset 3px 0 0 0 #c9d1d9;
   font-weight:700;
 }
 .composer-menu .ga-menu-item{
