@@ -197,6 +197,7 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 .modal[hidden]{ display:none; }
 /* 添加模型是从「配置」里二级弹出，需盖在配置之上 */
 #add-model-modal{ z-index:600; }
+#confirm-modal{ z-index:700; }
 .modal-backdrop{ position:absolute; inset:0; background:var(--overlay); }
 .modal-card{
   position:relative; width:420px; max-width:92vw; max-height:86vh; overflow:hidden;
@@ -405,6 +406,8 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
 .set-btn:hover{ background:var(--line-soft); border-color:var(--line-strong); }
 .set-btn.primary{ background:var(--accent); color:var(--on-accent); border-color:var(--accent); }
 .set-btn.primary:hover{ filter:brightness(1.05); }
+.set-btn.danger{ background:var(--danger-bg); color:var(--danger-text); border-color:var(--danger-ring); }
+.set-btn.danger:hover{ background:var(--danger-bg); border-color:var(--danger-text); }
 .set-btn.ghost{ background:transparent; }
 .set-btn-follow{ margin-top:8px; }
 .model-form-body{ min-height:0; }
@@ -616,7 +619,13 @@ body{ background:var(--bg); color:var(--txt); font-size:13px; overflow:hidden; f
   display:flex; align-items:center; justify-content:center; cursor:pointer;
 }
 .model-guide-copy:hover{ color:var(--accent); border-color:var(--accent); }
+.model-guide-copy svg{ width:14px; height:14px; display:block; }
 .model-guide-tip{ margin:8px 0 0; font-size:11px; color:var(--muted); line-height:1.35; }
+.confirm-card{ width:360px; }
+.confirm-body{ min-height:0; padding:18px; }
+.confirm-message{ white-space:pre-wrap; color:var(--txt-2); font-size:13px; line-height:1.55; }
+.confirm-actions{ display:flex; gap:10px; margin-top:18px; }
+.confirm-actions .set-btn{ flex:1; justify-content:center; }
 
 /* ============ 中间主区 ============ */
 .main{

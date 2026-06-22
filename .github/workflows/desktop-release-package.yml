@@ -202,7 +202,7 @@ jobs:
           ## 产物 / Downloads
           - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
           - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
-          - macOS: `GenericAgent-Desktop-macOS-Portable.zip` — 双击 / double-click `Start GenericAgent.command`
+          - macOS: `GenericAgent-Desktop-macOS-Portable.dmg`（或 zip）— 双击 / double-click `Start GenericAgent.command`
 
           ## 首次启动 / First launch
           首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
@@ -411,7 +411,7 @@ jobs:
           ## 产物 / Downloads
           - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
           - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
-          - macOS: `GenericAgent-Desktop-macOS-Portable.zip` — 双击 / double-click `Start GenericAgent.command`
+          - macOS: `GenericAgent-Desktop-macOS-Portable.dmg`（或 zip）— 双击 / double-click `Start GenericAgent.command`
 
           ## 首次启动 / First launch
           首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
@@ -602,6 +602,14 @@ jobs:
 
           mkdir -p artifacts/macos/out
           ( cd artifacts/macos && zip -qry out/GenericAgent-Desktop-macOS-Portable.zip GenericAgent-Desktop-macOS-Portable )
+          hdiutil create \
+            -volname "GenericAgent Desktop" \
+            -srcfolder "$PKG" \
+            -ov \
+            -format UDZO \
+            "artifacts/macos/out/GenericAgent-Desktop-macOS-Portable.dmg"
+          shasum -a 256 "artifacts/macos/out/GenericAgent-Desktop-macOS-Portable.dmg" \
+            > "artifacts/macos/out/GenericAgent-Desktop-macOS-Portable.dmg.sha256"
           cp "$PKG/SHA256SUMS-macos.txt" artifacts/macos/out/SHA256SUMS-macos.txt
 
           echo "Package tree (top levels):"
@@ -632,7 +640,7 @@ jobs:
           ## 产物 / Downloads
           - Windows: `GenericAgent-Desktop-Windows-Portable.zip` — 双击 / double-click `GenericAgent.exe`
           - Linux: `GenericAgent-Desktop-Linux-Portable.tar.gz` — `chmod +x GenericAgent.AppImage && ./GenericAgent.AppImage`
-          - macOS: `GenericAgent-Desktop-macOS-Portable.zip` — 双击 / double-click `Start GenericAgent.command`
+          - macOS: `GenericAgent-Desktop-macOS-Portable.dmg`（或 zip）— 双击 / double-click `Start GenericAgent.command`
 
           ## 首次启动 / First launch
           首次启动会自动离线准备运行环境（装依赖），有进度条，完成后进入主界面；之后秒进。
