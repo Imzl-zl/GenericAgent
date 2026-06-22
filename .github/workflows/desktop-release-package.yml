@@ -639,10 +639,6 @@ jobs:
           EOF
           sed -i '' 's/^          //' "$DMG_STAGE/readme.txt"
 
-          ( cd "$DMG_STAGE" && \
-            shasum -a 256 "readme.txt" "open_anyway.command" > SHA256SUMS-macos.txt && \
-            find GenericAgent.app -type f -print0 | sort -z | xargs -0 shasum -a 256 >> SHA256SUMS-macos.txt )
-
           mkdir -p artifacts/macos/out
           hdiutil create \
             -volname "GenericAgent Desktop" \
@@ -652,7 +648,6 @@ jobs:
             "artifacts/macos/out/GenericAgent-Desktop-macOS.dmg"
           shasum -a 256 "artifacts/macos/out/GenericAgent-Desktop-macOS.dmg" \
             > "artifacts/macos/out/GenericAgent-Desktop-macOS.dmg.sha256"
-          cp "$DMG_STAGE/SHA256SUMS-macos.txt" artifacts/macos/out/SHA256SUMS-macos.txt
 
           echo "DMG stage tree:"
           find "$DMG_STAGE" -maxdepth 2 -print | sort
