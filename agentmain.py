@@ -42,6 +42,10 @@ def get_system_prompt():
     prompt += get_global_memory()
     return prompt
 
+# SDK:
+# agent = GenericAgent(); threading.Thread(target=agent.run, daemon=True).start()
+# output1_queue = agent.put_task(prompt1)
+# output2_queue = agent.put_task(prompt2)
 class GenericAgent:
     def __init__(self):
         os.makedirs(os.path.join(script_dir, 'temp'), exist_ok=True)
@@ -50,12 +54,13 @@ class GenericAgent:
         self.history = []; self.handler = None; 
         self.task_queue = queue.Queue() 
         self.is_running = False; self.stop_sig = False; self.llm_no = 0;  
-        self.inc_out = False; self.verbose = True; self.show_mode = 'text'
+        self.inc_out = False; self.verbose = True
         self.peer_hint = True
         self.force_non_stream = False
         logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
         self.log_path = os.path.join(script_dir, f'temp/model_responses/model_responses_{logid}.txt')
         self.load_llm_sessions()
+        self.extra_sys_prompts = []
 
     def load_llm_sessions(self):
         mykeys, changed = reload_mykeys()
@@ -136,14 +141,13 @@ class GenericAgent:
             if raw_query is None:
                 self.task_queue.task_done(); continue
             self.is_running = True
-            if len(raw_query) > 1500:
+            if len(raw_query) > 2000:
                 task_file = os.path.join(script_dir, 'temp', f'user_prompt_{int(time.time())}.md')
                 with open(task_file, 'w', encoding='utf-8') as f: f.write(raw_query)
                 raw_query = f'Long user prompt saved to {task_file}. Read and execute.'
             rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
             self.history.append(f"[USER]: {rquery}")
-            
-            sys_prompt = get_system_prompt() + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
+            sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
             if self.peer_hint: sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
             handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
             if getattr(self, 'no_print', False): handler.print = lambda *a, **k: None
@@ -158,7 +162,7 @@ class GenericAgent:
                 self.llmclient.backend.stream = False
                 self.llmclient.backend.read_timeout = max(self.llmclient.backend.read_timeout, 1200)
             gen = agent_runner_loop(self.llmclient, sys_prompt, raw_query, handler, TOOLS_SCHEMA, 
-                                    max_turns=80, verbose=self.verbose, yield_info=True)
+                                    max_turns=180, verbose=self.verbose, yield_info=True)
             try:
                 full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = []
                 for chunk in gen:
@@ -187,13 +191,13 @@ class GenericAgent:
                 self.task_queue.task_done()
                 if self.handler is not None: self.handler.code_stop_signal.append(1)
 
-GeneraticAgent = GenericAgent    
+GeneraticAgent = GenericAgent
 
 if __name__ == '__main__':
     import argparse
     from datetime import datetime
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', metavar='IODIR', help='一次性任务模式(文件IO)')
+    parser.add_argument('--task', metavar='IODIR', help='一次性任务模式，先看subagent.md')
     parser.add_argument('--reflect', metavar='SCRIPT', help='反射模式：加载监控脚本，check()触发时发任务')
     parser.add_argument('--input', help='prompt')
     parser.add_argument('--llm_no', type=int, default=0)
@@ -260,24 +264,24 @@ if __name__ == '__main__':
             except Exception as e: 
                 print(f'[Reflect] check() error: {e}'); task = None
             if task and task == '/exit': break
-            if not task:
-                time.sleep(getattr(mod, 'INTERVAL', 5)); continue
-            print(f'[Reflect] triggered: {task[:80]}')
-            dq = agent.put_task(task, source='reflect')
-            try:
-                while 'done' not in (item := dq.get(timeout=1200)): pass
-                result = item['done']
-                print(result)
-            except Exception as e:
-                if getattr(mod, 'ONCE', False): raise
-                print(f'[Reflect] drain error: {e}'); result = f'[ERROR] {e}'
-            log_dir = os.path.join(script_dir, 'temp/reflect_logs'); os.makedirs(log_dir, exist_ok=True)
-            script_name = os.path.splitext(os.path.basename(args.reflect))[0]
-            open(os.path.join(log_dir, f'{script_name}_{datetime.now():%Y-%m-%d}.log'), 'a', encoding='utf-8').write(f'[{datetime.now():%m-%d %H:%M}]\n{result}\n\n')
-            if (on_done := getattr(mod, 'on_done', None)):
-                try: on_done(result)
-                except Exception as e: print(f'[Reflect] on_done error: {e}')
-            if getattr(mod, 'ONCE', False): print('[Reflect] ONCE=True, exiting.'); break
+            if task:
+                print(f'[Reflect] triggered: {task[:80]}')
+                dq = agent.put_task(task, source='reflect')
+                try:
+                    while 'done' not in (item := dq.get(timeout=1200)): pass
+                    result = item['done']
+                    print(result)
+                except Exception as e:
+                    if getattr(mod, 'ONCE', False): raise
+                    print(f'[Reflect] drain error: {e}'); result = f'[ERROR] {e}'
+                log_dir = os.path.join(script_dir, 'temp/reflect_logs'); os.makedirs(log_dir, exist_ok=True)
+                script_name = os.path.splitext(os.path.basename(args.reflect))[0]
+                open(os.path.join(log_dir, f'{script_name}_{datetime.now():%Y-%m-%d}.log'), 'a', encoding='utf-8').write(f'[{datetime.now():%m-%d %H:%M}]\n{result}\n\n')
+                if (on_done := getattr(mod, 'on_done', None)):
+                    try: on_done(result)
+                    except Exception as e: print(f'[Reflect] on_done error: {e}')
+                if getattr(mod, 'ONCE', False): print('[Reflect] ONCE=True, exiting.'); break
+            time.sleep(getattr(mod, 'INTERVAL', 5))
     else:
         try: import readline
         except Exception: pass

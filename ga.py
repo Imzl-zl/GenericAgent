@@ -1,4 +1,4 @@
-import sys, os, re, json, time, threading, importlib
+import sys, os, re, json, time, threading, importlib, webbrowser
 from datetime import datetime
 from pathlib import Path
 import tempfile, traceback, subprocess, itertools, collections, difflib, shutil
@@ -108,14 +108,11 @@ def first_init_driver():
     global driver
     from TMWebDriver import TMWebDriver
     driver = TMWebDriver()
-    for i in range(20):
-        time.sleep(1)
+    for i in range(7):
+        time.sleep(2)
         sess = driver.get_all_sessions()
         if len(sess) > 0: break
-    if len(sess) == 0: return 
-    if len(sess) == 1: 
-        #driver.newtab()
-        time.sleep(3)
+        if i == 4: webbrowser.open("https://example.com")
 
 def web_scan(tabs_only=False, switch_tab_id=None, text_only=False, maxlen=35000):
     """获取当前页面的简化HTML内容和标签页列表。注意：简化过程会过滤边栏、浮动元素等非主体内容。
@@ -244,9 +241,9 @@ def file_read(path, start=1, keyword=None, count=200, show_linenos=True):
     except FileNotFoundError:
         msg = f"Error: File not found: {path}"
         try:
-            tgt = os.path.basename(path); scan = os.path.dirname(os.path.dirname(os.path.abspath(path)))
-            roots = [scan] + [d for d in _read_dirs if not d.startswith(scan)]
-            cands = list(itertools.islice((c for base in roots for c in _scan_files(base)), 2000))
+            tgt = os.path.basename(path); parent = os.path.dirname(os.path.abspath(path)); scan = os.path.dirname(parent)
+            roots = [parent, scan] + [d for d in _read_dirs if not d.startswith(scan)]
+            cands = list(dict.fromkeys(itertools.islice((c for base in roots for c in _scan_files(base)), 2000)))
             top = sorted([(difflib.SequenceMatcher(None, tgt.lower(), c[0].lower()).ratio(), c) for c in cands[:2000]], key=lambda x: -x[0])[:5]
             top = [(s, c) for s, c in top if s > 0.3]
             if top: msg += "\n\nDid you mean:\n" + "\n".join(f"  {c[1]}  ({s:.0%})" for s, c in top)
@@ -503,7 +500,7 @@ class GenericAgentHandler(BaseHandler):
             if remaining == 0:
                 self._exit_plan_mode(); yield "[Info] Plan完成：plan.md中0个[ ]残留，退出plan模式。\n"
         
-        yield "[Info] Final response to user.\n"
+        #yield "[Info] Final response to user.\n"
         return StepOutcome(response, next_prompt=None)
     
     def do_start_long_term_update(self, args, response):
@@ -556,7 +553,7 @@ class GenericAgentHandler(BaseHandler):
         else:
             tc = tool_calls[0]; tool_name, args = tc['tool_name'], tc['args']   # at least one because no_tool
             clean_args = {k: v for k, v in args.items() if not k.startswith('_')}
-            summary = f"调用工具{tool_name}, args: {clean_args}"
+            summary = f"{tool_name}, args: {clean_args}"
             if tool_name == 'no_tool': summary = "直接回答了用户问题"
             next_prompt += "\n\n\n[SYSTEM] 必须在回复文本中包含<summary>！\n\n"
             summary = smart_format(summary.replace('\n', ''), max_str_len=40)
@@ -564,15 +561,17 @@ class GenericAgentHandler(BaseHandler):
         self.history_info.append(f'[Agent] {summary}')
         _plan = self._in_plan_mode()
 
-        if turn % 75 == 0 and (not _plan):
-            next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。必须总结情况进行ask_user，不允许继续重试。"
+        if turn % 175 == 0 and (not _plan):
+            next_prompt += f"\n\n[DANGER] Turn {turn}. Must call ask_user to summarize progress and get direction. No more blind retries."
         elif turn % 7 == 0:
-            next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。禁止无效重试。若无有效进展，必须切换策略：1. 探测物理边界 2. 请求用户协助。如有需要，可调用 update_working_checkpoint 保存关键上下文。"
+            next_prompt += f"\n\n[SYSTEM] Turn {turn}. Call update_working_checkpoint to save key context. Stop ineffective retries; if no progress, switch strategy: 1) Probe physical boundaries 2) **Re-read relevant SOPs**"
+        elif turn % 25 == 0:
+            next_prompt += f"\n\n[SYSTEM] Turn {turn}. Write checkpoints/key findings/tried approaches to a file for future reference. Avoid losing critical info."
         elif turn % 10 == 0: next_prompt += get_global_memory()
 
         if _plan and turn >= 10 and turn % 5 == 0:
             next_prompt = f"[Plan Hint] 正在计划模式。必须 file_read({_plan}) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
-        if _plan and turn >= 120: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
+        if _plan and turn >= 190: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
 
         injkeyinfo = consume_file(self.parent.task_dir, '_keyinfo')
         injprompt = consume_file(self.parent.task_dir, '_intervene')

@@ -1,7 +1,7 @@
 """`/continue` command: list & restore past model_responses sessions.
 Pure functions + one `install(cls)` monkey-patch entry. No side effects at import.
 """
-import ast, glob, json, os, re, time
+import ast, atexit, glob, json, os, random, re, shutil, threading, time
 _LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         'temp', 'model_responses')
 _LOG_GLOB = os.path.join(_LOG_DIR, 'model_responses_*.txt')
@@ -36,7 +36,7 @@ def _first_user(pairs):
         if not isinstance(msg, dict): continue
         for blk in msg.get('content', []) or []:
             if isinstance(blk, dict) and blk.get('type') == 'text':
-                t = (blk.get('text') or '').strip()
+                t = strip_project_mode(blk.get('text') or '').strip()
                 if t and '<history>' not in t and not t.startswith('### [WORKING MEMORY]'):
                     return t
     for p, _ in pairs[:1]:
@@ -116,6 +116,7 @@ def _parse_native_history(pairs):
         history.append(user_msg)
         history.append({'role': 'assistant', 'content': blocks})
     return history
+
 
 _PREVIEW_WIN = 32 * 1024
 
@@ -293,12 +294,19 @@ def _rounds_for_file(path, st):
     return n, key
 
 
-def list_sessions(exclude_pid=None):
-    """Newest-first list of (path, mtime, preview_text, n_rounds). Preview uses head/tail window only."""
+def list_sessions(exclude_pid=None, exclude_log=None, rewind_root=None):
+    """Newest-first list of (path, mtime, preview_text, n_rounds). Preview uses head/tail window only.
+
+    `exclude_log` (basename, e.g. 'model_responses_123456.txt') drops the caller's
+    OWN current session — preferred over `exclude_pid`, which assumed the log file
+    was named by PID (it isn't: agentmain mints a random 6-digit logid), so the
+    pid tag never matched and the current session leaked into its own list."""
     files = glob.glob(_LOG_GLOB)
     if exclude_pid is not None:
         tag = f'model_responses_{exclude_pid}.txt'
         files = [f for f in files if not f.endswith(tag)]
+    if exclude_log:
+        files = [f for f in files if os.path.basename(f) != exclude_log]
     out = []
     valid_keys = []
     for f in files:
@@ -316,6 +324,43 @@ def list_sessions(exclude_pid=None):
         valid_keys.append(key)
         out.append((f, mtime, preview, rounds))
     _save_rounds_cache(valid_keys)
+    # 【门控·worldline】树感知发现:日志空/缺失但有非空世界线树的会话(回退到起点后日志被
+    # 清空 → 上面 sz<32 跳过了)。仅当调用方显式传 rewind_root 时启用 → 其他 UI 不传,
+    # 行为逐字节不变。只读 tree.json 的 nodes/head(不依赖 worldline 模块)。
+    if rewind_root and os.path.isdir(rewind_root):
+        have = {os.path.basename(p) for p, *_ in out}
+        try:
+            keys = os.listdir(rewind_root)
+        except OSError:
+            keys = []
+        for key in keys:
+            if not key.startswith('model_responses_'):
+                continue
+            log_name = key + '.txt'
+            if log_name in have or log_name == exclude_log:
+                continue
+            log_path = os.path.join(_LOG_DIR, log_name)
+            try:                                    # 仅收"日志确实空/缺失"的(非空日志已被主循环收录)
+                if os.path.getsize(log_path) >= 32:
+                    continue
+            except OSError:
+                pass                                # 缺失也算
+            try:
+                with open(os.path.join(rewind_root, key, 'tree.json'), encoding='utf-8') as fh:
+                    d = json.load(fh)
+            except Exception:
+                continue
+            nodes = d.get('nodes') or {}
+            real = [v for v in nodes.values() if v.get('kind') != 'origin']
+            if not real:                            # 只有 origin 的空树 → 无内容,跳过
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(rewind_root, key, 'tree.json'))
+            except OSError:
+                mtime = 0
+            head = d.get('head')
+            title = (nodes.get(head, {}).get('title') if head else '') or '（已回退至会话起点）'
+            out.append((log_path, mtime, f'[世界线] {title}', len(real)))
     out.sort(key=lambda x: x[1], reverse=True)
     return out
 _MD_ESCAPE_RE = re.compile(r'([\\`*_\[\]])')
@@ -439,6 +484,17 @@ def handle(agent, query, display_queue):
 _INJECT_MARKERS = ('### [WORKING MEMORY]', '[SYSTEM TIPS]', '[SYSTEM]', '[System]',
                    '[DANGER]', '### [总结提炼经验]')
 
+# project_mode 插件把 `\n\n---\n[PROJECT MODE: <name>]\n…\n---` 追加在用户消息末尾
+# (见 plugins/project_mode._build_injection)。它会进日志,所以 /continue 重建 UI 时
+# 必须从显示文本里剔除,只留用户原话。不能加进 _INJECT_MARKERS——那会把整块(连用户
+# 原话)一起丢弃;这里只剜掉注入这一段后缀。
+_PM_BLOCK_RE = re.compile(r"\n*-{3,}\n\[PROJECT MODE:.*?\n-{3,}\s*$", re.DOTALL)
+
+
+def strip_project_mode(text: str) -> str:
+    """剔除用户文本尾部的 project-mode 注入块。"""
+    return _PM_BLOCK_RE.sub("", text or "")
+
 
 def _user_text(prompt_body):
     """User-typed text from a prompt JSON; '' if this is an agent auto-continuation.
@@ -457,7 +513,7 @@ def _user_text(prompt_body):
         return ''
     for blk in blocks:
         if isinstance(blk, dict) and blk.get('type') == 'text':
-            t = (blk.get('text') or '').strip()
+            t = strip_project_mode(blk.get('text') or '').strip()
             if t and not any(mk in t for mk in _INJECT_MARKERS): return t
     return ''
 
@@ -475,11 +531,22 @@ def _assistant_text(response_body):
 
 
 def _format_tool_use(block):
-    """Match agent_loop.py:72 verbose tool-call header."""
+    """Match agent_loop.py:78 verbose tool-call header byte-for-byte.
+
+    MUST use agent_loop's `get_pretty_json`, not a plain `json.dumps`: the
+    former rewrites a `script` arg's `"; "` into `";\\n  "`, so for tools
+    carrying `script` (code_run, web_execute_js) a plain dumps produces a
+    *different* fence body. The TUI's write/read/code cards content-address
+    their captures by `hash(get_pretty_json(args))`; a mismatched fence here
+    means the hash misses and the card silently falls back to the raw block."""
     name = block.get('name', '?')
     args = block.get('input', {})
-    try: pretty = json.dumps(args, indent=2, ensure_ascii=False).replace('\\n', '\n')
-    except Exception: pretty = str(args)
+    try:
+        from agent_loop import get_pretty_json
+        pretty = get_pretty_json(args)
+    except Exception:
+        try: pretty = json.dumps(args, indent=2, ensure_ascii=False).replace('\\n', '\n')
+        except Exception: pretty = str(args)
     return f"🛠️ Tool: `{name}`  📥 args:\n````text\n{pretty}\n````\n"
 
 
@@ -531,6 +598,165 @@ def _format_response_segment(response_body, tool_results):
             tid = b.get('id') or ''
             if tid and tid in tool_results: tool_parts.append(tool_results[tid])
     return '\n\n'.join(p for p in ['\n\n'.join(texts), '\n'.join(tool_parts)] if p)
+
+
+_PLAN_ENTRY_RE = re.compile(r'enter_plan_mode\(\s*[\'"]([^\'"]+plan\.md)[\'"]')
+
+
+def find_plan_entry(path):
+    """Last `enter_plan_mode("…plan.md")` call in a model_responses log.
+
+    Plan mode has exactly one entry point (plan_sop.md): a `code_run` tool call
+    whose inline_eval script invokes `handler.enter_plan_mode(...)`. That call
+    survives in the log as a structured `tool_use` block — unlike a plan path
+    merely *mentioned* in chat text, it cannot be produced by the user typing
+    a filename. Scanning these blocks is therefore the restore criterion for
+    the plan card; the last match wins so re-entered plans track the newest.
+
+    Returns the plan.md path string as written in the script, or None.
+    """
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except Exception:
+        return None
+    last = None
+    for _prompt, response in _pairs(content):
+        try:
+            blocks = ast.literal_eval(response)
+        except Exception:
+            continue
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not (isinstance(b, dict) and b.get('type') == 'tool_use'
+                    and b.get('name') == 'code_run'):
+                continue
+            m = _PLAN_ENTRY_RE.search(str((b.get('input') or {}).get('script') or ''))
+            if m:
+                last = m.group(1)
+    return last
+
+
+def iter_write_captures(path):
+    """Replay a log's file_write/file_patch/file_read calls into capture dicts
+    the TUI can feed to its card renderers (`_WRITE_CAP`), keyed later by
+    hash(get_pretty_json).
+
+    Live mode fills `_WRITE_CAP` from tool_before/tool_after hooks (with a real
+    pre-write disk snapshot); on /continue that history is gone, but the
+    structured `tool_use.input` survives in the log — clean, complete args. We
+    also track each path's content *within this session* so a file
+    written/patched several times shows real old→new diffs (not N× full "new
+    file"). Files first touched by an untracked on-disk state still fall back
+    to a full-content block.
+
+    Returns write entries `{"name", "args", "existed", "old", "status", "msg"}`
+    and read entries `{"name", "args", "content"}` in call order. `status`/`msg`
+    come from the matching tool_result so the header can show ✗ on a failed
+    write; a read's `content` is the raw tool_result text (the read card strips
+    its LLM-facing chrome itself).
+    """
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except Exception:
+        return []
+    pairs = _pairs(content)
+    # tool_use_id -> (status, msg) from any prompt's tool_result blocks (the
+    # result lands in the *next* round's Prompt as a tool_result whose content
+    # is the json-dumped outcome.data, e.g. {"status":"success","msg":...}).
+    # tr_raw keeps the undecoded text — a file_read result is plain text.
+    tr_status, tr_raw = {}, {}
+    for prompt, _ in pairs:
+        try:
+            msg_obj = json.loads(prompt)
+        except Exception:
+            continue
+        if not isinstance(msg_obj, dict):
+            continue
+        for blk in msg_obj.get('content', []) or []:
+            if not (isinstance(blk, dict) and blk.get('type') == 'tool_result'):
+                continue
+            tid = blk.get('tool_use_id')
+            c = blk.get('content')
+            if isinstance(c, list):
+                c = ''.join(b.get('text', '') for b in c
+                            if isinstance(b, dict) and b.get('type') == 'text')
+            if tid and isinstance(c, str):
+                tr_raw[tid] = c
+            try:
+                d = json.loads(c) if isinstance(c, str) else None
+            except Exception:
+                d = None
+            if tid and isinstance(d, dict):
+                tr_status[tid] = (d.get('status'), str(d.get('msg') or ''))
+
+    out, state = [], {}
+    for _prompt, response in pairs:
+        try:
+            blocks = ast.literal_eval(response)
+        except Exception:
+            continue
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not (isinstance(b, dict) and b.get('type') == 'tool_use'):
+                continue
+            name = b.get('name')
+            if name not in ('file_write', 'file_patch', 'file_read', 'code_run'):
+                continue
+            args = b.get('input') or {}
+            p = args.get('path')
+            if name == 'file_read':
+                out.append({'name': name, 'args': args,
+                            'content': tr_raw.get(b.get('id'))})
+                continue
+            if name == 'code_run':
+                # data = the tool_result text; a dict result is JSON, an
+                # inline_eval / code-missing result is plain text. Pass the
+                # parsed dict when possible so the card reads exit_code/stdout;
+                # else the raw string (the card handles both).
+                raw = tr_raw.get(b.get('id'))
+                d = raw
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else None
+                    if isinstance(parsed, dict):
+                        d = parsed
+                except Exception:
+                    pass
+                out.append({'name': name, 'args': args, 'data': d})
+                continue
+            st, mg = tr_status.get(b.get('id'), (None, ''))
+            if name == 'file_patch':
+                # If this file's content is tracked within the session, pass it as
+                # the pre-write full file so the renderer can do a whole-file diff
+                # (real line numbers + context); else fall back to the fragment.
+                pre = state.get(p, '')
+                out.append({'name': name, 'args': args,
+                            'existed': p in state, 'old': pre,
+                            'status': st, 'msg': mg})
+                if st == 'error':
+                    continue  # failed call left the disk untouched — don't book it
+                old = args.get('old_content') or ''
+                if p in state and old:
+                    state[p] = state[p].replace(old, args.get('new_content') or '', 1)
+            else:  # file_write
+                existed = p in state
+                old = state.get(p, '')
+                new = str(args.get('content') or '')
+                mode = str(args.get('mode') or 'overwrite')
+                out.append({'name': name, 'args': args, 'existed': existed, 'old': old,
+                            'status': st, 'msg': mg})
+                if st == 'error':
+                    continue  # failed call left the disk untouched — don't book it
+                if mode == 'append':
+                    state[p] = old + new
+                elif mode == 'prepend':
+                    state[p] = new + old
+                else:
+                    state[p] = new
+    return out
 
 
 def extract_ui_messages(path):
@@ -591,6 +817,286 @@ def handle_frontend_command(agent, query, exclude_pid=None):
     reset_conversation(agent, message=None)
     msg, _ = restore(agent, sessions[idx][0])
     return msg
+
+
+# ===========================================================================
+# 原地复原(in-place continue)共享层 —— 仅供 TUI(tui_v2/tui_v3 及其 rewind 副本)
+# 调用;其它前端(IM/qt/streamlit…)不调用这些函数,行为完全不受影响。
+#
+# 模型:每个会话 = 一个 `model_responses_<logid>.txt`,身份就是文件本身。
+#   · 原地续 X = 把 agent 的 log_path 指回 X,之后的轮次追加到 X 本身(同一会话延续)。
+#   · 拷贝续 X = 铸一个新 logid、把 X 拷进去,在副本上续;X 原件不动(并发安全)。
+#   · 切走/新对话 = 释放当前锁、旧日志原样留作"空闲会话"(不存快照、不清空),新对话铸新 logid。
+#
+# 独占:每个 TUI 会话出生即持有自己日志的一把锁(`.locks/<logid>.lock`);
+#   整进程共用一个心跳线程,每 ~5s touch 锁文件 mtime(无 fsync)。
+#   判活 = 锁 mtime 在 30s 内新鲜;超 30s 视为持锁者已死,可被接管。
+#   抢锁用原子 O_EXCL;锁基础设施任何故障都降级为"假定空闲、放行续接",绝不阻断 /continue。
+# ===========================================================================
+
+_LOCK_DIR = os.path.join(_LOG_DIR, '.locks')
+_HB_INTERVAL = 5.0       # 心跳间隔(秒)
+_STALE_AFTER = 30.0      # 超过这么久无心跳 → 持锁者视为已死,可接管
+_held_locks = set()      # 本进程当前持有的 log_path 集合
+_hb_lock = threading.Lock()
+_hb_thread = None
+
+
+def _lock_path(log_path):
+    base = os.path.splitext(os.path.basename(log_path))[0]
+    return os.path.join(_LOCK_DIR, base + '.lock')
+
+
+def _read_lock(lock_file):
+    try:
+        with open(lock_file, encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _lock_fresh(lock_file):
+    """心跳新鲜度 = 锁文件 mtime 距今 < _STALE_AFTER。"""
+    try:
+        return (time.time() - os.path.getmtime(lock_file)) < _STALE_AFTER
+    except OSError:
+        return False
+
+
+def session_occupant(log_path):
+    """若 `log_path` 正被一个活着的(心跳新鲜)进程持有,返回其 owner 元数据 dict;
+    否则返回 None(空闲,或锁已过期可接管)。供 TUI 判断"原地 / 弹窗拷贝"。"""
+    lf = _lock_path(log_path)
+    meta = _read_lock(lf)
+    if meta is not None and _lock_fresh(lf):
+        return meta
+    return None
+
+
+def acquire_lock(log_path, agent_id=None):
+    """尝试独占 `log_path`。成功(或锁设施故障降级)返回 True;
+    仅当被另一活进程(心跳新鲜)持有时返回 False。"""
+    try:
+        os.makedirs(_LOCK_DIR, exist_ok=True)
+        lf = _lock_path(log_path)
+        meta = {'pid': os.getpid(), 'agent_id': agent_id,
+                'log': os.path.basename(log_path),
+                'started': time.time()}
+        blob = json.dumps(meta, ensure_ascii=False)
+        try:
+            fd = os.open(lf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(blob)
+        except FileExistsError:
+            cur = _read_lock(lf)
+            if cur and cur.get('pid') != os.getpid() and _lock_fresh(lf):
+                return False                      # 被另一活进程持有
+            # 过期锁 / 本进程自己的 → 接管(覆盖)。小竞态窗口可接受。
+            try: os.remove(lf)
+            except OSError: pass
+            try:
+                fd = os.open(lf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                    fh.write(blob)
+            except FileExistsError:
+                cur2 = _read_lock(lf)
+                if cur2 and cur2.get('pid') != os.getpid() and _lock_fresh(lf):
+                    return False                  # 抢锁竞态输了
+                with open(lf, 'w', encoding='utf-8') as fh:
+                    fh.write(blob)
+        with _hb_lock:
+            _held_locks.add(log_path)
+        _ensure_hb_thread()
+        return True
+    except Exception:
+        # 锁设施故障绝不阻断续接 —— 降级为"假定空闲、放行"。
+        return True
+
+
+def release_lock(log_path):
+    """释放本进程对 `log_path` 的锁(只删自己持有/无主的锁文件)。"""
+    with _hb_lock:
+        _held_locks.discard(log_path)
+    try:
+        lf = _lock_path(log_path)
+        cur = _read_lock(lf)
+        if cur is None or cur.get('pid') == os.getpid():
+            os.remove(lf)
+    except Exception:
+        pass
+
+
+def _hb_tick():
+    now = time.time()
+    with _hb_lock:
+        items = list(_held_locks)
+    for lp in items:
+        try:
+            os.utime(_lock_path(lp), (now, now))   # 仅更新 mtime,无 fsync
+        except OSError:
+            pass
+
+
+def _hb_loop():
+    while True:
+        time.sleep(_HB_INTERVAL)
+        try:
+            _hb_tick()
+        except Exception:
+            pass
+
+
+def _ensure_hb_thread():
+    global _hb_thread
+    with _hb_lock:
+        if _hb_thread is None:
+            _hb_thread = threading.Thread(target=_hb_loop,
+                                          name='ga-session-heartbeat', daemon=True)
+            _hb_thread.start()
+
+
+@atexit.register
+def _release_all_locks():
+    for lp in list(_held_locks):
+        release_lock(lp)
+
+
+def _new_log_path():
+    """铸一个新的 6 位 logid 日志路径(与 agentmain 同公式)。"""
+    logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
+    return os.path.join(_LOG_DIR, f'model_responses_{logid}.txt')
+
+
+def _retarget_log(agent, new_path):
+    """把 agent(及其所有 llmclient)的日志写入点切到 new_path —— 之后的轮次写这里。"""
+    try:
+        agent.log_path = new_path
+    except Exception:
+        pass
+    for client in _agent_clients(agent):
+        try: client.log_path = new_path
+        except Exception: pass
+
+
+def is_snapshot(path):
+    """遗留快照存档(model_responses_snapshot_*.txt)。这类只能拷贝续,不参与原地
+    (provisional,待 worktree 复审)。"""
+    return os.path.basename(path).startswith('model_responses_snapshot_')
+
+
+def _clear_conversation_state(agent):
+    """清空对话状态(对齐 reset_conversation,但不碰日志文件)。"""
+    if hasattr(agent, 'history'):
+        agent.history = []
+    for client in _agent_clients(agent):
+        backend = getattr(client, 'backend', None)
+        if backend is not None and hasattr(backend, 'history'):
+            backend.history = []
+        if hasattr(client, 'last_tools'):
+            client.last_tools = ''
+    if hasattr(agent, 'handler'):
+        agent.handler = None
+
+
+def acquire_birth_lock(agent, agent_id=None):
+    """会话出生时持有自己当前日志的锁(新 logid 必然抢到)。TUI 在建会话时调用,
+    使本会话对"占用检测"可见 —— 别的会话才能据此判定它是否还活着。"""
+    lp = getattr(agent, 'log_path', '') or ''
+    if lp:
+        acquire_lock(lp, agent_id)
+
+
+def release_current(agent):
+    """切走:释放 agent 当前日志的锁,旧日志原样留作"空闲会话"(不存快照、不清空)。"""
+    lp = getattr(agent, 'log_path', '') or ''
+    if lp:
+        release_lock(lp)
+
+
+def begin_fresh_session(agent, agent_id=None):
+    """新对话 / clear:释放当前锁(旧日志留作空闲会话)→ 铸新 logid 重指 → 持新锁 →
+    清空对话状态。**替代 TUI 里的 reset_conversation**(不再存快照/清空旧日志)。"""
+    try: agent.abort()
+    except Exception: pass
+    release_current(agent)
+    newp = _new_log_path()
+    _retarget_log(agent, newp)
+    acquire_lock(newp, agent_id)
+    _clear_conversation_state(agent)
+
+
+def _load_history_into(agent, path):
+    """把 `path` 解析进 backend.history(native;否则降级摘要)。镜像 restore() 的解析,
+    但不 abort/不快照(日志重指由调用方先做好)。返回 (msg, is_full)。"""
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            content = fh.read()
+    except Exception as e:
+        return f'❌ 读取失败: {e}', False
+    pairs = _pairs(content)
+    if not pairs:
+        return f'❌ {os.path.basename(path)} 为空或格式不符', False
+    history = _parse_native_history(pairs)
+    name = os.path.basename(path)
+    if history is not None:
+        _replace_backend_history(agent, history)
+        return f'✅ 已恢复 {len(pairs)} 轮完整对话（{name}）', True
+    from chatapp_common import _restore_native_history, _restore_text_pairs
+    summary = _restore_text_pairs(content) or _restore_native_history(content)
+    if not summary:
+        return f'❌ {name} 无法解析（非 native 且无摘要可提取）', False
+    if hasattr(agent, 'history'):
+        agent.history.extend(summary)
+    n = sum(1 for l in summary if l.startswith('[USER]: '))
+    return f'⚠️ 非 native 格式，降级恢复 {n} 轮摘要（{name}）', False
+
+
+def _is_empty_log(path):
+    """日志空(<32 字节)或缺失。用于 allow_empty:回退到会话起点后日志被清空的会话。"""
+    try:
+        return os.path.getsize(path) < 32
+    except OSError:
+        return True
+
+
+def continue_inplace(agent, path, agent_id=None, allow_empty=False):
+    """原地续:把 agent 的日志指回 `path` 本身,之后轮次追加到 X,延续同一会话。
+    调用方应已确认空闲(session_occupant 为 None);抢锁失败(被占)返回错误。
+    `allow_empty`(仅 worldline UI 传):日志为空时不报错,按【空会话】恢复(清空对话,
+    由调用方按 `.ga_rewind` 树重连),用于"回退至会话起点"的会话。返回 (msg, ok)。"""
+    try: agent.abort()
+    except Exception: pass
+    if not acquire_lock(path, agent_id):       # 先抢到目标锁;失败则保持现状,不丢自己的锁
+        return '❌ 会话已被占用，无法原地接管', False
+    cur = getattr(agent, 'log_path', '') or ''
+    if cur and os.path.basename(cur) != os.path.basename(path):
+        release_lock(cur)                       # 目标到手,旧会话释放为空闲(同一文件则不放)
+    _retarget_log(agent, path)
+    msg, ok = _load_history_into(agent, path)
+    if not ok and allow_empty and _is_empty_log(path):
+        _replace_backend_history(agent, [])     # 空会话:清空对话(载入失败时它没被清)
+        return '✅ 已恢复空会话（回退至会话起点；世界线树已重连）', True
+    return msg, ok
+
+
+def continue_copy(agent, path, agent_id=None, allow_empty=False):
+    """拷贝续:铸新 logid、把 `path` 内容拷进去,在副本上续;`path` 原件不动。
+    用于"被占用→用户选拷贝"以及快照源。返回 (msg, ok)。"""
+    try: agent.abort()
+    except Exception: pass
+    release_current(agent)
+    newp = _new_log_path()
+    try:
+        shutil.copyfile(path, newp)
+    except Exception:
+        pass
+    acquire_lock(newp, agent_id)
+    _retarget_log(agent, newp)
+    msg, ok = _load_history_into(agent, newp)
+    if not ok and allow_empty and _is_empty_log(newp):
+        _replace_backend_history(agent, [])
+        return '✅ 已恢复空会话（回退至会话起点；世界线树已重连）', True
+    return msg, ok
 
 
 def install(cls):
