@@ -50,6 +50,8 @@ const gaServiceStore = {
   get: (id) => _serviceById[id],
 };
 
+let bridgeUiOffline = false;
+
 /* ═══════════════ Bridge 适配（HTTP 命令 + WS 状态） ═══════════════ */
 (function initGaBridge() {
   const listeners = new Map();
@@ -85,6 +87,13 @@ const gaServiceStore = {
     emit('service-state', msg);
   }
 
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const tauriInvoke = (name, args = {}) => {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (!invoke) throw new Error('Tauri IPC is not available');
+    return invoke(name, args);
+  };
+
   async function http(path, options = {}) {
     const headers = Object.assign({}, options.headers || {});
     const init = Object.assign({}, options, { headers });
@@ -103,6 +112,23 @@ const gaServiceStore = {
       throw err;
     }
     return data;
+  }
+
+  async function waitBridgeStatus(timeoutMs = 20000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastErr = null;
+    while (Date.now() < deadline) {
+      try {
+        const status = await http('/status');
+        wsRetries = 0;
+        connectWs();
+        return status;
+      } catch (err) {
+        lastErr = err;
+        await sleep(350);
+      }
+    }
+    throw lastErr || new Error('Bridge did not become ready');
   }
 
   function connectWs() {
@@ -187,6 +213,7 @@ const gaServiceStore = {
         return http(`/services/logs?id=${encodeURIComponent(id)}&tail=${encodeURIComponent(tail)}`);
       }
       case 'services/panel': return http('/services/panel');
+      case 'services/bridge/exit': return http('/services/bridge/exit', { method: 'POST' });
       case 'services/mykey/get': return http('/services/mykey');
       case 'services/mykey/save': return http('/services/mykey', { method: 'POST', body: params || {} });
       case 'app/path/selectGaRoot': return http('/config');
@@ -213,10 +240,35 @@ const gaServiceStore = {
     return res;
   }
 
+  async function spawnBridge() {
+    connectWs();
+    try {
+      const status = await http('/status');
+      bridgeUiOffline = false;
+      return status;
+    } catch (_) {
+      await tauriInvoke('start_bridge');
+      const status = await waitBridgeStatus();
+      bridgeUiOffline = false;
+      return status;
+    }
+  }
+
+  async function exitBridge() {
+    const res = await rpc('services/bridge/exit');
+    cachedBridgeReady = null;
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+    }
+    return res;
+  }
+
   window.ga = {
     platform: navigator.platform.toLowerCase().includes('mac') ? 'darwin' : 'win32',
     startBridge: async () => { connectWs(); return http('/status'); },
+    spawnBridge,
     stopBridge: async () => ({ ok: true }),
+    exitBridge,
     checkStatus: () => rpc('app/status', {}),
     getConfig: () => rpc('app/config/get', {}),
     saveConfig: (cfg) => rpc('app/config/save', cfg || {}),
@@ -230,6 +282,8 @@ const gaServiceStore = {
     getServicePanel: () => rpc('services/panel', {}),
     getMykeyContent: () => rpc('services/mykey/get', {}),
     saveMykeyContent: (content) => rpc('services/mykey/save', { content }),
+    tauriInvoke,
+    setBridgeUiOffline: (offline) => { bridgeUiOffline = !!offline; },
     pollSession: (sessionId, afterId = 0) => rpc('session/poll', { sessionId, afterId }),
     rpc,
     onBridgeMessage: (cb) => on('bridge-message', cb),
@@ -278,7 +332,8 @@ const I18N = {
     'customPreset.removeTitle': '删除',
     'customPreset.editTitle': '编辑',
     'builtinPreset.restoreBtn': '恢复默认预设',
-    'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型',
+    'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型', 'set.features': '功能', 'set.importMykey': '导入已有模型配置（mykey.py）', 'set.exportMykey': '导出当前模型配置', 'set.serviceManager': '后台服务管理',
+    'shortcut.askConfirm': '是否在桌面创建 GenericAgent 快捷方式？',
     'appearance.light': '浅色', 'appearance.dark': '深色',
     'set.noModels': '暂无模型，点击下方添加',
     'lang.zh': '简体中文', 'lang.en': 'English',
@@ -286,10 +341,11 @@ const I18N = {
     'model.apikey': 'API Key', 'model.apikeyPh': 'sk-...', 'model.apikeyKeep': '留空则保持原 Key 不变',
     'model.apibase': 'API 地址', 'model.apibasePh': 'https://.../v1/messages',
     'model.protocol': '协议', 'model.protocolPick': '请选择…', 'model.protocolOai': 'OpenAI 兼容 (chat/completions)', 'model.protocolClaude': 'Anthropic (Claude /v1/messages)',
+    'model.stream': '响应方式', 'model.streamOn': '流式', 'model.streamOff': '非流式',
     'model.model': '模型', 'model.modelPh': 'model 参数名',
     'model.modelHint': '须与中转站/官方文档中的 model 字段完全一致',
     'model.retries': '重试 (次)', 'model.connTimeout': '连接超时 (s)', 'model.readTimeout': '读取超时 (s)',
-    'model.save': '保存', 'common.cancel': '取消', 'common.edit': '编辑', 'common.delete': '删除',
+    'model.save': '保存', 'common.cancel': '取消', 'common.confirm': '确认', 'common.edit': '编辑', 'common.delete': '删除',
     'pq.title': '快速接入官方模型', 'pq.sub': '填好 API Key 即可使用', 'pq.toggle': '展开 / 收起',
     'pq.deepseekDesc': '官方 API · OpenAI 兼容', 'pq.qwenDesc': '通义千问 · 阿里云百炼',
     'guide.step1': '点击下方链接，登录后创建并复制 API Key',
@@ -300,6 +356,10 @@ const I18N = {
     'err.modelSave': '保存失败', 'err.modelRequired': '请填写模型、API Key 和 API 地址',
     'err.modelDelete': '删除失败', 'err.modelDeleteLast': '至少保留一个模型',
     'confirm.modelDelete': '确定删除该模型配置？',
+    'model.aggregation': '渠道组（自动故障转移）', 'model.aggregationShort': '渠道组', 'model.aggregationDesc': '按顺序尝试，失败自动切换到下一个',
+    'model.emptyMixin': '尚未加入模型',
+    'model.addToMixin': '加入渠道组', 'model.inMixin': '已在渠道组', 'model.removeFromMixin': '移出渠道组', 'model.alreadyInMixin': '已在渠道组中', 'model.dragReorder': '拖拽调整顺序',
+    'err.mixinFailed': '操作失败',
     'page.services.title': '后台服务', 'page.services.sub': 'IM 消息通道与后台进程，集中查看、启停与日志',
     'page.channels.title': '消息通道', 'page.channels.sub': '后台 IM 进程：列表、启停与日志（同 hub.pyw）',
     'page.status.title': '状态面板', 'page.status.sub': 'hub.pyw 管理的后台进程/服务，集中查看与启停',
@@ -384,14 +444,17 @@ const I18N = {
     'ch.loading': '加载中…', 'ch.empty': '未发现 IM 进程脚本',
     'ch.logEmpty': '暂无日志',
     'err.channelLoad': '加载失败', 'err.channelStart': '启动失败', 'err.channelStop': '停止失败',
+    'err.mykeyImport': '导入模型配置失败',
+    'err.mykeyExport': '导出模型配置失败',
     'err.channelNotConfigured': '请先在 mykey.py 中配置该平台',
     'sys.channelStarted': '已启动', 'sys.channelStopped': '已停止',
     'modal.channelLogs': '进程日志',
     'modal.mykeyConfig': 'mykey.py 配置',
     'sys.configSaved': '配置已保存',
-    'st.starting': '启动中…', 'st.stopping': '停止中…',
-    'st.online': '在线', 'st.offline': '离线', 'st.error': '错误', 'st.running': '运行', 'st.abnormal': '异常',
-    'act.configure': '配置', 'act.logs': '日志', 'act.restart': '重启', 'act.stop': '停止', 'act.start': '启动',
+    'sys.mykeyImported': '模型配置已导入',
+    'sys.mykeyExported': '模型配置已导出',
+    'st.starting': '启动中…', 'st.stopping': '停止中…', 'st.online': '在线', 'st.offline': '离线', 'st.error': '错误', 'st.running': '运行', 'st.abnormal': '异常',
+    'act.configure': '配置', 'act.logs': '日志', 'act.restart': '重启', 'act.stop': '停止', 'act.start': '启动', 'act.exit': '退出',
     'act.copy': '复制', 'act.copied': '已复制', 'act.copyTex': 'TeX', 'act.send': '发送',
     'proc.imbotWechat': 'imbot · 微信', 'proc.imbotDing': 'imbot · 钉钉', 'proc.scheduler': '定时任务调度', 'proc.conductor': '指挥家',
     'cm.scheduling': '调度中', 'cm.running': '执行中', 'cm.idleSt': '空闲',
@@ -442,7 +505,8 @@ const I18N = {
     'customPreset.removeTitle': 'Delete',
     'customPreset.editTitle': 'Edit',
     'builtinPreset.restoreBtn': 'Restore defaults',
-    'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model',
+    'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model', 'set.features': 'Features', 'set.importMykey': 'Import model config (mykey.py)', 'set.exportMykey': 'Export current model config', 'set.serviceManager': 'Service manager',
+    'shortcut.askConfirm': 'Create a desktop shortcut for GenericAgent?',
     'appearance.light': 'Light', 'appearance.dark': 'Dark',
     'set.noModels': 'No models yet — add one below',
     'lang.zh': '简体中文', 'lang.en': 'English',
@@ -450,10 +514,11 @@ const I18N = {
     'model.apikey': 'API Key', 'model.apikeyPh': 'sk-...', 'model.apikeyKeep': 'Leave blank to keep the current key',
     'model.apibase': 'API base URL', 'model.apibasePh': 'https://.../v1/messages',
     'model.protocol': 'Protocol', 'model.protocolPick': 'Select…', 'model.protocolOai': 'OpenAI-compatible (chat/completions)', 'model.protocolClaude': 'Anthropic (Claude /v1/messages)',
+    'model.stream': 'Response', 'model.streamOn': 'Stream', 'model.streamOff': 'Non-stream',
     'model.model': 'Model', 'model.modelPh': 'model parameter name',
     'model.modelHint': 'Must match the model field in your provider docs exactly',
     'model.retries': 'Retries (×)', 'model.connTimeout': 'Connect (s)', 'model.readTimeout': 'Read (s)',
-    'model.save': 'Save', 'common.cancel': 'Cancel', 'common.edit': 'Edit', 'common.delete': 'Delete',
+    'model.save': 'Save', 'common.cancel': 'Cancel', 'common.confirm': 'Confirm', 'common.edit': 'Edit', 'common.delete': 'Delete',
     'pq.title': 'Quick connect a model', 'pq.sub': 'Add your API key to get started', 'pq.toggle': 'Expand / collapse',
     'pq.deepseekDesc': 'Official API · OpenAI-compatible', 'pq.qwenDesc': 'Tongyi Qwen · Aliyun Bailian',
     'guide.step1': 'Open the link, sign in, then create & copy your API key',
@@ -464,6 +529,10 @@ const I18N = {
     'err.modelSave': 'Save failed', 'err.modelRequired': 'Model, API Key and base URL are required',
     'err.modelDelete': 'Delete failed', 'err.modelDeleteLast': 'At least one model is required',
     'confirm.modelDelete': 'Delete this model profile?',
+    'model.aggregation': 'Channel group (auto failover)', 'model.aggregationShort': 'Channel group', 'model.aggregationDesc': 'Tries in order, switches to the next on failure',
+    'model.emptyMixin': 'No models added yet',
+    'model.addToMixin': 'Add to channel', 'model.inMixin': 'In channel', 'model.removeFromMixin': 'Remove from channel', 'model.alreadyInMixin': 'Already in the channel', 'model.dragReorder': 'Drag to reorder',
+    'err.mixinFailed': 'Operation failed',
     'page.services.title': 'Services', 'page.services.sub': 'IM channels and background processes — view, start/stop, logs',
     'page.channels.title': 'Channels', 'page.channels.sub': 'Background IM processes: list, start/stop, logs (hub.pyw style)',
     'page.status.title': 'Status', 'page.status.sub': 'Background processes/services managed by hub.pyw',
@@ -548,14 +617,17 @@ const I18N = {
     'ch.loading': 'Loading…', 'ch.empty': 'No IM process scripts found',
     'ch.logEmpty': 'No log output yet',
     'err.channelLoad': 'Failed to load', 'err.channelStart': 'Start failed', 'err.channelStop': 'Stop failed',
+    'err.mykeyImport': 'Failed to import model config',
+    'err.mykeyExport': 'Failed to export model config',
     'err.channelNotConfigured': 'Configure this platform in mykey.py first',
     'sys.channelStarted': 'Started', 'sys.channelStopped': 'Stopped',
     'modal.channelLogs': 'Process logs',
     'modal.mykeyConfig': 'mykey.py',
     'sys.configSaved': 'Configuration saved',
-    'st.starting': 'Starting…', 'st.stopping': 'Stopping…',
-    'st.online': 'Online', 'st.offline': 'Offline', 'st.error': 'Error', 'st.running': 'Running', 'st.abnormal': 'Error',
-    'act.configure': 'Configure', 'act.logs': 'Logs', 'act.restart': 'Restart', 'act.stop': 'Stop', 'act.start': 'Start',
+    'sys.mykeyImported': 'Model config imported',
+    'sys.mykeyExported': 'Model config exported',
+    'st.starting': 'Starting…', 'st.stopping': 'Stopping…', 'st.online': 'Online', 'st.offline': 'Offline', 'st.error': 'Error', 'st.running': 'Running', 'st.abnormal': 'Error',
+    'act.configure': 'Configure', 'act.logs': 'Logs', 'act.restart': 'Restart', 'act.stop': 'Stop', 'act.start': 'Start', 'act.exit': 'Exit',
     'act.copy': 'Copy', 'act.copied': 'Copied', 'act.copyTex': 'TeX', 'act.send': 'Send',
     'proc.imbotWechat': 'imbot · WeChat', 'proc.imbotDing': 'imbot · DingTalk', 'proc.scheduler': 'Scheduler', 'proc.conductor': 'Conductor',
     'cm.scheduling': 'Scheduling', 'cm.running': 'Running', 'cm.idleSt': 'Idle',
@@ -671,6 +743,11 @@ function applyI18n() {
   });
   document.querySelectorAll('[data-i18n-title]').forEach(el => { el.setAttribute('title', t(el.dataset.i18nTitle)); });
   renderLangList();
+  // 语言切换后重算激活模型 chip 文案；若当前会话已有渠道组运行态模型，保留运行态而非退回首选项
+  const _ap = (state.modelProfiles || []).find(p => (p.id ?? 0) === state.llmNo);
+  if (_ap) state.modelName = modelDisplayName(_ap);
+  if (_ap?.kind === 'mixin' && state.liveModel?.sessionId === state.activeId) applyLiveModel(state.liveModel);
+  else if (typeof updateModelChip === 'function') updateModelChip();
   window.gaRefreshModelGuide?.();
   window.collabRetranslate?.();
   syncAskUserUi();
@@ -847,11 +924,85 @@ const closeModals = () => document.querySelectorAll('.modal').forEach(m => {
   m.querySelectorAll('.field-limit-hint').forEach(h => h.style.display = 'none');
 });
 const bindClick = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+function openServiceManagerFromSettings() {
+  closeModals();
+  gaGoPage('services');
+  setSvcTab('status');
+  void loadStatusPanel();
+}
 bindClick('add-model-btn', (e) => {
   e.stopPropagation();
   openAddModelForm();
 });
 bindClick('settings-btn',  (e) => { e.stopPropagation(); openSettings(); });
+bindClick('settings-services-btn', (e) => { e.stopPropagation(); openServiceManagerFromSettings(); });
+
+const importMykeyInput = document.getElementById('import-mykey-input');
+async function importMykeyFromFile(file) {
+  if (!file) return;
+  const text = await file.text();
+  if (!text.trim()) throw new Error(t('err.mykeyImport'));
+  await window.ga.saveMykeyContent(text);
+  await loadModelProfiles();
+}
+bindClick('import-mykey-btn', (e) => {
+  e.stopPropagation();
+  if (importMykeyInput) importMykeyInput.click();
+});
+if (importMykeyInput) {
+  importMykeyInput.addEventListener('change', async () => {
+    const file = importMykeyInput.files && importMykeyInput.files[0];
+    importMykeyInput.value = '';
+    if (!file) return;
+    try {
+      await importMykeyFromFile(file);
+      showChanToast(t('sys.mykeyImported'), '', 'ok');
+    } catch (err) {
+      showChanToast(t('err.mykeyImport'), err.message || String(err), 'err');
+    }
+  });
+}
+async function exportMykeyToDir() {
+  const res = await window.ga.getMykeyContent();
+  const content = (res && res.content) ? String(res.content) : '';
+  if (!content.trim()) throw new Error(t('err.mykeyExport'));
+  // WebView2：独立缓存 + 无目录选择/下载；走 Tauri 原生另存为
+  if (window.__TAURI__?.core?.invoke) {
+    const path = await window.ga.tauriInvoke('export_mykey', { content });
+    if (!path) return;
+    showChanToast(t('sys.mykeyExported'), path, 'ok');
+    return;
+  }
+  if (typeof window.showDirectoryPicker === 'function') {
+    const dir = await window.showDirectoryPicker();
+    const handle = await dir.getFileHandle('mykey.py', { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(content);
+    await writable.close();
+    showChanToast(t('sys.mykeyExported'), '', 'ok');
+    return;
+  }
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'mykey.py';
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showChanToast(t('sys.mykeyExported'), '', 'ok');
+}
+bindClick('export-mykey-btn', async (e) => {
+  e.stopPropagation();
+  try {
+    await exportMykeyToDir();
+  } catch (err) {
+    if (err && (err.name === 'AbortError' || err.code === 20)) return;
+    showChanToast(t('err.mykeyExport'), err.message || String(err), 'err');
+  }
+});
 // 侧边栏「快速接入」：点击官方模型按钮 → 打开预填好的添加模型表单
 const pqEl = document.getElementById('provider-quickstart');
 if (pqEl) pqEl.addEventListener('click', (e) => {
@@ -898,6 +1049,49 @@ document.querySelectorAll('.modal').forEach(m =>
     }
   }));
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModals(); });
+
+function showConfirmDialog({ title, message, okText, okKind = 'primary', cancelText } = {}) {
+  const modal = document.getElementById('confirm-modal');
+  if (!modal) return Promise.resolve(false);
+  const titleEl = document.getElementById('confirm-title');
+  const msgEl = document.getElementById('confirm-message');
+  const okBtn = document.getElementById('confirm-ok');
+  const cancelBtn = document.getElementById('confirm-cancel');
+  if (titleEl) titleEl.textContent = title || t('common.confirm');
+  if (msgEl) msgEl.textContent = message || '';
+  if (cancelBtn) cancelBtn.textContent = cancelText || t('common.cancel');
+  if (okBtn) {
+    okBtn.textContent = okText || t('common.confirm');
+    okBtn.classList.toggle('danger', okKind === 'danger');
+    okBtn.classList.toggle('primary', okKind !== 'danger');
+  }
+  modal.hidden = false;
+  return new Promise(resolve => {
+    let done = false;
+    const finish = (yes) => {
+      if (done) return;
+      done = true;
+      modal.hidden = true;
+      cleanup();
+      resolve(yes);
+    };
+    const onOk = (e) => { e.preventDefault(); e.stopPropagation(); finish(true); };
+    const onCancel = (e) => { e.preventDefault(); e.stopPropagation(); finish(false); };
+    const onClose = (e) => { if (e.target.closest('[data-close]')) finish(false); };
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); } };
+    const cleanup = () => {
+      okBtn?.removeEventListener('click', onOk);
+      cancelBtn?.removeEventListener('click', onCancel);
+      modal.removeEventListener('click', onClose, true);
+      document.removeEventListener('keydown', onKey, true);
+    };
+    okBtn?.addEventListener('click', onOk);
+    cancelBtn?.addEventListener('click', onCancel);
+    modal.addEventListener('click', onClose, true);
+    document.addEventListener('keydown', onKey, true);
+    okBtn?.focus();
+  });
+}
 
 /* ═══════════════ Markdown ═══════════════ */
 if (typeof marked !== 'undefined') {
@@ -2906,8 +3100,20 @@ function applyPollResult(sess, result) {
   for (const msg of (result.messages || [])) upsert(sess, msg, false);
   const busy = result.status === 'running' || !!result.partial;
   setBusy(sess, busy);
-  if (isActive(sess)) applyPlanPayload(sess, result.plan);
+  if (isActive(sess)) {
+    applyPlanPayload(sess, result.plan);
+    applyLiveModel(result.model, sess);
+  }
   return busy;
+}
+
+/** 渠道组随故障转移变化时，用运行态当前子模型刷新 chip（非渠道组/无 agent 时不动，保持静态显示） */
+function applyLiveModel(live, sess = activeSess()) {
+  const selected = (state.modelProfiles || []).find(p => (p.id ?? 0) === state.llmNo);
+  if (!selected || selected.kind !== 'mixin' || !live || !live.isMixin || !live.current) return;
+  state.liveModel = { ...live, sessionId: sess?.id || state.activeId };
+  const label = `${t('model.aggregationShort')}${lang === 'en' ? ' (' : '（'}${profileLabel(live.current) || live.current}${lang === 'en' ? ')' : '）'}`;
+  if (state.modelName !== label) { state.modelName = label; updateModelChip(); }
 }
 
 /** hydrate 批量灌历史，避免逐条 appendMessage 触发全量重绘 */
@@ -3200,6 +3406,15 @@ function showError(text) {
   if (sess) { const m = { role: 'error', content: text }; sess.messages.push(m); appendMessage(sess, m); }
   else console.error(text);
 }
+let _toastTimer = null;
+function showToast(text) {
+  let el = document.getElementById('ga-toast');
+  if (!el) { el = document.createElement('div'); el.id = 'ga-toast'; el.className = 'ga-toast'; document.body.appendChild(el); }
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+}
 async function handleSlash(cmd) {
   const name = cmd.slice(1).split(/\s+/)[0];
   switch (name) {
@@ -3255,12 +3470,115 @@ function updateModelChip() {
   if (modelNameEl) modelNameEl.textContent = name;
   if (collabModelNameEl) collabModelNameEl.textContent = name;
 }
+function modelDisplayName(p, fallbackName) {
+  if (p && p.kind === 'mixin') {
+    // 静态回退显示「渠道组（首选模型名）」；运行后由 applyLiveModel 切到真实当前子模型。
+    const primary = (p.members || [])[0];
+    if (!primary) return t('model.aggregation');
+    const open = lang === 'en' ? ' (' : '（', close = lang === 'en' ? ')' : '）';
+    return `${t('model.aggregationShort')}${open}${profileLabel(primary) || primary}${close}`;
+  }
+  return profileLabel(fallbackName ?? (p && p.name)) || (fallbackName ?? (p && p.name)) || null;
+}
 async function selectModel(id, name) {
   state.llmNo = id;
-  state.modelName = profileLabel(name) || name || null;
+  state.liveModel = null;
+  const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === id);
+  state.modelName = modelDisplayName(p, name);
   updateModelChip();
   renderSettingsModels();
   await persistUiPrefs();
+}
+async function addToMixin(id) {
+  try {
+    const res = await bridgeFetch(`/model-profiles/${id}/mixin`, { method: 'POST', body: {} });
+    if (res?.ok === false || res?.error) throw new Error(res.error || t('err.mixinFailed'));
+    state.modelProfiles = normalizeProfiles(res.profiles || []);
+    renderSettingsModels();
+  } catch (ex) { showChanToast(t('err.mixinFailed'), ex.message || '', 'err'); }
+}
+async function removeFromMixin(id) {
+  try {
+    const res = await bridgeFetch(`/model-profiles/${id}/mixin`, { method: 'DELETE', body: {} });
+    if (res?.ok === false || res?.error) throw new Error(res.error || t('err.mixinFailed'));
+    state.modelProfiles = normalizeProfiles(res.profiles || []);
+    renderSettingsModels();
+  } catch (ex) { showChanToast(t('err.mixinFailed'), ex.message || '', 'err'); }
+}
+async function reorderMixin(members) {
+  try {
+    const res = await bridgeFetch('/model-profiles/mixin/order', { method: 'PUT', body: { members } });
+    if (res?.ok === false || res?.error) throw new Error(res.error || t('err.mixinFailed'));
+    state.modelProfiles = normalizeProfiles(res.profiles || []);
+    renderSettingsModels();
+    const active = state.modelProfiles.find(p => (p.id ?? 0) === state.llmNo);
+    if (active) { state.modelName = modelDisplayName(active); updateModelChip(); }
+  } catch (ex) { showChanToast(t('err.mixinFailed'), ex.message || '', 'err'); renderSettingsModels(); }
+}
+function flipReorder(container, mutate) {
+  const rows = [...container.querySelectorAll('.model-member:not(.dragging)')];
+  const first = new Map(rows.map(el => [el, el.getBoundingClientRect()]));
+  mutate();
+  rows.forEach(el => {
+    const a = first.get(el), b = el.getBoundingClientRect();
+    if (!a) return;
+    const dx = a.left - b.left, dy = a.top - b.top;
+    if (!dx && !dy) return;
+    el.style.transition = 'none';
+    el.style.transform = `translate(${dx}px, ${dy}px)`;
+    requestAnimationFrame(() => {
+      el.style.transition = 'transform .14s cubic-bezier(.2,.8,.2,1)';
+      el.style.transform = '';
+    });
+  });
+}
+function bindMixinDrag(body, members) {
+  let drag = null;
+  const clear = () => {
+    body.querySelectorAll('.model-member').forEach(x => x.classList.remove('dragging', 'drag-over'));
+    document.body.classList.remove('mixin-dragging');
+  };
+  body.addEventListener('pointerdown', (e) => {
+    const handle = e.target.closest('.model-member-drag');
+    if (!handle || e.button !== 0) return;
+    const row = handle.closest('.model-member');
+    if (!row) return;
+    e.preventDefault();
+    handle.setPointerCapture?.(e.pointerId);
+    drag = { handle, row, name: row.dataset.member, order: [...members], original: [...members], pointerId: e.pointerId, over: null };
+    row.classList.add('dragging');
+    document.body.classList.add('mixin-dragging');
+  });
+  body.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const over = document.elementFromPoint(e.clientX, e.clientY)?.closest('.model-member');
+    if (!over || !body.contains(over) || over === drag.row) return;
+    const rect = over.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    const overKey = `${over.dataset.member}:${after ? 'after' : 'before'}`;
+    if (overKey === drag.over) return;
+    drag.over = overKey;
+    const from = drag.order.indexOf(drag.name), overIdx = drag.order.indexOf(over.dataset.member);
+    if (from < 0 || overIdx < 0) return;
+    const [moved] = drag.order.splice(from, 1);
+    let insertAt = drag.order.indexOf(over.dataset.member) + (after ? 1 : 0);
+    drag.order.splice(insertAt, 0, moved);
+    flipReorder(body, () => {
+      if (after) body.insertBefore(drag.row, over.nextSibling);
+      else body.insertBefore(drag.row, over);
+    });
+  });
+  const finish = (e) => {
+    if (!drag) return;
+    drag.handle.releasePointerCapture?.(drag.pointerId);
+    const changed = JSON.stringify(drag.order) !== JSON.stringify(drag.original);
+    const next = drag.order;
+    drag = null;
+    clear();
+    if (changed) reorderMixin(next);
+  };
+  body.addEventListener('pointerup', finish);
+  body.addEventListener('pointercancel', finish);
 }
 const MODEL_ACT_EDIT = GA_ICON('pencilSimple');
 const MODEL_ACT_DEL = GA_ICON('trash');
@@ -3284,7 +3602,7 @@ const PROVIDER_PRESETS = {
   deepseek: {
     label: 'DeepSeek', descKey: 'pq.deepseekDesc',
     protocol: 'oai', apibase: 'https://api.deepseek.com/v1',
-    model: 'deepseek-chat', name: 'DeepSeek',
+    model: 'deepseek-v4-pro', name: 'DeepSeek',
     keyUrl: 'https://platform.deepseek.com/api_keys',
     color: '#4D6BFE', tint: 'rgba(77,107,254,.12)',
     logo: '<svg viewBox="0 0 24 24" fill="#4D6BFE" xmlns="http://www.w3.org/2000/svg"><path d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254c-.274-.23-.47-.358-.551-.758a1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45"/></svg>',
@@ -3292,7 +3610,7 @@ const PROVIDER_PRESETS = {
   qwen: {
     label: '通义千问', descKey: 'pq.qwenDesc',
     protocol: 'oai', apibase: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    model: 'qwen-plus', name: '通义千问',
+    model: 'qwen3.6-max-preview', name: '通义千问',
     keyUrl: 'https://bailian.console.aliyun.com/?apiKey=1',
     color: '#615CED', tint: 'rgba(97,92,237,.12)',
     logo: '<svg viewBox="0 0 24 24" fill="#615CED" xmlns="http://www.w3.org/2000/svg"><path d="M23.919 14.545 20.817 9.17l1.47-2.544a.56.56 0 0 0 0-.566l-1.633-2.83a.57.57 0 0 0-.49-.283h-6.207L12.487.402a.57.57 0 0 0-.49-.284H8.732a.56.56 0 0 0-.49.284L5.139 5.775h-2.94a.56.56 0 0 0-.49.284L.077 8.887a.56.56 0 0 0 0 .567L3.18 14.83l-1.47 2.545a.56.56 0 0 0 0 .566l1.634 2.83a.57.57 0 0 0 .49.283h6.205l1.47 2.545a.57.57 0 0 0 .49.284h3.266a.57.57 0 0 0 .49-.284l3.104-5.375h2.94a.57.57 0 0 0 .49-.283l1.634-2.828a.55.55 0 0 0-.004-.568M8.733.686l1.634 2.828-1.634 2.828H21.8L20.164 9.17H7.425L5.63 6.06Zm1.306 19.801-6.205-.002 1.634-2.83h3.265L2.201 6.344h3.267q3.182 5.517 6.367 11.032zm10.124-5.66L18.53 12l-6.532 11.315-1.634-2.83c2.129-3.673 4.25-7.351 6.373-11.028h3.592l3.102 5.374z"/></svg>',
@@ -3381,17 +3699,21 @@ async function openEditModelForm(id) {
       const pv = /claude/i.test(p.varName || '') ? 'claude' : 'oai';
       const pr = form.querySelector(`input[name="protocol"][value="${pv}"]`);
       if (pr) pr.checked = true;
+      // 回填流式开关(默认流式)
+      const sv = (p.stream === false) ? 'false' : 'true';
+      const sr = form.querySelector(`input[name="stream"][value="${sv}"]`);
+      if (sr) sr.checked = true;
     }
     setModelApikeyMode(false);
     openModal('add-model-modal');
     applyI18n();
   } catch (ex) {
-    alert(ex.message || t('err.modelSave'));
+    showChanToast(t('err.modelSave'), ex.message || '', 'err');
   }
 }
 async function deleteModel(id, name) {
   const label = profileLabel(name) || name || ('#' + id);
-  if (!confirm(`${t('confirm.modelDelete')}\n${label}`)) return;
+  if (!(await showConfirmDialog({ title: t('common.delete'), message: `${t('confirm.modelDelete')}\n${label}`, okText: t('common.delete'), okKind: 'danger' }))) return;
   try {
     const res = await bridgeFetch(`/model-profiles/${id}`, { method: 'DELETE', body: {} });
     if (res?.ok === false || res?.error) throw new Error(res.error || t('err.modelDelete'));
@@ -3409,7 +3731,7 @@ async function deleteModel(id, name) {
     renderSettingsModels();
   } catch (ex) {
     const msg = ex.message || '';
-    alert(msg.includes('last profile') ? t('err.modelDeleteLast') : (msg || t('err.modelDelete')));
+    showChanToast(msg.includes('last profile') ? t('err.modelDeleteLast') : t('err.modelDelete'), msg.includes('last profile') ? '' : msg, 'err');
   }
 }
 function renderSettingsModels() {
@@ -3417,26 +3739,79 @@ function renderSettingsModels() {
   if (!box) return;
   box.innerHTML = '';
   const list = state.modelProfiles || [];
-  if (!list.length) {
+  const mixin = list.find(p => p.kind === 'mixin');
+  const natives = list.filter(p => p.kind !== 'mixin');
+  const byName = new Map(natives.map(p => [p.name, p]));
+
+  // ── 渠道组（自动故障转移）：可展开组；本身也可被选为激活模型 ──
+  if (mixin) {
+    const gid = mixin.id ?? 0;
+    const members = mixin.members || [];
+    const expanded = state.mixinExpanded !== false; // 默认展开
+    const group = document.createElement('div');
+    group.className = 'model-group';
+    const head = document.createElement('label');
+    head.className = 'model-row model-row--mixin' + (state.llmNo === gid ? ' sel' : '');
+    head.innerHTML = `<input type="radio" name="model-pick"${state.llmNo === gid ? ' checked' : ''}><span class="model-mixin-caret" data-act="toggle">${GA_ICON(expanded ? 'caretDown' : 'caretRight')}</span><span class="model-row-name">${escapeHtml(t('model.aggregation'))}</span>`;
+    head.querySelector('[data-act="toggle"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); state.mixinExpanded = !expanded; renderSettingsModels(); });
+    head.addEventListener('click', (e) => { if (e.target.closest('[data-act="toggle"]')) return; e.preventDefault(); selectModel(gid, mixin.name); });
+    group.appendChild(head);
+    if (expanded) {
+      const body = document.createElement('div');
+      body.className = 'model-mixin-body';
+      if (!members.length) {
+        const em = document.createElement('div');
+        em.className = 'model-mixin-empty'; em.textContent = t('model.emptyMixin');
+        body.appendChild(em);
+      } else {
+        members.forEach((mName, i) => {
+          const mp = byName.get(mName);
+          const row = document.createElement('div');
+          row.className = 'model-member';
+          row.dataset.member = mName;
+          row.innerHTML = `<button type="button" class="model-member-drag" data-act="drag" title="${escapeHtml(t('model.dragReorder'))}" aria-label="${escapeHtml(t('model.dragReorder'))}"><span class="grip-dot"></span></button><span class="model-member-name">${escapeHtml(profileLabel(mName) || mName)}</span><button type="button" class="model-act model-act-del" data-act="unmix" title="${escapeHtml(t('model.removeFromMixin'))}">${GA_ICON('x')}</button>`;
+          row.querySelector('[data-act="unmix"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); if (mp) removeFromMixin(mp.id ?? 0); });
+          body.appendChild(row);
+        });
+        bindMixinDrag(body, members);
+      }
+      group.appendChild(body);
+    }
+    box.appendChild(group);
+  }
+
+  // ── 独立模型（聚合渠道组已自带分隔，这里不再单列标题）──
+  if (!natives.length) {
     const empty = document.createElement('div');
     empty.className = 'set-empty'; empty.textContent = t('set.noModels');
-    box.appendChild(empty); return;
+    box.appendChild(empty);
+  } else {
+    for (const p of natives) {
+      const id = p.id ?? 0;
+      const label = profileLabel(p.name) || p.name || ('#' + id);
+      const row = document.createElement('label');
+      row.className = 'model-row' + (state.llmNo === id ? ' sel' : '');
+      // 独立列表按钮统一为「加入渠道组」（➕）；移除只在渠道组展开区做。
+      // 已在渠道组的，按钮仍是「加入」，但点击只提示「已在渠道组中」，并用 is-in 给个淡淡的视觉区分。
+      const mixToggle = !mixin ? '' : `<button type="button" class="model-act model-act-addmix${p.inMixin ? ' is-in' : ''}" data-act="addmix" title="${escapeHtml(p.inMixin ? t('model.alreadyInMixin') : t('model.addToMixin'))}">${GA_ICON('plus')}</button>`;
+      row.innerHTML = `<input type="radio" name="model-pick"${state.llmNo === id ? ' checked' : ''}><span class="model-row-name">${escapeHtml(label)}</span><span class="model-row-actions">${mixToggle}<button type="button" class="model-act" data-act="edit" title="${escapeHtml(t('common.edit'))}">${MODEL_ACT_EDIT}</button><button type="button" class="model-act model-act-del" data-act="delete" title="${escapeHtml(t('common.delete'))}">${MODEL_ACT_DEL}</button></span>`;
+      row.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); openEditModelForm(id); });
+      row.querySelector('[data-act="delete"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); deleteModel(id, p.name); });
+      const addBtn = row.querySelector('[data-act="addmix"]');
+      if (addBtn) addBtn.addEventListener('click', (e) => {
+        e.stopPropagation(); e.preventDefault();
+        if (p.inMixin) showToast(t('model.alreadyInMixin'));
+        else addToMixin(id);
+      });
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.model-row-actions')) return;
+        e.preventDefault();
+        selectModel(id, p.name);
+      });
+      box.appendChild(row);
+    }
   }
-  for (const p of list) {
-    const id = p.id ?? 0;
-    const label = profileLabel(p.name) || p.name || ('#' + id);
-    const row = document.createElement('label');
-    row.className = 'model-row' + (state.llmNo === id ? ' sel' : '');
-    row.innerHTML = `<input type="radio" name="model-pick"${state.llmNo === id ? ' checked' : ''}><span class="model-row-name">${escapeHtml(label)}</span><span class="model-row-actions"><button type="button" class="model-act" data-act="edit" title="${escapeHtml(t('common.edit'))}">${MODEL_ACT_EDIT}</button><button type="button" class="model-act model-act-del" data-act="delete" title="${escapeHtml(t('common.delete'))}">${MODEL_ACT_DEL}</button></span>`;
-    row.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); openEditModelForm(id); });
-    row.querySelector('[data-act="delete"]').addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); deleteModel(id, p.name); });
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('.model-row-actions')) return;
-      e.preventDefault();
-      selectModel(id, p.name);
-    });
-    box.appendChild(row);
-  }
+  applyI18n();
 }
 function openSettings() {
   openModal('settings-modal');
@@ -3454,7 +3829,7 @@ async function loadModelProfiles() {
     const active = state.modelProfiles.find(p => p.active) || state.modelProfiles[0];
     if (active) {
       state.llmNo = active.id ?? 0;
-      state.modelName = profileLabel(active.name) || active.name || null;
+      state.modelName = modelDisplayName(active);
     }
     updateModelChip();
     renderSettingsModels();
@@ -3469,7 +3844,8 @@ function renderModelMenu(menuEl) {
   const rows = list.map((p, i) => {
     const no = (p.id ?? i);
     const isActive = (state.llmNo === no) ? ' active' : '';
-    return `<div class="ga-menu-item${isActive}" data-llmno="${no}">${escapeHtml(p.name || '')}</div>`;
+    const label = (isActive && p.kind === 'mixin' && state.modelName) ? state.modelName : modelDisplayName(p);
+    return `<div class="ga-menu-item${isActive}" data-llmno="${no}">${escapeHtml(label || '')}</div>`;
   });
   menuEl.innerHTML = rows.join('');
   applyI18n();
@@ -3565,7 +3941,7 @@ async function loadBridgeConfig() {
       const p = state.modelProfiles.find(x => (x.id ?? 0) === cfg.llmNo);
       if (p) {
         state.llmNo = cfg.llmNo;
-        state.modelName = profileLabel(p.name) || p.name || null;
+        state.modelName = modelDisplayName(p);
         updateModelChip();
         renderSettingsModels();
       }
@@ -4030,6 +4406,7 @@ window.ga.onBridgeClosed(() => {
 
 /* ═══════════════ Token 用量页 ═══════════════ */
 const tokTbody = document.getElementById('tok-tbody');
+const tokTable = document.getElementById('tok-table');
 const tokPager = document.getElementById('tok-pager');
 const tokSince = document.getElementById('tok-since');
 const tokUntil = document.getElementById('tok-until');
@@ -4245,8 +4622,8 @@ if (tokTabs) tokTabs.addEventListener('click', e => {
   btn.classList.add('active');
   _tokTab = btn.dataset.tab;
   _tokPage = 0;
-  if (_tokTab === 'conductor') { if (tokFilter) tokFilter.style.display = 'none'; if (tokStatRow) tokStatRow.style.display = 'none'; loadConductorTokens(); }
-  else { if (tokFilter) tokFilter.style.display = ''; if (tokStatRow) tokStatRow.style.display = ''; loadTokenPage(); }
+  if (_tokTab === 'conductor') { if (tokFilter) tokFilter.style.display = 'none'; if (tokStatRow) tokStatRow.style.display = 'none'; if (tokTable) tokTable.classList.add('tok-table--conductor'); loadConductorTokens(); }
+  else { if (tokFilter) tokFilter.style.display = ''; if (tokStatRow) tokStatRow.style.display = ''; if (tokTable) tokTable.classList.remove('tok-table--conductor'); loadTokenPage(); }
 });
 
 async function loadConductorTokens() {
@@ -4273,7 +4650,7 @@ async function loadConductorTokens() {
   const hIn = hist.input + curIn, hOut = hist.output + curOut, hCc = hist.cacheCreate + curCc, hCr = hist.cacheRead + curCr, hCost = hist.cost + curCost;
   if (!tokTbody) return;
   const tip = t('tok.condTip');
-  const _ci = GA_ICON('gitFork');
+  const _ci = GA_ICON('gitFork', 'tok-cond-ico');
   const hCacheBase = hIn + hCr + hCc;
   const hCacheRate = hCacheBase > 0 ? (hCr / hCacheBase * 100).toFixed(1) + '%' : '0%';
   const curCacheBase = curIn + curCr + curCc;
@@ -4831,6 +5208,20 @@ function showChanToast(title, detail, kind) {
     // Preset form: 每字段独立内联提示（标题/Prompt 各自独立,互不串扰）
     bindFieldInlineLimit(document.getElementById('cp-title'));
     bindFieldInlineLimit(document.getElementById('cp-prompt'));
+
+    // First-run desktop-shortcut prompt (Windows portable bundle only). Driven from the web UI
+    // so the dialog always renders on top — a native dialog from the Rust startup thread had no
+    // parent window and got buried behind the main window on first launch.
+    maybeAskDesktopShortcut();
+  }
+
+  async function maybeAskDesktopShortcut() {
+    try {
+      const should = await window.ga.tauriInvoke('shortcut_should_ask');
+      if (!should) return;
+      const create = await showConfirmDialog({ title: t('common.confirm'), message: t('shortcut.askConfirm'), okText: t('common.confirm') });
+      await window.ga.tauriInvoke('shortcut_decide', { create });
+    } catch (_) { /* not in tauri / not a bundle — ignore */ }
   }
 
   if (document.readyState === 'loading') {
@@ -4980,10 +5371,49 @@ if (chanConfigSave) {
 
 /* ═══════════════ 状态面板（复用 ServiceManager + 启停/日志） ═══════════════ */
 const statusListEl = document.getElementById('status-list');
+const BRIDGE_SERVICE_ID = '__bridge__';
+const EXTRA_SERVICE_IDS = new Set(['frontends/conductor.py', 'reflect/scheduler.py']);
+
+function bridgeOfflinePanelServices() {
+  return [
+    {
+      id: BRIDGE_SERVICE_ID,
+      name: `bridge (:${BRIDGE_PORT})`,
+      status: 'offline',
+      running: false,
+      pid: null,
+      memMb: null,
+      cpuPct: null,
+      managed: false,
+    },
+    {
+      id: 'frontends/conductor.py',
+      name: 'frontends/conductor.py',
+      status: 'offline',
+      running: false,
+      pid: null,
+      memMb: null,
+      cpuPct: null,
+      managed: false,
+      bridgeOffline: true,
+    },
+    {
+      id: 'reflect/scheduler.py',
+      name: 'reflect/scheduler.py',
+      status: 'offline',
+      running: false,
+      pid: null,
+      memMb: null,
+      cpuPct: null,
+      managed: false,
+      bridgeOffline: true,
+    },
+  ];
+}
 
 function statusDisplayName(s) {
   if (!s) return '';
-  if (s.id === '__bridge__') return s.name || 'bridge';
+  if (s.id === BRIDGE_SERVICE_ID) return s.name || 'bridge';
   if (s.id === 'reflect/scheduler.py') return t('proc.scheduler');
   if (s.id === 'frontends/conductor.py') return t('proc.conductor');
   return channelDisplayName(s);
@@ -5005,10 +5435,26 @@ function renderStatusPanel(services) {
     const stClass = channelStatusClass(s.status || 'offline');
     const running = !!s.running;
     const managed = s.managed !== false;
-    let acts = `<button type="button" class="link-btn link sm" data-act="logs"></button>`;
-    if (managed) {
-      if (running) acts += `<button type="button" class="link-btn link sm" data-act="restart"></button>`;
-      acts += `<button type="button" class="sw-mini${running ? ' on' : ''}" data-act="toggle" aria-pressed="${running}"><i></i></button>`;
+    const isBridge = s.id === BRIDGE_SERVICE_ID;
+    const isExtra = EXTRA_SERVICE_IDS.has(s.id);
+    let acts = '';
+    if (isBridge) {
+      if (running) {
+        acts += `<button type="button" class="link-btn link sm" data-act="logs"></button>`;
+        acts += `<button type="button" class="link-btn link sm" data-act="bridge-exit"></button>`;
+      } else {
+        acts += `<button type="button" class="link-btn link sm" data-act="bridge-start"></button>`;
+      }
+    } else if (!s.bridgeOffline) {
+      acts += `<button type="button" class="link-btn link sm" data-act="logs"></button>`;
+      if (managed) {
+        if (running) acts += `<button type="button" class="link-btn link sm" data-act="restart"></button>`;
+        if (isExtra) {
+          acts += `<button type="button" class="link-btn link sm${running ? ' on' : ''}" data-act="toggle" aria-pressed="${running}"></button>`;
+        } else {
+          acts += `<button type="button" class="sw-mini${running ? ' on' : ''}" data-act="toggle" aria-pressed="${running}"><i></i></button>`;
+        }
+      }
     }
     row.innerHTML = `
       <b class="st-name"></b>
@@ -5025,14 +5471,30 @@ function renderStatusPanel(services) {
     if (logBtn) logBtn.textContent = t('act.logs');
     const rstBtn = row.querySelector('[data-act="restart"]');
     if (rstBtn) rstBtn.textContent = t('act.restart');
+    const startBridgeBtn = row.querySelector('[data-act="bridge-start"]');
+    if (startBridgeBtn) startBridgeBtn.textContent = t('act.start');
+    const exitBridgeBtn = row.querySelector('[data-act="bridge-exit"]');
+    if (exitBridgeBtn) exitBridgeBtn.textContent = t('act.exit');
+    const textToggleBtn = row.querySelector('.link-btn[data-act="toggle"]');
+    if (textToggleBtn) textToggleBtn.textContent = running ? t('act.exit') : t('act.start');
     statusListEl.appendChild(row);
   }
 }
 
 async function loadStatusPanel() {
   if (!statusListEl) return;
-  const res = await window.ga.getServicePanel();
-  renderStatusPanel(res.services || []);
+  if (bridgeUiOffline) {
+    renderStatusPanel(bridgeOfflinePanelServices());
+    return;
+  }
+  try {
+    const res = await window.ga.getServicePanel();
+    renderStatusPanel(res.services || []);
+  } catch (_) {
+    window.ga.setBridgeUiOffline(true);
+    gaServiceStore.applySnapshot(bridgeOfflinePanelServices());
+    renderStatusPanel(bridgeOfflinePanelServices());
+  }
 }
 
 async function restartService(id) {
@@ -5055,6 +5517,40 @@ if (statusListEl) {
     const act = actEl.dataset.act;
     if (act === 'logs') {
       openChannelLogs(id);
+      return;
+    }
+    if (act === 'bridge-start') {
+      if (_chanBusy) return;
+      _chanBusy = true;
+      actEl.disabled = true;
+      try {
+        await window.ga.spawnBridge();
+        await loadStatusPanel();
+        showChanToast(t('sys.channelStarted') + ' · bridge', '', 'ok');
+      } catch (err) {
+        showChanToast(t('err.channelStart') + ' · bridge', err.message || String(err), 'err');
+      } finally {
+        _chanBusy = false;
+        actEl.disabled = false;
+      }
+      return;
+    }
+    if (act === 'bridge-exit') {
+      if (_chanBusy) return;
+      _chanBusy = true;
+      actEl.disabled = true;
+      try {
+        window.ga.setBridgeUiOffline(true);
+        gaServiceStore.applySnapshot(bridgeOfflinePanelServices());
+        renderStatusPanel(bridgeOfflinePanelServices());
+        await window.ga.exitBridge();
+        showChanToast(t('sys.channelStopped') + ' · bridge', '', 'ok');
+      } catch (err) {
+        showChanToast(t('err.channelStop') + ' · bridge', err.message || String(err), 'err');
+      } finally {
+        _chanBusy = false;
+        actEl.disabled = false;
+      }
       return;
     }
     if (act === 'restart') {
@@ -5081,7 +5577,10 @@ if (statusListEl) {
 
 gaServiceStore.onServices((list) => {
   if (isSvcTab('channels')) renderChannelList(list);
-  if (isSvcTab('status')) loadStatusPanel();
+  if (isSvcTab('status')) {
+    if (bridgeUiOffline) renderStatusPanel(bridgeOfflinePanelServices());
+    else loadStatusPanel();
+  }
 });
 if (chanListEl) {
   chanListEl.addEventListener('click', async (e) => {

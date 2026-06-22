@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>GenericAgent</title>
 <link rel="stylesheet" href="assets/fonts/fonts.css?v=2">
-<link rel="stylesheet" href="styles.css?v=161">
+<link rel="stylesheet" href="styles.css?v=181">
 <!-- KaTeX: LaTeX 公式渲染 -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
 <!-- highlight.js: 代码高亮 -->
@@ -387,7 +387,6 @@
               <tbody id="tok-tbody"></tbody>
             </table>
             <div class="tok-pager" id="tok-pager"></div>
-            <p style="color:var(--muted);font-size:12px;margin-top:12px;text-align:center" data-i18n="tok.disclaimer"></p>
           </div>
         </section>
 
@@ -484,6 +483,12 @@
               <label class="seg-opt"><input type="radio" name="protocol" value="claude" required><span data-i18n="model.protocolClaude"></span></label>
             </div>
           </div>
+          <div class="model-form-field"><span class="field-label"><span data-i18n="model.stream"></span></span>
+            <div class="seg-group" role="radiogroup">
+              <label class="seg-opt"><input type="radio" name="stream" value="true" checked><span data-i18n="model.streamOn"></span></label>
+              <label class="seg-opt"><input type="radio" name="stream" value="false"><span data-i18n="model.streamOff"></span></label>
+            </div>
+          </div>
           <label><span data-i18n="model.name"></span><input name="name" data-i18n-ph="model.namePh" data-optional-ph maxlength="50"></label>
           <div class="model-form-row">
             <label class="model-form-mini"><span data-i18n="model.retries"></span><input name="max_retries" type="text" inputmode="numeric" pattern="[0-9]*" min="1" max="20" value="5"></label>
@@ -496,6 +501,25 @@
             <button type="submit" class="set-btn primary"><span data-i18n="model.save"></span></button>
           </div>
         </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="confirm-modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card confirm-card" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div class="modal-head">
+        <div class="modal-title" id="confirm-title"></div>
+        <button class="modal-x" data-close data-i18n-title="common.close" title="">
+          <span data-ga-icon="x"></span>
+        </button>
+      </div>
+      <div class="modal-body confirm-body">
+        <div class="confirm-message" id="confirm-message"></div>
+        <div class="confirm-actions">
+          <button type="button" class="set-btn ghost" id="confirm-cancel"></button>
+          <button type="button" class="set-btn primary" id="confirm-ok"></button>
+        </div>
       </div>
     </div>
   </div>
@@ -606,12 +630,28 @@
           <div class="set-sec-t" data-i18n="set.lang"></div>
           <div class="model-list lang-list" id="lang-list"></div>
         </div>
-        <div>
+        <div class="set-block">
           <div class="set-sec-t" data-i18n="set.model"></div>
           <div class="model-list" id="model-list"></div>
           <button class="set-btn" id="add-model-btn" type="button">
             <span data-ga-icon="plus"></span>
             <span data-i18n="set.addModel"></span>
+          </button>
+        </div>
+        <div class="set-block">
+          <div class="set-sec-t" data-i18n="set.features"></div>
+          <button class="set-btn" id="import-mykey-btn" type="button">
+            <span data-ga-icon="fileText"></span>
+            <span data-i18n="set.importMykey"></span>
+          </button>
+          <input type="file" id="import-mykey-input" accept=".py,text/plain" hidden>
+          <button class="set-btn set-btn-follow" id="export-mykey-btn" type="button">
+            <span data-ga-icon="folderSimple"></span>
+            <span data-i18n="set.exportMykey"></span>
+          </button>
+          <button class="set-btn set-btn-follow" id="settings-services-btn" type="button">
+            <span data-ga-icon="broadcast"></span>
+            <span data-i18n="set.serviceManager"></span>
           </button>
         </div>
       </div>
@@ -634,6 +674,6 @@
 <!-- highlight.js -->
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" crossorigin="anonymous"></script>
 <script src="phosphor-icons.js?v=2"></script>
-<script src="app.js?v=191"></script>
+<script src="app.js?v=208"></script>
 </body>
 </html>
