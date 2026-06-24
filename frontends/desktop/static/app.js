@@ -216,6 +216,8 @@ let bridgeUiOffline = false;
       case 'services/bridge/exit': return http('/services/bridge/exit', { method: 'POST' });
       case 'services/mykey/get': return http('/services/mykey');
       case 'services/mykey/save': return http('/services/mykey', { method: 'POST', body: params || {} });
+      case 'services/conductor/model/get': return http('/services/conductor/model');
+      case 'services/conductor/model/save': return http('/services/conductor/model', { method: 'POST', body: params || {} });
       case 'app/path/selectGaRoot': return http('/config');
       case 'list_continuable_sessions': return { sessions: [] };
       case 'restore_session': throw new Error('restore_session is not implemented in web2 bridge');
@@ -282,6 +284,8 @@ let bridgeUiOffline = false;
     getServicePanel: () => rpc('services/panel', {}),
     getMykeyContent: () => rpc('services/mykey/get', {}),
     saveMykeyContent: (content) => rpc('services/mykey/save', { content }),
+    getConductorModel: () => rpc('services/conductor/model/get', {}),
+    saveConductorModel: (llmNo) => rpc('services/conductor/model/save', { llmNo }),
     tauriInvoke,
     setBridgeUiOffline: (offline) => { bridgeUiOffline = !!offline; },
     pollSession: (sessionId, afterId = 0) => rpc('session/poll', { sessionId, afterId }),
@@ -1727,6 +1731,7 @@ function postRenderEnhance(containerEl) {
 const state = {
   sessions: new Map(), activeId: null, bridgeReady: false,
   llmNo: 0, modelProfiles: [], modelName: null,
+  conductorLlmNo: null, conductorModelName: null,
   runtime: new Map(),
   pendingFiles: [],
   fileSeq: 0,
@@ -3496,7 +3501,7 @@ document.querySelectorAll('.feature-grid').forEach(grid => {
 function updateModelChip() {
   const name = state.modelName || '';
   if (modelNameEl) modelNameEl.textContent = name;
-  if (collabModelNameEl) collabModelNameEl.textContent = name;
+  if (collabModelNameEl) collabModelNameEl.textContent = state.conductorModelName || name;
 }
 function modelDisplayName(p, fallbackName) {
   if (p && p.kind === 'mixin') {
@@ -3515,8 +3520,8 @@ async function selectModel(id, name) {
   state.modelName = modelDisplayName(p, name);
   updateModelChip();
   renderSettingsModels();
-  // 申请切换:有活跃会话 -> 绑定到该会话(后端权威);同时更新全局默认(供 conductor /
-  // 新建会话初始值)。后端是真相源,前端只发请求;申请失败则回滚显示并提示。
+  // 申请切换:有活跃会话 -> 绑定到该会话(后端权威);同时更新全局默认(供新建会话初始值)。
+  // 后端是真相源,前端只发请求;申请失败则回滚显示并提示。
   const sess = activeSess();
   if (sess && sess.bridgeSessionId) {
     const prevNo = sess.llmNo;
@@ -3540,6 +3545,13 @@ async function selectModel(id, name) {
     sess.llmNo = id;
   }
   await persistUiPrefs();  // 写 ui.llmNo 全局默认
+}
+async function selectConductorModel(id, name) {
+  state.conductorLlmNo = id;
+  const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === id);
+  state.conductorModelName = modelDisplayName(p, name);
+  updateModelChip();
+  try { await window.ga.saveConductorModel(id); } catch (_) {}
 }
 async function addToMixin(id) {
   try {
@@ -3893,10 +3905,12 @@ const collabModelMenu = document.getElementById('cdb-model-menu');
 function renderModelMenu(menuEl) {
   if (!menuEl) return;
   const list = state.modelProfiles || [];
+  const selectedNo = menuEl === collabModelMenu ? state.conductorLlmNo : state.llmNo;
+  const selectedName = menuEl === collabModelMenu ? state.conductorModelName : state.modelName;
   const rows = list.map((p, i) => {
     const no = (p.id ?? i);
-    const isActive = (state.llmNo === no) ? ' active' : '';
-    const label = (isActive && p.kind === 'mixin' && state.modelName) ? state.modelName : modelDisplayName(p);
+    const isActive = (selectedNo === no) ? ' active' : '';
+    const label = (isActive && p.kind === 'mixin' && selectedName) ? selectedName : modelDisplayName(p);
     return `<div class="ga-menu-item${isActive}" data-llmno="${no}">${escapeHtml(label || '')}</div>`;
   });
   menuEl.innerHTML = rows.join('');
@@ -3924,7 +3938,7 @@ function closeAllModelMenus() {
   if (modelChip) modelChip.classList.remove('open');
   if (collabModelChip) collabModelChip.classList.remove('open');
 }
-function bindModelMenuItemClick(menuEl) {
+function bindModelMenuItemClick(menuEl, onSelect) {
   if (!menuEl) return;
   menuEl.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -3933,12 +3947,12 @@ function bindModelMenuItemClick(menuEl) {
     const no = parseInt(item.dataset.llmno, 10);
     if (Number.isNaN(no)) return;
     const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === no);
-    selectModel(no, (p && p.name) || '');
+    onSelect(no, (p && p.name) || '');
     closeAllModelMenus();
   });
 }
-bindModelMenuItemClick(modelMenu);
-bindModelMenuItemClick(collabModelMenu);
+bindModelMenuItemClick(modelMenu, selectModel);
+bindModelMenuItemClick(collabModelMenu, selectConductorModel);
 if (modelChip) modelChip.addEventListener('click', (e) => {
   e.preventDefault(); e.stopPropagation();
   if (modelMenu && !modelMenu.hidden) { closeAllModelMenus(); return; }
@@ -3994,10 +4008,18 @@ async function loadBridgeConfig() {
       if (p) {
         state.llmNo = cfg.llmNo;
         state.modelName = modelDisplayName(p);
-        updateModelChip();
         renderSettingsModels();
       }
     }
+    const cno = cfg.conductor?.llmNo ?? cfg.llmNo;
+    if (cno != null && state.modelProfiles.length) {
+      const cp = state.modelProfiles.find(x => (x.id ?? 0) === cno);
+      if (cp) {
+        state.conductorLlmNo = cno;
+        state.conductorModelName = modelDisplayName(cp);
+      }
+    }
+    updateModelChip();
     syncBootCache();
   } catch (_) {}
 }
