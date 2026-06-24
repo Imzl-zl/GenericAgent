@@ -581,7 +581,7 @@ class AgentManager:
         _purge_session_uploads(sid)
         return {"ok": True, "sessionId": sid}
 
-    def submit_prompt(self, sid: str, prompt: Any, images: Optional[list] = None, llm_no: Optional[int] = None, display: Optional[str] = None, files_meta: Optional[list] = None, image_metas: Optional[list] = None) -> dict:
+    def submit_prompt(self, sid: str, prompt: Any, images: Optional[list] = None, display: Optional[str] = None, files_meta: Optional[list] = None, image_metas: Optional[list] = None) -> dict:
         prompt, image_ids = normalize_prompt(prompt, images)
         with self.lock:
             sess = self.sessions.get(sid)
@@ -589,9 +589,6 @@ class AgentManager:
                 raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
             if sess.status == "running":
                 raise web.HTTPConflict(text=json.dumps({"error": "session is already running"}, ensure_ascii=False), content_type="application/json")
-            # 模型绑定到会话(权威),不再写全局 config。前端带来的 llm_no 视为本会话的选择。
-            if llm_no is not None:
-                sess.llm_no = int(llm_no)
             extra = {}
             if image_ids:
                 extra["image_ids"] = image_ids
@@ -611,22 +608,20 @@ class AgentManager:
             sess.last_error = ""
             sess.partial = {"id": sess.msg_seq + 1, "role": "assistant", "content": "", "ts": time.time(), "partial": True,
                             "curr_turn": 0, "turn_segs": []}  # turn_segs[i]=第i轮全文(权威结构化,前端按轮渲染);content保留双轨兜底
-            t = threading.Thread(target=self.run_agent_turn, args=(sess, prompt, None, llm_no), daemon=True, name=f"Turn-{sid}")
+            t = threading.Thread(target=self.run_agent_turn, args=(sess, prompt, None), daemon=True, name=f"Turn-{sid}")
             sess.thread = t
             t.start()
             seq = sess.msg_seq
         emit_session_state(sess, "running")
         return {"ok": True, "sessionId": sid, "accepted": True, "userMessageId": user_msg["id"], "seq": seq}
 
-    def run_agent_turn(self, sess: Session, prompt: str, images: Optional[list] = None, llm_no: Optional[int] = None):
+    def run_agent_turn(self, sess: Session, prompt: str, images: Optional[list] = None):
         try:
             if sess.agent is None:
                 sess.agent = self.make_agent(sess)
             agent = sess.agent
-            # 生效优先级:本次显式 llm_no > 会话绑定 sess.llm_no > 全局默认。
-            no = llm_no if llm_no is not None else sess.llm_no
-            if no is None:
-                no = _global_default_llm_no()
+            # 模型取会话绑定 sess.llm_no,未绑定回退全局默认。切换走 set_session_model。
+            no = sess.llm_no if sess.llm_no is not None else _global_default_llm_no()
             if no is not None and hasattr(agent, "next_llm"):
                 with contextlib.suppress(Exception):
                     agent.next_llm(int(no))
@@ -1398,10 +1393,9 @@ async def prompt_handler(request):
     display = data.get("display")
     files_meta = data.get("files") or []        # 非图片附件 [{name, path}]
     image_metas = data.get("imageMetas") or []   # 图片附件 [{name, path}]（不含 dataUrl）
-    llm_no = data.get("llmNo")
-    if llm_no is not None:
-        llm_no = int(llm_no)
-    return json_ok(manager.submit_prompt(sid, prompt, images, llm_no=llm_no, display=display,
+    # 模型不再随 prompt 携带:切换模型走 POST /session/{sid}/model 这一唯一入口,
+    # 发消息只使用会话已绑定的 sess.llm_no(未绑定则回退全局默认)。
+    return json_ok(manager.submit_prompt(sid, prompt, images, display=display,
                                           files_meta=files_meta, image_metas=image_metas))
 
 

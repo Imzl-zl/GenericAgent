@@ -353,7 +353,7 @@ const I18N = {
     'guide.step3': '点击保存，即可在模型列表中选用',
     'guide.prefillTip': '已为你预填 API 地址、协议与模型，可按需修改',
     'guide.getKey': '获取 {name} 的 API Key', 'guide.copy': '复制链接', 'guide.copied': '链接已复制',
-    'err.modelSave': '保存失败', 'err.modelRequired': '请填写模型、API Key 和 API 地址',
+    'err.modelSave': '保存失败', 'err.modelSwitch': '切换模型失败', 'err.modelRequired': '请填写模型、API Key 和 API 地址',
     'err.modelDelete': '删除失败', 'err.modelDeleteLast': '至少保留一个模型',
     'confirm.modelDelete': '确定删除该模型配置？',
     'model.aggregation': '渠道组（自动故障转移）', 'model.aggregationShort': '渠道组', 'model.aggregationDesc': '按顺序尝试，失败自动切换到下一个',
@@ -526,7 +526,7 @@ const I18N = {
     'guide.step3': 'Click Save — then pick it from the model list',
     'guide.prefillTip': 'API base, protocol and model are pre-filled — edit if needed',
     'guide.getKey': 'Get your {name} API key', 'guide.copy': 'Copy link', 'guide.copied': 'Link copied',
-    'err.modelSave': 'Save failed', 'err.modelRequired': 'Model, API Key and base URL are required',
+    'err.modelSave': 'Save failed', 'err.modelSwitch': 'Failed to switch model', 'err.modelRequired': 'Model, API Key and base URL are required',
     'err.modelDelete': 'Delete failed', 'err.modelDeleteLast': 'At least one model is required',
     'confirm.modelDelete': 'Delete this model profile?',
     'model.aggregation': 'Channel group (auto failover)', 'model.aggregationShort': 'Channel group', 'model.aggregationDesc': 'Tries in order, switches to the next on failure',
@@ -3359,7 +3359,7 @@ async function sendPrompt(text) {
         localStorage.setItem('ga_active', sess.id);  // 会话 id 因 bridge 重建而变更，同步持久化
       }
     }
-    const res = await window.ga.rpc('session/prompt', { sessionId: sid, prompt: composedPrompt, display: text, llmNo: state.llmNo,
+    const res = await window.ga.rpc('session/prompt', { sessionId: sid, prompt: composedPrompt, display: text,
       files: previewFiles, imageMetas: previewImgs.map(im => ({ name: im.name, path: im.path })) });
     if (res?.error) throw new Error(res.error.message || res.error);
     removeUsedPendingFiles(usedFiles);
@@ -3516,13 +3516,28 @@ async function selectModel(id, name) {
   updateModelChip();
   renderSettingsModels();
   // 申请切换:有活跃会话 -> 绑定到该会话(后端权威);同时更新全局默认(供 conductor /
-  // 新建会话初始值)。后端是真相源,前端只发请求。
+  // 新建会话初始值)。后端是真相源,前端只发请求;申请失败则回滚显示并提示。
   const sess = activeSess();
-  if (sess) sess.llmNo = id;
   if (sess && sess.bridgeSessionId) {
+    const prevNo = sess.llmNo;
+    sess.llmNo = id;
     try {
       await bridgeFetch(`/session/${encodeURIComponent(sess.bridgeSessionId)}/model`, { method: 'POST', body: { llmNo: id } });
-    } catch (_) {}
+    } catch (ex) {
+      // 后端没切成功:回滚到该会话原绑定,避免前端显示与后端不一致。
+      sess.llmNo = prevNo;
+      if (prevNo != null) {
+        state.llmNo = prevNo;
+        const pp = (state.modelProfiles || []).find(x => (x.id ?? 0) === prevNo);
+        if (pp) state.modelName = modelDisplayName(pp);
+        updateModelChip();
+        renderSettingsModels();
+      }
+      showChanToast(t('err.modelSwitch'), ex.message || '', 'err');
+      return;
+    }
+  } else if (sess) {
+    sess.llmNo = id;
   }
   await persistUiPrefs();  // 写 ui.llmNo 全局默认
 }
