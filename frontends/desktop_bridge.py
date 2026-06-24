@@ -1249,17 +1249,30 @@ _SETTINGS = Path.home() / ".ga_desktop_settings.json"
 _UI_KEYS = ("lang", "theme", "appearance", "plain", "llmNo", "fontSize")
 
 
-def _desktop_ui() -> dict:
+def _settings_doc() -> dict:
     try:
-        ui = json.loads(_SETTINGS.read_text(encoding="utf-8")).get("ui")
-        return dict(ui) if isinstance(ui, dict) else {}
+        doc = json.loads(_SETTINGS.read_text(encoding="utf-8")) if _SETTINGS.is_file() else {}
+        return doc if isinstance(doc, dict) else {}
     except Exception:
         return {}
 
 
+def _write_settings_doc(doc: dict) -> None:
+    _SETTINGS.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _desktop_ui() -> dict:
+    ui = _settings_doc().get("ui")
+    return dict(ui) if isinstance(ui, dict) else {}
+
+
+def _conductor_settings() -> dict:
+    conductor = _settings_doc().get("conductor")
+    return dict(conductor) if isinstance(conductor, dict) else {}
+
+
 def _global_default_llm_no() -> int:
-    """全局默认模型下标。会话未绑定(sess.llm_no is None)时回退到它;conductor 也读
-    同一个键(~/.ga_desktop_settings.json -> ui.llmNo)。缺省为 0。"""
+    """全局默认模型下标。会话未绑定(sess.llm_no is None)时回退到它。"""
     no = _desktop_ui().get("llmNo")
     try:
         return int(no) if no is not None else 0
@@ -1274,6 +1287,7 @@ async def get_config_handler(request):
     if "llmNo" not in cfg:
         cfg["llmNo"] = active
     cfg.update(_desktop_ui())
+    cfg["conductor"] = _conductor_settings()
     return json_ok({"gaRoot": manager.ga_root, "mykeyPath": manager.mykey_path, "config": cfg})
 
 
@@ -1284,13 +1298,11 @@ async def save_config_handler(request):
         patch = {k: cfg[k] for k in _UI_KEYS if k in cfg}
         if patch:
             try:
-                doc = json.loads(_SETTINGS.read_text(encoding="utf-8")) if _SETTINGS.is_file() else {}
-                if not isinstance(doc, dict):
-                    doc = {}
+                doc = _settings_doc()
                 ui = doc["ui"] if isinstance(doc.get("ui"), dict) else {}
                 ui.update(patch)
                 doc["ui"] = ui
-                _SETTINGS.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+                _write_settings_doc(doc)
             except Exception as e:
                 print(f"[bridge] save ui prefs failed: {e}", file=sys.stderr)
         manager.config.update(cfg)
@@ -1684,6 +1696,27 @@ async def mykey_save_handler(request):
     return json_ok({"ok": True, "path": str(manager._mykey_file()), "profiles": profiles})
 
 
+async def conductor_model_get_handler(request):
+    return json_ok({"model": _conductor_settings()})
+
+
+async def conductor_model_save_handler(request):
+    data = await read_json(request)
+    try:
+        llm_no = int(data.get("llmNo"))
+    except (TypeError, ValueError):
+        return json_ok({"ok": False, "error": "invalid_llmNo"}, status=400)
+    try:
+        doc = _settings_doc()
+        conductor = doc["conductor"] if isinstance(doc.get("conductor"), dict) else {}
+        conductor["llmNo"] = llm_no
+        doc["conductor"] = conductor
+        _write_settings_doc(doc)
+    except Exception as e:
+        return json_ok({"ok": False, "error": str(e)}, status=500)
+    return json_ok({"ok": True, "model": conductor})
+
+
 async def service_start_handler(request):
     body = await read_json(request)
     sid = body.get("id") or request.query.get("id")
@@ -1837,6 +1870,8 @@ def create_app():
     app.router.add_get("/services/panel", service_panel_handler)
     app.router.add_get("/services/mykey", mykey_get_handler)
     app.router.add_post("/services/mykey", mykey_save_handler)
+    app.router.add_get("/services/conductor/model", conductor_model_get_handler)
+    app.router.add_post("/services/conductor/model", conductor_model_save_handler)
     app.router.add_post("/services/stop-extras", stop_extras_handler)
     app.router.add_post("/services/start-extras", start_extras_handler)
     app.router.add_get("/services/identity", identity_handler)
