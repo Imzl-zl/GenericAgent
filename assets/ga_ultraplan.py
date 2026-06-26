@@ -4,9 +4,9 @@ from time import time, sleep
 import html, os, subprocess, sys, tempfile, threading, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__all__ = ["phase", "parallel", "pipeline"]
+__all__ = ["phase", "parallel", "mapchain"]
 
-_T0 = time(); _phases = []; _phase_stack = []; _tasks = []; _current = "idle"; _events = []; _srv = None; _last = time(); _lock = threading.Lock()
+_T0 = time(); _RUN_DIR = None; _phases = []; _phase_stack = []; _tasks = []; _current = "idle"; _events = []; _srv = None; _last = time(); _lock = threading.Lock()
 
 def _note(s):
     global _last
@@ -91,9 +91,12 @@ def _fmt(x, data):
     return x.format(**data) if isinstance(x, str) else x
 
 def _subagent(desc, prompt=None, *, llm_no=0, timeout=3600):
+    global _RUN_DIR
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(tmp := os.path.join(root, "temp"), exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", prefix="ultra_", dir=tmp, delete=False) as f:
+    if _RUN_DIR is None:
+        _RUN_DIR = os.path.join(tmp, f"ultraplan_{int(_T0)}_{os.getpid()}"); os.makedirs(_RUN_DIR, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", prefix="ultra_", dir=_RUN_DIR, delete=False) as f:
         f.write(desc if prompt is None else prompt)
     print(f"[subagent] {desc} -> {f.name}", flush=True); _note(f"agent: {desc}")
     cmd = [sys.executable, os.path.join(root, "agentmain.py"), "--func", f.name, "--llm_no", str(llm_no), "--nobg", "--nolog"]
@@ -125,9 +128,9 @@ def parallel(tasks, max_workers=None, _label=None, **data):
     with ThreadPoolExecutor(max_workers=max_workers or len(tasks) or 1) as ex:
         return list(ex.map(lambda t: _run(t, data), tasks))
 
-def pipeline(items, *steps, max_workers=None, **data):
+def mapchain(items, *steps, max_workers=None, **data):
     global _current
-    items = list(items); label = f"pipeline: {len(items)} items x {len(steps)} steps"
+    items = list(items); label = f"mapchain: {len(items)} items x {len(steps)} steps"
     with _lock: _current = label
     def run(x):
         for step in steps:
