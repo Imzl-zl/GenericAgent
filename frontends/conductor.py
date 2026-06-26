@@ -56,13 +56,19 @@ def _fallback_usable_model(agent: "GenericAgent") -> None:
 
 
 def _apply_desktop_model(agent: "GenericAgent") -> None:
-    """Switch the conductor's own session to its bound model (if any)."""
+    """Make the conductor's session reflect the current desktop config before a task:
+    switch to its bound model if one is set, otherwise still refresh sessions from
+    mykey so live key/model edits (e.g. importing keys) take effect without a restart.
+    next_llm() already reloads internally; the no-bound-model branch must reload too,
+    or a conductor started on an empty/stale mykey would never pick up imported keys."""
     no = _conductor_llm_no()
     if no is not None:
         try:
             agent.next_llm(int(no))
         except Exception as e:
             print(f"[conductor] failed to apply conductor model #{no}: {e}", file=sys.stderr)
+    else:
+        agent.load_llm_sessions()  # mtime-guarded; rebuilds only when mykey changed
     if not _client_usable(agent):
         print("[conductor] selected model is unavailable; falling back to first usable model", file=sys.stderr)
         _fallback_usable_model(agent)
