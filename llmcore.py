@@ -59,6 +59,7 @@ def compress_history_tags(messages, keep_recent=10, max_len=800, force=False, in
                 if not isinstance(b, dict): continue
                 t = b.get('type')
                 if t == 'text' and isinstance(b.get('text'), str): b['text'] = _trunc(b['text'])
+                elif t == 'thinking' and isinstance(b.get('thinking'), str): b['thinking'] = _trunc_str(b['thinking'])
                 elif t == 'tool_result':
                     tc = b.get('content')
                     if isinstance(tc, str): b['content'] = _trunc_str(tc)

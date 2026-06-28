@@ -6,7 +6,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 __all__ = ["phase", "parallel", "mapchain"]
 
-_T0 = time(); _RUN_DIR = None; _phases = []; _phase_stack = []; _tasks = []; _current = "idle"; _events = []; _srv = None; _last = time(); _lock = threading.Lock()
+_T0 = time(); _phases = []; _phase_stack = []; _tasks = []; _current = "idle"; _events = []; _srv = None; _last = time(); _lock = threading.Lock()
+_RUN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp", f"ultraplan_{int(_T0)}_{os.getpid()}")
+os.makedirs(_RUN_DIR, exist_ok=True)
 
 def _note(s):
     global _last
@@ -91,11 +93,7 @@ def _fmt(x, data):
     return x.format(**data) if isinstance(x, str) else x
 
 def _subagent(desc, prompt=None, *, llm_no=0, timeout=3600):
-    global _RUN_DIR
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    os.makedirs(tmp := os.path.join(root, "temp"), exist_ok=True)
-    if _RUN_DIR is None:
-        _RUN_DIR = os.path.join(tmp, f"ultraplan_{int(_T0)}_{os.getpid()}"); os.makedirs(_RUN_DIR, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", prefix="ultra_", dir=_RUN_DIR, delete=False) as f:
         f.write(desc if prompt is None else prompt)
     print(f"[subagent] {desc} -> {f.name}", flush=True); _note(f"agent: {desc}")
