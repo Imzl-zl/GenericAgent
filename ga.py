@@ -553,12 +553,9 @@ class GenericAgentHandler(BaseHandler):
         rsumm = re.search(r"<summary>(.*?)</summary>", _c, re.DOTALL)
         if rsumm: summary = rsumm.group(1).strip()
         else:
-            tc = tool_calls[0]; tool_name, args = tc['tool_name'], tc['args']   # at least one because no_tool
-            clean_args = {k: v for k, v in args.items() if not k.startswith('_')}
-            summary = f"{tool_name}, args: {clean_args}"
-            if tool_name == 'no_tool': summary = "直接回答了用户问题"
+            tc = tool_calls[0]; clean_args = {k: v for k, v in tc['args'].items() if not k.startswith('_')}   # at least one because no_tool
+            summary = _c.strip() or smart_format("直接回答了用户问题" if tc['tool_name'] == 'no_tool' else f"{tc['tool_name']}, args: {clean_args}", max_str_len=40)
             next_prompt += "\n\n\n[SYSTEM] 必须在回复文本中包含<summary>！\n\n"
-            summary = smart_format(summary.replace('\n', ''), max_str_len=40)
         summary = smart_format(summary.replace('\n', ''), max_str_len=80)
         self.history_info.append(f'[Agent] {summary}')
         _plan = self._in_plan_mode()
