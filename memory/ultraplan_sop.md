@@ -16,10 +16,11 @@ main agent controller
 
 1. **Script completion is not task completion.** All phases being done only means the currently planned program returned evidence.
 2. **Plan only the currently plannable horizon.** If later work depends heavily on unknown results, stop after producing those results and let the main agent regenerate the next script.
-3. **Everything important is file-backed.** Subagents return `.out.txt` files; shared state lives in explicit files under the current working directory, usually `./temp/ultraplan_<task>/`.
+3. **Everything important is file-backed.** Subagents return `.out.txt` files (the library manages their output dir); shared state lives in explicit files you create under `temp/`, never in the code tree. The exact directory does not matter; the wiring does.
 4. **The main agent owns global reduction.** Subagents produce local evidence, attempts, critiques, or transforms. The main agent owns cross-run state, prioritization, final decisions, and user-facing claims.
 5. **Use independent perspectives on purpose.** Parallel agents should not be redundant copies unless redundancy itself is the experiment.
 6. **No silent completeness claims.** If coverage is bounded, sampled, timed out, or intentionally skipped, say so.
+7. **Scale to the request, not to ambition.** A casual ask gets a few agents and single-pass judgement; "exhaustively audit / be thorough" earns a larger pool and 3-5-vote adversarial verification. Heavy fan-out is opt-in by the request, never inferred.
 
 ## Workflow script contract
 
@@ -31,10 +32,12 @@ from assets.ga_ultraplan import phase, parallel, mapchain
 
 Run scripts from the GA code root so `assets` imports correctly. Express orchestration only through `phase()`, `parallel()`, and `mapchain()`; design prompts, shared files, and reduction steps around those primitives.
 
+Put the script file itself and every artifact it writes under `temp/` (or a user-specified area), never in the code tree (root, `assets/`, `memory/`). Running from the root is only for the import to resolve — it is not a license to drop the script there. If a `temp/` script needs the import, add the root to `sys.path` inside it; do not move the script into the code tree to make the import convenient.
+
 Each task can be one of:
 
 ```python
-("Short display name", "Prompt template with {item}, {previous}, {state_dir}, ...")
+("Short display name", "Prompt template with {item}, {previous}, ...")
 
 {
     "desc": "Short display name with {item}",
@@ -51,9 +54,9 @@ A task returns the path of its subagent output file, normally `.../temp/ultra_xx
 
 ## Shared workspace: give independent agents just enough shared context
 
-Subagents are independent. A prompt alone is often too narrow: it lacks the evolving global view and encourages duplicated work. For any serious UltraPlan run, create only the shared files this task needs, under the current working directory, usually `./temp/ultraplan_<target>/`.
+Subagents are independent. A prompt alone is often too narrow: it lacks the evolving global view and encourages duplicated work. For any serious UltraPlan run, put the few shared files it needs under a task folder like `temp/<task-slug>/` (or a user-specified area), never in the code tree. The library auto-creates its own per-run output dir for `.out.txt` files; you do not manage or pass it.
 
-Do not impose a fixed schema. Use task-shaped files such as `sop_context.md`, `current_findings.md`, `candidate_urls.txt`, `failed_attempts.md`, `coverage_list.txt`, or `acceptance_criteria.md`. One context file may be enough; a Sweep may need an item list; a Hunt may need prior attempts; an Improve run may need the target plus criteria.
+Do not impose a fixed schema or fixed filenames. Name shared files by the role they play in this task: context, item list, prior attempts, target, criteria, frontier, accepted findings. One context file may be enough; a Sweep may need an item list; a Hunt may need prior attempts; an Improve run may need the target plus criteria.
 
 Rules:
 
@@ -62,6 +65,8 @@ Rules:
 - Workers may write scratch notes only when explicitly assigned a unique file. Avoid concurrent appends to the same file.
 - Reducers read worker `.out.txt` files plus the relevant shared files; they do not infer global truth from one worker.
 - Between scripts, the main agent updates whichever notes are useful: tried attempts, accepted findings, rejected claims, remaining frontier, coverage bounds, or changed priorities.
+- A worker shares no context with you or its siblings; its prompt must stand alone. Hand it pointers, not payloads: pass a **file path** for anything large or unstructured and let it Read; pass small structured data (an item, a lens, a config) **directly** in the prompt. Never spill a long blob into the prompt, and never write a side-channel file just to smuggle a value a direct argument could carry. Its returned text IS the data, not a message to a human.
+- Pure data shaping — dedup, flatten, filter, sort, count — is plain controller code, not an agent. Spend an agent only where judgement is required.
 
 ## Primitive semantics
 
@@ -98,12 +103,10 @@ Each step receives the current value as `{item}` and `{previous}`. Initially thi
 When a later step consumes a prior `.out.txt`, instruct it to **tail** that file, not read it, unless the full transcript matters. `.out.txt` files contain the previous worker's full transcript; the useful conclusion is usually near the end.
 
 ```python
-context_file = f"{state_dir}/context.md"
 reports = mapchain(
     items,
-    ("Inspect {item}", f"Read {context_file} and inspect assigned item: {{item}}. Output evidence-backed findings."),
+    ("Inspect {item}", "Read this run's task folder context, then inspect assigned item: {item}. Output evidence-backed findings."),
     ("Verify {previous}", "Tail {previous}. Try to refute or reproduce the finding with tools."),
-    state_dir=state_dir,
 )
 ```
 
@@ -124,6 +127,8 @@ Use this cycle:
 7. **Decide next action.** Stop and answer, edit directly, ask the user, or launch a new UltraPlan script with a new archetype.
 
 This is the key distinction: all phases in one script being complete only ends that script's MapReduce program. It does not prove the overall task is complete.
+
+You do not need the full shape before the *task* — only before the next *orchestration step*. Stay in the loop: run one well-scoped fan-out, read its result, then decide the next phase, rather than committing the entire expand→reduce→verify graph up front. Several small scripts read end-to-end beat one ambitious script that guessed wrong.
 
 ## Four recursive archetypes
 
@@ -221,88 +226,106 @@ Do not force all transformations into one script. If the next archetype depends 
 
 ## Script templates by archetype
 
-The examples below are starting points. Replace placeholders with concrete shared files and target objects. Keep scripts short enough that the controller can read outputs and decide the next archetype.
+These templates teach **how to decompose the task**, not how to wire files. Read each one for its lens choices and why those lenses are independent. File wiring is deliberately reduced to a one-line task-folder header (`ctx`, `attempts`, ...); every worker is assumed to read the relevant shared file, so prompts state only the *thinking*, not `Read X and Y`. Run from the GA code root. Keep scripts short enough that the controller can read outputs and decide the next archetype.
 
 ### Hunt template
 
-```python
-# Run from GA code root.
-from assets.ga_ultraplan import phase, parallel, mapchain
+The decomposition idea: **cut the candidate space with several non-overlapping blades** so the union covers more ground than any single hunter would, then dedupe, attempt, and verify.
 
-state_dir = "./temp/ultraplan_<target>"
-context_file = f"{state_dir}/context.md"      # task-shaped target/context note
-attempts_file = f"{state_dir}/attempts.md"    # tried candidates and rejected repeats
-criteria_file = f"{state_dir}/criteria.md"    # success evidence or constraints, if useful
+```python
+from assets.ga_ultraplan import phase, parallel
+
+# --- file wiring (shared notes under a task folder) ---
+work = "temp/<task-slug>"
+ctx, attempts, criteria = f"{work}/context.md", f"{work}/attempts.md", f"{work}/criteria.md"
+
+# --- task decomposition ---
+# Three independent blades on the candidate space; each excludes recorded repeats.
+hunters = [
+    ("Known-pattern hunter", "candidates from established patterns only"),
+    ("Weird-angle hunter",   "unconventional candidates; argue why each could work"),
+    ("Constraint hunter",    "candidates that exploit the constraints / narrow success condition"),
+]
 
 with phase("Expand candidate frontier", "independent lenses, avoid recorded duplicates"):
-    candidate_notes = parallel([
-        ("Known-pattern hunter", f"Read {context_file} and {attempts_file}. Propose candidates from known patterns only; exclude repeats."),
-        ("Weird-angle hunter", f"Read {context_file} and {attempts_file}. Propose unconventional candidates; explain why each might work."),
-        ("Constraint hunter", f"Read {context_file} and {criteria_file}. Propose candidates that exploit constraints or narrow success criteria."),
-    ], state_dir=state_dir, max_workers=3)
+    notes = parallel([
+        (name, f"Read {ctx}, {attempts}, {criteria}. Propose {lens}.") for name, lens in hunters
+    ], max_workers=3)
 
-with phase("Reduce candidates", "dedupe and select attempts"):
+with phase("Reduce candidates", "dedupe and pick what to attempt"):
     shortlist = parallel([
-        ("Candidate reducer", f"Read {attempts_file} and these outputs: {candidate_notes}. Write a deduplicated attempt list with success evidence for each.")
+        ("Candidate reducer", f"Read {attempts} and outputs {notes}. Emit a deduped attempt list, each with explicit success evidence.")
     ])[0]
 
-with phase("Attempt and verify", "each candidate advances independently"):
-    # In real use, the controller may parse/validate shortlist into candidate IDs before this phase.
+with phase("Attempt and verify", "strongest candidates, physical proof only"):
     results = parallel([
-        ("Attempt selected candidates", f"Read {shortlist}. Try the strongest candidates. For each, report physical evidence of success or failure.")
+        ("Attempt + verify", f"Read {shortlist}. Try the strongest candidates; report physical evidence of success or failure per candidate.")
     ])
 
 print(results)
 ```
+
+The three blades above (`known-pattern / weird-angle / constraint`) are the **most generic** placeholder. They are not the answer for every Hunt. After scouting, **re-instantiate the lenses from the domain's real structure**: the blades should encode *competing hypotheses about where this specific problem is hard*, so the reducer can kill the wrong hypothesis from evidence and concentrate effort on the live one. If your three lenses could apply unchanged to any task, you have not decomposed yet. When candidates need *attempt → verify per item*, the attempt phase is a `mapchain(shortlist, attempt_step, verify_step)`, not a flat `parallel`.
 
 ### Improve template
 
 ```python
 from assets.ga_ultraplan import phase, parallel
 
-state_dir = "./temp/ultraplan_<target>"
-target_file = f"{state_dir}/target_or_draft.md"
-criteria_file = f"{state_dir}/criteria.md"          # optional constraints/current requirements
-findings_file = f"{state_dir}/current_findings.md"  # optional known claims or prior verification notes
+# wiring: shared notes under a task folder
+work = "temp/<task-slug>"
+target, criteria, findings = f"{work}/target.md", f"{work}/criteria.md", f"{work}/findings.md"
+
+# decomposition: four non-overlapping critical angles, each hunting a distinct failure class
+critics = [
+    ("Correctness critic", "exact correctness failures, citing target fragments"),
+    ("Simplicity critic",  "over-complex or confused parts; propose a simpler structure"),
+    ("Verification critic","claims or changes that lack executable verification"),
+    ("Originality critic", "derivative, generic, or weak ideas; propose stronger framing"),
+]
 
 with phase("Sharp independent critique", "specific failure modes, not generic review"):
     critiques = parallel([
-        ("Correctness critic", f"Read {target_file} and {criteria_file}. Find exact correctness failures; cite target fragments."),
-        ("Simplicity critic", f"Read {target_file}. Find over-complex or confused parts; propose simpler structure."),
-        ("Verification critic", f"Read {target_file} and {findings_file}. Find claims or changes that lack executable verification."),
-        ("Originality critic", f"Read {target_file}. Identify derivative, generic, or weak ideas; propose stronger framing."),
-    ], state_dir=state_dir, max_workers=4)
+        (name, f"Read {target}, {criteria}, {findings}. Find {angle}.")
+        for name, angle in critics
+    ], max_workers=4)
 
 with phase("Prioritize improvements", "reject vague or duplicate criticism"):
     issue_list = parallel([
-        ("Issue reducer", f"Read critiques: {critiques}. Produce prioritized issues with exact target location, evidence, and fix direction. Reject duplicates and vague comments.")
+        ("Issue reducer", f"Read critiques: {critiques}. Prioritize issues with exact location, evidence, fix direction. Reject duplicates and vague comments.")
     ])[0]
 
 print(issue_list)
 ```
 
-Usually the next script after this template is a **Sweep** over accepted issues or target sections.
+Usually the next script after this template is a **Sweep** over accepted issues or target sections. For a harder draft, run the critics as **competing rewrites** (each critic emits a full alternative), then a reducer picks the strongest per section.
 
 ### Explore template
 
 ```python
 from assets.ga_ultraplan import phase, parallel
 
-state_dir = "./temp/ultraplan_<target>"
-context_file = f"{state_dir}/context.md"          # what is known about the unknown space
-findings_file = f"{state_dir}/current_findings.md" # optional assumptions or prior evidence
+# wiring: shared notes under a task folder
+work = "temp/<task-slug>"
+context, findings = f"{work}/context.md", f"{work}/findings.md"
+
+# decomposition: four mappers triangulating the same unknown from independent directions
+mappers = [
+    ("Surface mapper",       "enumerate visible components/files/endpoints/sources and what each proves"),
+    ("Mechanism mapper",     "how the relevant mechanism likely works; separate evidence from inference"),
+    ("Contradiction mapper", "evidence that contradicts the current assumptions"),
+    ("Frontier mapper",      "unknowns whose answers would change the next archetype"),
+]
 
 with phase("Map unknown space", "evidence first, no premature final answer"):
     maps = parallel([
-        ("Surface mapper", f"Read {context_file}. Enumerate visible components/files/endpoints/sources and what each proves."),
-        ("Mechanism mapper", f"Read {context_file}. Investigate how the relevant mechanism likely works; separate evidence from inference."),
-        ("Contradiction mapper", f"Read {context_file} and {findings_file}. Search for evidence that contradicts the current assumptions."),
-        ("Frontier mapper", f"Read {context_file}. List unknowns whose answers would change the next archetype."),
-    ], state_dir=state_dir, max_workers=4)
+        (name, f"Read {context}, {findings}. Investigate: {lens}.")
+        for name, lens in mappers
+    ], max_workers=4)
 
 with phase("Reduce map", "knowns, unknowns, contradictions, next archetype"):
     frontier = parallel([
-        ("Exploration reducer", f"Read {findings_file} and outputs: {maps}. Write knowns, unknowns, contradictions, and recommended next archetype.")
+        ("Exploration reducer", f"Read {findings} and outputs: {maps}. Write knowns, unknowns, contradictions, and recommended next archetype.")
     ])[0]
 
 print(frontier)
@@ -313,18 +336,17 @@ print(frontier)
 ```python
 from assets.ga_ultraplan import phase, mapchain, parallel
 
-state_dir = "./temp/ultraplan_<target>"
-context_file = f"{state_dir}/context.md"       # target-specific context or source references
-criteria_file = f"{state_dir}/criteria.md"     # optional constraints/checklist
-items_file = f"{state_dir}/items.txt"          # one item per line, produced or checked by the controller
-items = [line.strip() for line in open(items_file, encoding="utf-8") if line.strip()]
+# wiring: shared notes under a task folder; item list is controller-produced/validated
+work = "temp/<task-slug>"
+context, criteria, items_file = f"{work}/context.md", f"{work}/criteria.md", f"{work}/items.txt"
+items = [l.strip() for l in open(items_file, encoding="utf-8") if l.strip()]
 
+# decomposition: same two-step chain per item (inspect -> verify), every item, none skipped
 with phase("Per-item sweep", "no duplicate or omitted items"):
     item_reports = mapchain(
         items,
-        ("Inspect {item}", f"Read {context_file} and {criteria_file}. Inspect assigned item only: {{item}}. Output item ID, evidence, proposed action, unresolved risk."),
-        ("Verify {previous}", "Tail {previous}. Verify the item report against tools/files. Keep only supported claims and note gaps."),
-        state_dir=state_dir,
+        ("Inspect {item}", f"Read {context}, {criteria}. Inspect ONLY {{item}}. Output item ID, evidence, proposed action, unresolved risk."),
+        ("Verify {previous}", "Tail {previous}. Verify the report against tools/files. Keep only supported claims; note gaps."),
         max_workers=6,
     )
 
@@ -336,7 +358,7 @@ with phase("Coverage reduce", "coverage table and omissions"):
 print(coverage)
 ```
 
-If you wrote `reviews = parallel(review tasks); verified = parallel(verify tasks)` but each item only needs its own prior review, rewrite it as `mapchain`.
+If you wrote `reviews = parallel(review tasks); verified = parallel(verify tasks)` but each item only needs its own prior review, rewrite it as `mapchain`. For very large item sets, sweep in **bounded batches** (chunk the list, reduce coverage per batch) so the controller can read results between batches.
 
 ## Dynamic fan-out and parsing discipline
 
@@ -348,6 +370,10 @@ Avoid asking workers to return complex JSON task graphs. For dynamic fan-out:
 4. If the list changes the workflow shape, stop and regenerate the next script instead of contorting the current script.
 
 Only parse small, explicit control data. Rich reasoning belongs in `.out.txt` files and shared markdown files.
+
+When a prompt both interpolates wiring (`f"...{ctx}..."`) and shows a worker a literal `{item}`/`{previous}` placeholder, the f-string will eat the literal braces — escape them as `{{item}}`, or the worker receives a blank.
+
+For loop-until-dry discovery, stop only after K consecutive rounds surface nothing new — a fixed `while count < N` misses the tail. Dedup each round against everything **seen**, not against what was **confirmed**: deduping on confirmed lets judge-rejected items reappear every round, so the loop never converges.
 
 ## Output discipline
 
@@ -406,16 +432,15 @@ Do not claim exhaustive coverage unless the item list, coverage notes, and reduc
 ```python
 from assets.ga_ultraplan import phase, parallel, mapchain
 
-state_dir = "./temp/ultraplan_<target>"
-context_file = f"{state_dir}/context.md"          # task-shaped shared context, not a required schema
-attempts_file = f"{state_dir}/attempts.md"        # optional prior attempts or coverage notes
-criteria_file = f"{state_dir}/criteria.md"        # optional success criteria or constraints
+# wiring: shared notes under a task folder
+work = "temp/<task-slug>"
+ctx, attempts, criteria = f"{work}/context.md", f"{work}/attempts.md", f"{work}/criteria.md"
 
 with phase("Current archetype", "state what this script is trying to learn or reduce"):
     outputs = parallel([
-        ("Lens A", f"Read {context_file}, plus {attempts_file} or {criteria_file} if relevant. Do the assigned independent work."),
-        ("Lens B", f"Read {context_file}, plus {attempts_file} or {criteria_file} if relevant. Use a different lens; avoid duplicating Lens A."),
-    ], state_dir=state_dir)
+        ("Lens A", f"Read {ctx}, plus {attempts} or {criteria} if relevant. Do the assigned independent work."),
+        ("Lens B", f"Read {ctx}, plus {attempts} or {criteria} if relevant. Use a different lens; avoid duplicating Lens A."),
+    ])
 
 with phase("Reduce", "controller-ready decision state"):
     reduced = parallel([
