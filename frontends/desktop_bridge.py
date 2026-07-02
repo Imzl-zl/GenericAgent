@@ -99,6 +99,9 @@ class Session:
     plan_scan_baseline: int = 0
     plan_path: str = ""
     llm_history: Optional[List[dict]] = None
+    # 该会话绑定的模型下标(mykey.py 配置块顺序,== agent.llmclients 下标)。
+    # None = 未绑定,发消息时回退到全局默认 ui.llmNo,保持旧会话平滑迁移。
+    llm_no: Optional[int] = None
 
 
 def _load_plan_baseline(item: dict, msgs: list) -> int:
@@ -152,6 +155,7 @@ class AgentManager:
                                 "pinned": s.pinned, "untitled": s.untitled,
                                 "plan_scan_baseline": s.plan_scan_baseline,
                                 "plan_path": s.plan_path or "",
+                                "llm_no": s.llm_no,
                                 "llm_history": llm_hist})
             self._sessions_file.write_text(json.dumps(arr, ensure_ascii=False, default=str), encoding="utf-8")
         except Exception as e:
@@ -176,7 +180,8 @@ class AgentManager:
                                plan_path=_sanitize_desktop_plan_path(
                                    item["id"], item.get("plan_path") or ""),
                                status="idle", agent=None,
-                               llm_history=item.get("llm_history"))
+                               llm_history=item.get("llm_history"),
+                               llm_no=item.get("llm_no"))
                 self.sessions[sess.id] = sess
             if self.sessions:
                 self.active_session_id = max(self.sessions.values(), key=lambda s: s.updated_at).id
@@ -418,20 +423,22 @@ class AgentManager:
         except Exception as e:
             print(f"get model profiles failed: {e}", file=sys.stderr)
             return []
-        active = self.config.get("llmNo", 0)
-        # collect all mixin members for inMixin check
-        all_mixin_members: set = set()
+        # A profile can be referenced by any mixin channel, not only the first one.
+        # Keep each mixin row's own members for display, but mark native profiles as
+        # inMixin when they appear in any mixin.
+        all_mixin_members: set[str] = set()
         for k in keys:
+            cfg = mk.get(k) if isinstance(mk.get(k), dict) else {}
             if "mixin" in k:
-                c = mk.get(k) if isinstance(mk.get(k), dict) else {}
-                all_mixin_members.update(str(m) for m in (c.get("llm_nos") or []))
+                all_mixin_members.update(str(m) for m in (cfg.get("llm_nos") or []))
+        active = self.config.get("llmNo", 0)
         out = []
         for i, k in enumerate(keys):
             cfg = mk.get(k) if isinstance(mk.get(k), dict) else {}
             if "mixin" in k:
-                mems = [str(m) for m in (cfg.get("llm_nos") or [])]
+                members = [str(m) for m in (cfg.get("llm_nos") or [])]
                 out.append({"id": i, "varName": k, "kind": "mixin", "name": "",
-                            "members": mems, "active": i == active})
+                            "members": members, "active": i == active})
             else:
                 name = self._base_display_name(k, cfg)
                 out.append({"id": i, "varName": k, "kind": "native", "name": name,
@@ -503,18 +510,20 @@ class AgentManager:
 
     @staticmethod
     def _live_model(sess: Session) -> Optional[dict]:
-        """该会话 agent 当前真正在用的模型（渠道组会随故障转移变化）。
-        agent 还没建（没跑过 turn）时返回 None，前端回退到静态显示。"""
+        """该会话 agent 当前真正在用的模型(渠道组会随故障转移变化)。
+        agent 还没建(没跑过 turn)时返回静态绑定信息,前端据 llmNo 回显选择器。
+        llmNo: agent 存活取 agent.llm_no(权威运行态),否则取 sess.llm_no(可能 None)。"""
         ag = getattr(sess, "agent", None)
         if ag is None:
-            return None
+            return {"current": None, "isMixin": False, "llmNo": sess.llm_no}
         try:
             back = ag.llmclient.backend
+            live_no = getattr(ag, "llm_no", sess.llm_no)
             if "Mixin" in type(back).__name__:
-                return {"current": back.current_name, "isMixin": True}
-            return {"current": back.name, "isMixin": False}
+                return {"current": back.current_name, "isMixin": True, "llmNo": live_no}
+            return {"current": back.name, "isMixin": False, "llmNo": live_no}
         except Exception:
-            return None
+            return {"current": None, "isMixin": False, "llmNo": sess.llm_no}
 
     def snapshot(self, sess: Session, include_messages: bool = True) -> dict:
         out = {
@@ -549,7 +558,7 @@ class AgentManager:
 
     def create_session(self, cwd: Optional[str] = None) -> Session:
         sid = "sess-" + uuid.uuid4().hex[:12]
-        sess = Session(id=sid, cwd=str(cwd or self.ga_root))
+        sess = Session(id=sid, cwd=str(cwd or self.ga_root), llm_no=_global_default_llm_no())
         with self.lock:
             self.sessions[sid] = sess
             self.active_session_id = sid
@@ -579,10 +588,8 @@ class AgentManager:
         _purge_session_uploads(sid)
         return {"ok": True, "sessionId": sid}
 
-    def submit_prompt(self, sid: str, prompt: Any, images: Optional[list] = None, llm_no: Optional[int] = None, display: Optional[str] = None, files_meta: Optional[list] = None, image_metas: Optional[list] = None) -> dict:
+    def submit_prompt(self, sid: str, prompt: Any, images: Optional[list] = None, display: Optional[str] = None, files_meta: Optional[list] = None, image_metas: Optional[list] = None) -> dict:
         prompt, image_ids = normalize_prompt(prompt, images)
-        if llm_no is not None:
-            self.config["llmNo"] = int(llm_no)
         with self.lock:
             sess = self.sessions.get(sid)
             if not sess:
@@ -608,19 +615,20 @@ class AgentManager:
             sess.last_error = ""
             sess.partial = {"id": sess.msg_seq + 1, "role": "assistant", "content": "", "ts": time.time(), "partial": True,
                             "curr_turn": 0, "turn_segs": []}  # turn_segs[i]=第i轮全文(权威结构化,前端按轮渲染);content保留双轨兜底
-            t = threading.Thread(target=self.run_agent_turn, args=(sess, prompt, None, llm_no), daemon=True, name=f"Turn-{sid}")
+            t = threading.Thread(target=self.run_agent_turn, args=(sess, prompt, None), daemon=True, name=f"Turn-{sid}")
             sess.thread = t
             t.start()
             seq = sess.msg_seq
         emit_session_state(sess, "running")
         return {"ok": True, "sessionId": sid, "accepted": True, "userMessageId": user_msg["id"], "seq": seq}
 
-    def run_agent_turn(self, sess: Session, prompt: str, images: Optional[list] = None, llm_no: Optional[int] = None):
+    def run_agent_turn(self, sess: Session, prompt: str, images: Optional[list] = None):
         try:
             if sess.agent is None:
                 sess.agent = self.make_agent(sess)
             agent = sess.agent
-            no = self.config.get("llmNo") if llm_no is None else llm_no
+            # 模型取会话绑定 sess.llm_no,未绑定回退全局默认。切换走 set_session_model。
+            no = sess.llm_no if sess.llm_no is not None else _global_default_llm_no()
             if no is not None and hasattr(agent, "next_llm"):
                 with contextlib.suppress(Exception):
                     agent.next_llm(int(no))
@@ -777,6 +785,11 @@ class AgentManager:
             if sess.agent is not None:
                 return {"ok": True, "sessionId": sid, "restored": False, "reason": "agent already alive"}
         agent = self.make_agent(sess)
+        # 恢复 agent 时按会话绑定 seed 模型(未绑定则全局默认),保持显示/使用一致。
+        no = sess.llm_no if sess.llm_no is not None else _global_default_llm_no()
+        if no is not None and hasattr(agent, "next_llm"):
+            with contextlib.suppress(Exception):
+                agent.next_llm(int(no))
         if sess.llm_history:
             try:
                 agent.llmclient.backend.history = sess.llm_history
@@ -800,6 +813,21 @@ class AgentManager:
             sess.agent = agent
             sess.status = "idle"
         return {"ok": True, "sessionId": sid, "restored": True, "messageCount": len(sess.llm_history or sess.messages)}
+
+    def set_session_model(self, sid: str, llm_no: int) -> dict:
+        """前端申请切换某会话的模型(唯一入口)。写 sess.llm_no(权威)并持久化;
+        agent 存活时立即 next_llm 让运行态跟上。返回该会话的运行态模型快照。"""
+        with self.lock:
+            sess = self.sessions.get(sid)
+            if not sess:
+                raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
+            sess.llm_no = int(llm_no)
+            if sess.agent is not None and hasattr(sess.agent, "next_llm"):
+                with contextlib.suppress(Exception):
+                    sess.agent.next_llm(int(llm_no))
+            sess.updated_at = time.time()
+        self._persist()
+        return {"ok": True, "sessionId": sid, "llmNo": sess.llm_no, "model": self._live_model(sess)}
 
 
 import base64
@@ -1100,6 +1128,37 @@ class ServiceManager:
             with contextlib.suppress(Exception):
                 self.stop_service(sid)
 
+    def _extra_is_broken(self, sid: str) -> bool:
+        """判断一个 extra 是否「已经坏掉、需要重启才能恢复」:
+          - 进程异常退出(非用户主动停)→ 坏(覆盖 scheduler 那种进程级崩溃);
+          - 进程还活着,但捕获日志里出现 `Exception in thread conductor-agent`
+            → 内部 agent 线程已崩死,uvicorn 还在跑但再也处理不了任务 → 坏。
+        健康运行中的进程返回 False:它会在下个任务靠自身 mtime 热重载读到新 mykey,
+        不该被打断。每次 start_service 都会换新缓冲,故缓冲里的崩溃签名只反映当前进程。"""
+        proc = self.procs.get(sid)
+        if proc is None:
+            return False                       # 没起过 / 用户主动停掉 → 不复活
+        if proc.poll() is not None:
+            return sid not in self._stopping   # 意外退出 = 坏
+        buf = self.buffers.get(sid)
+        return bool(buf) and any("Exception in thread conductor-agent" in ln for ln in buf)
+
+    def restart_broken_extras(self) -> None:
+        """mykey 被整体重写(导入密钥/编辑渠道配置)后,只重启「已经坏掉」的
+        conductor/scheduler。健康运行中的进程不动——它们会在下个任务靠自身 mtime
+        热重载新 key,强行重启反而会打断正在跑的任务。"""
+        for sid in sorted(set(self._catalog) - set(self._im_catalog)):
+            if not self._extra_is_broken(sid):
+                continue
+            with contextlib.suppress(Exception):
+                self.stop_service(sid)
+            try:
+                res = self.start_service(sid)
+                tag = "ok" if res.get("ok") else f"fail: {res.get('error')}"
+            except Exception as e:
+                tag = f"exception {type(e).__name__}: {e}"
+            print(f"[restart-broken] {sid}: {tag}", file=sys.stderr)
+
     def stop_service(self, sid: str) -> dict:
         if sid not in self._catalog:
             raise KeyError(sid)
@@ -1228,12 +1287,35 @@ _SETTINGS = Path.home() / ".ga_desktop_settings.json"
 _UI_KEYS = ("lang", "theme", "appearance", "plain", "llmNo", "fontSize")
 
 
-def _desktop_ui() -> dict:
+def _settings_doc() -> dict:
     try:
-        ui = json.loads(_SETTINGS.read_text(encoding="utf-8")).get("ui")
-        return dict(ui) if isinstance(ui, dict) else {}
+        doc = json.loads(_SETTINGS.read_text(encoding="utf-8")) if _SETTINGS.is_file() else {}
+        return doc if isinstance(doc, dict) else {}
     except Exception:
         return {}
+
+
+def _write_settings_doc(doc: dict) -> None:
+    _SETTINGS.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _desktop_ui() -> dict:
+    ui = _settings_doc().get("ui")
+    return dict(ui) if isinstance(ui, dict) else {}
+
+
+def _conductor_settings() -> dict:
+    conductor = _settings_doc().get("conductor")
+    return dict(conductor) if isinstance(conductor, dict) else {}
+
+
+def _global_default_llm_no() -> int:
+    """全局默认模型下标。会话未绑定(sess.llm_no is None)时回退到它。"""
+    no = _desktop_ui().get("llmNo")
+    try:
+        return int(no) if no is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 async def get_config_handler(request):
@@ -1243,6 +1325,7 @@ async def get_config_handler(request):
     if "llmNo" not in cfg:
         cfg["llmNo"] = active
     cfg.update(_desktop_ui())
+    cfg["conductor"] = _conductor_settings()
     return json_ok({"gaRoot": manager.ga_root, "mykeyPath": manager.mykey_path, "config": cfg})
 
 
@@ -1253,13 +1336,11 @@ async def save_config_handler(request):
         patch = {k: cfg[k] for k in _UI_KEYS if k in cfg}
         if patch:
             try:
-                doc = json.loads(_SETTINGS.read_text(encoding="utf-8")) if _SETTINGS.is_file() else {}
-                if not isinstance(doc, dict):
-                    doc = {}
+                doc = _settings_doc()
                 ui = doc["ui"] if isinstance(doc.get("ui"), dict) else {}
                 ui.update(patch)
                 doc["ui"] = ui
-                _SETTINGS.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+                _write_settings_doc(doc)
             except Exception as e:
                 print(f"[bridge] save ui prefs failed: {e}", file=sys.stderr)
         manager.config.update(cfg)
@@ -1362,10 +1443,9 @@ async def prompt_handler(request):
     display = data.get("display")
     files_meta = data.get("files") or []        # 非图片附件 [{name, path}]
     image_metas = data.get("imageMetas") or []   # 图片附件 [{name, path}]（不含 dataUrl）
-    llm_no = data.get("llmNo")
-    if llm_no is not None:
-        llm_no = int(llm_no)
-    return json_ok(manager.submit_prompt(sid, prompt, images, llm_no=llm_no, display=display,
+    # 模型不再随 prompt 携带:切换模型走 POST /session/{sid}/model 这一唯一入口,
+    # 发消息只使用会话已绑定的 sess.llm_no(未绑定则回退全局默认)。
+    return json_ok(manager.submit_prompt(sid, prompt, images, display=display,
                                           files_meta=files_meta, image_metas=image_metas))
 
 
@@ -1384,6 +1464,18 @@ async def cancel_handler(request):
 async def restore_handler(request):
     sid = request.match_info["sid"]
     return json_ok(manager.restore_context(sid))
+
+
+async def session_model_handler(request):
+    sid = request.match_info["sid"]
+    data = await read_json(request)
+    no = data.get("llmNo", data.get("llm_no"))
+    if no is None:
+        return json_ok({"ok": False, "error": "missing llmNo"}, status=400)
+    try:
+        return json_ok(manager.set_session_model(sid, int(no)))
+    except (TypeError, ValueError):
+        return json_ok({"ok": False, "error": "invalid llmNo"}, status=400)
 
 
 async def plan_handler(request):
@@ -1639,7 +1731,31 @@ async def mykey_save_handler(request):
         profiles = manager._save_mykey_text(str(content))
     except Exception as e:
         return json_ok({"ok": False, "error": str(e)}, status=400)
+    # 导入/整体重写 mykey 后,只有「已崩坏」的 conductor/scheduler 才重启(死了才救);
+    # 健康运行中的进程不打断,它们会在下个任务靠自身 mtime 热重载读到新 key。
+    services.restart_broken_extras()
     return json_ok({"ok": True, "path": str(manager._mykey_file()), "profiles": profiles})
+
+
+async def conductor_model_get_handler(request):
+    return json_ok({"model": _conductor_settings()})
+
+
+async def conductor_model_save_handler(request):
+    data = await read_json(request)
+    try:
+        llm_no = int(data.get("llmNo"))
+    except (TypeError, ValueError):
+        return json_ok({"ok": False, "error": "invalid_llmNo"}, status=400)
+    try:
+        doc = _settings_doc()
+        conductor = doc["conductor"] if isinstance(doc.get("conductor"), dict) else {}
+        conductor["llmNo"] = llm_no
+        doc["conductor"] = conductor
+        _write_settings_doc(doc)
+    except Exception as e:
+        return json_ok({"ok": False, "error": str(e)}, status=500)
+    return json_ok({"ok": True, "model": conductor})
 
 
 async def service_start_handler(request):
@@ -1781,6 +1897,7 @@ def create_app():
     app.router.add_get("/session/{sid}/plan", plan_handler)
     app.router.add_post("/session/{sid}/cancel", cancel_handler)
     app.router.add_post("/session/{sid}/restore", restore_handler)
+    app.router.add_post("/session/{sid}/model", session_model_handler)
     app.router.add_post("/path/open", path_open_handler)
     app.router.add_post("/upload", upload_handler)
     app.router.add_delete("/upload", upload_delete_handler)
@@ -1794,6 +1911,8 @@ def create_app():
     app.router.add_get("/services/panel", service_panel_handler)
     app.router.add_get("/services/mykey", mykey_get_handler)
     app.router.add_post("/services/mykey", mykey_save_handler)
+    app.router.add_get("/services/conductor/model", conductor_model_get_handler)
+    app.router.add_post("/services/conductor/model", conductor_model_save_handler)
     app.router.add_post("/services/stop-extras", stop_extras_handler)
     app.router.add_post("/services/start-extras", start_extras_handler)
     app.router.add_get("/services/identity", identity_handler)
