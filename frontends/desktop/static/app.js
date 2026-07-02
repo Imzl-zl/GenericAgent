@@ -216,6 +216,8 @@ let bridgeUiOffline = false;
       case 'services/bridge/exit': return http('/services/bridge/exit', { method: 'POST' });
       case 'services/mykey/get': return http('/services/mykey');
       case 'services/mykey/save': return http('/services/mykey', { method: 'POST', body: params || {} });
+      case 'services/conductor/model/get': return http('/services/conductor/model');
+      case 'services/conductor/model/save': return http('/services/conductor/model', { method: 'POST', body: params || {} });
       case 'app/path/selectGaRoot': return http('/config');
       case 'list_continuable_sessions': return { sessions: [] };
       case 'restore_session': throw new Error('restore_session is not implemented in web2 bridge');
@@ -282,6 +284,8 @@ let bridgeUiOffline = false;
     getServicePanel: () => rpc('services/panel', {}),
     getMykeyContent: () => rpc('services/mykey/get', {}),
     saveMykeyContent: (content) => rpc('services/mykey/save', { content }),
+    getConductorModel: () => rpc('services/conductor/model/get', {}),
+    saveConductorModel: (llmNo) => rpc('services/conductor/model/save', { llmNo }),
     tauriInvoke,
     setBridgeUiOffline: (offline) => { bridgeUiOffline = !!offline; },
     pollSession: (sessionId, afterId = 0) => rpc('session/poll', { sessionId, afterId }),
@@ -353,7 +357,7 @@ const I18N = {
     'guide.step3': '点击保存，即可在模型列表中选用',
     'guide.prefillTip': '已为你预填 API 地址、协议与模型，可按需修改',
     'guide.getKey': '获取 {name} 的 API Key', 'guide.copy': '复制链接', 'guide.copied': '链接已复制',
-    'err.modelSave': '保存失败', 'err.modelRequired': '请填写模型、API Key 和 API 地址',
+    'err.modelSave': '保存失败', 'err.modelSwitch': '切换模型失败', 'err.modelRequired': '请填写模型、API Key 和 API 地址',
     'err.modelDelete': '删除失败', 'err.modelDeleteLast': '至少保留一个模型',
     'confirm.modelDelete': '确定删除该模型配置？',
     'model.aggregation': '渠道组（自动故障转移）', 'model.aggregationShort': '渠道组', 'model.aggregationDesc': '按顺序尝试，失败自动切换到下一个',
@@ -526,7 +530,7 @@ const I18N = {
     'guide.step3': 'Click Save — then pick it from the model list',
     'guide.prefillTip': 'API base, protocol and model are pre-filled — edit if needed',
     'guide.getKey': 'Get your {name} API key', 'guide.copy': 'Copy link', 'guide.copied': 'Link copied',
-    'err.modelSave': 'Save failed', 'err.modelRequired': 'Model, API Key and base URL are required',
+    'err.modelSave': 'Save failed', 'err.modelSwitch': 'Failed to switch model', 'err.modelRequired': 'Model, API Key and base URL are required',
     'err.modelDelete': 'Delete failed', 'err.modelDeleteLast': 'At least one model is required',
     'confirm.modelDelete': 'Delete this model profile?',
     'model.aggregation': 'Channel group (auto failover)', 'model.aggregationShort': 'Channel group', 'model.aggregationDesc': 'Tries in order, switches to the next on failure',
@@ -651,7 +655,7 @@ const I18N = {
   },
 };
 const LANGS = ['zh', 'en'];
-const STORE = { lang: 'ga_lang', theme: 'ga_theme', appearance: 'ga_appearance', plain: 'ga_plain', fontSize: 'ga_font_size', llmNo: 'ga_llm_no' };
+const STORE = { lang: 'ga_lang', theme: 'ga_theme', appearance: 'ga_appearance', plain: 'ga_plain', fontSize: 'ga_font_size' };
 const APPEARANCE_IDS = ['light', 'dark'];
 const CHAT_FONT_MIN = 10;
 const CHAT_FONT_MAX = 20;
@@ -694,7 +698,6 @@ function syncBootCache() {
   localStorage.setItem(STORE.fontSize, String(chatFontSize));
   if (plainUi) localStorage.setItem(STORE.plain, '1');
   else localStorage.removeItem(STORE.plain);
-  localStorage.setItem(STORE.llmNo, String(state.llmNo));
 }
 async function persistUiPrefs() {
   try {
@@ -1728,6 +1731,7 @@ function postRenderEnhance(containerEl) {
 const state = {
   sessions: new Map(), activeId: null, bridgeReady: false,
   llmNo: 0, modelProfiles: [], modelName: null,
+  conductorLlmNo: null, conductorModelName: null,
   runtime: new Map(),
   pendingFiles: [],
   fileSeq: 0,
@@ -1756,7 +1760,8 @@ async function loadSessions() {
       state.sessions.set(s.id, {
         id: s.id, bridgeSessionId: s.id, title: s.title,
         messages: [], untitled: s.untitled ?? true,
-        pinned: s.pinned ?? false, lastActiveTs: s.updatedAt || s.createdAt
+        pinned: s.pinned ?? false, lastActiveTs: s.updatedAt || s.createdAt,
+        llmNo: s.model && s.model.llmNo != null ? s.model.llmNo : null
       });
     }
     // 刷新后固定恢复「上次正在看的会话」（前端持久化的 ga_active），而不是 bridge 的
@@ -2860,6 +2865,15 @@ function setActiveSession(id) {
   if (id) localStorage.setItem('ga_active', id);  // 持久化当前会话，刷新后固定恢复它
   const sess = state.sessions.get(id);
   if (!sess) return;
+  // 切会话:回显该会话绑定的模型(后端权威)。未绑定(null)则保持当前全局默认显示。
+  if (sess.llmNo != null && sess.llmNo !== state.llmNo) {
+    state.llmNo = sess.llmNo;
+    state.liveModel = null;
+    const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === sess.llmNo);
+    if (p) state.modelName = modelDisplayName(p);
+    updateModelChip();
+    renderSettingsModels();
+  }
   if (msgsEl) msgsEl.innerHTML = '';
   const r = rt(sess);
   r.draftEl = null;
@@ -3107,13 +3121,32 @@ function applyPollResult(sess, result) {
   return busy;
 }
 
-/** 渠道组随故障转移变化时，用运行态当前子模型刷新 chip（非渠道组/无 agent 时不动，保持静态显示） */
+/** 用后端运行态模型刷新 chip + 选择器。后端是权威:
+ *  - 同步该会话绑定的 llmNo(live.llmNo)到 sess/state，切回会话能正确回显；
+ *  - mixin: 显示「渠道组（当前子模型）」，跟随故障转移；
+ *  - native: 显示后端真正在用的模型名(live.current)，而非前端静态选择。 */
 function applyLiveModel(live, sess = activeSess()) {
+  if (!live) return;
+  // 回写该会话绑定的模型下标(权威来自后端)。
+  if (live.llmNo != null && sess) sess.llmNo = live.llmNo;
+  if (isActive(sess) && live.llmNo != null && state.llmNo !== live.llmNo) {
+    state.llmNo = live.llmNo;
+    renderSettingsModels();
+  }
   const selected = (state.modelProfiles || []).find(p => (p.id ?? 0) === state.llmNo);
-  if (!selected || selected.kind !== 'mixin' || !live || !live.isMixin || !live.current) return;
-  state.liveModel = { ...live, sessionId: sess?.id || state.activeId };
-  const label = `${t('model.aggregationShort')}${lang === 'en' ? ' (' : '（'}${profileLabel(live.current) || live.current}${lang === 'en' ? ')' : '）'}`;
-  if (state.modelName !== label) { state.modelName = label; updateModelChip(); }
+  if (!isActive(sess)) return;
+  if (selected && selected.kind === 'mixin') {
+    if (!live.isMixin || !live.current) return;
+    state.liveModel = { ...live, sessionId: sess?.id || state.activeId };
+    const label = `${t('model.aggregationShort')}${lang === 'en' ? ' (' : '（'}${profileLabel(live.current) || live.current}${lang === 'en' ? ')' : '）'}`;
+    if (state.modelName !== label) { state.modelName = label; updateModelChip(); }
+    return;
+  }
+  // native: chip 跟随后端实际模型名(没拿到运行态时回退到选中 profile 的静态名)
+  state.liveModel = null;
+  const label = (live.current ? (profileLabel(live.current) || live.current) : null)
+    || (selected ? modelDisplayName(selected) : null);
+  if (label && state.modelName !== label) { state.modelName = label; updateModelChip(); }
 }
 
 /** hydrate 批量灌历史，避免逐条 appendMessage 触发全量重绘 */
@@ -3331,7 +3364,7 @@ async function sendPrompt(text) {
         localStorage.setItem('ga_active', sess.id);  // 会话 id 因 bridge 重建而变更，同步持久化
       }
     }
-    const res = await window.ga.rpc('session/prompt', { sessionId: sid, prompt: composedPrompt, display: text, llmNo: state.llmNo,
+    const res = await window.ga.rpc('session/prompt', { sessionId: sid, prompt: composedPrompt, display: text,
       files: previewFiles, imageMetas: previewImgs.map(im => ({ name: im.name, path: im.path })) });
     if (res?.error) throw new Error(res.error.message || res.error);
     removeUsedPendingFiles(usedFiles);
@@ -3468,7 +3501,7 @@ document.querySelectorAll('.feature-grid').forEach(grid => {
 function updateModelChip() {
   const name = state.modelName || '';
   if (modelNameEl) modelNameEl.textContent = name;
-  if (collabModelNameEl) collabModelNameEl.textContent = name;
+  if (collabModelNameEl) collabModelNameEl.textContent = state.conductorModelName || name;
 }
 function modelDisplayName(p, fallbackName) {
   if (p && p.kind === 'mixin') {
@@ -3487,7 +3520,38 @@ async function selectModel(id, name) {
   state.modelName = modelDisplayName(p, name);
   updateModelChip();
   renderSettingsModels();
-  await persistUiPrefs();
+  // 申请切换:有活跃会话 -> 绑定到该会话(后端权威);同时更新全局默认(供新建会话初始值)。
+  // 后端是真相源,前端只发请求;申请失败则回滚显示并提示。
+  const sess = activeSess();
+  if (sess && sess.bridgeSessionId) {
+    const prevNo = sess.llmNo;
+    sess.llmNo = id;
+    try {
+      await bridgeFetch(`/session/${encodeURIComponent(sess.bridgeSessionId)}/model`, { method: 'POST', body: { llmNo: id } });
+    } catch (ex) {
+      // 后端没切成功:回滚到该会话原绑定,避免前端显示与后端不一致。
+      sess.llmNo = prevNo;
+      if (prevNo != null) {
+        state.llmNo = prevNo;
+        const pp = (state.modelProfiles || []).find(x => (x.id ?? 0) === prevNo);
+        if (pp) state.modelName = modelDisplayName(pp);
+        updateModelChip();
+        renderSettingsModels();
+      }
+      showChanToast(t('err.modelSwitch'), ex.message || '', 'err');
+      return;
+    }
+  } else if (sess) {
+    sess.llmNo = id;
+  }
+  await persistUiPrefs();  // 写 ui.llmNo 全局默认
+}
+async function selectConductorModel(id, name) {
+  state.conductorLlmNo = id;
+  const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === id);
+  state.conductorModelName = modelDisplayName(p, name);
+  updateModelChip();
+  try { await window.ga.saveConductorModel(id); } catch (_) {}
 }
 async function addToMixin(id) {
   try {
@@ -3831,6 +3895,12 @@ async function loadModelProfiles() {
       state.llmNo = active.id ?? 0;
       state.modelName = modelDisplayName(active);
     }
+    // conductor chip 的显示名只在 loadBridgeConfig/selectConductorModel 更新；导入密钥等
+    // 仅刷新 profiles 的路径若不在此一并重算，会让 conductor chip 停在旧文案(如空渠道组)。
+    if (state.conductorLlmNo != null) {
+      const cp = state.modelProfiles.find(p => (p.id ?? 0) === state.conductorLlmNo);
+      if (cp) state.conductorModelName = modelDisplayName(cp);
+    }
     updateModelChip();
     renderSettingsModels();
   } catch (_) {}
@@ -3841,10 +3911,12 @@ const collabModelMenu = document.getElementById('cdb-model-menu');
 function renderModelMenu(menuEl) {
   if (!menuEl) return;
   const list = state.modelProfiles || [];
+  const selectedNo = menuEl === collabModelMenu ? state.conductorLlmNo : state.llmNo;
+  const selectedName = menuEl === collabModelMenu ? state.conductorModelName : state.modelName;
   const rows = list.map((p, i) => {
     const no = (p.id ?? i);
-    const isActive = (state.llmNo === no) ? ' active' : '';
-    const label = (isActive && p.kind === 'mixin' && state.modelName) ? state.modelName : modelDisplayName(p);
+    const isActive = (selectedNo === no) ? ' active' : '';
+    const label = (isActive && p.kind === 'mixin' && selectedName) ? selectedName : modelDisplayName(p);
     return `<div class="ga-menu-item${isActive}" data-llmno="${no}">${escapeHtml(label || '')}</div>`;
   });
   menuEl.innerHTML = rows.join('');
@@ -3872,7 +3944,7 @@ function closeAllModelMenus() {
   if (modelChip) modelChip.classList.remove('open');
   if (collabModelChip) collabModelChip.classList.remove('open');
 }
-function bindModelMenuItemClick(menuEl) {
+function bindModelMenuItemClick(menuEl, onSelect) {
   if (!menuEl) return;
   menuEl.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -3881,12 +3953,12 @@ function bindModelMenuItemClick(menuEl) {
     const no = parseInt(item.dataset.llmno, 10);
     if (Number.isNaN(no)) return;
     const p = (state.modelProfiles || []).find(x => (x.id ?? 0) === no);
-    selectModel(no, (p && p.name) || '');
+    onSelect(no, (p && p.name) || '');
     closeAllModelMenus();
   });
 }
-bindModelMenuItemClick(modelMenu);
-bindModelMenuItemClick(collabModelMenu);
+bindModelMenuItemClick(modelMenu, selectModel);
+bindModelMenuItemClick(collabModelMenu, selectConductorModel);
 if (modelChip) modelChip.addEventListener('click', (e) => {
   e.preventDefault(); e.stopPropagation();
   if (modelMenu && !modelMenu.hidden) { closeAllModelMenus(); return; }
@@ -3942,10 +4014,18 @@ async function loadBridgeConfig() {
       if (p) {
         state.llmNo = cfg.llmNo;
         state.modelName = modelDisplayName(p);
-        updateModelChip();
         renderSettingsModels();
       }
     }
+    const cno = cfg.conductor?.llmNo ?? cfg.llmNo;
+    if (cno != null && state.modelProfiles.length) {
+      const cp = state.modelProfiles.find(x => (x.id ?? 0) === cno);
+      if (cp) {
+        state.conductorLlmNo = cno;
+        state.conductorModelName = modelDisplayName(cp);
+      }
+    }
+    updateModelChip();
     syncBootCache();
   } catch (_) {}
 }
