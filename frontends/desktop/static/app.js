@@ -286,6 +286,9 @@ let bridgeUiOffline = false;
     getMykeyContent: () => rpc('services/mykey/get', {}),
     saveMykeyContent: (content) => rpc('services/mykey/save', { content }),
     importMemory: (sourceDir) => rpc('memory/import', { sourceDir }),
+    getGaSource: () => tauriInvoke('get_ga_source'),
+    setGaSource: (dir) => tauriInvoke('set_ga_source', { dir }),
+    clearGaSource: () => tauriInvoke('clear_ga_source'),
     getConductorModel: () => rpc('services/conductor/model/get', {}),
     saveConductorModel: (llmNo) => rpc('services/conductor/model/save', { llmNo }),
     tauriInvoke,
@@ -338,7 +341,7 @@ const I18N = {
     'customPreset.removeTitle': '删除',
     'customPreset.editTitle': '编辑',
     'builtinPreset.restoreBtn': '恢复默认预设',
-    'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型', 'set.features': '功能', 'set.importMykey': '导入已有模型配置（mykey.py）', 'set.exportMykey': '导出当前模型配置', 'set.importMemory': '导入已有记忆与会话记录（选择 GenericAgent 根目录）', 'set.serviceManager': '后台服务管理',
+    'set.appearance': '外观', 'set.plainUi': '素色', 'set.fontSize': '聊天字号', 'set.lang': '语言', 'set.model': '模型', 'set.addModel': '添加模型', 'set.features': '功能', 'set.importMykey': '导入已有模型配置（mykey.py）', 'set.exportMykey': '导出当前模型配置', 'set.importMemory': '导入已有记忆与会话记录（选择 GenericAgent 根目录）', 'set.gaSource': '接入独立 GenericAgent 源码（把桌面版当作壳）', 'set.gaSourceClear': '取消接入，改用内置版本', 'set.gaSourceCurrent': '当前接入', 'set.serviceManager': '后台服务管理',
     'shortcut.askConfirm': '是否在桌面创建 GenericAgent 快捷方式？',
     'appearance.light': '浅色', 'appearance.dark': '深色',
     'set.noModels': '暂无模型，点击下方添加',
@@ -462,6 +465,12 @@ const I18N = {
     'err.memoryImport': '导入记忆失败',
     'sys.memoryImportBackup': '原记忆已备份至',
     'sys.memorySessions': '会话',
+    'sys.gaSourcePickTitle': '选择要接入的 GenericAgent 源码根目录（含 agentmain.py）',
+    'sys.gaSourceSwitching': '正在切换并重启后端…',
+    'sys.gaSourceSet': '已接入独立 GenericAgent',
+    'sys.gaSourceCleared': '已取消接入，恢复内置版本',
+    'err.gaSourceSet': '接入失败',
+    'err.gaSourceDesktopOnly': '此功能仅在桌面版中可用',
     'sys.memoryPickTitle': '选择 GenericAgent 根目录（包含 memory 与 temp 的目录）',
     'sys.memoryImportPrompt': '请输入 GenericAgent 根目录的完整路径（包含 memory 与 temp 的目录，而非 memory 文件夹本身）：',
     'sys.mykeyExported': '模型配置已导出',
@@ -517,7 +526,7 @@ const I18N = {
     'customPreset.removeTitle': 'Delete',
     'customPreset.editTitle': 'Edit',
     'builtinPreset.restoreBtn': 'Restore defaults',
-    'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model', 'set.features': 'Features', 'set.importMykey': 'Import model config (mykey.py)', 'set.exportMykey': 'Export current model config', 'set.importMemory': 'Import existing memory & sessions (select GenericAgent root)', 'set.serviceManager': 'Service manager',
+    'set.appearance': 'Appearance', 'set.plainUi': 'Plain', 'set.fontSize': 'Chat font size', 'set.lang': 'Language', 'set.model': 'Model', 'set.addModel': 'Add model', 'set.features': 'Features', 'set.importMykey': 'Import model config (mykey.py)', 'set.exportMykey': 'Export current model config', 'set.importMemory': 'Import existing memory & sessions (select GenericAgent root)', 'set.gaSource': 'Connect to a separate GenericAgent source (use desktop as a shell)', 'set.gaSourceClear': 'Disconnect, use the bundled version', 'set.gaSourceCurrent': 'Connected to', 'set.serviceManager': 'Service manager',
     'shortcut.askConfirm': 'Create a desktop shortcut for GenericAgent?',
     'appearance.light': 'Light', 'appearance.dark': 'Dark',
     'set.noModels': 'No models yet — add one below',
@@ -641,6 +650,12 @@ const I18N = {
     'err.memoryImport': 'Failed to import memory',
     'sys.memoryImportBackup': 'Previous memory backed up to',
     'sys.memorySessions': 'sessions',
+    'sys.gaSourcePickTitle': 'Select the GenericAgent source root to connect to (contains agentmain.py)',
+    'sys.gaSourceSwitching': 'Switching and restarting the backend…',
+    'sys.gaSourceSet': 'Connected to the external GenericAgent',
+    'sys.gaSourceCleared': 'Disconnected, restored the bundled version',
+    'err.gaSourceSet': 'Failed to connect',
+    'err.gaSourceDesktopOnly': 'This feature is only available in the desktop app',
     'sys.memoryPickTitle': 'Select the GenericAgent root directory (the folder containing memory and temp)',
     'sys.memoryImportPrompt': 'Enter the full path of the GenericAgent root directory (the folder containing memory and temp, not the memory folder itself):',
     'sys.mykeyExported': 'Model config exported',
@@ -1047,6 +1062,52 @@ bindClick('import-memory-btn', async (e) => {
     showChanToast(t('err.memoryImport'), err.message || String(err), 'err');
   }
 });
+// ── GA 源码目录（把桌面版当壳，接入独立本体）──────────────────────────
+const gaSourceCurrentEl = document.getElementById('ga-source-current');
+const gaSourceClearBtn = document.getElementById('ga-source-clear-btn');
+async function refreshGaSource() {
+  if (!window.__TAURI__?.core?.invoke) return; // 仅桌面壳支持
+  let cur = '';
+  try { cur = await window.ga.getGaSource(); } catch (_) { cur = ''; }
+  if (gaSourceCurrentEl) {
+    if (cur) {
+      gaSourceCurrentEl.textContent = `${t('set.gaSourceCurrent')}: ${cur}`;
+      gaSourceCurrentEl.hidden = false;
+    } else {
+      gaSourceCurrentEl.hidden = true;
+    }
+  }
+  if (gaSourceClearBtn) gaSourceClearBtn.hidden = !cur;
+}
+bindClick('ga-source-btn', async (e) => {
+  e.stopPropagation();
+  if (!window.__TAURI__?.core?.invoke) {
+    showChanToast(t('err.gaSourceDesktopOnly'), '', 'err');
+    return;
+  }
+  try {
+    const dir = await window.ga.tauriInvoke('pick_directory', { title: t('sys.gaSourcePickTitle') });
+    if (!dir) return;
+    showChanToast(t('sys.gaSourceSwitching'), dir, 'ok');
+    const project = await window.ga.setGaSource(dir);
+    await refreshGaSource();
+    showChanToast(t('sys.gaSourceSet'), project || dir, 'ok');
+  } catch (err) {
+    showChanToast(t('err.gaSourceSet'), err.message || String(err), 'err');
+  }
+});
+bindClick('ga-source-clear-btn', async (e) => {
+  e.stopPropagation();
+  try {
+    showChanToast(t('sys.gaSourceSwitching'), '', 'ok');
+    await window.ga.clearGaSource();
+    await refreshGaSource();
+    showChanToast(t('sys.gaSourceCleared'), '', 'ok');
+  } catch (err) {
+    showChanToast(t('err.gaSourceSet'), err.message || String(err), 'err');
+  }
+});
+refreshGaSource();
 // 侧边栏「快速接入」：点击官方模型按钮 → 打开预填好的添加模型表单
 const pqEl = document.getElementById('provider-quickstart');
 if (pqEl) pqEl.addEventListener('click', (e) => {
