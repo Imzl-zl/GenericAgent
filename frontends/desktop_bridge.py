@@ -70,6 +70,24 @@ def strip_final_info_marker(text: Any) -> str:
     return _FINAL_INFO_RE.sub('', str(text or ''))
 
 
+def normalize_final_turn_segs(full: str, outputs: Any) -> Optional[List[str]]:
+    if not outputs or not isinstance(outputs, (list, tuple)):
+        return None
+    segs = [strip_final_info_marker(s) for s in outputs]
+    full_text = strip_final_info_marker(full)
+    if not segs:
+        return None
+    joined = "".join(segs)
+    if full_text.strip() == joined.strip():
+        return segs
+    if joined and full_text.startswith(joined):
+        suffix = full_text[len(joined):]
+        if suffix.strip():
+            segs[-1] = segs[-1] + suffix
+        return segs
+    return None
+
+
 for _s in (sys.stdout, sys.stderr):
     with contextlib.suppress(Exception):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -664,9 +682,8 @@ class AgentManager:
                                             _segs[_idx - 1] = str(_outs[-2])
                         if "done" in item:
                             full = strip_final_info_marker(item.get("done") or "")
-                            done_outputs = item.get("outputs")  # done时=turn_resps.copy()全量轮
+                            done_outputs = normalize_final_turn_segs(full, item.get("outputs"))  # done时=turn_resps.copy()全量轮
                             if done_outputs:
-                                done_outputs = [strip_final_info_marker(s) for s in done_outputs]
                                 with self.lock:
                                     if sess.partial is not None:
                                         sess.partial["content"] = full
@@ -696,12 +713,10 @@ class AgentManager:
             with self.lock:
                 sess.partial = None
                 full = strip_final_info_marker(full)
-                if done_outputs:
-                    done_outputs = [strip_final_info_marker(s) for s in done_outputs]
                 import plan_state
                 plan_state.sync_plan_path_from_text(sess, full, sess.cwd or self.ga_root)
                 # 轨道2: 落库时带结构化全量轮(权威turn_segs),前端按轮渲染;content保留兜底
-                _final_segs = [str(s) for s in done_outputs] if done_outputs else None
+                _final_segs = normalize_final_turn_segs(full, done_outputs)
                 if _final_segs:
                     self.add_message(sess, "assistant", full, turn_segs=_final_segs)
                 else:
