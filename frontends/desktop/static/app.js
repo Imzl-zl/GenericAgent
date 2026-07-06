@@ -284,6 +284,10 @@ let bridgeUiOffline = false;
     getServicePanel: () => rpc('services/panel', {}),
     getMykeyContent: () => rpc('services/mykey/get', {}),
     saveMykeyContent: (content) => rpc('services/mykey/save', { content }),
+    importMemory: (sourceDir) => rpc('memory/import', { sourceDir }),
+    getGaSource: () => tauriInvoke('get_ga_source'),
+    setGaSource: (dir) => tauriInvoke('set_ga_source', { dir }),
+    clearGaSource: () => tauriInvoke('clear_ga_source'),
     getConductorModel: () => rpc('services/conductor/model/get', {}),
     saveConductorModel: (llmNo) => rpc('services/conductor/model/save', { llmNo }),
     tauriInvoke,
@@ -683,6 +687,79 @@ bindClick('export-mykey-btn', async (e) => {
     showChanToast(t('err.mykeyExport'), err.message || String(err), 'err');
   }
 });
+// 记忆/session 导入与外接 GA 源码。
+async function importMemoryFromDir() {
+  let sourceDir = '';
+  if (window.__TAURI__?.core?.invoke) {
+    sourceDir = await window.ga.tauriInvoke('pick_directory', { title: t('sys.memoryPickTitle') });
+  } else {
+    sourceDir = window.prompt(t('sys.memoryImportPrompt')) || '';
+  }
+  if (!sourceDir) return;
+  const res = await window.ga.importMemory(sourceDir);
+  if (!res || res.ok === false) throw new Error((res && res.error) || 'import failed');
+  const detail = `memory: ${res.memoryCopied}, model_responses: ${res.responsesCopied}`
+    + (res.responsesSkipped ? ` (skip ${res.responsesSkipped})` : '')
+    + `, ${t('sys.memorySessions')}: ${res.sessionsAdded || 0}`
+    + (res.backupDir ? `\n${t('sys.memoryImportBackup')}: ${res.backupDir}` : '');
+  if (res.sessionsAdded) {
+    try { await loadSessions(); renderSessionList(); } catch (_) {}
+  }
+  showChanToast(t('sys.memoryImported'), detail, 'ok');
+}
+bindClick('import-memory-btn', async (e) => {
+  e.stopPropagation();
+  try {
+    await importMemoryFromDir();
+  } catch (err) {
+    showChanToast(t('err.memoryImport'), err.message || String(err), 'err');
+  }
+});
+const gaSourceCurrentEl = document.getElementById('ga-source-current');
+const gaSourceClearBtn = document.getElementById('ga-source-clear-btn');
+async function refreshGaSource() {
+  if (!window.__TAURI__?.core?.invoke) return;
+  let cur = '';
+  try { cur = await window.ga.getGaSource(); } catch (_) { cur = ''; }
+  if (gaSourceCurrentEl) {
+    if (cur) {
+      gaSourceCurrentEl.textContent = `${t('set.gaSourceCurrent')}: ${cur}`;
+      gaSourceCurrentEl.hidden = false;
+    } else {
+      gaSourceCurrentEl.hidden = true;
+    }
+  }
+  if (gaSourceClearBtn) gaSourceClearBtn.hidden = !cur;
+}
+bindClick('ga-source-btn', async (e) => {
+  e.stopPropagation();
+  if (!window.__TAURI__?.core?.invoke) {
+    showChanToast(t('err.gaSourceDesktopOnly'), '', 'err');
+    return;
+  }
+  try {
+    const dir = await window.ga.tauriInvoke('pick_directory', { title: t('sys.gaSourcePickTitle') });
+    if (!dir) return;
+    showChanToast(t('sys.gaSourceSwitching'), dir, 'ok');
+    const project = await window.ga.setGaSource(dir);
+    await refreshGaSource();
+    showChanToast(t('sys.gaSourceSet'), project || dir, 'ok');
+  } catch (err) {
+    showChanToast(t('err.gaSourceSet'), err.message || String(err), 'err');
+  }
+});
+bindClick('ga-source-clear-btn', async (e) => {
+  e.stopPropagation();
+  try {
+    showChanToast(t('sys.gaSourceSwitching'), '', 'ok');
+    await window.ga.clearGaSource();
+    await refreshGaSource();
+    showChanToast(t('sys.gaSourceCleared'), '', 'ok');
+  } catch (err) {
+    showChanToast(t('err.gaSourceSet'), err.message || String(err), 'err');
+  }
+});
+refreshGaSource();
 // 侧边栏「快速接入」：点击官方模型按钮 → 打开预填好的添加模型表单
 const pqEl = document.getElementById('provider-quickstart');
 if (pqEl) pqEl.addEventListener('click', (e) => {
