@@ -130,6 +130,8 @@ class AgentManager:
         self.config: Dict[str, Any] = {}
         self.sessions: Dict[str, Session] = {}
         self.active_session_id: Optional[str] = None
+        self._sessions_dir = Path(self.ga_root) / "temp" / "desktop_sessions"
+        # Legacy monolithic store; migrated into _sessions_dir on first load, then retired.
         self._sessions_file = Path(self.ga_root) / "temp" / "desktop_sessions.json"
         self._load_sessions()
 
@@ -137,98 +139,156 @@ class AgentManager:
     def mykey_path(self) -> str:
         return str(Path(self.ga_root) / "mykey.py")
 
-    def _persist(self):
+    def _session_dict(self, s: "Session") -> dict:
+        llm_hist = None
+        if s.agent and hasattr(s.agent, 'llmclient'):
+            try: llm_hist = s.agent.llmclient.backend.history
+            except Exception: pass
+        if llm_hist is None:
+            llm_hist = s.llm_history
+        return {"id": s.id, "title": s.title, "cwd": s.cwd,
+                "created_at": s.created_at, "updated_at": s.updated_at,
+                "messages": s.messages, "msg_seq": s.msg_seq,
+                "pinned": s.pinned, "untitled": s.untitled,
+                "plan_scan_baseline": s.plan_scan_baseline,
+                "plan_path": s.plan_path or "",
+                "llm_no": s.llm_no,
+                "llm_history": llm_hist}
+
+    def _session_file(self, sid: str) -> Path:
+        return self._sessions_dir / f"{sid}.json"
+
+    def _persist_session(self, s: "Session"):
+        """Write a single session file. Cost is O(one session), independent of how many
+        sessions exist — this is the fix for the monolithic-file scaling problem."""
         try:
-            self._sessions_file.parent.mkdir(parents=True, exist_ok=True)
-            arr = []
+            self._sessions_dir.mkdir(parents=True, exist_ok=True)
             with self.lock:
-                for s in self.sessions.values():
-                    llm_hist = None
-                    if s.agent and hasattr(s.agent, 'llmclient'):
-                        try: llm_hist = s.agent.llmclient.backend.history
-                        except Exception: pass
-                    if llm_hist is None:
-                        llm_hist = s.llm_history
-                    arr.append({"id": s.id, "title": s.title, "cwd": s.cwd,
-                                "created_at": s.created_at, "updated_at": s.updated_at,
-                                "messages": s.messages, "msg_seq": s.msg_seq,
-                                "pinned": s.pinned, "untitled": s.untitled,
-                                "plan_scan_baseline": s.plan_scan_baseline,
-                                "plan_path": s.plan_path or "",
-                                "llm_no": s.llm_no,
-                                "llm_history": llm_hist})
-            self._sessions_file.write_text(json.dumps(arr, ensure_ascii=False, default=str), encoding="utf-8")
+                data = self._session_dict(s)
+            tmp = self._sessions_dir / f"{s.id}.json.tmp"
+            tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+            os.replace(tmp, self._session_file(s.id))  # atomic swap
         except Exception as e:
-            print(f"[bridge] persist sessions failed: {e}", file=sys.stderr)
+            print(f"[bridge] persist session {s.id} failed: {e}", file=sys.stderr)
+
+    def _delete_session_file(self, sid: str):
+        try:
+            f = self._session_file(sid)
+            if f.exists():
+                f.unlink()
+        except Exception as e:
+            print(f"[bridge] delete session file {sid} failed: {e}", file=sys.stderr)
+
+    def _persist(self):
+        """Write every session (one file each). Used for bulk ops (import) / full flush."""
+        with self.lock:
+            sessions = list(self.sessions.values())
+        for s in sessions:
+            self._persist_session(s)
+
+    def _session_from_item(self, item: dict) -> "Session":
+        msgs = item.get("messages", [])
+        return Session(id=item["id"], title=item.get("title", "New chat"),
+                       cwd=item.get("cwd", self.ga_root),
+                       created_at=item.get("created_at", time.time()),
+                       updated_at=item.get("updated_at", time.time()),
+                       messages=msgs,
+                       msg_seq=item.get("msg_seq", 0),
+                       pinned=item.get("pinned", False),
+                       untitled=item.get("untitled", True),
+                       plan_scan_baseline=_load_plan_baseline(item, msgs),
+                       plan_path=_sanitize_desktop_plan_path(item["id"], item.get("plan_path") or ""),
+                       status="idle", agent=None,
+                       llm_history=item.get("llm_history"),
+                       llm_no=item.get("llm_no"))
 
     def _load_sessions(self):
+        # New format: one file per session under temp/desktop_sessions/.
         try:
-            if not self._sessions_file.exists():
-                return
-            arr = json.loads(self._sessions_file.read_text(encoding="utf-8"))
-            for item in arr:
-                msgs = item.get("messages", [])
-                sess = Session(id=item["id"], title=item.get("title", "New chat"),
-                               cwd=item.get("cwd", self.ga_root),
-                               created_at=item.get("created_at", time.time()),
-                               updated_at=item.get("updated_at", time.time()),
-                               messages=msgs,
-                               msg_seq=item.get("msg_seq", 0),
-                               pinned=item.get("pinned", False),
-                               untitled=item.get("untitled", True),
-                               plan_scan_baseline=_load_plan_baseline(item, msgs),
-                               plan_path=_sanitize_desktop_plan_path(
-                                   item["id"], item.get("plan_path") or ""),
-                               status="idle", agent=None,
-                               llm_history=item.get("llm_history"),
-                               llm_no=item.get("llm_no"))
-                self.sessions[sess.id] = sess
-            if self.sessions:
-                self.active_session_id = max(self.sessions.values(), key=lambda s: s.updated_at).id
+            if self._sessions_dir.is_dir():
+                for f in self._sessions_dir.glob("*.json"):
+                    try:
+                        item = json.loads(f.read_text(encoding="utf-8"))
+                        sess = self._session_from_item(item)
+                        self.sessions[sess.id] = sess
+                    except Exception as e:
+                        print(f"[bridge] load session {f.name} failed: {e}", file=sys.stderr)
         except Exception as e:
-            print(f"[bridge] load sessions failed: {e}", file=sys.stderr)
+            print(f"[bridge] load sessions dir failed: {e}", file=sys.stderr)
+
+        # One-time migration from the legacy monolithic desktop_sessions.json.
+        try:
+            if self._sessions_file.exists():
+                arr = json.loads(self._sessions_file.read_text(encoding="utf-8"))
+                for item in arr:
+                    if not isinstance(item, dict) or item.get("id") in self.sessions:
+                        continue
+                    try:
+                        sess = self._session_from_item(item)
+                        self.sessions[sess.id] = sess
+                        self._persist_session(sess)
+                    except Exception as e:
+                        print(f"[bridge] migrate session failed: {e}", file=sys.stderr)
+                # Retire the legacy file so we do not migrate again next launch.
+                with contextlib.suppress(Exception):
+                    self._sessions_file.rename(
+                        self._sessions_file.parent / (self._sessions_file.name + ".migrated"))
+        except Exception as e:
+            print(f"[bridge] migrate sessions failed: {e}", file=sys.stderr)
+
+        if self.sessions:
+            self.active_session_id = max(self.sessions.values(), key=lambda s: s.updated_at).id
 
     def import_sessions(self, source_dir: str) -> dict:
-        """把 source_dir/temp/desktop_sessions.json 合并进当前会话列表(按 id 去重)。
+        """把 source 的桌面会话合并进当前列表(按 id 去重)。
 
-        既更新内存(立即在侧边栏可见)又落盘。返回新增/跳过计数。
+        兼容两种源格式:新版 temp/desktop_sessions/<id>.json,以及旧版单文件
+        temp/desktop_sessions.json(含已退休的 .migrated)。只落盘新增的会话。
         """
         src = Path(source_dir).expanduser().resolve()
-        src_file = src / "temp" / "desktop_sessions.json"
-        if not src_file.is_file():
+        items: List[dict] = []
+        found = False
+
+        # New per-session format.
+        src_dir = src / "temp" / "desktop_sessions"
+        if src_dir.is_dir():
+            for f in src_dir.glob("*.json"):
+                try:
+                    items.append(json.loads(f.read_text(encoding="utf-8")))
+                    found = True
+                except Exception:
+                    continue
+
+        # Legacy monolithic format (live or already retired).
+        for legacy in (src / "temp" / "desktop_sessions.json",
+                       src / "temp" / "desktop_sessions.json.migrated"):
+            if legacy.is_file():
+                found = True
+                try:
+                    arr = json.loads(legacy.read_text(encoding="utf-8"))
+                    if isinstance(arr, list):
+                        items.extend(x for x in arr if isinstance(x, dict))
+                except Exception:
+                    continue
+
+        if not found:
             return {"sessionsAdded": 0, "sessionsSkipped": 0, "sessionsFileFound": False}
-        try:
-            arr = json.loads(src_file.read_text(encoding="utf-8"))
-            if not isinstance(arr, list):
-                raise ValueError("desktop_sessions.json is not a list")
-        except Exception as e:
-            raise ValueError(f"cannot read desktop_sessions.json: {e}")
+
         added = 0
         skipped = 0
+        new_sessions: List["Session"] = []
         with self.lock:
-            for item in arr:
+            for item in items:
                 sid = item.get("id")
                 if not sid or sid in self.sessions:
                     skipped += 1
                     continue
-                msgs = item.get("messages", [])
-                sess = Session(id=sid, title=item.get("title", "New chat"),
-                               cwd=item.get("cwd", self.ga_root),
-                               created_at=item.get("created_at", time.time()),
-                               updated_at=item.get("updated_at", time.time()),
-                               messages=msgs,
-                               msg_seq=item.get("msg_seq", 0),
-                               pinned=item.get("pinned", False),
-                               untitled=item.get("untitled", True),
-                               plan_scan_baseline=_load_plan_baseline(item, msgs),
-                               plan_path=_sanitize_desktop_plan_path(sid, item.get("plan_path") or ""),
-                               status="idle", agent=None,
-                               llm_history=item.get("llm_history"),
-                               llm_no=item.get("llm_no"))
+                sess = self._session_from_item(item)
                 self.sessions[sid] = sess
+                new_sessions.append(sess)
                 added += 1
-        if added:
-            self._persist()
+        for sess in new_sessions:
+            self._persist_session(sess)
         return {"sessionsAdded": added, "sessionsSkipped": skipped, "sessionsFileFound": True}
 
     def _mykey_file(self) -> Path:
@@ -596,7 +656,7 @@ class AgentManager:
         sess.updated_at = time.time()
         if role == "user" and content.strip() and sess.title == "New chat":
             sess.title = content.strip().replace("\n", " ")[:40]
-        self._persist()
+        self._persist_session(sess)
         return msg
 
     def create_session(self, cwd: Optional[str] = None) -> Session:
@@ -606,7 +666,7 @@ class AgentManager:
             self.sessions[sid] = sess
             self.active_session_id = sid
         emit_session_state(sess, "created")
-        self._persist()
+        self._persist_session(sess)
         return sess
 
     def get_session(self, sid: str) -> Session:
@@ -627,7 +687,7 @@ class AgentManager:
                 with contextlib.suppress(Exception):
                     sess.agent.abort()
         emit_session_state(sess, "closed")
-        self._persist()
+        self._delete_session_file(sid)
         _purge_session_uploads(sid)
         return {"ok": True, "sessionId": sid}
 
@@ -652,7 +712,7 @@ class AgentManager:
             import plan_state
             if plan_state.is_plan_preset_prompt(prompt):
                 plan_state.bind_plan_session(sess, prompt)
-                self._persist()
+                self._persist_session(sess)
             sess.status = "running"
             sess.cancel_requested = False
             sess.last_error = ""
@@ -869,7 +929,7 @@ class AgentManager:
                 with contextlib.suppress(Exception):
                     sess.agent.next_llm(int(llm_no))
             sess.updated_at = time.time()
-        self._persist()
+        self._persist_session(sess)
         return {"ok": True, "sessionId": sid, "llmNo": sess.llm_no, "model": self._live_model(sess)}
 
 
@@ -1474,7 +1534,7 @@ async def patch_session_handler(request):
     if "plan_scan_baseline" in data:
         sess.plan_scan_baseline = int(data["plan_scan_baseline"])
     sess.updated_at = time.time()
-    manager._persist()
+    manager._persist_session(sess)
     return json_ok({"ok": True, "session": manager.snapshot(sess, include_messages=False)})
 
 
