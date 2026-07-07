@@ -20,6 +20,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from datetime import datetime
@@ -50,7 +51,7 @@ class RewindStore:
 
     def __init__(self, root: str, cwd: str) -> None:
         self.root = os.path.abspath(root)
-        self.cwd = os.path.abspath(cwd)
+        self.cwd = os.path.realpath(cwd)   # realpath：与 key() 同基准，解析 junction/symlink
         self.objects_dir = os.path.join(self.root, "objects")
         self.tree_path = os.path.join(self.root, "tree.json")
 
@@ -65,8 +66,6 @@ class RewindStore:
 
         # 段内暂存：本段触碰过的相对路径（commit 时落定）。
         self._touched: set[str] = set()
-        # 最近一次 restore 的 redo 点（内存级软保险②），结构同 node.files。
-        self._redo: dict | None = None
 
         self.load()
         if self.nodes:
@@ -99,8 +98,11 @@ class RewindStore:
 
     # ------------------------------------------------------------------ paths
     def key(self, abs_path: str) -> str:
-        """绝对路径在 cwd 下 → 存相对（参考 CC maybeShortenFilePath）；否则原样。"""
-        ap = os.path.abspath(abs_path)
+        """路径 → 规范 key：realpath 解析 junction/symlink，使同一物理文件只有一个身份
+        （workspace 的 junction 相对路径与真实绝对路径不再分裂成两个 key，避免 apply_code
+        对同一文件重复回写而损坏内容）；落在 cwd 下则存相对（参考 CC maybeShortenFilePath），
+        否则存绝对。"""
+        ap = os.path.realpath(abs_path)
         try:
             if os.path.commonpath([ap, self.cwd]) == self.cwd:
                 return os.path.relpath(ap, self.cwd).replace(os.sep, "/")
@@ -151,12 +153,17 @@ class RewindStore:
             self.tracked.add(rel)
 
     def commit(self, title: str, hist_len: int | None = None, kind: str = "edit",
-               history: list | None = None) -> str:
+               history: list | None = None, hist_info: list | None = None,
+               key_info: str | None = None) -> str:
         """段末落节点：继承 HEAD.files，把本段触碰文件的「改后」内容写进新节点。
 
         `history` 给定时(对话树化)：切 `history[parent.hist_len:当前]` 为本轮对话增量，
         存成 content-addressable conv blob，节点记其 hash + `hist_len=len(history)`。
         此刻索引可靠 → 增量精确，恢复时沿路径拼回即可，不再靠会漂的绝对下标。
+
+        `hist_info`/`key_info` 给定时(工作记忆树化)：`hist_info` 是轮级摘要列表,与 conv
+        同构切增量存 blob;`key_info` 是小便签(<200 token),直接内联进节点。rewind 时
+        一并恢复 → 纪要与历史**硬同步**,杜绝旧 rewind「历史回退了、纪要没回」的串味。
 
         无触碰文件时也会落节点（纯对话推进也是 checkpoint）。返回新节点 id。"""
         self._ensure_origin()        # 第一次提交前先确保有「会话起点」根
@@ -167,12 +174,35 @@ class RewindStore:
 
         conv = None
         if history is not None:
-            parent_len = self.nodes[parent].get("hist_len") if parent is not None else 0
-            parent_len = parent_len or 0          # None(旧节点) / origin → 0
+            # 增量起点用【树重建的真实长度】而非 stored hist_len。原因:_rw_commit 喂的 history
+            # 取自日志全量(见集成层),而 stored hist_len 可能是早先压缩态 commit 留下的脏值;
+            # 删头后绝对下标会越界丢轮。以树实际已有长度为准:delta = 日志里树还没有的尾部 →
+            # 既不丢轮,也能自愈此前因压缩漏掉的轮(日志只增不改,恒 ⊇ 树)。
+            parent_len = len(self.rebuild_history(parent)) if parent is not None else 0
             delta = list(history[parent_len:])
             hist_len = len(history)
             conv = self._put_blob(
                 json.dumps(delta, ensure_ascii=False, default=str).encode("utf-8"))
+
+        # 工作记忆默认【从 history 派生】(与 reconcile 同口径 → 树的 WM 恒由日志重建、彼此
+        # 对齐)。显式传入才尊重(测试/特殊调用)。关键:/continue 会把 handler.history_info
+        # 清空,若仍取 live 纪要,长度与树派生的不一致 → 增量算空、续接后新轮纪要补不进树。
+        # 从 history(集成层喂日志全量)派生则永远对齐,不受 live 纪要被重置影响。
+        if history is not None and hist_info is None:
+            hist_info = self._derive_hist_info(history)
+        if history is not None and key_info is None:
+            key_info = self._key_info_of(history)
+
+        # 工作记忆增量(与 conv 同构):history_info 轮级摘要切本段增量存 blob;key_info
+        # 覆盖式小便签直接内联。两者皆可选,老树/外部续接未传则为 None(恢复时跳过,不动现场)。
+        hinfo = None
+        hinfo_len = None
+        if hist_info is not None:
+            parent_hlen = len(self.rebuild_hist_info(parent)) if parent is not None else 0
+            hdelta = list(hist_info[parent_hlen:])
+            hinfo_len = len(hist_info)
+            hinfo = self._put_blob(
+                json.dumps(hdelta, ensure_ascii=False, default=str).encode("utf-8"))
 
         nid = self._new_id()
         self.nodes[nid] = {
@@ -184,11 +214,64 @@ class RewindStore:
             "hist_len": hist_len,
             "files": files,
             "conv": conv,
+            "hinfo": hinfo,
+            "hinfo_len": hinfo_len,
+            "kinfo": key_info,
         }
         if parent is not None:
             self.nodes[parent]["children"].append(nid)
         elif self.root_id is None or self.root_id not in self.nodes:
             self.root_id = nid   # 只认第一个根;rewind-到-根之前再提交会产生第二个顶层节点(forest)
+        self.head = nid
+        self._touched.clear()
+        self.save()
+        return nid
+
+    def commit_bridge(self, *, parent: str, conv_delta: list | None,
+                      hinfo_delta: list | None, kinfo: str | None,
+                      files_override: dict | None, title: str,
+                      rw_tag: str) -> str:
+        """落一个**桥接节点**(仅会话/仅代码回退用):承载「对话与代码来自不同节点」的
+        交叉态,使该状态成为树里的一等节点(三种回退模式对它都可用)。
+
+        与 `commit` 的区别:不走 `_touched`/继承派生,对话/WM 增量与文件均**显式给定**。
+        - `conv_delta`/`hinfo_delta`:本节点自带的对话/纪要增量(list),存 blob(内容寻址,
+          大多复用已有 blob);None 则不带(空会话桥接)。
+        - `kinfo`:覆盖式便签,直接内联。
+        - `files_override`:显式 files map;None → 继承 parent。
+        - `rw_tag`:来源标注(`仅会话回退`/`仅代码回退`/`仅会话回退到聊天起点`),独立于 title。
+
+        parent 必须是现存节点(由 restore_plan 保证)。返回新节点 id,HEAD 指向它。"""
+        if parent not in self.nodes:
+            parent = self.root_id if self.root_id in self.nodes else self.head
+        files = (dict(files_override) if files_override is not None
+                 else dict(self.nodes[parent]["files"]))
+        conv = None
+        if conv_delta:
+            conv = self._put_blob(
+                json.dumps(conv_delta, ensure_ascii=False, default=str).encode("utf-8"))
+        hinfo = None
+        hinfo_len = None
+        if hinfo_delta:
+            hinfo_len = len(self.rebuild_hist_info(parent)) + len(hinfo_delta)
+            hinfo = self._put_blob(
+                json.dumps(hinfo_delta, ensure_ascii=False, default=str).encode("utf-8"))
+        nid = self._new_id()
+        self.nodes[nid] = {
+            "parent": parent,
+            "children": [],
+            "title": title,
+            "created": time.time(),
+            "kind": "edit",
+            "hist_len": len(self.rebuild_history(parent)) + len(conv_delta or []),
+            "files": files,
+            "conv": conv,
+            "hinfo": hinfo,
+            "hinfo_len": hinfo_len,
+            "kinfo": kinfo,
+            "rw_tag": rw_tag,
+        }
+        self.nodes[parent]["children"].append(nid)
         self.head = nid
         self._touched.clear()
         self.save()
@@ -223,17 +306,10 @@ class RewindStore:
         """把工作区文件还原到 node_id 的状态。`node_id=None` → 还原到 baseline
         (任何 checkpoint 之前的原始状态,用于「回退到根之前」)。
 
-        - **只动本 store 追踪过的路径**（self.tracked），绝不碰未记录文件（软保险①）。
-        - restore 前先把这些路径的当前内容存进 redo 点（软保险②）——误覆盖也能找回。
+        - **只动本 store 追踪过的路径**（self.tracked），绝不碰未记录文件。
         返回 [(rel, action)]，action ∈ {restored, deleted}。"""
         if node_id is not None and node_id not in self.nodes:
             raise KeyError(node_id)
-
-        # 软保险②：redo 点（记录当前 = 即将被覆盖的状态）。
-        redo_files: dict[str, str | None] = {}
-        for rel in self.tracked:
-            redo_files[rel] = self._snapshot(self._abs(rel))
-        self._redo = {"from": self.head, "files": redo_files}
 
         changed: list[tuple[str, str]] = []
         for rel in self.tracked:
@@ -315,6 +391,18 @@ class RewindStore:
             out.append({"rel": rel, "old": self._text(ph), "new": self._text(nh)})
         return out
 
+    def node_line_delta(self, node_id) -> tuple[int, int]:
+        """本节点相对父节点的 (新增行, 删除行) 合计，仅计 file_write/file_patch 追踪的
+        文件。供 rewind/worldline 显示「代码变动行数」。"""
+        ins = dele = 0
+        for f in self.node_diff(node_id):
+            for line in difflib.ndiff(f["old"].splitlines(), f["new"].splitlines()):
+                if line.startswith("+ "):
+                    ins += 1
+                elif line.startswith("- "):
+                    dele += 1
+        return ins, dele
+
     def _text(self, h: str | None) -> str:
         if h is _ABSENT:
             return ""
@@ -362,13 +450,12 @@ class RewindStore:
             ch = node.get("conv")          # 对话增量 blob 也是引用
             if ch:
                 referenced.add(ch)
+            hh = node.get("hinfo")         # 工作记忆纪要增量 blob 同样是引用
+            if hh:
+                referenced.add(hh)
         for h in self.baseline.values():
             if h is not _ABSENT:
                 referenced.add(h)
-        if self._redo:
-            for h in self._redo["files"].values():
-                if h is not _ABSENT:
-                    referenced.add(h)
         removed = 0
         if not os.path.isdir(self.objects_dir):
             return 0
@@ -509,8 +596,18 @@ class RewindStore:
         return chain
 
     # ----------------------------------------------------------- conversation
+    _PM_BLOCK_RE = re.compile(r"\s*-{3,}\s*\[PROJECT MODE:.*?(?:\n-{3,}\s*|$)", re.DOTALL)
+
+    @classmethod
+    def _strip_project_mode(cls, text: str) -> str:
+        """剔除 project_mode 插件注入块(可出现在旧 WORKING MEMORY 文本中间)。"""
+        return cls._PM_BLOCK_RE.sub("", text or "")
+
     def _node_conv(self, node_id) -> list:
-        """单节点的对话增量（list）。无 conv / 读失败 → []（容错降级）。"""
+        """单节点的对话增量（list）。无 conv / 读失败 → []（容错降级）。
+
+        runtime history 尊重当时真实 prompt,包括 project_mode 的当轮注入;用户可见
+        投影(标题/prefill/turn_sig/history_info)在各自入口清洗。"""
         h = self.nodes.get(node_id, {}).get("conv")
         if not h:
             return []
@@ -530,21 +627,70 @@ class RewindStore:
             hist.extend(self._node_conv(nid))
         return hist
 
+    # ------------------------------------------------------ 工作记忆(随对话回退)
+    def _node_hinfo(self, node_id) -> list:
+        """单节点的 working-memory 纪要增量（list）。无 / 读失败 → []（容错降级）。"""
+        h = self.nodes.get(node_id, {}).get("hinfo")
+        if not h:
+            return []
+        try:
+            data = json.loads(self._get_blob(h).decode("utf-8"))
+            if not isinstance(data, list):
+                return []
+            return [self._strip_project_mode(str(x)) for x in data]
+        except Exception:
+            return []
+
+    def rebuild_hist_info(self, node_id) -> list:
+        """沿 root→node_id 拼接各节点纪要增量，重建 `handler.history_info`。
+        与 `rebuild_history` 同构：纪要随对话一起精确回退，恢复后两者自洽。"""
+        out: list = []
+        for nid in self.path_to(node_id):
+            out.extend(self._node_hinfo(nid))
+        return out
+
+    def key_info_at(self, node_id) -> str:
+        """node_id 处生效的 key_info：沿 root→node 取最后一个非 None 的 `kinfo`
+        （key_info 是覆盖式小便签，不像纪要那样累加）。无则空串。"""
+        ki = ""
+        for nid in self.path_to(node_id):
+            v = self.nodes[nid].get("kinfo")
+            if v is not None:
+                ki = v
+        return ki
+
+    def path_has_wm(self, node_id) -> bool:
+        """root→node 路径上是否记录过工作记忆（hinfo/kinfo）。老树（本特性之前）
+        全为 None → False：恢复时据此跳过 WM 同步，不抹掉现场纪要（向后兼容）。"""
+        for nid in self.path_to(node_id):
+            nd = self.nodes.get(nid, {})
+            if nd.get("hinfo") is not None or nd.get("kinfo") is not None:
+                return True
+        return False
+
     # ----------------------------------------------------- 对账(防外部改写灾难)
-    @staticmethod
-    def _msg_user_text(msg) -> str:
-        """真实用户提问文本;非 user / 纯 tool_result 回填 → ""(不算提问边界)。"""
+    @classmethod
+    def _msg_user_text(cls, msg) -> str:
+        """真实用户提问文本;非 user / 自动注入轮 → ""(不算提问边界)。"""
         if not isinstance(msg, dict) or msg.get("role") != "user":
             return ""
         c = msg.get("content")
         if isinstance(c, str):
-            return c
-        if isinstance(c, list):
+            text = cls._strip_project_mode(c)
+        elif isinstance(c, list):
             if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
                 return ""
-            return " ".join(b.get("text", "") for b in c
-                            if isinstance(b, dict) and b.get("type") == "text")
-        return ""
+            text = cls._strip_project_mode(" ".join(
+                b.get("text", "") for b in c
+                if isinstance(b, dict) and b.get("type") == "text"))
+        else:
+            return ""
+        text = (text or "").strip()
+        inject_markers = ("### [WORKING MEMORY]", "[SYSTEM TIPS]", "[DANGER]",
+                          "### [总结提炼经验]", "Continue from where you left off")
+        if not text or text.startswith(inject_markers):
+            return ""
+        return text
 
     @classmethod
     def _turn_sig(cls, msgs) -> list:
@@ -552,10 +698,71 @@ class RewindStore:
         故不含注入的易变内容)。用于 reconcile 判两段是否同一对话。"""
         return [t for t in (cls._msg_user_text(m).strip() for m in msgs) if t]
 
+    # ---------------------------------- 从日志/历史重建工作记忆(reconcile 吸收外部轮时补 WM)
+    @staticmethod
+    def _all_text(msg) -> str:
+        """消息里所有 text block 的拼接(含 tool_result 轮注入的 WORKING MEMORY 文本)。"""
+        if not isinstance(msg, dict):
+            return ""
+        c = msg.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return "\n".join(b.get("text", "") for b in c
+                             if isinstance(b, dict) and b.get("type") == "text")
+        return ""
+
+    @classmethod
+    def _summary_of(cls, msg) -> str:
+        """从 assistant 消息提取 `<summary>`(GA 轮级纪要的来源);无则退化取首行。
+        与 ga.turn_end_callback 的提取口径一致,使从日志重建的 history_info 贴近原值。"""
+        text = re.sub(r'```.*?```|<thinking>.*?</thinking>', '',
+                      cls._all_text(msg), flags=re.DOTALL)
+        m = re.search(r'<summary>(.*?)</summary>', text, re.DOTALL)
+        if m and m.group(1).strip():
+            return m.group(1).strip()[:80]
+        for line in text.splitlines():
+            if line.strip():
+                return line.strip()[:80]
+        return "（无摘要）"
+
+    @classmethod
+    def _derive_hist_info(cls, history) -> list:
+        """从对话历史重建 `handler.history_info`(轮级纪要):真实用户提问 → `[USER]: …`;
+        每条 assistant(=一轮) → `[Agent] <summary>`。这正是 GA 原本构建 history_info 的
+        方式,故 reconcile 从日志吸收外部/老会话轮次时可据此把工作记忆补回(否则续接后
+        rewind 到这些轮,纪要会缺失 → 串味)。"""
+        out: list = []
+        for m in history:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "user":
+                q = cls._msg_user_text(m).strip()   # tool_result 轮 → ""(非提问,不计)
+                if q:
+                    out.append(f"[USER]: {q}")
+            elif role == "assistant":
+                out.append(f"[Agent] {cls._summary_of(m)}")
+        return out
+
+    @classmethod
+    def _key_info_of(cls, history) -> Optional[str]:
+        """取历史里最后一个注入的 `<key_info>…</key_info>`(agent 便签);无则 None。"""
+        ki = None
+        for m in history:
+            for mt in re.finditer(r'<key_info>(.*?)</key_info>', cls._all_text(m), re.DOTALL):
+                ki = mt.group(1).strip()
+        return ki
+
     def reconcile(self, history: list) -> int:
-        """把 live history 里树尚未记录的尾部轮次吸收成 conv-only 节点,使树追平日志。
-        供「带 worldline 的 UI」在打开世界线 / 接管日志前调用 —— 别的(不更新树的)
-        UI 往同一日志追加后,若不对账,树会滞后;一旦在滞后状态 rewind,
+        """把 live history 里树尚未记录的尾部轮次吸收成节点,使树追平日志。
+
+        ⚠️ **契约**:`history` 必须是**日志解析出的全量历史**(`_parse_native_history`),
+        **禁止传压缩态的 `backend.history`**。对账是「日志 ↔ 树」两个全量真相源之间的事;
+        喂压缩/删头后的内存会让全量的树去迁就残缺副本——前缀比对失败 → 误判分歧 → 弃树
+        另起(详见下方安全闸)。调用方负责从日志取全量历史。
+
+        用途:别的(不更新树的)UI 往同一日志追加后树会滞后;一旦在滞后状态 rewind,
         `rewrite_projection` 会拿陈旧树回写、**抹掉那些外部轮次**(灾难性丢失)。
         对账后树恒 ⊇ 日志,故 rewind 物理上不可能 clobber 未见过的轮次。
 
@@ -593,7 +800,11 @@ class RewindStore:
                           for i in range(s, end)
                           if self._msg_user_text(history[i]).strip()), "")
             title = (title or "（外部续接）").replace("\n", " ").strip()[:80]
-            self.commit(title or "（外部续接）", kind="edit", history=list(history[:end]))
+            seg_hist = list(history[:end])
+            # 吸收时一并从日志重建工作记忆 → 续接/外部轮也能随 rewind 同步纪要(修缺口B)。
+            self.commit(title or "（外部续接）", kind="edit", history=seg_hist,
+                        hist_info=self._derive_hist_info(seg_hist),
+                        key_info=self._key_info_of(seg_hist))
             absorbed += end - s
         return absorbed
 
@@ -605,6 +816,17 @@ class RewindStore:
         for msg in self._node_conv(node_id):
             if isinstance(msg, dict) and msg.get("role") == "user":
                 return msg
+        return None
+
+    def first_question(self) -> Optional[str]:
+        """当前 HEAD 路径上**第一条真实用户提问**的文本;空树 → None。沿路径读各节点
+        conv（通常首个真实节点即命中,O(1) blob 读）。供集成层**廉价检测 backend.history
+        是否被删头**:删头先 pop 掉首问,故 live 首问与此对不上 ⇒ 删过头(该回退到日志)。"""
+        for nid in self.path_to(self.head):
+            for msg in self._node_conv(nid):
+                t = self._msg_user_text(msg).strip()
+                if t:
+                    return t
         return None
 
 
@@ -646,7 +868,7 @@ def files_summary(files: List[str]) -> str:
     return "、".join(files[:3]) + f" (+{len(files) - 3})"
 
 
-_TITLE_MAX_CELLS = 40
+_TITLE_MAX_CELLS = 54   # 左树标题截断宽度，对应 worldline 左栏 60%（3:2 布局）
 
 
 def ellipsize(s: str, max_cells: int = _TITLE_MAX_CELLS) -> str:
@@ -667,6 +889,7 @@ class CheckpointNode:
     kind: str = "edit"
     files: List[str] = field(default_factory=list)
     ago: Optional[int] = 0
+    rw_tag: Optional[str] = None  # 桥接来源标注(仅会话/仅代码回退);普通节点 None
 
 
 class CheckpointTree:
@@ -697,12 +920,13 @@ def tree_from_store(store, now: float) -> CheckpointTree:
     for nid, nd in store.nodes.items():
         t.nodes[nid] = CheckpointNode(
             id=nid,
-            title=nd.get("title") or "（空）",
+            title=store._strip_project_mode(nd.get("title") or "（空）").replace("\n", " ").strip() or "（空）",
             parent_id=nd.get("parent"),
             children=[c for c in nd.get("children", []) if c in store.nodes],
             kind="current" if nid == store.head else nd.get("kind", "edit"),
             files=_changed_files(store, nid),
             ago=int(max(0, now - nd.get("created", now))),
+            rw_tag=nd.get("rw_tag"),
         )
     t.root_id = store.root_id
     return t
@@ -831,24 +1055,6 @@ def nearest_depth_node(order, sel, delta):
     return order[best][0]
 
 
-def parent_sibling_first_child(ct, sel, direction):
-    d = ct.disp[sel]
-    if d.parent_key is None:
-        return sel
-    parent = ct.disp[d.parent_key]
-    if parent.parent_key is None:
-        return sel
-    siblings = ct.disp[parent.parent_key].children
-    if parent.key not in siblings or len(siblings) <= 1:
-        return sel
-    start = siblings.index(parent.key)
-    step = 1 if direction >= 0 else -1
-    for off in range(1, len(siblings)):
-        sib = ct.disp[siblings[(start + step * off) % len(siblings)]]
-        if sib.children:
-            return sib.children[0]
-    return sel
-
 
 # ============================================================================
 # 恢复编排(UI 无关):算出回退后的对话/文件/prefill 并落地,前端只刷新自己的显示
@@ -923,12 +1129,17 @@ def restore_plan(store, node_id, mode: str = "both", to: str = "before",
         target = parent(node) / origin。
       - **at**(末尾占位项):在该节点处**继续**(HEAD→node,不清除、无 prefill)。
     `mode`: both/conv/code。会就地:重建对话(返回 history,调用方自行赋给 backend)、
-    `apply_code`(还原文件,前自动留 redo 点)、移 HEAD、重写投影日志。
+    `apply_code`(还原文件)、移 HEAD、重写投影日志。
 
     返回 None(无效) 或 dict:
-      {history: list|None(仅 conv 变更时), changed: [(rel,action)], prefill: str,
+      {history: list|None(对话变更时), hist_info: list|None, key_info: str|None,
+       changed: [(rel,action)], prefill: str,
        at_origin: bool, target: str, title: str, to: str}
-    —— 前端据此:赋 backend.history、重建界面消息、prefill 输入框、刷新。"""
+    `target` 字段:both = 落点节点;conv/code = 桥接节点 id(前端 cursor 标它)。
+    —— 前端据此:赋 backend.history、同步 working memory、重建界面消息、prefill 输入框、刷新。
+
+    conv/code 落一个**桥接节点**承载「对话/代码交叉态」(见 `commit_bridge`),使该状态成为
+    一等节点;both 直接还原到 target,无桥接。"""
     if store is None or not node_id or node_id not in store.nodes:
         return None
     nd = store.nodes[node_id]
@@ -943,26 +1154,106 @@ def restore_plan(store, node_id, mode: str = "both", to: str = "before",
         at_origin = parent is None
         if not at_origin:
             um = store.first_user_message(node_id)
-            prefill = (user_msg_text(um) if um else "") or nd.get("title", "")
+            # 剥离 project_mode 注入块:回填输入框的是用户原话,不能夹带注入内容。
+            # 树里的 user 消息取自 native 日志(含注入),user_msg_text 逐字取文本不清洗,
+            # 故在此统一 _strip_project_mode(幂等,无注入块则原样返回)。
+            prefill = store._strip_project_mode((user_msg_text(um) if um else "") or nd.get("title", ""))
 
-    history = None
-    if mode in ("both", "conv"):
+    old_head = store.head  # 回退前的 HEAD(代码/对话的「另一侧」来源)
+
+    def _wm_at(node_id):
+        """(hist_info, key_info) @ node;树无 WM 记录 → (None, None),调用方跳过不动现场。"""
+        if store.path_has_wm(node_id):
+            return store.rebuild_hist_info(node_id), store.key_info_at(node_id)
+        return None, None
+
+    def _prompt_of(node_id):
+        um = store.first_user_message(node_id)
+        # 同 prefill:桥接节点标题也要剥离 project_mode 注入,取用户原话。
+        return store._strip_project_mode(
+            (user_msg_text(um) if um else "") or store.nodes.get(node_id, {}).get("title", ""))
+
+    # ---- both:直接还原到 target(对话+代码),无桥接
+    if mode == "both":
         history = store.rebuild_history(target)
-    changed = []
-    if mode in ("both", "code"):
-        try:
-            changed = store.apply_code(target)
-        except Exception:
-            changed = []
-    store.rewind_head(target)
-    if mode in ("both", "conv") and log_path:
-        rewrite_projection(store, target, log_path)
+        hist_info, key_info = _wm_at(target)
+        changed, code_error = _apply_code_safe(store, target)
+        store.rewind_head(target)
+        if log_path:
+            rewrite_projection(store, target, log_path)
+        return _res(history, hist_info, key_info, changed, prefill,
+                    at_origin, target, store._strip_project_mode(nd.get("title", "")), to,
+                    code_error=code_error)
+
+    # ---- conv:对话退到 target、代码留 old_head。桥接挂 fork(=parent(target),或 target 若 origin)
+    if mode == "conv":
+        tp = store.nodes[target].get("parent")
+        fork = tp if tp in store.nodes else target          # target=origin → fork=origin(空会话)
+        at_start = (fork == target)                          # 空会话:对话退空,无 delta 可带
+        conv_delta = None if at_start else store._node_conv(target)
+        hinfo_delta = None if at_start else store._node_hinfo(target)
+        bridge_files = dict(store.nodes[old_head]["files"]) if old_head in store.nodes else {}
+        if at_start:
+            b_title, rw_tag = prefill or "会话起点", "仅会话回退到聊天起点"
+        else:
+            b_title, rw_tag = _prompt_of(target), "仅会话回退"
+        bridge_id = store.commit_bridge(
+            parent=fork, conv_delta=conv_delta, hinfo_delta=hinfo_delta,
+            kinfo=store.key_info_at(target), files_override=bridge_files,
+            title=b_title, rw_tag=rw_tag)
+        history = store.rebuild_history(target)
+        hist_info, key_info = _wm_at(target)
+        store.rewind_head(bridge_id)
+        if log_path:
+            rewrite_projection(store, target, log_path)
+        return _res(history, hist_info, key_info, [], prefill,
+                    at_origin, bridge_id, store._strip_project_mode(nd.get("title", "")), to)
+
+    # ---- code:代码退到 target、对话留 old_head。桥接按会话拓扑挂在 old_head 的父节点,
+    #      自带 old_head 这一轮对话/WM,文件显式覆盖为 target 的代码状态。
+    if mode == "code":
+        changed, code_error = _apply_code_safe(store, target)
+        conv_parent = store.nodes.get(old_head, {}).get("parent")
+        conv_parent = conv_parent if conv_parent in store.nodes else old_head
+        conv_delta = list(store._node_conv(old_head) or [])
+        hinfo_delta = list(store._node_hinfo(old_head) or []) or None
+        bridge_files = dict(store.nodes[target]["files"])
+        bridge_id = store.commit_bridge(
+            parent=conv_parent, conv_delta=conv_delta, hinfo_delta=hinfo_delta,
+            kinfo=store.key_info_at(old_head), files_override=bridge_files,
+            title=_prompt_of(old_head), rw_tag="仅代码回退")
+        store.rewind_head(bridge_id)
+        # 对话没动 → history=None(前端不重赋 backend.history)、不重写投影日志、
+        # 不 prefill(对话未回退,输入框不该被塞入选中节点的旧提问)。
+        return _res(None, None, None, changed, "",
+                    at_origin, bridge_id, store._strip_project_mode(nd.get("title", "")), to,
+                    code_error=code_error)
+
+    return None  # 未知 mode
+
+
+def _apply_code_safe(store, target) -> "tuple[list, Optional[str]]":
+    """还原工作区代码,失败不静默:返回 (changed, code_error)。code_error 非 None 时
+    表示写盘中途出错(权限/磁盘…),工作区可能处于部分回退状态——交由前端提示用户,
+    而非当作「无变更」悄悄放过(apply_code 直接写用户文件,失败半径不为零)。"""
+    try:
+        return store.apply_code(target), None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+
+def _res(history, hist_info, key_info, changed, prefill,
+         at_origin, target, title, to, *, code_error=None) -> dict:
+    """restore_plan 的返回 dict 构造器。code_error:代码回退失败信息(None=成功)。"""
     return {
         "history": history,
+        "hist_info": hist_info,
+        "key_info": key_info,
         "changed": changed,
         "prefill": prefill,
         "at_origin": at_origin,
         "target": target,
-        "title": nd.get("title", ""),
+        "title": title,
         "to": to,
+        "code_error": code_error,
     }
