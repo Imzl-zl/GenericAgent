@@ -59,6 +59,18 @@ invoke('get_config').then(([py, dir]) => {
   if (dir) dirInput.value = dir;
 }).catch(()=>{});
 
+// Surface the actual first-run prepare error (if this screen was reached via a
+// failed install), instead of only showing the generic "configure paths" text.
+invoke('get_prepare_error').then(err => {
+  if (!err) return;
+  const box = document.createElement('p');
+  box.className = 'err';
+  box.style.cssText = 'text-align:left;white-space:pre-wrap;font-size:.8rem;max-height:8em;overflow:auto';
+  box.textContent = bootT('setup.prepare_error') + '\n' + err;
+  const card = document.querySelector('.card');
+  card.insertBefore(box, card.querySelector('.field-label'));
+}).catch(()=>{});
+
 async function doStart() {
   const pythonPath = pyInput.value.trim();
   const projectDir = dirInput.value.trim();
