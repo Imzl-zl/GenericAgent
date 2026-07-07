@@ -218,6 +218,7 @@ let bridgeUiOffline = false;
       case 'services/mykey/save': return http('/services/mykey', { method: 'POST', body: params || {} });
       case 'services/conductor/model/get': return http('/services/conductor/model');
       case 'services/conductor/model/save': return http('/services/conductor/model', { method: 'POST', body: params || {} });
+      case 'memory/import': return http('/memory/import', { method: 'POST', body: params || {} });
       case 'app/path/selectGaRoot': return http('/config');
       case 'list_continuable_sessions': return { sessions: [] };
       case 'restore_session': throw new Error('restore_session is not implemented in web2 bridge');
