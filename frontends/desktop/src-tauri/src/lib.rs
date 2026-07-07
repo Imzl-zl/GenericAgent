@@ -12,6 +12,10 @@ use std::os::windows::process::CommandExt;
 
 static BRIDGE_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
+/// Last first-run prepare error, surfaced to the setup window (fallback.html) so the
+/// user sees WHY the install failed instead of a generic "configure paths" screen.
+static PREPARE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
 /// Get project root (parent of frontends/)
 fn project_root() -> PathBuf {
     std::env::current_exe()
@@ -304,6 +308,12 @@ fn maybe_setup_shortcut() {
 #[tauri::command]
 fn shortcut_should_ask() -> bool {
     bundle_root().is_some() && read_shortcut_pref().is_none()
+}
+
+/// Returns the last first-run prepare error (if any) so the setup window can display it.
+#[tauri::command]
+fn get_prepare_error() -> Option<String> {
+    PREPARE_ERROR.lock().unwrap().clone()
 }
 
 /// Frontend reports the user's choice. Persists it and creates the shortcut when enabled.
@@ -884,7 +894,7 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }))
-        .invoke_handler(tauri::generate_handler![start_bridge_with_config, start_bridge, get_config, export_mykey, pick_directory, get_ga_source, set_ga_source, clear_ga_source, shortcut_should_ask, shortcut_decide])
+        .invoke_handler(tauri::generate_handler![start_bridge_with_config, start_bridge, get_config, export_mykey, pick_directory, get_ga_source, set_ga_source, clear_ga_source, shortcut_should_ask, shortcut_decide, get_prepare_error])
         .setup(move |app| {
             // Show the loading window immediately so the first-run prepare isn't a blank screen.
             // The window starts on loading.html (a local page), so no "connection refused" flash.
@@ -915,6 +925,12 @@ pub fn run() {
                     report(5, "start");
                     if let Err(e) = run_offline_prepare(&project_dir, &report) {
                         eprintln!("[tauri] first-run prepare failed: {}", e);
+                        // Persist the error for the setup window and to a log file next to the
+                        // bundle, so the failure is explicit instead of a silent config screen.
+                        *PREPARE_ERROR.lock().unwrap() = Some(e.clone());
+                        if let Some(root) = bundle_root() {
+                            let _ = std::fs::write(root.join("prepare_error.log"), &e);
+                        }
                         if let Some(sw) = handle.get_webview_window("setup") { let _ = sw.show(); }
                         if let Some(mw) = handle.get_webview_window("main") { let _ = mw.hide(); }
                         return;
