@@ -536,14 +536,38 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
         c
     };
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     sanitize_bundle_env(&mut cmd);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     let mut child = cmd.spawn().map_err(|e| format!("failed to launch prepare: {}", e))?;
 
+    // Keep only the last N lines of a stream (pip errors are at the end; a full capture
+    // could be huge and the setup window only needs the tail to explain the failure).
+    const TAIL: usize = 40;
+    fn push_tail(buf: &mut Vec<String>, line: String) {
+        if buf.len() >= TAIL {
+            buf.remove(0);
+        }
+        buf.push(line);
+    }
+
+    // Drain stderr on a helper thread (both pipes must be drained concurrently or the child
+    // can deadlock on a full pipe buffer). pip/install errors land here.
+    let stderr_tail = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+    let stderr_thread = child.stderr.take().map(|err| {
+        let tail = std::sync::Arc::clone(&stderr_tail);
+        thread::spawn(move || {
+            for line in BufReader::new(err).lines().flatten() {
+                push_tail(&mut tail.lock().unwrap(), line);
+            }
+        })
+    });
+
     // Forward the script's ASCII progress keys to the loading window, which localizes them
-    // (window.gaProgress maps key -> zh/en by navigator.language).
+    // (window.gaProgress maps key -> zh/en by navigator.language). Non-progress stdout is
+    // kept (tail only) so a failure can show what the script was doing when it died.
+    let mut stdout_tail: Vec<String> = Vec::new();
     if let Some(out) = child.stdout.take() {
         for line in BufReader::new(out).lines().flatten() {
             if let Some(key) = line.trim().strip_prefix("GAPROGRESS|") {
@@ -553,13 +577,30 @@ fn run_offline_prepare(project_dir: &str, report: &dyn Fn(i32, &str)) -> Result<
                     "done" => report(90, "done"),
                     _ => {}
                 }
+            } else if !line.trim().is_empty() {
+                push_tail(&mut stdout_tail, line);
             }
         }
     }
 
     let status = child.wait().map_err(|e| format!("prepare wait failed: {}", e))?;
+    if let Some(h) = stderr_thread {
+        let _ = h.join();
+    }
     if !status.success() {
-        return Err(format!("prepare exited with status {:?}", status.code()));
+        // Surface the real installer output, not just the exit code (shown in the setup
+        // window via get_prepare_error and written to prepare_error.log).
+        let mut msg = format!("prepare exited with status {:?}", status.code());
+        let err_lines = stderr_tail.lock().unwrap();
+        if !err_lines.is_empty() {
+            msg.push_str("\n\n--- stderr (tail) ---\n");
+            msg.push_str(&err_lines.join("\n"));
+        }
+        if !stdout_tail.is_empty() {
+            msg.push_str("\n\n--- output (tail) ---\n");
+            msg.push_str(&stdout_tail.join("\n"));
+        }
+        return Err(msg);
     }
     // Record success so later launches (and relocated copies) skip the prepare step.
     if let Some(marker) = prepared_marker() {
