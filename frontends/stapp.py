@@ -88,6 +88,7 @@ def get_controller():
         threading.Thread(target=ag.run, daemon=True).start()
         while True:
             b['ev'].wait(); b['ev'].clear()
+            if ag.llm_no != agent.llm_no: ag.next_llm(agent.llm_no)
             dq = ag.put_task(build_prompt(b['obj']), source="controller")
             while 'done' not in (it := dq.get()): pass
             ms = re.findall(r'<next_prompt>(.*?)</next_prompt>', it['done'], re.S)
