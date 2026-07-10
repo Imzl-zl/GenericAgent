@@ -340,10 +340,10 @@ fn running_inside_app_bundle() -> bool {
         .unwrap_or(false)
 }
 
-/// User-set external GenericAgent source directory (design A: desktop as a thin shell).
-/// Returns the path only when it is a valid GA checkout (has agentmain.py AND
-/// frontends/desktop_bridge.py). An invalid/missing override returns None so callers fall
-/// back to the bundle's own runtime/app — this is the "本体 moved/deleted" safety net.
+/// User-set external GenericAgent source directory (方案三: bundle shell + external core).
+/// Returns the path only when it still looks like a GA core checkout (agentmain.py exists).
+/// The bundle's own bridge/frontend/conductor are used; the saved source only becomes GA_ROOT.
+/// An invalid/missing override returns None so callers fall back to the bundle runtime/app.
 fn valid_ga_source_override() -> Option<String> {
     let s = read_settings()
         .get("ga_source_override")
@@ -355,7 +355,7 @@ fn valid_ga_source_override() -> Option<String> {
         return None;
     }
     let p = PathBuf::from(&s);
-    if p.join("agentmain.py").exists() && p.join("frontends").join("desktop_bridge.py").exists() {
+    if p.join("agentmain.py").exists() {
         Some(p.to_string_lossy().to_string())
     } else {
         None
@@ -892,6 +892,9 @@ fn probe_ga_source(dir: &str) -> Result<(), String> {
     let mut cmd = Command::new(&py);
     cmd.arg(&probe).arg(dir);
     sanitize_bundle_env(&mut cmd);
+    // If switching from one external core to another, validate the candidate core, not the
+    // previously saved GA_ROOT that sanitize_bundle_env may have injected.
+    cmd.env("GA_ROOT", dir);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
     let out = cmd.output().map_err(|e| format!("probe failed to run: {}", e))?;
