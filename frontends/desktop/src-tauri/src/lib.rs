@@ -378,15 +378,9 @@ fn remove_setting(key: &str) {
 pub fn get_or_discover_config() -> (String, String) {
     let path = settings_path();
 
-    // A user-set, still-valid external GA source wins over everything — including the bundle's
-    // own runtime/app. This is what turns the desktop app into a thin shell over a separate 本体.
-    // Uses the bundle python (which has deps installed) to run the external source.
-    if let Some(src) = valid_ga_source_override() {
-        let python = find_python();
-        if !python.is_empty() {
-            return (python, src);
-        }
-    }
+    // NOTE: the external GA source override does NOT change which project_dir/bridge we run.
+    // 方案三: we always run the bundle's own bridge + frontend, and inject the external核 via
+    // the GA_ROOT env (see sanitize_bundle_env). So project_dir stays the bundle here.
 
     if bundle_root().is_some() {
         let python = find_python();
@@ -479,6 +473,13 @@ fn sanitize_bundle_env(cmd: &mut Command) {
     // Stamp the bridge we spawn with this build's id so a later app launch can tell whether the
     // bridge holding :14168 is ours (see bridge_identity_matches / GET /services/identity).
     cmd.env("GA_BUILD_ID", env!("GA_BUILD_ID"));
+    // 方案三: when the user has set a valid external GA source, inject it as GA_ROOT so the
+    // (bundle's own) bridge + conductor import the external核 and read/write its data. When
+    // unset/invalid we leave GA_ROOT unset → the bridge falls back to its own bundle runtime.
+    match valid_ga_source_override() {
+        Some(src) => { cmd.env("GA_ROOT", src); }
+        None => { cmd.env_remove("GA_ROOT"); }
+    }
 }
 
 /// Run the offline prepare (install_windows.ps1 -Mode PrepareOnly) using bundled python + wheels.
@@ -875,68 +876,45 @@ fn get_ga_source() -> String {
         .to_string()
 }
 
-/// Recursively copy a directory tree (src into dst, creating dst).
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir_all(&from, &to)?;
-        } else {
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent)?;
+/// Run the contract probe (frontends/ga_contract_probe.py, shipped with the bundle) against a
+/// target ga_root using the bundle python. Returns Ok(()) if the核 satisfies the bridge/conductor
+/// contract, or Err(message) listing what's missing / why it's incompatible.
+fn probe_ga_source(dir: &str) -> Result<(), String> {
+    let (py, bundle_project) = get_or_discover_config();
+    if py.is_empty() {
+        return Err("no python available to run the compatibility probe".into());
+    }
+    let probe = PathBuf::from(&bundle_project).join("frontends").join("ga_contract_probe.py");
+    if !probe.exists() {
+        // No probe shipped → skip the check rather than block (backward compatible).
+        return Ok(());
+    }
+    let mut cmd = Command::new(&py);
+    cmd.arg(&probe).arg(dir);
+    sanitize_bundle_env(&mut cmd);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    let out = cmd.output().map_err(|e| format!("probe failed to run: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The probe prints a JSON line: {"ok":bool,"missing":[..],"error":".."}.
+    if let Some(line) = stdout.lines().rev().find(|l| l.trim_start().starts_with('{')) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+                return Ok(());
             }
-            std::fs::copy(&from, &to)?;
+            let missing = v.get("missing")
+                .and_then(|m| m.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+            let mut msg = String::from("this GenericAgent core is not compatible");
+            if !missing.is_empty() { msg = format!("{}: missing {}", msg, missing); }
+            if !err.is_empty() { msg = format!("{} ({})", msg, err); }
+            return Err(msg);
         }
     }
-    Ok(())
-}
-
-/// Push the shell's own (bundled/new) desktop files into an external 本体 so that connecting
-/// to it serves the new frontend + bridge instead of the source's older copies. Backs up the
-/// source's originals first. Only the runtime-relevant files are synced — NOT src-tauri (the
-/// shell runs its own Rust) or build/packaging artifacts.
-fn sync_desktop_files(src_root: &std::path::Path, dst_root: &std::path::Path) -> Result<(), String> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let backup = dst_root.join("temp").join(format!("desktop_sync_backup_{}", ts));
-
-    // Individual files: bridge + the local modules it imports.
-    for rel in ["frontends/desktop_bridge.py", "frontends/plan_state.py", "frontends/cost_tracker.py"] {
-        let s = src_root.join(rel);
-        if !s.exists() {
-            continue;
-        }
-        let d = dst_root.join(rel);
-        if d.exists() {
-            let b = backup.join(rel);
-            if let Some(parent) = b.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            std::fs::copy(&d, &b).map_err(|e| format!("backup {} failed: {}", rel, e))?;
-        }
-        if let Some(parent) = d.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::copy(&s, &d).map_err(|e| format!("copy {} failed: {}", rel, e))?;
-    }
-
-    // The served frontend directory (index.html, app.js, assets, ...).
-    let s_static = src_root.join("frontends").join("desktop").join("static");
-    if s_static.is_dir() {
-        let d_static = dst_root.join("frontends").join("desktop").join("static");
-        if d_static.exists() {
-            let b_static = backup.join("frontends").join("desktop").join("static");
-            copy_dir_all(&d_static, &b_static).map_err(|e| format!("backup static failed: {}", e))?;
-            std::fs::remove_dir_all(&d_static).map_err(|e| format!("clear static failed: {}", e))?;
-        }
-        copy_dir_all(&s_static, &d_static).map_err(|e| format!("copy static failed: {}", e))?;
-    }
-    Ok(())
+    Err(format!("compatibility probe returned no verdict: {}",
+        String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")))
 }
 
 #[tauri::command]
@@ -945,17 +923,10 @@ fn set_ga_source(app_handle: tauri::AppHandle, dir: String) -> Result<String, St
     if !p.join("agentmain.py").exists() {
         return Err("not a GenericAgent source: agentmain.py not found".into());
     }
-    if !p.join("frontends").join("desktop_bridge.py").exists() {
-        return Err("frontends/desktop_bridge.py not found in the selected directory".into());
-    }
-    // Sync this shell's own (new) desktop files into 本体 so it serves the new UI + bridge.
-    // Skip when the source IS our own code location (dev tree / same dir) — nothing to push.
-    if let Some(self_src) = find_project_dir() {
-        let self_path = PathBuf::from(&self_src);
-        if norm_path(&self_src) != norm_path(&dir) {
-            sync_desktop_files(&self_path, &p)?;
-        }
-    }
+    // 方案三: we do NOT copy files into 本体. We run the bundle's own bridge/frontend and point
+    // its ga_root at this external核 via GA_ROOT. Verify the核 satisfies the contract first so a
+    // stale/incompatible核 fails up front with a clear message instead of a runtime crash.
+    probe_ga_source(&dir)?;
     merge_settings(serde_json::json!({ "ga_source_override": dir }));
     switch_bridge(&app_handle)
 }
@@ -972,12 +943,15 @@ pub fn run() {
     let no_autostart = args.iter().any(|a| a == "--no-autostart");
     let dev_mode = args.iter().any(|a| a == "--dev");
 
-    // Resolve the effective config once (honors a user-set external GA source over the bundle).
-    // Use it for takeover + spawn so identity checks match what we actually launch.
+    // Resolve the effective config once. project_dir is ALWAYS the bundle's own (方案三: we run
+    // our own bridge/frontend); the external核, if any, is injected via GA_ROOT in
+    // sanitize_bundle_env. Identity/takeover must compare against the EFFECTIVE ga_root (what the
+    // bridge will report), not the bundle script dir.
     let (eff_py, eff_project) = get_or_discover_config();
+    let effective_ga_root = valid_ga_source_override().unwrap_or_else(|| eff_project.clone());
     let needs_prepare = needs_first_run_prepare(&eff_project);
 
-    takeover_stale_bridge(&eff_project);
+    takeover_stale_bridge(&effective_ga_root);
 
     let bridge_ok = is_bridge_running();
     let mut spawned_bridge = false;
