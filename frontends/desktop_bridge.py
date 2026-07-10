@@ -47,7 +47,29 @@ from aiohttp import web, WSMsgType
 APP_DIR = Path(__file__).resolve().parent
 
 
+def _ga_root_override() -> Optional[Path]:
+    """External core dir injected by the desktop shell (design 三: bundle bridge + external核).
+    Priority: --ga-root <path> arg, then GA_ROOT env. Only honored when it holds agentmain.py;
+    an invalid/missing value returns None so we fall back to the bundle's own derivation."""
+    val = ""
+    for i, a in enumerate(sys.argv):
+        if a == "--ga-root" and i + 1 < len(sys.argv):
+            val = sys.argv[i + 1]
+        elif a.startswith("--ga-root="):
+            val = a.split("=", 1)[1]
+    if not val:
+        val = os.environ.get("GA_ROOT", "")
+    val = (val or "").strip()
+    if not val:
+        return None
+    root = Path(val).expanduser().resolve()
+    return root if (root / "agentmain.py").exists() else None
+
+
 def find_default_ga_root() -> Path:
+    override = _ga_root_override()
+    if override is not None:
+        return override
     candidates = [
         APP_DIR / "..",
         APP_DIR / ".." / "..",
@@ -1050,11 +1072,13 @@ def discover_extra_services(ga_root: Path) -> List[dict]:
     # conductor 跟 scheduler 一样,bridge 启动时自动拉起。--no-browser 是关键:
     # conductor.py 默认会用 webbrowser.open 在用户浏览器弹一个 8900 端口 UI,
     # 桌面版自启时不需要这个独立 UI(用户从「指挥家」页直接访问)。
-    conductor = ga_root / "frontends" / "conductor.py"
+    # 方案三:conductor 深度桌面耦合,恒用 bundle 自带的那份(APP_DIR 侧),
+    # 通过 GA_ROOT(见 start_service env)让它 import 外部核。
+    conductor = APP_DIR / "conductor.py"
     if conductor.is_file():
         out.append({
             "id": "frontends/conductor.py",
-            "cmd": [sys.executable, "frontends/conductor.py", "--no-browser"],
+            "cmd": [sys.executable, str(conductor), "--no-browser"],
         })
     return out
 
@@ -1208,7 +1232,9 @@ class ServiceManager:
             self._notify(sid, err=err)
             return {"ok": False, "error": "not_configured", "service": self._state(sid, err=err)}
         self.buffers[sid] = deque(maxlen=500)
-        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        # Pass the effective ga_root so bundle-side extras (conductor) import the external核.
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
+               "GA_ROOT": str(self.ga_root)}
         kw: Dict[str, Any] = dict(
             cwd=str(self.ga_root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,

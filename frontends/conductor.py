@@ -8,7 +8,17 @@ from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def _resolve_ga_root() -> str:
+    """External core dir when launched as the bundle's conductor (design 三).
+    Prefer GA_ROOT env (set by the desktop bridge), else derive from own location."""
+    val = (os.environ.get("GA_ROOT", "") or "").strip()
+    if val:
+        root = os.path.abspath(os.path.expanduser(val))
+        if os.path.exists(os.path.join(root, "agentmain.py")):
+            return root
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+ROOT = _resolve_ga_root()
 if ROOT not in sys.path: sys.path.insert(0, ROOT)
 
 from agentmain import GenericAgent
