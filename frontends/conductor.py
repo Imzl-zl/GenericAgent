@@ -431,7 +431,17 @@ API: {base}；requests，GET /readme查用法，GET /chat读未读对话，GET /
 conductor = Conductor()
 
 # ---- IM poller: 探测conductor_im_plugins/下各插件,信号变化→唤醒总管 ----
-IM_DIR, IM_COOLDOWN = os.path.join(os.path.dirname(__file__), "conductor_im_plugins"), 300
+def _resolve_im_dir() -> str:
+    # 方案三: conductor.py itself is bundle-owned, but IM plugins are user/environment
+    # integrations. Prefer the external core's plugins when GA_ROOT points at one; fall back
+    # to the bundle templates/examples when the external core has no plugin directory.
+    external = os.path.join(ROOT, "frontends", "conductor_im_plugins")
+    if os.path.isdir(external):
+        return external
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "conductor_im_plugins")
+
+
+IM_DIR, IM_COOLDOWN = _resolve_im_dir(), 300
 IM_PROMPTS: Dict[str, str] = {}   # source -> 采集prompt（派采集subagent时按需取）
 
 def im_poll_loop():

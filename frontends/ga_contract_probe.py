@@ -3,10 +3,14 @@
 
 Given a target ga_root, verify the external核 satisfies the symbol/signature contract that
 the desktop bridge + conductor + cost_tracker rely on — WITHOUT instantiating GenericAgent
-(that would read mykey, build LLM clients, and mutate the核). We only:
+(that would read mykey and build LLM clients). We only:
   - import the核 modules against `ga_root` (this doubles as a dependency check: if the bundle
     python can't import the核's deps, the import fails and we report incompatible), and
   - introspect the GenericAgent class + module-level functions via `inspect`.
+
+Note: importing agentmain/llmcore can still run module top-level create-if-missing
+initializers in the target核 (for example seeding default memory/config files). The probe
+does not intentionally overwrite existing files and never constructs a GenericAgent instance.
 
 Runtime-only surface (instance attrs like llmclient.backend.history, llmclients, task_queue,
 handler.working, backend.current_name) cannot be checked statically and is intentionally not
