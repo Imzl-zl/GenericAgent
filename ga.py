@@ -190,6 +190,20 @@ def expand_file_refs(text, base_dir=None):
         return ''.join(lines[start-1:end])
     return re.sub(pattern, replacer, text)
     
+def _file_newline(path):
+    endings = set(re.findall(rb'\r\n|[\r\n]', Path(path).read_bytes())) if os.path.exists(path) else set()
+    return next(iter(endings)).decode() if len(endings) == 1 else None
+
+def _arg(args, name, default, type=None):
+    v = args.get(name, default)
+    if type is int:
+        try: return int(v)
+        except (TypeError, ValueError): return default
+    if type is bool:
+        if isinstance(v, str): return v.strip().lower() in ('1','true','yes','y','on')
+        return default if v is None else bool(v)
+    return v
+
 def file_patch(path: str, old_content: str, new_content: str):
     """在文件中寻找唯一的 old_content 块并替换为 new_content"""
     path = str(Path(path).resolve())
@@ -201,7 +215,7 @@ def file_patch(path: str, old_content: str, new_content: str):
         if count == 0: return {"status": "error", "msg": "未找到匹配的旧文本块，建议：先用 file_read 确认当前内容，再分小段进行 patch。若多次失败则询问用户，严禁自行使用 overwrite 或代码替换。"}
         if count > 1: return {"status": "error", "msg": f"找到 {count} 处匹配，无法确定唯一位置。请提供更长、更具体的旧文本块以确保唯一性。建议：包含上下文行来增强特征，或分小段逐个修改。"}
         updated_text = full_text.replace(old_content, new_content)
-        with open(path, 'w', encoding='utf-8') as f: f.write(updated_text)
+        with open(path, 'w', encoding='utf-8', newline=_file_newline(path)) as f: f.write(updated_text)
         return {"status": "success", "msg": "文件局部修改成功"}
     except Exception as e: return {"status": "error", "msg": str(e)}
 
@@ -290,13 +304,12 @@ class GenericAgentHandler(BaseHandler):
         if not code:
             code = self._extract_code_block(response, code_type)
             if not code: return StepOutcome("[Error] Code missing. Must use reply code block or 'script' arg.", next_prompt="\n")
-        try: timeout = int(args.get("timeout", 60))
-        except: timeout = 60
+        timeout = _arg(args, "timeout", 60, int)
         raw_path = os.path.join(self.cwd, args.get("cwd", './'))
         cwd = os.path.normpath(os.path.abspath(raw_path))
         code_cwd = os.path.normpath(self.cwd)
         maxlen = 10000 // args.get('_tool_num', 1)
-        if code_type == 'python' and args.get("inline_eval"):
+        if code_type == 'python' and _arg(args, "inline_eval", False, bool):
             ns = {'handler':self, 'parent':self.parent, 'history':json.dumps(self.parent.llmclient.backend.history)}
             old_cwd = os.getcwd()
             try:
@@ -321,9 +334,9 @@ class GenericAgentHandler(BaseHandler):
         '''获取当前页面内容和标签页列表。也可用于切换标签页。
         注意：HTML经过简化，边栏/浮动元素等可能被过滤。如需查看被过滤的内容请用execute_js。
         tabs_only=true时仅返回标签页列表，不获取HTML（省token）'''
-        tabs_only = args.get("tabs_only", False)
+        tabs_only = _arg(args, "tabs_only", False, bool)
         switch_tab_id = args.get("switch_tab_id", None)
-        text_only = args.get("text_only", False)
+        text_only = _arg(args, "text_only", False, bool)
         maxlen = 35000 // args.get('_tool_num', 1)
         result = web_scan(tabs_only=tabs_only, switch_tab_id=switch_tab_id, text_only=text_only, maxlen=maxlen)
         content = result.pop("content", None)
@@ -341,7 +354,7 @@ class GenericAgentHandler(BaseHandler):
             with open(abs_path, 'r', encoding='utf-8') as f: script = f.read()
         save_to_file = args.get("save_to_file", "")
         switch_tab_id = args.get("switch_tab_id") or args.get("tab_id")
-        no_monitor = args.get("no_monitor", False)
+        no_monitor = _arg(args, "no_monitor", False, bool)
         result = web_execute_js(script, switch_tab_id=switch_tab_id, no_monitor=no_monitor)
         if save_to_file and "js_return" in result:
             content = str(result["js_return"] or '')
@@ -396,9 +409,9 @@ class GenericAgentHandler(BaseHandler):
             new_content = expand_file_refs(content, base_dir=self.cwd)
             if mode == "prepend":
                 old = open(path, 'r', encoding="utf-8").read() if os.path.exists(path) else ""
-                open(path, 'w', encoding="utf-8").write(new_content + old)
+                open(path, 'w', encoding="utf-8", newline=_file_newline(path)).write(new_content + old)
             else:
-                with open(path, 'a' if mode == "append" else 'w', encoding="utf-8") as f: f.write(new_content)
+                with open(path, 'a' if mode == "append" else 'w', encoding="utf-8", newline=_file_newline(path)) as f: f.write(new_content)
             yield f"[Status] ✅ {mode.capitalize()} 成功 ({len(new_content)} bytes)\n"
             next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
             if len(new_content) > 5000: next_prompt = "\n[SYSTEM TIPS] WRITE TOO LONG! MUST RECHECK HALLUCINATIONS! SMALL WRITES OR PATCHES NEXT TIME!"
@@ -411,10 +424,10 @@ class GenericAgentHandler(BaseHandler):
         '''读取文件内容。从第start行开始读取。如有keyword则返回第一个keyword(忽略大小写)周边内容'''
         path = self._get_abs_path(args.get("path", ""))
         yield f"\n[Action] Reading file: {path}\n"
-        start = args.get("start", 1)
-        count = args.get("count", 200)
+        start = _arg(args, "start", 1, int)
+        count = _arg(args, "count", 200, int)
         keyword = args.get("keyword")
-        show_linenos = args.get("show_linenos", True)
+        show_linenos = _arg(args, "show_linenos", True, bool)
         result = file_read(path, start=start, keyword=keyword,
                            count=count, show_linenos=show_linenos)
         if show_linenos and not result.startswith("Error:"): result = '由于设置了show_linenos，以下返回信息为：(行号|)内容 。\n' + result 
