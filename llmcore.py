@@ -1,4 +1,4 @@
-import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid, pathlib
+import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid, pathlib, copy
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RESP_CACHE_KEY = str(uuid.uuid4()); _RESP_CODEX_KEY = str(uuid.uuid4())
@@ -955,45 +955,75 @@ def tryparse(json_str):
     return json.loads(json_str)
 
 class MixinSession:
-    """Multi-session fallback with spring-back to primary."""
+    """A Session facade backed by multiple routed transport sessions."""
+    _TRANSPORT_OVERRIDES = frozenset({
+        'stream', 'connect_timeout', 'read_timeout', 'temperature', 'max_tokens',
+        'reasoning_effort', 'service_tier', 'thinking_type',
+        'thinking_budget_tokens', 'omit_thinking', 'proxies', 'verify',
+    })
+    _FACADE_STATE = frozenset({'name', 'history', 'system', 'tools', 'lock'})
+
     def __init__(self, all_sessions, cfg):
-        self._retries, self._base_delay = cfg.get('max_retries', 3), cfg.get('base_delay', 1.5)
+        self._retries = cfg.get('max_retries', 3)
+        self._base_delay = cfg.get('base_delay', 1.5)
         self._spring_sec = cfg.get('spring_back', 300)
-        self._sessions = [all_sessions[i].backend if isinstance(i, int) else 
-                          next(s.backend for s in all_sessions if type(s) is not dict and s.backend.name == i) for i in cfg.get('llm_nos', [])]
-        is_native = lambda s: 'Native' in s.__class__.__name__
-        groups = {is_native(s) for s in self._sessions}
-        assert len(groups) == 1, f"MixinSession: sessions must be in same group (Native or non-Native), got {[type(s).__name__ for s in self._sessions]}"
-        self.name = '|'.join(s.name for s in self._sessions)
-        import copy; self._sessions = [copy.copy(s) for s in self._sessions]
+        selected = [all_sessions[i].backend if isinstance(i, int) else
+                    next(s.backend for s in all_sessions if type(s) is not dict and s.backend.name == i)
+                    for i in cfg.get('llm_nos', [])]
+        if not selected: raise ValueError('MixinSession: no sessions selected')
+        native_groups = {isinstance(s, NativeClaudeSession) for s in selected}
+        if len(native_groups) != 1:
+            raise ValueError(f"MixinSession: sessions must be in same group (Native or non-Native), got {[type(s).__name__ for s in selected]}")
+
+        self._sessions = [copy.copy(s) for s in selected]
         for s in self._sessions: s.max_retries = 0
-        self._orig_raw_asks = [s.raw_ask for s in self._sessions]
-        self._sessions[0].raw_ask = self._raw_ask
+        self._native = native_groups.pop()
+        self._ask_impl = selected[0].ask.__func__
         self._cur_idx, self._switched_at = 0, 0.0
-    def __getattr__(self, name): return getattr(self._sessions[0], name)
-    _BROADCAST_ATTRS = frozenset({'system', 'tools', 'temperature', 'max_tokens', 'reasoning_effort', 'history', 'stream', 'read_timeout'})
-    def __setattr__(self, name, value):
-        if name in self._BROADCAST_ATTRS:
-            for s in self._sessions:
-                v = openai_tools_to_claude(value) if name == 'tools' and type(s) is NativeClaudeSession else value
-                setattr(s, name, v)
-        else: object.__setattr__(self, name, value)
+
+        primary = self._sessions[0]
+        self.name = '|'.join(s.name for s in self._sessions)
+        self.history = copy.deepcopy(primary.history)
+        self.system = primary.system
+        self.tools = getattr(primary, 'tools', None)
+        self.lock = threading.Lock()
     @property
     def primary(self): return self._sessions[0]
     @property
-    def model(self): return getattr(self._sessions[self._cur_idx], 'model', None)
+    def current(self): return self._sessions[self._cur_idx]
     @property
-    def current_name(self): return getattr(self._sessions[self._cur_idx], 'name', None)
+    def current_name(self): return self.current.name
+    def __getattr__(self, name): return getattr(self.current, name)
+    def __setattr__(self, name, value):
+        sessions = self.__dict__.get('_sessions')
+        if sessions and name in self._TRANSPORT_OVERRIDES:
+            for s in sessions: setattr(s, name, value)
+            return
+        node_owns = sessions and any(
+            name in s.__dict__ or any(name in cls.__dict__ for cls in type(s).__mro__)
+            for s in sessions)
+        if node_owns and name not in self._FACADE_STATE: raise AttributeError(f"MixinSession.{name} is node-specific and read-only")
+        object.__setattr__(self, name, value)
+    def ask(self, prompt):
+        self._pick()  # Select the node before ask() reads its context limits.
+        return self._ask_impl(self, prompt)
+    def make_messages(self, messages): return messages
     def _pick(self):
         if self._cur_idx and time.time() - self._switched_at > self._spring_sec: self._cur_idx = 0
         return self._cur_idx
-    def _raw_ask(self, *args, **kwargs):
+    def _prepare(self, idx, messages):
+        session = self._sessions[idx]
+        session.system = self.system
+        session.tools = openai_tools_to_claude(self.tools) if self.tools and type(session) is NativeClaudeSession else self.tools
+        return messages if self._native else session.make_messages(messages)
+    def raw_ask(self, messages):
         base, n = self._pick(), len(self._sessions)
         test_error = lambda x: isinstance(x, str) and x.lstrip().startswith(('!!!Error:', '[Error:'))
         for attempt in range(self._retries + 1):
             idx = (base + attempt) % n
-            gen = self._orig_raw_asks[idx](*args, **kwargs)
-            print(f'[MixinSession] Using session ({self._sessions[idx].name})')
+            session = self._sessions[idx]
+            gen = session.raw_ask(self._prepare(idx, messages))
+            print(f'[MixinSession] Using session ({session.name})')
             last_chunk, return_val, yielded = None, [], False
             try:
                 while True:
@@ -1006,17 +1036,18 @@ class MixinSession:
                 if attempt > 0: self._cur_idx = idx; self._switched_at = time.time()
                 elif isinstance(last_chunk, str) and '[!!! 流异常中断' in last_chunk and n > 1:
                     self._cur_idx = (idx + 1) % n; self._switched_at = time.time()
-                    print(f'[MixinSession] Partial failure, next call → s{self._cur_idx} ({self._sessions[self._cur_idx].name})')
+                    print(f'[MixinSession] Partial failure, next call → s{self._cur_idx} ({self.current.name})')
                 return return_val
             if attempt >= self._retries:
                 yield last_chunk; return return_val
             nxt = (base + attempt + 1) % n
-            if nxt == base:  # full round failed, delay before next
+            if nxt == base:
                 rnd = (attempt + 1) // n
                 delay = min(30, self._base_delay * (1.5 ** rnd))
                 print(f'[MixinSession] {last_chunk[:80]}, round {rnd} exhausted, retry in {delay:.1f}s')
                 time.sleep(delay)
-            else: print(f'[MixinSession] {last_chunk[:80]}, retry {attempt+1}/{self._retries} (s{idx}→s{nxt})')
+            else:
+                print(f'[MixinSession] {last_chunk[:80]}, retry {attempt+1}/{self._retries} (s{idx}→s{nxt})')
 
 THINKING_PROMPT_ZH = """
 ### 行动规范（持续有效）
