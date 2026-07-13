@@ -288,6 +288,9 @@ class GenericAgentHandler(BaseHandler):
         self._done_hooks = []
         self.print = safe_print
 
+    def _get_tool_maxlen(self, l, args, growth_rate=1.0):
+        multiplier = 1 + (self.parent.get_ctx_multiplier() - 1) * growth_rate
+        return int(l * multiplier / args.get('_tool_num', 1))
     def _get_abs_path(self, path):
         if not path: return ""
         return os.path.abspath(os.path.join(self.cwd, path))   
@@ -308,7 +311,7 @@ class GenericAgentHandler(BaseHandler):
         raw_path = os.path.join(self.cwd, args.get("cwd", './'))
         cwd = os.path.normpath(os.path.abspath(raw_path))
         code_cwd = os.path.normpath(self.cwd)
-        maxlen = 10000 // args.get('_tool_num', 1)
+        maxlen = self._get_tool_maxlen(10000, args)
         if code_type == 'python' and _arg(args, "inline_eval", False, bool):
             ns = {'handler':self, 'parent':self.parent, 'history':json.dumps(self.parent.llmclient.backend.history)}
             old_cwd = os.getcwd()
@@ -337,7 +340,7 @@ class GenericAgentHandler(BaseHandler):
         tabs_only = _arg(args, "tabs_only", False, bool)
         switch_tab_id = args.get("switch_tab_id", None)
         text_only = _arg(args, "text_only", False, bool)
-        maxlen = 35000 // args.get('_tool_num', 1)
+        maxlen = self._get_tool_maxlen(35000, args, growth_rate=0.5)
         result = web_scan(tabs_only=tabs_only, switch_tab_id=switch_tab_id, text_only=text_only, maxlen=maxlen)
         content = result.pop("content", None)
         yield f'[Info] {str(result)}\n'
@@ -369,7 +372,7 @@ class GenericAgentHandler(BaseHandler):
         yield f"JS 执行结果:\n{show}\n"
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         result = json.dumps(result, ensure_ascii=False, default=json_default)
-        maxlen = 8000 // args.get('_tool_num', 1)
+        maxlen = self._get_tool_maxlen(8000, args)
         return StepOutcome(smart_format(result, max_str_len=maxlen), next_prompt=next_prompt)
     
     def do_file_patch(self, args, response):
@@ -432,7 +435,7 @@ class GenericAgentHandler(BaseHandler):
                            count=count, show_linenos=show_linenos)
         if show_linenos and not result.startswith("Error:"): result = '由于设置了show_linenos，以下返回信息为：(行号|)内容 。\n' + result 
         if ' ... [TRUNCATED]' in result: result += '\n\n（某些行被截断，如需完整内容可改用 code_run 读取）'
-        maxlen = 15000 // args.get('_tool_num', 1)
+        maxlen = self._get_tool_maxlen(15000, args)
         result = smart_format(result, max_str_len=maxlen, omit_str='\n\n[omitted long content]\n\n')
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         log_memory_access(path)
