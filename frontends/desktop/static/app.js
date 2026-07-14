@@ -751,6 +751,12 @@ bindClick('ga-source-btn', async (e) => {
 });
 bindClick('ga-source-clear-btn', async (e) => {
   e.stopPropagation();
+  const confirmed = await showConfirmDialog({
+    title: t('confirm.gaSourceClearTitle'),
+    message: t('confirm.gaSourceClear'),
+    okText: t('set.gaSourceClear'),
+  });
+  if (!confirmed) return;
   try {
     showChanToast(t('sys.gaSourceSwitching'), '', 'ok');
     await window.ga.clearGaSource();
