@@ -51,7 +51,7 @@ I18N = {
         'get_token': '🔑 获取 Token',
         'get_token_toast': '已打开浏览器',
         'need_mykey': '⚠️ 请配置 mykey.py',
-        'reopen_page': '请重新打开程序',
+        'reopen_page': '等待配置写入，完成后将自动进入…',
     },
     'en': {
         'force_stop': 'Force Stop',
@@ -66,7 +66,7 @@ I18N = {
         'get_token': '🔑 Get Token',
         'get_token_toast': 'Opened in browser',
         'need_mykey': '⚠️ Please set mykey.py',
-        'reopen_page': 'Please restart the app',
+        'reopen_page': 'Waiting for config… will enter automatically',
     },
 }
 def T(key): return I18N.get(LANG, I18N['zh']).get(key, key)
@@ -94,7 +94,8 @@ if not agent.llmclients and _sp:
 if "portal_wait" in st.session_state: _watch_portal()
 
 if not agent.llmclients:
-    st.warning(T("reopen_page")) if _sp else st.error(T("need_mykey"))
+    if _sp: st.warning(T("reopen_page"))
+    else: st.error(T("need_mykey"))
     st.stop()
 
 def build_prompt(objective):
