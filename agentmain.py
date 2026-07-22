@@ -63,8 +63,8 @@ class GenericAgent:
     def load_llm_sessions(self):
         mykeys, changed = reload_mykeys()
         if not changed and hasattr(self, 'llmclients'): return
-        try: oldhistory = self.llmclient.backend.history
-        except: oldhistory = None
+        try: oldhistory, oldname = self.llmclient.backend.history, self.llmclient.backend.name
+        except: oldhistory = oldname = None
         llm_sessions = []
         for k, cfg in mykeys.items():
             if not any(x in k for x in ['api', 'config', 'cookie']): continue
@@ -81,6 +81,8 @@ class GenericAgent:
                 except Exception as e: print(f'\n\n\n[ERROR] Failed to init MixinSession with cfg {s["mixin_cfg"]}: {e}!!!\n\n')
         self.llmclients = llm_sessions
         if not self.llmclients: return
+        names = [c.backend.name for c in self.llmclients]
+        if oldname in names: self.llm_no = names.index(oldname)
         self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
         if oldhistory: self.llmclient.backend.history = oldhistory
     
