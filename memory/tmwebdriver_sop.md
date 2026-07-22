@@ -136,3 +136,16 @@ web_scan失败时按序排查（自动检测优先，用户参与放最后）：
 ③扩展没装？→读Chrome用户目录下`Secure Preferences`→`extensions.settings`中找`path`含`tmwd_cdp_bridge`的条目
   找到→扩展已装，排查其他原因；没找到→走web_setup_sop
 ④以上都正常仍连不上→请求用户协助
+
+## HTTP /link execute_js备选路径（已验证）
+web_execute_js工具层报错时，可用HTTP直接调用：
+```python
+requests.post('http://127.0.0.1:18766/link',
+  json={"cmd":"execute_js","sessionId":"<sid>","code":"<js>","timeout":15})
+```
+⚠已验证坑点（2026-05实测）：
+- **`arguments`不可用**：link execute_js中`arguments`未定义，需在代码中自行定义参数变量
+- **fetch返回status 0**：扩展上下文中fetch某些POST可能被CSP/网络层阻断→改用**DOM click**绕过（先找到button/form再.click()/.submit()）
+- **页面导航导致脚本超时**：form.submit()或button触发页面跳转后，脚本返回"No response data in Ns"→这是**正常行为**，页面已跳转，需重新execute_js读新页面
+- ⚠**form多选警告**：页面可能有多个form（如登出form和claim form），必须按action URL精确匹配，误提交登出form会导致**登录态丢失**且不可逆
+- **按钮触发confirm()**：部分按钮点击会弹confirm对话框，需先`window.confirm=()=>true`猴子补丁再click

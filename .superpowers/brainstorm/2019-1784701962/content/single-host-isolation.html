@@ -1,0 +1,97 @@
+<h2>单服务器多租户：Shell/Python 可用，但不能碰宿主机</h2>
+<p class="subtitle">目标：先服务约 10–20 人；部署在一台 Linux 服务器；保留文档解析、Shell、Python；租户之间和平台密钥之间必须有真实隔离。</p>
+
+<div class="section">
+  <div class="label">推荐拓扑</div>
+  <div class="mockup">
+    <div class="mockup-header">方案 B：单机控制面 + 每个活跃会话一个隔离 Worker</div>
+    <div class="mockup-body">
+      <div style="display:grid;grid-template-columns:1fr auto 1.5fr;gap:14px;align-items:center">
+        <div style="display:grid;gap:10px">
+          <div style="border:1px solid #64748b;padding:12px;border-radius:6px;text-align:center"><strong>微信 / Web</strong><br><small>用户消息与控制台</small></div>
+          <div style="border:1px solid #64748b;padding:12px;border-radius:6px;text-align:center"><strong>管理员</strong><br><small>账号、绑定、团队</small></div>
+        </div>
+        <div style="font-size:24px">→</div>
+        <div style="border:2px solid #2563eb;padding:14px;border-radius:6px">
+          <strong>宿主机控制面</strong>
+          <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px">
+            <div style="background:#eff6ff;padding:9px;border-radius:4px">IM Gateway + Router</div>
+            <div style="background:#eff6ff;padding:9px;border-radius:4px">Web API + Auth</div>
+            <div style="background:#eff6ff;padding:9px;border-radius:4px">PostgreSQL</div>
+            <div style="background:#eff6ff;padding:9px;border-radius:4px">Worker Manager</div>
+            <div style="background:#eff6ff;padding:9px;border-radius:4px">LLM Proxy</div>
+            <div style="background:#eff6ff;padding:9px;border-radius:4px">Audit + Quota</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align:center;font-size:24px;margin:10px 0">↓</div>
+
+      <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px">
+        <div style="border:2px solid #16a34a;padding:12px;border-radius:6px">
+          <strong>Worker：user_42</strong><br>
+          <small>rootless 容器<br>只挂载 user_42 工作区<br>允许 Shell / Python<br>CPU / 内存 / PID / 超时限额</small>
+        </div>
+        <div style="border:2px solid #16a34a;padding:12px;border-radius:6px">
+          <strong>Worker：team_7</strong><br>
+          <small>独立容器与团队卷<br>成员共享团队上下文<br>无宿主机密钥<br>无容器管理接口</small>
+        </div>
+        <div style="border:2px solid #16a34a;padding:12px;border-radius:6px">
+          <strong>Worker：user_9</strong><br>
+          <small>空闲后 checkpoint + 销毁<br>新消息自动恢复<br>默认禁止任意外网<br>LLM 仅走鉴权代理</small>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="label">核心安全边界</div>
+  <div class="pros-cons">
+    <div class="pros">
+      <h4>允许的能力</h4>
+      <ul>
+        <li>在本会话工作区读写文件</li>
+        <li>执行 Shell、Python 和文档解析工具</li>
+        <li>通过受控 LLM Proxy 调模型</li>
+        <li>通过显式平台工具访问获批外部能力</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>明确禁止</h4>
+      <ul>
+        <li>读取其他用户、团队或宿主机文件</li>
+        <li>读取 bot token、模型 Key、数据库凭证</li>
+        <li>访问 Docker/Podman socket</li>
+        <li>任意外网、提权、无限进程和无限资源</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h3>三种路线对比</h3>
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>单进程多线程</h3>
+      <p>部署最省事；但 Shell/Python 与控制面同 OS 用户，路径白名单和字符串黑名单可绕过，无法满足多租户安全。</p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>单机隔离 Worker（推荐）</h3>
+      <p>一台服务器即可。rootless Podman/Docker 管理短生命周期 worker；保留 Shell/Python，且具备可验证的租户隔离。以后可平滑迁移到 Kubernetes。</p>
+    </div>
+  </div>
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Kubernetes</h3>
+      <p>扩缩容和调度最好；但 10–20 人试运行阶段运维成本过高，暂时不值得。</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:18px">建议选 B。它不是“每个用户永久跑一个容器”，而是“每个活跃个人/团队会话按需启动一个 worker；空闲保存后销毁”。</p>
