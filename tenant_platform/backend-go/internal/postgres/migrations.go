@@ -38,7 +38,6 @@ func DropFoundationSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	if pool == nil {
 		return fmt.Errorf("pool is nil")
 	}
-	// Order: dependents first.
 	for _, name := range foundationTableNames {
 		if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, name)); err != nil {
 			return fmt.Errorf("drop table %s: %w", name, err)
@@ -51,15 +50,16 @@ func DropFoundationSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			return fmt.Errorf("drop type %s: %w", name, err)
 		}
 	}
-	// Sequences owned by dropped tables should be gone; clean known leftover.
 	if _, err := pool.Exec(ctx, `DROP SEQUENCE IF EXISTS task_events_id_seq CASCADE`); err != nil {
 		return fmt.Errorf("drop sequence: %w", err)
 	}
 	return nil
 }
 
-// ApplyMigrations executes the foundation SQL migration on an empty schema.
-// Call DropFoundationSchema first when re-applying in tests.
+// ApplyMigrations executes the foundation SQL migration.
+// It does NOT take advisory locks; callers that need serialization use EnsureSchema
+// or OpenTestPool. It also does NOT drop existing tables (idempotent empty-DB apply).
+// For re-apply after DROP, call DropFoundationSchema first.
 func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool, migrationPath string) error {
 	if pool == nil {
 		return fmt.Errorf("pool is nil")
@@ -70,10 +70,6 @@ func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool, migrationPath stri
 	raw, err := os.ReadFile(migrationPath)
 	if err != nil {
 		return fmt.Errorf("read migration %s: %w", migrationPath, err)
-	}
-	// Pre-clean orphan types that would collide with CREATE TABLE composite types.
-	if err := DropFoundationSchema(ctx, pool); err != nil {
-		return err
 	}
 	if _, err := pool.Exec(ctx, string(raw)); err != nil {
 		return fmt.Errorf("apply migration: %w", err)
@@ -90,30 +86,61 @@ func ResetSchema(ctx context.Context, pool *pgxpool.Pool) error {
 }
 
 // EnsureSchema applies the migration only when the tasks table is absent.
-// Uses a session advisory lock so concurrent platform/test processes do not
-// race CREATE TABLE composite types.
+// Uses a transaction-scoped advisory lock so concurrent platform/test processes
+// do not race CREATE TABLE composite types. Nested ApplyMigrations does not lock.
 func EnsureSchema(ctx context.Context, pool *pgxpool.Pool, migrationPath string) error {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(87236401)`); err != nil {
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
 		return err
 	}
-	defer func() { _, _ = conn.Exec(ctx, `SELECT pg_advisory_unlock(87236401)`) }()
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Transaction-scoped lock: released on commit/rollback; avoids session-lock
+	// deadlocks with other code paths that also take the same key.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(87236401)`); err != nil {
+		return err
+	}
 
 	var n int
-	if err := conn.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 SELECT COUNT(*) FROM information_schema.tables
 WHERE table_schema='public' AND table_name='tasks'
 `).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
-		return nil
+		return tx.Commit(ctx)
 	}
-	// Build a temporary one-conn pool view: use the locked connection via pool.Exec is fine
-	// after lock is held on this backend; other backends wait on the same lock key.
-	return ApplyMigrations(ctx, pool, migrationPath)
+
+	if strings.TrimSpace(migrationPath) == "" {
+		migrationPath = DefaultMigrationPath()
+	}
+	raw, err := os.ReadFile(migrationPath)
+	if err != nil {
+		return fmt.Errorf("read migration %s: %w", migrationPath, err)
+	}
+	// Clean orphans inside the same locked transaction, then create.
+	for _, name := range foundationTableNames {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, name)); err != nil {
+			return err
+		}
+	}
+	for _, name := range foundationTableNames {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TYPE IF EXISTS %s CASCADE`, name)); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `DROP SEQUENCE IF EXISTS task_events_id_seq CASCADE`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, string(raw)); err != nil {
+		return fmt.Errorf("apply migration: %w", err)
+	}
+	return tx.Commit(ctx)
 }

@@ -31,16 +31,6 @@ func OpenTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(87236401)`); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _, _ = conn.Exec(ctx, `SELECT pg_advisory_unlock(87236401)`) }()
-
 	if err := resetAndMigrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
@@ -48,21 +38,42 @@ func OpenTestPool(t *testing.T) *pgxpool.Pool {
 }
 
 func resetAndMigrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if err := DropFoundationSchema(ctx, pool); err != nil {
-		return fmt.Errorf("drop: %w", err)
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
 	}
-	// ApplyMigrations also drops; call the raw SQL path only.
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(87236401)`); err != nil {
+		return err
+	}
+	for _, name := range foundationTableNames {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, name)); err != nil {
+			return fmt.Errorf("drop table %s: %w", name, err)
+		}
+	}
+	for _, name := range foundationTableNames {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TYPE IF EXISTS %s CASCADE`, name)); err != nil {
+			return fmt.Errorf("drop type %s: %w", name, err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `DROP SEQUENCE IF EXISTS task_events_id_seq CASCADE`); err != nil {
+		return err
+	}
+
 	path := DefaultMigrationPath()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read migration: %w", err)
 	}
-	if _, err := pool.Exec(ctx, string(raw)); err != nil {
-		// One retry after force-clean orphan types.
-		_ = DropFoundationSchema(ctx, pool)
-		if _, err2 := pool.Exec(ctx, string(raw)); err2 != nil {
-			return fmt.Errorf("apply migration: %w (retry: %v)", err, err2)
-		}
+	if _, err := tx.Exec(ctx, string(raw)); err != nil {
+		return fmt.Errorf("apply migration: %w", err)
 	}
-	return nil
+	return tx.Commit(ctx)
 }
