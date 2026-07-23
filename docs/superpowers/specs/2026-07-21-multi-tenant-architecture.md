@@ -1,9 +1,10 @@
 # 多租户 IM 个人助手平台 — 架构设计
 
-**日期：** 2026-07-22  
-**状态：** 设计已确认；未进入实现  
+**日期：** 2026-07-23  
+**状态：** 设计已确认；已补充 P0 物理部署与容量门槛；未进入实现  
 **对应 PRD：** [2026-07-21-multi-tenant-im-platform-design.md](2026-07-21-multi-tenant-im-platform-design.md)  
 **试运行目标：** 一台 Linux 服务器，先服务约 10–20 名已批准用户；容量由部署前压测结果决定，不作未经验证的并发承诺。
+**当前 P0 验证基线：** 目标主机为 2 vCPU / 4 GiB RAM；该硬件只用于容量实验，不构成用户数、并发数或响应时间承诺。
 
 ---
 
@@ -16,7 +17,7 @@
 1. 个人模式闭环：注册、人工批准、微信绑定、私人对话、文件处理、`/stop`、`/new`。
 2. 每个个人或团队工作区具有可证明的执行隔离，而不是仅靠路径过滤。
 3. Shell/Python 仅在会话隔离 Worker 内运行。
-4. 每个完成任务都有原子持久化快照；崩溃不会重放可能已执行 Shell 的任务。
+4. 每个完成任务都有分阶段持久化 checkpoint；恢复只认最后一个 committed 快照，崩溃不会重放可能已执行 Shell 的任务。
 5. 平台真实 LLM Key、bot token、数据库凭证永不进入 Worker。
 
 ### 1.2 非目标
@@ -39,12 +40,16 @@
 | 人设 | persona-in-task：persona snapshot 写入 task envelope，Worker 取任务时才设置 |
 | 准入 | 新账号默认 `pending`；仅 `approved` 用户可启动 Worker 或消耗模型 |
 | 数据库 | P0 使用 PostgreSQL；SQLite 不作为多 Worker 的正式状态库 |
-| 状态持久化 | 每个成功完成 task 原子 checkpoint；运行中任务崩溃后标记 `interrupted`，禁止自动重放 |
+| 状态持久化 | 每个成功完成 task 采用文件与数据库分阶段 checkpoint；运行中任务崩溃后标记 `interrupted`，禁止自动重放 |
 | LLM Key | 真实 Key 只存在于控制面 LLM Proxy；Worker 只持有短时、单 session、可撤销凭证 |
 | 工具 | Shell/Python 可用，但仅在 Worker；默认无任意外网、无宿主机挂载、无容器管理 socket |
 | 团队人设 | `team_members.persona_id → teams.team_persona_id → platform default` |
 | 团队 key_info | 团队会话内共享；PRD 必须明示该隐私边界 |
 | 中继 | 仅整条消息为 `@username` 时发起；不调用 AI；中继和团队邀请使用带短 ID 的确定性状态机 |
+| P0 物理部署 | §3.1 的组件是逻辑边界；默认部署为 `platform`、`worker-manager`、`llm-proxy` 三个应用进程加 PostgreSQL，不要求一组件一进程 |
+| 容量准入 | `MAX_ACTIVE_WORKERS` 只是硬上限；调度必须同时检查 running/idle Worker 内存、CPU、PID、磁盘、模型并发和租户配额 |
+| 管理员并发配置 | 受保护的运营操作可运行时调整 `MAX_RUNNING_TASKS`；值不得超过目标主机测得硬上限；每次修改记录 actor、原因和 config version |
+| P0 任务队列 | PostgreSQL `tasks` 表是持久化事实来源；`LISTEN/NOTIFY` 只做唤醒提示；P0 不引入 RabbitMQ、Redis 等外部消息队列 |
 
 ---
 
@@ -89,7 +94,20 @@
 | Worker Manager | 创建、鉴权、监测、终止 rootless Worker | 不接受用户提供的镜像、挂载或容器参数 |
 | LLM Proxy | 模型路由、真实 Key、配额、上游错误转换 | 不信任 Worker 自带的 tenant 标识 |
 | PostgreSQL | 事务性元数据、任务和审计状态 | 不保存明文业务秘密 |
-| Workspace Store | 每 session 工作区与快照 | 不由 Gateway 直接暴露为宿主机路径 |
+| Workspace Store | 每 session 受控 volume 的 staging、fsync、rename、quarantine 与 snapshot 文件读写；通过 platform task store 的版本化 RPC 获取/更新元数据 | 不由 Gateway 直接暴露宿主机路径，不直接写 PostgreSQL，不把数据库或宿主机路径交给 Worker |
+
+### 3.1.1 P0 单机部署进程
+
+§3.1 的表描述逻辑组件，不等于需要启动同等数量的进程。当前 P0 在单 Linux 主机上的默认部署形态如下；所有应用单元由 systemd 或等效进程监督器管理，并配置健康检查与失败自动重启。P0 不承诺高可用，LLM Proxy 故障时必须向任务返回可见错误，不得静默成功或自动重放可能产生副作用的任务。
+
+| 部署单元 | 默认包含的逻辑组件 | 边界与职责 |
+|---|---|---|
+| `platform` | Web/Auth、IM Gateway、Router、Binding Service、Bot Transport Adapter、Audit/Quota、Task Store/Checkpoint Coordinator | 只处理身份、路由、队列、快照元数据和审计；是 `tasks`、`task_deliveries`、`workspace_snapshots` 的唯一 PostgreSQL 事务 owner；不执行用户代码，不持有 GA runtime state |
+| `worker-manager` | Worker Manager、Workspace Store 文件协调 | 只使用固定镜像、固定挂载和版本化 RPC 管理 Worker，执行受控 volume 文件动作；不直接写 PostgreSQL，不持有真实 LLM Key |
+| `llm-proxy` | LLM Proxy | 独立持有真实上游 Key，校验 session capability、模型策略和用量配额 |
+| PostgreSQL | PostgreSQL | 事务性元数据、任务、快照指针和审计状态；不保存明文业务秘密 |
+
+逻辑模块仍应在代码中保持职责边界。若压测证明 IM 长轮询或 Web 请求会阻塞 `platform`，可把 Bot Transport Adapter 拆成独立部署单元；这属于性能调优，不得改变 Worker 与 LLM Proxy 的安全边界。
 
 ### 3.2 Worker 隔离要求
 
@@ -132,7 +150,64 @@ P0 审计必须记录：actor、team/session/task、工具与 capability 决策�
 
 ### 3.4 性能与资源公平性
 
-控制面必须分别限制每 user/team 的排队长度、单任务时长、CPU、内存、PID、磁盘、输出字节和模型 token；同时限制全局活跃 Worker 与 LLM 并发。调度采用 per-session FIFO 与跨租户公平配额，避免单一用户占满 Worker 或上游模型额度。所有具体数值均由压测写入部署配置；未测得前不得写死为产品承诺。
+控制面必须分别限制每 user/team 的排队长度、单任务时长、CPU、内存、PID、磁盘、输出字节和模型 token；同时限制全局活跃 Worker 与 LLM 并发。调度采用 per-session FIFO 与跨租户公平配额，避免单一用户占满 Worker 或上游模型额度。
+
+P0 的全局准入不能只按 Worker 数量判断。`worker_memory_budget` 必须由目标主机实测派生：
+
+```text
+worker_memory_budget = host_memory_limit
+  - system_and_kernel_reserve
+  - control_plane_memory_p95
+  - postgres_memory_p95
+  - page_cache_reserve
+  - safety_margin
+```
+
+调度器以各 Worker cgroup `memory.current` 的实时总和作为当前占用，并为 starting Worker 和下一 task 保留静态预算：
+
+```text
+sum(worker_memory_current)
++ starting_worker_reservations
++ next_task_reservation
+<= worker_memory_budget
+```
+
+running/idle P95 用于新 Worker 尚未启动时的预留、实时指标不可用时的保守回退和容量校准；`memory.peak` 用于更新预留模型，不能代替当前占用。`starting_worker_reservations` 和 `next_task_reservation` 只计算尚未被已观测 `memory.current` 覆盖的剩余 headroom，避免重复计费。实时指标不可用时必须回退完整静态预留，不得静默放宽。Worker Manager 还必须用 cgroup `memory.high`/`memory.max` 和原子准入预留防止并发检查竞态。
+
+`MAX_ACTIVE_WORKERS` 是最终硬上限，但不是唯一准入条件；调度器必须取内存、CPU、PID、磁盘、LLM 并发、租户额度和队列额度的共同约束。swap 不计入可用 Worker 容量，但不等同于统一关闭宿主机 swap：cgroup v2 的 `memory.swap.max` 或 v1 等效 memsw 策略必须显式配置并在目标主机验证，是否设为 0 由压测和延迟目标决定。
+
+所有具体数值均由目标主机压测写入部署配置；未测得前不得写死为产品承诺。
+
+### 3.4.1 运行时并发配置
+
+管理员可通过受保护的运营操作调整调度配置；配置更新写入 PostgreSQL 的 `runtime_settings`，带 `version`、`updated_by`、`updated_at`、`reason` 和审计事件。不可由管理员突破的主机硬上限、Worker 内存预算和安全策略仍来自部署配置与 Worker Manager。
+
+P0 至少区分以下语义：
+
+| 配置 | 作用 |
+|---|---|
+| `MAX_RUNNING_TASKS` | 全局同时处于 `starting/running` 的 task 数，是管理员的主要并发旋钮 |
+| `MAX_LLM_INFLIGHT` | 同时请求上游 LLM 的数量，防止模型限流或代理过载 |
+| `PER_TENANT_RUNNING_LIMIT` | 单 user/team 同时运行的 task 上限 |
+| `PER_TENANT_QUEUE_LIMIT` | 单 user/team 可保留的 queued task 上限 |
+| `MAX_ACTIVE_WORKERS` | running + idle Worker 的容器与资源硬上限，不等同于运行中 task 数 |
+| `WORKER_IDLE_TIMEOUT` | Worker 完成 checkpoint 后允许复用的 idle 宽限期 |
+
+有效运行并发取所有约束的最小值：
+
+```text
+effective_running_tasks = min(
+  admin_max_running_tasks,
+  measured_host_task_cap,
+  memory_admission_limit,
+  cpu_admission_limit,
+  max_llm_inflight,
+  tenant_quota
+)
+```
+
+调高 `MAX_RUNNING_TASKS` 后调度器唤醒并尝试领取 queued task；调低时不强杀已经运行的 task，现有 task 自然结束，idle Worker 优先淘汰，新 task 等待；设置为 `0` 表示暂停启动新 task 的 drain/维护模式。所有修改都必须校验范围、审计并支持按版本追踪。
+
 
 ---
 
@@ -160,6 +235,7 @@ CancelTask(task_id)
 Health()
 Shutdown(reason)
 ```
+快照控制使用同一条版本化 RPC 通道：platform Checkpoint Coordinator 通过 `worker-manager` 调用 `BeginCheckpoint(task_id, manifest)`，platform task store 创建 writing 元数据和 lease，Worker 在 token 指定的 session staging ref 中写入 bundle 后返回 `CheckpointReady(token, checksum, result_digest)`；`worker-manager` 完成受控文件动作后调用幂等 `CommitCheckpoint(token, file_ref, checksum)`，platform task store 在单个 PostgreSQL 事务中完成元数据、task 和 delivery 提交，再返回 `CheckpointCommitted(token)`。Worker 不访问 PostgreSQL、数据库 socket 或宿主机路径；`lease_owner` 是 platform 控制面身份。
 
 `TaskEnvelope` 至少包含：
 
@@ -179,7 +255,28 @@ Shutdown(reason)
 
 `source` 协议层保留 `wechat|web` 两个取值；P0 实际只接收 `wechat` 通道产生的 task，Web 在 P0 仅用于注册、审批、绑定和人设编辑，不产生聊天 task。Web 聊天通道属 P2 范围。
 
-Worker 事件只允许一个控制面消费者读取：`chunk`、`tool_progress`、`task_complete`、`task_failed`、`task_cancelled`。checkpoint 由 Worker 在产生最终完成事件前执行，绝不通过第二个消费者抢读流式 Queue。
+Worker 的 display stream 只允许 Gateway/Router 这一控制面消费者读取：`chunk`、`tool_progress`、`task_complete`、`task_failed`、`task_cancelled`、`task_interrupted`。`checkpoint_ready` 不进入 display stream，只由 Worker Manager 在同一版本化 checkpoint RPC 通道接收；因此 checkpoint 不会抢读或复制流式队列。
+
+`chunk` 和 `tool_progress` 是临时流，不要求持久化或重放；`checkpoint_ready` 只携带受控 staging ref、checksum 和结果摘要；`task_complete` 是成功终态交付，Gateway/Router 以稳定 delivery_id 处理并可按未确认状态重试，至少包含：
+
+```json
+{
+  "delivery_type": "task_complete",
+  "delivery_id": "task_id:task_complete",
+  "task_id": "uuid",
+  "status": "succeeded",
+  "snapshot_id": "uuid",
+  "result_ref": "workspace-result-ref",
+  "result_digest": "sha256:...",
+  "usage": {"input_tokens": 0, "output_tokens": 0}
+}
+```
+
+成功 task 的最终用户可见结果必须在 `task=succeeded` 提交前作为有字节上限的不可变 payload 持久化；`result_ref` 是指向 committed snapshot bundle 内该 payload 的不透明引用，不得是任意宿主机路径，读取时必须校验 `result_digest`。pending 或未确认的 delivery 每次重试都从 `result_ref` 读取并重发，不重放已消费的 chunk。
+
+`task_failed`、`task_cancelled` 和恢复生成的 `task_interrupted` 也是终态交付类型，使用各自稳定的 `delivery_id`，在 `task_deliveries` 中保存有字节上限的脱敏错误码/用户提示；它们不需要 `snapshot_id` 或 `result_ref`，但同样按确认状态重试或进入 dead-letter，不重新执行 task。
+
+控制面 task store 为每个 `(task_id, delivery_type)` 建立唯一的 `task_deliveries` 记录和稳定 `delivery_id`；所有 terminal task 的恢复扫描都可补建 pending delivery，失败/取消/中断终态必须在对应 task 状态事务中一并写入 bounded terminal payload。重试沿用同一个 `delivery_id`；平台自己的 outbox/状态更新必须去重。BotTransportAdapter 若底层 carrier 支持幂等键，必须传递该 ID；carrier 不支持幂等时，发送确认前的崩溃窗口只能提供 at-least-once 语义，重复消息风险须可见并审计，但不得重新执行 task。
 
 ### 4.3 GA 适配边界
 
@@ -193,6 +290,7 @@ GenericAgent 仍是 Worker 内的任务引擎；平台不直接读写 `handler`�
 4. snapshot 仅在任务完全静止的边界生成，包含 `backend_history`、`working`、`display_history` 与 schema version。
 5. 工具 schema 是 runtime policy 的子集。P0 只保留会话内文件、Shell/Python 与文档解析所需工具；宿主机桌面、全局浏览器、容器管理和任意网络工具默认不可用。
 6. `shutdown` 先请求协作取消；超过宽限期由 Worker Manager 销毁容器。不能把 `abort()` 描述为对任意阻塞调用的即时终止保证。
+7. Worker 必须在流式读取工具 stdout/stderr 时执行字节上限；超限立即终止对应子进程并返回可见的配额错误，不能等任务结束后再截断结果。
 
 ---
 
@@ -209,10 +307,12 @@ P0 使用 PostgreSQL。每个状态变更在事务中完成，并附加审计事
 | `bot_transport_state` | 每 bot 独立加密 update cursor、重连状态、错误时间；禁止共享本地 token 文件 |
 | `context_tokens` | `(bot_id, ilink_user_id)` 唯一；加密、到期、最后使用时间；视为能力凭证 |
 | `workspaces` | session_key 唯一；personal 与 team 的归属列互斥；只保存受控 volume ID 和 snapshot 元数据，不保存任意宿主机路径 |
+| `workspace_snapshots` | snapshot_id、workspace、task、file_ref、checksum、state ∈ writing/committed/quarantined、lease_owner（控制面身份）、lease_until、created_at、committed_at；committed snapshot 是否保留由 retention policy 决定，不以 current 指针为唯一存活条件 |
 | `teams` | owner、名称、默认人设、状态 |
 | `team_members` | `(team_id,user_id)` 唯一；`status`、role、nullable `persona_id`；踢人/封禁由路由每条消息复核 |
 | `active_contexts` | personal 时 `team_id IS NULL`；team 时 `team_id IS NOT NULL`，且成员关系必须 approved |
-| `tasks` | task_id、session、requester、message idempotency key、状态、顺序号；每 session 同时最多一个 running task |
+| `tasks` | task_id、session、requester、message idempotency key、状态、顺序号、result_ref/result_digest、最终用量、succeeded_at、terminal_at；每 session 同时最多一个 running task |
+| `task_deliveries` | `(task_id, delivery_type)` 唯一；delivery_id、状态 ∈ pending/sending/acked/dead_letter、payload_ref/payload_digest 或 bounded error payload、尝试次数、next_attempt_at、attempt_lease_until、delivery_deadline_at、sent_at、acked_at、terminal_at；用于终态结果恢复与去重，不作为 task 事实来源 |
 | `task_events` | 状态转换、Worker ID、错误码、时间；不存模型 Key 或完整敏感 prompt |
 | `relay_sessions` | 发起人/接收人、状态、过期时间、短 ID；每参与者同时至多一个 pending/active relay，由事务约束保证 |
 | `relay_blocks` | blocker、blocked、创建时间 |
@@ -243,6 +343,16 @@ queued → starting → running → succeeded | failed | cancelled | interrupted
 任务先持久化，再由该 session 的 Worker 按顺序领取。Worker 或主机崩溃时，`running` 任务转为 `interrupted`；不得自动重放，因为 Shell/Python 可能已产生不可逆副作用。`queued` 任务保留顺序，可在恢复后继续执行。
 
 **blocked 用户运行中任务取消机制：** `users.status` 变更为 `blocked` 时，控制面在同一事务中发布取消事件，Worker Manager 取消该用户作为 `requester_user_id` 的所有 `running` 任务，并按 §3.2 Worker 销毁策略终止对应容器。`queued` 任务直接标记 `cancelled`。取消必须产生审计事件，记录触发原因（`user_blocked`）、受影响 task 列表与资源回收结果。该机制不依赖用户下一条消息触发，确保 blocked 即时生效。
+
+### 5.4 任务队列与调度
+
+任务进入 PostgreSQL 后先以 `status=queued` 持久化；调度器在事务中锁定候选 session/task，确认该 session 没有 `starting/running` task 且全局、租户和资源预算允许后，才将任务推进到 `starting`。领取不能只依赖进程内计数，避免重启或多进程造成超额并发。
+
+调度选择遵循同 session FIFO 与跨租户公平轮转；队列满时在入队事务中明确拒绝。P0 可以只有一个逻辑 scheduler loop；未来增加 scheduler 实例时，必须继续使用数据库行锁或等效租约保证同一 task 只被领取一次。
+
+新任务和运行时配置变化可以通过 PostgreSQL `LISTEN/NOTIFY` 唤醒调度器，但通知不是任务数据，也不是可靠队列；断线、重启或通知丢失后必须通过周期扫描恢复。Worker 的 `chunk` 和 `tool_progress` 仍走版本化 RPC 流，由单一控制面消费者读取，不写入任务队列表。
+
+P0 不引入 RabbitMQ、Redis、Celery 等外部消息队列。PostgreSQL `tasks` 表负责任务事实、幂等、恢复和审计关联；内存队列只可作为降低唤醒延迟的缓存，不能作为 queued task 的唯一存储。
 
 ---
 
@@ -307,26 +417,47 @@ Worker 不能通过伪造 `X-Session-Key` 获取其他租户配额。session cap
 
 ## 8. 持久化、恢复与可观测性
 
-Worker 是唯一读取 GA runtime state 的组件。每个成功 task 的顺序为：
+### 8.1 成功任务 checkpoint
 
+Workspace Store 是受控 snapshot 文件 staging、fsync、rename、quarantine 的唯一文件操作 owner；platform task store 是 snapshot 元数据、task 和 delivery outbox 的唯一 PostgreSQL 事务 owner；Worker 只读取 GA runtime state 并通过版本化 RPC 提供 staging bundle。每个成功 task 的顺序为：
 ```text
-Agent 状态稳定
-→ Worker 深拷贝 backend_history / working / display_history
-→ 写入 workspace 临时快照
-→ fsync + 原子 replace
-→ 更新 snapshot metadata 与 task=succeeded 的事务
-→ 发送 task_complete
+Platform Checkpoint Coordinator 调用 BeginCheckpoint；platform task store 创建 snapshot_id、state=writing、lease_owner=platform:<instance>、lease_until，并返回带 generation 的 opaque checkpoint token
+→ Worker 深拷贝 backend_history / working / display_history，生成有字节上限的最终用户结果 payload
+→ Worker 将 runtime state 与最终结果写入 token 指定的 session staging bundle
+→ Worker 返回 CheckpointReady(token, checksum, result_digest)
+→ Worker Manager/Workspace Store 校验本地 staging manifest 并 fsync staging bundle
+→ 原子 rename 为带 snapshot_id 和 checksum 的不可变快照
+→ fsync 快照目录，生成 result_ref / result_digest
+→ platform task store 以单个 PostgreSQL 连接执行事务：将 snapshot 标为 committed，更新 current_snapshot_id、result_ref、task=succeeded、succeeded_at、terminal_at，并插入/幂等更新 task_deliveries=pending；该事务不跨进程包含文件操作
+→ platform 返回 CheckpointCommitted；Gateway/Router 继续作为 display stream 唯一消费者，delivery outbox 可从 task 行重建终态交付
 ```
 
-因此控制面不会从 display queue 推测 checkpoint，也不会在 handler 尚未创建时写入 working。快照 schema 不兼容时，恢复必须失败为可见错误，不允许静默丢字段。
+Worker Manager 根据同一 RPC 会话和心跳向 platform task store 请求续租 writing lease；Worker 本身不续租、不写数据库。lease token 带 generation，过期或续租失败即失效，Worker Manager 必须停止该 staging session；`CommitCheckpoint` 只接受当前 generation，失败或 Worker 断连时不得提交 `succeeded`，让 lease 过期后进入 orphan 流程。
 
-每个 Worker、任务和控制面服务必须记录结构化日志、trace ID、session/task ID、资源用量和策略拒绝原因。日志默认脱敏；秘密、完整 token、原始中继正文和未授权用户内容不可写入审计日志。
+数据库中的 `current_snapshot_id` 是恢复当前会话的权威指针；`workspace_snapshots` 是所有 snapshot 生命周期的权威登记。文件已 rename 但提交事务未完成时，旧指针仍有效，writing 记录及其控制面 lease 防止清理器误删；数据库已提交但 `task_complete` 尚未送达时，任务保持 `succeeded`，恢复扫描按 task_id 补建或重试 `task_deliveries`，按未确认状态重发终态事件或最终结果，不重新执行任务，也不重放 chunk。
 
-容量由部署配置和压测控制：`MAX_ACTIVE_WORKERS`、每 session queue 上限、CPU/内存/PID/磁盘配额均须在上线前测得并设置。
+orphan 候选必须同时满足：没有 committed 记录，且 writing lease 已过期或不存在，并且文件年龄超过可配置的 `SNAPSHOT_ORPHAN_GRACE`。platform task store 锁定并复核元数据、引用和 token generation 后，使 token 失效；worker-manager/Workspace Store 执行受控文件 quarantine，不能由清理器直接改数据库状态。
 
-**Worker 生命周期与 idle timeout：** Worker 在 task 完成并写入 checkpoint 后进入 idle 状态，保留一段可配置的 idle 宽限期（`WORKER_IDLE_TIMEOUT`，由部署配置）。宽限期内收到同 session 的新 task 直接复用该 Worker，避免冷启动；宽限期满后 Worker Manager 执行 `Shutdown(reason=idle_timeout)`，先请求协作取消，超过宽限期销毁容器。下一条 task 从快照恢复重建 Worker。`MAX_ACTIVE_WORKERS` 同时计入 idle 与 running 状态的 Worker；idle Worker 不占用模型并发额度，但占用容器名额，调度器在名额不足时优先销毁最早进入 idle 的 Worker。
+quarantine 是文件与元数据的分阶段动作：worker-manager 先原子 rename 到 quarantine 目录并回报 file_ref，platform task store 再在事务中将状态记为 `quarantined` 并审计；只有再次延迟确认未被引用后才 unlink。已过期但没有文件的 writing 记录也由 platform task store 按审计后的清理流程回收。
 
-**`/new` 快照行为：** `/new` 仅清空内存中的 `history` 与 `working`，不生成额外快照，不删除工作区文件。若 `/new` 后立即崩溃，恢复到 `/new` 前最后一个成功 task 的快照；用户可再次发送 `/new` 清空。该设计保证不丢数据且实现最简，不引入"清理前快照"的额外存储路径。
+committed snapshot 即使不是 current，也只能按明确 retention policy 清理。对被 `result_ref` 引用的 snapshot，必须在所有关联 `task_deliveries` 进入 `acked` 或 `dead_letter` 后才开始结果保留计时；`acked_at` 取 BotTransportAdapter/carrier 接受交付的控制面时间，`terminal_at` 取 deadline dead-letter 的控制面时间，令 `delivery_terminal_at = max(COALESCE(acked_at, terminal_at))`，`TASK_RESULT_RETENTION` 从该时间起算，snapshot 的最早清理时间为 `max(普通 snapshot retention 截止时间, delivery_terminal_at + TASK_RESULT_RETENTION)`。delivery 未终态、引用关系不明或时间字段缺失时禁止清理；不能按“未被 current 指针引用”判为 orphan。
+
+### 8.2 状态上限与可观测性
+
+Worker 必须对下列值设置部署配置上限，具体数值由目标主机压测决定：`MAX_BACKEND_HISTORY_BYTES`、`MAX_WORKING_BYTES`、`MAX_DISPLAY_HISTORY_BYTES`、`MAX_TASK_OUTPUT_BYTES`、`MAX_TOOL_STDOUT_BYTES`、`MAX_SNAPSHOT_BYTES`。上限应在运行时和 checkpoint 前共同执行；超限时保留最后一个成功快照、停止继续累积数据并向用户报告原因。
+
+每个 Worker、任务和控制面服务必须记录结构化日志、trace ID、session/task ID、资源用量和策略拒绝原因。至少观测 cgroup `memory.current`/`memory.peak`、`memory.high`/`memory.max` 触发、swap current/max、OOM 事件、启动预留、CPU、PID、磁盘、队列长度、冷启动耗时、checkpoint 耗时、pending delivery/重试/dead-letter 数量和 LLM token 用量。日志与审计输出必须配置轮转、保留期和磁盘告警；不得让单个 session 或单个模型响应无限增长日志文件。
+同时记录 `runtime_settings.version`、当前 running/queued 数量、队列年龄 P95、调度唤醒延迟、配置导致的拒绝原因和管理员调节事件。
+`DELIVERY_RETRY_WINDOW` 从 `tasks.terminal_at` 起算，超过后未确认 delivery 进入 `dead_letter` 并产生可见错误和审计；`TASK_RESULT_RETENTION` 与普通 snapshot retention 均为显式部署配置，不在架构中写死数值。恢复扫描必须把 `sending` 且 `attempt_lease_until` 已过期的 delivery 原子退回 `pending`，不得留下永久卡住的交付。
+### 8.3 Worker 生命周期
+
+Worker 在 task 完成并写入 checkpoint 后进入 idle 状态，保留一段可配置的 idle 宽限期（`WORKER_IDLE_TIMEOUT`）。同 session 新 task 复用前，Worker Manager 必须在 per-session 锁或等效 CAS 下将 Worker 从 `idle` 原子转为 `assigned`；宽限期满或容量压力淘汰则先将其从 `idle` 原子转为 `evicting`。两种转移互斥，不能同时领取和销毁同一 Worker。
+
+`MAX_ACTIVE_WORKERS` 同时计入 idle 与 running 状态；idle Worker 不占用模型并发额度，但占用容器名额和内存预算。容量压力下只有成功取得 `idle→evicting` 转移的 Worker 才能执行 `Shutdown(reason=capacity_pressure)` 并销毁，不重复 checkpoint；queued task 若发现 Worker 已进入 `evicting`，必须从最近的已提交快照重新 `StartSession`，不能向正在淘汰的 Worker 投递。所有任务队列仍必须有界；预算不足时向用户返回排队、配额不足或资源不足的明确状态。
+
+### 8.4 `/new` 快照行为
+
+`/new` 仅清空内存中的 `history` 与 `working`，不生成额外快照，不删除工作区文件。若 `/new` 后立即崩溃，恢复到 `/new` 前最后一个成功 task 的已提交快照；用户可再次发送 `/new` 清空。该设计不引入清理前快照的额外存储路径。
 
 ---
 
@@ -340,10 +471,15 @@ Agent 状态稳定
 | 任务 | 同一 session 串行且有界；`/stop` 不误伤其他请求者；取消能在宽限期后终止 Worker |
 | 恢复 | 完成任务的快照恢复完整；崩溃中的任务标记 interrupted，不被自动重放 |
 | 传输 | 多 bot 的 token/cursor 相互独立；token 过期不会清除其他 bot；消息按 bot/message ID 去重 |
-| 代理 | Worker 拿不到真实 Key；Proxy 拒绝过期、跨 session 或超配额请求 |
-| 运维 | 资源上限、队列满、上游限流和 Worker 崩溃都产生可见、可审计错误 |
+| 结果交付 | `task_deliveries` 按 `(task_id, delivery_type)` 唯一；成功/失败/取消/中断终态均有稳定 delivery_id，pending 或未确认时重复读取 durable payload 重试；历史 chunk 不重放，carrier 不支持幂等时的 at-least-once 风险可见且不触发 task 重跑 |
+| Worker 生命周期竞态 | idle→assigned 与 idle→evicting 在 Worker Manager 锁/CAS 下互斥；淘汰胜出时 queued task 从最后已提交 snapshot 重建，不向 evicting Worker 投递 |
+| 运维 | 资源上限、队列满、上游限流、LLM Proxy 重启、磁盘不足、日志轮转和 Worker 崩溃都产生可见、可审计错误 |
+| 容量 | 准入同时使用 cgroup `memory.current`、starting/task 预留与主机预算；指标缺失时保守回退；idle 压力淘汰不重复 checkpoint，也不等待宿主机 OOM |
+| 快照一致性 | 覆盖 snapshot lease 的控制面续租、文件 rename、目录持久化、数据库提交、quarantine、结果保留期、延迟删除和 task_complete/task_failed/task_cancelled 丢失；恢复使用最后一个已提交 snapshot |
+| 调度 | 管理员调高/调低/暂停并发后，任务领取遵守新上限；降低不强杀运行中 task，调高会唤醒 queued task |
+| 队列 | PostgreSQL 重启或 platform 重启后 queued task 不丢失、不重复领取；LISTEN/NOTIFY 丢失时周期扫描仍能恢复 |
 
-中继（`@username` 文字中继）属 P1 范围，其验收见 PRD §9 P1 第 12 条，不进入 P0 矩阵。
+中继（`@username` 文字中继）属 P1 范围，其验收见 PRD §9 P1 第 18 条，不进入 P0 矩阵。
 
 ---
 
@@ -351,14 +487,20 @@ Agent 状态稳定
 
 实现计划必须先列出并验证：
 
-1. Linux 主机支持 rootless Podman、user namespace、cgroup、seccomp 与所需文件系统挂载策略。
-2. Worker 固定镜像与工具 policy；Shell/Python 以外的危险工具默认禁用。
-3. PostgreSQL schema、迁移、加密密钥轮换和备份恢复演练。
-4. BotTransportAdapter 对当前 iLink 客户端的 stop、token 更新、cursor 和绑定身份适配。
-5. Worker RPC、LLM Proxy session capability、审计字段及端到端隔离测试。
-6. 隔离、绑定、`/stop`、blocked 取消、崩溃恢复和代理鉴权的验收用例进入 implementation plan。
-7. capability policy 草案完成：默认拒绝清单、不可授权边界、高风险授权字段（授予者、理由、到期时间、策略版本）、源文件变更审批流程和审计事件 schema。
-8. P0 资源配额、跨租户公平调度策略和告警指标定义完成；具体数值待压测填入。
-9. 压测后确定真实容量配置（`MAX_ACTIVE_WORKERS`、`WORKER_IDLE_TIMEOUT`、每 session queue 上限、CPU/内存/PID/磁盘配额）；未测得的数字不得写入对外承诺。
+1. Linux 主机支持 rootless Podman、user namespace、cgroup、seccomp 与所需文件系统挂载策略；确认 rootless storage、overlayfs/fuse-overlayfs、`memory.current/high/max`、cgroup v2 `memory.swap.max` 或 v1 等效 memsw 策略、临时目录和工作区目录均按预期生效。
+2. P0 物理部署单元完成：`platform`、`worker-manager`、`llm-proxy` 与 PostgreSQL 的启动依赖、健康检查、失败自动重启和资源边界明确；不把逻辑组件数量当作进程数量。
+3. Worker 固定镜像与工具 policy 草案完成；记录镜像压缩/展开后的磁盘占用、rootless graphroot 可用空间和冷启动观测方法。
+4. PostgreSQL schema、迁移、加密密钥轮换、备份恢复演练、连接池上限和目标主机资源配置草案完成；具体数据库参数不得脱离压测直接复制。
+5. BotTransportAdapter 对当前 iLink 客户端的 stop、token 更新、cursor 和绑定身份适配。
+6. Worker RPC、platform Checkpoint Coordinator 与 Workspace Store 文件动作边界、platform task store 的单 owner checkpoint 事务、LLM Proxy session capability、终态 delivery outbox、审计字段及端到端隔离测试完成；Proxy 故障、重启和上游限流的失败语义明确。
+7. 隔离、绑定、`/stop`、blocked 取消、崩溃恢复、代理鉴权、队列满和资源不足的验收用例进入 implementation plan。
+8. 明确并实现队列、history、working、display history、task output、tool stdout、snapshot、CPU、内存、PID、磁盘和模型 token 的硬限制；限制必须在数据累积过程中生效。
+9. 容量 spike 在目标 2 vCPU / 4 GiB RAM 主机执行，至少记录控制面/PostgreSQL 基线、系统与 page cache 预留、Worker 冷启动 p50/p95、cgroup memory current/peak、starting/task 预留、1..N 并发下的 P95 延迟、checkpoint/fsync 延迟、CPU/PID/磁盘、swap、delivery retry/dead-letter 和 OOM 行为，并据此派生 worker_memory_budget。
+10. 资源公平调度压测完成：验证 per-session FIFO、跨租户配额、idle 压力淘汰、idle claim/evict 互锁、队列上限、LLM 并发上限和恢复后的重新准入。
+11. 快照恢复演练覆盖 workspace_snapshots writing/committed/quarantined、控制面 lease 续租/到期、grace 判定、quarantine 后延迟删除、文件 rename 后数据库提交前、数据库提交后事件发送前、task_deliveries 恢复/去重/dead-letter、成功/失败/取消/中断终态补发、chunk 不重放、carrier 确认前崩溃、Worker OOM、磁盘不足和 schema/checksum 不兼容；日志/审计轮转与磁盘告警同时验证。
+12. 压测与容量/运维演练后确定真实 `MAX_RUNNING_TASKS`、`MAX_LLM_INFLIGHT`、`PER_TENANT_RUNNING_LIMIT`、`PER_TENANT_QUEUE_LIMIT`、`MAX_ACTIVE_WORKERS`、`WORKER_IDLE_TIMEOUT`、`DELIVERY_RETRY_WINDOW`、`TASK_RESULT_RETENTION`、CPU/内存/PID/磁盘配额和状态字节上限；未测得或未定义的数字不得写入对外承诺。
+13. 受保护的管理员调度配置接口完成：范围校验、`MAX_RUNNING_TASKS` 更新、暂停/drain、版本审计和配置生效语义明确。
+14. PostgreSQL-backed scheduler 完成：任务事务入队、同 session FIFO、跨租户公平、单 task 领取、队列上限、`LISTEN/NOTIFY` 唤醒和周期扫描兜底均有验收用例。
+15. 运行时调高、调低、设为 0、platform 重启、PostgreSQL 重启和 scheduler 重启的行为完成压测与恢复演练。
 
 **只有上述门槛、PRD 和修订清单一致时，才开始 implementation plan。**
