@@ -86,18 +86,8 @@ func run() error {
 	if mig == "" {
 		mig = postgres.DefaultMigrationPath()
 	}
-	// Apply migration if tasks table missing.
-	var n int
-	if err := pool.QueryRow(ctx, `
-SELECT COUNT(*) FROM information_schema.tables
-WHERE table_schema='public' AND table_name='tasks'
-`).Scan(&n); err != nil {
+	if err := postgres.EnsureSchema(ctx, pool, mig); err != nil {
 		return err
-	}
-	if n == 0 {
-		if err := postgres.ApplyMigrations(ctx, pool, mig); err != nil {
-			return err
-		}
 	}
 
 	store, err := postgres.NewStore(pool)

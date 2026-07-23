@@ -5,17 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
-import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 POLICY_PATH = REPO_ROOT / "tenant_platform" / "contracts" / "policy" / "foundation.v1.json"
@@ -38,17 +35,30 @@ if not TEST_DB:
 
 DEV_TOKEN = "foundation-dev-token-not-real"
 DEV_USER_ID = "1"
-TEST_TOKEN = "test-worker-token-not-a-real-key"
+
+_DROP_SQL = """
+DROP TABLE IF EXISTS task_deliveries CASCADE;
+DROP TABLE IF EXISTS task_events CASCADE;
+DROP TABLE IF EXISTS workspace_snapshots CASCADE;
+DROP TABLE IF EXISTS tasks CASCADE;
+DROP TABLE IF EXISTS workspaces CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
+DROP TYPE IF EXISTS task_deliveries CASCADE;
+DROP TYPE IF EXISTS task_events CASCADE;
+DROP TYPE IF EXISTS workspace_snapshots CASCADE;
+DROP TYPE IF EXISTS tasks CASCADE;
+DROP TYPE IF EXISTS workspaces CASCADE;
+DROP TYPE IF EXISTS users CASCADE;
+DROP SEQUENCE IF EXISTS task_events_id_seq CASCADE;
+"""
 
 
 def _platform_bin(tmp: Path) -> Path:
-    out = tmp / "platform.exe" if os.name == "nt" else tmp / "platform"
-    env = os.environ.copy()
-    # Build once per session directory.
+    out = tmp / ("platform.exe" if os.name == "nt" else "platform")
     subprocess.check_call(
         ["go", "build", "-o", str(out), "./cmd/platform"],
         cwd=str(BACKEND_GO),
-        env=env,
+        env=os.environ.copy(),
     )
     return out
 
@@ -75,22 +85,36 @@ def _http_json(method: str, url: str, body: dict | None = None, token: str | Non
         return e.code, payload
 
 
-def _wait_health(base: str, timeout: float = 30.0) -> None:
-    deadline = time.time() + timeout
-    last = None
-    while time.time() < deadline:
+def _free_loopback_addr() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return f"127.0.0.1:{s.getsockname()[1]}"
+
+
+def _reset_db() -> None:
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise RuntimeError("psycopg required for foundation tests") from exc
+    mig = REPO_ROOT / "tenant_platform" / "infra" / "postgres" / "migrations" / "0001_foundation.sql"
+    sql = mig.read_text(encoding="utf-8")
+    with psycopg.connect(TEST_DB) as conn:
+        conn.execute(_DROP_SQL)
+        conn.commit()
         try:
-            status, body = _http_json("GET", base + "/healthz", token=None)
-            if status == 200 and body.get("status") == "ok":
-                return
-            last = (status, body)
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-        time.sleep(0.2)
-    raise AssertionError(f"healthz not ready: {last}")
+            conn.execute(sql)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.execute(_DROP_SQL)
+            conn.commit()
+            conn.execute(sql)
+            conn.commit()
 
 
-def _start_platform(tmp: Path, listen: str = "127.0.0.1:18080") -> tuple[subprocess.Popen, str, Path, Path]:
+def _start_platform(tmp: Path, listen: str | None = None) -> tuple[subprocess.Popen, str, Path, Path]:
+    if listen is None:
+        listen = _free_loopback_addr()
     bin_path = _platform_bin(tmp)
     config_root = tmp / "config"
     runtime_root = tmp / "runtime"
@@ -107,7 +131,6 @@ def _start_platform(tmp: Path, listen: str = "127.0.0.1:18080") -> tuple[subproc
     env["GA_WORKER_PYTHON"] = str(PYTHON)
     env["GA_WORKER_SRC"] = str(WORKER_SRC)
     env["GA_POLICY_FILE"] = str(POLICY_PATH)
-    # Reset schema via small helper using psycopg in this process before start.
     _reset_db()
     proc = subprocess.Popen(
         [
@@ -141,42 +164,29 @@ def _start_platform(tmp: Path, listen: str = "127.0.0.1:18080") -> tuple[subproc
         errors="replace",
     )
     base = f"http://{listen}"
-    try:
-        _wait_health(base, timeout=45)
-    except Exception:
-        out = ""
-        if proc.stdout:
-            try:
-                out = proc.stdout.read()
-            except Exception:
-                pass
-        proc.kill()
-        raise AssertionError(f"platform failed to start\n{out}")
-    return proc, base, config_root, runtime_root
+    deadline = time.time() + 45
+    last = None
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            out = proc.stdout.read() if proc.stdout else ""
+            raise AssertionError(f"platform exited early code={proc.returncode}\n{out}")
+        try:
+            status, body = _http_json("GET", base + "/healthz", token=None)
+            if status == 200 and body.get("status") == "ok":
+                return proc, base, config_root, runtime_root
+            last = (status, body)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+        time.sleep(0.2)
+    out = ""
+    proc.kill()
+    if proc.stdout:
+        try:
+            out = proc.stdout.read()
+        except Exception:
+            pass
+    raise AssertionError(f"platform failed to start; last={last}\n{out}")
 
-
-def _reset_db() -> None:
-    try:
-        import psycopg
-    except ImportError as exc:
-        raise RuntimeError("psycopg required for foundation tests") from exc
-    mig = REPO_ROOT / "tenant_platform" / "infra" / "postgres" / "migrations" / "0001_foundation.sql"
-    sql = mig.read_text(encoding="utf-8")
-    with psycopg.connect(TEST_DB) as conn:
-        conn.execute(
-            """
-DROP TABLE IF EXISTS task_deliveries CASCADE;
-DROP TABLE IF EXISTS task_events CASCADE;
-DROP TABLE IF EXISTS workspace_snapshots CASCADE;
-DROP TABLE IF EXISTS tasks CASCADE;
-DROP TABLE IF EXISTS workspaces CASCADE;
-DROP TABLE IF EXISTS users CASCADE;
-"""
-        )
-        conn.commit()
-        # Apply foundation migration so platform startup always finds schema.
-        conn.execute(sql)
-        conn.commit()
 
 def _stop(proc: subprocess.Popen) -> str:
     if proc.poll() is not None:
@@ -212,7 +222,6 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
     proc, base, _, _ = _start_platform(tmp_path)
     try:
         session = f"personal:{DEV_USER_ID}"
-        # Success path.
         code, body = _http_json(
             "POST",
             f"{base}/v1/sessions/{session}/tasks",
@@ -229,7 +238,6 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         task_id = body["task_id"]
         assert body["status"] == "queued"
 
-        # Dedupe: same message returns same id.
         code2, body2 = _http_json(
             "POST",
             f"{base}/v1/sessions/{session}/tasks",
@@ -245,7 +253,6 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         assert code2 == 202
         assert body2["task_id"] == task_id
 
-        # Different source instance creates a new task (cancel this one quickly).
         code3, body3 = _http_json(
             "POST",
             f"{base}/v1/sessions/{session}/tasks",
@@ -262,7 +269,6 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         other_id = body3["task_id"]
         assert other_id != task_id
 
-        # Cancel the second while likely still queued/starting.
         ccode, cbody = _http_json("POST", f"{base}/v1/tasks/{other_id}/cancel")
         assert ccode == 200, cbody
         assert cbody.get("accepted") is True
@@ -271,7 +277,6 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         assert final["status"] == "succeeded", final
         assert final.get("result_ref")
         assert final.get("result_digest")
-        # Opaque ref, not a host path.
         assert "\\" not in final["result_ref"] and "/" not in final["result_ref"]
 
         rcode, rbody = _http_json(
@@ -282,7 +287,6 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         assert rbody["result_digest"] == final["result_digest"]
         assert rbody.get("payload") is not None
 
-        # Path-like result_ref rejected.
         pcode, pbody = _http_json(
             "GET",
             f"{base}/v1/tasks/{task_id}/result?result_ref=C:%5Csecrets",
@@ -292,7 +296,6 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         cancelled = _poll_status(base, other_id, {"cancelled", "interrupted", "failed"}, timeout=30)
         assert cancelled["status"] == "cancelled", cancelled
 
-        # Host tool policy rejected on submit.
         hcode, hbody = _http_json(
             "POST",
             f"{base}/v1/sessions/{session}/tasks",
@@ -307,7 +310,6 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         )
         assert hcode >= 400, hbody
         assert hbody.get("code")
-
     finally:
         _stop(proc)
 
@@ -336,7 +338,8 @@ def test_platform_requires_dev_loopback_for_local_coordinator(tmp_path: Path):
         timeout=20,
     )
     assert proc.returncode != 0
-    assert "dev-loopback" in (proc.stderr + proc.stdout).lower() or "dev-loopback" in (proc.stderr + proc.stdout)
+    combined = (proc.stderr or "") + (proc.stdout or "")
+    assert "dev-loopback" in combined.lower() or "dev-loopback" in combined
 
 
 def test_policy_digest_matches_checked_in_file():

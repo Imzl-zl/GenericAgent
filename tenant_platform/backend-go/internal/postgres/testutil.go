@@ -31,7 +31,6 @@ func OpenTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	// Serialize schema rebuild against other connections using an advisory lock.
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -49,33 +48,21 @@ func OpenTestPool(t *testing.T) *pgxpool.Pool {
 }
 
 func resetAndMigrate(ctx context.Context, pool *pgxpool.Pool) error {
-	// Drop in a single batch with CASCADE; ignore missing.
-	if _, err := pool.Exec(ctx, `
-DROP TABLE IF EXISTS task_deliveries CASCADE;
-DROP TABLE IF EXISTS task_events CASCADE;
-DROP TABLE IF EXISTS workspace_snapshots CASCADE;
-DROP TABLE IF EXISTS tasks CASCADE;
-DROP TABLE IF EXISTS workspaces CASCADE;
-DROP TABLE IF EXISTS users CASCADE;
-`); err != nil {
+	if err := DropFoundationSchema(ctx, pool); err != nil {
 		return fmt.Errorf("drop: %w", err)
 	}
-	// Ensure no orphaned types remain.
-	if _, err := pool.Exec(ctx, `
-DO $$ DECLARE r RECORD;
-BEGIN
-  FOR r IN (
-    SELECT c.relname AS name
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'r'
-      AND c.relname IN ('users','workspaces','tasks','task_events','task_deliveries','workspace_snapshots')
-  ) LOOP
-    EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.name) || ' CASCADE';
-  END LOOP;
-END $$;
-`); err != nil {
-		return fmt.Errorf("force drop: %w", err)
+	// ApplyMigrations also drops; call the raw SQL path only.
+	path := DefaultMigrationPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read migration: %w", err)
 	}
-	return ApplyMigrations(ctx, pool, "")
+	if _, err := pool.Exec(ctx, string(raw)); err != nil {
+		// One retry after force-clean orphan types.
+		_ = DropFoundationSchema(ctx, pool)
+		if _, err2 := pool.Exec(ctx, string(raw)); err2 != nil {
+			return fmt.Errorf("apply migration: %w (retry: %v)", err, err2)
+		}
+	}
+	return nil
 }
