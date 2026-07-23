@@ -1,0 +1,212 @@
+openapi: 3.1.0
+info:
+  title: GenericAgent Tenant Platform Foundation API
+  version: 0.1.0
+  description: >
+    Loopback foundation HTTP contract for session tasks. X-Platform-Dev-Token is
+    required for this foundation-only API. No browser chat endpoint is exposed;
+    the P0 user chat path remains BotTransportAdapter.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local loopback foundation backend
+security:
+  - PlatformDevToken: []
+paths:
+  /healthz:
+    get:
+      operationId: healthz
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                    example: ok
+  /v1/sessions/{session_key}/tasks:
+    post:
+      operationId: createTask
+      summary: Accept a task for the given session
+      parameters:
+        - $ref: "#/components/parameters/SessionKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskEnvelope"
+      responses:
+        "202":
+          description: Task accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - task_id
+                  - status
+                properties:
+                  task_id:
+                    type: string
+                  status:
+                    type: string
+  /v1/tasks/{task_id}:
+    get:
+      operationId: getTask
+      summary: Read task status and opaque result references
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Task status envelope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskStatus"
+  /v1/tasks/{task_id}/result:
+    get:
+      operationId: getTaskResult
+      summary: Read the bounded committed result by opaque result_ref
+      description: >
+        Returns the committed result payload identified by an opaque result_ref
+        and its matching digest. Host filesystem paths are never accepted.
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+        - name: result_ref
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Opaque committed result reference (never a host path)
+      responses:
+        "200":
+          description: Committed result payload and digest
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - result_ref
+                  - result_digest
+                  - payload
+                properties:
+                  result_ref:
+                    type: string
+                  result_digest:
+                    type: string
+                  payload:
+                    type: object
+                    additionalProperties: true
+  /v1/tasks/{task_id}/cancel:
+    post:
+      operationId: cancelTask
+      summary: Request cooperative task cancellation
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Cancellation acceptance and current status
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - accepted
+                  - status
+                properties:
+                  accepted:
+                    type: boolean
+                  status:
+                    type: string
+components:
+  securitySchemes:
+    PlatformDevToken:
+      type: apiKey
+      in: header
+      name: X-Platform-Dev-Token
+      description: Required foundation-only loopback development token
+  parameters:
+    SessionKey:
+      name: session_key
+      in: path
+      required: true
+      schema:
+        type: string
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    TaskEnvelope:
+      type: object
+      required:
+        - message_id
+        - source_instance_id
+        - prompt
+        - source
+        - persona_snapshot
+        - tool_policy_version
+      properties:
+        message_id:
+          type: string
+        source_instance_id:
+          type: string
+        prompt:
+          type: string
+        source:
+          type: string
+        persona_snapshot:
+          type: array
+          items:
+            type: string
+        tool_policy_version:
+          type: string
+        task_id:
+          type: string
+        session_key:
+          type: string
+        requester_user_id:
+          type: integer
+          format: int64
+    TaskStatus:
+      type: object
+      required:
+        - task_id
+        - session_key
+        - status
+      properties:
+        task_id:
+          type: string
+        session_key:
+          type: string
+        status:
+          type: string
+        snapshot_id:
+          type: string
+        snapshot_checksum:
+          type: string
+        result_ref:
+          type: string
+          description: Opaque committed result reference; never a host path
+        result_digest:
+          type: string
+        terminal_error:
+          type: object
+          nullable: true
+          properties:
+            code:
+              type: string
+            user_message:
+              type: string
+            trace_id:
+              type: string
