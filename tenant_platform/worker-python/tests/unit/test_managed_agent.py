@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import queue
+import sys
 import threading
 import time
 from copy import deepcopy
@@ -820,3 +821,271 @@ def test_max_history_bytes_on_restore(roots, foundation_registry):
             )
         )
     assert ei.value.code in {"HISTORY_LIMIT_EXCEEDED", "SNAPSHOT_TOO_LARGE", "POLICY_LIMIT", "INVALID_SNAPSHOT"}
+
+
+def test_max_turns_wraps_legacy_runner_loop(roots, foundation_registry, monkeypatch):
+    """RuntimePolicy.max_turns must constrain agent_runner_loop without editing agentmain."""
+    import types
+    import ga_worker.managed_agent as ma
+
+    calls: list[int] = []
+
+    def fake_runner_loop(client, system_prompt, user_input, handler, tools_schema, max_turns=40, **kwargs):
+        calls.append(max_turns)
+        if False:
+            yield "x"
+        return {"result": "ok"}
+
+    # Simulate imported legacy modules with real wrap targets.
+    agent_loop_mod = types.ModuleType("agent_loop")
+    agent_loop_mod.agent_runner_loop = fake_runner_loop
+
+    class StepOutcome:
+        def __init__(self, data, next_prompt=None, should_exit=False):
+            self.data = data
+            self.next_prompt = next_prompt
+            self.should_exit = should_exit
+
+    agent_loop_mod.StepOutcome = StepOutcome
+
+    agentmain_mod = types.ModuleType("agentmain")
+    agentmain_mod.TOOLS_SCHEMA = [
+        {"type": "function", "function": {"name": "code_run"}},
+        {"type": "function", "function": {"name": "update_working_checkpoint"}},
+    ]
+    agentmain_mod.agent_runner_loop = fake_runner_loop
+
+    class FakeHandler:
+        def dispatch(self, tool_name, args, response, index=0, tool_num=1):
+            yield f"dispatched:{tool_name}\n"
+            return StepOutcome(None, next_prompt="ok")
+
+    ga_mod = types.ModuleType("ga")
+    ga_mod.GenericAgentHandler = FakeHandler
+
+    class LoopAwareAgent(ScriptedAgent):
+        def run(self):
+            while True:
+                task = self.task_queue.get()
+                if isinstance(task, str):
+                    break
+                self.is_running = True
+                # Call the same name agentmain uses so the wrap is observable.
+                import agentmain as am
+
+                gen = am.agent_runner_loop(None, "sys", task["query"], FakeHandler(), am.TOOLS_SCHEMA, max_turns=180)
+                try:
+                    for _ in gen:
+                        pass
+                except TypeError:
+                    pass
+                task["output"].put({"done": f"turns={calls[-1] if calls else None}", "turn": 1})
+                self.is_running = False
+                self.task_queue.task_done()
+
+    adapter = _make_adapter(roots, foundation_registry, LoopAwareAgent)
+    adapter.start_session(_start_req(runtime_policy=_runtime_policy(max_turns=2)))
+    # Inject fake legacy mods as if real import happened.
+    adapter._legacy_mods = {
+        "agent_loop": agent_loop_mod,
+        "agentmain": agentmain_mod,
+        "ga": ga_mod,
+    }
+    # Install wraps the same way execute_task does.
+    monkeypatch.setitem(sys.modules, "agent_loop", agent_loop_mod)
+    monkeypatch.setitem(sys.modules, "agentmain", agentmain_mod)
+    monkeypatch.setitem(sys.modules, "ga", ga_mod)
+
+    events = _events(adapter, _task("turns", "run-loop"))
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_SUCCEEDED
+    assert calls == [2], f"expected agent_runner_loop max_turns=2, got {calls}"
+    assert "turns=2" in term.user_message
+
+
+def test_task_deadline_emits_interrupted_timeout(roots, foundation_registry):
+    class HangAgent(ScriptedAgent):
+        def __init__(self):
+            super().__init__(hang_on={"deadline-me"})
+
+    adapter = _make_adapter(roots, foundation_registry, HangAgent)
+    adapter.start_session(_start_req(runtime_policy=_runtime_policy(task_timeout_seconds=1)))
+    t0 = time.time()
+    events = _events(adapter, _task("dl1", "deadline-me"))
+    elapsed = time.time() - t0
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_INTERRUPTED
+    assert term.error.code == "TASK_TIMEOUT"
+    assert elapsed < 5.0
+    assert ScriptedAgent.instances[0].abort_calls == 1
+
+
+def test_repeated_cancel_and_timeout_abort_once(roots, foundation_registry):
+    class SlowAgent(ScriptedAgent):
+        def __init__(self):
+            super().__init__(hang_on={"once-abort"})
+
+    adapter = _make_adapter(roots, foundation_registry, SlowAgent)
+    adapter.start_session(_start_req(runtime_policy=_runtime_policy(task_timeout_seconds=30)))
+    box: list = []
+
+    def runner():
+        box.append(_events(adapter, _task("ab1", "once-abort")))
+
+    th = threading.Thread(target=runner, daemon=True)
+    th.start()
+    agent = ScriptedAgent.instances[0]
+    assert agent._started.wait(2.0)
+    assert adapter.cancel_task("ab1").accepted is True
+    assert adapter.cancel_task("ab1").accepted is True
+    assert adapter.cancel_task("ab1").accepted is True
+    th.join(timeout=3)
+    assert box
+    term = _terminal(box[0])
+    assert term.status in (worker_pb2.TASK_CANCELLED, worker_pb2.TASK_INTERRUPTED)
+    assert agent.abort_calls == 1
+
+
+def test_max_output_bytes_counts_handler_print(roots, foundation_registry):
+    class PrintyAgent(ScriptedAgent):
+        def run(self):
+            while True:
+                task = self.task_queue.get()
+                if isinstance(task, str):
+                    break
+                self.is_running = True
+                self.handler = SeededHandler()
+                # Wait until adapter instruments handler.print (created after put_task).
+                deadline = time.time() + 2.0
+                while time.time() < deadline and not getattr(self.handler, "_adapter_print_wrapped", False):
+                    wrap = getattr(self, "_adapter_wrap_handler", None)
+                    if callable(wrap):
+                        wrap(self.handler)
+                    time.sleep(0.01)
+                if not getattr(self.handler, "_adapter_print_wrapped", False):
+                    raise AssertionError("handler.print not instrumented")
+                self.handler.print("Y" * 80)
+                time.sleep(0.05)
+                if not self.stop_sig:
+                    task["output"].put({"next": "tiny", "turn": 1})
+                    task["output"].put({"done": "should-not-succeed", "turn": 1})
+                else:
+                    task["output"].put({"done": "stopped", "turn": 1})
+                self.is_running = False
+                self.task_queue.task_done()
+
+    adapter = _make_adapter(roots, foundation_registry, PrintyAgent)
+    adapter.start_session(
+        _start_req(runtime_policy=_runtime_policy(max_output_bytes=40, task_timeout_seconds=10))
+    )
+    events = _events(adapter, _task("print-cap", "go"))
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_FAILED
+    assert term.error.code == "MAX_OUTPUT_BYTES"
+
+
+def test_tool_schema_filter_and_dispatch_deny(roots, foundation_registry, monkeypatch):
+    import types
+    import sys
+
+    class StepOutcome:
+        def __init__(self, data, next_prompt=None, should_exit=False):
+            self.data = data
+            self.next_prompt = next_prompt
+            self.should_exit = should_exit
+
+    agent_loop_mod = types.ModuleType("agent_loop")
+    agent_loop_mod.StepOutcome = StepOutcome
+    agent_loop_mod.agent_runner_loop = lambda *a, **k: iter(())
+
+    agentmain_mod = types.ModuleType("agentmain")
+    agentmain_mod.TOOLS_SCHEMA = [
+        {"type": "function", "function": {"name": "code_run"}},
+        {"type": "function", "function": {"name": "file_read"}},
+        {"type": "function", "function": {"name": "update_working_checkpoint"}},
+    ]
+
+    denied: list[str] = []
+    allowed_seen: list[str] = []
+
+    class FakeHandler:
+        def dispatch(self, tool_name, args, response, index=0, tool_num=1):
+            allowed_seen.append(tool_name)
+            yield f"ok:{tool_name}\n"
+            return StepOutcome("ok")
+
+    ga_mod = types.ModuleType("ga")
+    ga_mod.GenericAgentHandler = FakeHandler
+
+    class ToolAgent(ScriptedAgent):
+        def run(self):
+            while True:
+                task = self.task_queue.get()
+                if isinstance(task, str):
+                    break
+                self.is_running = True
+                import agentmain as am
+
+                names = [t["function"]["name"] for t in am.TOOLS_SCHEMA]
+                h = FakeHandler()
+                # Fabricated disallowed tool must be denied by wrap.
+                gen = h.dispatch("code_run", {}, None)
+                out = []
+                try:
+                    while True:
+                        out.append(next(gen))
+                except StopIteration as e:
+                    outcome = e.value
+                denied.extend(out)
+                # Allowed tool still works.
+                gen2 = h.dispatch("update_working_checkpoint", {"key_info": "x"}, None)
+                try:
+                    while True:
+                        next(gen2)
+                except StopIteration:
+                    pass
+                task["output"].put({"done": f"schema={names}", "turn": 1})
+                self.is_running = False
+                self.task_queue.task_done()
+
+    monkeypatch.setitem(sys.modules, "agent_loop", agent_loop_mod)
+    monkeypatch.setitem(sys.modules, "agentmain", agentmain_mod)
+    monkeypatch.setitem(sys.modules, "ga", ga_mod)
+
+    adapter = _make_adapter(roots, foundation_registry, ToolAgent)
+    adapter.start_session(_start_req())
+    adapter._legacy_mods = {
+        "agent_loop": agent_loop_mod,
+        "agentmain": agentmain_mod,
+        "ga": ga_mod,
+    }
+    events = _events(adapter, _task("tools", "check"))
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_SUCCEEDED
+    assert "update_working_checkpoint" in term.user_message
+    assert "code_run" not in term.user_message.split("schema=")[-1] or "schema=['update_working_checkpoint']" in term.user_message
+    assert any("denied" in str(x) for x in denied)
+    assert "update_working_checkpoint" in allowed_seen
+    assert "code_run" not in allowed_seen
+
+
+def test_plugins_hooks_import_failure_is_visible(roots, foundation_registry):
+    # Break plugins/hooks in overlay source so materialize copies broken file.
+    hooks = roots["legacy_root"] / "plugins" / "hooks.py"
+    hooks.write_text("raise RuntimeError('hooks-boom')\n", encoding="utf-8")
+    from ga_worker.runtime_overlay import materialize_runtime_overlay
+    from ga_worker.legacy_import import import_legacy_runtime, LegacyImportError
+
+    overlay, manifest = materialize_runtime_overlay(
+        legacy_root=roots["legacy_root"],
+        runtime_root=roots["runtime_root"],
+        session_id="s-hooks-fail",
+    )
+    with pytest.raises(LegacyImportError) as ei:
+        import_legacy_runtime(
+            config_root=roots["config_root"],
+            legacy_root=roots["legacy_root"],
+            overlay_dir=overlay,
+            manifest=manifest,
+        )
+    assert "plugins" in str(ei.value).lower() or "hooks" in str(ei.value).lower()

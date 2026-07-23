@@ -45,8 +45,8 @@ class _PendingTask:
     request: worker_pb2.ExecuteTaskRequest
     cancel_requested: bool = False
     started: bool = False
+    abort_called: bool = False
     reserved: threading.Event = field(default_factory=threading.Event)
-
 
 @dataclass
 class _CompletedTask:
@@ -270,13 +270,15 @@ class ManagedAgentAdapter:
             eq: queue.Queue = queue.Queue()
             self._event_queues[task.task_id] = eq
 
-        # Test barrier for pre-start cancel.
+        # Test barrier for pre-start cancel (unit: events; integration: files under env dir).
         barrier = self._test_pre_dispatch_barrier
         if barrier is not None:
             reserved_ev, proceed_ev = barrier
             pending.reserved.set()
             reserved_ev.set()
             proceed_ev.wait(timeout=5)
+        else:
+            self._file_pre_dispatch_barrier(task.task_id, pending)
 
         # Pre-start cancel check.
         with self._lock:
@@ -296,30 +298,46 @@ class ManagedAgentAdapter:
         previous_persona = list(getattr(agent, "extra_sys_prompts", []) or [])
         previous_schema = None
         deadline_timer: threading.Timer | None = None
-        output_bytes = 0
+        output_bytes = {"n": 0}
         max_output = int(self._session.runtime_policy.max_output_bytes or 0)
         max_turns = int(self._session.runtime_policy.max_turns or 0)
         timed_out = {"v": False}
         output_exceeded = {"v": False}
         cancel_flag = {"v": False}
+        loop_unwrap: Callable[[], None] | None = None
+
+        def _count_output(text: str) -> bool:
+            """Accumulate UTF-8 bytes; return True if quota exceeded (and signal stop)."""
+            if not max_output:
+                return False
+            n = len((text or "").encode("utf-8"))
+            output_bytes["n"] += n
+            if output_bytes["n"] > max_output:
+                output_exceeded["v"] = True
+                try:
+                    if getattr(agent, "handler", None) is not None:
+                        agent.handler.code_stop_signal.append(1)
+                    self._abort_once(pending, agent)
+                except Exception:
+                    pass
+                return True
+            return False
 
         try:
             agent.extra_sys_prompts = list(task.persona_snapshot)
             previous_schema = self._apply_tool_policy(tool_policy)
             self._install_dispatch_guard(tool_policy)
             self._prepare_handler_seed(agent, self._session.seed_working)
+            self._install_handler_print_counter(agent, _count_output)
 
             if max_turns > 0:
-                self._install_max_turns(agent, max_turns)
+                loop_unwrap = self._install_max_turns(agent, max_turns)
 
             timeout_s = int(self._session.runtime_policy.task_timeout_seconds or 0)
             if timeout_s > 0:
                 def _on_timeout():
                     timed_out["v"] = True
-                    try:
-                        agent.abort()
-                    except Exception:
-                        pass
+                    # Single abort path via cancel_task (abort-once guarded).
                     self.cancel_task(task.task_id)
 
                 deadline_timer = threading.Timer(timeout_s, _on_timeout)
@@ -341,6 +359,17 @@ class ManagedAgentAdapter:
 
             display_q = agent.put_task(task.prompt, source=task.source or "user")
 
+            # Handler is often constructed inside the runner after put_task; wrap print ASAP.
+            for _ in range(100):
+                h = getattr(agent, "handler", None)
+                if h is not None and not getattr(h, "_adapter_print_wrapped", False):
+                    self._install_handler_print_counter(agent, _count_output)
+                if h is not None and getattr(h, "_adapter_print_wrapped", False):
+                    break
+                if not display_q.empty():
+                    break
+                time.sleep(0.01)
+
             final_body = ""
             final_turn = 0
             terminal_emitted = False
@@ -350,6 +379,10 @@ class ManagedAgentAdapter:
                 try:
                     item = display_q.get(timeout=0.1)
                 except queue.Empty:
+                    # Re-wrap handler.print if handler was created after put_task.
+                    h = getattr(agent, "handler", None)
+                    if h is not None and not getattr(h, "_adapter_print_wrapped", False):
+                        self._install_handler_print_counter(agent, _count_output)
                     if pending.cancel_requested or cancel_flag["v"]:
                         # Wait a bit more for abort terminal.
                         try:
@@ -380,15 +413,7 @@ class ManagedAgentAdapter:
                 if "next" in item:
                     text = item.get("next") or ""
                     turn = int(item.get("turn") or 0)
-                    text_bytes = len(text.encode("utf-8"))
-                    if max_output and output_bytes + text_bytes > max_output:
-                        output_exceeded["v"] = True
-                        try:
-                            if getattr(agent, "handler", None) is not None:
-                                agent.handler.code_stop_signal.append(1)
-                            agent.abort()
-                        except Exception:
-                            pass
+                    if _count_output(text):
                         if not terminal_emitted:
                             term = self._terminal(
                                 task.task_id,
@@ -402,7 +427,6 @@ class ManagedAgentAdapter:
                             yield worker_pb2.WorkerEvent(terminal=term)
                             terminal_emitted = True
                         break
-                    output_bytes += text_bytes
                     display_history.append({"text": text, "turn": turn})
                     with self._lock:
                         if self._session is not None:
@@ -416,6 +440,18 @@ class ManagedAgentAdapter:
                     final_body = item.get("done") or ""
                     final_turn = int(item.get("turn") or 0)
                     if output_exceeded["v"]:
+                        if not terminal_emitted:
+                            term = self._terminal(
+                                task.task_id,
+                                worker_pb2.TASK_FAILED,
+                                user_message="max_output_bytes exceeded",
+                                error_code="MAX_OUTPUT_BYTES",
+                            )
+                            self._record_completed(
+                                task, term, final_body, display_history, agent
+                            )
+                            yield worker_pb2.WorkerEvent(terminal=term)
+                            terminal_emitted = True
                         break
                     if pending.cancel_requested or timed_out["v"]:
                         status = (
@@ -444,12 +480,20 @@ class ManagedAgentAdapter:
                     break
 
             if not terminal_emitted:
-                term = self._terminal(
-                    task.task_id,
-                    worker_pb2.TASK_FAILED,
-                    user_message="task ended without terminal payload",
-                    error_code="MISSING_TERMINAL",
-                )
+                if output_exceeded["v"]:
+                    term = self._terminal(
+                        task.task_id,
+                        worker_pb2.TASK_FAILED,
+                        user_message="max_output_bytes exceeded",
+                        error_code="MAX_OUTPUT_BYTES",
+                    )
+                else:
+                    term = self._terminal(
+                        task.task_id,
+                        worker_pb2.TASK_FAILED,
+                        user_message="task ended without terminal payload",
+                        error_code="MISSING_TERMINAL",
+                    )
                 self._record_completed(task, term, final_body, display_history, agent)
                 yield worker_pb2.WorkerEvent(terminal=term)
 
@@ -471,6 +515,11 @@ class ManagedAgentAdapter:
         finally:
             if deadline_timer is not None:
                 deadline_timer.cancel()
+            if loop_unwrap is not None:
+                try:
+                    loop_unwrap()
+                except Exception:
+                    pass
             # Restore task-scoped settings.
             try:
                 agent.extra_sys_prompts = previous_persona
@@ -488,21 +537,30 @@ class ManagedAgentAdapter:
         with self._lock:
             if self._session is None:
                 return worker_pb2.CancelTaskResponse(accepted=False)
+            agent = self._session.agent
             if self._pending and self._pending.task_id == task_id:
-                self._pending.cancel_requested = True
-                if self._pending.started:
-                    try:
-                        self._session.agent.abort()
-                    except Exception:
-                        pass
+                pending = self._pending
+                pending.cancel_requested = True
+                if pending.started:
+                    self._abort_once_locked(pending, agent)
                 return worker_pb2.CancelTaskResponse(accepted=True)
             if self._session.active_task_id == task_id:
-                if self._pending:
-                    self._pending.cancel_requested = True
-                try:
-                    self._session.agent.abort()
-                except Exception:
-                    pass
+                pending = self._pending
+                if pending is not None and pending.task_id == task_id:
+                    pending.cancel_requested = True
+                    self._abort_once_locked(pending, agent)
+                else:
+                    # No pending record (edge): still try one abort via ephemeral flag on session.
+                    flag = getattr(self._session, "_abort_once_flag", None)
+                    if flag is None:
+                        self._session._abort_once_flag = set()  # type: ignore[attr-defined]
+                        flag = self._session._abort_once_flag  # type: ignore[attr-defined]
+                    if task_id not in flag:
+                        flag.add(task_id)
+                        try:
+                            agent.abort()
+                        except Exception:
+                            pass
                 return worker_pb2.CancelTaskResponse(accepted=True)
             return worker_pb2.CancelTaskResponse(accepted=False)
 
@@ -747,18 +805,154 @@ class ManagedAgentAdapter:
         def guarded(self, tool_name, args, response, index=0, tool_num=1):
             if tool_name not in allowed and tool_name not in ("no_tool", "bad_json"):
                 yield f"tool denied by policy: {tool_name}\n"
-                from agent_loop import StepOutcome
+                StepOutcome = getattr(agent_loop, "StepOutcome", None) if agent_loop is not None else None
+                if StepOutcome is None:
+                    import agent_loop as _al
 
+                    StepOutcome = _al.StepOutcome
                 return StepOutcome(None, next_prompt=f"tool denied: {tool_name}", should_exit=False)
             return (yield from base_dispatch(self, tool_name, args, response, index=index, tool_num=tool_num))
 
         handler_cls.dispatch = guarded  # type: ignore[assignment]
         handler_cls._adapter_dispatch_guard = allowed  # type: ignore[attr-defined]
 
-    def _install_max_turns(self, agent: Any, max_turns: int) -> None:
-        # Real path: agent_runner_loop uses handler.max_turns; we can't easily wrap without
-        # patching agent_runner_loop. Store for handler.
+    def _file_pre_dispatch_barrier(self, task_id: str, pending: _PendingTask) -> None:
+        """Optional integration barrier: only when <dir>/<task_id>.wait exists."""
+        barrier_dir = os.environ.get("GA_TEST_PRE_DISPATCH_BARRIER_DIR", "").strip()
+        if not barrier_dir:
+            return
+        root = Path(barrier_dir)
+        wait_flag = root / f"{task_id}.wait"
+        if not wait_flag.exists():
+            return
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            reserved = root / f"{task_id}.reserved"
+            proceed = root / f"{task_id}.proceed"
+            pending.reserved.set()
+            reserved.write_text("1", encoding="utf-8")
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                if pending.cancel_requested or proceed.exists():
+                    break
+                time.sleep(0.02)
+        except Exception:
+            return
+
+    def _abort_once(self, pending: _PendingTask | None, agent: Any) -> None:
+        with self._lock:
+            self._abort_once_locked(pending, agent)
+
+    def _abort_once_locked(self, pending: _PendingTask | None, agent: Any) -> None:
+        if pending is not None:
+            if pending.abort_called:
+                return
+            pending.abort_called = True
+        try:
+            agent.abort()
+        except Exception:
+            pass
+
+    def _install_handler_print_counter(self, agent: Any, count_fn: Callable[[str], bool]) -> None:
+        def _wrap_handler(handler: Any) -> None:
+            if handler is None or getattr(handler, "_adapter_print_wrapped", False):
+                return
+            original_print = getattr(handler, "print", None)
+
+            def counted_print(*args, **kwargs):
+                text = " ".join(str(a) for a in args)
+                if count_fn(text):
+                    return None
+                if callable(original_print):
+                    return original_print(*args, **kwargs)
+                return None
+
+            handler.print = counted_print  # type: ignore[assignment]
+            handler._adapter_print_wrapped = True  # type: ignore[attr-defined]
+
+        _wrap_handler(getattr(agent, "handler", None))
+
+        if self._legacy_mods:
+            ga_mod = self._legacy_mods.get("ga")
+            if ga_mod is not None and hasattr(ga_mod, "GenericAgentHandler"):
+                original_cls = ga_mod.GenericAgentHandler
+                if getattr(original_cls, "_adapter_print_factory", None) is not count_fn:
+                    base_init = original_cls.__init__
+
+                    def init_with_counter(self, *args, **kwargs):
+                        base_init(self, *args, **kwargs)
+                        _wrap_handler(self)
+
+                    original_cls.__init__ = init_with_counter  # type: ignore[method-assign]
+                    original_cls._adapter_print_factory = count_fn  # type: ignore[attr-defined]
+
+        # Scripted agents often set handler inside run().
+        if not getattr(agent, "_adapter_handler_watch", False):
+            agent._adapter_handler_watch = True
+            try:
+                def watching_setattr(name, value, _orig=object.__setattr__):
+                    _orig(agent, name, value)
+                    if name == "handler":
+                        _wrap_handler(value)
+
+                object.__setattr__(agent, "__class__", type(agent.__class__.__name__, (agent.__class__,), {
+                    "__setattr__": lambda self, n, v: watching_setattr(n, v),
+                }))
+            except Exception:
+                # Fallback: periodic wrap not available; tests set handler after install
+                # so re-wrap right before put_task is insufficient — call wrap in run via
+                # agent attribute callback.
+                agent._adapter_wrap_handler = _wrap_handler
+
+    def _install_max_turns(self, agent: Any, max_turns: int) -> Callable[[], None]:
+        """Force RuntimePolicy.max_turns into agent_runner_loop without editing legacy files."""
+        unwraps: list[Callable[[], None]] = []
+
+        def _wrap_module(mod: Any, attr: str = "agent_runner_loop") -> None:
+            if mod is None or not hasattr(mod, attr):
+                return
+            original = getattr(mod, attr)
+            if getattr(original, "_adapter_max_turns_wrapped", False):
+                original._adapter_forced_max_turns = max_turns  # type: ignore[attr-defined]
+                return
+
+            def wrapped(*args, **kwargs):
+                forced = getattr(wrapped, "_adapter_forced_max_turns", max_turns)
+                kwargs = dict(kwargs)
+                kwargs["max_turns"] = forced
+                return original(*args, **kwargs)
+
+            wrapped._adapter_max_turns_wrapped = True  # type: ignore[attr-defined]
+            wrapped._adapter_forced_max_turns = max_turns  # type: ignore[attr-defined]
+            setattr(mod, attr, wrapped)
+
+            def unwrap() -> None:
+                if getattr(mod, attr, None) is wrapped:
+                    setattr(mod, attr, original)
+
+            unwraps.append(unwrap)
+
+        mods: list[Any] = []
+        if self._legacy_mods:
+            mods.extend([self._legacy_mods.get("agentmain"), self._legacy_mods.get("agent_loop")])
+        import sys
+
+        for name in ("agentmain", "agent_loop"):
+            mod = sys.modules.get(name)
+            if mod is not None and mod not in mods:
+                mods.append(mod)
+        for mod in mods:
+            _wrap_module(mod, "agent_runner_loop")
         agent._adapter_max_turns = max_turns
+
+        def unwrap_all() -> None:
+            for u in unwraps:
+                try:
+                    u()
+                except Exception:
+                    pass
+
+        return unwrap_all
 
     def _terminal(
         self,

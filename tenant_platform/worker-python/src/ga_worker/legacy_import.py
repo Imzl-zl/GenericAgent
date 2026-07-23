@@ -120,20 +120,38 @@ def import_legacy_runtime(
     imported: dict[str, ModuleType] = {}
 
     def _load(name: str) -> ModuleType:
+        overlay_resolved = overlay_dir.resolve()
         if name in sys.modules:
             mod = sys.modules[name]
             origin = getattr(mod, "__file__", "") or ""
-            if origin and "legacy-overlay" not in Path(origin).as_posix() and name in LEGACY_MODULE_NAMES:
-                # Force reload from overlay.
-                del sys.modules[name]
+            if origin:
+                try:
+                    Path(origin).resolve().relative_to(overlay_resolved)
+                    return mod
+                except ValueError:
+                    # Loaded from a different path/overlay — force reload.
+                    del sys.modules[name]
+                    # Also drop package parents that may cache old path.
+                    if name.startswith("plugins"):
+                        for key in list(sys.modules):
+                            if key == "plugins" or key.startswith("plugins."):
+                                if key != name:
+                                    try:
+                                        op = getattr(sys.modules[key], "__file__", "") or ""
+                                        if op:
+                                            Path(op).resolve().relative_to(overlay_resolved)
+                                        else:
+                                            del sys.modules[key]
+                                    except Exception:
+                                        del sys.modules[key]
             else:
-                return mod
+                del sys.modules[name]
         mod = importlib.import_module(name)
         origin = getattr(mod, "__file__", "") or ""
         if name in LEGACY_MODULE_NAMES and origin:
             origin_path = Path(origin).resolve()
             try:
-                origin_path.relative_to(overlay_dir.resolve())
+                origin_path.relative_to(overlay_resolved)
             except ValueError as exc:
                 raise LegacyImportError(
                     f"imported legacy module {name} not from overlay: {origin}"
@@ -141,17 +159,13 @@ def import_legacy_runtime(
         return mod
 
     # Ensure simphtml and ga are importable (ga eagerly imports simphtml in real tree).
+    # plugins/hooks are on the immutable allowlist — failures must be visible.
     for name in ("simphtml", "agent_loop", "llmcore", "ga", "plugins", "plugins.hooks", "agentmain"):
         try:
             imported[name] = _load(name)
-        except ModuleNotFoundError:
-            # plugins package may only partially exist in unit-test minimal overlays.
-            if name.startswith("plugins"):
-                continue
-            raise LegacyImportError(f"failed to import legacy module {name}") from None
+        except ModuleNotFoundError as exc:
+            raise LegacyImportError(f"failed to import legacy module {name}: {exc}") from exc
         except Exception as exc:
-            if name.startswith("plugins"):
-                continue
             raise LegacyImportError(f"failed to import legacy module {name}: {exc}") from exc
 
     _purge_legacy_from_sys_path(legacy_root)

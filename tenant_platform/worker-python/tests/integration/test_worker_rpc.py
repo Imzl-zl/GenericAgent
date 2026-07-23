@@ -49,11 +49,12 @@ class _OAIHandler(BaseHTTPRequestHandler):
         except Exception:
             payload = {}
         self.server.requests.append(payload)
-        # Optional delay for mid-run cancel window.
-        delay = self.server.response_delay
-        if delay:
-            time.sleep(delay)
-        # Non-stream chat completion; no tools so agent finishes in one turn.
+        # Signal request arrival for deterministic mid-run cancel.
+        self.server.request_arrived.set()
+        # Hold response until released (or timeout safety).
+        if not self.server.release_response.wait(timeout=self.server.hold_timeout):
+            # Safety: never hang the whole suite forever.
+            pass
         content = self.server.response_text
         data = {
             "id": "chatcmpl-test",
@@ -81,8 +82,17 @@ class FixtureServer(ThreadingHTTPServer):
         self.seen_auth: list[str] = []
         self.requests: list[dict] = []
         self.response_text = "fixture-reply-ok"
-        self.response_delay = 0.0
+        self.request_arrived = threading.Event()
+        self.release_response = threading.Event()
+        self.release_response.set()  # default: do not block
+        self.hold_timeout = 30.0
 
+    def arm_hold(self):
+        self.request_arrived.clear()
+        self.release_response.clear()
+
+    def release(self):
+        self.release_response.set()
 
 @pytest.fixture(scope="module")
 def oai_fixture():
@@ -119,8 +129,9 @@ def _start_worker(config_root: Path, runtime_root: Path) -> tuple[subprocess.Pop
     env["GA_RUNTIME_DIR"] = str(runtime_root)
     env["GA_POLICY_FILE"] = str(POLICY_PATH)
     env["GA_WORKER_LISTEN"] = "127.0.0.1:0"
+    # Integration pre-start cancel barrier directory (file protocol).
+    env["GA_TEST_PRE_DISPATCH_BARRIER_DIR"] = str(runtime_root / "barriers")
     env["PYTHONPATH"] = str(WORKER_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    # Avoid picking up a real key from the developer's environment.
     env.pop("OPENAI_API_KEY", None)
     env.pop("ANTHROPIC_API_KEY", None)
     proc = subprocess.Popen(
@@ -304,10 +315,9 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 term_b = _assert_one_terminal(events_b)
                 assert term_b.status == worker_pb2.TASK_SUCCEEDED
 
-                # Pre-start cancel: reserve via concurrent execute + cancel.
-                # Use a delayed model response and cancel quickly after starting execute in another thread.
-                srv.response_delay = 1.5
-                srv.response_text = "slow-reply"
+                # Mid-run cancel: hold fixture until request arrives, cancel, then release.
+                srv.response_text = "slow-reply-should-not-win"
+                srv.arm_hold()
                 box: list = []
                 err_box: list = []
 
@@ -319,24 +329,57 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
 
                 th = threading.Thread(target=run_slow, daemon=True)
                 th.start()
-                time.sleep(0.2)
+                assert srv.request_arrived.wait(10.0), "fixture never received LLM request"
                 cancel_mid = stub.CancelTask(worker_pb2.CancelTaskRequest(task_id="t-slow"))
                 assert cancel_mid.accepted is True
-                th.join(timeout=15)
+                time.sleep(0.15)
+                srv.release()
+                th.join(timeout=20)
                 assert not err_box, err_box
                 assert box
                 term_slow = _assert_one_terminal(box[0])
-                assert term_slow.status in (worker_pb2.TASK_CANCELLED, worker_pb2.TASK_INTERRUPTED, worker_pb2.TASK_SUCCEEDED)
-                # If the model finished before abort landed, success is possible; still one terminal.
-                srv.response_delay = 0.0
+                assert term_slow.status in (
+                    worker_pb2.TASK_CANCELLED,
+                    worker_pb2.TASK_INTERRUPTED,
+                ), f"accepted mid-run cancel must not succeed: {term_slow.status}"
+                # True pre-start cancel: opt-in barrier file before put_task.
+                barrier_dir = runtime_root / "barriers"
+                barrier_dir.mkdir(parents=True, exist_ok=True)
+                wait_flag = barrier_dir / "t-pre.wait"
+                reserved_flag = barrier_dir / "t-pre.reserved"
+                proceed_flag = barrier_dir / "t-pre.proceed"
+                for p in (wait_flag, reserved_flag, proceed_flag):
+                    if p.exists():
+                        p.unlink()
+                wait_flag.write_text("1", encoding="utf-8")
+                pre_box: list = []
+                pre_err: list = []
 
-                # Pre-start cancel of a not-yet-dispatched task is covered in unit tests;
-                # here issue cancel for unknown id.
+                def run_pre():
+                    try:
+                        pre_box.append(_collect(stub, "t-pre", "should-not-reach-model"))
+                    except Exception as exc:
+                        pre_err.append(exc)
+
+                th_pre = threading.Thread(target=run_pre, daemon=True)
+                th_pre.start()
+                deadline = time.time() + 10
+                while time.time() < deadline and not reserved_flag.exists():
+                    time.sleep(0.05)
+                assert reserved_flag.exists(), "worker never reserved pre-start task"
+                pre_req_count = len(srv.requests)
+                cancel_pre = stub.CancelTask(worker_pb2.CancelTaskRequest(task_id="t-pre"))
+                assert cancel_pre.accepted is True
+                proceed_flag.write_text("1", encoding="utf-8")
+                th_pre.join(timeout=15)
+                assert not pre_err, pre_err
+                assert pre_box
+                term_pre = _assert_one_terminal(pre_box[0])
+                assert term_pre.status == worker_pb2.TASK_CANCELLED
+                assert len(srv.requests) == pre_req_count
                 c_unknown = stub.CancelTask(worker_pb2.CancelTaskRequest(task_id="no-such"))
                 assert c_unknown.accepted is False
 
-                # Policy limit: tiny max_output_bytes.
-                # Need a fresh worker for new session limits (immutable session policy).
                 shut = stub.Shutdown(worker_pb2.ShutdownRequest(reason="swap"))
                 assert shut.accepted is True
         finally:
@@ -345,15 +388,13 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-            # Drain remaining output for debugging (must not contain real keys).
             leftover = ""
             if proc.stdout:
                 leftover = proc.stdout.read()
             combined = leftover
             assert "sk-" not in combined
-            assert TEST_TOKEN not in combined or True  # token may appear in process env dump; body must not leak keys
-            # Real secret patterns.
             assert "sk-ant-" not in combined
+            assert TEST_TOKEN not in combined
 
         # Restart worker for snapshot restore + policy limit paths.
         proc2, listen2 = _start_worker(config_root, runtime_root)
