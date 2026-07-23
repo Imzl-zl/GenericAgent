@@ -340,6 +340,8 @@ func fileDigest(path string) (string, error) {
 
 func writeFixtureMyKey(configRoot, apibase string) error {
 	// Development smoke only: fixture credentials, never a real key.
+	// Refuse to overwrite an existing mykey.py so a mis-pointed GA_CONFIG_ROOT
+	// cannot destroy real secrets. No overwrite flag / backup fallback.
 	content := fmt.Sprintf(
 		"native_oai_config = {\n"+
 			"    'name': 'loopback-fixture-gpt',\n"+
@@ -352,7 +354,19 @@ func writeFixtureMyKey(configRoot, apibase string) error {
 			"}\n",
 		testToken, apibase,
 	)
-	return os.WriteFile(filepath.Join(configRoot, "mykey.py"), []byte(content), 0o600)
+	path := filepath.Join(configRoot, "mykey.py")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("refusing to overwrite existing mykey.py at %s: %w", path, err)
+		}
+		return fmt.Errorf("create mykey.py at %s: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte(content)); err != nil {
+		return fmt.Errorf("write mykey.py at %s: %w", path, err)
+	}
+	return nil
 }
 
 type oaiFixture struct {
