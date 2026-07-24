@@ -28,6 +28,14 @@ func main() {
 	}
 }
 
+func resolvePolicyPath(path string) (string, error) {
+	resolved, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve policy path: %w", err)
+	}
+	return resolved, nil
+}
+
 func run() error {
 	var (
 		policyFile   = flag.String("policy-file", "", "path to capability policy manifest (required)")
@@ -50,6 +58,10 @@ func run() error {
 	if *claimLease <= 0 {
 		return fmt.Errorf("--claim-lease must be a positive duration")
 	}
+	resolvedPolicyFile, err := resolvePolicyPath(*policyFile)
+	if err != nil {
+		return fmt.Errorf("resolve --policy-file: %w", err)
+	}
 
 	// Generate platform instance id exactly once before opening PostgreSQL.
 	instanceID, err := application.NewPlatformInstanceID()
@@ -68,7 +80,7 @@ func run() error {
 		return fmt.Errorf("database URL required via --database-url or DATABASE_URL")
 	}
 
-	reg, err := policy.LoadRegistry(*policyFile)
+	reg, err := policy.LoadRegistry(resolvedPolicyFile)
 	if err != nil {
 		return fmt.Errorf("load policy: %w", err)
 	}
@@ -101,7 +113,7 @@ func run() error {
 	}
 	boot.Enabled = *devLoopback
 	boot.DatabaseURL = dbURL
-	boot.PolicyFile = *policyFile
+	boot.PolicyFile = resolvedPolicyFile
 	if *runtimeRoot != "" {
 		boot.RuntimeRoot = *runtimeRoot
 	}
@@ -161,7 +173,7 @@ func run() error {
 		Store:              store,
 		Registry:           reg,
 		Coordinator:        coord,
-		PolicyFile:         *policyFile,
+		PolicyFile:         resolvedPolicyFile,
 		ConfigRoot:         boot.ConfigRoot,
 		LegacyRoot:         boot.LegacyRoot,
 		RuntimeRoot:        boot.RuntimeRoot,
@@ -186,7 +198,7 @@ func run() error {
 		Kick: func(ctx context.Context, sessionKey string) {
 			_ = sched.KickSession(ctx, sessionKey)
 		},
-		CancelWorker: nil, // scheduler loop issues cancel for running tasks
+		CancelWorker: sched.CancelWorker,
 	})
 	if err != nil {
 		return err
@@ -210,9 +222,5 @@ func run() error {
 	fmt.Fprintf(os.Stderr, "platform: instance_id=%s listen=%s session=%s policy_digest=%s\n",
 		instanceID, *listen, devCtx.SessionKey, reg.Digest())
 
-	// Ensure abs policy path for worker env inheritance via scheduler.
-	if p, err := filepath.Abs(*policyFile); err == nil {
-		_ = p
-	}
 	return api.ServeContext(ctx, *listen, server.Handler())
 }

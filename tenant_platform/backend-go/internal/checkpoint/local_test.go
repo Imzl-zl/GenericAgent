@@ -139,6 +139,66 @@ func TestLocalCoordinator_PrepareCommitRead_TokenMismatch(t *testing.T) {
 	}
 }
 
+func TestLocalCoordinator_CommitRejectsBundleAbovePreparedLimit(t *testing.T) {
+	pool := postgres.OpenTestPool(t)
+	store, err := postgres.NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := seedTask(t, store)
+	coord, err := NewLocalCoordinator(LocalConfig{
+		RuntimeRoot: t.TempDir(), PlatformInstanceID: "platform-a", Store: store,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const maxBundleBytes = 128
+	lease, err := coord.Prepare(ctx, CheckpointPrepareRequest{
+		TaskID: task.ID, WorkspaceID: task.WorkspaceID, SessionKey: task.SessionKey,
+		MaxBundleBytes: maxBundleBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Repeat("x", 512)
+	bundle := map[string]any{
+		"schema_version": snapshotSchemaVersion,
+		"task_id": task.ID,
+		"session_key": task.SessionKey,
+		"result": map[string]any{"body": body},
+		"result_digest": "sha256:" + hex.EncodeToString(hashBytes([]byte(body))),
+	}
+	raw, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= maxBundleBytes {
+		t.Fatalf("test bundle len=%d must exceed limit", len(raw))
+	}
+	if err := os.WriteFile(lease.StagingRef, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checksum := "sha256:" + hex.EncodeToString(hashBytes(raw))
+	if _, err := coord.Commit(ctx, ReadyCheckpoint{
+		TaskID: task.ID, SnapshotID: lease.SnapshotID, CheckpointToken: lease.Token,
+		StagingRef: lease.StagingRef, Checksum: checksum, ResultDigest: bundle["result_digest"].(string),
+	}); err == nil || !strings.Contains(err.Error(), "max bundle") {
+		t.Fatalf("expected max bundle rejection, got %v", err)
+	}
+}
+
+func TestSyncDirectorySupportsCheckpointRuntime(t *testing.T) {
+	root := t.TempDir()
+	path := root + string(os.PathSeparator) + "bundle.json"
+	if err := atomicWrite(path, []byte("bundle")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncDirectory(root); err != nil {
+		t.Fatalf("sync checkpoint directory: %v", err)
+	}
+}
+
 func TestChecksumHelper(t *testing.T) {
 	b := []byte("x")
 	sum := sha256.Sum256(b)

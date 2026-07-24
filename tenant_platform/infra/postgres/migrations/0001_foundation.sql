@@ -130,6 +130,7 @@ CREATE TABLE workspace_snapshots (
     lease_until         TIMESTAMPTZ,
     token               TEXT NOT NULL,
     staging_ref         TEXT,
+    max_bundle_bytes    BIGINT NOT NULL,
     file_ref            TEXT,
     checksum            TEXT,
     result_ref          TEXT,
@@ -143,6 +144,7 @@ CREATE TABLE workspace_snapshots (
     ),
     CONSTRAINT workspace_snapshots_generation_pos CHECK (generation > 0),
     CONSTRAINT workspace_snapshots_token_nonempty CHECK (char_length(token) > 0),
+    CONSTRAINT workspace_snapshots_max_bundle_pos CHECK (max_bundle_bytes > 0),
     CONSTRAINT workspace_snapshots_writing_lease CHECK (
         state <> 'writing'
         OR (

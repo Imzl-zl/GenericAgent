@@ -34,6 +34,7 @@ type Scheduler interface {
 	Run(ctx context.Context) error
 	KickSession(ctx context.Context, sessionKey string) error
 	Recover(ctx context.Context, platformInstanceID string) error
+	CancelWorker(ctx context.Context, task domain.Task) error
 }
 
 // SchedulerConfig carries process-lifetime identity and lease.
@@ -59,15 +60,21 @@ type SchedulerConfig struct {
 	MaxBundleBytes uint64
 }
 
+type cancelCall struct {
+	once sync.Once
+	err  error
+}
+
 type scheduler struct {
 	cfg    SchedulerConfig
 	mu     sync.Mutex
+	workerCallMu sync.Mutex
 	wake   chan struct{}
 	worker workerclient.WorkerClient
 	workerCleanup func()
 	workerInstID  string
 	sessionKey    string // last started worker session
-	cancelOnce    sync.Map // taskID -> struct{}
+	cancelOnce    sync.Map // taskID -> *cancelCall
 	oai           *oaiFixture
 	ownOAI        bool
 }
@@ -181,15 +188,26 @@ func (s *scheduler) tick(ctx context.Context) error {
 	return nil
 }
 
-func (s *scheduler) maybeCancelWorker(ctx context.Context, t domain.Task) {
-	if _, loaded := s.cancelOnce.LoadOrStore(t.ID, struct{}{}); loaded {
-		return
-	}
-	client, err := s.ensureWorker(ctx, t.SessionKey)
-	if err != nil {
-		return
-	}
-	_ = client.CancelTask(ctx, t.ID)
+func (s *scheduler) maybeCancelWorker(ctx context.Context, task domain.Task) {
+	_ = s.CancelWorker(ctx, task)
+}
+
+func (s *scheduler) CancelWorker(ctx context.Context, task domain.Task) error {
+	value, _ := s.cancelOnce.LoadOrStore(task.ID, &cancelCall{})
+	call := value.(*cancelCall)
+	call.once.Do(func() {
+		s.workerCallMu.Lock()
+		defer s.workerCallMu.Unlock()
+		s.mu.Lock()
+		client := s.worker
+		s.mu.Unlock()
+		if client == nil {
+			call.err = fmt.Errorf("no active worker for task %s", task.ID)
+			return
+		}
+		call.err = client.CancelTask(ctx, task.ID)
+	})
+	return call.err
 }
 
 func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
@@ -217,6 +235,15 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 		return err
 	}
 
+	s.workerCallMu.Lock()
+	workerCallLocked := true
+	releaseWorkerCall := func() {
+		if workerCallLocked {
+			workerCallLocked = false
+			s.workerCallMu.Unlock()
+		}
+	}
+	defer releaseWorkerCall()
 	// Record dispatch intent before Worker RPC.
 	cur, err = s.cfg.Store.MarkDispatchStarted(ctx, task.ID, s.cfg.PlatformInstanceID, s.workerInstID)
 	if err != nil {
@@ -224,10 +251,6 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 		return nil
 	}
 
-	// Re-check cancel after marking dispatch.
-	if cur.CancelRequestedAt != nil {
-		s.maybeCancelWorker(ctx, cur)
-	}
 
 	if _, err := s.cfg.Registry.Resolve(CapabilityVersion, task.ToolPolicyVersion); err != nil {
 		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
@@ -265,11 +288,24 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 	if _, err := s.cfg.Store.MarkRunning(ctx, task.ID, s.cfg.PlatformInstanceID); err != nil {
 		return err
 	}
-	_ = s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease)
+	if err := s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease); err != nil {
+		releaseWorkerCall()
+		_ = s.CancelWorker(ctx, task)
+		return fmt.Errorf("claim heartbeat: %w", err)
+	}
 
 	// Round-trip durable envelope from PostgreSQL (never scheduler memory).
 	taskRow, err := s.cfg.Store.GetTask(ctx, task.ID)
 	if err != nil {
+		return err
+	}
+	if taskRow.Status.IsTerminal() {
+		return nil
+	}
+	if taskRow.CancelRequestedAt != nil {
+		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+			"TASK_INTERRUPTED", "task interrupted before worker execution", "")
+		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	req := &workerv1.ExecuteTaskRequest{
@@ -287,7 +323,21 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 		},
 	}
 
-	events, errs := client.ExecuteTask(ctx, req)
+	executeCtx, cancelExecute := context.WithCancel(ctx)
+	defer cancelExecute()
+	events, errs := client.ExecuteTask(executeCtx, req)
+	releaseWorkerCall()
+	if err := s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease); err != nil {
+		cancelExecute()
+		_ = s.CancelWorker(ctx, task)
+		return fmt.Errorf("claim heartbeat after stream start: %w", err)
+	}
+	heartbeatEvery := s.cfg.ClaimLease / 3
+	if heartbeatEvery <= 0 {
+		heartbeatEvery = s.cfg.ClaimLease
+	}
+	heartbeat := time.NewTicker(heartbeatEvery)
+	defer heartbeat.Stop()
 	var terminal *workerv1.Terminal
 	var streamErr error
 	eventsOpen, errsOpen := true, true
@@ -295,6 +345,12 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-heartbeat.C:
+			if err := s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease); err != nil {
+				cancelExecute()
+				_ = s.CancelWorker(ctx, task)
+				return fmt.Errorf("claim heartbeat: %w", err)
+			}
 		case ev, ok := <-events:
 			if !ok {
 				eventsOpen = false
@@ -305,7 +361,13 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 				text := ev.Chunk.GetText()
 				sum := sha256.Sum256([]byte(text))
 				digest := "sha256:" + hex.EncodeToString(sum[:])
-				_ = s.cfg.Store.RecordChunkEvent(ctx, task.ID, len([]byte(text)), digest)
+				if err := s.cfg.Store.RecordChunkEvent(ctx, task.ID, len([]byte(text)), digest); err != nil {
+					cancelExecute()
+					_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+						"CHUNK_EVENT_FAILED", err.Error(), "")
+					_ = s.KickSession(ctx, task.SessionKey)
+					return fmt.Errorf("record chunk event: %w", err)
+				}
 			}
 			if ev.IsTerminal() {
 				terminal = ev.Terminal
@@ -320,7 +382,6 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 				streamErr = err
 			}
 		}
-		_ = s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease)
 	}
 	if streamErr != nil && terminal == nil {
 		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
@@ -335,6 +396,16 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 		return fmt.Errorf("missing terminal")
 	}
 
+	current, err := s.cfg.Store.GetTask(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	if current.CancelRequestedAt != nil {
+		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+			"TASK_INTERRUPTED", "task interrupted after accepted cancellation", "")
+		_ = s.KickSession(ctx, task.SessionKey)
+		return err
+	}
 	switch terminal.GetStatus() {
 	case workerv1.TerminalStatus_TASK_SUCCEEDED:
 		return s.completeSuccess(ctx, task, terminal)
@@ -407,10 +478,13 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 			"RESULT_DIGEST_MISMATCH", "terminal and checkpoint result digests differ", "")
 		return fmt.Errorf("result digest mismatch")
 	}
-	resultBytes := 0
-	if payload, err := s.cfg.Coordinator.ReadResult(ctx, committed.ResultRef, committed.ResultDigest); err == nil {
-		resultBytes = len(payload.Body)
+	payload, err := s.cfg.Coordinator.ReadResult(ctx, committed.ResultRef, committed.ResultDigest)
+	if err != nil {
+		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+			"RESULT_READ_FAILED", err.Error(), "")
+		return err
 	}
+	resultBytes := len(payload.Body)
 	if _, err := s.cfg.Store.CompleteSucceeded(ctx, task.ID, s.cfg.PlatformInstanceID,
 		committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, resultBytes); err != nil {
 		return err

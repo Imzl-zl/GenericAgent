@@ -116,7 +116,7 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 	if ready.TaskID == "" || ready.SnapshotID == "" || ready.CheckpointToken == "" {
 		return CommittedCheckpoint{}, fmt.Errorf("ready checkpoint missing identifiers")
 	}
-	wsID, taskID, stagingRef, leaseOwner, leaseUntil, _, state, err := c.store.LoadSnapshotToken(ctx, ready.SnapshotID, ready.CheckpointToken)
+	wsID, taskID, stagingRef, leaseOwner, leaseUntil, _, maxBundleBytes, state, err := c.store.LoadSnapshotToken(ctx, ready.SnapshotID, ready.CheckpointToken)
 	if err != nil {
 		return CommittedCheckpoint{}, fmt.Errorf("token mismatch or unknown snapshot: %w", err)
 	}
@@ -143,6 +143,9 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 	raw, err := os.ReadFile(ready.StagingRef)
 	if err != nil {
 		return CommittedCheckpoint{}, fmt.Errorf("read staging: %w", err)
+	}
+	if uint64(len(raw)) > maxBundleBytes {
+		return CommittedCheckpoint{}, fmt.Errorf("checkpoint bundle exceeds prepared max bundle bytes: got %d want <= %d", len(raw), maxBundleBytes)
 	}
 	if ready.Checksum == "" {
 		return CommittedCheckpoint{}, fmt.Errorf("checksum required")
@@ -267,7 +270,9 @@ func atomicWrite(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	// Best-effort directory fsync via reopening parent is OS-specific; rename is atomic on same FS.
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync directory after rename: %w", err)
+	}
 	return nil
 }
 
@@ -277,7 +282,7 @@ func writeIndex(runtimeRoot, ref, path string) error {
 		return err
 	}
 	safe := strings.ReplaceAll(ref, ":", "_")
-	return os.WriteFile(filepath.Join(dir, safe+".path"), []byte(path), 0o600)
+	return atomicWrite(filepath.Join(dir, safe+".path"), []byte(path))
 }
 
 func readIndex(runtimeRoot, ref string) (string, error) {

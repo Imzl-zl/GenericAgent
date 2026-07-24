@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -269,13 +270,16 @@ WHERE session_key = $1 AND status IN ('starting','running')
 		if busy > 0 {
 			return nil
 		}
-		leaseUntil := time.Now().UTC().Add(claimLease)
+		leaseMicros := claimLease.Microseconds()
+		if leaseMicros <= 0 {
+			leaseMicros = 1
+		}
 		row := tx.QueryRow(ctx, `
 UPDATE tasks SET
   status = 'starting',
   claim_owner = $2,
   claimed_at = timezone('utc', now()),
-  claim_lease_until = $3,
+	  claim_lease_until = timezone('utc', now()) + $3 * interval '1 microsecond',
   updated_at = timezone('utc', now()),
   started_at = COALESCE(started_at, timezone('utc', now()))
 WHERE id = (
@@ -285,7 +289,7 @@ WHERE id = (
   FOR UPDATE SKIP LOCKED
   LIMIT 1
 )
-RETURNING `+taskSelectColumns, sessionKey, platformInstanceID, leaseUntil)
+RETURNING `+taskSelectColumns, sessionKey, platformInstanceID, leaseMicros)
 		t, err := scanTask(row)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -293,7 +297,7 @@ RETURNING `+taskSelectColumns, sessionKey, platformInstanceID, leaseUntil)
 		if err != nil {
 			return err
 		}
-		if err := insertEvent(ctx, tx, t.ID, "status_transition", nextEventSeq(ctx, tx, t.ID), nil, nil, "queued", "starting", "", ""); err != nil {
+		if err := insertNextEvent(ctx, tx, t.ID, "status_transition", nil, nil, "queued", "starting", "", ""); err != nil {
 			return err
 		}
 		task = t
@@ -308,11 +312,16 @@ func (s *Store) HeartbeatClaim(ctx context.Context, taskID, platformInstanceID s
 	if claimLease <= 0 {
 		return fmt.Errorf("claim lease must be positive")
 	}
-	leaseUntil := time.Now().UTC().Add(claimLease)
+	leaseMicros := claimLease.Microseconds()
+	if leaseMicros <= 0 {
+		leaseMicros = 1
+	}
 	tag, err := s.pool.Exec(ctx, `
-UPDATE tasks SET claim_lease_until = $3, updated_at = timezone('utc', now())
+UPDATE tasks SET
+  claim_lease_until = timezone('utc', now()) + $3 * interval '1 microsecond',
+  updated_at = timezone('utc', now())
 WHERE id = $1 AND claim_owner = $2 AND status IN ('starting','running')
-`, taskID, platformInstanceID, leaseUntil)
+`, taskID, platformInstanceID, leaseMicros)
 	if err != nil {
 		return err
 	}
@@ -354,7 +363,7 @@ RETURNING `+taskSelectColumns, taskID, workerInstanceID, platformInstanceID)
 		if err != nil {
 			return err
 		}
-		if err := insertEvent(ctx, tx, t.ID, "dispatch", nextEventSeq(ctx, tx, t.ID), nil, nil, "", "", workerInstanceID, ""); err != nil {
+		if err := insertNextEvent(ctx, tx, t.ID, "dispatch", nil, nil, "", "", workerInstanceID, ""); err != nil {
 			return err
 		}
 		task = t
@@ -376,7 +385,7 @@ RETURNING `+taskSelectColumns, taskID, platformInstanceID)
 		if err != nil {
 			return err
 		}
-		if err := insertEvent(ctx, tx, t.ID, "status_transition", nextEventSeq(ctx, tx, t.ID), nil, nil, "starting", "running", t.WorkerInstanceID, ""); err != nil {
+		if err := insertNextEvent(ctx, tx, t.ID, "status_transition", nil, nil, "starting", "running", t.WorkerInstanceID, ""); err != nil {
 			return err
 		}
 		task = t
@@ -388,8 +397,12 @@ RETURNING `+taskSelectColumns, taskID, platformInstanceID)
 // RecordChunkEvent stores bounded chunk metadata only (no text).
 func (s *Store) RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
+		var lockedTaskID string
+		if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&lockedTaskID); err != nil {
+			return err
+		}
 		bc := byteCount
-		return insertEvent(ctx, tx, taskID, "chunk", nextEventSeq(ctx, tx, taskID), &bc, strPtr(digest), "", "", "", "")
+		return insertNextEvent(ctx, tx, lockedTaskID, "chunk", &bc, strPtr(digest), "", "", "", "")
 	})
 }
 
@@ -443,7 +456,7 @@ RETURNING `+taskSelectColumns, taskID)
 				if err != nil {
 					return err
 				}
-				if err := insertEvent(ctx, tx, t.ID, "cancel_request", nextEventSeq(ctx, tx, t.ID), nil, nil, string(t.Status), string(t.Status), t.WorkerInstanceID, "TASK_CANCELLED"); err != nil {
+				if err := insertNextEvent(ctx, tx, t.ID, "cancel_request", nil, nil, string(t.Status), string(t.Status), t.WorkerInstanceID, "TASK_CANCELLED"); err != nil {
 					return err
 				}
 			}
@@ -460,7 +473,7 @@ RETURNING `+taskSelectColumns, taskID)
 				if err != nil {
 					return err
 				}
-				if err := insertEvent(ctx, tx, t.ID, "cancel_request", nextEventSeq(ctx, tx, t.ID), nil, nil, string(t.Status), string(t.Status), t.WorkerInstanceID, "TASK_CANCELLED"); err != nil {
+				if err := insertNextEvent(ctx, tx, t.ID, "cancel_request", nil, nil, string(t.Status), string(t.Status), t.WorkerInstanceID, "TASK_CANCELLED"); err != nil {
 					return err
 				}
 			}
@@ -519,6 +532,9 @@ FOR UPDATE
 
 // PrepareCheckpoint inserts workspace_snapshots(state=writing) with generation token.
 func (s *Store) PrepareCheckpoint(ctx context.Context, taskID, platformInstanceID, stagingRef string, maxBundleBytes uint64) (snapshotID, token string, generation int64, err error) {
+	if maxBundleBytes == 0 || maxBundleBytes > uint64(math.MaxInt64) {
+		return "", "", 0, fmt.Errorf("max bundle bytes must be between 1 and %d", int64(math.MaxInt64))
+	}
 	err = s.withTx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE`, taskID)
 		t, err := scanTask(row)
@@ -543,12 +559,12 @@ SELECT COALESCE(MAX(generation), 0) + 1 FROM workspace_snapshots WHERE workspace
 		if _, err := tx.Exec(ctx, `
 INSERT INTO workspace_snapshots (
   id, workspace_id, task_id, schema_version, state, generation,
-  lease_owner, lease_until, token, staging_ref, result_bytes
+  lease_owner, lease_until, token, staging_ref, max_bundle_bytes
 ) VALUES (
   $1, $2::uuid, $3, 'genericagent.snapshot.v1', 'writing', $4,
   $5, $6, $7, $8, $9
 )
-`, sid, t.WorkspaceID, t.ID, gen, platformInstanceID, leaseUntil, tok, stagingRef, int(maxBundleBytes)); err != nil {
+`, sid, t.WorkspaceID, t.ID, gen, platformInstanceID, leaseUntil, tok, stagingRef, int64(maxBundleBytes)); err != nil {
 			return err
 		}
 		snapshotID = sid.String()
@@ -560,12 +576,16 @@ INSERT INTO workspace_snapshots (
 }
 
 // LoadSnapshotToken returns writing snapshot metadata for token validation.
-func (s *Store) LoadSnapshotToken(ctx context.Context, snapshotID, token string) (workspaceID, taskID, stagingRef, leaseOwner string, leaseUntil time.Time, generation int64, state string, err error) {
+func (s *Store) LoadSnapshotToken(ctx context.Context, snapshotID, token string) (workspaceID, taskID, stagingRef, leaseOwner string, leaseUntil time.Time, generation int64, maxBundleBytes uint64, state string, err error) {
+	var maxBundle int64
 	err = s.pool.QueryRow(ctx, `
 SELECT workspace_id::text, task_id, COALESCE(staging_ref,''), COALESCE(lease_owner,''),
-       COALESCE(lease_until, timezone('utc', now())), generation, state
+       COALESCE(lease_until, timezone('utc', now())), generation, max_bundle_bytes, state
 FROM workspace_snapshots WHERE id = $1::uuid AND token = $2
-`, snapshotID, token).Scan(&workspaceID, &taskID, &stagingRef, &leaseOwner, &leaseUntil, &generation, &state)
+`, snapshotID, token).Scan(&workspaceID, &taskID, &stagingRef, &leaseOwner, &leaseUntil, &generation, &maxBundle, &state)
+	if err == nil {
+		maxBundleBytes = uint64(maxBundle)
+	}
 	return
 }
 
@@ -583,6 +603,25 @@ func (s *Store) CompleteSucceeded(ctx context.Context, taskID, platformInstanceI
 		}
 		if t.Status.IsTerminal() {
 			return fmt.Errorf("complete: already terminal %s", t.Status)
+		}
+		if t.CancelRequestedAt != nil {
+			if _, err := tx.Exec(ctx, `
+UPDATE workspace_snapshots SET
+  state = 'quarantined',
+  lease_owner = NULL,
+  lease_until = NULL,
+  staging_ref = NULL
+WHERE id = $1::uuid AND task_id = $2 AND state = 'writing'
+`, snapshotID, taskID); err != nil {
+				return err
+			}
+			tt, err := finalizeTerminal(ctx, tx, t, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+				"TASK_INTERRUPTED", "task interrupted after accepted cancellation", "", "", "")
+		if err != nil {
+				return err
+			}
+			task = tt
+			return nil
 		}
 		tag, err := tx.Exec(ctx, `
 UPDATE workspace_snapshots SET
@@ -628,7 +667,7 @@ RETURNING `+taskSelectColumns, taskID, snapshotID, checksum, resultRef, resultDi
 		if err != nil {
 			return err
 		}
-		if err := insertEvent(ctx, tx, tt.ID, "status_transition", nextEventSeq(ctx, tx, tt.ID), nil, strPtr(resultDigest), string(t.Status), "succeeded", tt.WorkerInstanceID, ""); err != nil {
+		if err := insertNextEvent(ctx, tx, tt.ID, "status_transition", nil, strPtr(resultDigest), string(t.Status), "succeeded", tt.WorkerInstanceID, ""); err != nil {
 			return err
 		}
 		if err := insertDelivery(ctx, tx, tt.ID, domain.DeliveryTaskComplete, resultRef, resultDigest, "", "", ""); err != nil {
@@ -825,7 +864,7 @@ RETURNING `+taskSelectColumns, t.ID, string(status), code, message, traceID, res
 	if err != nil {
 		return domain.Task{}, err
 	}
-	if err := insertEvent(ctx, tx, tt.ID, "status_transition", nextEventSeq(ctx, tx, tt.ID), nil, nil, string(t.Status), string(status), tt.WorkerInstanceID, code); err != nil {
+	if err := insertNextEvent(ctx, tx, tt.ID, "status_transition", nil, nil, string(t.Status), string(status), tt.WorkerInstanceID, code); err != nil {
 		return domain.Task{}, err
 	}
 	if err := insertDelivery(ctx, tx, tt.ID, deliveryType, resultRef, resultDigest, code, message, traceID); err != nil {
@@ -855,10 +894,14 @@ INSERT INTO task_events (
 	return err
 }
 
-func nextEventSeq(ctx context.Context, tx pgx.Tx, taskID string) int64 {
-	var n int64
-	_ = tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence_no), -1) + 1 FROM task_events WHERE task_id = $1`, taskID).Scan(&n)
-	return n
+func insertNextEvent(ctx context.Context, tx pgx.Tx, taskID, eventType string, byteCount *int, digest *string, fromStatus, toStatus, worker, errCode string) error {
+	var sequence int64
+	if err := tx.QueryRow(ctx, `
+SELECT COALESCE(MAX(sequence_no), -1) + 1 FROM task_events WHERE task_id = $1
+`, taskID).Scan(&sequence); err != nil {
+		return err
+	}
+	return insertEvent(ctx, tx, taskID, eventType, sequence, byteCount, digest, fromStatus, toStatus, worker, errCode)
 }
 
 func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {

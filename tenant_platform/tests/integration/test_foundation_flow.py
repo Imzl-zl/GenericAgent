@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -112,12 +113,19 @@ def _reset_db() -> None:
             conn.commit()
 
 
-def _start_platform(tmp: Path, listen: str | None = None) -> tuple[subprocess.Popen, str, Path, Path]:
+def _start_platform(
+    tmp: Path,
+    listen: str | None = None,
+    *,
+    reset_db: bool = True,
+) -> tuple[subprocess.Popen, str, Path, Path, Path]:
+    tmp.mkdir(parents=True, exist_ok=True)
     if listen is None:
         listen = _free_loopback_addr()
     bin_path = _platform_bin(tmp)
     config_root = tmp / "config"
     runtime_root = tmp / "runtime"
+    log_path = tmp / "platform.log"
     config_root.mkdir()
     runtime_root.mkdir()
     env = os.environ.copy()
@@ -131,13 +139,15 @@ def _start_platform(tmp: Path, listen: str | None = None) -> tuple[subprocess.Po
     env["GA_WORKER_PYTHON"] = str(PYTHON)
     env["GA_WORKER_SRC"] = str(WORKER_SRC)
     env["GA_POLICY_FILE"] = str(POLICY_PATH)
-    _reset_db()
+    if reset_db:
+        _reset_db()
+    relative_policy = os.path.relpath(POLICY_PATH, BACKEND_GO)
     proc = subprocess.Popen(
         [
             str(bin_path),
             "--dev-loopback",
             "--policy-file",
-            str(POLICY_PATH),
+            relative_policy,
             "--claim-lease",
             "15s",
             "--listen",
@@ -162,6 +172,7 @@ def _start_platform(tmp: Path, listen: str | None = None) -> tuple[subprocess.Po
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
     )
     base = f"http://{listen}"
     deadline = time.time() + 45
@@ -169,39 +180,165 @@ def _start_platform(tmp: Path, listen: str | None = None) -> tuple[subprocess.Po
     while time.time() < deadline:
         if proc.poll() is not None:
             out = proc.stdout.read() if proc.stdout else ""
+            log_path.write_text(out, encoding="utf-8")
             raise AssertionError(f"platform exited early code={proc.returncode}\n{out}")
         try:
             status, body = _http_json("GET", base + "/healthz", token=None)
             if status == 200 and body.get("status") == "ok":
-                return proc, base, config_root, runtime_root
+                startup_line = proc.stdout.readline() if proc.stdout else ""
+                log_path.write_text(startup_line, encoding="utf-8")
+                return proc, base, config_root, runtime_root, log_path
             last = (status, body)
         except Exception as exc:  # noqa: BLE001
             last = exc
         time.sleep(0.2)
-    out = ""
     proc.kill()
-    if proc.stdout:
-        try:
-            out = proc.stdout.read()
-        except Exception:
-            pass
+    out = proc.stdout.read() if proc.stdout else ""
+    log_path.write_text(out, encoding="utf-8")
     raise AssertionError(f"platform failed to start; last={last}\n{out}")
 
 
-def _stop(proc: subprocess.Popen) -> str:
+def _stop(proc: subprocess.Popen, log_path: Path | None = None) -> str:
     if proc.poll() is not None:
         out = proc.stdout.read() if proc.stdout else ""
-        return out or ""
-    if os.name == "nt":
-        proc.terminate()
     else:
-        proc.send_signal(signal.SIGTERM)
-    try:
-        out, _ = proc.communicate(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out, _ = proc.communicate(timeout=5)
-    return out or ""
+        if os.name == "nt":
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            proc.send_signal(signal.SIGTERM)
+        try:
+            out, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate(timeout=5)
+    existing = ""
+    if log_path is not None and log_path.exists():
+        existing = log_path.read_text(encoding="utf-8")
+        log_path.write_text(existing + (out or ""), encoding="utf-8")
+    return existing + (out or "")
+
+
+def _platform_instance_id(log_path: Path) -> str:
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if log_path.exists():
+            match = re.search(r"instance_id=([0-9a-f-]{36})", log_path.read_text(encoding="utf-8"))
+            if match:
+                return match.group(1)
+        time.sleep(0.1)
+    raise AssertionError(f"platform instance id missing from {log_path}")
+
+
+def _seed_restart_rows(prior_instance: str) -> dict[str, str]:
+    import psycopg
+
+    ids = {
+        "expired": "restart-expired-task",
+        "queued": "restart-queued-task",
+        "live": "restart-live-task",
+    }
+    with psycopg.connect(TEST_DB) as conn:
+        dev_workspace = conn.execute(
+            "SELECT id::text FROM workspaces WHERE session_key=%s", (f"personal:{DEV_USER_ID}",)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO users (id, username, status) VALUES (2, 'restart-foreign', 'approved')"
+        )
+        foreign_workspace = "00000000-0000-4000-8000-000000000002"
+        conn.execute(
+            """
+            INSERT INTO workspaces (id, session_key, owner_user_id, kind, volume_id)
+            VALUES (%s::uuid, 'personal:2', 2, 'personal', 'restart-foreign-volume')
+            """,
+            (foreign_workspace,),
+        )
+        task_sql = """
+            INSERT INTO tasks (
+                id, workspace_id, session_key, session_sequence, requester_user_id,
+                source, source_instance_id, message_id, message_idempotency_key,
+                prompt, persona_snapshot, tool_policy_version, prompt_bytes, persona_bytes,
+                status, claim_owner, claimed_at, claim_lease_until,
+                worker_instance_id, worker_dispatch_started_at
+            ) VALUES (
+                %s, %s::uuid, %s, %s, %s,
+                'web', %s, %s, %s,
+                %s, '[]'::jsonb, 'foundation.no-host-tools.v1', %s, 2,
+                %s, %s, %s, %s, %s, %s
+            )
+        """
+        conn.execute(
+            task_sql,
+            (
+                ids["expired"], dev_workspace, f"personal:{DEV_USER_ID}", 1, int(DEV_USER_ID),
+                "restart-expired", "restart-expired", "restart-expired", "expired prior owner",
+                len("expired prior owner"), "running", prior_instance,
+                time.strftime("%Y-%m-%d %H:%M:%S+00", time.gmtime(time.time() - 120)),
+                time.strftime("%Y-%m-%d %H:%M:%S+00", time.gmtime(time.time() - 60)),
+                "prior-worker", time.strftime("%Y-%m-%d %H:%M:%S+00", time.gmtime(time.time() - 120)),
+            ),
+        )
+        conn.execute(
+            task_sql,
+            (
+                ids["queued"], dev_workspace, f"personal:{DEV_USER_ID}", 2, int(DEV_USER_ID),
+                "restart-queued", "restart-queued", "restart-queued", "complete after restart",
+                len("complete after restart"), "queued", None, None, None, None, None,
+            ),
+        )
+        conn.execute(
+            task_sql,
+            (
+                ids["live"], foreign_workspace, "personal:2", 1, 2,
+                "restart-live", "restart-live", "restart-live", "foreign live task",
+                len("foreign live task"), "starting", "foreign-live-owner",
+                time.strftime("%Y-%m-%d %H:%M:%S+00", time.gmtime()),
+                time.strftime("%Y-%m-%d %H:%M:%S+00", time.gmtime(time.time() + 600)),
+                "foreign-worker", time.strftime("%Y-%m-%d %H:%M:%S+00", time.gmtime()),
+            ),
+        )
+        conn.commit()
+    return ids
+
+
+def _restart_row_facts(ids: dict[str, str]) -> dict[str, object]:
+    import psycopg
+
+    with psycopg.connect(TEST_DB) as conn:
+        expired = conn.execute(
+            "SELECT status FROM tasks WHERE id=%s", (ids["expired"],)
+        ).fetchone()
+        live = conn.execute(
+            "SELECT status, claim_owner FROM tasks WHERE id=%s", (ids["live"],)
+        ).fetchone()
+        queued = conn.execute(
+            "SELECT status FROM tasks WHERE id=%s", (ids["queued"],)
+        ).fetchone()
+
+        def count(sql: str, task_id: str) -> int:
+            return conn.execute(sql, (task_id,)).fetchone()[0]
+
+        return {
+            "expired_status": expired[0],
+            "expired_interrupt_deliveries": count(
+                "SELECT count(*) FROM task_deliveries WHERE task_id=%s AND delivery_type='task_interrupted'",
+                ids["expired"],
+            ),
+            "expired_dispatch_events": count(
+                "SELECT count(*) FROM task_events WHERE task_id=%s AND event_type='dispatch'",
+                ids["expired"],
+            ),
+            "live_status": live[0],
+            "live_owner": live[1],
+            "queued_status": queued[0],
+            "queued_dispatch_events": count(
+                "SELECT count(*) FROM task_events WHERE task_id=%s AND event_type='dispatch'",
+                ids["queued"],
+            ),
+            "queued_complete_deliveries": count(
+                "SELECT count(*) FROM task_deliveries WHERE task_id=%s AND delivery_type='task_complete'",
+                ids["queued"],
+            ),
+        }
 
 
 def _poll_status(base: str, task_id: str, want: set[str], timeout: float = 120.0) -> dict:
@@ -219,7 +356,7 @@ def _poll_status(base: str, task_id: str, want: set[str], timeout: float = 120.0
 
 def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
     """Submit → succeeded; cancel second; recovery leaves unexpired foreign rows."""
-    proc, base, _, _ = _start_platform(tmp_path)
+    proc, base, _, _, log_path = _start_platform(tmp_path)
     try:
         session = f"personal:{DEV_USER_ID}"
         code, body = _http_json(
@@ -311,7 +448,7 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         assert hcode >= 400, hbody
         assert hbody.get("code")
     finally:
-        _stop(proc)
+        _stop(proc, log_path)
 
 
 def test_platform_requires_dev_loopback_for_local_coordinator(tmp_path: Path):
@@ -346,3 +483,40 @@ def test_policy_digest_matches_checked_in_file():
     digest = "sha256:" + hashlib.sha256(POLICY_PATH.read_bytes()).hexdigest()
     assert digest.startswith("sha256:")
     assert len(digest) == len("sha256:") + 64
+
+def test_restart_recovers_expired_preserves_live_and_runs_queued_once(tmp_path: Path):
+    first_proc, _, _, _, first_log = _start_platform(tmp_path / "first")
+    try:
+        first_instance = _platform_instance_id(first_log)
+    finally:
+        _stop(first_proc, first_log)
+
+    seeded = _seed_restart_rows(first_instance)
+    second_proc, base, _, _, second_log = _start_platform(
+        tmp_path / "second", reset_db=False
+    )
+    try:
+        second_instance = _platform_instance_id(second_log)
+        assert second_instance != first_instance
+
+        expired = _poll_status(base, seeded["expired"], {"interrupted"}, timeout=30)
+        assert expired["status"] == "interrupted"
+        queued = _poll_status(base, seeded["queued"], {"succeeded", "failed"}, timeout=150)
+        assert queued["status"] == "succeeded", queued
+        live = _poll_status(base, seeded["live"], {"starting"}, timeout=10)
+        assert live["status"] == "starting"
+
+        before = _restart_row_facts(seeded)
+        time.sleep(1.5)
+        after = _restart_row_facts(seeded)
+        assert before == after
+        assert after["expired_status"] == "interrupted"
+        assert after["expired_interrupt_deliveries"] == 1
+        assert after["expired_dispatch_events"] == 0
+        assert after["live_status"] == "starting"
+        assert after["live_owner"] == "foreign-live-owner"
+        assert after["queued_status"] == "succeeded"
+        assert after["queued_dispatch_events"] == 1
+        assert after["queued_complete_deliveries"] == 1
+    finally:
+        _stop(second_proc, second_log)

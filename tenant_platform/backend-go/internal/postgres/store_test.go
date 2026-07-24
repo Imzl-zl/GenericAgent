@@ -276,3 +276,166 @@ SELECT byte_count, digest FROM task_events WHERE task_id=$1 AND event_type='chun
 		t.Fatalf("chunk meta bc=%d dig=%s", bc, dig)
 	}
 }
+
+func TestCompleteSucceededMapsAcceptedCancelToInterruptedWithoutPublishingSnapshot(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
+		Source: "web", SourceInstanceID: "complete-cancel", MessageID: "complete-cancel",
+		Prompt: "race", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "owner-cancel", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.MarkDispatchStarted(ctx, claimed.ID, "owner-cancel", "worker-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, claimed.ID, "owner-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	snapshotID, _, _, err := store.PrepareCheckpoint(ctx, task.ID, "owner-cancel", "staging", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, needWorker, err := store.CancelTask(ctx, task.ID, dev.UserID); err != nil || !needWorker {
+		t.Fatalf("cancel: needWorker=%v err=%v", needWorker, err)
+	}
+	final, err := store.CompleteSucceeded(ctx, task.ID, "owner-cancel", snapshotID,
+		"snapshot:race", "sha256:bundle", "result:race", "sha256:result", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != domain.TaskInterrupted {
+		t.Fatalf("status=%s want interrupted", final.Status)
+	}
+	var snapshotState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM workspace_snapshots WHERE id=$1::uuid`, snapshotID).Scan(&snapshotState); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotState == "committed" {
+		t.Fatal("cancelled task published its checkpoint")
+	}
+	var currentSnapshot *string
+	if err := pool.QueryRow(ctx, `SELECT current_snapshot_id::text FROM workspaces WHERE id=$1::uuid`, task.WorkspaceID).Scan(&currentSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if currentSnapshot != nil {
+		t.Fatalf("workspace current snapshot=%s want null", *currentSnapshot)
+	}
+	if _, err := store.GetDelivery(ctx, task.ID, domain.DeliveryTaskInterrupted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDelivery(ctx, task.ID, domain.DeliveryTaskComplete); err == nil {
+		t.Fatal("unexpected task_complete delivery")
+	}
+}
+
+func TestRecordChunkEventSerializesConcurrentSequenceAllocation(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
+		Source: "web", SourceInstanceID: "events", MessageID: "events",
+		Prompt: "events", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const writers = 64
+	start := make(chan struct{})
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- store.RecordChunkEvent(ctx, task.ID, 1, "sha256:chunk")
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("record chunk event: %v", err)
+		}
+	}
+	var total, distinct int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*), count(DISTINCT sequence_no) FROM task_events WHERE task_id=$1 AND event_type='chunk'
+`, task.ID).Scan(&total, &distinct); err != nil {
+		t.Fatal(err)
+	}
+	if total != writers || distinct != writers {
+		t.Fatalf("events total=%d distinct_sequences=%d want=%d", total, distinct, writers)
+	}
+}
+
+func TestEnsureSchemaUpgradesExistingSnapshotMaxBundleColumn(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
+		Source: "web", SourceInstanceID: "upgrade", MessageID: "upgrade",
+		Prompt: "upgrade", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "upgrade-owner", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if _, err := pool.Exec(ctx, `
+ALTER TABLE workspace_snapshots DROP COLUMN max_bundle_bytes
+`); err != nil {
+		t.Fatal(err)
+	}
+	const priorPreparedLimit = 777
+	if _, err := pool.Exec(ctx, `
+INSERT INTO workspace_snapshots (
+  id, workspace_id, task_id, schema_version, state, generation,
+  lease_owner, lease_until, token, staging_ref, result_bytes
+) VALUES (
+  '00000000-0000-4000-8000-000000000777', $1::uuid, $2,
+  'genericagent.snapshot.v1', 'writing', 1, $3,
+  timezone('utc', now()) + interval '2 minutes', 'old-token', 'old-staging', $4
+)
+`, task.WorkspaceID, claimed.ID, "upgrade-owner", priorPreparedLimit); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSchema(ctx, pool, DefaultMigrationPath()); err != nil {
+		t.Fatal(err)
+	}
+	var upgradedLimit int
+	if err := pool.QueryRow(ctx, `
+SELECT max_bundle_bytes FROM workspace_snapshots
+WHERE id='00000000-0000-4000-8000-000000000777'::uuid
+`).Scan(&upgradedLimit); err != nil {
+		t.Fatal(err)
+	}
+	if upgradedLimit != priorPreparedLimit {
+		t.Fatalf("max_bundle_bytes=%d want %d", upgradedLimit, priorPreparedLimit)
+	}
+}
