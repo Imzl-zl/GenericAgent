@@ -668,6 +668,13 @@ def _cancel_queued_task(base: str, session: str, unique: str) -> dict[str, Any]:
     return {"task_id": submitted["task_id"], "status": task["status"], "elapsed": elapsed}
 
 
+def _sample_worker_after_terminal(proc: subprocess.Popen[Any], known_children: set[int]) -> int:
+    children, rss = _sample_descendants(proc.pid)
+    known_children.update(children)
+    _require(bool(children) and rss > 0, "Worker process was not measurable")
+    return rss
+
+
 def _complete_success(
     base: str,
     database_url: str,
@@ -697,8 +704,7 @@ def _complete_success(
     _require(bundle.is_file(), "committed checkpoint bundle is missing")
     raw = bundle.read_bytes()
     _require("sha256:" + hashlib.sha256(raw).hexdigest() == facts["checkpoint_digest"], "committed checkpoint digest mismatch")
-    children, rss = _sample_descendants(proc.pid)
-    known_children.update(children)
+    rss = _sample_worker_after_terminal(proc, known_children)
     _require(fixture.server.valid_request_count == 1, "cancelled task reached the OpenAI fixture")
     return {"task": task, "elapsed": elapsed, "facts": facts, "bundle_bytes": len(raw), "rss": rss}
 

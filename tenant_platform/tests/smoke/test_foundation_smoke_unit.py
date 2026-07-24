@@ -125,3 +125,13 @@ def test_submit_dedupe_does_not_run_rss_sampler_before_fixture_release(monkeypat
     assert result["task_id"] == "task-1"
     assert sampler_calls == 0
     assert elapsed < 0.1
+
+def test_post_terminal_worker_sample_rejects_empty_descendants(monkeypatch) -> None:
+    smoke = _load_smoke()
+    monkeypatch.setattr(smoke, "_sample_descendants", lambda _pid: (set(), 0))
+    known_children: set[int] = set()
+
+    with pytest.raises(smoke.SmokeError, match="Worker process was not measurable"):
+        smoke._sample_worker_after_terminal(SimpleNamespace(pid=7), known_children)
+
+    assert known_children == set()
