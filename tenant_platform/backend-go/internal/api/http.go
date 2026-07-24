@@ -1,0 +1,301 @@
+// Package api provides the loopback-only foundation HTTP surface.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
+)
+
+// Server is the loopback HTTP API.
+type Server struct {
+	svc        application.TaskService
+	registry   policy.Registry
+	devToken   string
+	devUserID  int64
+	sessionKey string
+	mux        *http.ServeMux
+}
+
+// ServerConfig configures the foundation API.
+type ServerConfig struct {
+	Service    application.TaskService
+	Registry   policy.Registry
+	DevToken   string
+	DevUserID  int64
+	SessionKey string
+}
+
+// NewServer constructs handlers. Bind address enforcement is the caller's responsibility (127.0.0.1).
+func NewServer(cfg ServerConfig) (*Server, error) {
+	if cfg.Service == nil || cfg.Registry == nil {
+		return nil, fmt.Errorf("service and registry required")
+	}
+	if strings.TrimSpace(cfg.DevToken) == "" {
+		return nil, fmt.Errorf("dev token required")
+	}
+	if cfg.DevUserID <= 0 {
+		return nil, fmt.Errorf("dev user id required")
+	}
+	if strings.TrimSpace(cfg.SessionKey) == "" {
+		cfg.SessionKey = fmt.Sprintf("personal:%d", cfg.DevUserID)
+	}
+	s := &Server{
+		svc:        cfg.Service,
+		registry:   cfg.Registry,
+		devToken:   cfg.DevToken,
+		devUserID:  cfg.DevUserID,
+		sessionKey: cfg.SessionKey,
+		mux:        http.NewServeMux(),
+	}
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.auth(s.handleCreateTask))
+	s.mux.HandleFunc("GET /v1/tasks/{task_id}", s.auth(s.handleGetTask))
+	s.mux.HandleFunc("GET /v1/tasks/{task_id}/result", s.auth(s.handleGetResult))
+	s.mux.HandleFunc("POST /v1/tasks/{task_id}/cancel", s.auth(s.handleCancel))
+	return s, nil
+}
+
+// Handler returns the root handler.
+func (s *Server) Handler() http.Handler { return s.mux }
+
+// ListenAndServe binds only loopback addresses.
+func (s *Server) ListenAndServe(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("platform API must bind loopback, got %s", addr)
+	}
+	return http.ListenAndServe(addr, s.mux)
+}
+
+func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok := r.Header.Get("X-Platform-Dev-Token")
+		if tok == "" || tok != s.devToken {
+			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid X-Platform-Dev-Token", traceID())
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type createTaskBody struct {
+	MessageID         string   `json:"message_id"`
+	SourceInstanceID  string   `json:"source_instance_id"`
+	Prompt            string   `json:"prompt"`
+	Source            string   `json:"source"`
+	PersonaSnapshot   []string `json:"persona_snapshot"`
+	ToolPolicyVersion string   `json:"tool_policy_version"`
+}
+
+func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	sessionKey := r.PathValue("session_key")
+	if sessionKey != s.sessionKey {
+		writeErr(w, http.StatusBadRequest, "SESSION_MISMATCH", "session_key must match bootstrapped development workspace", tid)
+		return
+	}
+	var body createTaskBody
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+		return
+	}
+	if err := validateCreate(body); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
+		return
+	}
+	if _, err := s.registry.Resolve(application.CapabilityVersion, body.ToolPolicyVersion); err != nil {
+		writeErr(w, http.StatusBadRequest, "POLICY_REJECTED", err.Error(), tid)
+		return
+	}
+	if len([]byte(body.Prompt)) > postgres.MaxPromptBytes {
+		writeErr(w, http.StatusBadRequest, "PROMPT_TOO_LARGE", "prompt exceeds limit", tid)
+		return
+	}
+	task, err := s.svc.SubmitTask(r.Context(), domain.SubmitTaskCommand{
+		SessionKey:        sessionKey,
+		RequesterUserID:   s.devUserID, // derived from bootstrap, not request JSON
+		Source:            body.Source,
+		SourceInstanceID:  body.SourceInstanceID,
+		MessageID:         body.MessageID,
+		Prompt:            body.Prompt,
+		PersonaSnapshot:   body.PersonaSnapshot,
+		ToolPolicyVersion: body.ToolPolicyVersion,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "SUBMIT_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"task_id": task.ID,
+		"status":  string(task.Status),
+	})
+}
+
+func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	taskID := r.PathValue("task_id")
+	task, err := s.svc.GetTask(r.Context(), taskID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "NOT_FOUND", err.Error(), tid)
+		return
+	}
+	out := map[string]any{
+		"task_id":     task.ID,
+		"session_key": task.SessionKey,
+		"status":      string(task.Status),
+	}
+	if task.SnapshotID != "" {
+		out["snapshot_id"] = task.SnapshotID
+	}
+	if task.SnapshotChecksum != "" {
+		out["snapshot_checksum"] = task.SnapshotChecksum
+	}
+	if task.ResultRef != "" {
+		out["result_ref"] = task.ResultRef
+	}
+	if task.ResultDigest != "" {
+		out["result_digest"] = task.ResultDigest
+	}
+	if task.TerminalErrorCode != "" {
+		out["terminal_error"] = map[string]string{
+			"code":         task.TerminalErrorCode,
+			"user_message": task.TerminalErrorMessage,
+			"trace_id":     task.TerminalErrorTraceID,
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	taskID := r.PathValue("task_id")
+	// Optional query result_ref must match opaque stored ref when provided; never a host path.
+	if ref := r.URL.Query().Get("result_ref"); ref != "" {
+		if strings.ContainsAny(ref, `/\`) || strings.Contains(ref, "..") {
+			writeErr(w, http.StatusBadRequest, "INVALID_RESULT_REF", "path-like result_ref rejected", tid)
+			return
+		}
+	}
+	payload, err := s.svc.ReadResult(r.Context(), taskID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "RESULT_UNAVAILABLE", err.Error(), tid)
+		return
+	}
+	if q := r.URL.Query().Get("result_ref"); q != "" && q != payload.Ref {
+		writeErr(w, http.StatusBadRequest, "RESULT_REF_MISMATCH", "result_ref does not match committed ref", tid)
+		return
+	}
+	// Return payload as JSON object when possible, else string body.
+	var body any
+	var asMap map[string]any
+	if err := json.Unmarshal(payload.Body, &asMap); err == nil {
+		body = asMap
+	} else {
+		body = map[string]any{"text": string(payload.Body)}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result_ref":    payload.Ref,
+		"result_digest": payload.Digest,
+		"payload":       body,
+	})
+}
+
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	taskID := r.PathValue("task_id")
+	task, err := s.svc.CancelTask(r.Context(), taskID, s.devUserID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "CANCEL_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accepted": true,
+		"status":   string(task.Status),
+	})
+}
+
+func validateCreate(b createTaskBody) error {
+	if strings.TrimSpace(b.MessageID) == "" {
+		return fmt.Errorf("message_id is required")
+	}
+	if strings.TrimSpace(b.SourceInstanceID) == "" {
+		return fmt.Errorf("source_instance_id is required")
+	}
+	if strings.TrimSpace(b.Prompt) == "" {
+		return fmt.Errorf("prompt is required")
+	}
+	if strings.TrimSpace(b.Source) == "" {
+		return fmt.Errorf("source is required")
+	}
+	if b.PersonaSnapshot == nil {
+		return fmt.Errorf("persona_snapshot is required")
+	}
+	if strings.TrimSpace(b.ToolPolicyVersion) == "" {
+		return fmt.Errorf("tool_policy_version is required")
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, status int, code, message, tid string) {
+	writeJSON(w, status, map[string]any{
+		"code":     code,
+		"message":  message,
+		"trace_id": tid,
+	})
+}
+
+func traceID() string {
+	return uuid.NewString()
+}
+
+// ServeContext starts the server and shuts down on ctx cancel.
+func ServeContext(ctx context.Context, addr string, h http.Handler) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("platform API must bind loopback, got %s", addr)
+	}
+	srv := &http.Server{Addr: addr, Handler: h}
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+	select {
+	case <-ctx.Done():
+		shctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shctx)
+		return ctx.Err()
+	case err := <-errCh:
+		return err
+	}
+}
