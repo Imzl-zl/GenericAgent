@@ -692,6 +692,12 @@ func (s *Store) CompleteFailedTerminal(ctx context.Context, taskID string, statu
 			task = t
 			return nil
 		}
+		if t.CancelRequestedAt != nil && t.WorkerDispatchStartedAt != nil {
+			status = domain.TaskInterrupted
+			deliveryType = domain.DeliveryTaskInterrupted
+			code = "TASK_INTERRUPTED"
+			message = "task interrupted after accepted cancellation"
+		}
 		tt, err := finalizeTerminal(ctx, tx, t, status, deliveryType, code, message, "", "", traceID)
 		if err != nil {
 			return err

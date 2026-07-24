@@ -65,6 +65,33 @@ type cancelCall struct {
 	err  error
 }
 
+type dispatchHeartbeat struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+	mu       sync.Mutex
+	err      error
+}
+
+func (h *dispatchHeartbeat) setError(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.err == nil {
+		h.err = err
+	}
+}
+
+func (h *dispatchHeartbeat) Stop() error {
+	h.stopOnce.Do(func() { close(h.stop) })
+	<-h.done
+	h.cancel()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.err
+}
+
 type scheduler struct {
 	cfg    SchedulerConfig
 	mu     sync.Mutex
@@ -210,7 +237,7 @@ func (s *scheduler) CancelWorker(ctx context.Context, task domain.Task) error {
 	return call.err
 }
 
-func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
+func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr error) {
 	// Re-check under store: may have been cancelled before dispatch.
 	cur, err := s.cfg.Store.GetTask(ctx, task.ID)
 	if err != nil {
@@ -226,6 +253,24 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 	if cur.Status != domain.TaskStarting {
 		return nil
 	}
+	heartbeat, err := s.startDispatchHeartbeat(ctx, task)
+	if err != nil {
+		latest, getErr := s.cfg.Store.GetTask(ctx, task.ID)
+		if getErr == nil && latest.Status.IsTerminal() {
+			return nil
+		}
+		return err
+	}
+	defer func() {
+		if err := heartbeat.Stop(); err != nil {
+			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = s.CancelWorker(cancelCtx, task)
+			cancel()
+			returnErr = fmt.Errorf("claim heartbeat: %w", err)
+		}
+	}()
+	ctx = heartbeat.ctx
+
 
 	client, err := s.ensureWorker(ctx, task.SessionKey)
 	if err != nil {
@@ -288,11 +333,6 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 	if _, err := s.cfg.Store.MarkRunning(ctx, task.ID, s.cfg.PlatformInstanceID); err != nil {
 		return err
 	}
-	if err := s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease); err != nil {
-		releaseWorkerCall()
-		_ = s.CancelWorker(ctx, task)
-		return fmt.Errorf("claim heartbeat: %w", err)
-	}
 
 	// Round-trip durable envelope from PostgreSQL (never scheduler memory).
 	taskRow, err := s.cfg.Store.GetTask(ctx, task.ID)
@@ -327,17 +367,6 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 	defer cancelExecute()
 	events, errs := client.ExecuteTask(executeCtx, req)
 	releaseWorkerCall()
-	if err := s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease); err != nil {
-		cancelExecute()
-		_ = s.CancelWorker(ctx, task)
-		return fmt.Errorf("claim heartbeat after stream start: %w", err)
-	}
-	heartbeatEvery := s.cfg.ClaimLease / 3
-	if heartbeatEvery <= 0 {
-		heartbeatEvery = s.cfg.ClaimLease
-	}
-	heartbeat := time.NewTicker(heartbeatEvery)
-	defer heartbeat.Stop()
 	var terminal *workerv1.Terminal
 	var streamErr error
 	eventsOpen, errsOpen := true, true
@@ -345,12 +374,6 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-heartbeat.C:
-			if err := s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease); err != nil {
-				cancelExecute()
-				_ = s.CancelWorker(ctx, task)
-				return fmt.Errorf("claim heartbeat: %w", err)
-			}
 		case ev, ok := <-events:
 			if !ok {
 				eventsOpen = false
@@ -491,6 +514,45 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 	}
 	_ = s.KickSession(ctx, task.SessionKey)
 	return nil
+}
+
+func (s *scheduler) startDispatchHeartbeat(parent context.Context, task domain.Task) (*dispatchHeartbeat, error) {
+	ctx, cancel := context.WithCancel(parent)
+	if err := s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease); err != nil {
+		cancel()
+		return nil, err
+	}
+	heartbeat := &dispatchHeartbeat{
+		ctx: ctx, cancel: cancel, stop: make(chan struct{}), done: make(chan struct{}),
+	}
+	interval := s.cfg.ClaimLease / 3
+	if interval <= 0 {
+		interval = s.cfg.ClaimLease
+	}
+	go func() {
+		defer close(heartbeat.done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeat.stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := s.cfg.Store.HeartbeatClaim(ctx, task.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease); err != nil {
+					current, getErr := s.cfg.Store.GetTask(ctx, task.ID)
+					if getErr == nil && current.Status.IsTerminal() {
+						return
+					}
+					heartbeat.setError(err)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return heartbeat, nil
 }
 
 func (s *scheduler) ensureWorker(ctx context.Context, sessionKey string) (workerclient.WorkerClient, error) {
