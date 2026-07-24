@@ -29,6 +29,18 @@ const (
 	TaskInterrupted TaskStatus = "interrupted"
 )
 
+// Source values are the protocol-level origins allowed for task submission
+// (architecture §4.2: wechat|web).
+const (
+	SourceWechat = "wechat"
+	SourceWeb    = "web"
+)
+
+// IsValidSource reports whether s is an allowed task source.
+func IsValidSource(s string) bool {
+	return s == SourceWechat || s == SourceWeb
+}
+
 // Task is the durable task envelope stored in PostgreSQL.
 type Task struct {
 	ID                    string

@@ -9,7 +9,6 @@ import (
 	"math"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -140,8 +139,7 @@ func (s *Store) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (d
 	if err := validateSubmit(cmd); err != nil {
 		return domain.Task{}, err
 	}
-	promptBytes := utf8.RuneCountInString(cmd.Prompt) // use byte size for storage limit
-	promptBytes = len([]byte(cmd.Prompt))
+	promptBytes := len([]byte(cmd.Prompt))
 	personaRaw, personaBytes, err := encodePersona(cmd.PersonaSnapshot)
 	if err != nil {
 		return domain.Task{}, err
@@ -531,9 +529,18 @@ FOR UPDATE
 }
 
 // PrepareCheckpoint inserts workspace_snapshots(state=writing) with generation token.
-func (s *Store) PrepareCheckpoint(ctx context.Context, taskID, platformInstanceID, stagingRef string, maxBundleBytes uint64) (snapshotID, token string, generation int64, err error) {
+// StagingRefFunc computes the token-scoped staging reference inside the same
+// transaction that inserts the workspace_snapshots row, so the DB-stored ref
+// and the ref returned to the caller can never diverge (plan Task 5: token and
+// staging_ref must be created atomically).
+type StagingRefFunc func(snapshotID, token string, generation int64) string
+
+func (s *Store) PrepareCheckpoint(ctx context.Context, taskID, platformInstanceID string, stagingRefFor StagingRefFunc, maxBundleBytes uint64) (snapshotID, token string, generation int64, err error) {
 	if maxBundleBytes == 0 || maxBundleBytes > uint64(math.MaxInt64) {
 		return "", "", 0, fmt.Errorf("max bundle bytes must be between 1 and %d", int64(math.MaxInt64))
+	}
+	if stagingRefFor == nil {
+		return "", "", 0, fmt.Errorf("stagingRefFor callback is required")
 	}
 	err = s.withTx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE`, taskID)
@@ -555,6 +562,9 @@ SELECT COALESCE(MAX(generation), 0) + 1 FROM workspace_snapshots WHERE workspace
 		}
 		sid := uuid.New()
 		tok := fmt.Sprintf("ckpt-%s-g%d-%s", taskID, gen, uuid.NewString())
+		// Resolve the token-scoped staging ref before INSERT so the row stores
+		// the final ref in the same transaction (no out-of-band rewrite).
+		stagingRef := stagingRefFor(sid.String(), tok, gen)
 		leaseUntil := time.Now().UTC().Add(2 * time.Minute)
 		if _, err := tx.Exec(ctx, `
 INSERT INTO workspace_snapshots (
@@ -617,7 +627,7 @@ WHERE id = $1::uuid AND task_id = $2 AND state = 'writing'
 			}
 			tt, err := finalizeTerminal(ctx, tx, t, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 				"TASK_INTERRUPTED", "task interrupted after accepted cancellation", "", "", "")
-		if err != nil {
+			if err != nil {
 				return err
 			}
 			task = tt
@@ -928,6 +938,9 @@ func validateSubmit(cmd domain.SubmitTaskCommand) error {
 	}
 	if strings.TrimSpace(cmd.Source) == "" || len(cmd.Source) > MaxSourceLen {
 		return fmt.Errorf("source is required and must be <= %d", MaxSourceLen)
+	}
+	if !domain.IsValidSource(cmd.Source) {
+		return fmt.Errorf("source must be one of %s|%s", domain.SourceWechat, domain.SourceWeb)
 	}
 	if strings.TrimSpace(cmd.SourceInstanceID) == "" || len(cmd.SourceInstanceID) > MaxSourceInstanceLen {
 		return fmt.Errorf("source_instance_id is required and must be <= %d", MaxSourceInstanceLen)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -22,8 +23,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
-	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/workerclient"
@@ -42,7 +43,7 @@ type SchedulerConfig struct {
 	PlatformInstanceID string
 	ClaimLease         time.Duration
 	PollInterval       time.Duration
-	Store              *postgres.Store
+	Store              TaskStore
 	Registry           policy.Registry
 	Coordinator        checkpoint.Coordinator
 	// Worker process environment (dev-loopback).
@@ -68,10 +69,10 @@ type cancelCall struct {
 }
 
 type workerProcessCleanup struct {
-	client       workerclient.WorkerClient
-	closeConn    func() error
-	killProcess  func() error
-	waitProcess  func() error
+	client      workerclient.WorkerClient
+	closeConn   func() error
+	killProcess func() error
+	waitProcess func() error
 }
 
 func (c workerProcessCleanup) run(timeout time.Duration) {
@@ -111,17 +112,30 @@ func (h *dispatchHeartbeat) Stop() error {
 }
 
 type scheduler struct {
-	cfg    SchedulerConfig
-	mu     sync.Mutex
-	workerCallMu sync.Mutex
-	wake   chan struct{}
-	worker workerclient.WorkerClient
+	cfg           SchedulerConfig
+	mu            sync.Mutex
+	workerCallMu  sync.Mutex
+	wake          chan struct{}
+	worker        workerclient.WorkerClient
 	workerCleanup func()
 	workerInstID  string
-	sessionKey    string // last started worker session
+	sessionKey    string   // last started worker session
 	cancelOnce    sync.Map // taskID -> *cancelCall
 	oai           *oaiFixture
 	ownOAI        bool
+}
+
+// finalizeOrFail records a terminal task state + delivery and surfaces any
+// persistence failure via log instead of silently dropping it (global rule:
+// No Silent Fallbacks). The returned task is the updated row on success, or
+// the original task on failure so callers can continue without a panic.
+func (s *scheduler) finalizeOrFail(ctx context.Context, task domain.Task, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) domain.Task {
+	t, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, status, deliveryType, code, message, traceID)
+	if err != nil {
+		log.Printf("scheduler: CompleteFailedTerminal failed task=%s target_status=%s: %v", task.ID, status, err)
+		return task
+	}
+	return t
 }
 
 // NewScheduler validates config and constructs the scheduler.
@@ -289,10 +303,9 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}()
 	ctx = heartbeat.ctx
 
-
 	client, err := s.ensureWorker(ctx, task.SessionKey)
 	if err != nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_START_FAILED", err.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
@@ -314,9 +327,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		return nil
 	}
 
-
 	if _, err := s.cfg.Registry.Resolve(CapabilityVersion, task.ToolPolicyVersion); err != nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"POLICY_RESOLVE_FAILED", err.Error(), "")
 		return err
 	}
@@ -341,7 +353,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			startReq.SnapshotChecksum = task.SnapshotChecksum
 		}
 		if _, err := client.StartSession(ctx, startReq); err != nil {
-			_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"START_SESSION_FAILED", err.Error(), "")
 			return err
 		}
@@ -404,7 +416,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 				digest := "sha256:" + hex.EncodeToString(sum[:])
 				if err := s.cfg.Store.RecordChunkEvent(ctx, task.ID, len([]byte(text)), digest); err != nil {
 					cancelExecute()
-					_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+					_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 						"CHUNK_EVENT_FAILED", err.Error(), "")
 					_ = s.KickSession(ctx, task.SessionKey)
 					return fmt.Errorf("record chunk event: %w", err)
@@ -425,13 +437,13 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		}
 	}
 	if streamErr != nil && terminal == nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_STREAM_ERROR", streamErr.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return streamErr
 	}
 	if terminal == nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"MISSING_TERMINAL", "worker stream ended without terminal", "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return fmt.Errorf("missing terminal")
@@ -451,17 +463,17 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	case workerv1.TerminalStatus_TASK_SUCCEEDED:
 		return s.completeSuccess(ctx, task, terminal)
 	case workerv1.TerminalStatus_TASK_CANCELLED:
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskCancelled, domain.DeliveryTaskCancelled,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskCancelled, domain.DeliveryTaskCancelled,
 			"TASK_CANCELLED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	case workerv1.TerminalStatus_TASK_INTERRUPTED:
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	default:
 		code := "TASK_FAILED"
 		if terminal.GetError() != nil && terminal.GetError().GetCode() != "" {
 			code = terminal.GetError().GetCode()
 		}
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			code, boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	}
 	_ = s.KickSession(ctx, task.SessionKey)
@@ -470,7 +482,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 
 func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, terminal *workerv1.Terminal) error {
 	if s.cfg.Coordinator == nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"NO_COORDINATOR", "checkpoint coordinator not configured", "")
 		return fmt.Errorf("no coordinator")
 	}
@@ -481,7 +493,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		MaxBundleBytes: s.cfg.MaxBundleBytes,
 	})
 	if err != nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"CHECKPOINT_PREPARE_FAILED", err.Error(), "")
 		return err
 	}
@@ -496,7 +508,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		MaxBundleBytes:  lease.MaxBundleBytes,
 	})
 	if err != nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"BEGIN_CHECKPOINT_FAILED", err.Error(), "")
 		return err
 	}
@@ -509,19 +521,19 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		ResultDigest:    firstNonEmpty(ready.GetResultDigest(), terminal.GetResultDigest()),
 	})
 	if err != nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"CHECKPOINT_COMMIT_FAILED", err.Error(), "")
 		return err
 	}
 	// Digest consistency with terminal when present.
 	if terminal.GetResultDigest() != "" && committed.ResultDigest != "" && terminal.GetResultDigest() != committed.ResultDigest {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"RESULT_DIGEST_MISMATCH", "terminal and checkpoint result digests differ", "")
 		return fmt.Errorf("result digest mismatch")
 	}
 	payload, err := s.cfg.Coordinator.ReadResult(ctx, committed.ResultRef, committed.ResultDigest)
 	if err != nil {
-		_, _ = s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"RESULT_READ_FAILED", err.Error(), "")
 		return err
 	}

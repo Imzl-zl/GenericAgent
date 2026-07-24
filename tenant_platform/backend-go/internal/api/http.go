@@ -129,10 +129,6 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "POLICY_REJECTED", err.Error(), tid)
 		return
 	}
-	if len([]byte(body.Prompt)) > postgres.MaxPromptBytes {
-		writeErr(w, http.StatusBadRequest, "PROMPT_TOO_LARGE", "prompt exceeds limit", tid)
-		return
-	}
 	task, err := s.svc.SubmitTask(r.Context(), domain.SubmitTaskCommand{
 		SessionKey:        sessionKey,
 		RequesterUserID:   s.devUserID, // derived from bootstrap, not request JSON
@@ -204,21 +200,16 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if q := r.URL.Query().Get("result_ref"); q != "" && q != payload.Ref {
-		writeErr(w, http.StatusBadRequest, "RESULT_REF_MISMATCH", "result_ref does not match committed ref", tid)
+		writeErr(w, http.StatusConflict, "RESULT_REF_MISMATCH", "result_ref does not match committed ref", tid)
 		return
 	}
-	// Return payload as JSON object when possible, else string body.
-	var body any
-	var asMap map[string]any
-	if err := json.Unmarshal(payload.Body, &asMap); err == nil {
-		body = asMap
-	} else {
-		body = map[string]any{"text": string(payload.Body)}
-	}
+	// Plan Task 3 Step 5: result body is text/plain UTF-8; result_digest is
+	// sha256 over these exact bytes. OpenAPI declares payload as string.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"result_ref":    payload.Ref,
 		"result_digest": payload.Digest,
-		"payload":       body,
+		"content_type":  "text/plain; charset=utf-8",
+		"payload":       string(payload.Body),
 	})
 }
 
@@ -237,23 +228,23 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateCreate(b createTaskBody) error {
-	if strings.TrimSpace(b.MessageID) == "" {
-		return fmt.Errorf("message_id is required")
+	if strings.TrimSpace(b.MessageID) == "" || len(b.MessageID) > postgres.MaxMessageIDLen {
+		return fmt.Errorf("message_id is required and must be <= %d bytes", postgres.MaxMessageIDLen)
 	}
-	if strings.TrimSpace(b.SourceInstanceID) == "" {
-		return fmt.Errorf("source_instance_id is required")
+	if strings.TrimSpace(b.SourceInstanceID) == "" || len(b.SourceInstanceID) > postgres.MaxSourceInstanceLen {
+		return fmt.Errorf("source_instance_id is required and must be <= %d bytes", postgres.MaxSourceInstanceLen)
 	}
-	if strings.TrimSpace(b.Prompt) == "" {
-		return fmt.Errorf("prompt is required")
+	if strings.TrimSpace(b.Prompt) == "" || len([]byte(b.Prompt)) > postgres.MaxPromptBytes {
+		return fmt.Errorf("prompt is required and must be <= %d bytes", postgres.MaxPromptBytes)
 	}
-	if strings.TrimSpace(b.Source) == "" {
-		return fmt.Errorf("source is required")
+	if strings.TrimSpace(b.Source) == "" || !domain.IsValidSource(b.Source) {
+		return fmt.Errorf("source must be one of %s|%s", domain.SourceWechat, domain.SourceWeb)
 	}
 	if b.PersonaSnapshot == nil {
 		return fmt.Errorf("persona_snapshot is required")
 	}
-	if strings.TrimSpace(b.ToolPolicyVersion) == "" {
-		return fmt.Errorf("tool_policy_version is required")
+	if strings.TrimSpace(b.ToolPolicyVersion) == "" || len(b.ToolPolicyVersion) > postgres.MaxToolPolicyVersionLen {
+		return fmt.Errorf("tool_policy_version is required and must be <= %d bytes", postgres.MaxToolPolicyVersionLen)
 	}
 	return nil
 }

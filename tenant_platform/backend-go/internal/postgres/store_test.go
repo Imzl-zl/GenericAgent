@@ -303,7 +303,8 @@ func TestCompleteSucceededMapsAcceptedCancelToInterruptedWithoutPublishingSnapsh
 	if _, err := store.MarkRunning(ctx, claimed.ID, "owner-cancel"); err != nil {
 		t.Fatal(err)
 	}
-	snapshotID, _, _, err := store.PrepareCheckpoint(ctx, task.ID, "owner-cancel", "staging", 1024)
+	stagingRefFor := func(snapshotID, token string, generation int64) string { return "staging" }
+	snapshotID, _, _, err := store.PrepareCheckpoint(ctx, task.ID, "owner-cancel", stagingRefFor, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,55 +388,26 @@ SELECT count(*), count(DISTINCT sequence_no) FROM task_events WHERE task_id=$1 A
 	}
 }
 
-func TestEnsureSchemaUpgradesExistingSnapshotMaxBundleColumn(t *testing.T) {
+func TestEnsureSchemaCreatesMaxBundleColumnOnFreshDB(t *testing.T) {
 	pool := requireDB(t)
-	store, err := NewStore(pool)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctx := context.Background()
-	dev := seedDev(t, store)
-	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
-		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
-		Source: "web", SourceInstanceID: "upgrade", MessageID: "upgrade",
-		Prompt: "upgrade", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "upgrade-owner", time.Minute)
-	if err != nil || !ok {
-		t.Fatalf("claim: ok=%v err=%v", ok, err)
-	}
-	if _, err := pool.Exec(ctx, `
-ALTER TABLE workspace_snapshots DROP COLUMN max_bundle_bytes
-`); err != nil {
-		t.Fatal(err)
-	}
-	const priorPreparedLimit = 777
-	if _, err := pool.Exec(ctx, `
-INSERT INTO workspace_snapshots (
-  id, workspace_id, task_id, schema_version, state, generation,
-  lease_owner, lease_until, token, staging_ref, result_bytes
-) VALUES (
-  '00000000-0000-4000-8000-000000000777', $1::uuid, $2,
-  'genericagent.snapshot.v1', 'writing', 1, $3,
-  timezone('utc', now()) + interval '2 minutes', 'old-token', 'old-staging', $4
-)
-`, task.WorkspaceID, claimed.ID, "upgrade-owner", priorPreparedLimit); err != nil {
+	// G-M6: runtime ALTER patches were removed. EnsureSchema only applies the
+	// migration on a fresh DB (tasks table absent). Verify the base migration
+	// includes max_bundle_bytes rather than expecting runtime upgrades.
+	if err := DropFoundationSchema(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
 	if err := EnsureSchema(ctx, pool, DefaultMigrationPath()); err != nil {
 		t.Fatal(err)
 	}
-	var upgradedLimit int
+	var n int
 	if err := pool.QueryRow(ctx, `
-SELECT max_bundle_bytes FROM workspace_snapshots
-WHERE id='00000000-0000-4000-8000-000000000777'::uuid
-`).Scan(&upgradedLimit); err != nil {
+SELECT count(*) FROM information_schema.columns
+WHERE table_schema='public' AND table_name='workspace_snapshots' AND column_name='max_bundle_bytes'
+`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if upgradedLimit != priorPreparedLimit {
-		t.Fatalf("max_bundle_bytes=%d want %d", upgradedLimit, priorPreparedLimit)
+	if n != 1 {
+		t.Fatalf("max_bundle_bytes column missing on fresh DB (count=%d)", n)
 	}
 }

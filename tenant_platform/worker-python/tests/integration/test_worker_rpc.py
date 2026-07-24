@@ -27,6 +27,52 @@ PYTHON = Path(os.environ.get("GA_TEST_PYTHON") or sys.executable)
 TEST_TOKEN = "test-worker-token-not-a-real-key"
 FOUNDATION_DIGEST = "sha256:" + hashlib.sha256(POLICY_PATH.read_bytes()).hexdigest()
 
+# Plan Task 3 Step 3 overlay manifest: every legacy file the Worker is allowed
+# to copy. The integration test snapshots exactly this set before launching the
+# worker and verifies none are modified, proving writes never reach GA_LEGACY_ROOT
+# (plan Global Constraints: "Tests must prove no writes reach GA_LEGACY_ROOT").
+LEGACY_ROOT_WATCHED_FILES = (
+    "agentmain.py",
+    "ga.py",
+    "llmcore.py",
+    "agent_loop.py",
+    "simphtml.py",
+    "plugins/__init__.py",
+    "plugins/hooks.py",
+    "assets/tools_schema.json",
+    "assets/tools_schema_cn.json",
+    "assets/sys_prompt.txt",
+    "assets/sys_prompt_en.txt",
+    "assets/global_mem_insight_template.txt",
+    "assets/global_mem_insight_template_en.txt",
+    "assets/insight_fixed_structure.txt",
+    "assets/insight_fixed_structure_en.txt",
+    "assets/code_run_header.py",
+)
+
+
+def _snapshot_legacy_root() -> dict[str, str]:
+    """Return {relative_path: sha256_hex} for every watched legacy file."""
+    snap: dict[str, str] = {}
+    for rel in LEGACY_ROOT_WATCHED_FILES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            # Missing legacy file is itself a regression; record empty so the
+            # post-check fails loudly instead of silently passing.
+            snap[rel] = "MISSING"
+            continue
+        snap[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return snap
+
+
+def _assert_legacy_root_unchanged(before: dict[str, str]) -> None:
+    after = _snapshot_legacy_root()
+    changed = [rel for rel in before if before[rel] != after.get(rel)]
+    assert not changed, (
+        "legacy root files were modified during the test; GA_LEGACY_ROOT must "
+        f"be read-only: {changed}"
+    )
+
 
 class _OAIHandler(BaseHTTPRequestHandler):
     server: "FixtureServer"
@@ -230,6 +276,9 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
     sentinel = REPO_ROOT / ".worker_itest_sentinel_do_not_commit"
     sentinel.write_text("sentinel\n", encoding="utf-8")
     sentinel_bytes = sentinel.read_bytes()
+    # Stronger guarantee: sha256-snapshot every legacy file the overlay is
+    # allowed to copy, so any write-back (not just the sentinel) is caught.
+    legacy_before = _snapshot_legacy_root()
     try:
         # Registry load sanity.
         reg = CapabilityRegistry.load(POLICY_PATH)
@@ -286,7 +335,12 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 term_a = _assert_one_terminal(events_a)
                 assert term_a.status == worker_pb2.TASK_SUCCEEDED
                 assert "persona-A" in term_a.user_message or "reply-persona-A" in term_a.user_message
-                assert term_a.result_digest == result_digest_for(term_a.user_message) or term_a.result_digest
+                # Plan Task 3 Step 5: result_digest is sha256 over UTF-8 bytes of
+                # result.body. Verify both presence and exact byte-sequence match
+                # (previously a single `== ... or term_a.result_digest` assertion
+                # was short-circuited by the truthy digest and never compared).
+                assert term_a.result_digest
+                assert term_a.result_digest == result_digest_for(term_a.user_message)
 
                 # Checkpoint for task A.
                 staging = runtime_root / "staging" / "t-a.bundle.json"
@@ -467,6 +521,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
 
         # Legacy root sentinel unchanged.
         assert sentinel.read_bytes() == sentinel_bytes
+        # Every watched legacy file must be byte-identical to the pre-run snapshot.
+        _assert_legacy_root_unchanged(legacy_before)
         # Fixture saw our test bearer token.
         assert any(a == f"Bearer {TEST_TOKEN}" for a in srv.seen_auth)
         # No real key material in fixture captures.

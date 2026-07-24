@@ -689,6 +689,44 @@ def test_policy_digest_mismatch_and_unknown_tool_policy(roots, foundation_regist
     assert ei2.value.code in {"UNKNOWN_TOOL_POLICY", "INVALID_TOOL_POLICY", "POLICY_REJECTED"}
 
 
+def test_legacy_backend_exception_maps_to_task_failed(roots, foundation_registry):
+    """B1: when legacy agentmain pushes {'done': partial, 'error': msg}, the
+    adapter must emit TASK_FAILED (not TASK_SUCCEEDED) with the error code
+    TASK_EXCEPTION and preserve the partial body as result_body."""
+    class CrashAgent(ScriptedAgent):
+        def run(self):
+            while True:
+                task = self.task_queue.get()
+                if isinstance(task, str):
+                    break
+                self.is_running = True
+                # Simulate agent_runner_loop raising mid-task: legacy run()
+                # catches and pushes done+error per B1 fix.
+                task["output"].put({"next": "partial-chunk", "turn": 1})
+                task["output"].put({
+                    "done": "partial-body",
+                    "error": "ValueError: simulated backend crash",
+                    "source": "test",
+                    "turn": 1,
+                    "outputs": [],
+                })
+                self.is_running = False
+                self.task_queue.task_done()
+
+    adapter = _make_adapter(roots, foundation_registry, CrashAgent)
+    adapter.start_session(_start_req())
+    events = _events(adapter, _task("b1-crash", "trigger-crash"))
+    _assert_no_tool_progress(events)
+    chunks = _chunks(events)
+    assert [c.text for c in chunks] == ["partial-chunk"]
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_FAILED
+    assert term.error.code == "TASK_EXCEPTION"
+    assert "simulated backend crash" in term.user_message
+    # Partial body is preserved for checkpoint digest.
+    assert term.result_digest == result_digest_for("partial-body")
+
+
 def test_output_byte_cap_emits_failed(roots, foundation_registry):
     class LoudAgent(ScriptedAgent):
         def __init__(self):

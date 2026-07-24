@@ -9,7 +9,6 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
 )
 
 const CapabilityVersion = "foundation.v1"
@@ -26,7 +25,7 @@ type TaskService interface {
 
 // TaskServiceConfig wires store, policy, coordinator, and claim lease.
 type TaskServiceConfig struct {
-	Store              *postgres.Store
+	Store              TaskStore
 	Registry           policy.Registry
 	Coordinator        checkpoint.Coordinator
 	PlatformInstanceID string
@@ -38,7 +37,7 @@ type TaskServiceConfig struct {
 }
 
 type taskService struct {
-	store              *postgres.Store
+	store              TaskStore
 	registry           policy.Registry
 	coord              checkpoint.Coordinator
 	platformInstanceID string
@@ -135,18 +134,3 @@ func (s *taskService) ReadResult(ctx context.Context, taskID string) (domain.Res
 	}
 	return s.coord.ReadResult(ctx, task.ResultRef, task.ResultDigest)
 }
-
-// Store returns the underlying store (scheduler/tests).
-func (s *taskService) Store() *postgres.Store { return s.store }
-
-// Registry returns the policy registry.
-func (s *taskService) Registry() policy.Registry { return s.registry }
-
-// Coordinator returns the checkpoint coordinator.
-func (s *taskService) Coordinator() checkpoint.Coordinator { return s.coord }
-
-// ClaimLease returns the configured lease duration.
-func (s *taskService) ClaimLease() time.Duration { return s.claimLease }
-
-// PlatformInstanceID returns the process instance id.
-func (s *taskService) PlatformInstanceID() string { return s.platformInstanceID }

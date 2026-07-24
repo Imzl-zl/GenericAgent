@@ -145,9 +145,11 @@ type successfulCoordinator struct {
 }
 
 func (c *successfulCoordinator) Prepare(ctx context.Context, request checkpoint.CheckpointPrepareRequest) (checkpoint.CheckpointLease, error) {
-	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.owner, "staging-success", request.MaxBundleBytes)
+	ref := "staging-success"
+	stagingRefFor := func(snapshotID, token string, generation int64) string { return ref }
+	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.owner, stagingRefFor, request.MaxBundleBytes)
 	return checkpoint.CheckpointLease{
-		SnapshotID: snapshotID, Token: token, StagingRef: "staging-success", MaxBundleBytes: request.MaxBundleBytes,
+		SnapshotID: snapshotID, Token: token, StagingRef: ref, MaxBundleBytes: request.MaxBundleBytes,
 	}, err
 }
 
@@ -169,9 +171,11 @@ type readFailCoordinator struct {
 }
 
 func (c *readFailCoordinator) Prepare(ctx context.Context, request checkpoint.CheckpointPrepareRequest) (checkpoint.CheckpointLease, error) {
-	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.owner, "staging-read-fail", request.MaxBundleBytes)
+	ref := "staging-read-fail"
+	stagingRefFor := func(snapshotID, token string, generation int64) string { return ref }
+	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.owner, stagingRefFor, request.MaxBundleBytes)
 	return checkpoint.CheckpointLease{
-		SnapshotID: snapshotID, Token: token, StagingRef: "staging-read-fail", MaxBundleBytes: request.MaxBundleBytes,
+		SnapshotID: snapshotID, Token: token, StagingRef: ref, MaxBundleBytes: request.MaxBundleBytes,
 	}, err
 }
 

@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 )
 
 const bufSize = 1 << 20
@@ -117,7 +118,9 @@ func (s *scriptedWorker) BeginCheckpoint(ctx context.Context, req *workerv1.Begi
 	}
 	if s.checkpoint != nil {
 		// Preserve token/task/staging from request when scripted response leaves them empty.
-		out := *s.checkpoint
+		// go vet: must not value-copy protobuf messages (they embed sync.Mutex via
+		// protoimpl.MessageState). Clone via proto reflection then mutate the clone.
+		out := proto.Clone(s.checkpoint).(*workerv1.CheckpointReady)
 		if out.TaskId == "" {
 			out.TaskId = req.GetTaskId()
 		}
@@ -127,7 +130,7 @@ func (s *scriptedWorker) BeginCheckpoint(ctx context.Context, req *workerv1.Begi
 		if out.StagingRef == "" {
 			out.StagingRef = req.GetStagingRef()
 		}
-		return &out, nil
+		return out, nil
 	}
 	return &workerv1.CheckpointReady{
 		TaskId:          req.GetTaskId(),

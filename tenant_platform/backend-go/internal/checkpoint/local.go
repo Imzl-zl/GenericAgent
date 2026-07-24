@@ -74,6 +74,8 @@ func NewLocalCoordinator(cfg LocalConfig) (*LocalCoordinator, error) {
 }
 
 // Prepare creates writing snapshot metadata and a token-scoped staging path under runtime root.
+// The staging_ref is resolved inside the store transaction via stagingRefFor so
+// the DB row and the returned lease always agree (no out-of-band rewrite).
 func (c *LocalCoordinator) Prepare(ctx context.Context, request CheckpointPrepareRequest) (CheckpointLease, error) {
 	if strings.TrimSpace(request.TaskID) == "" {
 		return CheckpointLease{}, fmt.Errorf("task_id required")
@@ -82,33 +84,19 @@ func (c *LocalCoordinator) Prepare(ctx context.Context, request CheckpointPrepar
 	if maxB == 0 {
 		maxB = c.defaultMaxBundle
 	}
-	// Provisional staging path uses task id; final token is returned from store.
-	provisional := filepath.Join(c.runtimeRoot, "staging", request.TaskID+".pending.bundle.json")
-	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.platformInstanceID, provisional, maxB)
-	if err != nil {
-		return CheckpointLease{}, err
+	stagingRefFor := func(snapshotID, token string, generation int64) string {
+		return filepath.Join(c.runtimeRoot, "staging", token+".bundle.json")
 	}
-	staging := filepath.Join(c.runtimeRoot, "staging", token+".bundle.json")
-	// Update staging_ref to token-scoped path (rewrite writing row via prepare already stored provisional;
-	// Worker receives the token-scoped path below; Commit verifies against DB staging_ref.
-	// Re-prepare is avoided: store provisional then we rewrite staging_ref in a small update.
-	if err := c.rewriteStagingRef(ctx, snapshotID, staging); err != nil {
+	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.platformInstanceID, stagingRefFor, maxB)
+	if err != nil {
 		return CheckpointLease{}, err
 	}
 	return CheckpointLease{
 		SnapshotID:     snapshotID,
 		Token:          token,
-		StagingRef:     staging,
+		StagingRef:     stagingRefFor(snapshotID, token, 0),
 		MaxBundleBytes: maxB,
 	}, nil
-}
-
-func (c *LocalCoordinator) rewriteStagingRef(ctx context.Context, snapshotID, staging string) error {
-	_, err := c.store.Pool().Exec(ctx, `
-UPDATE workspace_snapshots SET staging_ref = $2
-WHERE id = $1::uuid AND state = 'writing'
-`, snapshotID, staging)
-	return err
 }
 
 // Commit verifies staging bundle, renames immutably, extracts result, returns opaque refs.

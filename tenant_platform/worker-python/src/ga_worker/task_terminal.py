@@ -1,0 +1,128 @@
+"""Terminal-event emitters for the task drain loop.
+
+Extracted from task_runner.py (B3: file size limit). Each function is a generator
+that yields at most one WorkerEvent carrying a Terminal payload, and records the
+completed task on the adapter. None of them return early silently: a terminal is
+always emitted unless one was already emitted for this task.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Iterator
+
+from genericagent.worker.v1 import worker_pb2
+
+from ga_worker.state import TaskRunState
+
+# P-M8: named constant (no magic numbers).
+ERROR_MSG_MAX_LEN = 500
+
+
+def emit_error_terminal(
+    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState, error_msg: Any,
+) -> Iterator[worker_pb2.WorkerEvent]:
+    """B1: legacy exception → TASK_FAILED with partial body as result_body."""
+    if state.terminal_emitted:
+        return
+    term = adapter._terminal(
+        task.task_id, worker_pb2.TASK_FAILED,
+        user_message=str(error_msg)[:ERROR_MSG_MAX_LEN],
+        error_code="TASK_EXCEPTION", result_body=state.final_body,
+    )
+    adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
+    yield worker_pb2.WorkerEvent(terminal=term)
+    state.terminal_emitted = True
+
+
+def emit_output_exceeded_terminal(
+    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
+) -> Iterator[worker_pb2.WorkerEvent]:
+    if state.terminal_emitted:
+        return
+    term = adapter._terminal(
+        task.task_id, worker_pb2.TASK_FAILED,
+        user_message="max_output_bytes exceeded", error_code="MAX_OUTPUT_BYTES",
+    )
+    adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
+    yield worker_pb2.WorkerEvent(terminal=term)
+    state.terminal_emitted = True
+
+
+def emit_cancel_or_timeout_terminal(
+    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
+) -> Iterator[worker_pb2.WorkerEvent]:
+    is_timeout = state.timed_out["v"]
+    status = worker_pb2.TASK_INTERRUPTED if is_timeout else worker_pb2.TASK_CANCELLED
+    code = "TASK_TIMEOUT" if is_timeout else "TASK_CANCELLED"
+    term = adapter._terminal(
+        task.task_id, status,
+        user_message="task timeout" if is_timeout else "cancelled",
+        error_code=code,
+    )
+    adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
+    yield worker_pb2.WorkerEvent(terminal=term)
+    state.terminal_emitted = True
+
+
+def emit_final_terminal(
+    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
+) -> Iterator[worker_pb2.WorkerEvent]:
+    if state.pending.cancel_requested or state.timed_out["v"]:
+        is_timeout = state.timed_out["v"]
+        status = worker_pb2.TASK_INTERRUPTED if is_timeout else worker_pb2.TASK_CANCELLED
+        code = "TASK_TIMEOUT" if is_timeout else "TASK_CANCELLED"
+        term = adapter._terminal(
+            task.task_id, status,
+            user_message=state.final_body or ("timeout" if is_timeout else "cancelled"),
+            error_code=code, result_body=state.final_body,
+        )
+    else:
+        term = adapter._terminal(
+            task.task_id, worker_pb2.TASK_SUCCEEDED,
+            user_message=state.final_body, result_body=state.final_body,
+        )
+    adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
+    yield worker_pb2.WorkerEvent(terminal=term)
+    state.terminal_emitted = True
+
+
+def emit_missing_terminal_if_needed(
+    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
+) -> Iterator[worker_pb2.WorkerEvent]:
+    if state.terminal_emitted:
+        return
+    if state.output_exceeded["v"]:
+        term = adapter._terminal(
+            task.task_id, worker_pb2.TASK_FAILED,
+            user_message="max_output_bytes exceeded", error_code="MAX_OUTPUT_BYTES",
+        )
+    else:
+        term = adapter._terminal(
+            task.task_id, worker_pb2.TASK_FAILED,
+            user_message="task ended without terminal payload", error_code="MISSING_TERMINAL",
+        )
+    adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
+    yield worker_pb2.WorkerEvent(terminal=term)
+    state.terminal_emitted = True
+
+
+def emit_exception_terminal(
+    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState | None, exc: Exception,
+) -> Iterator[worker_pb2.WorkerEvent]:
+    term = adapter._terminal(
+        task.task_id, worker_pb2.TASK_FAILED,
+        user_message=str(exc)[:ERROR_MSG_MAX_LEN], error_code="TASK_EXCEPTION",
+    )
+    agent = state.agent if state is not None else None
+    try:
+        if agent is not None:
+            adapter._record_completed(task, term, "", [], agent)
+        else:
+            with adapter._lock:
+                adapter._clear_active_locked(task.task_id)
+    except Exception:
+        with adapter._lock:
+            adapter._clear_active_locked(task.task_id)
+    yield worker_pb2.WorkerEvent(terminal=term)
+    if state is not None:
+        state.terminal_emitted = True

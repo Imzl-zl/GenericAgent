@@ -115,35 +115,11 @@ WHERE table_schema='public' AND table_name='tasks'
 		return err
 	}
 	if n > 0 {
-		if _, err := tx.Exec(ctx, `
-ALTER TABLE workspace_snapshots
-  ADD COLUMN IF NOT EXISTS max_bundle_bytes BIGINT;
-
-UPDATE workspace_snapshots
-SET max_bundle_bytes = CASE
-  WHEN state = 'writing' AND result_bytes IS NOT NULL AND result_bytes > 0 THEN result_bytes
-  ELSE 2097152
-END
-WHERE max_bundle_bytes IS NULL;
-
-ALTER TABLE workspace_snapshots
-  ALTER COLUMN max_bundle_bytes SET NOT NULL;
-
-DO $upgrade$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conrelid = 'workspace_snapshots'::regclass
-      AND conname = 'workspace_snapshots_max_bundle_pos'
-  ) THEN
-    ALTER TABLE workspace_snapshots
-      ADD CONSTRAINT workspace_snapshots_max_bundle_pos CHECK (max_bundle_bytes > 0);
-  END IF;
-END
-$upgrade$;
-`); err != nil {
-			return fmt.Errorf("upgrade foundation schema: %w", err)
-		}
+		// Foundation slice: the migration file is the single source of truth for
+		// schema (plan Task 5 Step 3). Runtime ALTER patches are rejected as
+		// patch-stacking; if the schema needs to evolve, ship a new migration
+		// file instead. When the tasks table already exists we trust it was
+		// created by 0001_foundation.sql.
 		return tx.Commit(ctx)
 	}
 
