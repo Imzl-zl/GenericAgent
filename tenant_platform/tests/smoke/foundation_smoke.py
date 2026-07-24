@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -27,12 +28,106 @@ DEV_TOKEN = "foundation-smoke-dev-token-not-real"
 OAI_TOKEN = "foundation-smoke-oai-token-not-real"
 POLICY_VERSION = "foundation.no-host-tools.v1"
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
-SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "CREDENTIAL")
+CHILD_ENV_ALLOWLIST = frozenset(
+    {
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TZ",
+        "USERPROFILE",
+        "WINDIR",
+    }
+)
 WINDOWS_NO_WINDOW = 0x08000000
 
 
 class SmokeError(RuntimeError):
     pass
+@dataclass(frozen=True)
+class _StopResult:
+    exit_code: int
+    graceful_worker_shutdown: bool
+    used_fallback: bool
+
+
+class _WindowsJob:
+    def __init__(self) -> None:
+        self._handle: int | None = None
+        if os.name != "nt":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        class _BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class _ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimits),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = _ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x00002000
+        if not kernel32.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            kernel32.CloseHandle(handle)
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle = int(handle)
+
+    def assign(self, proc: subprocess.Popen[Any]) -> None:
+        if self._handle is None:
+            return
+        import ctypes
+
+        if not ctypes.windll.kernel32.AssignProcessToJobObject(self._handle, int(proc._handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        import ctypes
+
+        handle, self._handle = self._handle, None
+        if not ctypes.windll.kernel32.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
@@ -221,11 +316,7 @@ def _build_platform(output: Path) -> None:
 def _child_environment(
     values: dict[str, str], config_root: Path, runtime_root: Path, legacy_root: Path, policy_file: Path
 ) -> dict[str, str]:
-    env = {
-        name: value
-        for name, value in os.environ.items()
-        if not any(marker in name.upper() for marker in SENSITIVE_ENV_MARKERS)
-    }
+    env = {name: value for name, value in os.environ.items() if name.upper() in CHILD_ENV_ALLOWLIST}
     env.update(
         {
             "DATABASE_URL": values["TEST_DATABASE_URL"],
@@ -381,17 +472,28 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _force_process_tree(proc: subprocess.Popen[Any], known_children: set[int]) -> None:
+def _wait_pids_gone(pids: set[int], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    alive = {pid for pid in pids if _pid_alive(pid)}
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.1)
+        alive = {pid for pid in alive if _pid_alive(pid)}
+    return not alive
+
+
+def _force_process_tree(
+    proc: subprocess.Popen[Any], known_children: set[int], job: _WindowsJob | None
+) -> None:
     if os.name == "nt":
+        if job is not None:
+            try:
+                job.close()
+            except OSError:
+                pass
+        targets = set(known_children)
         if proc.poll() is None:
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                creationflags=WINDOWS_NO_WINDOW,
-                timeout=10,
-                check=False,
-            )
-        for pid in known_children:
+            targets.add(proc.pid)
+        for pid in targets:
             if _pid_alive(pid):
                 subprocess.run(
                     ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
@@ -400,48 +502,46 @@ def _force_process_tree(proc: subprocess.Popen[Any], known_children: set[int]) -
                     timeout=10,
                     check=False,
                 )
-    else:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-
-def _stop_process_tree(proc: subprocess.Popen[Any], known_children: set[int]) -> int:
+        return
     try:
-        children, _ = _sample_descendants(proc.pid)
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _stop_process_tree(
+    proc: subprocess.Popen[Any],
+    known_children: set[int],
+    *,
+    job: _WindowsJob | None = None,
+    sample_descendants: Any = _sample_descendants,
+    grace_seconds: float = 12,
+) -> _StopResult:
+    sampling_ok = True
+    try:
+        children, _ = sample_descendants(proc.pid)
         known_children.update(children)
     except Exception:
-        # Cleanup must continue even when OS metrics are unavailable.
-        pass
-    if os.name != "nt" and proc.poll() is not None:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    if proc.poll() is None:
+        sampling_ok = False
+    platform_stopped = proc.poll() is not None
+    if not platform_stopped:
         try:
             if os.name == "nt":
                 proc.send_signal(signal.CTRL_BREAK_EVENT)
             else:
-                os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=12)
+                proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=grace_seconds)
+            platform_stopped = True
         except (OSError, subprocess.TimeoutExpired):
-            _force_process_tree(proc, known_children)
+            platform_stopped = proc.poll() is not None
+    workers_stopped = sampling_ok and _wait_pids_gone(known_children, min(8.0, grace_seconds))
+    if platform_stopped and workers_stopped:
+        return _StopResult(int(proc.returncode or 0), True, False)
+    _force_process_tree(proc, known_children, job)
     if proc.poll() is None:
-        _force_process_tree(proc, known_children)
         proc.wait(timeout=10)
-    deadline = time.monotonic() + 8
-    alive = {pid for pid in known_children if _pid_alive(pid)}
-    while alive and time.monotonic() < deadline:
-        time.sleep(0.2)
-        alive = {pid for pid in alive if _pid_alive(pid)}
-    if alive:
-        _force_process_tree(proc, alive)
-        time.sleep(0.5)
-        alive = {pid for pid in alive if _pid_alive(pid)}
-    _require(not alive, "Worker descendant cleanup failed")
-    return int(proc.returncode or 0)
+    _require(_wait_pids_gone(known_children, 5), "Worker descendant cleanup failed")
+    return _StopResult(int(proc.returncode or 0), False, True)
 
 
 def _poll_task(base: str, task_id: str, wanted: set[str], timeout: float) -> dict[str, Any]:
@@ -515,6 +615,7 @@ def _launch_stack(
     env = _child_environment(values, config_root, runtime_root, legacy_root, policy_file)
     proc, base = _start_platform(binary, log_file, env, policy_file, config_root, runtime_root, legacy_root)
     state["proc"] = proc
+    state["job"].assign(proc)
     _wait_health(proc, base)
     return proc, base, runtime_root
 
@@ -675,23 +776,37 @@ def run() -> tuple[dict[str, Any], dict[str, Any]]:
     legacy_root, policy_file = _validate_paths(values)
     fixture = _Fixture()
     temp_context = tempfile.TemporaryDirectory(prefix="foundation-smoke-")
-    state: dict[str, Any] = {"proc": None, "log_file": None, "known_children": set()}
+    state: dict[str, Any] = {
+        "proc": None,
+        "log_file": None,
+        "known_children": set(),
+        "job": _WindowsJob(),
+    }
     try:
         fixture.start()
         summary, metrics = _exercise(values, legacy_root, policy_file, Path(temp_context.name), fixture, state)
         fixture.server.release_response.set()
-        exit_code = _stop_process_tree(state["proc"], state["known_children"])
+        stop_result = _stop_process_tree(
+            state["proc"], state["known_children"], job=state["job"]
+        )
         state["proc"] = None
+        _require(
+            stop_result.graceful_worker_shutdown and not stop_result.used_fallback,
+            "normal shutdown required process-containment fallback",
+        )
         if state["log_file"] is not None:
             state["log_file"].close()
             state["log_file"] = None
-        metrics["platform_shutdown_exit_code"] = exit_code
+        metrics["platform_shutdown_exit_code"] = stop_result.exit_code
         metrics["worker_descendants_cleaned"] = True
+        metrics["worker_graceful_shutdown"] = True
     finally:
         fixture.server.release_response.set()
         try:
             if state["proc"] is not None:
-                _stop_process_tree(state["proc"], state["known_children"])
+                _stop_process_tree(
+                    state["proc"], state["known_children"], job=state["job"]
+                )
         finally:
             try:
                 if state["log_file"] is not None:
@@ -699,9 +814,12 @@ def run() -> tuple[dict[str, Any], dict[str, Any]]:
                     state["log_file"] = None
             finally:
                 try:
-                    fixture.close()
+                    state["job"].close()
                 finally:
-                    temp_context.cleanup()
+                    try:
+                        fixture.close()
+                    finally:
+                        temp_context.cleanup()
     return summary, metrics
 
 

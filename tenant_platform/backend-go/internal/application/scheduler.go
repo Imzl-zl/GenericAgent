@@ -738,6 +738,7 @@ func writeFixtureMyKey(configRoot, apibase string) error {
 func startPythonWorker(python, workerSrc, configRoot, legacyRoot, runtimeDir, policyFile string) (*exec.Cmd, string, error) {
 	listen := "127.0.0.1:0"
 	cmd := exec.Command(python, "-m", "ga_worker.entrypoint", "--listen", listen, "--grace-seconds", "5")
+	configureWorkerProcess(cmd)
 	if base := filepath.Base(workerSrc); base == "src" {
 		cmd.Dir = filepath.Dir(workerSrc)
 	} else {

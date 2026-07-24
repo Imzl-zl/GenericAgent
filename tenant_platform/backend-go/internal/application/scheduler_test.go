@@ -274,7 +274,7 @@ func TestScheduler_HeartbeatsQuietStreamBeforeLeaseExpires(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease := 800 * time.Millisecond
+	lease := 2 * time.Second
 	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "quiet-owner", lease)
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
@@ -298,13 +298,24 @@ func TestScheduler_HeartbeatsQuietStreamBeforeLeaseExpires(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("worker execution did not start")
 	}
-	time.Sleep(lease + lease/2)
-	beforeRecovery, err := store.GetTask(ctx, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !beforeRecovery.ClaimLeaseUntil.After(claimed.ClaimLeaseUntil) {
-		t.Fatalf("claim lease did not advance: initial=%s current=%s", claimed.ClaimLeaseUntil, beforeRecovery.ClaimLeaseUntil)
+	var beforeRecovery domain.Task
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var databaseNow time.Time
+		if err := store.Pool().QueryRow(ctx, `SELECT timezone('utc', now())`).Scan(&databaseNow); err != nil {
+			t.Fatal(err)
+		}
+		beforeRecovery, err = store.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if databaseNow.After(claimed.ClaimLeaseUntil) && beforeRecovery.ClaimLeaseUntil.After(databaseNow.Add(lease/3)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("claim lease did not retain margin: initial=%s current=%s database_now=%s", claimed.ClaimLeaseUntil, beforeRecovery.ClaimLeaseUntil, databaseNow)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	recovered, err := store.RecoverAfterRestart(ctx, "competing-owner")
 	if err != nil {

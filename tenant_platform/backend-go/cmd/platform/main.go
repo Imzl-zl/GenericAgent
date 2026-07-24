@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -34,6 +35,21 @@ func resolvePolicyPath(path string) (string, error) {
 		return "", fmt.Errorf("resolve policy path: %w", err)
 	}
 	return resolved, nil
+}
+
+func finishPlatform(serveErr error, schedulerDone <-chan error, timeout time.Duration) error {
+	select {
+	case schedulerErr := <-schedulerDone:
+		if schedulerErr != nil && !errors.Is(schedulerErr, context.Canceled) {
+			return fmt.Errorf("scheduler shutdown: %w", schedulerErr)
+		}
+	case <-time.After(timeout):
+		return fmt.Errorf("scheduler shutdown timed out after %s", timeout)
+	}
+	if errors.Is(serveErr, context.Canceled) {
+		return nil
+	}
+	return serveErr
 }
 
 func run() error {
@@ -215,12 +231,15 @@ func run() error {
 		return err
 	}
 
+	schedulerDone := make(chan error, 1)
 	go func() {
-		_ = sched.Run(ctx)
+		schedulerDone <- sched.Run(ctx)
 	}()
 
 	fmt.Fprintf(os.Stderr, "platform: instance_id=%s listen=%s session=%s policy_digest=%s\n",
 		instanceID, *listen, devCtx.SessionKey, reg.Digest())
 
-	return api.ServeContext(ctx, *listen, server.Handler())
+	serveErr := api.ServeContext(ctx, *listen, server.Handler())
+	cancel()
+	return finishPlatform(serveErr, schedulerDone, 15*time.Second)
 }
