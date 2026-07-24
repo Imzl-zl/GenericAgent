@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import threading
+import time
 import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -95,3 +98,30 @@ def test_job_fallback_cleans_process_when_sampling_fails() -> None:
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
+
+def test_submit_dedupe_does_not_run_rss_sampler_before_fixture_release(monkeypatch) -> None:
+    smoke = _load_smoke()
+    sampler_calls = 0
+
+    def submit(_base: str, _session: str, _payload: dict):
+        return {"task_id": "task-1"}
+
+    def slow_failing_sampler(_pid: int):
+        nonlocal sampler_calls
+        sampler_calls += 1
+        time.sleep(0.25)
+        raise smoke.SmokeError("slow sampler must not gate fixture release")
+
+    monkeypatch.setattr(smoke, "_submit", submit)
+    monkeypatch.setattr(smoke, "_sample_descendants", slow_failing_sampler)
+    arrived = threading.Event()
+    arrived.set()
+    fixture = SimpleNamespace(server=SimpleNamespace(request_arrived=arrived))
+
+    started = time.monotonic()
+    result = smoke._submit_deduped_success("base", "session", "unique", fixture)
+    elapsed = time.monotonic() - started
+
+    assert result["task_id"] == "task-1"
+    assert sampler_calls == 0
+    assert elapsed < 0.1

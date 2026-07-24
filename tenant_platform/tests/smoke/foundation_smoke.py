@@ -625,8 +625,6 @@ def _submit_deduped_success(
     session: str,
     unique: str,
     fixture: _Fixture,
-    proc: subprocess.Popen[Any],
-    known_children: set[int],
 ) -> dict[str, Any]:
     payload = {
         "message_id": f"success-{unique}",
@@ -643,10 +641,7 @@ def _submit_deduped_success(
     duplicate = _submit(base, session, duplicate_payload)
     _require(duplicate["task_id"] == submitted["task_id"], "same-key submit was not deduplicated")
     _require(fixture.server.request_arrived.wait(timeout=40), "real Worker never reached the OpenAI fixture")
-    children, rss = _sample_descendants(proc.pid)
-    known_children.update(children)
-    _require(rss > 0 and known_children, "Worker process was not measurable")
-    return {"task_id": submitted["task_id"], "dedupe_id": duplicate["task_id"], "started": started, "rss": rss}
+    return {"task_id": submitted["task_id"], "dedupe_id": duplicate["task_id"], "started": started}
 
 
 def _cancel_queued_task(base: str, session: str, unique: str) -> dict[str, Any]:
@@ -729,7 +724,7 @@ def _make_outputs(
         "total_elapsed_ms": total_elapsed,
     }
     metrics = {
-        "worker_peak_rss_bytes": max(success["rss"], completed["rss"]),
+        "worker_peak_rss_bytes": completed["rss"],
         "checkpoint_bundle_bytes": completed["bundle_bytes"],
         "checkpoint_prepare_to_commit_ms": facts["checkpoint_prepare_to_commit_ms"],
         "success_task_latency_ms": completed["elapsed"],
@@ -753,7 +748,7 @@ def _exercise(
     proc, base, runtime_root = _launch_stack(values, legacy_root, policy_file, tmp, fixture, state)
     session = f"personal:{values['PLATFORM_DEV_USER_ID']}"
     unique = uuid.uuid4().hex
-    success = _submit_deduped_success(base, session, unique, fixture, proc, state["known_children"])
+    success = _submit_deduped_success(base, session, unique, fixture)
     cancelled = _cancel_queued_task(base, session, unique)
     completed = _complete_success(
         base,
