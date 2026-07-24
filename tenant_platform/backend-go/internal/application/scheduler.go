@@ -60,9 +60,27 @@ type SchedulerConfig struct {
 	MaxBundleBytes uint64
 }
 
+const workerShutdownTimeout = 5 * time.Second
+
 type cancelCall struct {
 	once sync.Once
 	err  error
+}
+
+type workerProcessCleanup struct {
+	client       workerclient.WorkerClient
+	closeConn    func() error
+	killProcess  func() error
+	waitProcess  func() error
+}
+
+func (c workerProcessCleanup) run(timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	_ = c.client.Shutdown(ctx, "scheduler-stop")
+	cancel()
+	_ = c.closeConn()
+	_ = c.killProcess()
+	_ = c.waitProcess()
 }
 
 type dispatchHeartbeat struct {
@@ -624,11 +642,17 @@ func (s *scheduler) ensureWorker(ctx context.Context, sessionKey string) (worker
 	}
 	s.worker = client
 	s.workerInstID = "loopback-" + listen
+	cleanup := workerProcessCleanup{
+		client:      client,
+		closeConn:   conn.Close,
+		killProcess: proc.Process.Kill,
+		waitProcess: func() error {
+			_, err := proc.Process.Wait()
+			return err
+		},
+	}
 	s.workerCleanup = func() {
-		_ = client.Shutdown(context.Background(), "scheduler-stop")
-		_ = conn.Close()
-		_ = proc.Process.Kill()
-		_, _ = proc.Process.Wait()
+		cleanup.run(workerShutdownTimeout)
 		if s.ownOAI && s.oai != nil {
 			s.oai.Close()
 		}
