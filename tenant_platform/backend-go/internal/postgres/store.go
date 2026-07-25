@@ -39,7 +39,8 @@ type DevelopmentContext struct {
 
 // Store is the PostgreSQL-backed task store.
 type Store struct {
-	pool *pgxpool.Pool
+	pool                *pgxpool.Pool
+	perUserQueueLimit   int // 0 = disabled (dev/test); enforced inside SubmitTask tx
 }
 
 // NewStore wraps a pgx pool.
@@ -48,6 +49,12 @@ func NewStore(pool *pgxpool.Pool) (*Store, error) {
 		return nil, fmt.Errorf("pool is nil")
 	}
 	return &Store{pool: pool}, nil
+}
+
+// SetPerUserQueueLimit sets the per-requester queued-task cap. Must be called
+// before the scheduler starts. 0 disables the check (dev/test only).
+func (s *Store) SetPerUserQueueLimit(limit int) {
+	s.perUserQueueLimit = limit
 }
 
 // Pool exposes the underlying pool for tests.
@@ -135,6 +142,9 @@ VALUES ($1, $2, $3, 'personal', NULL, NULL, 'dev-loopback')
 }
 
 // SubmitTask inserts a queued task or returns the existing dedupe row unchanged.
+// PerUserQueueLimit, when > 0, is enforced inside this transaction (after the
+// workspace row lock serializes concurrent submits for the same user) to
+// prevent TOCTOU races.
 func (s *Store) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error) {
 	if err := validateSubmit(cmd); err != nil {
 		return domain.Task{}, err
@@ -171,6 +181,20 @@ SELECT id, owner_user_id, kind, COALESCE(team_id::text, '') FROM workspaces WHER
 		}
 		if err := authorizeSubmitter(tx, ctx, kind, ownerID, teamID, requester); err != nil {
 			return err
+		}
+
+		// Hard per-user queue cap inside the workspace lock. Concurrent
+		// submits for the same user serialize on the workspace FOR UPDATE
+		// above, so the count is consistent. The soft pre-check in
+		// TaskService.SubmitTask handles the obvious case without entering a tx.
+		if s.perUserQueueLimit > 0 && requester > 0 {
+			queued, err := s.CountQueuedTasksByRequesterTx(ctx, tx, requester)
+			if err != nil {
+				return fmt.Errorf("count queued (tx): %w", err)
+			}
+			if queued >= s.perUserQueueLimit {
+				return domain.ErrPerUserQueueFull
+			}
 		}
 
 		var nextSeq int64
@@ -306,6 +330,9 @@ RETURNING `+taskSelectColumns, sessionKey, platformInstanceID, leaseMicros)
 }
 
 // HeartbeatClaim extends claim_lease_until for a current-owner starting/running task.
+// Returns application.ErrLeaseExpired when 0 rows matched (the caller no longer
+// owns the task — lease expired or was stolen by RecoverAfterRestart). Other
+// errors indicate DB connectivity issues and should be retried next tick.
 func (s *Store) HeartbeatClaim(ctx context.Context, taskID, platformInstanceID string, claimLease time.Duration) error {
 	if claimLease <= 0 {
 		return fmt.Errorf("claim lease must be positive")
@@ -324,7 +351,7 @@ WHERE id = $1 AND claim_owner = $2 AND status IN ('starting','running')
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("heartbeat missed for task %s owner %s", taskID, platformInstanceID)
+		return domain.ErrLeaseExpired
 	}
 	return nil
 }
@@ -724,14 +751,15 @@ func (s *Store) ListClaimableSessionKeys(ctx context.Context, limit int) ([]stri
 		limit = 32
 	}
 	rows, err := s.pool.Query(ctx, `
-SELECT DISTINCT t.session_key
+SELECT t.session_key
 FROM tasks t
 WHERE t.status = 'queued'
   AND NOT EXISTS (
     SELECT 1 FROM tasks r
     WHERE r.session_key = t.session_key AND r.status IN ('starting','running')
   )
-ORDER BY t.session_key
+GROUP BY t.session_key
+ORDER BY MIN(t.created_at)
 LIMIT $1
 `, limit)
 	if err != nil {
@@ -747,6 +775,53 @@ LIMIT $1
 		out = append(out, sk)
 	}
 	return out, rows.Err()
+}
+
+// CountRunningTasks returns the global number of starting/running tasks.
+// Used by the scheduler to enforce MaxRunningTasks before claiming.
+func (s *Store) CountRunningTasks(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+SELECT COUNT(*) FROM tasks WHERE status IN ('starting','running')
+`).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CountQueuedTasksByRequester returns the number of queued tasks owned by
+// the given requester. Used by SubmitTask to enforce PerUserQueueLimit.
+// Reads inside the caller's transaction when called via CountQueuedTasksByRequesterTx.
+func (s *Store) CountQueuedTasksByRequester(ctx context.Context, requesterUserID int64) (int, error) {
+	if requesterUserID <= 0 {
+		return 0, fmt.Errorf("requester user id must be positive")
+	}
+	var n int
+	err := s.pool.QueryRow(ctx, `
+SELECT COUNT(*) FROM tasks WHERE requester_user_id = $1 AND status = 'queued'
+`, requesterUserID).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CountQueuedTasksByRequesterTx is the in-transaction variant used by
+// SubmitTask to avoid TOCTOU races. The count is taken after the workspace
+// row lock so concurrent submits for the same user serialize on the workspace.
+func (s *Store) CountQueuedTasksByRequesterTx(ctx context.Context, tx pgx.Tx, requesterUserID int64) (int, error) {
+	if requesterUserID <= 0 {
+		return 0, fmt.Errorf("requester user id must be positive")
+	}
+	var n int
+	err := tx.QueryRow(ctx, `
+SELECT COUNT(*) FROM tasks WHERE requester_user_id = $1 AND status = 'queued'
+`, requesterUserID).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ListOwnedActiveTasks returns starting/running tasks for this platform instance.

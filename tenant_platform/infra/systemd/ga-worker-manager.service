@@ -1,0 +1,59 @@
+[Unit]
+Description=GenericAgent Worker Manager (Podman container isolation)
+Documentation=https://github.com/Imzl-zl/GenericAgent/tree/main/docs/superpowers/specs/2026-07-23-multi-tenant-implementation-boundaries-design.md
+After=network-online.target podman.socket ga-platform.service
+Wants=network-online.target podman.socket
+Requires=ga-platform.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# Resource limits — the manager itself is light; the heavy lifting happens
+# inside Worker containers, which are capped separately via Podman cgroups.
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=4096
+
+EnvironmentFile=-/etc/ga/worker-manager.env
+
+User=ga
+Group=ga
+WorkingDirectory=/opt/ga
+
+# ExecStart — listens on a Unix socket so the platform connects without
+# exposing the manager to the network. The socket is created by systemd
+# via a paired .socket unit (see ga-worker-manager.socket).
+ExecStart=/opt/ga/bin/worker-manager \
+  --listen=unix:///run/ga/worker-manager.sock \
+  --podman-binary=/usr/bin/podman \
+  --worker-image=ghcr.io/imzl-zl/genericagent-worker:latest \
+  --config-root=/etc/ga/config \
+  --runtime-root=/var/lib/ga/runtime
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ga /etc/ga/config /run/ga
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ga-worker-manager
+
+[Install]
+WantedBy=multi-user.target

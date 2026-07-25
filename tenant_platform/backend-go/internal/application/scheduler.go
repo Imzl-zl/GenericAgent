@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +38,7 @@ type SchedulerConfig struct {
 	PollInterval       time.Duration
 	Store              TaskStore
 	Registry           policy.Registry
-	Coordinator checkpoint.Coordinator
+	Coordinator        checkpoint.Coordinator
 	// Runtime creates a Worker instance for a session. Required.
 	Runtime worker.WorkerRuntime
 	// ConfigRoot is where the platform writes the token-only mykey.py for the
@@ -58,9 +58,9 @@ type SchedulerConfig struct {
 	// LLM Proxy capability_token issuance. Required for real Worker path: the
 	// platform issues a short-lived, session-bound token and writes a token-only
 	// mykey.py (no real upstream key).
-	TokenIssuer       *llmproxy.Issuer
-	TokenRevoker      TokenRevoker
-	LLMProxyAddr      string // e.g. "http://127.0.0.1:8081"
+	TokenIssuer        *llmproxy.Issuer
+	TokenRevoker       TokenRevoker
+	LLMProxyAddr       string // e.g. "http://127.0.0.1:8081"
 	ModelPolicyVersion string
 	// LLMProvider is the admin-configured upstream provider. Required when
 	// TokenIssuer is set so the scheduler can stamp provider/model into the
@@ -68,6 +68,20 @@ type SchedulerConfig struct {
 	LLMProvider LLMProviderSource
 	// MaxBundleBytes for checkpoint prepare.
 	MaxBundleBytes uint64
+	// MaxRunningTasks caps the global number of simultaneously starting/running
+	// tasks. Zero disables the check (dev/test only). Production should set
+	// this to a value derived from host capacity testing.
+	MaxRunningTasks int
+	// TaskTimeoutSeconds is the hard wall-clock budget for a single task.
+	// The same value is sent to the Worker (RuntimePolicy.TaskTimeoutSeconds)
+	// so the Worker's soft timer and the platform's hard timeout agree.
+	// Zero disables the hard timeout and the stuck-task reaper (dev/test).
+	TaskTimeoutSeconds int
+	// StuckTaskMultiplier controls the reaper: a task whose running duration
+	// exceeds TaskTimeoutSeconds * StuckTaskMultiplier is force-failed as
+	// STUCK_TASK. Default 2 (a 60s task is reaped at 120s). Only effective
+	// when TaskTimeoutSeconds > 0.
+	StuckTaskMultiplier int
 }
 
 // LLMProviderSource returns the platform's current default LLM provider.
@@ -76,6 +90,15 @@ type LLMProviderSource interface {
 }
 
 const workerShutdownTimeout = 5 * time.Second
+
+// defaultStuckTaskMultiplier is used when StuckTaskMultiplier is unset but
+// TaskTimeoutSeconds > 0. A 2x multiplier gives the Worker one timeout
+// interval of grace beyond its own soft timer before the platform reaps.
+const defaultStuckTaskMultiplier = 2
+
+// ErrLeaseExpired is re-exported from domain for callers in the application
+// layer. The postgres store returns this when a heartbeat updates 0 rows.
+var ErrLeaseExpired = domain.ErrLeaseExpired
 
 type cancelCall struct {
 	once sync.Once
@@ -152,7 +175,11 @@ type scheduler struct {
 func (s *scheduler) finalizeOrFail(ctx context.Context, task domain.Task, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) domain.Task {
 	t, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, status, deliveryType, code, message, traceID)
 	if err != nil {
-		log.Printf("scheduler: CompleteFailedTerminal failed task=%s target_status=%s: %v", task.ID, status, err)
+		slog.ErrorContext(ctx, "scheduler: CompleteFailedTerminal failed",
+			"task_id", task.ID,
+			"session_key", task.SessionKey,
+			"target_status", string(status),
+			"error", err)
 		return task
 	}
 	return t
@@ -257,11 +284,42 @@ func (s *scheduler) tick(ctx context.Context) error {
 		return err
 	}
 	for _, t := range owned {
-		_ = s.cfg.Store.HeartbeatClaim(ctx, t.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease)
+		hbErr := s.cfg.Store.HeartbeatClaim(ctx, t.ID, s.cfg.PlatformInstanceID, s.cfg.ClaimLease)
+		switch {
+		case hbErr == nil:
+			// ok
+		case errors.Is(hbErr, domain.ErrLeaseExpired):
+			// Lease lost (expired or stolen by RecoverAfterRestart on another
+			// instance). The dispatch goroutine — if any — will observe ctx
+			// cancel via the heartbeat's own context and exit. Finalize the
+			// task so the running slot is released; otherwise it would block
+			// MaxRunningTasks forever.
+			slog.ErrorContext(ctx, "scheduler: heartbeat lost lease; finalizing task",
+				"task_id", t.ID,
+				"session_key", t.SessionKey,
+				"status", string(t.Status))
+			_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
+				"LEASE_EXPIRED", "claim lease expired or lost during heartbeat", "")
+			_ = s.KickSession(ctx, t.SessionKey)
+			continue
+		default:
+			// DB connectivity error; don't finalize — retry next tick.
+			slog.ErrorContext(ctx, "scheduler: heartbeat failed (transient)",
+				"task_id", t.ID,
+				"session_key", t.SessionKey,
+				"error", hbErr)
+		}
 		// Drive cancel if requested and dispatch started.
 		if t.CancelRequestedAt != nil && t.WorkerDispatchStartedAt != nil {
 			s.maybeCancelWorker(ctx, t)
 		}
+	}
+	// Stuck-task reaper: force-fail tasks whose running duration exceeds
+	// TaskTimeoutSeconds * StuckTaskMultiplier. Catches dispatch goroutines
+	// that died without closing the gRPC stream (panic, runtime.Goexit) and
+	// tasks the Worker soft-timer couldn't preempt (stuck in a syscall).
+	if err := s.reapStuckTasks(ctx, owned); err != nil {
+		return err
 	}
 	// If we already own a non-terminal starting/running task, continue dispatch if needed.
 	for _, t := range owned {
@@ -283,6 +341,21 @@ func (s *scheduler) tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if len(keys) == 0 {
+		return nil
+	}
+	// Global running cap: don't claim new tasks when at capacity. The check
+	// happens after ListClaimableSessionKeys so the cap doesn't mask session
+	// discovery errors. Zero means disabled (dev/test).
+	if s.cfg.MaxRunningTasks > 0 {
+		running, err := s.cfg.Store.CountRunningTasks(ctx)
+		if err != nil {
+			return err
+		}
+		if running >= s.cfg.MaxRunningTasks {
+			return nil
+		}
+	}
 	for _, sk := range keys {
 		task, ok, err := s.cfg.Store.ClaimNextTask(ctx, sk, s.cfg.PlatformInstanceID, s.cfg.ClaimLease)
 		if err != nil {
@@ -292,6 +365,56 @@ func (s *scheduler) tick(ctx context.Context) error {
 			continue
 		}
 		return s.dispatch(ctx, task)
+	}
+	return nil
+}
+
+// reapStuckTasks force-fails owned running tasks whose wall-clock duration
+// exceeds TaskTimeoutSeconds * StuckTaskMultiplier. This is the backstop for:
+//   - dispatch goroutines that died without closing the gRPC stream (panic,
+//     runtime.Goexit, scheduler bug)
+//   - tasks the Worker soft timer couldn't preempt (stuck in a blocking
+//     syscall past the budget)
+//
+// Without this reaper, a stuck task would occupy a MaxRunningTasks slot
+// indefinitely, eventually blocking all users. The reaper runs every tick
+// (PollInterval) so the worst-case detection latency is PollInterval.
+func (s *scheduler) reapStuckTasks(ctx context.Context, owned []domain.Task) error {
+	if s.cfg.TaskTimeoutSeconds <= 0 {
+		return nil
+	}
+	multiplier := s.cfg.StuckTaskMultiplier
+	if multiplier <= 0 {
+		multiplier = defaultStuckTaskMultiplier
+	}
+	threshold := time.Duration(s.cfg.TaskTimeoutSeconds*multiplier) * time.Second
+	for _, t := range owned {
+		if t.Status != domain.TaskRunning {
+			continue
+		}
+		if t.StartedAt == nil {
+			continue
+		}
+		elapsed := time.Since(*t.StartedAt)
+		if elapsed <= threshold {
+			continue
+		}
+		slog.ErrorContext(ctx, "scheduler: reaping stuck task",
+			"task_id", t.ID,
+			"session_key", t.SessionKey,
+			"started_at", t.StartedAt.Format(time.RFC3339),
+			"elapsed", elapsed.String(),
+			"threshold", threshold.String())
+		_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
+			"STUCK_TASK",
+			fmt.Sprintf("task exceeded %v wall-clock budget (started %s ago)", threshold, elapsed),
+			"")
+		// Best-effort cancel the Worker so it stops consuming resources;
+		// the gRPC stream will be torn down by context cancellation.
+		cancelCtx, cancel := context.WithTimeout(context.Background(), workerShutdownTimeout)
+		_ = s.CancelWorker(cancelCtx, t)
+		cancel()
+		_ = s.KickSession(ctx, t.SessionKey)
 	}
 	return nil
 }
@@ -426,7 +549,20 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		},
 	}
 
+	// Hard wall-clock timeout: when TaskTimeoutSeconds is set, wrap the
+	// execute context so a runaway Worker (stuck in an LLM call, deadlock,
+	// infinite loop) is force-cancelled at the budget. The Worker also
+	// receives this value in RuntimePolicy for its soft timer; the Go-side
+	// hard timeout is the backstop when the soft timer can't preempt a
+	// blocking syscall. Add workerShutdownTimeout of grace so the Worker
+	// has a chance to flush a partial checkpoint before the stream dies.
 	executeCtx, cancelExecute := context.WithCancel(ctx)
+	if s.cfg.TaskTimeoutSeconds > 0 {
+		hardBudget := time.Duration(s.cfg.TaskTimeoutSeconds)*time.Second + workerShutdownTimeout
+		var timeoutCancel context.CancelFunc
+		executeCtx, timeoutCancel = context.WithTimeout(ctx, hardBudget)
+		defer timeoutCancel()
+	}
 	defer cancelExecute()
 	events, errs := client.ExecuteTask(executeCtx, req)
 	releaseWorkerCall()
@@ -674,7 +810,9 @@ func (s *scheduler) revokeTokenBestEffort(ctx context.Context, jti string) {
 	revokeCtx, cancel := context.WithTimeout(ctx, revokeTimeout)
 	defer cancel()
 	if err := s.cfg.TokenRevoker.Revoke(revokeCtx, jti); err != nil {
-		log.Printf("scheduler: best-effort revoke jti=%s failed: %v", jti, err)
+		slog.WarnContext(ctx, "scheduler: best-effort revoke failed",
+			"jti", jti,
+			"error", err)
 	}
 }
 
@@ -694,7 +832,7 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 			MaxHistoryBytes:    256 * 1024,
 			MaxWorkingBytes:    64 * 1024,
 			MaxOutputBytes:     256 * 1024,
-			TaskTimeoutSeconds: 60,
+			TaskTimeoutSeconds: uint32(s.cfg.TaskTimeoutSeconds),
 			CapabilityVersion:  CapabilityVersion,
 			PolicyDigest:       s.cfg.Registry.Digest(),
 		},
@@ -753,5 +891,3 @@ func firstNonEmpty(a, b string) string {
 	}
 	return b
 }
-
-

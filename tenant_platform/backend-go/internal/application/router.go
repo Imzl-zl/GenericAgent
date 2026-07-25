@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -33,9 +33,9 @@ const (
 
 // RouterResult is the outcome of processing an incoming message.
 type RouterResult struct {
-	Action  RouterAction
-	Reply   string
-	UserID  int64
+	Action RouterAction
+	Reply  string
+	UserID int64
 }
 
 // IncomingMessage is a message received from a bot transport.
@@ -184,7 +184,10 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 		if errors.Is(perr, domain.ErrDuplicateInboundMessage) {
 			return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
 		}
-		log.Printf("router: persist inbound message %s failed: %v", msg.MessageID, perr)
+		slog.ErrorContext(ctx, "router: persist inbound message failed",
+			"message_id", msg.MessageID,
+			"bot_uuid", msg.BotUUID,
+			"error", perr)
 	}
 	// Unbound bot: only /activate is allowed (spec §6.1 step 2).
 	if !bot.IsBound() {
@@ -522,7 +525,10 @@ func (r *router) persistInbound(ctx context.Context, msg IncomingMessage, bot do
 			Direction:   domain.MessageInbound,
 		})
 		if merr != nil && !errors.Is(merr, domain.ErrDuplicateMediaAsset) {
-			log.Printf("router: persist media asset %s failed: %v", item.StoragePath, merr)
+			slog.ErrorContext(ctx, "router: persist media asset failed",
+				"storage_path", item.StoragePath,
+				"file_name", item.FileName,
+				"error", merr)
 		}
 	}
 	return msgRow, nil

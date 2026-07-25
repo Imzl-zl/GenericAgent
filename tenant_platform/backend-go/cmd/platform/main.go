@@ -6,7 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -26,10 +26,12 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/ilink"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/logging"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/poller"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/systemd"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/transport"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/worker"
 )
@@ -54,6 +56,21 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// envInt reads an integer from the named env var, returning fallback when
+// unset or unparsable. Used for quota tunables so operators can set them
+// without touching flags.
+func envInt(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 // buildWorkerRuntime selects the loopback or podman runtime based on mode.
@@ -229,6 +246,10 @@ func finishPlatform(serveErr error, schedulerDone <-chan error, timeout time.Dur
 }
 
 func run() error {
+	// Initialize structured logging before anything else so even early
+	// failures produce JSON. LOG_LEVEL controls verbosity.
+	logging.Init()
+
 	var (
 		policyFile           = flag.String("policy-file", "", "path to capability policy manifest (required)")
 		claimLease           = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
@@ -255,6 +276,10 @@ func run() error {
 		botPollerURL         = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
 		platformWebhookURL   = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
 		webhookSecret        = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
+		maxRunningTasks      = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
+		perUserQueueLimit    = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
+		taskTimeoutSeconds   = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 60), "hard wall-clock budget per task (or TASK_TIMEOUT_SECONDS); 0 = disabled (dev/test)")
+		stuckTaskMultiplier  = flag.Int("stuck-task-multiplier", envInt("STUCK_TASK_MULTIPLIER", 2), "reaper threshold multiplier: a task running longer than task_timeout*multiplier is force-failed (or STUCK_TASK_MULTIPLIER); default 2")
 	)
 	flag.Parse()
 
@@ -311,6 +336,13 @@ func run() error {
 	store, err := postgres.NewStore(pool)
 	if err != nil {
 		return err
+	}
+	// Resource quotas: enforced by scheduler (global running cap) and store
+	// (per-user queued cap). Zero disables (dev/test).
+	store.SetPerUserQueueLimit(*perUserQueueLimit)
+	if *maxRunningTasks > 0 || *taskTimeoutSeconds > 0 {
+		fmt.Fprintf(os.Stderr, "platform: quota max_running_tasks=%d per_user_queue_limit=%d task_timeout=%ds stuck_multiplier=%d\n",
+			*maxRunningTasks, *perUserQueueLimit, *taskTimeoutSeconds, *stuckTaskMultiplier)
 	}
 
 	boot, err := application.LoadDevBootstrapFromEnv()
@@ -464,6 +496,9 @@ func run() error {
 		TokenRevoker:        revoker,
 		ModelPolicyVersion:  strings.TrimSpace(*modelPolicyVersion),
 		LLMProvider:         store,
+		MaxRunningTasks:     *maxRunningTasks,
+		TaskTimeoutSeconds:  *taskTimeoutSeconds,
+		StuckTaskMultiplier: *stuckTaskMultiplier,
 	})
 	if err != nil {
 		return err
@@ -480,6 +515,7 @@ func run() error {
 		Coordinator:        coord,
 		PlatformInstanceID: instanceID,
 		ClaimLease:         *claimLease,
+		PerUserQueueLimit:  *perUserQueueLimit,
 		Kick: func(ctx context.Context, sessionKey string) {
 			_ = sched.KickSession(ctx, sessionKey)
 		},
@@ -656,7 +692,7 @@ func run() error {
 	if deliverySvc != nil {
 		go func() {
 			if err := deliverySvc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("delivery service error: %v", err)
+				slog.ErrorContext(ctx, "delivery service error", "error", err)
 			}
 		}()
 	}
@@ -666,14 +702,19 @@ func run() error {
 	// inside the lifecycle service; one bad bot does not block startup.
 	if botLifecycle != nil {
 		if err := botLifecycle.RestoreActiveBots(ctx); err != nil {
-			log.Printf("bot lifecycle restore error: %v", err)
+			slog.ErrorContext(ctx, "bot lifecycle restore error", "error", err)
 		}
 	}
 
 	fmt.Fprintf(os.Stderr, "platform: instance_id=%s listen=%s session=%s policy_digest=%s\n",
 		instanceID, *listen, devCtx.SessionKey, reg.Digest())
 
-	serveErr := api.ServeContext(ctx, *listen, server.Handler())
+	// Wrap the HTTP server with sd_notify so systemd Type=notify + WatchdogSec
+	// can supervise this process. When not running under systemd (NOTIFY_SOCKET
+	// unset), the wrapper is a pass-through that just calls serve().
+	serveErr := systemd.ReadyAndServe(ctx, func() error {
+		return api.ServeContext(ctx, *listen, server.Handler())
+	})
 	cancel()
 	return finishPlatform(serveErr, schedulerDone, 15*time.Second)
 }

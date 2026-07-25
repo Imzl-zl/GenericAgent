@@ -30,6 +30,11 @@ type TaskServiceConfig struct {
 	Coordinator        checkpoint.Coordinator
 	PlatformInstanceID string
 	ClaimLease         time.Duration
+	// PerUserQueueLimit caps the number of queued tasks a single requester
+	// may have. Zero disables the check (dev/test only). The hard check is
+	// enforced inside Store.SubmitTask's transaction to avoid TOCTOU races;
+	// this field is the soft pre-check for fast rejection of obvious floods.
+	PerUserQueueLimit int
 	// Kick is optional; called after durable mutations that may unblock work.
 	Kick func(ctx context.Context, sessionKey string)
 	// CancelWorker is optional; invoked when durable cancel requires Worker RPC.
@@ -42,6 +47,7 @@ type taskService struct {
 	coord              checkpoint.Coordinator
 	platformInstanceID string
 	claimLease         time.Duration
+	perUserQueueLimit  int
 	kick               func(ctx context.Context, sessionKey string)
 	cancelWorker       func(ctx context.Context, task domain.Task) error
 }
@@ -66,14 +72,30 @@ func NewTaskService(cfg TaskServiceConfig) (TaskService, error) {
 		coord:              cfg.Coordinator,
 		platformInstanceID: cfg.PlatformInstanceID,
 		claimLease:         cfg.ClaimLease,
+		perUserQueueLimit:  cfg.PerUserQueueLimit,
 		kick:               cfg.Kick,
 		cancelWorker:       cfg.CancelWorker,
 	}, nil
 }
 
+// ErrPerUserQueueFull is re-exported from domain so callers in the application
+// layer can match against it without importing domain directly in some paths.
+var ErrPerUserQueueFull = domain.ErrPerUserQueueFull
+
 func (s *taskService) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error) {
 	if _, err := s.registry.Resolve(CapabilityVersion, cmd.ToolPolicyVersion); err != nil {
 		return domain.Task{}, fmt.Errorf("tool_policy_version: %w", err)
+	}
+	// Soft pre-check to fast-reject obvious floods without entering a tx.
+	// The hard check inside Store.SubmitTask prevents TOCTOU.
+	if s.perUserQueueLimit > 0 && cmd.RequesterUserID > 0 {
+		queued, err := s.store.CountQueuedTasksByRequester(ctx, cmd.RequesterUserID)
+		if err != nil {
+			return domain.Task{}, fmt.Errorf("count queued: %w", err)
+		}
+		if queued >= s.perUserQueueLimit {
+			return domain.Task{}, ErrPerUserQueueFull
+		}
 	}
 	task, err := s.store.SubmitTask(ctx, cmd)
 	if err != nil {

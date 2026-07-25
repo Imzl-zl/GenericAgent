@@ -1,0 +1,57 @@
+[Unit]
+Description=GenericAgent LLM Proxy (capability_token gateway)
+Documentation=https://github.com/Imzl-zl/GenericAgent/tree/main/docs/superpowers/specs/2026-07-23-multi-tenant-implementation-boundaries-design.md
+After=network-online.target ga-platform.service
+Wants=network-online.target
+Requires=ga-platform.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=15s
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# The Proxy holds decrypted upstream API keys in memory only; never log
+# request bodies. MemoryMax caps the in-flight token cache.
+MemoryMax=256M
+TasksMax=64
+LimitNOFILE=4096
+
+EnvironmentFile=-/etc/ga/llm-proxy.env
+
+User=ga
+Group=ga
+WorkingDirectory=/opt/ga
+
+# ExecStart — binds loopback only. The platform's Worker calls this address
+# via the LLM_PROXY_ADDR environment variable. capability_token signing key
+# MUST match the platform's --capability-signing-key.
+ExecStart=/opt/ga/bin/llm-proxy \
+  --listen=127.0.0.1:8081 \
+  --signing-key-file=/etc/ga/llm-proxy.signing-key \
+  --database-url=${DATABASE_URL}
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ga
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ga-llm-proxy
+
+[Install]
+WantedBy=multi-user.target

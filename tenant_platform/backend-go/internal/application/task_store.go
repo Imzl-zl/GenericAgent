@@ -25,4 +25,10 @@ type TaskStore interface {
 	MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string) (domain.Task, error)
 	MarkRunning(ctx context.Context, taskID, platformInstanceID string) (domain.Task, error)
 	RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error
+	// CountRunningTasks returns the global number of tasks in starting/running
+	// status. Used by the scheduler to enforce MaxRunningTasks.
+	CountRunningTasks(ctx context.Context) (int, error)
+	// CountQueuedTasksByRequester returns the number of queued tasks for a
+	// given requester. Used by SubmitTask to enforce PerUserQueueLimit.
+	CountQueuedTasksByRequester(ctx context.Context, requesterUserID int64) (int, error)
 }

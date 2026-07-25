@@ -1,0 +1,74 @@
+[Unit]
+Description=GenericAgent Platform (control plane)
+Documentation=https://github.com/Imzl-zl/GenericAgent/tree/main/docs/superpowers/specs/2026-07-21-multi-tenant-architecture.md
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# Resource limits — tune per host. The 2 vCPU / 4 GiB reference host uses
+# these values; raise on bigger boxes. MemoryMax pairs with the per-task
+# cap enforced inside the Worker container (cgroup v2).
+MemoryMax=2G
+TasksMax=512
+LimitNOFILE=4096
+
+# Environment — supplied via /etc/ga/platform.env (not committed). The file
+# must define DATABASE_URL, BOT_TOKEN_KEY, PLATFORM_WEBHOOK_SECRET,
+# LLM_PROXY_CAPABILITY_SIGNING_KEY, and any optional quota tunables.
+EnvironmentFile=-/etc/ga/platform.env
+
+# User isolation — never run as root.
+User=ga
+Group=ga
+
+# Working directory — needed so relative paths in flags resolve.
+WorkingDirectory=/opt/ga
+
+# ExecStart — dev-loopback is the only currently-supported mode; the
+# production path will replace this with the three-process split
+# (platform / worker-manager / llm-proxy) once Slice 2b Podman is validated.
+ExecStart=/opt/ga/bin/platform \
+  --policy-file=/opt/ga/policy/foundation.yaml \
+  --claim-lease=30s \
+  --dev-loopback \
+  --listen=127.0.0.1:8080 \
+  --runtime-root=/var/lib/ga/runtime \
+  --config-root=/etc/ga/config \
+  --legacy-root=/opt/ga/legacy \
+  --worker-python=/usr/bin/python3 \
+  --worker-src=/opt/ga/worker-python/src \
+  --worker-runtime=loopback
+
+# Sandboxing — defense in depth. The service still works if any of these
+# are too restrictive for a given deployment; relax in /etc/systemd/system.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ga /etc/ga/config
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+# Logging — systemd journal captures stdout/stderr automatically. No
+# separate logrotate needed; journal has built-in size-based rotation.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ga-platform
+
+[Install]
+WantedBy=multi-user.target

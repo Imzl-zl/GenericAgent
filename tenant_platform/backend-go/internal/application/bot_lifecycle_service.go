@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/errgroup"
@@ -76,7 +76,7 @@ func NewBotLifecycleService(cfg BotLifecycleConfig) (BotLifecycleService, error)
 		store:              cfg.Store,
 		cipher:             cfg.Cipher,
 		poller:             cfg.Poller,
-		webhookURL:        cfg.WebhookURL,
+		webhookURL:         cfg.WebhookURL,
 		restoreConcurrency: cfg.RestoreConcurrency,
 	}, nil
 }
@@ -159,10 +159,17 @@ func (s *botLifecycleService) RestoreActiveBots(ctx context.Context) error {
 		bot := bot // capture
 		g.Go(func() error {
 			if err := s.StartBotForBoundUser(gctx, bot); err != nil {
-				log.Printf("bot_lifecycle: restore bot %s failed: %v", bot.BotUUID, err)
+				slog.ErrorContext(gctx, "bot_lifecycle: restore bot failed",
+					"bot_uuid", bot.BotUUID,
+					"bot_id", bot.ID,
+					"owner_user_id", bot.OwnerID,
+					"error", err)
 				return nil // do not cancel the group; one bad bot must not block others
 			}
-			log.Printf("bot_lifecycle: restored bot %s", bot.BotUUID)
+			slog.InfoContext(gctx, "bot_lifecycle: restored bot",
+				"bot_uuid", bot.BotUUID,
+				"bot_id", bot.ID,
+				"owner_user_id", bot.OwnerID)
 			return nil
 		})
 	}

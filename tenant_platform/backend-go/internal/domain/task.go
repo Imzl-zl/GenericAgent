@@ -1,7 +1,10 @@
 // Package domain holds platform task and result types owned by the control plane.
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // SubmitTaskCommand is the validated carrier for enqueuing a task.
 // MessageID becomes message_idempotency_key; callers cannot supply a second dedupe value.
@@ -94,3 +97,14 @@ func (s TaskStatus) IsTerminal() bool {
 		return false
 	}
 }
+
+// ErrPerUserQueueFull signals that a requester has reached the per-user
+// queued-task cap. Defined in domain so both application and postgres layers
+// can return/test against the same sentinel without import cycles.
+var ErrPerUserQueueFull = errors.New("per-user queue limit reached")
+
+// ErrLeaseExpired signals that a claim heartbeat updated 0 rows because the
+// caller no longer owns the task (lease expired or was stolen by recovery).
+// Defined in domain so both the application (scheduler tick) and the postgres
+// store can reference it without an import cycle.
+var ErrLeaseExpired = errors.New("claim lease expired or lost")

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"time"
 
@@ -144,7 +144,7 @@ func (s *deliveryService) Run(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		if err := s.tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("delivery: tick error: %v", err)
+			slog.ErrorContext(ctx, "delivery: tick error", "error", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -179,7 +179,10 @@ func (s *deliveryService) tick(ctx context.Context) error {
 		d := d
 		g.Go(func() error {
 			if err := s.process(gctx, d, now); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("delivery: process %s failed: %v", d.DeliveryID, err)
+				slog.ErrorContext(gctx, "delivery: process failed",
+					"delivery_id", d.DeliveryID,
+					"task_id", d.TaskID,
+					"error", err)
 			}
 			return nil
 		})
@@ -220,7 +223,12 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 		Content:     text,
 		TaskID:      task.ID,
 	}); err != nil {
-		log.Printf("delivery: audit outbound for delivery %s failed: %v", d.DeliveryID, err)
+		slog.ErrorContext(ctx, "delivery: audit outbound failed",
+			"delivery_id", d.DeliveryID,
+			"task_id", task.ID,
+			"user_id", bot.OwnerID,
+			"bot_id", bot.ID,
+			"error", err)
 	}
 	return s.cfg.Store.MarkDeliveryAcked(ctx, d.DeliveryID, now)
 }

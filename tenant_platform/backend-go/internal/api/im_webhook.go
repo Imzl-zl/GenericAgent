@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -113,15 +113,22 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Persist the cursor pushed by the Poller so the platform can resume
-	// long-polling from the right position after a restart. The Go side owns
-	// encryption; the Poller sends plaintext (it never touches disk).
-	// Failures are surfaced (no silent fallback) but non-fatal: the message
-	// is still routed. The next successful persist will catch up; the log
-	// lets operators spot DB issues before they cascade.
+	// Persist the cursor pushed by the Poller BEFORE routing the message.
+	// This is a hard sync: if the cursor can't be durably stored, we must not
+	// route the message — because a platform restart after routing would
+	// resume polling from the OLD cursor and re-deliver this same message,
+	// breaking exactly-once inbound delivery. Surfacing 5xx here lets the
+	// Poller retry the whole webhook; UpsertBotTransportState is idempotent
+	// (ON CONFLICT DO UPDATE) so a retry that re-sends the same cursor is safe.
 	if s.botLifecycle != nil && body.UpdatesBuf != "" {
 		if err := s.botLifecycle.PersistUpdatesBuf(r.Context(), body.BotUUID, body.UpdatesBuf); err != nil {
-			log.Printf("im_webhook: persist cursor for bot=%s failed: %v (non-fatal; message still routed)", body.BotUUID, err)
+			slog.ErrorContext(r.Context(), "im_webhook: cursor persist failed; returning 5xx so Poller retries",
+				"bot_uuid", body.BotUUID,
+				"trace_id", tid,
+				"error", err)
+			writeErr(w, http.StatusServiceUnavailable, "CURSOR_PERSIST_FAILED",
+				"failed to persist updates cursor; message not routed to avoid duplicate delivery on restart", tid)
+			return
 		}
 	}
 
@@ -151,7 +158,7 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 func (s *Server) verifyWebhookSignature(body []byte, sigHex string) bool {
 	if s.webhookSecret == "" {
 		emptySecretOnce.Do(func() {
-			log.Printf("im_webhook: webhook secret empty; /v1/im/webhook is unauthenticated (dev/test only)")
+			slog.Warn("im_webhook: webhook secret empty; /v1/im/webhook is unauthenticated (dev/test only)")
 		})
 		return true
 	}
