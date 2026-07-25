@@ -16,12 +16,17 @@ import (
 type fakeRouterStore struct {
 	bots         map[string]domain.Bot // botUUID → bot
 	statuses     map[int64]domain.UserStatus
+	toolPolicies map[int64]string // userID → tool_policy_version
 	runningTask  *domain.Task
 	findTaskErr  error
 }
 
 func newFakeRouterStore() *fakeRouterStore {
-	return &fakeRouterStore{bots: make(map[string]domain.Bot), statuses: make(map[int64]domain.UserStatus)}
+	return &fakeRouterStore{
+		bots:         make(map[string]domain.Bot),
+		statuses:     make(map[int64]domain.UserStatus),
+		toolPolicies: make(map[int64]string),
+	}
 }
 
 func (f *fakeRouterStore) GetBotByUUID(_ context.Context, botUUID string) (domain.Bot, error) {
@@ -38,6 +43,14 @@ func (f *fakeRouterStore) GetUserStatus(_ context.Context, userID int64) (domain
 		return "", fmt.Errorf("user %d not found", userID)
 	}
 	return s, nil
+}
+
+func (f *fakeRouterStore) GetUserToolPolicy(_ context.Context, userID int64) (string, error) {
+	p, ok := f.toolPolicies[userID]
+	if !ok {
+		return "foundation.no-host-tools.v1", nil // default
+	}
+	return p, nil
 }
 
 func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string) (domain.Task, error) {
@@ -287,6 +300,96 @@ func TestRouterNewCommandAcknowledged(t *testing.T) {
 	})
 	if res.Action != ActionNewSession {
 		t.Fatalf("expected new_session, got %s", res.Action)
+	}
+}
+
+func TestRouterHelpCommand(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, _, _ := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/help",
+	})
+	if res.Action != ActionHelp {
+		t.Fatalf("expected help, got %s", res.Action)
+	}
+	last, ok := tr.LastSentMessage()
+	if !ok || !contains(last.Text, "平台命令") {
+		t.Fatalf("expected help text with '平台命令', got %q", last.Text)
+	}
+}
+
+func TestRouterStatusIdle(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, _, _ := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/status",
+	})
+	if res.Action != ActionStatus {
+		t.Fatalf("expected status, got %s", res.Action)
+	}
+	last, _ := tr.LastSentMessage()
+	if !contains(last.Text, "idle") {
+		t.Fatalf("expected idle status, got %q", last.Text)
+	}
+}
+
+func TestRouterStatusRunning(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	store.runningTask = &domain.Task{ID: "task-1", Status: domain.TaskRunning}
+	tr := transport.NewLoopbackTransport()
+	r, _, _ := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/status",
+	})
+	if res.Action != ActionStatus {
+		t.Fatalf("expected status, got %s", res.Action)
+	}
+	last, _ := tr.LastSentMessage()
+	if !contains(last.Text, "running") {
+		t.Fatalf("expected running status, got %q", last.Text)
+	}
+}
+
+func TestRouterLLMCommand(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, _, _ := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/llm",
+	})
+	if res.Action != ActionModelInfo {
+		t.Fatalf("expected model_info, got %s", res.Action)
+	}
+	last, _ := tr.LastSentMessage()
+	if !contains(last.Text, "LLM Proxy") {
+		t.Fatalf("expected LLM Proxy mention, got %q", last.Text)
+	}
+}
+
+func TestRouterUnknownSlashCommandForwardedAsTask(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, tasks, _ := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/restore",
+	})
+	if res.Action != ActionTaskCreated {
+		t.Fatalf("expected task_created for unknown /xxx, got %s", res.Action)
+	}
+	if tasks.submittedTask.Prompt != "/restore" {
+		t.Fatalf("expected prompt '/restore' forwarded verbatim, got %q", tasks.submittedTask.Prompt)
 	}
 }
 

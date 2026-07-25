@@ -26,10 +26,22 @@ type Server struct {
 	binding    application.BindingService
 	router     application.Router
 	registry   policy.Registry
+	policies   PolicyStore
 	devToken   string
 	devUserID  int64
 	sessionKey string
 	mux        *http.ServeMux
+}
+
+// PolicyStore is the admin-facing port for command/policy management.
+type PolicyStore interface {
+	ListAllCommands(ctx context.Context) ([]domain.PlatformCommand, error)
+	UpdateCommand(ctx context.Context, id int64, action domain.CommandAction,
+		helpText string, enabled bool, sortOrder int, updatedBy int64) (domain.PlatformCommand, error)
+	ListToolPolicies(ctx context.Context) ([]domain.ToolPolicy, error)
+	CreateToolPolicy(ctx context.Context, version, description string,
+		allowedTools []string, createdBy int64) (domain.ToolPolicy, error)
+	UpdateUserToolPolicy(ctx context.Context, userID int64, version string, updatedBy int64) error
 }
 
 // ServerConfig configures the foundation API.
@@ -39,6 +51,7 @@ type ServerConfig struct {
 	Binding    application.BindingService
 	Router     application.Router
 	Registry   policy.Registry
+	Policies   PolicyStore
 	DevToken   string
 	DevUserID  int64
 	SessionKey string
@@ -64,6 +77,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		binding:    cfg.Binding,
 		router:     cfg.Router,
 		registry:   cfg.Registry,
+		policies:   cfg.Policies,
 		devToken:   cfg.DevToken,
 		devUserID:  cfg.DevUserID,
 		sessionKey: cfg.SessionKey,

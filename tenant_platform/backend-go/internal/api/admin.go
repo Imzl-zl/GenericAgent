@@ -28,6 +28,13 @@ func (s *Server) registerLifecycleRoutes() {
 	if s.router != nil {
 		s.mux.HandleFunc("POST /v1/router/messages", s.auth(s.handleRouterMessage))
 	}
+	if s.policies != nil {
+		s.mux.HandleFunc("GET /v1/admin/commands", s.auth(s.handleListCommands))
+		s.mux.HandleFunc("PUT /v1/admin/commands/{command_id}", s.auth(s.handleUpdateCommand))
+		s.mux.HandleFunc("GET /v1/admin/tool-policies", s.auth(s.handleListToolPolicies))
+		s.mux.HandleFunc("POST /v1/admin/tool-policies", s.auth(s.handleCreateToolPolicy))
+		s.mux.HandleFunc("PUT /v1/admin/users/{user_id}/tool-policy", s.auth(s.handleUpdateUserToolPolicy))
+	}
 }
 
 type createUserBody struct {

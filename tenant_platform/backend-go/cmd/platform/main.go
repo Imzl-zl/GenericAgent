@@ -415,6 +415,7 @@ func run() error {
 		Binding:        bindingSvc,
 		Tasks:          svc,
 		Transport:      loopback,
+		Commands:       store, // DB-driven command registry (migration 0004)
 		ToolPolicy:     strings.TrimSpace(*modelPolicyVersion),
 		SourceInstance: instanceID,
 	})
@@ -428,6 +429,7 @@ func run() error {
 		Binding:    bindingSvc,
 		Router:     routerSvc,
 		Registry:   reg,
+		Policies:   store, // admin command/policy management (migration 0004)
 		DevToken:   boot.DevToken,
 		DevUserID:  devCtx.UserID,
 		SessionKey: devCtx.SessionKey,

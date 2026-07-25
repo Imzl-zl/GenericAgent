@@ -338,6 +338,84 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /v1/admin/commands:
+    get:
+      tags: [admin]
+      summary: List all platform commands (admin-configurable)
+      security: [{PlatformDevToken: []}]
+      responses:
+        "200":
+          description: Command list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/PlatformCommand"}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/admin/commands/{command_id}:
+    put:
+      tags: [admin]
+      summary: Update a platform command (enable/disable, reclassify, edit help)
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: command_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateCommandRequest"}
+      responses:
+        "200":
+          description: Updated command
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PlatformCommand"}
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/admin/tool-policies:
+    get:
+      tags: [admin]
+      summary: List all tool policies
+      security: [{PlatformDevToken: []}]
+      responses:
+        "200":
+          description: Policy list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/ToolPolicy"}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [admin]
+      summary: Create a new tool policy version
+      security: [{PlatformDevToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateToolPolicyRequest"}
+      responses:
+        "201":
+          description: Created policy
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ToolPolicy"}
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
 components:
   securitySchemes:
     PlatformDevToken:
@@ -611,7 +689,7 @@ components:
       properties:
         action:
           type: string
-          enum: [activated, stopped, new_session, task_created, rejected, duplicate, no_running_task]
+          enum: [activated, stopped, new_session, task_created, rejected, duplicate, no_running_task, help, status, model_info]
         reply:
           type: string
           description: Reply text sent to the user via the transport
@@ -619,3 +697,93 @@ components:
           type: integer
           format: int64
           nullable: true
+    PlatformCommand:
+      type: object
+      required:
+        - id
+        - command
+        - action
+        - handler
+        - enabled
+      properties:
+        id:
+          type: integer
+          format: int64
+        command:
+          type: string
+          example: "/stop"
+        action:
+          type: string
+          enum: [intercept, passthrough]
+        handler:
+          type: string
+          example: "stop"
+        help_text:
+          type: string
+        enabled:
+          type: boolean
+        sort_order:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+    UpdateCommandRequest:
+      type: object
+      required:
+        - action
+        - enabled
+      properties:
+        action:
+          type: string
+          enum: [intercept, passthrough]
+        help_text:
+          type: string
+        enabled:
+          type: boolean
+        sort_order:
+          type: integer
+    ToolPolicy:
+      type: object
+      required:
+        - id
+        - version
+        - allowed_tools
+        - enabled
+      properties:
+        id:
+          type: integer
+          format: int64
+        version:
+          type: string
+          example: "foundation.no-host-tools.v1"
+        allowed_tools:
+          type: array
+          items:
+            type: string
+          example: ["update_working_checkpoint"]
+        description:
+          type: string
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateToolPolicyRequest:
+      type: object
+      required:
+        - version
+        - allowed_tools
+      properties:
+        version:
+          type: string
+          example: "foundation.code-run.v1"
+        allowed_tools:
+          type: array
+          items:
+            type: string
+          example: ["update_working_checkpoint", "code_run", "file_read"]
+        description:
+          type: string
