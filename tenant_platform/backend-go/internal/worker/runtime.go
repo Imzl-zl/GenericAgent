@@ -45,6 +45,7 @@ type LoopbackConfig struct {
 	Python     string
 	WorkerSrc  string
 	LegacyRoot string
+	PolicyFile string
 }
 
 // LoopbackWorkerRuntime starts a real Python Worker subprocess on the host and
@@ -84,6 +85,9 @@ func (r *LoopbackWorkerRuntime) Start(ctx context.Context, req StartRequest) (*I
 	env = setEnv(env, "GA_LEGACY_ROOT", r.cfg.LegacyRoot)
 	env = setEnv(env, "GA_RUNTIME_DIR", req.RuntimeDir)
 	env = setEnv(env, "GA_WORKER_LISTEN", listen)
+	if r.cfg.PolicyFile != "" {
+		env = setEnv(env, "GA_POLICY_FILE", r.cfg.PolicyFile)
+	}
 	env = unsetEnv(env, "OPENAI_API_KEY")
 	env = unsetEnv(env, "ANTHROPIC_API_KEY")
 	pp := workerSrc

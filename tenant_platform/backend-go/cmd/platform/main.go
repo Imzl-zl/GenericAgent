@@ -66,6 +66,7 @@ func buildWorkerRuntime(mode, managerAddr string, boot application.DevBootstrapC
 			Python:     boot.WorkerPython,
 			WorkerSrc:  boot.WorkerSrc,
 			LegacyRoot: boot.LegacyRoot,
+			PolicyFile: boot.PolicyFile,
 		})
 		if err != nil {
 			return nil, false, fmt.Errorf("loopback runtime: %w", err)

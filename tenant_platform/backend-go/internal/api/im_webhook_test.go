@@ -137,6 +137,48 @@ func TestIMWebhookPersistsUpdatesBuf(t *testing.T) {
 	}
 }
 
+// TestIMWebhookForwardsMediaPaths verifies that media_paths from the Poller
+// webhook body are forwarded to the router via IncomingMessage.MediaPaths.
+// Uses a capturing fake router to assert the field is plumbed through.
+func TestIMWebhookForwardsMediaPaths(t *testing.T) {
+	captured := &captureRouter{result: application.RouterResult{Action: application.ActionTaskCreated}}
+	server := newTestServerWithRouter(t, captured)
+
+	body, _ := json.Marshal(imWebhookBody{
+		BotUUID:    "bot-1",
+		IlinkUserID: "user-1",
+		MessageID:  "msg-1",
+		Text:       "see attached",
+		MediaPaths: []string{"/tmp/media/bot-1/img.jpg", "/tmp/media/bot-1/img2.jpg"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(captured.last.MediaPaths) != 2 {
+		t.Fatalf("expected 2 media paths, got %d", len(captured.last.MediaPaths))
+	}
+	if captured.last.MediaPaths[0] != "/tmp/media/bot-1/img.jpg" {
+		t.Fatalf("first media path mismatch: %q", captured.last.MediaPaths[0])
+	}
+}
+
+type captureRouter struct {
+	last   application.IncomingMessage
+	result application.RouterResult
+	err    error
+}
+
+func (r *captureRouter) HandleMessage(_ context.Context, msg application.IncomingMessage) (application.RouterResult, error) {
+	r.last = msg
+	return r.result, r.err
+}
+
+func (r *captureRouter) InvalidateCommandCache() {}
+
 func newTestServerWithRouter(t *testing.T, router application.Router) *Server {
 	return newTestServerWithRouterAndLifecycle(t, router, nil)
 }

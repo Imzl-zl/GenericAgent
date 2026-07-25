@@ -16,14 +16,18 @@ func (s *Store) GetBotTransportState(ctx context.Context, botID int64) (domain.B
 	}
 	var st domain.BotTransportState
 	var cursor []byte
+	var lastErrorCode *string
 	err := s.pool.QueryRow(ctx, `
 SELECT bot_id, update_cursor_ciphertext, reconnect_state, last_error_at, last_error_code, updated_at
 FROM bot_transport_state WHERE bot_id = $1
-`, botID).Scan(&st.BotID, &cursor, &st.ReconnectState, &st.LastErrorAt, &st.LastErrorCode, &st.UpdatedAt)
+`, botID).Scan(&st.BotID, &cursor, &st.ReconnectState, &st.LastErrorAt, &lastErrorCode, &st.UpdatedAt)
 	if err != nil {
 		return domain.BotTransportState{}, err
 	}
 	st.UpdateCursorCiphertext = cursor
+	if lastErrorCode != nil {
+		st.LastErrorCode = *lastErrorCode
+	}
 	return st, nil
 }
 

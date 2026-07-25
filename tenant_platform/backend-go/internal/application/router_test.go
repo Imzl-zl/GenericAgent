@@ -257,6 +257,44 @@ func TestRouterNormalMessageCreatesTask(t *testing.T) {
 	}
 }
 
+func TestRouterMediaPathsAppendedToPrompt(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, tasks, _ := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "check this image",
+		MediaPaths: []string{"/tmp/media/b1/img.jpg"},
+	})
+	if res.Action != ActionTaskCreated {
+		t.Fatalf("expected task_created, got %s", res.Action)
+	}
+	want := "check this image\n\n[Attached files: /tmp/media/b1/img.jpg]"
+	if tasks.submittedTask.Prompt != want {
+		t.Fatalf("prompt mismatch:\n got: %q\nwant: %q", tasks.submittedTask.Prompt, want)
+	}
+}
+
+func TestRouterMediaOnlyMessageUsesPlaceholder(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, tasks, _ := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "",
+		MediaPaths: []string{"/tmp/media/b1/a.pdf", "/tmp/media/b1/b.pdf"},
+	})
+	if res.Action != ActionTaskCreated {
+		t.Fatalf("expected task_created, got %s", res.Action)
+	}
+	want := "[media message]\n\n[Attached files: /tmp/media/b1/a.pdf, /tmp/media/b1/b.pdf]"
+	if tasks.submittedTask.Prompt != want {
+		t.Fatalf("prompt mismatch:\n got: %q\nwant: %q", tasks.submittedTask.Prompt, want)
+	}
+}
+
 func TestRouterStopCancelsRunningTask(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}

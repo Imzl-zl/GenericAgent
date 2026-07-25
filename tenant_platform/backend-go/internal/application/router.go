@@ -43,6 +43,10 @@ type IncomingMessage struct {
 	IlinkUserID string
 	MessageID   string
 	Text        string
+	// MediaPaths are local file paths of inbound media downloaded by the
+	// Bot Poller. Empty for text-only messages. The router surfaces them in
+	// the task prompt so GA's file tools can read them.
+	MediaPaths []string
 }
 
 // RouterStore is the persistence port for router identity resolution.
@@ -374,10 +378,20 @@ func (r *router) handleLLM(ctx context.Context, msg IncomingMessage, bot domain.
 }
 
 func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, text string) (RouterResult, error) {
-	if text == "" {
+	if text == "" && len(msg.MediaPaths) == 0 {
 		reply := "empty message ignored"
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
+	}
+	// Surface inbound media paths in the prompt so GA's file tools can read them.
+	// This keeps the SubmitTaskCommand proto stable while making media reachable
+	// to the worker. If text is empty (pure media message), use a placeholder.
+	prompt := text
+	if len(msg.MediaPaths) > 0 {
+		if prompt == "" {
+			prompt = "[media message]"
+		}
+		prompt = prompt + "\n\n[Attached files: " + strings.Join(msg.MediaPaths, ", ") + "]"
 	}
 	// Per-user tool policy (migration 0005): resolve the user's assigned policy
 	// version, not a global default. Admins can grant different capabilities
@@ -396,7 +410,7 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		Source:            domain.SourceWechat,
 		SourceInstanceID:  r.sourceInstance,
 		MessageID:         msg.MessageID,
-		Prompt:            text,
+		Prompt:            prompt,
 		PersonaSnapshot:   []string{},
 		ToolPolicyVersion: userPolicy,
 	})

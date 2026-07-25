@@ -6,12 +6,18 @@ implementation) so the platform never re-implements iLink getupdates/sendmessage
 Architecture:
     Go platform (control plane)  ──HTTP──▶  Bot Poller (this process)
          │                                    │
-         │  /v1/im/webhook ◀──HTTP POST────  │  (inbound messages)
+         │  /v1/im/webhook ◀──HTTP POST────  │  (inbound messages + media_paths)
          │                                    │
-         └── /send ──▶ Poller.send_text ──▶  iLink
+         └── /send ──▶ Poller.send_text/send_image/send_video/send_file ──▶ iLink
 
 Each active bot runs in its own thread via WxBotClient.get_updates.
-Token is injected at start time (decrypted by Go); nothing is written to disk.
+Token is injected at start time (decrypted by Go); nothing is written to disk
+except inbound media files, which land under --media-dir/{bot_uuid}/.
+
+iLink officially supports 4 media types (image/voice/file/video) for both
+send and receive (see docs/superpowers/specs/2026-07-25-ilink-official-binding-flow.md).
+GA Core's WxBotClient implements send_image/send_video/send_file and
+wxbot_media.download_media covers all 4 inbound types.
 """
 
 import argparse
@@ -23,16 +29,38 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-# Make frontends/ importable for wxbot_client.
+# Make frontends/ importable for wxbot_client and wxbot_media.
+# _POLLER_DIR = tenant_platform/bot_poller
+# _LEGACY_ROOT = GenericAgent (two levels up)
+# _FRONTENDS_DIR = GenericAgent/frontends (where wxbot_client.py and wxbot_media.py live)
 _POLLER_DIR = os.path.dirname(os.path.abspath(__file__))
 _LEGACY_ROOT = os.path.dirname(os.path.dirname(_POLLER_DIR))
-if _LEGACY_ROOT not in sys.path:
-    sys.path.insert(0, _LEGACY_ROOT)
+_FRONTENDS_DIR = os.path.join(_LEGACY_ROOT, 'frontends')
+for _p in (_FRONTENDS_DIR, _LEGACY_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from wxbot_client import WxBotClient, AuthExpired  # noqa: E402
+from wxbot_media import download_media  # noqa: E402
 
 POLL_TIMEOUT = 30
 WEBHOOK_TIMEOUT = 10
+
+
+def _parse_listen_addr(listen):
+    """Parse 'host:port' into (host, port_int). Raises ValueError on bad input."""
+    if ':' not in listen:
+        raise ValueError(f"listen address must be 'host:port', got: {listen}")
+    host, port_str = listen.rsplit(':', 1)
+    return host, int(port_str)
+
+
+# msg_type values accepted by /send. "text" is the default for backward compat.
+MSG_TYPE_TEXT = 'text'
+MSG_TYPE_IMAGE = 'image'
+MSG_TYPE_VIDEO = 'video'
+MSG_TYPE_FILE = 'file'
+_VALID_MSG_TYPES = {MSG_TYPE_TEXT, MSG_TYPE_IMAGE, MSG_TYPE_VIDEO, MSG_TYPE_FILE}
 
 
 class BotEntry:
@@ -50,9 +78,12 @@ class BotEntry:
 class BotManager:
     """Manages long-poll threads for multiple bots."""
 
-    def __init__(self):
+    def __init__(self, media_root=None):
         self._bots = {}
         self._lock = threading.Lock()
+        self._media_root = media_root
+        if media_root:
+            os.makedirs(media_root, exist_ok=True)
 
     def start(self, bot_uuid, bot_token, ilink_bot_id, base_url, updates_buf, webhook_url):
         with self._lock:
@@ -62,9 +93,17 @@ class BotManager:
             client.bot_id = ilink_bot_id
             client.updates_buf = updates_buf or ''
             entry = BotEntry(client=client, webhook_url=webhook_url, bot_uuid=bot_uuid)
+            entry.media_dir = self._bot_media_dir(bot_uuid)
             entry.thread = threading.Thread(target=self._run, args=(entry,), daemon=True)
             entry.thread.start()
             self._bots[bot_uuid] = entry
+
+    def _bot_media_dir(self, bot_uuid):
+        if not self._media_root:
+            return None
+        d = os.path.join(self._media_root, bot_uuid)
+        os.makedirs(d, exist_ok=True)
+        return d
 
     def _run(self, entry):
         """Long-poll loop for one bot. Exits on stop_event or AuthExpired."""
@@ -82,7 +121,13 @@ class BotManager:
                 entry.stop_event.wait(5)
 
     def _dispatch(self, entry, msg, seen):
-        """Forward one inbound message to the platform webhook."""
+        """Forward one inbound message to the platform webhook.
+
+        Downloads any media items via wxbot_media.download_media and includes
+        the resulting local file paths in the webhook body as `media_paths`.
+        Text is still extracted so text-only routing (commands, /stop, etc.)
+        keeps working when a message contains both text and media items.
+        """
         mid = str(msg.get('message_id', 0))
         if not entry.client.is_user_msg(msg) or mid in seen:
             return
@@ -92,9 +137,15 @@ class BotManager:
         text = entry.client.extract_text(msg)
         uid = msg.get('from_user_id', '')
         ctx = msg.get('context_token', '')
-        self._post_webhook(entry, uid, mid, text, ctx)
+        media_paths = []
+        if entry.media_dir:
+            try:
+                media_paths = download_media(msg.get('item_list', []), dest_dir=entry.media_dir)
+            except Exception as exc:
+                print(f'[Poller] media dl err ({entry.bot_uuid}): {exc}', flush=True)
+        self._post_webhook(entry, uid, mid, text, ctx, media_paths)
 
-    def _post_webhook(self, entry, uid, mid, text, ctx):
+    def _post_webhook(self, entry, uid, mid, text, ctx, media_paths):
         body = {
             'bot_uuid': entry.bot_uuid,
             'ilink_user_id': uid,
@@ -102,6 +153,7 @@ class BotManager:
             'text': text,
             'context_token': ctx,
             'updates_buf': entry.client.updates_buf,
+            'media_paths': media_paths or [],
         }
         try:
             requests.post(entry.webhook_url, json=body, timeout=WEBHOOK_TIMEOUT)
@@ -124,12 +176,30 @@ class BotManager:
         entry.thread.join(timeout=5)
         return entry.client.updates_buf
 
-    def send(self, bot_uuid, ilink_user_id, text, context_token=''):
+    def send(self, bot_uuid, ilink_user_id, text, context_token='', msg_type=MSG_TYPE_TEXT, file_path=''):
+        """Dispatch to send_text/send_image/send_video/send_file based on msg_type.
+
+        iLink officially supports image/video/file media sends (see spec).
+        Voice send is not implemented in GA Core's WxBotClient, so 'voice'
+        is not a valid msg_type here (inbound voice still downloads fine).
+        """
         with self._lock:
             entry = self._bots.get(bot_uuid)
         if not entry:
             raise KeyError(f'bot {bot_uuid} not running')
-        entry.client.send_text(ilink_user_id, text, context_token=context_token)
+        if msg_type == MSG_TYPE_TEXT or not msg_type:
+            entry.client.send_text(ilink_user_id, text, context_token=context_token)
+            return
+        if not file_path:
+            raise ValueError(f'file_path is required for msg_type={msg_type}')
+        if msg_type == MSG_TYPE_IMAGE:
+            entry.client.send_image(ilink_user_id, file_path, context_token=context_token)
+        elif msg_type == MSG_TYPE_VIDEO:
+            entry.client.send_video(ilink_user_id, file_path, context_token=context_token)
+        elif msg_type == MSG_TYPE_FILE:
+            entry.client.send_file(ilink_user_id, file_path, context_token=context_token)
+        else:
+            raise ValueError(f'unsupported msg_type: {msg_type}')
 
     def health(self):
         with self._lock:
@@ -177,8 +247,13 @@ class PollerHandler(BaseHTTPRequestHandler):
                 buf = self.manager.stop(body['bot_uuid'])
                 self._reply(200, {'stopped': True, 'updates_buf': buf})
             elif self.path == '/send':
+                msg_type = body.get('msg_type') or MSG_TYPE_TEXT
+                if msg_type not in _VALID_MSG_TYPES:
+                    self._reply(400, {'error': f'invalid msg_type: {msg_type}'})
+                    return
                 self.manager.send(body['bot_uuid'], body['ilink_user_id'],
-                                  body['text'], body.get('context_token', ''))
+                                  body.get('text', ''), body.get('context_token', ''),
+                                  msg_type=msg_type, file_path=body.get('file_path', ''))
                 self._reply(200, {'sent': True})
             else:
                 self._reply(404, {'error': 'not found'})
@@ -188,36 +263,31 @@ class PollerHandler(BaseHTTPRequestHandler):
             self._reply(500, {'error': str(exc)})
 
 
-def serve(listen, grace_seconds=10.0):
-    PollerHandler.manager = BotManager()
-    server = ThreadingHTTPServer(listen, PollerHandler)
-    print(f'bot_poller listening on {listen}', flush=True)
+def serve(listen, grace_seconds=10.0, media_root=None):
+    PollerHandler.manager = BotManager(media_root=media_root)
+    host, port = _parse_listen_addr(listen)
+    server = ThreadingHTTPServer((host, port), PollerHandler)
+    print(f'bot_poller listening on {host}:{port} (media_root={media_root or "disabled"})', flush=True)
 
-    stop = threading.Event()
-
-    def _handle_signal(signum, frame):
-        stop.set()
-
-    import signal
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(sig, _handle_signal)
-        except Exception:
-            pass
-
+    # serve_forever() blocks the main thread; SIGINT/SIGTERM raise KeyboardInterrupt
+    # on Windows (SIGTERM) or interrupt the call (SIGINT), letting us shut down cleanly.
     try:
-        while not stop.is_set():
-            stop.wait(0.5)
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='GenericAgent Bot Poller')
     parser.add_argument('--listen', default=os.environ.get('BOT_POLLER_LISTEN', '127.0.0.1:8090'))
     parser.add_argument('--grace-seconds', type=float, default=10.0)
+    parser.add_argument('--media-dir', default=os.environ.get('BOT_POLLER_MEDIA_DIR', ''),
+                        help='Root directory for inbound media files. Empty disables media download.')
     args = parser.parse_args(argv)
-    serve(args.listen, args.grace_seconds)
+    serve(args.listen, args.grace_seconds, media_root=args.media_dir or None)
 
 
 if __name__ == '__main__':

@@ -77,19 +77,54 @@ func (c *Client) StopBot(ctx context.Context, botUUID string) (StopBotResponse, 
 	return resp, nil
 }
 
+// Message type constants for SendMessageRequest.MsgType.
+// iLink officially supports image/video/file media sends via the same
+// /ilink/bot/sendmessage endpoint with different item_list entries.
+// The Python Poller dispatches based on MsgType.
+const (
+	MsgTypeText  = "text"
+	MsgTypeImage = "image"
+	MsgTypeVideo = "video"
+	MsgTypeFile  = "file"
+)
+
 // SendMessageRequest is the body for POST /send.
+//
+// For text messages, only Text needs to be set (MsgType defaults to "text").
+// For media messages, MsgType must be one of image/video/file and FilePath
+// must point to a local file accessible to the Python Poller process.
 type SendMessageRequest struct {
 	BotUUID      string `json:"bot_uuid"`
 	ILinkUserID  string `json:"ilink_user_id"`
-	Text         string `json:"text"`
+	Text         string `json:"text,omitempty"`
 	ContextToken string `json:"context_token,omitempty"`
+	MsgType      string `json:"msg_type,omitempty"`
+	FilePath     string `json:"file_path,omitempty"`
 }
 
-// SendMessage delivers a text reply via the poller (which calls iLink sendmessage).
+// SendMessage delivers a text or media reply via the poller (which calls
+// iLink sendmessage). Empty MsgType defaults to "text" for backward compat.
 func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error {
-	if req.BotUUID == "" || req.ILinkUserID == "" || req.Text == "" {
-		return errors.New("bot_uuid, ilink_user_id, and text are required")
+	if req.BotUUID == "" || req.ILinkUserID == "" {
+		return errors.New("bot_uuid and ilink_user_id are required")
 	}
+	msgType := req.MsgType
+	if msgType == "" {
+		msgType = MsgTypeText
+	}
+	switch msgType {
+	case MsgTypeText:
+		if req.Text == "" {
+			return errors.New("text is required for msg_type=text")
+		}
+	case MsgTypeImage, MsgTypeVideo, MsgTypeFile:
+		if req.FilePath == "" {
+			return fmt.Errorf("file_path is required for msg_type=%s", msgType)
+		}
+	default:
+		return fmt.Errorf("unsupported msg_type: %s", msgType)
+	}
+	req.MsgType = msgType
 	_, err := c.post(ctx, "/send", req)
 	return err
 }

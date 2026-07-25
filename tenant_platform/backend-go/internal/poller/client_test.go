@@ -133,6 +133,64 @@ func TestSendMessage(t *testing.T) {
 	if received.BotUUID != "bot-1" || received.ILinkUserID != "user-1" || received.Text != "hello" {
 		t.Fatalf("payload mismatch: %+v", received)
 	}
+	if received.MsgType != MsgTypeText {
+		t.Fatalf("expected msg_type=%q, got %q", MsgTypeText, received.MsgType)
+	}
+}
+
+func TestSendMessageMedia(t *testing.T) {
+	tests := []struct {
+		name    string
+		msgType string
+		text    string
+		filePath string
+		wantErr bool
+	}{
+		{name: "image", msgType: MsgTypeImage, filePath: "/tmp/a.jpg"},
+		{name: "video", msgType: MsgTypeVideo, filePath: "/tmp/a.mp4"},
+		{name: "file", msgType: MsgTypeFile, filePath: "/tmp/a.pdf"},
+		{name: "media-missing-filepath", msgType: MsgTypeImage, wantErr: true},
+		{name: "invalid-msgtype", msgType: "voice", filePath: "/tmp/a.silk", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var received SendMessageRequest
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(body, &received)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"sent":true}`))
+			}))
+			defer server.Close()
+
+			c, err := NewClient(server.URL)
+			if err != nil {
+				t.Fatalf("new client: %v", err)
+			}
+			err = c.SendMessage(context.Background(), SendMessageRequest{
+				BotUUID:     "bot-1",
+				ILinkUserID: "user-1",
+				MsgType:     tt.msgType,
+				Text:        tt.text,
+				FilePath:    tt.filePath,
+			})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			if received.MsgType != tt.msgType {
+				t.Fatalf("msg_type mismatch: got %q want %q", received.MsgType, tt.msgType)
+			}
+			if received.FilePath != tt.filePath {
+				t.Fatalf("file_path mismatch: got %q want %q", received.FilePath, tt.filePath)
+			}
+		})
+	}
 }
 
 func TestHealth(t *testing.T) {

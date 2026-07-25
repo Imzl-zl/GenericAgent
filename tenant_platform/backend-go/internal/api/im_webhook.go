@@ -12,16 +12,17 @@ import (
 // The Poller reuses GA Core's WxBotClient and forwards every inbound message
 // here. Two payload variants exist:
 //   - normal message: bot_uuid, ilink_user_id, message_id, text, updates_buf,
-//     context_token
+//     context_token, media_paths (downloaded inbound media file paths)
 //   - auth-expired signal: bot_uuid, auth_expired=true
 type imWebhookBody struct {
-	BotUUID      string `json:"bot_uuid"`
-	IlinkUserID  string `json:"ilink_user_id"`
-	MessageID    string `json:"message_id"`
-	Text         string `json:"text"`
-	UpdatesBuf   string `json:"updates_buf"`
-	ContextToken string `json:"context_token"`
-	AuthExpired  bool   `json:"auth_expired"`
+	BotUUID      string   `json:"bot_uuid"`
+	IlinkUserID  string   `json:"ilink_user_id"`
+	MessageID    string   `json:"message_id"`
+	Text         string   `json:"text"`
+	UpdatesBuf   string   `json:"updates_buf"`
+	ContextToken string   `json:"context_token"`
+	AuthExpired  bool     `json:"auth_expired"`
+	MediaPaths   []string `json:"media_paths"`
 }
 
 // handleIMWebhook receives inbound messages from the Bot Poller and routes them
@@ -75,6 +76,7 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 		IlinkUserID: body.IlinkUserID,
 		MessageID:   body.MessageID,
 		Text:        body.Text,
+		MediaPaths:  body.MediaPaths,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "ROUTER_ERROR", err.Error(), tid)

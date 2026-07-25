@@ -135,12 +135,26 @@ GET /ilink/bot/get_qrcode_status?qrcode={qrcode}
 
 响应包含 `msgs` 和新的 `get_updates_buf`（游标，必须持久化）。
 
+**入站消息类型**（`item_list[].type`）：
+
+| type | item_key       | 说明                          |
+|------|----------------|-------------------------------|
+| 1    | `text_item`    | 文本                          |
+| 2    | `image_item`   | 图片（含缩略图，CDN 加密）   |
+| 3    | `voice_item`   | 语音（.silk）                 |
+| 4    | `file_item`    | 文件                          |
+| 5    | `video_item`   | 视频                          |
+
+下载链路：`GET https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=...` → AES-128-ECB 解密。GA Core 的 `frontends/wxbot_media.py` 已实现 4 种入站媒体的下载与解密。
+
 ### 5.2 发送消息
 
 通过 `POST /ilink/bot/sendmessage`：
 
 - 必须回传 incoming message 中的 `context_token`。
 - 需要 `to_user_id`、`message_type` 等字段。
+
+**出站消息类型**（`item_list[].type`）：text / image / file / video（voice 不支持出站）。媒体上传链路：`POST /ilink/bot/getuploadurl` 拿 `upload_param` → `POST <cdn>/upload`（AES-ECB 加密裸字节）→ `sendmessage` 带 `image_item`/`video_item`/`file_item`。GA Core 的 `frontends/wxbot_client.py` 已实现 `send_image`/`send_video`/`send_file`。
 
 ## 6. 实现注意（别再搞错）
 
@@ -285,5 +299,10 @@ GA Core 的 [`frontends/wechatapp.py`](file:///c:/sudy/github/GenericAgent/front
 1. ~~**Bot Poller**~~：✅ 已完成，Python Poller 复用 `WxBotClient`，Go 通过 HTTP 委托。
 2. ~~**updates_buf 持久化**~~：✅ 已完成，`bot_transport_state.update_cursor_ciphertext` 加密存储。
 3. **重试/限流**：`internal/ilink/client.go` 对 `GetQRCodeStatus` 和 `SendMessage` 的网络抖动/限流退避待补齐。
-4. **媒体收发**：目前只实现文本，GA 的文件/图片/视频收发逻辑需移植到 Poller。
+4. ~~**媒体收发**~~：✅ 已完成（2026-07-25）。4 个接入点已打通：
+   - Python Poller `/send` 按 `msg_type`（text/image/video/file）分发到 `WxBotClient.send_text/send_image/send_video/send_file`
+   - Python Poller `_dispatch` 调 `wxbot_media.download_media` 下载入站媒体（image/voice/file/video 全覆盖）
+   - Go `poller.Client.SendMessageRequest` 新增 `MsgType` / `FilePath` 字段
+   - Go `im_webhook.go` webhook body 新增 `media_paths` 字段，路由到 `IncomingMessage.MediaPaths`，并在 prompt 末尾追加 `[Attached files: ...]` 让 GA 的文件工具可读
+   - 新增 `--media-dir` flag 控制是否下载入站媒体；空则禁用（保持纯文本模式）
 5. **端到端验证**：需要 mock iLink 服务器 + Poller + 平台联调测试。
