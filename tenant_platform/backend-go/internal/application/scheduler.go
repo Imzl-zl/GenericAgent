@@ -72,16 +72,13 @@ type SchedulerConfig struct {
 	// tasks. Zero disables the check (dev/test only). Production should set
 	// this to a value derived from host capacity testing.
 	MaxRunningTasks int
-	// TaskTimeoutSeconds is the hard wall-clock budget for a single task.
-	// The same value is sent to the Worker (RuntimePolicy.TaskTimeoutSeconds)
-	// so the Worker's soft timer and the platform's hard timeout agree.
-	// Zero disables the hard timeout and the stuck-task reaper (dev/test).
+	// TaskTimeoutSeconds is passed to the Worker as RuntimePolicy.TaskTimeoutSeconds
+	// for its internal soft timer (e.g. cancelling a single hung LLM call). The
+	// platform does NOT use it as a hard wall-clock kill switch — legitimate
+	// tasks may run many times longer than a single LLM call. Stuck-task
+	// detection relies on gRPC stream errors and heartbeat lease loss instead.
+	// Zero disables the Worker soft timer (dev/test).
 	TaskTimeoutSeconds int
-	// StuckTaskMultiplier controls the reaper: a task whose running duration
-	// exceeds TaskTimeoutSeconds * StuckTaskMultiplier is force-failed as
-	// STUCK_TASK. Default 2 (a 60s task is reaped at 120s). Only effective
-	// when TaskTimeoutSeconds > 0.
-	StuckTaskMultiplier int
 }
 
 // LLMProviderSource returns the platform's current default LLM provider.
@@ -90,11 +87,6 @@ type LLMProviderSource interface {
 }
 
 const workerShutdownTimeout = 5 * time.Second
-
-// defaultStuckTaskMultiplier is used when StuckTaskMultiplier is unset but
-// TaskTimeoutSeconds > 0. A 2x multiplier gives the Worker one timeout
-// interval of grace beyond its own soft timer before the platform reaps.
-const defaultStuckTaskMultiplier = 2
 
 // ErrLeaseExpired is re-exported from domain for callers in the application
 // layer. The postgres store returns this when a heartbeat updates 0 rows.
@@ -314,13 +306,21 @@ func (s *scheduler) tick(ctx context.Context) error {
 			s.maybeCancelWorker(ctx, t)
 		}
 	}
-	// Stuck-task reaper: force-fail tasks whose running duration exceeds
-	// TaskTimeoutSeconds * StuckTaskMultiplier. Catches dispatch goroutines
-	// that died without closing the gRPC stream (panic, runtime.Goexit) and
-	// tasks the Worker soft-timer couldn't preempt (stuck in a syscall).
-	if err := s.reapStuckTasks(ctx, owned); err != nil {
-		return err
-	}
+	// Stuck-task reaping is intentionally NOT done via a wall-clock multiplier
+	// on TaskTimeoutSeconds. A legitimate task may run many times longer than
+	// a single LLM call (multi-step file processing, slow thinking models,
+	// long tool chains). Instead, stuck detection relies on two signals:
+	//   1. gRPC stream error/close — Worker process crashed or network died.
+	//      The dispatch loop's streamErr path finalizes the task immediately.
+	//   2. Heartbeat lease loss — dispatch goroutine died (panic, Goexit) so
+	//      HeartbeatClaim stopped being called. The tick loop's ErrLeaseExpired
+	//      path finalizes the task on the next tick.
+	// These two paths cover the failure modes the platform can detect without
+	// false-positive killing legitimate long tasks. The Worker's own
+	// RuntimePolicy.TaskTimeoutSeconds remains as its internal soft timer.
+	// If we later need to detect "Worker alive but deadlocked", we'll add an
+	// idle heuristic (last_activity_at column + chunk-event timestamps) rather
+	// than a wall-clock kill switch.
 	// If we already own a non-terminal starting/running task, continue dispatch if needed.
 	for _, t := range owned {
 		if t.Status == domain.TaskStarting && t.WorkerDispatchStartedAt == nil {
@@ -365,56 +365,6 @@ func (s *scheduler) tick(ctx context.Context) error {
 			continue
 		}
 		return s.dispatch(ctx, task)
-	}
-	return nil
-}
-
-// reapStuckTasks force-fails owned running tasks whose wall-clock duration
-// exceeds TaskTimeoutSeconds * StuckTaskMultiplier. This is the backstop for:
-//   - dispatch goroutines that died without closing the gRPC stream (panic,
-//     runtime.Goexit, scheduler bug)
-//   - tasks the Worker soft timer couldn't preempt (stuck in a blocking
-//     syscall past the budget)
-//
-// Without this reaper, a stuck task would occupy a MaxRunningTasks slot
-// indefinitely, eventually blocking all users. The reaper runs every tick
-// (PollInterval) so the worst-case detection latency is PollInterval.
-func (s *scheduler) reapStuckTasks(ctx context.Context, owned []domain.Task) error {
-	if s.cfg.TaskTimeoutSeconds <= 0 {
-		return nil
-	}
-	multiplier := s.cfg.StuckTaskMultiplier
-	if multiplier <= 0 {
-		multiplier = defaultStuckTaskMultiplier
-	}
-	threshold := time.Duration(s.cfg.TaskTimeoutSeconds*multiplier) * time.Second
-	for _, t := range owned {
-		if t.Status != domain.TaskRunning {
-			continue
-		}
-		if t.StartedAt == nil {
-			continue
-		}
-		elapsed := time.Since(*t.StartedAt)
-		if elapsed <= threshold {
-			continue
-		}
-		slog.ErrorContext(ctx, "scheduler: reaping stuck task",
-			"task_id", t.ID,
-			"session_key", t.SessionKey,
-			"started_at", t.StartedAt.Format(time.RFC3339),
-			"elapsed", elapsed.String(),
-			"threshold", threshold.String())
-		_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
-			"STUCK_TASK",
-			fmt.Sprintf("task exceeded %v wall-clock budget (started %s ago)", threshold, elapsed),
-			"")
-		// Best-effort cancel the Worker so it stops consuming resources;
-		// the gRPC stream will be torn down by context cancellation.
-		cancelCtx, cancel := context.WithTimeout(context.Background(), workerShutdownTimeout)
-		_ = s.CancelWorker(cancelCtx, t)
-		cancel()
-		_ = s.KickSession(ctx, t.SessionKey)
 	}
 	return nil
 }
@@ -549,20 +499,17 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		},
 	}
 
-	// Hard wall-clock timeout: when TaskTimeoutSeconds is set, wrap the
-	// execute context so a runaway Worker (stuck in an LLM call, deadlock,
-	// infinite loop) is force-cancelled at the budget. The Worker also
-	// receives this value in RuntimePolicy for its soft timer; the Go-side
-	// hard timeout is the backstop when the soft timer can't preempt a
-	// blocking syscall. Add workerShutdownTimeout of grace so the Worker
-	// has a chance to flush a partial checkpoint before the stream dies.
+	// Hard wall-clock timeout is intentionally NOT applied here. A single
+	// task may legitimately run for minutes (slow LLM thinking, multi-step
+	// file processing, long tool chains). Killing the gRPC stream on a fixed
+	// budget would abort legitimate work. Instead, stuck-task detection uses
+	// an idle heuristic (see reapStuckTasks): a task is only reaped when it
+	// has produced no activity for longer than the idle threshold, which
+	// distinguishes "slow but working" from "deadlocked". The Worker's own
+	// RuntimePolicy.TaskTimeoutSeconds remains as a soft timer for its
+	// internal use (e.g. cancelling a single hung LLM call), not as a
+	// process-level kill switch.
 	executeCtx, cancelExecute := context.WithCancel(ctx)
-	if s.cfg.TaskTimeoutSeconds > 0 {
-		hardBudget := time.Duration(s.cfg.TaskTimeoutSeconds)*time.Second + workerShutdownTimeout
-		var timeoutCancel context.CancelFunc
-		executeCtx, timeoutCancel = context.WithTimeout(ctx, hardBudget)
-		defer timeoutCancel()
-	}
 	defer cancelExecute()
 	events, errs := client.ExecuteTask(executeCtx, req)
 	releaseWorkerCall()

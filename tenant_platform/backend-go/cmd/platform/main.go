@@ -278,8 +278,7 @@ func run() error {
 		webhookSecret        = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
 		maxRunningTasks      = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
 		perUserQueueLimit    = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
-		taskTimeoutSeconds   = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 60), "hard wall-clock budget per task (or TASK_TIMEOUT_SECONDS); 0 = disabled (dev/test)")
-		stuckTaskMultiplier  = flag.Int("stuck-task-multiplier", envInt("STUCK_TASK_MULTIPLIER", 2), "reaper threshold multiplier: a task running longer than task_timeout*multiplier is force-failed (or STUCK_TASK_MULTIPLIER); default 2")
+		taskTimeoutSeconds   = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
 	)
 	flag.Parse()
 
@@ -341,8 +340,10 @@ func run() error {
 	// (per-user queued cap). Zero disables (dev/test).
 	store.SetPerUserQueueLimit(*perUserQueueLimit)
 	if *maxRunningTasks > 0 || *taskTimeoutSeconds > 0 {
-		fmt.Fprintf(os.Stderr, "platform: quota max_running_tasks=%d per_user_queue_limit=%d task_timeout=%ds stuck_multiplier=%d\n",
-			*maxRunningTasks, *perUserQueueLimit, *taskTimeoutSeconds, *stuckTaskMultiplier)
+		fmt.Fprintf(os.Stderr, "platform: quota max_running_tasks=%d per_user_queue_limit=%d worker_task_timeout=%ds\n",
+			*maxRunningTasks, *perUserQueueLimit, *taskTimeoutSeconds)
+	} else {
+		fmt.Fprintf(os.Stderr, "platform: quotas disabled (max_running_tasks=0 per_user_queue_limit=0 worker_task_timeout=0); stuck detection via gRPC stream errors + heartbeat lease loss\n")
 	}
 
 	boot, err := application.LoadDevBootstrapFromEnv()
@@ -498,7 +499,6 @@ func run() error {
 		LLMProvider:         store,
 		MaxRunningTasks:     *maxRunningTasks,
 		TaskTimeoutSeconds:  *taskTimeoutSeconds,
-		StuckTaskMultiplier: *stuckTaskMultiplier,
 	})
 	if err != nil {
 		return err
