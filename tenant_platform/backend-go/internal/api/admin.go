@@ -2,7 +2,9 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -153,9 +155,9 @@ func botReply(b domain.Bot) map[string]any {
 // userReply serializes a domain.User into a JSON-friendly map.
 func userReply(u domain.User) map[string]any {
 	reply := map[string]any{
-		"user_id":   u.ID,
-		"username":  u.Username,
-		"status":    string(u.Status),
+		"user_id":    u.ID,
+		"username":   u.Username,
+		"status":     string(u.Status),
 		"created_at": u.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if u.ApprovedAt != nil {
@@ -166,9 +168,31 @@ func userReply(u domain.User) map[string]any {
 
 // decodeStrict decodes JSON with DisallowUnknownFields.
 func decodeStrict(r *http.Request, v any) error {
-	dec := json.NewDecoder(r.Body)
+	return decodeStrictBytes(readBody(r), v)
+}
+
+// decodeStrictBytes decodes JSON with DisallowUnknownFields from a byte slice.
+// Split out so webhook handlers can verify an HMAC over the raw bytes before
+// parsing.
+func decodeStrictBytes(body []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
+}
+
+// readBody fully drains r.Body and replaces it so downstream handlers can
+// still read it. Returns nil on error; the caller surfaces a 400.
+func readBody(r *http.Request) []byte {
+	if r.Body == nil {
+		return nil
+	}
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil
+	}
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	return b
 }
 
 // parseUserID extracts the {user_id} path value as int64.

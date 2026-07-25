@@ -21,6 +21,8 @@ wxbot_media.download_media covers all 4 inbound types.
 """
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -108,10 +110,14 @@ class BotEntry:
 class BotManager:
     """Manages long-poll threads for multiple bots."""
 
-    def __init__(self, media_root=None):
+    def __init__(self, media_root=None, webhook_secret=''):
         self._bots = {}
         self._lock = threading.Lock()
         self._media_root = media_root
+        # HMAC-SHA256 secret shared with the Go platform. When set, every
+        # webhook POST carries X-Webhook-Signature = hex(HMAC-SHA256(body)).
+        # Empty = unauthenticated (dev/test only; Go side logs a warning).
+        self._webhook_secret = webhook_secret or ''
         if media_root:
             os.makedirs(media_root, exist_ok=True)
 
@@ -221,17 +227,32 @@ class BotManager:
             'media_paths': media_paths or [],
             'media_items': media_items or [],
         }
-        try:
-            requests.post(entry.webhook_url, json=body, timeout=WEBHOOK_TIMEOUT)
-        except Exception as exc:
-            print(f'[Poller] webhook post err ({entry.bot_uuid}): {exc}', flush=True)
+        self._post_webhook_body(entry, body)
 
     def _notify_expired(self, entry):
         body = {'bot_uuid': entry.bot_uuid, 'auth_expired': True}
+        self._post_webhook_body(entry, body)
+
+    def _post_webhook_body(self, entry, body):
+        """POST webhook with deterministic JSON + HMAC-SHA256 signature.
+
+        We serialize once and send as raw bytes so the signature matches the
+        exact bytes on the wire (requests' json= would re-serialize and could
+        diverge on key ordering/whitespace across versions).
+        """
+        body_bytes = json.dumps(body, separators=(',', ':')).encode('utf-8')
+        headers = {'Content-Type': 'application/json'}
+        if self._webhook_secret:
+            sig = hmac.new(
+                self._webhook_secret.encode('utf-8'),
+                body_bytes,
+                hashlib.sha256,
+            ).hexdigest()
+            headers['X-Webhook-Signature'] = sig
         try:
-            requests.post(entry.webhook_url, json=body, timeout=WEBHOOK_TIMEOUT)
+            requests.post(entry.webhook_url, data=body_bytes, headers=headers, timeout=WEBHOOK_TIMEOUT)
         except Exception as exc:
-            print(f'[Poller] expired-notify err ({entry.bot_uuid}): {exc}', flush=True)
+            print(f'[Poller] webhook post err ({entry.bot_uuid}): {exc}', flush=True)
 
     def stop(self, bot_uuid):
         with self._lock:
@@ -329,11 +350,11 @@ class PollerHandler(BaseHTTPRequestHandler):
             self._reply(500, {'error': str(exc)})
 
 
-def serve(listen, grace_seconds=10.0, media_root=None):
-    PollerHandler.manager = BotManager(media_root=media_root)
+def serve(listen, grace_seconds=10.0, media_root=None, webhook_secret=''):
+    PollerHandler.manager = BotManager(media_root=media_root, webhook_secret=webhook_secret)
     host, port = _parse_listen_addr(listen)
     server = ThreadingHTTPServer((host, port), PollerHandler)
-    print(f'bot_poller listening on {host}:{port} (media_root={media_root or "disabled"})', flush=True)
+    print(f'bot_poller listening on {host}:{port} (media_root={media_root or "disabled"}, auth={"on" if webhook_secret else "off"})', flush=True)
 
     # serve_forever() blocks the main thread; SIGINT/SIGTERM raise KeyboardInterrupt
     # on Windows (SIGTERM) or interrupt the call (SIGINT), letting us shut down cleanly.
@@ -352,8 +373,12 @@ def main(argv=None):
     parser.add_argument('--grace-seconds', type=float, default=10.0)
     parser.add_argument('--media-dir', default=os.environ.get('BOT_POLLER_MEDIA_DIR', ''),
                         help='Root directory for inbound media files. Empty disables media download.')
+    parser.add_argument('--webhook-secret', default=os.environ.get('PLATFORM_WEBHOOK_SECRET', ''),
+                        help='HMAC-SHA256 secret shared with the Go platform to sign /v1/im/webhook requests (or PLATFORM_WEBHOOK_SECRET). Empty = unauthenticated (dev/test only).')
     args = parser.parse_args(argv)
-    serve(args.listen, args.grace_seconds, media_root=args.media_dir or None)
+    serve(args.listen, args.grace_seconds,
+          media_root=args.media_dir or None,
+          webhook_secret=args.webhook_secret or '')
 
 
 if __name__ == '__main__':

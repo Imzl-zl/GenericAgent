@@ -8,6 +8,8 @@ import (
 	"math"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/transport"
 )
@@ -17,10 +19,17 @@ const (
 	defaultDeliveryClaimLease   = 30 * time.Second
 	defaultDeliveryRetryWindow  = 5 * time.Minute
 	defaultDeliveryMaxBatch     = 8
-	maxDeliveryTextBytes        = 4096
-	minDeliveryBackoff          = time.Second
-	maxDeliveryBackoff          = 5 * time.Minute
-	deliverySendTimeout         = 15 * time.Second
+	// maxDeliveryConcurrency caps in-flight process() calls within one tick.
+	// Each call may block up to deliverySendTimeout on iLink send, so a batch
+	// of 8 with concurrency 4 finishes in ~2 send-windows worst case instead
+	// of 8. Per-user ordering is already enforced at task claim time
+	// (session_sequence + workspace FOR UPDATE), so concurrent delivery here
+	// is safe.
+	maxDeliveryConcurrency = 4
+	maxDeliveryTextBytes   = 4096
+	minDeliveryBackoff     = time.Second
+	maxDeliveryBackoff     = 5 * time.Minute
+	deliverySendTimeout    = 15 * time.Second
 )
 
 // DeliveryStore is the persistence port for the terminal delivery outbox.
@@ -154,12 +163,28 @@ func (s *deliveryService) tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, d := range deliveries {
-		if err := s.process(ctx, d, now); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("delivery: process %s failed: %v", d.DeliveryID, err)
-		}
+	if len(deliveries) == 0 {
+		return nil
 	}
-	return nil
+	// Process the batch concurrently. Each delivery targets a different user
+	// (ClaimPendingDeliveries already SKIP LOCKED'd them across instances),
+	// so cross-user parallelism is safe. Within a user, task-level ordering
+	// is enforced at SubmitTask/ClaimNextTask via session_sequence + workspace
+	// FOR UPDATE, so concurrent delivery here doesn't break per-user order.
+	// Errors are logged per-delivery and swallowed so one failure doesn't
+	// cancel the rest of the batch.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxDeliveryConcurrency)
+	for _, d := range deliveries {
+		d := d
+		g.Go(func() error {
+			if err := s.process(gctx, d, now); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("delivery: process %s failed: %v", d.DeliveryID, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now time.Time) error {

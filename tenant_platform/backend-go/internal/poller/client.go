@@ -17,7 +17,16 @@ import (
 	"time"
 )
 
-const defaultTimeout = 15 * time.Second
+const (
+	defaultTimeout = 15 * time.Second
+	// HTTP transport tunables for the Poller client. The Poller is a single
+	// downstream host, so MaxIdleConnsPerHost is the lever that matters: the
+	// Go default of 2 forces connection churn under any real concurrency.
+	// 32 idle conns covers 10-20 active bots with headroom for bursts.
+	defaultMaxIdleConns        = 64
+	defaultMaxIdleConnsPerHost = 32
+	defaultIdleConnTimeout     = 90 * time.Second
+)
 
 // Client calls the Python Bot Poller HTTP API.
 type Client struct {
@@ -25,25 +34,33 @@ type Client struct {
 	http    *http.Client
 }
 
-// NewClient validates the poller base URL and returns a client.
+// NewClient validates the poller base URL and returns a client with a tuned
+// transport: keep-alive is on, idle conns per host are raised above the Go
+// default (2) so concurrent StartBot/SendMessage/Health calls reuse conns
+// instead of churning TCP handshakes.
 func NewClient(baseURL string) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, errors.New("poller base URL is required")
 	}
+	transport := &http.Transport{
+		MaxIdleConns:        defaultMaxIdleConns,
+		MaxIdleConnsPerHost: defaultMaxIdleConnsPerHost,
+		IdleConnTimeout:     defaultIdleConnTimeout,
+	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: defaultTimeout},
+		http:    &http.Client{Timeout: defaultTimeout, Transport: transport},
 	}, nil
 }
 
 // StartBotRequest is the body for POST /start.
 type StartBotRequest struct {
-	BotUUID     string `json:"bot_uuid"`
-	BotToken    string `json:"bot_token"`
-	ILinkBotID  string `json:"ilink_bot_id"`
-	BaseURL     string `json:"base_url"`
-	UpdatesBuf  string `json:"updates_buf"`
-	WebhookURL  string `json:"webhook_url"`
+	BotUUID    string `json:"bot_uuid"`
+	BotToken   string `json:"bot_token"`
+	ILinkBotID string `json:"ilink_bot_id"`
+	BaseURL    string `json:"base_url"`
+	UpdatesBuf string `json:"updates_buf"`
+	WebhookURL string `json:"webhook_url"`
 }
 
 // StartBot tells the poller to begin long-polling for one bot.

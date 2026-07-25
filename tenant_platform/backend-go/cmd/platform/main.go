@@ -90,8 +90,8 @@ func buildWorkerRuntime(mode, managerAddr string, boot application.DevBootstrapC
 // is fetched from the admin-configured provider store and decrypted with the
 // cipher; it is never part of this static config.
 type llmProxyConfig struct {
-	externalAddr   string              // when non-empty, use external Proxy (no in-process start)
-	signingKey     string              // HMAC signing key for capability_tokens (>=16 bytes)
+	externalAddr   string // when non-empty, use external Proxy (no in-process start)
+	signingKey     string // HMAC signing key for capability_tokens (>=16 bytes)
 	providerSource llmproxy.ProviderSource
 	cipher         llmproxy.TokenCipher
 }
@@ -230,30 +230,31 @@ func finishPlatform(serveErr error, schedulerDone <-chan error, timeout time.Dur
 
 func run() error {
 	var (
-		policyFile   = flag.String("policy-file", "", "path to capability policy manifest (required)")
-		claimLease   = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
-		devLoopback  = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
-		listen       = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
-		databaseURL  = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
-		migration    = flag.String("migration", "", "path to 0001_foundation.sql")
-		runtimeRoot  = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
-		configRoot   = flag.String("config-root", "", "GA_CONFIG_ROOT for token-only mykey.py")
-		legacyRoot   = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
-		workerPython = flag.String("worker-python", "", "python interpreter for worker")
-		workerSrc    = flag.String("worker-src", "", "path to worker-python/src")
+		policyFile           = flag.String("policy-file", "", "path to capability policy manifest (required)")
+		claimLease           = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
+		devLoopback          = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
+		listen               = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
+		databaseURL          = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
+		migration            = flag.String("migration", "", "path to 0001_foundation.sql")
+		runtimeRoot          = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
+		configRoot           = flag.String("config-root", "", "GA_CONFIG_ROOT for token-only mykey.py")
+		legacyRoot           = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
+		workerPython         = flag.String("worker-python", "", "python interpreter for worker")
+		workerSrc            = flag.String("worker-src", "", "path to worker-python/src")
 		llmProxyAddr         = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
 		capabilitySigningKey = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=16 bytes")
 		modelPolicyVersion   = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
-		devExtraUsers = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
-		devTeam      = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
-		workerRuntime     = flag.String("worker-runtime", "loopback", "worker runtime mode: loopback or podman")
-		workerManagerAddr = flag.String("worker-manager-addr", os.Getenv("GA_WORKER_MANAGER_ADDR"), "worker-manager gRPC address (required for podman mode)")
-		botTokenKey        = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
-		ilinkBaseURL       = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
-		ilinkAppID         = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
-		ilinkClientVersion = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
-		botPollerURL       = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
-		platformWebhookURL = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
+		devExtraUsers        = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
+		devTeam              = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
+		workerRuntime        = flag.String("worker-runtime", "loopback", "worker runtime mode: loopback or podman")
+		workerManagerAddr    = flag.String("worker-manager-addr", os.Getenv("GA_WORKER_MANAGER_ADDR"), "worker-manager gRPC address (required for podman mode)")
+		botTokenKey          = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
+		ilinkBaseURL         = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
+		ilinkAppID           = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
+		ilinkClientVersion   = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
+		botPollerURL         = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
+		platformWebhookURL   = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
+		webhookSecret        = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
 	)
 	flag.Parse()
 
@@ -619,6 +620,7 @@ func run() error {
 		DevToken:      boot.DevToken,
 		DevUserID:     devCtx.UserID,
 		SessionKey:    devCtx.SessionKey,
+		WebhookSecret: strings.TrimSpace(*webhookSecret),
 	})
 	if err != nil {
 		return err

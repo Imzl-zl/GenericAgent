@@ -1,9 +1,14 @@
 package api
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 )
@@ -56,15 +61,32 @@ func convertWebhookMedia(items []webhookMedia) []application.IncomingMediaItem {
 	return out
 }
 
-// handleIMWebhook receives inbound messages from the Bot Poller and routes them
-// through the router pipeline. It is intentionally unauthenticated at the HTTP
-// layer: identity and binding verification happen inside the router using
-// bot_uuid + ilink_user_id (spec §6.1 step 2). A shared webhook secret can be
-// added later for transport-level authentication if iLink supports it.
+// webhookSignatureHeader is the HTTP header carrying the hex-encoded
+// HMAC-SHA256(secret, body) computed by the Bot Poller.
+const webhookSignatureHeader = "X-Webhook-Signature"
+
+// emptySecretOnce gates a one-shot warning so the operator sees exactly one
+// log line when running without webhook auth (dev/test only).
+var emptySecretOnce sync.Once
+
+// handleIMWebhook receives inbound messages from the Bot Poller and routes
+// them through the router pipeline. When webhookSecret is set, the request
+// must carry X-Webhook-Signature = hex(HMAC-SHA256(secret, body)); this
+// prevents unauthenticated callers from injecting fake inbound messages.
+// When the secret is empty (dev/test), a one-shot warning is logged.
 func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
+	bodyBytes := readBody(r)
+	if bodyBytes == nil {
+		writeErr(w, http.StatusBadRequest, "READ_BODY", "failed to read request body", tid)
+		return
+	}
+	if !s.verifyWebhookSignature(bodyBytes, r.Header.Get(webhookSignatureHeader)) {
+		writeErr(w, http.StatusUnauthorized, "INVALID_SIGNATURE", "webhook signature mismatch", tid)
+		return
+	}
 	var body imWebhookBody
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrictBytes(bodyBytes, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
 		return
 	}
@@ -94,11 +116,12 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 	// Persist the cursor pushed by the Poller so the platform can resume
 	// long-polling from the right position after a restart. The Go side owns
 	// encryption; the Poller sends plaintext (it never touches disk).
+	// Failures are surfaced (no silent fallback) but non-fatal: the message
+	// is still routed. The next successful persist will catch up; the log
+	// lets operators spot DB issues before they cascade.
 	if s.botLifecycle != nil && body.UpdatesBuf != "" {
 		if err := s.botLifecycle.PersistUpdatesBuf(r.Context(), body.BotUUID, body.UpdatesBuf); err != nil {
-			// Cursor persistence failure is non-fatal: the message is still
-			// routed. The next successful persist will catch up.
-			_ = err
+			log.Printf("im_webhook: persist cursor for bot=%s failed: %v (non-fatal; message still routed)", body.BotUUID, err)
 		}
 	}
 
@@ -119,6 +142,30 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 		"reply":   result.Reply,
 		"user_id": result.UserID,
 	})
+}
+
+// verifyWebhookSignature returns true when the request signature matches
+// HMAC-SHA256(secret, body). When secret is empty the check is skipped
+// (dev/test only) and a one-shot warning is logged so production deployments
+// don't accidentally run unauthenticated.
+func (s *Server) verifyWebhookSignature(body []byte, sigHex string) bool {
+	if s.webhookSecret == "" {
+		emptySecretOnce.Do(func() {
+			log.Printf("im_webhook: webhook secret empty; /v1/im/webhook is unauthenticated (dev/test only)")
+		})
+		return true
+	}
+	if sigHex == "" {
+		return false
+	}
+	want, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(s.webhookSecret))
+	mac.Write(body)
+	got := mac.Sum(nil)
+	return hmac.Equal(got, want)
 }
 
 func validateIMWebhookBody(body imWebhookBody) error {

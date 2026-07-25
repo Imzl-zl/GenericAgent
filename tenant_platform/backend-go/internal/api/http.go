@@ -39,6 +39,10 @@ type Server struct {
 	devToken      string
 	devUserID     int64
 	sessionKey    string
+	// webhookSecret is the HMAC-SHA256 key shared with the Bot Poller. When
+	// non-empty, /v1/im/webhook rejects requests whose X-Webhook-Signature
+	// header doesn't match. Empty = unauthenticated (dev/test only; logs once).
+	webhookSecret string
 	mux           *http.ServeMux
 }
 
@@ -91,6 +95,9 @@ type ServerConfig struct {
 	DevToken      string
 	DevUserID     int64
 	SessionKey    string
+	// WebhookSecret, when set, requires Bot Poller requests to /v1/im/webhook
+	// to carry a valid X-Webhook-Signature header (HMAC-SHA256 over body).
+	WebhookSecret string
 }
 
 // NewServer constructs handlers. Bind address enforcement is the caller's responsibility (127.0.0.1).
@@ -125,6 +132,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		devToken:      cfg.DevToken,
 		devUserID:     cfg.DevUserID,
 		sessionKey:    cfg.SessionKey,
+		webhookSecret: cfg.WebhookSecret,
 		mux:           http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)

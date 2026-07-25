@@ -3,7 +3,6 @@ package transport
 import (
 	"context"
 	"errors"
-	"sync"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/poller"
 )
@@ -19,12 +18,13 @@ type ILinkAdapterConfig struct {
 
 // ILinkAdapter is the production BotTransportAdapter for iLink.
 // It forwards SendMessage to the Bot Poller and keeps an in-memory idempotency
-// window. For multi-instance deployments the idempotency store must be
-// externalized (spec §6.1).
+// cache sharded by botUUID|messageID. The cache is TTL-bounded so long-running
+// processes don't leak memory. For multi-instance deployments the idempotency
+// store must be externalized (spec §6.1); the DB UNIQUE(bot_id, message_id)
+// index is the cross-instance backstop.
 type ILinkAdapter struct {
-	poller *poller.Client
-	mu     sync.Mutex
-	seen   map[string]bool // key = botUUID + "|" + messageID
+	poller      *poller.Client
+	idempotency *idempotencyCache
 }
 
 // NewILinkAdapter validates config and returns a production adapter.
@@ -33,8 +33,8 @@ func NewILinkAdapter(cfg ILinkAdapterConfig) (*ILinkAdapter, error) {
 		return nil, errors.New("Poller is required")
 	}
 	return &ILinkAdapter{
-		poller: cfg.Poller,
-		seen:   make(map[string]bool),
+		poller:      cfg.Poller,
+		idempotency: newIdempotencyCache(),
 	}, nil
 }
 
@@ -50,17 +50,12 @@ func (a *ILinkAdapter) SendMessage(ctx context.Context, botUUID, ilinkUserID, te
 	})
 }
 
-// RecordMessageIdempotency returns true the first time a message is seen.
+// RecordMessageIdempotency returns true the first time a message is seen
+// within the TTL window. Sharded by key hash so concurrent bots don't contend
+// on a single mutex.
 func (a *ILinkAdapter) RecordMessageIdempotency(_ context.Context, botUUID, messageID string) (bool, error) {
 	if botUUID == "" || messageID == "" {
 		return false, errors.New("bot uuid and message id are required")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	key := botUUID + "|" + messageID
-	if a.seen[key] {
-		return false, nil
-	}
-	a.seen[key] = true
-	return true, nil
+	return a.idempotency.Record(botUUID, messageID), nil
 }
