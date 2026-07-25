@@ -23,11 +23,20 @@ func newFakeUserStore() *fakeUserStore {
 	return &fakeUserStore{users: make(map[int64]domain.User), nextID: 1}
 }
 
-func (f *fakeUserStore) CreateUser(_ context.Context, username string) (domain.User, error) {
-	u := domain.User{ID: f.nextID, Username: username, Status: domain.UserPending}
+func (f *fakeUserStore) CreateUser(_ context.Context, username, passwordHash string) (domain.User, error) {
+	u := domain.User{ID: f.nextID, Username: username, PasswordHash: passwordHash, Status: domain.UserPending}
 	f.users[f.nextID] = u
 	f.nextID++
 	return u, nil
+}
+
+func (f *fakeUserStore) GetUserByUsername(_ context.Context, username string) (domain.User, error) {
+	for _, u := range f.users {
+		if u.Username == username {
+			return u, nil
+		}
+	}
+	return domain.User{}, fmt.Errorf("user %q not found", username)
 }
 
 func (f *fakeUserStore) ApproveUser(_ context.Context, userID int64) (domain.User, error) {
@@ -93,10 +102,10 @@ func TestUserServiceCreateUserRejectsEmptyUsername(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.CreateUser(context.Background(), ""); err == nil {
+	if _, err := svc.CreateUser(context.Background(), "", "password"); err == nil {
 		t.Fatal("expected error for empty username")
 	}
-	if _, err := svc.CreateUser(context.Background(), "   "); err == nil {
+	if _, err := svc.CreateUser(context.Background(), "   ", "password"); err == nil {
 		t.Fatal("expected error for whitespace-only username")
 	}
 }
@@ -107,7 +116,7 @@ func TestUserServiceCreateUserRejectsTooLongUsername(t *testing.T) {
 		t.Fatal(err)
 	}
 	long := strings.Repeat("a", MaxUsernameLen+1)
-	if _, err := svc.CreateUser(context.Background(), long); err == nil {
+	if _, err := svc.CreateUser(context.Background(), long, "password"); err == nil {
 		t.Fatal("expected error for too-long username")
 	}
 }
@@ -118,7 +127,7 @@ func TestUserServiceCreateUserTrimsAndSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u, err := svc.CreateUser(context.Background(), "  alice  ")
+	u, err := svc.CreateUser(context.Background(), "  alice  ", "password123")
 	if err != nil {
 		t.Fatal(err)
 	}

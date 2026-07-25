@@ -24,8 +24,10 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/ilink"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/poller"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/transport"
@@ -245,8 +247,12 @@ func run() error {
 		devTeam      = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
 		workerRuntime     = flag.String("worker-runtime", "loopback", "worker runtime mode: loopback or podman")
 		workerManagerAddr = flag.String("worker-manager-addr", os.Getenv("GA_WORKER_MANAGER_ADDR"), "worker-manager gRPC address (required for podman mode)")
-		botTokenKey      = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
-		ilinkBaseURL     = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
+		botTokenKey        = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
+		ilinkBaseURL       = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
+		ilinkAppID         = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
+		ilinkClientVersion = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
+		botPollerURL       = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
+		platformWebhookURL = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
 	)
 	flag.Parse()
 
@@ -496,23 +502,85 @@ func run() error {
 		return err
 	}
 
-	// Bot transport: real iLink when configured, otherwise in-process loopback
-	// for dev/test. The loopback transport records sent messages for assertions.
-	var botTransport transport.BotTransportAdapter
-	if baseURL := strings.TrimSpace(*ilinkBaseURL); baseURL != "" {
+	botSvc, err := application.NewBotService(store)
+	if err != nil {
+		return err
+	}
+
+	var wechatBindingSvc application.WechatQRBindingService
+	if ilinkBaseURL := strings.TrimSpace(*ilinkBaseURL); ilinkBaseURL != "" {
 		if cipher == nil {
 			return fmt.Errorf("--ilink-base-url requires --bot-token-key/BOT_TOKEN_KEY")
 		}
+		ilinkClient, err := ilink.NewClient(ilink.ClientConfig{
+			BaseURL:       ilinkBaseURL,
+			AppID:         *ilinkAppID,
+			ClientVersion: *ilinkClientVersion,
+		})
+		if err != nil {
+			return fmt.Errorf("ilink client: %w", err)
+		}
+		wechatBindingSvc, err = application.NewWechatQRBindingService(application.WechatQRBindingConfig{
+			Store:       store,
+			BotStore:    store,
+			ILinkClient: ilinkClient,
+			Cipher:      cipher,
+		})
+		if err != nil {
+			return fmt.Errorf("wechat qr binding service: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "platform: wechat qr binding enabled base_url=%s\n", ilinkBaseURL)
+	}
+
+	inviteSvc, err := application.NewInviteService(application.InviteServiceConfig{
+		Store: store,
+		Users: store,
+	})
+	if err != nil {
+		return err
+	}
+
+	personaSvc, err := application.NewPersonaService(store)
+	if err != nil {
+		return err
+	}
+
+	// Bot transport + lifecycle: when iLink is configured, the Go platform
+	// delegates all iLink protocol I/O to the Python Bot Poller (which reuses
+	// GA Core's verified WxBotClient). Go owns encryption + persistence; the
+	// Poller owns getupdates/sendmessage. Without iLink, an in-process
+	// loopback transport is used for dev/test.
+	var botTransport transport.BotTransportAdapter
+	var botLifecycle application.BotLifecycleService
+	if pollerURL := strings.TrimSpace(*botPollerURL); pollerURL != "" {
+		if cipher == nil {
+			return fmt.Errorf("--bot-poller-url requires --bot-token-key/BOT_TOKEN_KEY")
+		}
+		webhookURL := strings.TrimSpace(*platformWebhookURL)
+		if webhookURL == "" {
+			webhookURL = fmt.Sprintf("http://%s/v1/im/webhook", *listen)
+		}
+		pollerClient, err := poller.NewClient(pollerURL)
+		if err != nil {
+			return fmt.Errorf("poller client: %w", err)
+		}
 		ilinkAdapter, err := transport.NewILinkAdapter(transport.ILinkAdapterConfig{
-			BaseURL:  baseURL,
-			Cipher:   cipher,
-			Resolver: store,
+			Poller: pollerClient,
 		})
 		if err != nil {
 			return fmt.Errorf("ilink adapter: %w", err)
 		}
 		botTransport = ilinkAdapter
-		fmt.Fprintf(os.Stderr, "platform: ilink transport base_url=%s\n", baseURL)
+		botLifecycle, err = application.NewBotLifecycleService(application.BotLifecycleConfig{
+			Store:      store,
+			Cipher:     cipher,
+			Poller:     pollerClient,
+			WebhookURL: webhookURL,
+		})
+		if err != nil {
+			return fmt.Errorf("bot lifecycle service: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "platform: bot poller transport url=%s webhook=%s\n", pollerURL, webhookURL)
 	} else {
 		botTransport = transport.NewLoopbackTransport()
 	}
@@ -531,18 +599,23 @@ func run() error {
 	}
 
 	server, err := api.NewServer(api.ServerConfig{
-		Service:      svc,
-		Users:        userSvc,
-		Binding:      bindingSvc,
-		Router:       routerSvc,
-		Registry:     reg,
-		Policies:     store, // admin command/policy management (migration 0004)
-		Bots:         store,
-		LLMProviders: store, // admin LLM provider management (migration 0007)
-		Cipher:       cipher,
-		DevToken:     boot.DevToken,
-		DevUserID:    devCtx.UserID,
-		SessionKey:   devCtx.SessionKey,
+		Service:       svc,
+		Users:         userSvc,
+		Binding:       bindingSvc,
+		WechatBinding: wechatBindingSvc,
+		BotService:    botSvc,
+		Invite:        inviteSvc,
+		Personas:      personaSvc,
+		Router:        routerSvc,
+		Registry:      reg,
+		Policies:      store, // admin command/policy management (migration 0004)
+		Bots:          store,
+		LLMProviders:  store, // admin LLM provider management (migration 0007)
+		BotLifecycle:  botLifecycle,
+		Cipher:        cipher,
+		DevToken:      boot.DevToken,
+		DevUserID:     devCtx.UserID,
+		SessionKey:    devCtx.SessionKey,
 	})
 	if err != nil {
 		return err
@@ -580,6 +653,15 @@ func run() error {
 				log.Printf("delivery service error: %v", err)
 			}
 		}()
+	}
+
+	// Re-register every active bound bot with the Bot Poller so inbound
+	// message polling resumes after a platform restart. Failures are logged
+	// inside the lifecycle service; one bad bot does not block startup.
+	if botLifecycle != nil {
+		if err := botLifecycle.RestoreActiveBots(ctx); err != nil {
+			log.Printf("bot lifecycle restore error: %v", err)
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "platform: instance_id=%s listen=%s session=%s policy_digest=%s\n",

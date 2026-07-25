@@ -22,19 +22,24 @@ import (
 
 // Server is the loopback HTTP API.
 type Server struct {
-	svc         application.TaskService
-	users       application.UserService
-	binding     application.BindingService
-	router      application.Router
-	registry    policy.Registry
-	policies    PolicyStore
-	bots        BotStore
-	llmProviders LLMProviderStore
-	cipher      secret.TokenCipher
-	devToken    string
-	devUserID   int64
-	sessionKey  string
-	mux         *http.ServeMux
+	svc           application.TaskService
+	users         application.UserService
+	binding       application.BindingService
+	wechatBinding application.WechatQRBindingService
+	botSvc        application.BotService
+	invite        application.InviteService
+	personas      application.PersonaService
+	router        application.Router
+	registry      policy.Registry
+	policies      PolicyStore
+	bots          BotStore
+	llmProviders  LLMProviderStore
+	botLifecycle  application.BotLifecycleService
+	cipher        secret.TokenCipher
+	devToken      string
+	devUserID     int64
+	sessionKey    string
+	mux           *http.ServeMux
 }
 
 // PolicyStore is the admin-facing port for command/policy management.
@@ -50,8 +55,9 @@ type PolicyStore interface {
 
 // BotStore creates and resolves bot records with encrypted tokens.
 type BotStore interface {
-	CreateBot(ctx context.Context, botUUID string, ownerID int64, tokenCiphertext []byte) (domain.Bot, error)
+	CreateBot(ctx context.Context, ilinkBotID string, ownerID int64, tokenCiphertext []byte) (domain.Bot, error)
 	GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error)
+	GetBotByIlinkBotID(ctx context.Context, ilinkBotID string) (domain.Bot, error)
 }
 
 // LLMProviderStore is the admin-facing port for configuring upstream LLMs.
@@ -68,18 +74,23 @@ type LLMProviderStore interface {
 
 // ServerConfig configures the foundation API.
 type ServerConfig struct {
-	Service      application.TaskService
-	Users        application.UserService
-	Binding      application.BindingService
-	Router       application.Router
-	Registry     policy.Registry
-	Policies     PolicyStore
-	Bots         BotStore
-	LLMProviders LLMProviderStore
-	Cipher       secret.TokenCipher
-	DevToken     string
-	DevUserID    int64
-	SessionKey   string
+	Service       application.TaskService
+	Users         application.UserService
+	Binding       application.BindingService
+	WechatBinding application.WechatQRBindingService
+	BotService    application.BotService
+	Invite        application.InviteService
+	Personas      application.PersonaService
+	Router        application.Router
+	Registry      policy.Registry
+	Policies      PolicyStore
+	Bots          BotStore
+	LLMProviders  LLMProviderStore
+	BotLifecycle  application.BotLifecycleService
+	Cipher        secret.TokenCipher
+	DevToken      string
+	DevUserID     int64
+	SessionKey    string
 }
 
 // NewServer constructs handlers. Bind address enforcement is the caller's responsibility (127.0.0.1).
@@ -97,19 +108,24 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.SessionKey = fmt.Sprintf("personal:%d", cfg.DevUserID)
 	}
 	s := &Server{
-		svc:          cfg.Service,
-		users:        cfg.Users,
-		binding:      cfg.Binding,
-		router:       cfg.Router,
-		registry:     cfg.Registry,
-		policies:     cfg.Policies,
-		bots:         cfg.Bots,
-		llmProviders: cfg.LLMProviders,
-		cipher:       cfg.Cipher,
-		devToken:     cfg.DevToken,
-		devUserID:    cfg.DevUserID,
-		sessionKey:   cfg.SessionKey,
-		mux:          http.NewServeMux(),
+		svc:           cfg.Service,
+		users:         cfg.Users,
+		binding:       cfg.Binding,
+		wechatBinding: cfg.WechatBinding,
+		botSvc:        cfg.BotService,
+		invite:        cfg.Invite,
+		personas:      cfg.Personas,
+		router:        cfg.Router,
+		registry:      cfg.Registry,
+		policies:      cfg.Policies,
+		bots:          cfg.Bots,
+		llmProviders:  cfg.LLMProviders,
+		botLifecycle:  cfg.BotLifecycle,
+		cipher:        cfg.Cipher,
+		devToken:      cfg.DevToken,
+		devUserID:     cfg.DevUserID,
+		sessionKey:    cfg.SessionKey,
+		mux:           http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.auth(s.handleCreateTask))
@@ -148,6 +164,41 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+type ctxKey int
+
+const ctxUserIDKey ctxKey = 0
+
+func (s *Server) userAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.invite == nil {
+			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "user authentication not configured", traceID())
+			return
+		}
+		header := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(header, prefix) {
+			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing Authorization header", traceID())
+			return
+		}
+		token := strings.TrimSpace(header[len(prefix):])
+		if token == "" {
+			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "empty bearer token", traceID())
+			return
+		}
+		userID, err := s.invite.ValidateSession(r.Context(), token)
+		if err != nil {
+			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), traceID())
+			return
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxUserIDKey, userID)))
+	}
+}
+
+func userIDFromContext(ctx context.Context) (int64, bool) {
+	v, ok := ctx.Value(ctxUserIDKey).(int64)
+	return v, ok
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

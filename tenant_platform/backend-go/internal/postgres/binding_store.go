@@ -38,12 +38,12 @@ RETURNING id, user_id, code_hash, state, bot_uuid, expires_at, created_at, updat
 // Returns pgx.ErrNoRows if no consumable binding exists for the hash.
 func (s *Store) FindConsumableBindingByCodeHash(ctx context.Context, codeHash string) (domain.BindingAttempt, error) {
 	var b domain.BindingAttempt
-	err := s.pool.QueryRow(ctx, `
+	err := scanBindingAttempt(s.pool.QueryRow(ctx, `
 SELECT id, user_id, code_hash, state, bot_uuid, expires_at, created_at, updated_at, activated_at
 FROM binding_attempts
 WHERE code_hash = $1 AND state IN ('requested', 'qr_pending', 'awaiting_activation')
 FOR UPDATE
-`, codeHash).Scan(&b.ID, &b.UserID, &b.CodeHash, &b.State, &b.BotUUID, &b.ExpiresAt, &b.CreatedAt, &b.UpdatedAt, &b.ActivatedAt)
+`, codeHash), &b)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.BindingAttempt{}, pgx.ErrNoRows
 	}
@@ -171,13 +171,20 @@ WHERE state IN ('requested', 'qr_pending', 'awaiting_activation')
 // BindingByID returns a binding attempt by its ID.
 func (s *Store) BindingByID(ctx context.Context, id int64) (domain.BindingAttempt, error) {
 	var b domain.BindingAttempt
-	err := s.pool.QueryRow(ctx, `
+	err := scanBindingAttempt(s.pool.QueryRow(ctx, `
 SELECT id, user_id, code_hash, state, bot_uuid, expires_at, created_at, updated_at, activated_at
 FROM binding_attempts WHERE id = $1
-`, id).Scan(&b.ID, &b.UserID, &b.CodeHash, &b.State, &b.BotUUID, &b.ExpiresAt, &b.CreatedAt, &b.UpdatedAt, &b.ActivatedAt)
+`, id), &b)
 	return b, err
 }
 
 func scanBindingAttempt(row pgx.Row, b *domain.BindingAttempt) error {
-	return row.Scan(&b.ID, &b.UserID, &b.CodeHash, &b.State, &b.BotUUID, &b.ExpiresAt, &b.CreatedAt, &b.UpdatedAt, &b.ActivatedAt)
+	var botUUID *string
+	if err := row.Scan(&b.ID, &b.UserID, &b.CodeHash, &b.State, &botUUID, &b.ExpiresAt, &b.CreatedAt, &b.UpdatedAt, &b.ActivatedAt); err != nil {
+		return err
+	}
+	if botUUID != nil {
+		b.BotUUID = *botUUID
+	}
+	return nil
 }

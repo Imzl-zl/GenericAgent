@@ -3,7 +3,6 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,15 +15,44 @@ import (
 // corresponding services are present. Missing services skip registration
 // so the foundation task-only API still works in tests that don't need them.
 func (s *Server) registerLifecycleRoutes() {
+	if s.invite != nil {
+		s.mux.HandleFunc("POST /v1/register", s.handleRegister)
+		s.mux.HandleFunc("POST /v1/login", s.handleLogin)
+	}
 	if s.users != nil {
 		s.mux.HandleFunc("POST /v1/admin/users", s.auth(s.handleAdminCreateUser))
 		s.mux.HandleFunc("POST /v1/admin/users/{user_id}/approve", s.auth(s.handleAdminApproveUser))
 		s.mux.HandleFunc("POST /v1/admin/users/{user_id}/block", s.auth(s.handleAdminBlockUser))
 		s.mux.HandleFunc("GET /v1/admin/users/pending", s.auth(s.handleAdminListPending))
 	}
+	if s.invite != nil {
+		s.mux.HandleFunc("POST /v1/admin/invite-codes", s.auth(s.handleAdminCreateInviteCode))
+		s.mux.HandleFunc("GET /v1/admin/invite-codes", s.auth(s.handleAdminListInviteCodes))
+		s.mux.HandleFunc("DELETE /v1/admin/invite-codes/{code}", s.auth(s.handleAdminRevokeInviteCode))
+	}
+	if s.botSvc != nil && s.cipher != nil {
+		s.mux.HandleFunc("POST /v1/users/me/bots", s.userAuth(s.handleBindOwnBot))
+		s.mux.HandleFunc("GET /v1/users/me/bots", s.userAuth(s.handleGetOwnBot))
+	}
 	if s.binding != nil {
-		s.mux.HandleFunc("POST /v1/bindings", s.auth(s.handleCreateBinding))
+		s.mux.HandleFunc("POST /v1/bindings", s.userAuth(s.handleCreateBinding))
 		s.mux.HandleFunc("POST /v1/activate", s.auth(s.handleActivate))
+	}
+	if s.wechatBinding != nil {
+		s.mux.HandleFunc("POST /v1/users/me/wechat-qrcode", s.userAuth(s.handleCreateWechatQRCode))
+		s.mux.HandleFunc("GET /v1/users/me/wechat-qrcode/status", s.userAuth(s.handleGetWechatQRCodeStatus))
+	}
+	if s.personas != nil {
+		s.mux.HandleFunc("GET /v1/personas", s.userAuth(s.handleListPersonas))
+		s.mux.HandleFunc("POST /v1/personas", s.userAuth(s.handleCreatePersona))
+		s.mux.HandleFunc("GET /v1/personas/{persona_id}", s.userAuth(s.handleGetPersona))
+		s.mux.HandleFunc("PUT /v1/personas/{persona_id}", s.userAuth(s.handleUpdatePersona))
+		s.mux.HandleFunc("DELETE /v1/personas/{persona_id}", s.userAuth(s.handleDeletePersona))
+		s.mux.HandleFunc("POST /v1/personas/{persona_id}/submit", s.userAuth(s.handleSubmitPersona))
+		s.mux.HandleFunc("POST /v1/users/me/default-persona", s.userAuth(s.handleSetDefaultPersona))
+		s.mux.HandleFunc("GET /v1/admin/personas/pending", s.auth(s.handleAdminListPendingPersonas))
+		s.mux.HandleFunc("POST /v1/admin/personas/{persona_id}/approve", s.auth(s.handleAdminApprovePersona))
+		s.mux.HandleFunc("POST /v1/admin/personas/{persona_id}/reject", s.auth(s.handleAdminRejectPersona))
 	}
 	if s.router != nil {
 		s.mux.HandleFunc("POST /v1/router/messages", s.auth(s.handleRouterMessage))
@@ -36,9 +64,6 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("GET /v1/admin/tool-policies", s.auth(s.handleListToolPolicies))
 		s.mux.HandleFunc("POST /v1/admin/tool-policies", s.auth(s.handleCreateToolPolicy))
 		s.mux.HandleFunc("PUT /v1/admin/users/{user_id}/tool-policy", s.auth(s.handleUpdateUserToolPolicy))
-	}
-	if s.bots != nil && s.cipher != nil {
-		s.mux.HandleFunc("POST /v1/admin/bots", s.auth(s.handleAdminCreateBot))
 	}
 	if s.llmProviders != nil && s.cipher != nil {
 		s.mux.HandleFunc("POST /v1/admin/llm-providers", s.auth(s.handleAdminCreateLLMProvider))
@@ -52,6 +77,7 @@ func (s *Server) registerLifecycleRoutes() {
 
 type createUserBody struct {
 	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 func (s *Server) handleAdminCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +87,7 @@ func (s *Server) handleAdminCreateUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
 		return
 	}
-	user, err := s.users.CreateUser(r.Context(), body.Username)
+	user, err := s.users.CreateUser(r.Context(), body.Username, body.Password)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "USER_CREATE_FAILED", err.Error(), tid)
 		return
@@ -111,56 +137,16 @@ func (s *Server) handleAdminListPending(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
 }
 
-type createBotBody struct {
-	OwnerID int64  `json:"owner_id"`
-	BotUUID string `json:"bot_uuid"`
-	Token   string `json:"token"`
-}
-
-func (s *Server) handleAdminCreateBot(w http.ResponseWriter, r *http.Request) {
-	tid := traceID()
-	var body createBotBody
-	if err := decodeStrict(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
-		return
-	}
-	if err := validateCreateBot(body); err != nil {
-		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
-		return
-	}
-	cipherText, _, err := s.cipher.Encrypt([]byte(body.Token))
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "ENCRYPT_FAILED", err.Error(), tid)
-		return
-	}
-	bot, err := s.bots.CreateBot(r.Context(), body.BotUUID, body.OwnerID, cipherText)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "BOT_CREATE_FAILED", err.Error(), tid)
-		return
-	}
-	writeJSON(w, http.StatusCreated, botReply(bot))
-}
-
-func validateCreateBot(b createBotBody) error {
-	if b.OwnerID <= 0 {
-		return fmt.Errorf("owner_id must be positive")
-	}
-	if strings.TrimSpace(b.BotUUID) == "" {
-		return fmt.Errorf("bot_uuid is required")
-	}
-	if strings.TrimSpace(b.Token) == "" {
-		return fmt.Errorf("token is required")
-	}
-	return nil
-}
-
 func botReply(b domain.Bot) map[string]any {
 	return map[string]any{
-		"bot_id":     b.ID,
-		"bot_uuid":   b.BotUUID,
-		"owner_id":   b.OwnerID,
-		"state":      string(b.State),
-		"created_at": b.CreatedAt.UTC().Format(time.RFC3339),
+		"bot_id":        b.ID,
+		"bot_uuid":      b.BotUUID,
+		"ilink_bot_id":  b.IlinkBotID,
+		"ilink_user_id": b.IlinkUserID,
+		"baseurl":       b.BaseURL,
+		"owner_id":      b.OwnerID,
+		"state":         string(b.State),
+		"created_at":    b.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 

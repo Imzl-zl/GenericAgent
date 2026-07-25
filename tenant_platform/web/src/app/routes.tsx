@@ -1,0 +1,69 @@
+import { createBrowserRouter, Navigate } from 'react-router-dom';
+import { AppLayout } from '../components/layout/AppLayout';
+import { AdminLayout } from '../components/layout/AdminLayout';
+import { RequireAuth } from '../components/auth/RequireAuth';
+import { LoginPage } from '../features/auth/LoginPage';
+import { RegisterPage } from '../features/auth/RegisterPage';
+import { DashboardPage } from '../features/user/DashboardPage';
+import { BindingPage } from '../features/user/BindingPage';
+import { PersonaPage } from '../features/user/PersonaPage';
+import { StatusPage } from '../features/user/StatusPage';
+import { AdminDashboardPage } from '../features/admin/AdminDashboardPage';
+import { UsersPage } from '../features/admin/UsersPage';
+import { InviteCodesPage } from '../features/admin/InviteCodesPage';
+import { PersonaReviewPage } from '../features/admin/PersonaReviewPage';
+import { LLMProvidersPage } from '../features/admin/LLMProvidersPage';
+import { SettingsPage } from '../features/admin/SettingsPage';
+
+function ProtectedAppLayout() {
+  return (
+    <RequireAuth>
+      <AppLayout />
+    </RequireAuth>
+  );
+}
+
+function ProtectedAdminLayout() {
+  return (
+    <RequireAuth adminOnly>
+      <AdminLayout />
+    </RequireAuth>
+  );
+}
+
+export const router = createBrowserRouter([
+  {
+    path: '/',
+    element: <Navigate to="/app" replace />,
+  },
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
+  {
+    path: '/register',
+    element: <RegisterPage />,
+  },
+  {
+    path: '/app',
+    element: <ProtectedAppLayout />,
+    children: [
+      { index: true, element: <DashboardPage /> },
+      { path: 'binding', element: <BindingPage /> },
+      { path: 'persona', element: <PersonaPage /> },
+      { path: 'status', element: <StatusPage /> },
+    ],
+  },
+  {
+    path: '/admin',
+    element: <ProtectedAdminLayout />,
+    children: [
+      { index: true, element: <AdminDashboardPage /> },
+      { path: 'users', element: <UsersPage /> },
+      { path: 'invite-codes', element: <InviteCodesPage /> },
+      { path: 'personas', element: <PersonaReviewPage /> },
+      { path: 'providers', element: <LLMProvidersPage /> },
+      { path: 'settings', element: <SettingsPage /> },
+    ],
+  },
+]);

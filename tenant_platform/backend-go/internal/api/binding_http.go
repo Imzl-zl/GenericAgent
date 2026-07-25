@@ -6,24 +6,16 @@ import (
 	"strings"
 )
 
-type createBindingBody struct {
-	UserID int64 `json:"user_id"`
-}
-
-// handleCreateBinding generates a one-time binding code for a user.
+// handleCreateBinding generates a one-time binding code for the authenticated user.
 // The plaintext code is returned ONCE; only its SHA-256 hash is persisted.
 func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
-	var body createBindingBody
-	if err := decodeStrict(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+	userID, ok := userIDFromContext(r.Context())
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing user context", tid)
 		return
 	}
-	if body.UserID <= 0 {
-		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", "user_id must be a positive integer", tid)
-		return
-	}
-	code, attempt, err := s.binding.GenerateBindingCode(r.Context(), body.UserID)
+	code, attempt, err := s.binding.GenerateBindingCode(r.Context(), userID)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "BINDING_GENERATE_FAILED", err.Error(), tid)
 		return

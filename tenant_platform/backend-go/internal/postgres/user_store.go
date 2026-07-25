@@ -12,19 +12,42 @@ import (
 )
 
 // CreateUser inserts a new user in status 'pending'. Username must be unique.
-func (s *Store) CreateUser(ctx context.Context, username string) (domain.User, error) {
+func (s *Store) CreateUser(ctx context.Context, username, passwordHash string) (domain.User, error) {
 	if username == "" {
 		return domain.User{}, fmt.Errorf("username is required")
 	}
 	var u domain.User
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		return scanUser(tx.QueryRow(ctx, `
-INSERT INTO users (username, status)
-VALUES ($1, 'pending')
-RETURNING id, username, status, COALESCE(bootstrap_marker,''), created_at, approved_at
-`, username), &u)
+INSERT INTO users (username, status, password_hash)
+VALUES ($1, 'pending', $2)
+RETURNING id, username, password_hash, status, COALESCE(bootstrap_marker,''), created_at, approved_at
+`, username, nullString(passwordHash)), &u)
 	})
 	return u, err
+}
+
+func nullString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// GetUserByUsername returns a user by username.
+func (s *Store) GetUserByUsername(ctx context.Context, username string) (domain.User, error) {
+	if username == "" {
+		return domain.User{}, fmt.Errorf("username is required")
+	}
+	var u domain.User
+	row := s.pool.QueryRow(ctx, `
+SELECT id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
+FROM users WHERE username = $1
+`, username)
+	if err := scanUser(row, &u); err != nil {
+		return domain.User{}, err
+	}
+	return u, nil
 }
 
 // ApproveUser transitions a user from 'pending' to 'approved' and records an
@@ -36,7 +59,7 @@ func (s *Store) ApproveUser(ctx context.Context, userID int64) (domain.User, err
 	var u domain.User
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		if err := scanUser(tx.QueryRow(ctx, `
-SELECT id, username, status, COALESCE(bootstrap_marker,''), created_at, approved_at
+SELECT id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 FROM users WHERE id = $1 FOR UPDATE
 `, userID), &u); err != nil {
 			return err
@@ -48,7 +71,7 @@ FROM users WHERE id = $1 FOR UPDATE
 		if err := scanUser(tx.QueryRow(ctx, `
 UPDATE users SET status = 'approved', approved_at = $2, updated_at = $2
 WHERE id = $1 AND status = 'pending'
-RETURNING id, username, status, COALESCE(bootstrap_marker,''), created_at, approved_at
+RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 `, userID, now), &u); err != nil {
 			return err
 		}
@@ -74,7 +97,7 @@ func (s *Store) BlockUser(ctx context.Context, userID int64) (domain.User, []dom
 	var affected []domain.Task
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		if err := scanUser(tx.QueryRow(ctx, `
-SELECT id, username, status, COALESCE(bootstrap_marker,''), created_at, approved_at
+SELECT id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 FROM users WHERE id = $1 FOR UPDATE
 `, userID), &u); err != nil {
 			return err
@@ -86,7 +109,7 @@ FROM users WHERE id = $1 FOR UPDATE
 		if err := scanUser(tx.QueryRow(ctx, `
 UPDATE users SET status = 'blocked', updated_at = $2
 WHERE id = $1
-RETURNING id, username, status, COALESCE(bootstrap_marker,''), created_at, approved_at
+RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 `, userID, now), &u); err != nil {
 			return err
 		}
@@ -134,7 +157,7 @@ RETURNING `+taskSelectColumns, userID, now)
 // ListPendingUsers returns all users with status 'pending'.
 func (s *Store) ListPendingUsers(ctx context.Context) ([]domain.User, error) {
 	rows, err := s.pool.Query(ctx, `
-SELECT id, username, status, COALESCE(bootstrap_marker,''), created_at, approved_at
+SELECT id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 FROM users WHERE status = 'pending' ORDER BY created_at
 `)
 	if err != nil {
@@ -153,7 +176,7 @@ FROM users WHERE status = 'pending' ORDER BY created_at
 }
 
 func scanUser(row pgx.Row, u *domain.User) error {
-	return row.Scan(&u.ID, &u.Username, &u.Status, &u.BootstrapMarker, &u.CreatedAt, &u.ApprovedAt)
+	return row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Status, &u.BootstrapMarker, &u.CreatedAt, &u.ApprovedAt)
 }
 
 // EnsureUserExists returns nil if the user exists; otherwise pgx.ErrNoRows.

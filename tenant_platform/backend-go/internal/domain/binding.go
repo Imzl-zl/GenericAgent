@@ -24,6 +24,7 @@ func IsValidUserStatus(s UserStatus) bool {
 type User struct {
 	ID              int64
 	Username        string
+	PasswordHash    string
 	Status          UserStatus
 	BootstrapMarker string
 	CreatedAt       time.Time
@@ -80,8 +81,10 @@ const (
 type Bot struct {
 	ID                int64
 	BotUUID           string
+	IlinkBotID        string
 	OwnerID           int64
 	IlinkUserID       string
+	BaseURL           string
 	TokenCiphertext   []byte
 	TokenKeyVersion   int
 	State             BotState
@@ -91,6 +94,36 @@ type Bot struct {
 
 // IsBound reports whether the bot has a paired ilink_user_id.
 func (b Bot) IsBound() bool { return b.IlinkUserID != "" }
+
+// WechatQRStatus is the iLink QR-code scan lifecycle.
+type WechatQRStatus string
+
+const (
+	WechatQRWait      WechatQRStatus = "wait"
+	WechatQRScaned    WechatQRStatus = "scaned"
+	WechatQRRedirect  WechatQRStatus = "scaned_but_redirect"
+	WechatQRExpired   WechatQRStatus = "expired"
+	WechatQRConfirmed WechatQRStatus = "confirmed"
+)
+
+// WechatQRSession persists a QR-code login attempt for a platform user.
+type WechatQRSession struct {
+	ID                 string
+	UserID             int64
+	ILINKQRCode        string
+	QRCodeImgURL       string
+	Status             WechatQRStatus
+	ILINKBotID         string
+	ILINKUserID        string
+	BotTokenCiphertext []byte
+	BaseURL            string
+	ExpiresAt          time.Time
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+// IsExpired reports whether the QR session is past its expiry.
+func (s WechatQRSession) IsExpired(now time.Time) bool { return now.After(s.ExpiresAt) }
 
 // BotTransportState is the per-bot encrypted transport cursor (spec §5, §7.2).
 type BotTransportState struct {

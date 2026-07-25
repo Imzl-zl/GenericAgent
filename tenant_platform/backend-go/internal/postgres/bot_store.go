@@ -13,10 +13,12 @@ import (
 )
 
 // CreateBot inserts a new bot owned by userID. owner_id is unique (one bot per user).
+// ilinkBotID is the external iLink bot identifier supplied by the user.
 // tokenCiphertext is the encrypted upstream bot token; plaintext is never stored.
-func (s *Store) CreateBot(ctx context.Context, botUUID string, ownerID int64, tokenCiphertext []byte) (domain.Bot, error) {
-	if _, err := uuid.Parse(botUUID); err != nil {
-		return domain.Bot{}, fmt.Errorf("invalid bot_uuid: %w", err)
+// An internal UUID is generated for bot_uuid.
+func (s *Store) CreateBot(ctx context.Context, ilinkBotID string, ownerID int64, tokenCiphertext []byte) (domain.Bot, error) {
+	if ilinkBotID == "" {
+		return domain.Bot{}, fmt.Errorf("ilink bot id is required")
 	}
 	if ownerID <= 0 {
 		return domain.Bot{}, fmt.Errorf("owner id must be positive")
@@ -27,10 +29,29 @@ func (s *Store) CreateBot(ctx context.Context, botUUID string, ownerID int64, to
 	var b domain.Bot
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		return scanBot(tx.QueryRow(ctx, `
-INSERT INTO bots (bot_uuid, owner_id, token_ciphertext, state)
-VALUES ($1::uuid, $2, $3, 'active')
-RETURNING id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_version, state, created_at, updated_at
-`, botUUID, ownerID, tokenCiphertext), &b)
+INSERT INTO bots (bot_uuid, ilink_bot_id, owner_id, token_ciphertext, state)
+VALUES ($1::uuid, $2, $3, $4, 'active')
+RETURNING id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
+`, uuid.New().String(), ilinkBotID, ownerID, tokenCiphertext), &b)
+	})
+	return b, err
+}
+
+// CreateBotFromQRSession creates a fully-bound bot from a confirmed WechatQRSession.
+func (s *Store) CreateBotFromQRSession(ctx context.Context, sess domain.WechatQRSession, tokenKeyVersion int) (domain.Bot, error) {
+	if sess.ID == "" {
+		return domain.Bot{}, fmt.Errorf("session is required")
+	}
+	if sess.ILINKBotID == "" || sess.ILINKUserID == "" || len(sess.BotTokenCiphertext) == 0 {
+		return domain.Bot{}, fmt.Errorf("session is not confirmed")
+	}
+	var b domain.Bot
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		return scanBot(tx.QueryRow(ctx, `
+INSERT INTO bots (bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state)
+VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, 'active')
+RETURNING id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
+`, uuid.New().String(), sess.ILINKBotID, sess.UserID, sess.ILINKUserID, nullString(sess.BaseURL), sess.BotTokenCiphertext, tokenKeyVersion), &b)
 	})
 	return b, err
 }
@@ -39,9 +60,22 @@ RETURNING id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_ver
 func (s *Store) GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error) {
 	var b domain.Bot
 	err := scanBot(s.pool.QueryRow(ctx, `
-SELECT id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_version, state, created_at, updated_at
+SELECT id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
 FROM bots WHERE bot_uuid = $1::uuid
 `, botUUID), &b)
+	return b, err
+}
+
+// GetBotByIlinkBotID returns the bot with the given external iLink bot id.
+func (s *Store) GetBotByIlinkBotID(ctx context.Context, ilinkBotID string) (domain.Bot, error) {
+	if ilinkBotID == "" {
+		return domain.Bot{}, fmt.Errorf("ilink bot id is required")
+	}
+	var b domain.Bot
+	err := scanBot(s.pool.QueryRow(ctx, `
+SELECT id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
+FROM bots WHERE ilink_bot_id = $1
+`, ilinkBotID), &b)
 	return b, err
 }
 
@@ -49,7 +83,7 @@ FROM bots WHERE bot_uuid = $1::uuid
 func (s *Store) GetBotByOwner(ctx context.Context, ownerID int64) (domain.Bot, error) {
 	var b domain.Bot
 	err := scanBot(s.pool.QueryRow(ctx, `
-SELECT id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_version, state, created_at, updated_at
+SELECT id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
 FROM bots WHERE owner_id = $1
 `, ownerID), &b)
 	return b, err
@@ -63,7 +97,7 @@ func (s *Store) GetBoundBotByIlinkUser(ctx context.Context, ilinkUserID string) 
 	}
 	var b domain.Bot
 	err := scanBot(s.pool.QueryRow(ctx, `
-SELECT id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_version, state, created_at, updated_at
+SELECT id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
 FROM bots
 WHERE ilink_user_id = $1 AND state = 'active'
 `, ilinkUserID), &b)
@@ -130,13 +164,19 @@ func (s *Store) GetUserByID(ctx context.Context, userID int64) (id int64, userna
 }
 
 func scanBot(row pgx.Row, b *domain.Bot) error {
-	var ilinkUserID *string
-	err := row.Scan(&b.ID, &b.BotUUID, &b.OwnerID, &ilinkUserID, &b.TokenCiphertext, &b.TokenKeyVersion, &b.State, &b.CreatedAt, &b.UpdatedAt)
+	var ilinkBotID, ilinkUserID, baseurl *string
+	err := row.Scan(&b.ID, &b.BotUUID, &ilinkBotID, &b.OwnerID, &ilinkUserID, &baseurl, &b.TokenCiphertext, &b.TokenKeyVersion, &b.State, &b.CreatedAt, &b.UpdatedAt)
 	if err != nil {
 		return err
 	}
+	if ilinkBotID != nil {
+		b.IlinkBotID = *ilinkBotID
+	}
 	if ilinkUserID != nil {
 		b.IlinkUserID = *ilinkUserID
+	}
+	if baseurl != nil {
+		b.BaseURL = *baseurl
 	}
 	return nil
 }

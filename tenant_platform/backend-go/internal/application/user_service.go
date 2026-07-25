@@ -11,7 +11,8 @@ import (
 // UserStore is the persistence port for user lifecycle operations.
 // *postgres.Store implements it implicitly.
 type UserStore interface {
-	CreateUser(ctx context.Context, username string) (domain.User, error)
+	CreateUser(ctx context.Context, username, passwordHash string) (domain.User, error)
+	GetUserByUsername(ctx context.Context, username string) (domain.User, error)
 	ApproveUser(ctx context.Context, userID int64) (domain.User, error)
 	BlockUser(ctx context.Context, userID int64) (domain.User, []domain.Task, error)
 	ListPendingUsers(ctx context.Context) ([]domain.User, error)
@@ -27,7 +28,7 @@ type UserServiceConfig struct {
 
 // UserService manages the platform user lifecycle (create/approve/block).
 type UserService interface {
-	CreateUser(ctx context.Context, username string) (domain.User, error)
+	CreateUser(ctx context.Context, username, password string) (domain.User, error)
 	ApproveUser(ctx context.Context, userID int64) (domain.User, error)
 	BlockUser(ctx context.Context, userID int64) (domain.User, error)
 	ListPendingUsers(ctx context.Context) ([]domain.User, error)
@@ -49,7 +50,7 @@ func NewUserService(cfg UserServiceConfig) (UserService, error) {
 	}, nil
 }
 
-func (s *userService) CreateUser(ctx context.Context, username string) (domain.User, error) {
+func (s *userService) CreateUser(ctx context.Context, username, password string) (domain.User, error) {
 	trimmed := strings.TrimSpace(username)
 	if trimmed == "" {
 		return domain.User{}, fmt.Errorf("username is required")
@@ -57,7 +58,11 @@ func (s *userService) CreateUser(ctx context.Context, username string) (domain.U
 	if len(trimmed) > MaxUsernameLen {
 		return domain.User{}, fmt.Errorf("username must be <= %d bytes", MaxUsernameLen)
 	}
-	return s.store.CreateUser(ctx, trimmed)
+	passwordHash, err := HashPassword(password)
+	if err != nil {
+		return domain.User{}, fmt.Errorf("hash password: %w", err)
+	}
+	return s.store.CreateUser(ctx, trimmed, passwordHash)
 }
 
 func (s *userService) ApproveUser(ctx context.Context, userID int64) (domain.User, error) {
