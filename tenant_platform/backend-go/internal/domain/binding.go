@@ -127,12 +127,13 @@ func (s WechatQRSession) IsExpired(now time.Time) bool { return now.After(s.Expi
 
 // BotTransportState is the per-bot encrypted transport cursor (spec §5, §7.2).
 type BotTransportState struct {
-	BotID                 int64
-	UpdateCursorCiphertext []byte
-	ReconnectState        string
-	LastErrorAt           *time.Time
-	LastErrorCode         string
-	UpdatedAt             time.Time
+	BotID                  int64
+	UpdateCursorCiphertext  []byte
+	UpdateCursorKeyVersion int
+	ReconnectState         string
+	LastErrorAt            *time.Time
+	LastErrorCode          string
+	UpdatedAt              time.Time
 }
 
 // ContextToken is a per-(bot, ilink_user) capability credential (spec §5).

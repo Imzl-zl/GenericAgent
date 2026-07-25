@@ -573,10 +573,11 @@ func run() error {
 		}
 		botTransport = ilinkAdapter
 		botLifecycle, err = application.NewBotLifecycleService(application.BotLifecycleConfig{
-			Store:      store,
-			Cipher:     cipher,
-			Poller:     pollerClient,
-			WebhookURL: webhookURL,
+			Store:              store,
+			Cipher:             cipher,
+			Poller:             pollerClient,
+			WebhookURL:         webhookURL,
+			RestoreConcurrency: 4,
 		})
 		if err != nil {
 			return fmt.Errorf("bot lifecycle service: %w", err)

@@ -7,6 +7,7 @@ import (
 	"log"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/poller"
@@ -19,7 +20,7 @@ import (
 type BotLifecycleStore interface {
 	GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error)
 	GetBotTransportState(ctx context.Context, botID int64) (domain.BotTransportState, error)
-	UpsertBotTransportState(ctx context.Context, botID int64, cursorCiphertext []byte, reconnectState, lastErrorCode string) error
+	UpsertBotTransportState(ctx context.Context, botID int64, cursorCiphertext []byte, cursorKeyVersion int, reconnectState, lastErrorCode string) error
 	ListActiveBoundBots(ctx context.Context) ([]domain.Bot, error)
 	UpdateBotState(ctx context.Context, botUUID string, state domain.BotState) error
 }
@@ -41,13 +42,17 @@ type BotLifecycleConfig struct {
 	Cipher     secret.TokenCipher
 	Poller     *poller.Client
 	WebhookURL string // platform's /v1/im/webhook endpoint, told to the Poller
+	// RestoreConcurrency caps parallel bot restoration on startup. 0 = 1 (serial).
+	// Recommended: 4 for 10-20 bots.
+	RestoreConcurrency int
 }
 
 type botLifecycleService struct {
-	store      BotLifecycleStore
-	cipher     secret.TokenCipher
-	poller     *poller.Client
-	webhookURL string
+	store              BotLifecycleStore
+	cipher             secret.TokenCipher
+	poller             *poller.Client
+	webhookURL         string
+	restoreConcurrency int
 }
 
 // NewBotLifecycleService validates config and returns a lifecycle service.
@@ -64,11 +69,15 @@ func NewBotLifecycleService(cfg BotLifecycleConfig) (BotLifecycleService, error)
 	if cfg.WebhookURL == "" {
 		return nil, errors.New("webhook url is required")
 	}
+	if cfg.RestoreConcurrency <= 0 {
+		cfg.RestoreConcurrency = 1
+	}
 	return &botLifecycleService{
-		store:      cfg.Store,
-		cipher:     cfg.Cipher,
-		poller:     cfg.Poller,
-		webhookURL: cfg.WebhookURL,
+		store:              cfg.Store,
+		cipher:             cfg.Cipher,
+		poller:             cfg.Poller,
+		webhookURL:        cfg.WebhookURL,
+		restoreConcurrency: cfg.RestoreConcurrency,
 	}, nil
 }
 
@@ -97,8 +106,8 @@ func (s *botLifecycleService) StartBotForBoundUser(ctx context.Context, bot doma
 	})
 }
 
-// resolveCursor decrypts the persisted update cursor for a bot. Returns empty
-// string when no cursor exists yet (first start).
+// resolveCursor decrypts the persisted update cursor for a bot using the
+// stored key version. Returns empty string when no cursor exists yet.
 func (s *botLifecycleService) resolveCursor(ctx context.Context, botID int64) (string, error) {
 	st, err := s.store.GetBotTransportState(ctx, botID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -110,7 +119,11 @@ func (s *botLifecycleService) resolveCursor(ctx context.Context, botID int64) (s
 	if len(st.UpdateCursorCiphertext) == 0 {
 		return "", nil
 	}
-	plain, err := s.cipher.Decrypt(st.UpdateCursorCiphertext, 1)
+	if st.UpdateCursorKeyVersion <= 0 {
+		// Defensive: pre-0012 rows default to 1 via the migration.
+		st.UpdateCursorKeyVersion = 1
+	}
+	plain, err := s.cipher.Decrypt(st.UpdateCursorCiphertext, st.UpdateCursorKeyVersion)
 	if err != nil {
 		return "", fmt.Errorf("decrypt cursor: %w", err)
 	}
@@ -133,24 +146,32 @@ func (s *botLifecycleService) StopBot(ctx context.Context, botUUID string) error
 
 // RestoreActiveBots re-registers every active bound bot with the Poller after a
 // platform restart. Called once during startup. Failures are logged, not fatal,
-// so one bad bot does not block the rest.
+// so one bad bot does not block the rest. Bots are restored in parallel up to
+// RestoreConcurrency to avoid 10-30s serial startup on 10-20 bots.
 func (s *botLifecycleService) RestoreActiveBots(ctx context.Context) error {
 	bots, err := s.store.ListActiveBoundBots(ctx)
 	if err != nil {
 		return fmt.Errorf("list active bots: %w", err)
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.restoreConcurrency)
 	for _, bot := range bots {
-		if err := s.StartBotForBoundUser(ctx, bot); err != nil {
-			log.Printf("bot_lifecycle: restore bot %s failed: %v", bot.BotUUID, err)
-			continue
-		}
-		log.Printf("bot_lifecycle: restored bot %s", bot.BotUUID)
+		bot := bot // capture
+		g.Go(func() error {
+			if err := s.StartBotForBoundUser(gctx, bot); err != nil {
+				log.Printf("bot_lifecycle: restore bot %s failed: %v", bot.BotUUID, err)
+				return nil // do not cancel the group; one bad bot must not block others
+			}
+			log.Printf("bot_lifecycle: restored bot %s", bot.BotUUID)
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 // PersistUpdatesBuf encrypts and stores the plaintext cursor pushed by the
 // Poller alongside an inbound message. Called by the IM webhook handler.
+// Empty buffer is a no-op (Poller has not advanced its cursor).
 func (s *botLifecycleService) PersistUpdatesBuf(ctx context.Context, botUUID, plaintextBuf string) error {
 	if plaintextBuf == "" {
 		return nil
@@ -172,17 +193,22 @@ func (s *botLifecycleService) HandleAuthExpired(ctx context.Context, botUUID str
 	if err := s.store.UpdateBotState(ctx, botUUID, domain.BotExpired); err != nil {
 		return fmt.Errorf("mark bot expired: %w", err)
 	}
-	return s.store.UpsertBotTransportState(ctx, bot.ID, nil, "error", "AUTH_EXPIRED")
+	return s.store.UpsertBotTransportState(ctx, bot.ID, nil, 0, "error", "AUTH_EXPIRED")
 }
 
 // persistCursor encrypts the plaintext cursor and upserts the transport state.
+// The AES key version returned by Encrypt is stored alongside the ciphertext so
+// future key rotation can still decrypt old cursors.
 func (s *botLifecycleService) persistCursor(ctx context.Context, botID int64, plaintextBuf, reconnectState, errorCode string) error {
 	if plaintextBuf == "" {
-		return s.store.UpsertBotTransportState(ctx, botID, nil, reconnectState, errorCode)
+		return s.store.UpsertBotTransportState(ctx, botID, nil, 0, reconnectState, errorCode)
 	}
-	ct, _, err := s.cipher.Encrypt([]byte(plaintextBuf))
+	ct, version, err := s.cipher.Encrypt([]byte(plaintextBuf))
 	if err != nil {
 		return fmt.Errorf("encrypt cursor: %w", err)
 	}
-	return s.store.UpsertBotTransportState(ctx, botID, ct, reconnectState, errorCode)
+	return s.store.UpsertBotTransportState(ctx, botID, ct, version, reconnectState, errorCode)
 }
+
+// Compile-time guard: botLifecycleService must satisfy BotLifecycleService.
+var _ BotLifecycleService = (*botLifecycleService)(nil)

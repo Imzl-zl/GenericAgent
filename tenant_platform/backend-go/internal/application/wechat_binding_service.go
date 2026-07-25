@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -48,6 +49,13 @@ type wechatQRBindingService struct {
 	botStore BotQRStore
 	client   *ilink.Client
 	cipher   secret.TokenCipher
+
+	// qrMu guards qrLocks. Each qr_code gets its own *sync.Mutex so concurrent
+	// polls of the same QR session are serialized: the first caller advances
+	// the iLink state machine and creates the bot; later callers see the
+	// updated session and return without re-calling iLink or re-creating the bot.
+	qrMu    sync.Mutex
+	qrLocks map[string]*sync.Mutex
 }
 
 // NewWechatQRBindingService constructs the service.
@@ -69,7 +77,25 @@ func NewWechatQRBindingService(cfg WechatQRBindingConfig) (WechatQRBindingServic
 		botStore: cfg.BotStore,
 		client:   cfg.ILinkClient,
 		cipher:   cfg.Cipher,
+		qrLocks:  make(map[string]*sync.Mutex),
 	}, nil
+}
+
+// lockForQR returns a per-qr_code mutex and a release function. Callers must
+// hold the mutex while mutating the QR session state machine so concurrent
+// polls of the same qr_code do not race. The mutex map grows unboundedly with
+// QR sessions; P0 has few sessions (4-minute TTL × handful of active bindings).
+// If this becomes a problem, evict expired entries on access.
+func (s *wechatQRBindingService) lockForQR(qrCode string) func() {
+	s.qrMu.Lock()
+	mu, ok := s.qrLocks[qrCode]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.qrLocks[qrCode] = mu
+	}
+	s.qrMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (s *wechatQRBindingService) GenerateQRCode(ctx context.Context, userID int64) (domain.WechatQRSession, error) {
@@ -88,6 +114,15 @@ func (s *wechatQRBindingService) PollStatus(ctx context.Context, qrCode string) 
 	if qrCode == "" {
 		return domain.WechatQRSession{}, domain.Bot{}, fmt.Errorf("qrcode is required")
 	}
+	// Serialize concurrent polls of the same qr_code. The first caller runs the
+	// iLink state machine + bot creation; later callers observe the committed
+	// session state and short-circuit. Without this lock, two concurrent polls
+	// could both see status=confirmed, both call iLink, and both attempt to
+	// create a bot for the same owner (the bots UNIQUE(owner_id) constraint
+	// would reject the second, surfacing an ugly duplicate-key error).
+	unlock := s.lockForQR(qrCode)
+	defer unlock()
+
 	sess, err := s.store.GetWechatQRSessionByQRCode(ctx, qrCode)
 	if err != nil {
 		return domain.WechatQRSession{}, domain.Bot{}, fmt.Errorf("get session: %w", err)
