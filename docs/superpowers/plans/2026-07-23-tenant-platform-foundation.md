@@ -1,5 +1,21 @@
 # Multi-Tenant Platform Foundation Implementation Plan
 
+> **Status (updated 2026-07-24):** Foundation slice IMPLEMENTED. All 6 tasks / 37 steps complete and verified by Go + Python test suites and live API smoke testing (single session, 3-way personal-session concurrency, minimal team workspace, non-member rejection). Checkbox state below has been reconciled with the codebase.
+>
+> **Session 2026-07-24 additions (beyond original plan scope):**
+> - Multi-session concurrency: scheduler refactored from single-worker to per-`session_key` worker pool; verified 3 personal sessions run in parallel with isolated worker processes and no cross-talk.
+> - Minimal team workspace: `0002_team_tables.sql` adds `teams` + `team_members`; `team_store.go` provides idempotent `EnsureTeamContext` and `authorizeSubmitter`; `--dev-team` flag bootstraps a dev team. Verified owner + member submit success and non-member rejection.
+> - Three blocking bugs fixed: (1) `mykey.py` `mixin_config` with empty `llm_nos` crashed worker start with `'dict' object has no attribute 'backend'`; (2) `EnsureTeamContext` was not idempotent across restarts (`teams_owner_name_uq` violation); (3) Python `Path.resolve()` normalized Windows drive-letter case, causing `staging ref mismatch` at checkpoint commit.
+> - Stale `genericagent_worker/` empty package removed; `.gitignore` extended for `tenant_platform/runtime/runtime_data/`.
+>
+> **Session 2026-07-25 — Slice 2a (LLM Proxy + capability_token):**
+> - Closed the #1 security gap: real upstream LLM key removed from the Worker path. `cmd/llm-proxy` holds the real key (host-env injected); the scheduler issues a short-lived, HMAC-SHA256 signed, session-bound `capability_token` and writes a token-only `mykey.py` (Proxy URL + token, no real key) into `GA_CONFIG_ROOT`.
+> - Legacy `writeFixtureMyKey` / `startOAIFixture` / user-provided-`mykey.py` branch REMOVED from `scheduler.go` (security red line: always Proxy path).
+> - Token revocation via in-memory denylist (`/internal/revoke` endpoint); per-session issuance, revoked on Worker cleanup.
+> - `cmd/platform` starts an in-process LLM Proxy in dev-loopback (or accepts `--llm-proxy-addr` for external deployment).
+> - Smoke + integration tests updated to use the Proxy path end-to-end; 10-test security audit suite added (`tenant_platform/tests/security/test_no_real_key_leak.py`).
+> - Container isolation (Slice 2b, rootless Podman) deferred — requires Linux host. See [Slice 2a SPEC](../../../.codex-tasks/20260725-llm-proxy-slice-2a/SPEC.md) for full scope.
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the first real vertical slice from a Go platform task API through PostgreSQL and a versioned RPC to the existing Python GenericAgent, without modifying legacy runtime files.
@@ -40,7 +56,7 @@
 - Produces the versioned `genericagent.worker.v1.WorkerService` contract consumed by Tasks 2–6.
 - Produces the initial platform HTTP contract and shared foundation capability policy consumed by Tasks 2–6 and the later React plan.
 
-- [ ] **Step 1: Write the contract-source tests**
+- [x] **Step 1: Write the contract-source tests**
 
 Create `tenant_platform/tests/contract/test_contract_sources.py` with tests that read both protobuf files, the OpenAPI file, and the shared policy manifest and assert:
 
@@ -92,7 +108,7 @@ def test_platform_openapi_exposes_foundation_task_paths():
         assert f"- {field}" in task_required
 ```
 
-- [ ] **Step 2: Run the contract-source tests and verify the red state**
+- [x] **Step 2: Run the contract-source tests and verify the red state**
 
 Run:
 
@@ -102,7 +118,7 @@ python -m pytest tenant_platform/tests/contract/test_contract_sources.py -q
 
 Expected: FAIL because the contract files do not exist yet. Do not create empty files just to make this test pass.
 
-- [ ] **Step 3: Write the Worker protobuf contract**
+- [x] **Step 3: Write the Worker protobuf contract**
 
 `worker.proto` must define the following service and message shape:
 
@@ -232,7 +248,7 @@ service WorkerService {
 
 `llm_proxy.proto` must use package `genericagent.proxy.v1`, Go package `github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/proxy/v1;proxyv1`, and define `LlmProxyService.Generate(GenerateRequest) returns (stream GenerateEvent)`. `GenerateRequest` contains `session_key`, `capability_token`, `model`, and repeated `{role, content}` messages. `GenerateEvent` is a oneof of `{text}`, `{input_tokens, output_tokens}`, and `ErrorEnvelope`. Neither protobuf contract may contain a real API key field.
 
-- [ ] **Step 4: Write the initial OpenAPI and capability-policy contracts**
+- [x] **Step 4: Write the initial OpenAPI and capability-policy contracts**
 
 `platform.yaml` must define OpenAPI 3.1 paths and schemas for:
 
@@ -261,11 +277,11 @@ Document `X-Platform-Dev-Token` as required for this foundation-only loopback AP
 
 The foundation policy is deny-by-default and deliberately enables no Shell/Python, file, browser, desktop, arbitrary-network, or container-management tool while the loopback Worker has no container boundary. `tool_policy_version` must resolve under `RuntimePolicy.capability_version="foundation.v1"`; both processes compute the manifest SHA-256 and the Worker rejects a different `policy_digest`. Do not expose a browser chat endpoint in this plan; the P0 user chat path remains BotTransportAdapter.
 
-- [ ] **Step 5: Add isolated project metadata**
+- [x] **Step 5: Add isolated project metadata**
 
 Create `backend-go/go.mod` with module path `github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go`, Go `1.22`, and dependencies only after the generated client is used. Create `worker-python/pyproject.toml` with Python `>=3.10,<3.14`, runtime dependencies `grpcio` and `protobuf`, test dependencies `pytest` and `grpcio-tools`, a `src` package-discovery configuration, pytest `pythonpath = ["src"]`, and a test extra installable with `python -m pip install -e "tenant_platform/worker-python[test]"`. Do not add these dependencies to the root `pyproject.toml` yet.
 
-- [ ] **Step 6: Run the contract-source tests and commit the boundary**
+- [x] **Step 6: Run the contract-source tests and commit the boundary**
 
 Run:
 
@@ -291,11 +307,11 @@ Expected: PASS. Commit only the new `tenant_platform/contracts`, `tenant_platfor
 - Produces Python `WorkerServiceServicer` and Go `WorkerServiceClient` bindings used by Tasks 3–5.
 - The `.proto` files remain the only hand-edited source.
 
-- [ ] **Step 1: Write the binding compatibility test**
+- [x] **Step 1: Write the binding compatibility test**
 
 The test must add `tenant_platform/worker-python/src` to its import path, import both `genericagent.worker.v1.worker_pb2` and `genericagent.worker.v1.worker_pb2_grpc`, and assert that the generated `WorkerService` descriptor exposes `StartSession`, `ExecuteTask`, `BeginCheckpoint`, `CancelTask`, `Health`, and `Shutdown`. It must assert that `WorkerServiceServicer` and `WorkerServiceStub` exist and that the generated descriptor package is `genericagent.worker.v1`.
 
-- [ ] **Step 2: Run the test to verify the red state**
+- [x] **Step 2: Run the test to verify the red state**
 
 Run:
 
@@ -305,7 +321,7 @@ python -m pytest tenant_platform/tests/contract/test_generated_bindings.py -q
 
 Expected: FAIL with an import error because generated bindings do not exist.
 
-- [ ] **Step 3: Generate Python bindings**
+- [x] **Step 3: Generate Python bindings**
 
 From the repository root, run:
 
@@ -320,7 +336,7 @@ python -m grpc_tools.protoc \
 
 Add package `__init__.py` files required for Python imports. Keep generated files out of manual edits.
 
-- [ ] **Step 4: Generate Go bindings**
+- [x] **Step 4: Generate Go bindings**
 
 Verify `protoc` is installed before generation; a missing compiler or generator plugin is a visible prerequisite failure, never replaced by checked-in hand-written bindings. Install the pinned generator tools in the developer environment and run:
 
@@ -335,7 +351,7 @@ protoc -I tenant_platform/contracts/proto \
   tenant_platform/contracts/proto/genericagent/proxy/v1/llm_proxy.proto
 ```
 
-- [ ] **Step 5: Run both binding checks**
+- [x] **Step 5: Run both binding checks**
 
 Run:
 
@@ -400,7 +416,7 @@ class CapabilityRegistry:
 
 `load` parses only `genericagent.capability-policy.v1`, hashes the exact file bytes as `sha256:<lowercase-hex>`, rejects duplicate/empty names and empty allowlists, and never supplies a built-in fallback. `resolve` rejects unknown and cross-capability versions.
 
-- [ ] **Step 1: Write unit tests for session state and cancellation**
+- [x] **Step 1: Write unit tests for session state and cancellation**
 
 Use a test-only scripted Agent implementing only `put_task`, `abort`, `run`, `is_running`, and a queue-compatible output stream. Cover:
 
@@ -418,7 +434,7 @@ Use a test-only scripted Agent implementing only `put_task`, `abort`, `run`, `is
 - A cancel arriving before runner start emits one cancelled terminal without executing the queued prompt; a cancel during execution invokes `abort` once and maps the terminal result without rerun.
 - Runtime policy tests cover max turns, task deadline, history/working/output byte caps, unknown or capability-mismatched `tool_policy_version`, a `policy_digest` mismatch, and disallowed tool names; the checked-in foundation policy resolves to only `update_working_checkpoint`, while test-only injected registries exercise quota wrappers without enabling host tools in the smoke path.
 
-- [ ] **Step 2: Run the unit tests and verify the red state**
+- [x] **Step 2: Run the unit tests and verify the red state**
 
 Run:
 
@@ -429,11 +445,11 @@ python -m pytest tests/unit/test_managed_agent.py -q
 
 Expected: FAIL because the adapter modules and methods do not exist.
 
-- [ ] **Step 3: Implement the legacy import boundary**
+- [x] **Step 3: Implement the legacy import boundary**
 
 `legacy_import.py` must validate that `legacy_root / "agentmain.py"` exists and then ask `runtime_overlay.py` to materialize `GA_RUNTIME_DIR/<session-id>/legacy-overlay` before importing anything. Symlinks/read-only links are allowed only when their resolved targets are immutable manifest entries; otherwise copy and verify SHA-256 before import. Never include `mykey.py` or legacy `temp/`/`memory/` in the overlay source. Reject reserved module names in `GA_CONFIG_ROOT`, any preloaded legacy module, any imported legacy module absent from the overlay manifest, a missing root, or a current-working-directory fallback. `GA_LEGACY_ROOT` is removed from `sys.path` after materialization. `start_session` then resolves a non-empty `snapshot_ref` only under the permitted runtime/session root, verifies `snapshot_id`, `snapshot_checksum`, and `schema_version`, and loads backend history plus seed working/display state before accepting tasks.
 
-- [ ] **Step 4: Implement the adapter state machine**
+- [x] **Step 4: Implement the adapter state machine**
 
 Use a `threading.Lock`, one session state, an adapter-owned pending task gate, `active_task_id`, `started_event`, `cancel_requested`, a runner thread, and a bounded display buffer. Reserve a task in the adapter before calling legacy `put_task`; a pre-start cancel marks the pending item cancelled and the dispatcher skips it without enqueueing the prompt, then emits exactly one `TASK_CANCELLED`. A started cancel calls legacy `abort` once and waits for the normal terminal boundary. A task deadline requests cancellation and reports a visible timeout; `abort()` is not described as an immediate hard kill for a blocked upstream call.
 
@@ -454,17 +470,17 @@ exception or policy limit -> Terminal(TASK_FAILED) with bounded user_message and
 
 The legacy queue has no structured tool-progress signal in this slice. Textual tool markers remain bounded `Chunk` data; the adapter must not fabricate `ToolProgress`. Add the structured mapping as a follow-up contract task and test that no checkpoint or duplicate terminal event enters the display stream. The Worker does not create delivery IDs or immutable result refs; the platform creates them only after checkpoint commit.
 
-- [ ] **Step 5: Implement bounded checkpoint bundle writing**
+- [x] **Step 5: Implement bounded checkpoint bundle writing**
 
 `checkpoint.py` must capture a quiescent task boundary as a JSON bundle with `schema_version="genericagent.snapshot.v1"`, `task_id`, `session_key`, bounded `backend_history`, bounded `working`, bounded `display_history`, and `result={"content_type":"text/plain; charset=utf-8","body":"final user-visible text"}`. `result_digest` is `sha256:<lowercase-hex>` over the exact UTF-8 bytes of `result.body`, not over JSON or the full bundle; Worker, coordinator, and result API must verify that same byte sequence. `begin_checkpoint` validates the opaque token, active completed task, schema limits, and that `staging_ref` resolves under `GA_RUNTIME_DIR`; it writes a token-scoped temporary file, flushes and `os.fsync`s it, atomically renames it to the ready staging ref, fsyncs the staging directory, and returns `CheckpointReady` with token, ref, bundle checksum, and result digest. `start_session` accepts only the same schema version and supplied snapshot checksum. A configured byte limit must fail visibly before writing an oversized bundle.
 
 The bundle also stores bounded `agent_history` from `agent.history`. Restore writes it back before the first task; `max_history_bytes` applies to the combined serialized `backend_history` and `agent_history`.
 
-- [ ] **Step 6: Implement the gRPC servicer and entrypoint**
+- [x] **Step 6: Implement the gRPC servicer and entrypoint**
 
 `rpc_server.py` must use generated bindings and delegate every Worker RPC, including `BeginCheckpoint`, to `ManagedAgentAdapter`. `entrypoint.py` must require `GA_CONFIG_ROOT`, `GA_LEGACY_ROOT`, `GA_RUNTIME_DIR`, `GA_POLICY_FILE`, and a Unix/TCP listen address; missing values or an invalid policy registry are startup errors. It loads the registry before importing the legacy runtime, then injects the same immutable object into every adapter operation. It must not read PostgreSQL or call Podman. Graceful shutdown first requests cooperative cancellation, waits the configured grace period, and reports a visible timeout if a blocked call remains; Worker Manager owns eventual destruction in the production follow-up.
 
-- [ ] **Step 7: Run the unit tests to verify the green state**
+- [x] **Step 7: Run the unit tests to verify the green state**
 
 Run:
 
@@ -475,7 +491,7 @@ python -m pytest tests/unit/test_managed_agent.py -q
 
 Expected: PASS with coverage for success, cancellation before runner start, cancellation during execution, duplicate task rejection, snapshot restore/persona isolation, runtime overlay writes, policy limits, checkpoint isolation, and failure transitions.
 
-- [ ] **Step 8: Add the real GenericAgent integration smoke test**
+- [x] **Step 8: Add the real GenericAgent integration smoke test**
 
 Create a temporary `GA_CONFIG_ROOT` containing a test-only `mykey.py` whose `native_oai_config` points to a local deterministic OpenAI-compatible HTTP server with `stream=False`. Start that server inside the test process; it must return one valid non-stream chat completion and assert the bearer token is the test token. Launch the Worker entrypoint as a subprocess with that directory as `GA_CONFIG_ROOT`, the repository root as `GA_LEGACY_ROOT`, a temporary `GA_RUNTIME_DIR`, and the checked-in policy manifest as `GA_POLICY_FILE`. Drive `Health`, `StartSession` with an empty and a committed snapshot, `ExecuteTask` with two different personas and `tool_policy_version="foundation.no-host-tools.v1"`, pre-start and mid-run `CancelTask`, `BeginCheckpoint`, and graceful `Shutdown` through gRPC. Assert restored history/working, schema/checksum/policy-digest rejection, no writes under the legacy root, policy-limit errors, exactly one terminal display event per task, no checkpoint/tool-progress fabrication, a checksum-valid ready bundle, and no real key in captured output.
 
@@ -514,11 +530,11 @@ type WorkerClient interface {
 
 `WorkerEvent` must be a typed Go wrapper that distinguishes chunk, terminal, and transport error without exposing generated oneof handling to the scheduler. `CheckpointReady` is returned only by the separate unary `BeginCheckpoint` method.
 
-- [ ] **Step 1: Write Go client tests against an in-process gRPC server**
+- [x] **Step 1: Write Go client tests against an in-process gRPC server**
 
 Cover streaming order, context cancellation, malformed terminal events, transport disconnect, and token-preserving `BeginCheckpoint`. Assert that a terminal event closes the event channel exactly once and no checkpoint payload can appear on that channel.
 
-- [ ] **Step 2: Run the Go tests and verify the red state**
+- [x] **Step 2: Run the Go tests and verify the red state**
 
 Run:
 
@@ -529,15 +545,15 @@ go test ./internal/workerclient -run TestWorkerClient -v
 
 Expected: FAIL because the client and typed event wrapper do not exist.
 
-- [ ] **Step 3: Implement the client and event conversion**
+- [x] **Step 3: Implement the client and event conversion**
 
 Use one gRPC connection per Worker process, bounded receive contexts, explicit conversion errors for unknown display oneof values, and a bounded unary checkpoint deadline. Do not put retry loops in the client; retry policy belongs to the manager/scheduler layer.
 
-- [ ] **Step 4: Implement the loopback command**
+- [x] **Step 4: Implement the loopback command**
 
 `cmd/worker-loopback` starts a local Python Worker subprocess only for development smoke tests, waits for `Health.ready`, executes one task using `capability_version="foundation.v1"`, `tool_policy_version="foundation.no-host-tools.v1"`, and the loaded policy digest, requests `BeginCheckpoint` with a temporary token-scoped staging ref, prints a JSON summary with task ID/status/checksum, then sends `Shutdown`. It must require `GA_CONFIG_ROOT`, `GA_LEGACY_ROOT`, `GA_RUNTIME_DIR`, and `GA_POLICY_FILE`, and bind to loopback only.
 
-- [ ] **Step 5: Run the tests and loopback smoke**
+- [x] **Step 5: Run the tests and loopback smoke**
 
 Run:
 
@@ -725,7 +741,7 @@ type CheckpointCoordinator interface {
 
 `LocalCheckpointCoordinator` is wired only when `cmd/platform` starts with explicit `--dev-loopback`. `Prepare` creates the `workspace_snapshots(state=writing)` row and generation-bearing opaque token, then returns a token-scoped ref under the configured development runtime root. `Commit` rejects mismatched/expired tokens, verifies staging ref, checksum, schema, and size, performs the atomic immutable rename/fsync, and returns an opaque `result_ref` for the bounded `result` member inside the committed bundle. `ReadResult` resolves only that opaque ref, reads the result bytes, and verifies `expectedDigest`. The normal platform startup path must refuse this coordinator; production lease renewal and `CommitCheckpoint` manager RPC remain in the worker-manager follow-up plan.
 
-- [ ] **Step 1: Write migration and transaction tests first**
+- [x] **Step 1: Write migration and transaction tests first**
 
 The Go store tests and Python end-to-end test must require `TEST_DATABASE_URL`; absence is a visible prerequisite failure.
 
@@ -747,7 +763,7 @@ Create `tenant_platform/tests/integration/test_foundation_flow.py` with real Pos
 - terminal transition, snapshot pointer, result ref, and pending delivery are written in one PostgreSQL transaction.
 - `task_events` records transition/chunk sequence, byte count, and digest only; it never persists full prompt or chunk text.
 
-- [ ] **Step 2: Run the integration tests to verify the red state**
+- [x] **Step 2: Run the integration tests to verify the red state**
 
 Run:
 
@@ -760,7 +776,7 @@ go test ./internal/policy ./internal/postgres ./internal/application ./internal/
 
 Expected: FAIL because the migration, store, and services do not exist. If `TEST_DATABASE_URL` is absent, the test must exit with a clear prerequisite error rather than selecting SQLite.
 
-- [ ] **Step 3: Write the foundation migration**
+- [x] **Step 3: Write the foundation migration**
 
 Create `0001_foundation.sql` with PostgreSQL tables and constraints for `users`, `workspaces`, `tasks`, `task_events`, `task_deliveries`, and `workspace_snapshots`. Define `users` with `id BIGINT PRIMARY KEY`, unique non-empty `username`, `status TEXT NOT NULL CHECK (status IN ('approved', 'pending', 'blocked'))`, nullable unique `bootstrap_marker` with an allowed value of `dev-loopback`, `created_at`, and nullable `approved_at`. Define `workspaces` with `id UUID PRIMARY KEY`, unique non-empty `session_key`, `owner_user_id BIGINT NOT NULL REFERENCES users(id)`, `kind TEXT NOT NULL CHECK (kind = 'personal')` for this foundation slice, nullable `team_id UUID`, nullable `volume_id`, nullable unique `bootstrap_marker` with an allowed value of `dev-loopback`, nullable `current_snapshot_id`, and `created_at`; add checks that personal rows have no team and that `volume_id IS NULL` is allowed only when `bootstrap_marker='dev-loopback'`. `tasks` stores `workspace_id`, `session_sequence`, requester, idempotency fields, `prompt`, `persona_snapshot`, `tool_policy_version`, validated prompt/persona byte counts, `claim_owner`, `claimed_at`, `claim_lease_until`, `worker_instance_id`, `cancel_requested_at`, `worker_dispatch_started_at`, and lifecycle timestamps; `starting/running` rows require a non-empty `claim_owner` and non-null `claim_lease_until`, while queued rows have no claim owner or lease. `workspace_snapshots` references workspace/task and carries `schema_version`, `state` in `writing/committed/quarantined`, lease owner/until, generation, checksum, opaque file/result refs, and bounded result metadata; `task_deliveries` carries the stable delivery ID, one of the four delivery types, payload ref/digest or bounded error payload, and retry/ack state. Include:
 
@@ -784,17 +800,17 @@ WHERE status IN ('starting', 'running');
 
 Use `CHECK` constraints for task/delivery/snapshot states, delivery types, bounded byte sizes, non-empty stable IDs, and claim ownership/lease invariants; use UTC timestamps and foreign keys, adding the nullable `workspaces.current_snapshot_id` foreign key after `workspace_snapshots` exists. Validate prompt, persona, policy-version, terminal-error, and claim-lease future-time limits in application code before insert/update; database checks enforce non-null ownership/lease fields but do not use volatile `now()` checks. `EnsureDevelopmentContext` is the only foundation bootstrap mutation: inside `--dev-loopback` it inserts the approved development user/workspace or updates only a row already marked `bootstrap_marker='dev-loopback'`; if the requested ID exists with another marker or a non-approved status, it fails visibly without promotion. Normal startup rejects this bootstrap path. Do not store result payloads or terminal errors beyond configured byte limits, and never put prompt or chunk text in `task_events`.
 
-- [ ] **Step 4: Implement the PostgreSQL store**
+- [x] **Step 4: Implement the PostgreSQL store**
 
 Use `pgxpool.Pool`. Every mutating method accepts a context and runs in an explicit transaction. `EnsureDevelopmentContext` is the only foundation bootstrap mutation and is gated by the command flag. `SubmitTask` locks the workspace/session row to allocate the next `session_sequence`, validates and stores the complete prompt/persona/policy envelope, inserts `queued` with `ON CONFLICT (source, source_instance_id, message_idempotency_key) DO NOTHING RETURNING`, and, when no row is returned, selects the existing unique-key row `FOR UPDATE` and returns it unchanged. `ClaimNextTask` receives the current `platform_instance_id`, locks the oldest queued row with `FOR UPDATE SKIP LOCKED` only when the session has no `starting/running` row, then advances it to `starting` with `claim_owner=platform_instance_id` and `claim_lease_until=now()+configured_lease`; it returns all durable envelope fields with `worker_instance_id` still empty. After the scheduler starts or reuses the Worker, a transaction records its actual `worker_instance_id` and `worker_dispatch_started_at` before issuing the Worker RPC, then advances to `running` only after Worker session/task acceptance. The scheduler heartbeats the lease while dispatching/running. `RecoverAfterRestart(platform_instance_id)` locks only `starting/running` rows with a different owner and expired lease, transactionally converts them to `interrupted`, creates the stable `task_interrupted` delivery, and leaves current-owner, unexpired foreign-owner, and queued rows untouched. `PrepareCheckpoint` creates writing metadata and a generation token without advancing the current pointer. After `CheckpointCoordinator.Commit` returns an immutable ref, `CompleteTask` updates snapshot state, current pointer, task result fields, and the success `task_complete` delivery payload (`result_ref`, `result_digest`) atomically. `ReadResult` resolves only an opaque ref and verifies its digest.
 
-- [ ] **Step 5: Implement the task service and loopback Worker integration**
+- [x] **Step 5: Implement the task service and loopback Worker integration**
 
 The service persists every request before scheduling. `cmd/platform` generates one `platform_instance_id`, validates a positive claim lease, constructs `SchedulerConfig`, and calls recovery before accepting HTTP traffic. A single P0 scheduler loop implements `Run`, periodically scans PostgreSQL for queued and newly expired prior-owner work, heartbeats current claims, and is also kicked after submit, terminal completion, cancellation, and recovery; PostgreSQL remains the fact source, while notifications are only wakeups. It claims one session FIFO row, starts/reuses the real Worker with the same explicit `GA_POLICY_FILE`, records bounded display event metadata, resolves the task's durable `tool_policy_version` under `capability_version="foundation.v1"`, and passes `snapshot_ref`, `snapshot_id`, `snapshot_checksum`, `RuntimePolicy` including the registry digest, persona, and tool policy into the RPC. On a successful terminal signal it performs `Prepare → Worker.BeginCheckpoint → Commit`, verifies the terminal/result digest, stores the opaque result ref, and only then commits `succeeded` plus `task_complete` delivery. Failure/cancel/interrupted paths skip success checkpointing and persist their corresponding stable delivery type and bounded error payload in the terminal transaction. After every terminal transition it kicks the next queued row. Unit tests use an in-process gRPC test service and a real temporary-filesystem coordinator; the foundation smoke uses the real Python Worker subprocess and `LocalCheckpointCoordinator` under explicit `--dev-loopback`. No production code path may make platform read an arbitrary Worker path.
 
 `CancelTask` first locks the task row and makes a durable decision. A `queued` task becomes `cancelled` and gets its stable bounded `task_cancelled` delivery without contacting Worker. A `starting` task with no `worker_dispatch_started_at` is also committed as `cancelled` with zero Worker RPCs; the scheduler's dispatch transaction must re-check the row and stop. Once `worker_dispatch_started_at` is set, or for `running`, the transaction records `cancel_requested_at` exactly once; the scheduler then issues an idempotent Worker cancel RPC once, and the Worker pre-start gate maps a not-yet-running task to `TASK_CANCELLED` while started work maps to `TASK_INTERRUPTED`. The platform commits the matching terminal state and stable delivery without checkpointing. Unique delivery IDs and the locked state transition make retries and dispatch races side-effect free; cancelled tasks never re-enter the claim path, and every cancellation kicks the next queued session task.
 
-- [ ] **Step 6: Implement the loopback-only HTTP API**
+- [x] **Step 6: Implement the loopback-only HTTP API**
 
 Use Go `net/http` with these handlers:
 
@@ -808,7 +824,7 @@ POST /v1/tasks/{task_id}/cancel
 
 Require `cmd/platform --policy-file <path> --claim-lease <positive-duration>` and fail startup if the policy manifest is missing/malformed, the lease is non-positive, or platform instance ID generation fails. Require `X-Platform-Dev-Token`, bind to `127.0.0.1`, derive `requester_user_id` from the bootstrapped development context rather than request JSON, require and validate `source`, `source_instance_id`, `message_id`, prompt limits, `persona_snapshot`, and `tool_policy_version` against the loaded `foundation.v1` capability, and return JSON errors with stable `code`, `message`, and `trace_id`. `POST` returns `202` for a durable `queued` task; `GET /result` reads through `TaskService.ReadResult`, returns only the bounded committed payload with its digest, and rejects path-like refs. Do not add production user authentication in this foundation plan.
 
-- [ ] **Step 7: Run the red-green test cycle**
+- [x] **Step 7: Run the red-green test cycle**
 
 Run:
 
@@ -832,11 +848,11 @@ Expected: both commands pass against PostgreSQL; the end-to-end scenario proves 
 **Interfaces:**
 - Confirms the new boundary does not change legacy imports or desktop/IM startup contracts.
 
-- [ ] **Step 1: Write the import regression test**
+- [x] **Step 1: Write the import regression test**
 
 The test must import `agentmain`, `ga`, `llmcore`, `frontends.chatapp_common`, and `frontends.ga_contract_probe` in a clean subprocess and assert exit code 0. It must not import any real key value into test output.
 
-- [ ] **Step 2: Run the regression test**
+- [x] **Step 2: Run the regression test**
 
 Run:
 
@@ -846,11 +862,11 @@ python -m pytest tenant_platform/tests/integration/test_legacy_imports.py -q
 
 Expected: PASS. Any failure is a boundary regression and must be fixed without moving or rewriting the legacy files.
 
-- [ ] **Step 3: Implement the foundation smoke script**
+- [x] **Step 3: Implement the foundation smoke script**
 
 `foundation_smoke.py` must require `TEST_DATABASE_URL`, `PLATFORM_DEV_USER_ID`, `GA_LEGACY_ROOT`, and `GA_POLICY_FILE`; create a temporary `GA_CONFIG_ROOT`/`GA_RUNTIME_DIR` and test-only `mykey.py`; and start a deterministic local OpenAI-compatible fixture that validates the test bearer token. It starts the loopback-only Go platform with `--dev-loopback --policy-file "$GA_POLICY_FILE" --claim-lease 5s`, passes `X-Platform-Dev-Token`, waits for `/healthz`, and submits a task to `personal:<PLATFORM_DEV_USER_ID>` with a unique source instance/message ID, explicit `persona_snapshot`, and `tool_policy_version="foundation.no-host-tools.v1"`. It resubmits the same key and asserts the same task ID, polls until `succeeded`, reads `GET /v1/tasks/{task_id}/result`, and verifies returned bytes against `result_digest`. It then submits a second task, cancels it, and asserts a cancellation terminal with no checkpoint/result ref. It must terminate every child process in a `finally` block and print only task IDs, statuses, result/checkpoint digests, and elapsed milliseconds.
 
-- [ ] **Step 4: Run the complete foundation verification**
+- [x] **Step 4: Run the complete foundation verification**
 
 Run:
 
@@ -864,7 +880,7 @@ go test ./...
 
 Expected: all tests pass; no test silently skips due to missing PostgreSQL or local fixture configuration.
 
-- [ ] **Step 5: Run the foundation smoke command**
+- [x] **Step 5: Run the foundation smoke command**
 
 Run:
 
@@ -874,7 +890,7 @@ python tenant_platform/tests/smoke/foundation_smoke.py
 
 The command must exercise health, submit, the internal Worker display stream, separate `BeginCheckpoint`, terminal persistence/read-back, cancellation, and shutdown, then print a bounded JSON summary without prompt contents or credentials.
 
-- [ ] **Step 6: Stop and review before Podman/Web work**
+- [x] **Step 6: Stop and review before Podman/Web work**
 
 Record the observed Worker RSS, checkpoint size/time, task latency, and failure behavior. Use those measurements to write separate follow-up plans for:
 

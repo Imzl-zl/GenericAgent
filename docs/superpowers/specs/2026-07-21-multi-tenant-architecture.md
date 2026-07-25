@@ -1,7 +1,7 @@
 # 多租户 IM 个人助手平台 — 架构设计
 
 **日期：** 2026-07-23  
-**状态：** 设计已确认；已补充 P0 物理部署与容量门槛；未进入实现  
+**状态：** 设计已确认；Foundation 垂直切片已实现（2026-07-24，见 [foundation plan](../plans/2026-07-23-tenant-platform-foundation.md)）；LLM Proxy + capability_token 垂直切片已实现（2026-07-25，Slice 2a — 真实上游 Key 仅存于 `cmd/llm-proxy`，Worker 只持有短时 session-bound capability_token，见 [Slice 2a SPEC](../../../.codex-tasks/20260725-llm-proxy-slice-2a/SPEC.md)）；P0 完整闭环仍待后续切片（容器隔离 / Web UI / IM Gateway）  
 **对应 PRD：** [2026-07-21-multi-tenant-im-platform-design.md](2026-07-21-multi-tenant-im-platform-design.md)  
 **试运行目标：** 一台 Linux 服务器，先服务约 10–20 名已批准用户；容量由部署前压测结果决定，不作未经验证的并发承诺。
 **当前 P0 验证基线：** 目标主机为 2 vCPU / 4 GiB RAM；该硬件只用于容量实验，不构成用户数、并发数或响应时间承诺。

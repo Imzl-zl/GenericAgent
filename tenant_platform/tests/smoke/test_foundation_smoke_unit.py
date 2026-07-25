@@ -43,6 +43,9 @@ def test_child_environment_uses_allowlist_and_drops_parent_secrets(monkeypatch, 
     values = {
         "TEST_DATABASE_URL": "postgresql://test.invalid/db",
         "PLATFORM_DEV_USER_ID": "7",
+        "LLM_PROXY_UPSTREAM_BASEURL": "http://127.0.0.1:1/v1",
+        "LLM_PROXY_UPSTREAM_APIKEY": "upstream-key-sentinel",
+        "LLM_PROXY_CAPABILITY_SIGNING_KEY": "signing-key-sentinel",
     }
     env = smoke._child_environment(values, tmp_path / "config", tmp_path / "runtime", tmp_path, tmp_path / "policy.json")
 
@@ -59,6 +62,9 @@ def test_child_environment_uses_allowlist_and_drops_parent_secrets(monkeypatch, 
         "GA_POLICY_FILE",
         "GA_WORKER_PYTHON",
         "GA_WORKER_SRC",
+        "LLM_PROXY_UPSTREAM_BASEURL",
+        "LLM_PROXY_UPSTREAM_APIKEY",
+        "LLM_PROXY_CAPABILITY_SIGNING_KEY",
     }
     assert set(env) <= set(smoke.CHILD_ENV_ALLOWLIST) | explicit
 

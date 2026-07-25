@@ -213,7 +213,12 @@ class SessionLifecycleMixin:
         with self._lock:
             completed: CompletedTask = self._session.completed  # type: ignore[union-attr]
             policy = self._session.runtime_policy  # type: ignore[union-attr]
-        staging = Path(request.staging_ref).resolve()
+        # Use the staging_ref as-is for writing and round-tripping back to the
+        # coordinator. Path.resolve() on Windows normalizes the drive letter to
+        # uppercase (c:\ -> C:\), which would mismatch the DB-stored ref and
+        # fail the coordinator's staging_ref equality check. Validation that
+        # the ref resolves under runtime_root is done in _validate_checkpoint_request.
+        staging = Path(request.staging_ref)
         try:
             bundle = build_snapshot_bundle(
                 task_id=completed.task_id,

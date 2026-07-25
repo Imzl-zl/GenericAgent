@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,9 @@ import (
 // Server is the loopback HTTP API.
 type Server struct {
 	svc        application.TaskService
+	users      application.UserService
+	binding    application.BindingService
+	router     application.Router
 	registry   policy.Registry
 	devToken   string
 	devUserID  int64
@@ -31,6 +35,9 @@ type Server struct {
 // ServerConfig configures the foundation API.
 type ServerConfig struct {
 	Service    application.TaskService
+	Users      application.UserService
+	Binding    application.BindingService
+	Router     application.Router
 	Registry   policy.Registry
 	DevToken   string
 	DevUserID  int64
@@ -53,6 +60,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	s := &Server{
 		svc:        cfg.Service,
+		users:      cfg.Users,
+		binding:    cfg.Binding,
+		router:     cfg.Router,
 		registry:   cfg.Registry,
 		devToken:   cfg.DevToken,
 		devUserID:  cfg.DevUserID,
@@ -64,8 +74,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	s.mux.HandleFunc("GET /v1/tasks/{task_id}", s.auth(s.handleGetTask))
 	s.mux.HandleFunc("GET /v1/tasks/{task_id}/result", s.auth(s.handleGetResult))
 	s.mux.HandleFunc("POST /v1/tasks/{task_id}/cancel", s.auth(s.handleCancel))
+	s.registerLifecycleRoutes()
 	return s, nil
 }
+
+// SessionKey returns the default bootstrapped session (used by smoke tooling).
+func (s *Server) SessionKey() string { return s.sessionKey }
 
 // Handler returns the root handler.
 func (s *Server) Handler() http.Handler { return s.mux }
@@ -105,13 +119,14 @@ type createTaskBody struct {
 	Source            string   `json:"source"`
 	PersonaSnapshot   []string `json:"persona_snapshot"`
 	ToolPolicyVersion string   `json:"tool_policy_version"`
+	RequesterUserID   int64    `json:"requester_user_id,omitempty"`
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	sessionKey := r.PathValue("session_key")
-	if sessionKey != s.sessionKey {
-		writeErr(w, http.StatusBadRequest, "SESSION_MISMATCH", "session_key must match bootstrapped development workspace", tid)
+	if strings.TrimSpace(sessionKey) == "" {
+		writeErr(w, http.StatusBadRequest, "SESSION_REQUIRED", "session_key is required", tid)
 		return
 	}
 	var body createTaskBody
@@ -129,9 +144,13 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "POLICY_REJECTED", err.Error(), tid)
 		return
 	}
+	requester := s.devUserID
+	if body.RequesterUserID > 0 {
+		requester = body.RequesterUserID
+	}
 	task, err := s.svc.SubmitTask(r.Context(), domain.SubmitTaskCommand{
 		SessionKey:        sessionKey,
-		RequesterUserID:   s.devUserID, // derived from bootstrap, not request JSON
+		RequesterUserID:   requester,
 		Source:            body.Source,
 		SourceInstanceID:  body.SourceInstanceID,
 		MessageID:         body.MessageID,
@@ -216,7 +235,13 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	taskID := r.PathValue("task_id")
-	task, err := s.svc.CancelTask(r.Context(), taskID, s.devUserID)
+	requester := s.devUserID
+	if q := r.URL.Query().Get("requester_user_id"); q != "" {
+		if v, err := strconv.ParseInt(q, 10, 64); err == nil && v > 0 {
+			requester = v
+		}
+	}
+	task, err := s.svc.CancelTask(r.Context(), taskID, requester)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "CANCEL_FAILED", err.Error(), tid)
 		return

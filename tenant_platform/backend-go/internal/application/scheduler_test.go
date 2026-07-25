@@ -211,7 +211,7 @@ func TestScheduler_AcceptedRunningCancelReachesWorkerBeforeStreamCompletionAndWi
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "scheduler-cancel", ClaimLease: time.Second,
 		Store: store, Registry: reg,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) {
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
 			return worker, func() {}, nil
 		},
 	})
@@ -287,7 +287,7 @@ func TestScheduler_HeartbeatsQuietStreamBeforeLeaseExpires(t *testing.T) {
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "quiet-owner", ClaimLease: lease,
 		Store: store, Registry: reg,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) {
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
 			return worker, func() {}, nil
 		},
 	})
@@ -365,7 +365,7 @@ func TestScheduler_ResultReadFailureCannotCommitSucceeded(t *testing.T) {
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "read-owner", ClaimLease: time.Second,
 		Store: store, Registry: reg, Coordinator: coord,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) {
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
 			return worker, func() {}, nil
 		},
 	})
@@ -416,7 +416,7 @@ func TestScheduler_HeartbeatLossCancelsWorkerAndCannotSucceed(t *testing.T) {
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "heartbeat-owner", ClaimLease: 600 * time.Millisecond,
 		Store: store, Registry: reg,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) {
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
 			return worker, func() {}, nil
 		},
 	})
@@ -482,7 +482,7 @@ func TestScheduler_CancelDuringStartSessionSkipsExecuteTaskAndSendsOneRPC(t *tes
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "pre-execute-owner", ClaimLease: time.Second,
 		Store: store, Registry: reg,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) {
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
 			return worker, func() {}, nil
 		},
 	})
@@ -573,7 +573,7 @@ func TestScheduler_HeartbeatsWhileStartSessionIsBlocked(t *testing.T) {
 	worker.releaseStartSession = make(chan struct{})
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "blocked-start-owner", ClaimLease: lease, Store: store, Registry: reg,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -644,7 +644,7 @@ func TestScheduler_HeartbeatsThroughBlockedCheckpointCommit(t *testing.T) {
 	coord := &successfulCoordinator{store: store, owner: "checkpoint-owner"}
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "checkpoint-owner", ClaimLease: lease, Store: store, Registry: reg, Coordinator: coord,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -712,7 +712,7 @@ func TestScheduler_HeartbeatLossDuringCheckpointCannotPublishSuccess(t *testing.
 	coord := &successfulCoordinator{store: store, owner: "checkpoint-loss-owner"}
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "checkpoint-loss-owner", ClaimLease: lease, Store: store, Registry: reg, Coordinator: coord,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -770,7 +770,7 @@ func TestScheduler_CancelRacingStreamErrorCommitsInterrupted(t *testing.T) {
 	worker := newControlledWorker()
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "cancel-stream-owner", ClaimLease: time.Second, Store: store, Registry: reg,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -833,7 +833,7 @@ func TestScheduler_CancelRacingCheckpointErrorCommitsInterrupted(t *testing.T) {
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "cancel-checkpoint-owner", ClaimLease: time.Second,
 		Store: store, Registry: reg, Coordinator: coord,
-		DialWorker: func(context.Context) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
 	})
 	if err != nil {
 		t.Fatal(err)

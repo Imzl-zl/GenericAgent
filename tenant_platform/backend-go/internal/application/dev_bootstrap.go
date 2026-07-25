@@ -7,24 +7,36 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
 )
 
 // DevBootstrapConfig is required for --dev-loopback startup.
 type DevBootstrapConfig struct {
-	Enabled        bool
-	UserID         int64
-	Username       string
-	DevToken       string
-	DatabaseURL    string
-	PolicyFile     string
-	ClaimLease     string // parsed by main
-	RuntimeRoot    string
-	ConfigRoot     string
-	LegacyRoot     string
-	WorkerPython   string
-	WorkerSrc      string
-	ListenAddr     string
+	Enabled      bool
+	UserID       int64
+	Username     string
+	DevToken     string
+	DatabaseURL  string
+	PolicyFile   string
+	ClaimLease   string // parsed by main
+	RuntimeRoot  string
+	ConfigRoot   string
+	LegacyRoot   string
+	WorkerPython string
+	WorkerSrc    string
+	ListenAddr   string
+}
+
+// DevTeamConfig bootstraps a minimal team workspace for multi-session testing.
+// OwnerID is the primary dev user; MemberIDs are additional dev users that
+// must already exist (bootstrap them via --dev-extra-users first).
+type DevTeamConfig struct {
+	TeamID    uuid.UUID
+	TeamName  string
+	OwnerID   int64
+	MemberIDs []int64
 }
 
 // LoadDevBootstrapFromEnv reads PLATFORM_DEV_* and related env for loopback mode.
@@ -65,4 +77,23 @@ func EnsureDevelopmentContext(ctx context.Context, store *postgres.Store, cfg De
 		return postgres.DevelopmentContext{}, fmt.Errorf("PLATFORM_DEV_TOKEN is required for --dev-loopback")
 	}
 	return store.EnsureDevelopmentContext(ctx, cfg.UserID, cfg.Username)
+}
+
+// EnsureDevTeam bootstraps a minimal team workspace for testing. The owner and
+// all members must already exist as dev-loopback users. Returns the team
+// session_key (team:<uuid>) for HTTP task submission.
+func EnsureDevTeam(ctx context.Context, store *postgres.Store, cfg DevTeamConfig) (postgres.TeamContext, error) {
+	if store == nil {
+		return postgres.TeamContext{}, fmt.Errorf("store is nil")
+	}
+	if cfg.TeamID == uuid.Nil {
+		return postgres.TeamContext{}, fmt.Errorf("team id is required")
+	}
+	if strings.TrimSpace(cfg.TeamName) == "" {
+		return postgres.TeamContext{}, fmt.Errorf("team name is required")
+	}
+	if cfg.OwnerID <= 0 {
+		return postgres.TeamContext{}, fmt.Errorf("owner id is required")
+	}
+	return store.EnsureTeamContext(ctx, cfg.TeamID, cfg.TeamName, cfg.OwnerID, cfg.MemberIDs)
 }

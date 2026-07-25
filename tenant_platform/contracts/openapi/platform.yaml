@@ -171,6 +171,173 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/admin/users:
+    post:
+      operationId: adminCreateUser
+      summary: Create a pending platform user (admin-only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+      responses:
+        "201":
+          description: User created in pending state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserRecord"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/admin/users/{user_id}/approve:
+    post:
+      operationId: adminApproveUser
+      summary: Approve a pending user (pending → approved)
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          description: User approved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserRecord"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/admin/users/{user_id}/block:
+    post:
+      operationId: adminBlockUser
+      summary: Block a user (approved → blocked); cancels queued/running tasks
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          description: User blocked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserRecord"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/admin/users/pending:
+    get:
+      operationId: adminListPendingUsers
+      summary: List users in pending state
+      responses:
+        "200":
+          description: Pending users
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - users
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/UserRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/bindings:
+    post:
+      operationId: createBinding
+      summary: Generate a one-time WeChat binding code for a user
+      description: >
+        Returns the plaintext code ONCE; only its SHA-256 hash is persisted.
+        The code expires after a short TTL (default 10 minutes).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBindingRequest"
+      responses:
+        "201":
+          description: Binding code generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BindingCode"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/activate:
+    post:
+      operationId: activateBinding
+      summary: Activate a binding code and pair a bot with an ilink user
+      description: >
+        HTTP equivalent of the /activate bot command (spec §6.2). Consumes
+        the one-time code atomically and binds the bot to the ilink_user_id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ActivateRequest"
+      responses:
+        "200":
+          description: Binding activated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BindingRecord"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/router/messages:
+    post:
+      operationId: routerMessage
+      summary: Ingest one bot message through the router pipeline
+      description: >
+        Processes identity resolution, user status check, command parsing
+        (/stop, /new, /activate), and task routing. Replies are sent via
+        the BotTransportAdapter; the HTTP response carries the action
+        classification for observability.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RouterMessage"
+      responses:
+        "200":
+          description: Message processed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouterResult"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
 components:
   securitySchemes:
     PlatformDevToken:
@@ -191,6 +358,14 @@ components:
       required: true
       schema:
         type: string
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
   responses:
     ValidationError:
       description: Client-side validation failure (e.g. prompt too long, unknown source)
@@ -309,3 +484,138 @@ components:
               type: string
             trace_id:
               type: string
+    CreateUserRequest:
+      type: object
+      required:
+        - username
+      properties:
+        username:
+          type: string
+          description: Platform username (1-64 bytes)
+    UserRecord:
+      type: object
+      required:
+        - user_id
+        - username
+        - status
+        - created_at
+      properties:
+        user_id:
+          type: integer
+          format: int64
+        username:
+          type: string
+        status:
+          type: string
+          enum: [pending, approved, blocked]
+        created_at:
+          type: string
+          format: date-time
+        approved_at:
+          type: string
+          format: date-time
+          nullable: true
+    CreateBindingRequest:
+      type: object
+      required:
+        - user_id
+      properties:
+        user_id:
+          type: integer
+          format: int64
+          minimum: 1
+    BindingCode:
+      type: object
+      required:
+        - code
+        - binding_id
+        - user_id
+        - state
+        - expires_at
+      properties:
+        code:
+          type: string
+          description: One-time plaintext binding code; returned ONCE, never persisted
+        binding_id:
+          type: integer
+          format: int64
+        user_id:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum: [requested, qr_pending, awaiting_activation, active, expired, revoked]
+        expires_at:
+          type: string
+          format: date-time
+    ActivateRequest:
+      type: object
+      required:
+        - code
+        - bot_uuid
+        - ilink_user_id
+      properties:
+        code:
+          type: string
+          description: One-time binding code (plaintext)
+        bot_uuid:
+          type: string
+          format: uuid
+        ilink_user_id:
+          type: string
+          description: External IM user id to bind to the bot
+    BindingRecord:
+      type: object
+      required:
+        - binding_id
+        - user_id
+        - state
+      properties:
+        binding_id:
+          type: integer
+          format: int64
+        user_id:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum: [requested, qr_pending, awaiting_activation, active, expired, revoked]
+        activated_at:
+          type: string
+          format: date-time
+          nullable: true
+    RouterMessage:
+      type: object
+      required:
+        - bot_uuid
+        - ilink_user_id
+        - message_id
+        - text
+      properties:
+        bot_uuid:
+          type: string
+          format: uuid
+        ilink_user_id:
+          type: string
+        message_id:
+          type: string
+          description: Transport-unique message id for idempotency
+        text:
+          type: string
+          description: Message text; may be a command (/stop, /new, /activate) or normal text
+    RouterResult:
+      type: object
+      required:
+        - action
+        - reply
+      properties:
+        action:
+          type: string
+          enum: [activated, stopped, new_session, task_created, rejected, duplicate, no_running_task]
+        reply:
+          type: string
+          description: Reply text sent to the user via the transport
+        user_id:
+          type: integer
+          format: int64
+          nullable: true

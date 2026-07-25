@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +24,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/workerclient"
@@ -53,10 +53,16 @@ type SchedulerConfig struct {
 	RuntimeRoot  string
 	WorkerPython string
 	WorkerSrc    string
-	// Optional injected Worker factory for unit tests.
-	DialWorker func(ctx context.Context) (workerclient.WorkerClient, func(), error)
-	// Optional OAI fixture base URL; when empty scheduler starts its own fixture.
-	OAIBaseURL string
+	// Optional injected Worker factory for unit tests. When set, the scheduler
+	// calls it once per session_key to obtain a dedicated worker instance.
+	DialWorker func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(), error)
+	// LLM Proxy capability_token issuance. Required when DialWorker is nil
+	// (real Worker path): the platform issues a short-lived, session-bound
+	// token and writes a token-only mykey.py (no real upstream key).
+	TokenIssuer       *llmproxy.Issuer
+	TokenRevoker      TokenRevoker
+	LLMProxyAddr      string // e.g. "http://127.0.0.1:8081"
+	ModelPolicyVersion string
 	// MaxBundleBytes for checkpoint prepare.
 	MaxBundleBytes uint64
 }
@@ -111,18 +117,40 @@ func (h *dispatchHeartbeat) Stop() error {
 	return h.err
 }
 
+// workerEntry holds a dedicated Worker process bound to one session_key.
+type workerEntry struct {
+	client     workerclient.WorkerClient
+	cleanup    func()
+	instID     string
+	sessionKey string
+	jti        string // capability_token JTI; revoked on Worker cleanup
+	startOnce  sync.Once
+	startErr   error
+	started    bool
+}
+
+// startSession invokes StartSession on the worker exactly once. Subsequent
+// calls return the cached result. This is called AFTER MarkDispatchStarted so
+// that cancel-during-StartSession sees WorkerDispatchStartedAt != nil and
+// records a durable cancel request instead of finalizing immediately.
+func (e *workerEntry) startSession(ctx context.Context, req *workerv1.StartSessionRequest) error {
+	e.startOnce.Do(func() {
+		if _, err := e.client.StartSession(ctx, req); err != nil {
+			e.startErr = err
+			return
+		}
+		e.started = true
+	})
+	return e.startErr
+}
+
 type scheduler struct {
-	cfg           SchedulerConfig
-	mu            sync.Mutex
-	workerCallMu  sync.Mutex
-	wake          chan struct{}
-	worker        workerclient.WorkerClient
-	workerCleanup func()
-	workerInstID  string
-	sessionKey    string   // last started worker session
-	cancelOnce    sync.Map // taskID -> *cancelCall
-	oai           *oaiFixture
-	ownOAI        bool
+	cfg          SchedulerConfig
+	mu           sync.Mutex
+	workerCallMu sync.Mutex
+	wake         chan struct{}
+	workers      map[string]*workerEntry // session_key -> dedicated worker
+	cancelOnce   sync.Map                // taskID -> *cancelCall
 }
 
 // finalizeOrFail records a terminal task state + delivery and surfaces any
@@ -149,6 +177,23 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 	if cfg.Store == nil || cfg.Registry == nil {
 		return nil, fmt.Errorf("store and registry are required")
 	}
+	// Real Worker path (no injected DialWorker) MUST go through the LLM Proxy:
+	// token issuer + revoker + Proxy address + config root for token-only
+	// mykey.py. This is the spec §7.1 security red line.
+	if cfg.DialWorker == nil {
+		if cfg.TokenIssuer == nil {
+			return nil, fmt.Errorf("SchedulerConfig.TokenIssuer is required when DialWorker is nil (real Worker must use capability_token)")
+		}
+		if cfg.TokenRevoker == nil {
+			return nil, fmt.Errorf("SchedulerConfig.TokenRevoker is required when DialWorker is nil")
+		}
+		if strings.TrimSpace(cfg.LLMProxyAddr) == "" {
+			return nil, fmt.Errorf("SchedulerConfig.LLMProxyAddr is required when DialWorker is nil")
+		}
+		if strings.TrimSpace(cfg.ConfigRoot) == "" {
+			return nil, fmt.Errorf("SchedulerConfig.ConfigRoot is required when DialWorker is nil")
+		}
+	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = time.Second
 	}
@@ -156,8 +201,9 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 		cfg.MaxBundleBytes = 2 * 1024 * 1024
 	}
 	return &scheduler{
-		cfg:  cfg,
-		wake: make(chan struct{}, 1),
+		cfg:     cfg,
+		wake:    make(chan struct{}, 1),
+		workers: make(map[string]*workerEntry),
 	}, nil
 }
 
@@ -189,7 +235,9 @@ func (s *scheduler) Run(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			s.shutdownWorker()
+			shutCtx, shutCancel := context.WithTimeout(context.Background(), workerShutdownTimeout*3)
+			defer shutCancel()
+			s.shutdownAllWorkers(shutCtx)
 			return ctx.Err()
 		case <-s.wake:
 		case <-ticker.C:
@@ -258,13 +306,13 @@ func (s *scheduler) CancelWorker(ctx context.Context, task domain.Task) error {
 		s.workerCallMu.Lock()
 		defer s.workerCallMu.Unlock()
 		s.mu.Lock()
-		client := s.worker
+		entry := s.workers[task.SessionKey]
 		s.mu.Unlock()
-		if client == nil {
-			call.err = fmt.Errorf("no active worker for task %s", task.ID)
+		if entry == nil {
+			call.err = fmt.Errorf("no active worker for session %s task %s", task.SessionKey, task.ID)
 			return
 		}
-		call.err = client.CancelTask(ctx, task.ID)
+		call.err = entry.client.CancelTask(ctx, task.ID)
 	})
 	return call.err
 }
@@ -303,7 +351,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}()
 	ctx = heartbeat.ctx
 
-	client, err := s.ensureWorker(ctx, task.SessionKey)
+	client, entry, err := s.ensureWorker(ctx, task)
 	if err != nil {
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_START_FAILED", err.Error(), "")
@@ -320,8 +368,10 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		}
 	}
 	defer releaseWorkerCall()
-	// Record dispatch intent before Worker RPC.
-	cur, err = s.cfg.Store.MarkDispatchStarted(ctx, task.ID, s.cfg.PlatformInstanceID, s.workerInstID)
+	// Record dispatch intent BEFORE StartSession so cancel-during-StartSession
+	// sees WorkerDispatchStartedAt != nil and records a durable cancel request
+	// instead of finalizing immediately.
+	cur, err = s.cfg.Store.MarkDispatchStarted(ctx, task.ID, s.cfg.PlatformInstanceID, entry.instID)
 	if err != nil {
 		// Likely cancelled before dispatch.
 		return nil
@@ -333,31 +383,13 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		return err
 	}
 
-	// Start session once per worker process / session key.
-	if s.sessionKey != task.SessionKey {
-		startReq := &workerv1.StartSessionRequest{
-			SessionKey: task.SessionKey,
-			RuntimePolicy: &workerv1.RuntimePolicy{
-				MaxTurns:           6,
-				MaxHistoryBytes:    256 * 1024,
-				MaxWorkingBytes:    64 * 1024,
-				MaxOutputBytes:     256 * 1024,
-				TaskTimeoutSeconds: 60,
-				CapabilityVersion:  CapabilityVersion,
-				PolicyDigest:       s.cfg.Registry.Digest(),
-			},
-		}
-		// Optional restore from durable snapshot pointer (StartSession owns restore fields).
-		if task.SnapshotID != "" {
-			startReq.SnapshotId = task.SnapshotID
-			startReq.SnapshotChecksum = task.SnapshotChecksum
-		}
-		if _, err := client.StartSession(ctx, startReq); err != nil {
-			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-				"START_SESSION_FAILED", err.Error(), "")
-			return err
-		}
-		s.sessionKey = task.SessionKey
+	// StartSession happens after MarkDispatchStarted so the durable cancel path
+	// can observe and record CancelRequestedAt while StartSession is in flight.
+	if err := s.startSessionOnWorker(ctx, task); err != nil {
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+			"WORKER_START_FAILED", err.Error(), "")
+		_ = s.KickSession(ctx, task.SessionKey)
+		return err
 	}
 
 	if _, err := s.cfg.Store.MarkRunning(ctx, task.ID, s.cfg.PlatformInstanceID); err != nil {
@@ -497,7 +529,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 			"CHECKPOINT_PREPARE_FAILED", err.Error(), "")
 		return err
 	}
-	client, err := s.ensureWorker(ctx, task.SessionKey)
+	client, _, err := s.ensureWorker(ctx, task)
 	if err != nil {
 		return err
 	}
@@ -585,46 +617,125 @@ func (s *scheduler) startDispatchHeartbeat(parent context.Context, task domain.T
 	return heartbeat, nil
 }
 
-func (s *scheduler) ensureWorker(ctx context.Context, sessionKey string) (workerclient.WorkerClient, error) {
+// ensureWorker returns the dedicated Worker for task.SessionKey, creating a new
+// Worker process on first use. StartSession is NOT called here; it is invoked
+// later by dispatch after MarkDispatchStarted so that cancel-during-StartSession
+// sees WorkerDispatchStartedAt != nil and records a durable cancel request.
+//
+// On first use for a session, a capability_token is issued (via TokenIssuer)
+// and a token-only mykey.py is written to ConfigRoot. The real upstream key
+// never enters the Worker (spec §7.1). The token JTI is stored for revocation
+// when the Worker process is cleaned up.
+func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerclient.WorkerClient, *workerEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.worker != nil {
-		return s.worker, nil
+	if entry, ok := s.workers[task.SessionKey]; ok {
+		return entry.client, entry, nil
 	}
+
+	jti, err := s.issueAndWriteCredential(task.SessionKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	client, instID, cleanup, err := s.startWorkerProcess(ctx, task.SessionKey)
+	if err != nil {
+		s.revokeTokenBestEffort(context.Background(), jti)
+		return nil, nil, err
+	}
+
+	entry := &workerEntry{
+		client:     client,
+		cleanup:    cleanup,
+		instID:     instID,
+		sessionKey: task.SessionKey,
+		jti:        jti,
+	}
+	s.workers[task.SessionKey] = entry
+	return client, entry, nil
+}
+
+// issueAndWriteCredential issues a capability_token for the session and writes
+// a token-only mykey.py. Returns the JTI for later revocation. When
+// TokenIssuer is nil (unit tests with injected DialWorker), returns "".
+func (s *scheduler) issueAndWriteCredential(sessionKey string) (string, error) {
+	if s.cfg.TokenIssuer == nil {
+		return "", nil
+	}
+	token, claims, err := s.cfg.TokenIssuer.Issue(sessionKey, s.cfg.ModelPolicyVersion)
+	if err != nil {
+		return "", fmt.Errorf("issue capability_token: %w", err)
+	}
+	if s.cfg.LLMProxyAddr != "" && s.cfg.ConfigRoot != "" {
+		if err := writeTokenOnlyMyKey(s.cfg.ConfigRoot, s.cfg.LLMProxyAddr, token); err != nil {
+			return "", fmt.Errorf("write token-only mykey.py: %w", err)
+		}
+	}
+	return claims.Jti, nil
+}
+
+// revokeTokenBestEffort attempts a revocation; failures are logged (token TTL
+// is the safety net). Never blocks the caller on revocation errors.
+func (s *scheduler) revokeTokenBestEffort(ctx context.Context, jti string) {
+	if s.cfg.TokenRevoker == nil || jti == "" {
+		return
+	}
+	revokeCtx, cancel := context.WithTimeout(ctx, revokeTimeout)
+	defer cancel()
+	if err := s.cfg.TokenRevoker.Revoke(revokeCtx, jti); err != nil {
+		log.Printf("scheduler: best-effort revoke jti=%s failed: %v", jti, err)
+	}
+}
+
+// startSessionOnWorker calls StartSession on the worker bound to task.SessionKey.
+// Must be called AFTER MarkDispatchStarted. Idempotent per worker via startOnce.
+func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) error {
+	s.mu.Lock()
+	entry := s.workers[task.SessionKey]
+	s.mu.Unlock()
+	if entry == nil {
+		return fmt.Errorf("no worker for session %s", task.SessionKey)
+	}
+	startReq := &workerv1.StartSessionRequest{
+		SessionKey: task.SessionKey,
+		RuntimePolicy: &workerv1.RuntimePolicy{
+			MaxTurns:           6,
+			MaxHistoryBytes:    256 * 1024,
+			MaxWorkingBytes:    64 * 1024,
+			MaxOutputBytes:     256 * 1024,
+			TaskTimeoutSeconds: 60,
+			CapabilityVersion:  CapabilityVersion,
+			PolicyDigest:       s.cfg.Registry.Digest(),
+		},
+	}
+	if task.SnapshotID != "" {
+		startReq.SnapshotId = task.SnapshotID
+		startReq.SnapshotChecksum = task.SnapshotChecksum
+	}
+	if err := entry.startSession(ctx, startReq); err != nil {
+		s.mu.Lock()
+		delete(s.workers, task.SessionKey)
+		s.mu.Unlock()
+		s.revokeTokenBestEffort(context.Background(), entry.jti)
+		entry.cleanup()
+		return err
+	}
+	return nil
+}
+
+// startWorkerProcess launches a Python Worker subprocess (or an injected test
+// double) and returns its client. The token-only mykey.py has already been
+// written by ensureWorker; this function only launches the process and dials
+// its gRPC port. The real upstream key is never on this code path.
+func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string) (workerclient.WorkerClient, string, func(), error) {
 	if s.cfg.DialWorker != nil {
-		client, cleanup, err := s.cfg.DialWorker(ctx)
+		client, cleanup, err := s.cfg.DialWorker(ctx, sessionKey)
 		if err != nil {
-			return nil, err
+			return nil, "", nil, err
 		}
-		s.worker = client
-		s.workerCleanup = cleanup
-		s.workerInstID = "injected-worker"
-		return client, nil
+		return client, "injected-worker", cleanup, nil
 	}
-	// Start OAI fixture if needed.
-	if s.cfg.OAIBaseURL == "" && s.oai == nil {
-		fx, err := startOAIFixture()
-		if err != nil {
-			return nil, err
-		}
-		s.oai = fx
-		s.ownOAI = true
-	}
-	base := s.cfg.OAIBaseURL
-	if base == "" && s.oai != nil {
-		base = s.oai.URL
-	}
-	if err := writeFixtureMyKey(s.cfg.ConfigRoot, base); err != nil {
-		// Allow existing test-written mykey only if exclusive create fails with exist and content already fixture?
-		// Spec: refuse overwrite of existing mykey. Tests create temp config roots empty.
-		if !errors.Is(err, os.ErrExist) && !strings.Contains(err.Error(), "refusing to overwrite") {
-			return nil, err
-		}
-		// If refused, continue only when file already exists (test pre-seeded).
-		if _, statErr := os.Stat(filepath.Join(s.cfg.ConfigRoot, "mykey.py")); statErr != nil {
-			return nil, err
-		}
-	}
+
 	python := s.cfg.WorkerPython
 	if python == "" {
 		python = defaultPython(s.cfg.LegacyRoot)
@@ -635,51 +746,47 @@ func (s *scheduler) ensureWorker(ctx context.Context, sessionKey string) (worker
 	}
 	proc, listen, err := startPythonWorker(python, workerSrc, s.cfg.ConfigRoot, s.cfg.LegacyRoot, s.cfg.RuntimeRoot, s.cfg.PolicyFile)
 	if err != nil {
-		return nil, err
+		return nil, "", nil, err
 	}
 	if !isLoopbackAddr(listen) {
 		_ = proc.Process.Kill()
-		return nil, fmt.Errorf("worker not loopback: %s", listen)
+		return nil, "", nil, fmt.Errorf("worker not loopback: %s", listen)
 	}
 	conn, err := grpc.DialContext(ctx, listen, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
 		_ = proc.Process.Kill()
-		return nil, err
+		return nil, "", nil, err
 	}
 	client, err := workerclient.New(conn)
 	if err != nil {
 		_ = conn.Close()
 		_ = proc.Process.Kill()
-		return nil, err
+		return nil, "", nil, err
 	}
-	s.worker = client
-	s.workerInstID = "loopback-" + listen
-	cleanup := workerProcessCleanup{
-		client:      client,
-		closeConn:   conn.Close,
-		killProcess: proc.Process.Kill,
-		waitProcess: func() error {
-			_, err := proc.Process.Wait()
-			return err
-		},
+	instID := "loopback-" + listen
+	cleanup := func() {
+		workerProcessCleanup{
+			client:      client,
+			closeConn:   conn.Close,
+			killProcess: proc.Process.Kill,
+			waitProcess: func() error {
+				_, err := proc.Process.Wait()
+				return err
+			},
+		}.run(workerShutdownTimeout)
 	}
-	s.workerCleanup = func() {
-		cleanup.run(workerShutdownTimeout)
-		if s.ownOAI && s.oai != nil {
-			s.oai.Close()
-		}
-	}
-	_ = sessionKey
-	return client, nil
+	return client, instID, cleanup, nil
 }
 
-func (s *scheduler) shutdownWorker() {
+// shutdownAllWorkers revokes all active capability_tokens and tears down every
+// Worker process. Called once on platform shutdown.
+func (s *scheduler) shutdownAllWorkers(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.workerCleanup != nil {
-		s.workerCleanup()
-		s.workerCleanup = nil
-		s.worker = nil
+	for sk, entry := range s.workers {
+		s.revokeTokenBestEffort(ctx, entry.jti)
+		entry.cleanup()
+		delete(s.workers, sk)
 	}
 }
 
@@ -699,77 +806,7 @@ func firstNonEmpty(a, b string) string {
 
 // --- worker process helpers (dev loopback) ---
 
-const testToken = "test-worker-token-not-a-real-key"
-
 var workerListenRE = regexp.MustCompile(`WORKER_LISTEN=(\S+)`)
-
-type oaiFixture struct {
-	URL    string
-	server *http.Server
-	ln     net.Listener
-}
-
-func (f *oaiFixture) Close() {
-	if f == nil || f.server == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = f.server.Shutdown(ctx)
-	if f.ln != nil {
-		_ = f.ln.Close()
-	}
-}
-
-func startOAIFixture() (*oaiFixture, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
-	}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if !strings.Contains(auth, testToken) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		body := `{"id":"chatcmpl-platform","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"platform-fixture-reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(body))
-	})
-	mux := http.NewServeMux()
-	mux.Handle("/v1/chat/completions", handler)
-	mux.Handle("/chat/completions", handler)
-	srv := &http.Server{Handler: mux}
-	go func() { _ = srv.Serve(ln) }()
-	return &oaiFixture{URL: "http://" + ln.Addr().String(), server: srv, ln: ln}, nil
-}
-
-func writeFixtureMyKey(configRoot, apibase string) error {
-	content := fmt.Sprintf(
-		"native_oai_config = {\n"+
-			"    'name': 'platform-fixture-gpt',\n"+
-			"    'apikey': %q,\n"+
-			"    'apibase': %q,\n"+
-			"    'model': 'gpt-test',\n"+
-			"    'api_mode': 'chat_completions',\n"+
-			"    'stream': False,\n"+
-			"    'read_timeout': 30,\n"+
-			"}\n",
-		testToken, apibase,
-	)
-	if err := os.MkdirAll(configRoot, 0o755); err != nil {
-		return err
-	}
-	path := filepath.Join(configRoot, "mykey.py")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.Write([]byte(content))
-	return err
-}
 
 func startPythonWorker(python, workerSrc, configRoot, legacyRoot, runtimeDir, policyFile string) (*exec.Cmd, string, error) {
 	listen := "127.0.0.1:0"

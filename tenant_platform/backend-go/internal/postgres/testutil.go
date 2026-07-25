@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -67,13 +68,16 @@ func resetAndMigrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 
-	path := DefaultMigrationPath()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
-	}
-	if _, err := tx.Exec(ctx, string(raw)); err != nil {
-		return fmt.Errorf("apply migration: %w", err)
+	dir := migrationsDir()
+	for _, name := range migrationFiles() {
+		path := filepath.Join(dir, name)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx, string(raw)); err != nil {
+			return fmt.Errorf("apply migration %s: %w", name, err)
+		}
 	}
 	return tx.Commit(ctx)
 }

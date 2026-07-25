@@ -155,22 +155,22 @@ func (s *Store) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (d
 	err = s.withTx(ctx, func(tx pgx.Tx) error {
 		var workspaceID uuid.UUID
 		var ownerID int64
+		var kind, teamID string
 		err := tx.QueryRow(ctx, `
-SELECT id, owner_user_id FROM workspaces WHERE session_key = $1 FOR UPDATE
-`, cmd.SessionKey).Scan(&workspaceID, &ownerID)
+SELECT id, owner_user_id, kind, COALESCE(team_id::text, '') FROM workspaces WHERE session_key = $1 FOR UPDATE
+`, cmd.SessionKey).Scan(&workspaceID, &ownerID, &kind, &teamID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("workspace not found for session_key %q", cmd.SessionKey)
 			}
 			return err
 		}
-		if cmd.RequesterUserID != 0 && cmd.RequesterUserID != ownerID {
-			// Foundation: requester must own the personal workspace.
-			return fmt.Errorf("requester %d is not owner of session %s", cmd.RequesterUserID, cmd.SessionKey)
-		}
 		requester := ownerID
 		if cmd.RequesterUserID != 0 {
 			requester = cmd.RequesterUserID
+		}
+		if err := authorizeSubmitter(tx, ctx, kind, ownerID, teamID, requester); err != nil {
+			return err
 		}
 
 		var nextSeq int64

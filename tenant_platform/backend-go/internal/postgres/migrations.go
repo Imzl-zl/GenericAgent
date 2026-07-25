@@ -8,28 +8,61 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// DefaultMigrationPath returns the checked-in 0001_foundation.sql path relative to this module.
-func DefaultMigrationPath() string {
+// migrationsDir returns the checked-in migrations directory relative to this module.
+func migrationsDir() string {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		return ""
 	}
 	// backend-go/internal/postgres -> tenant_platform/infra/postgres/migrations
 	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
-	return filepath.Join(root, "infra", "postgres", "migrations", "0001_foundation.sql")
+	return filepath.Join(root, "infra", "postgres", "migrations")
 }
 
-// foundationTableNames are dropped before re-applying the migration.
+// DefaultMigrationPath returns the checked-in 0001_foundation.sql path relative to this module.
+func DefaultMigrationPath() string {
+	return filepath.Join(migrationsDir(), "0001_foundation.sql")
+}
+
+// migrationFiles lists all migration SQL files in apply order.
+func migrationFiles() []string {
+	return []string{
+		"0001_foundation.sql",
+		"0002_team_tables.sql",
+		"0003_user_lifecycle.sql",
+	}
+}
+
+// pendingMigrations maps each post-foundation migration file to a marker table
+// that indicates it has already been applied. applyPendingMigrations applies
+// each file only when its marker table is absent.
+var pendingMigrations = []struct {
+	file       string
+	markerTable string
+}{
+	{"0002_team_tables.sql", "teams"},
+	{"0003_user_lifecycle.sql", "binding_attempts"},
+}
+
+// foundationTableNames are dropped before re-applying migrations (dependents first).
 var foundationTableNames = []string{
+	"audit_events",
+	"context_tokens",
+	"bot_transport_state",
+	"bots",
+	"binding_attempts",
 	"task_deliveries",
 	"task_events",
 	"workspace_snapshots",
 	"tasks",
 	"workspaces",
 	"users",
+	"team_members",
+	"teams",
 }
 
 // DropFoundationSchema removes foundation tables and leftover composite types.
@@ -56,23 +89,36 @@ func DropFoundationSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-// ApplyMigrations executes the foundation SQL migration.
+// ApplyMigrations executes all migration SQL files in order.
 // It does NOT take advisory locks; callers that need serialization use EnsureSchema
 // or OpenTestPool. It also does NOT drop existing tables (idempotent empty-DB apply).
 // For re-apply after DROP, call DropFoundationSchema first.
+// The migrationPath argument is accepted for backward compatibility but ignored
+// when empty; the canonical migration set lives under migrationsDir().
 func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool, migrationPath string) error {
 	if pool == nil {
 		return fmt.Errorf("pool is nil")
 	}
-	if strings.TrimSpace(migrationPath) == "" {
-		migrationPath = DefaultMigrationPath()
+	files := migrationFiles()
+	// Backward-compatible single-file override (tests/dev tooling).
+	if strings.TrimSpace(migrationPath) != "" {
+		if info, err := os.Stat(migrationPath); err == nil && !info.IsDir() {
+			files = []string{migrationPath}
+		}
 	}
-	raw, err := os.ReadFile(migrationPath)
-	if err != nil {
-		return fmt.Errorf("read migration %s: %w", migrationPath, err)
-	}
-	if _, err := pool.Exec(ctx, string(raw)); err != nil {
-		return fmt.Errorf("apply migration: %w", err)
+	dir := migrationsDir()
+	for _, name := range files {
+		path := name
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(dir, name)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", path, err)
+		}
+		if _, err := pool.Exec(ctx, string(raw)); err != nil {
+			return fmt.Errorf("apply migration %s: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -115,21 +161,15 @@ WHERE table_schema='public' AND table_name='tasks'
 		return err
 	}
 	if n > 0 {
-		// Foundation slice: the migration file is the single source of truth for
+		// Foundation slice: migration files are the single source of truth for
 		// schema (plan Task 5 Step 3). Runtime ALTER patches are rejected as
 		// patch-stacking; if the schema needs to evolve, ship a new migration
-		// file instead. When the tasks table already exists we trust it was
-		// created by 0001_foundation.sql.
-		return tx.Commit(ctx)
+		// file instead. When the tasks table already exists we trust the base
+		// 0001 migration has run; apply any newer migrations that haven't.
+		return applyPendingMigrations(ctx, tx)
 	}
 
-	if strings.TrimSpace(migrationPath) == "" {
-		migrationPath = DefaultMigrationPath()
-	}
-	raw, err := os.ReadFile(migrationPath)
-	if err != nil {
-		return fmt.Errorf("read migration %s: %w", migrationPath, err)
-	}
+	dir := migrationsDir()
 	// Clean orphans inside the same locked transaction, then create.
 	for _, name := range foundationTableNames {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, name)); err != nil {
@@ -144,8 +184,44 @@ WHERE table_schema='public' AND table_name='tasks'
 	if _, err := tx.Exec(ctx, `DROP SEQUENCE IF EXISTS task_events_id_seq CASCADE`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, string(raw)); err != nil {
-		return fmt.Errorf("apply migration: %w", err)
+	for _, name := range migrationFiles() {
+		path := filepath.Join(dir, name)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", path, err)
+		}
+		if _, err := tx.Exec(ctx, string(raw)); err != nil {
+			return fmt.Errorf("apply migration %s: %w", name, err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// applyPendingMigrations applies migration files whose marker table is missing.
+// This runs inside the EnsureSchema advisory-locked transaction so concurrent
+// platform processes do not race. Each migration file is responsible for being
+// idempotent-safe (guarded by the caller's marker table check).
+func applyPendingMigrations(ctx context.Context, tx pgx.Tx) error {
+	dir := migrationsDir()
+	for _, pm := range pendingMigrations {
+		var count int
+		if err := tx.QueryRow(ctx, `
+SELECT COUNT(*) FROM information_schema.tables
+WHERE table_schema='public' AND table_name=$1
+`, pm.markerTable).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			continue
+		}
+		path := filepath.Join(dir, pm.file)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", pm.file, err)
+		}
+		if _, err := tx.Exec(ctx, string(raw)); err != nil {
+			return fmt.Errorf("apply migration %s: %w", pm.file, err)
+		}
 	}
 	return tx.Commit(ctx)
 }
