@@ -25,12 +25,18 @@ func newTestValidator(t *testing.T) *Validator {
 
 func TestTokenIssueAndValidate(t *testing.T) {
 	iss := newTestIssuer(t, time.Hour)
-	token, claims, err := iss.Issue("personal:42", "foundation.no-host-tools.v1")
+	token, claims, err := iss.Issue("personal:42", "foundation.no-host-tools.v1", "openai_compatible", "gpt-test")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 	if claims.SessionKey != "personal:42" {
 		t.Fatalf("claims.SessionKey = %q", claims.SessionKey)
+	}
+	if claims.ProviderType != "openai_compatible" {
+		t.Fatalf("claims.ProviderType = %q", claims.ProviderType)
+	}
+	if claims.Model != "gpt-test" {
+		t.Fatalf("claims.Model = %q", claims.Model)
 	}
 	v := newTestValidator(t)
 	got, err := v.Validate(token, "personal:42")
@@ -44,7 +50,7 @@ func TestTokenIssueAndValidate(t *testing.T) {
 
 func TestTokenRejectsTamperedSignature(t *testing.T) {
 	iss := newTestIssuer(t, time.Hour)
-	token, _, err := iss.Issue("personal:42", "p")
+	token, _, err := iss.Issue("personal:42", "p", "openai_compatible", "gpt-test")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -66,7 +72,7 @@ func TestTokenRejectsExpired(t *testing.T) {
 	iss := newTestIssuer(t, time.Minute)
 	// Issue in the past so ExpiresAt is already behind the validator clock.
 	iss.clock = func() time.Time { return time.Now().Add(-2 * time.Minute) }
-	token, _, err := iss.Issue("personal:42", "p")
+	token, _, err := iss.Issue("personal:42", "p", "openai_compatible", "gpt-test")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -78,7 +84,7 @@ func TestTokenRejectsExpired(t *testing.T) {
 
 func TestTokenRejectsWrongSession(t *testing.T) {
 	iss := newTestIssuer(t, time.Hour)
-	token, _, err := iss.Issue("personal:42", "p")
+	token, _, err := iss.Issue("personal:42", "p", "openai_compatible", "gpt-test")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -90,7 +96,7 @@ func TestTokenRejectsWrongSession(t *testing.T) {
 
 func TestTokenRevocation(t *testing.T) {
 	iss := newTestIssuer(t, time.Hour)
-	token, claims, err := iss.Issue("personal:42", "p")
+	token, claims, err := iss.Issue("personal:42", "p", "openai_compatible", "gpt-test")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -115,7 +121,7 @@ func TestTokenRejectsMalformed(t *testing.T) {
 
 func TestTokenRejectsCrossKey(t *testing.T) {
 	iss := newTestIssuer(t, time.Hour)
-	token, _, err := iss.Issue("personal:42", "p")
+	token, _, err := iss.Issue("personal:42", "p", "openai_compatible", "gpt-test")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}

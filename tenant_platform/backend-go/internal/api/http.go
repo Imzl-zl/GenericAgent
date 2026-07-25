@@ -22,18 +22,19 @@ import (
 
 // Server is the loopback HTTP API.
 type Server struct {
-	svc        application.TaskService
-	users      application.UserService
-	binding    application.BindingService
-	router     application.Router
-	registry   policy.Registry
-	policies   PolicyStore
-	bots       BotStore
-	cipher     secret.TokenCipher
-	devToken   string
-	devUserID  int64
-	sessionKey string
-	mux        *http.ServeMux
+	svc         application.TaskService
+	users       application.UserService
+	binding     application.BindingService
+	router      application.Router
+	registry    policy.Registry
+	policies    PolicyStore
+	bots        BotStore
+	llmProviders LLMProviderStore
+	cipher      secret.TokenCipher
+	devToken    string
+	devUserID   int64
+	sessionKey  string
+	mux         *http.ServeMux
 }
 
 // PolicyStore is the admin-facing port for command/policy management.
@@ -53,19 +54,32 @@ type BotStore interface {
 	GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error)
 }
 
+// LLMProviderStore is the admin-facing port for configuring upstream LLMs.
+type LLMProviderStore interface {
+	CreateProvider(ctx context.Context, name string, providerType domain.LLMProviderType,
+		baseURL, model string, apiKeyCiphertext []byte, keyVersion string) (domain.LLMProvider, error)
+	GetProvider(ctx context.Context, id int64) (domain.LLMProvider, error)
+	ListProviders(ctx context.Context) ([]domain.LLMProvider, error)
+	UpdateProvider(ctx context.Context, id int64, name string, providerType domain.LLMProviderType,
+		baseURL, model string, apiKeyCiphertext []byte, keyVersion string) (domain.LLMProvider, error)
+	SetDefaultProvider(ctx context.Context, id int64) error
+	DeleteProvider(ctx context.Context, id int64) error
+}
+
 // ServerConfig configures the foundation API.
 type ServerConfig struct {
-	Service    application.TaskService
-	Users      application.UserService
-	Binding    application.BindingService
-	Router     application.Router
-	Registry   policy.Registry
-	Policies   PolicyStore
-	Bots       BotStore
-	Cipher     secret.TokenCipher
-	DevToken   string
-	DevUserID  int64
-	SessionKey string
+	Service      application.TaskService
+	Users        application.UserService
+	Binding      application.BindingService
+	Router       application.Router
+	Registry     policy.Registry
+	Policies     PolicyStore
+	Bots         BotStore
+	LLMProviders LLMProviderStore
+	Cipher       secret.TokenCipher
+	DevToken     string
+	DevUserID    int64
+	SessionKey   string
 }
 
 // NewServer constructs handlers. Bind address enforcement is the caller's responsibility (127.0.0.1).
@@ -83,18 +97,19 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.SessionKey = fmt.Sprintf("personal:%d", cfg.DevUserID)
 	}
 	s := &Server{
-		svc:        cfg.Service,
-		users:      cfg.Users,
-		binding:    cfg.Binding,
-		router:     cfg.Router,
-		registry:   cfg.Registry,
-		policies:   cfg.Policies,
-		bots:       cfg.Bots,
-		cipher:     cfg.Cipher,
-		devToken:   cfg.DevToken,
-		devUserID:  cfg.DevUserID,
-		sessionKey: cfg.SessionKey,
-		mux:        http.NewServeMux(),
+		svc:          cfg.Service,
+		users:        cfg.Users,
+		binding:      cfg.Binding,
+		router:       cfg.Router,
+		registry:     cfg.Registry,
+		policies:     cfg.Policies,
+		bots:         cfg.Bots,
+		llmProviders: cfg.LLMProviders,
+		cipher:       cfg.Cipher,
+		devToken:     cfg.DevToken,
+		devUserID:    cfg.DevUserID,
+		sessionKey:   cfg.SessionKey,
+		mux:          http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.auth(s.handleCreateTask))

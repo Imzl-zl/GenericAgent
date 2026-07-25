@@ -40,6 +40,14 @@ func (s *Server) registerLifecycleRoutes() {
 	if s.bots != nil && s.cipher != nil {
 		s.mux.HandleFunc("POST /v1/admin/bots", s.auth(s.handleAdminCreateBot))
 	}
+	if s.llmProviders != nil && s.cipher != nil {
+		s.mux.HandleFunc("POST /v1/admin/llm-providers", s.auth(s.handleAdminCreateLLMProvider))
+		s.mux.HandleFunc("GET /v1/admin/llm-providers", s.auth(s.handleAdminListLLMProviders))
+		s.mux.HandleFunc("GET /v1/admin/llm-providers/{provider_id}", s.auth(s.handleAdminGetLLMProvider))
+		s.mux.HandleFunc("PUT /v1/admin/llm-providers/{provider_id}", s.auth(s.handleAdminUpdateLLMProvider))
+		s.mux.HandleFunc("DELETE /v1/admin/llm-providers/{provider_id}", s.auth(s.handleAdminDeleteLLMProvider))
+		s.mux.HandleFunc("POST /v1/admin/llm-providers/{provider_id}/default", s.auth(s.handleAdminSetDefaultLLMProvider))
+	}
 }
 
 type createUserBody struct {

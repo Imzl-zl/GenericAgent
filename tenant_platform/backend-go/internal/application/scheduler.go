@@ -62,8 +62,17 @@ type SchedulerConfig struct {
 	TokenRevoker      TokenRevoker
 	LLMProxyAddr      string // e.g. "http://127.0.0.1:8081"
 	ModelPolicyVersion string
+	// LLMProvider is the admin-configured upstream provider. Required when
+	// TokenIssuer is set so the scheduler can stamp provider/model into the
+	// capability_token and write the matching mykey.py variable.
+	LLMProvider LLMProviderSource
 	// MaxBundleBytes for checkpoint prepare.
 	MaxBundleBytes uint64
+}
+
+// LLMProviderSource returns the platform's current default LLM provider.
+type LLMProviderSource interface {
+	GetDefaultProvider(ctx context.Context) (domain.LLMProvider, error)
 }
 
 const workerShutdownTimeout = 5 * time.Second
@@ -181,6 +190,9 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 		}
 		if strings.TrimSpace(cfg.ConfigRoot) == "" {
 			return nil, fmt.Errorf("SchedulerConfig.ConfigRoot is required for real Worker path")
+		}
+		if cfg.LLMProvider == nil {
+			return nil, fmt.Errorf("SchedulerConfig.LLMProvider is required for real Worker path")
 		}
 	}
 	if cfg.PollInterval <= 0 {
@@ -622,7 +634,7 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 		return entry.client, entry, nil
 	}
 
-	jti, err := s.issueAndWriteCredential(task.SessionKey)
+	jti, err := s.issueAndWriteCredential(ctx, task.SessionKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -642,26 +654,6 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 	}
 	s.workers[task.SessionKey] = entry
 	return client, entry, nil
-}
-
-// issueAndWriteCredential issues a capability_token for the session and writes
-// a token-only mykey.py. Returns the JTI for later revocation. When
-// TokenIssuer is nil (unit tests with injected DialWorker), returns "".
-func (s *scheduler) issueAndWriteCredential(sessionKey string) (string, error) {
-	if s.cfg.TokenIssuer == nil {
-		return "", nil
-	}
-	token, claims, err := s.cfg.TokenIssuer.Issue(sessionKey, s.cfg.ModelPolicyVersion)
-	if err != nil {
-		return "", fmt.Errorf("issue capability_token: %w", err)
-	}
-	if s.cfg.LLMProxyAddr != "" && s.cfg.ConfigRoot != "" {
-		configDir := s.configDirFor(sessionKey)
-		if err := writeTokenOnlyMyKey(configDir, s.cfg.LLMProxyAddr, token); err != nil {
-			return "", fmt.Errorf("write token-only mykey.py: %w", err)
-		}
-	}
-	return claims.Jti, nil
 }
 
 // configDirFor returns the directory that holds mykey.py for the session.

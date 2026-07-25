@@ -9,17 +9,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 const testUpstreamKey = "real-upstream-key-do-not-leak"
 
-func newTestForwarder(t *testing.T, srv *httptest.Server) *Forwarder {
+func newTestUpstream(t *testing.T, srv *httptest.Server) *Upstream {
 	t.Helper()
-	f, err := NewForwarder(srv.URL, testUpstreamKey, srv.Client())
-	if err != nil {
-		t.Fatalf("NewForwarder: %v", err)
-	}
-	return f
+	return NewUpstream(srv.Client())
 }
 
 func TestUpstreamForwardsWithRealKey(t *testing.T) {
@@ -33,8 +31,9 @@ func TestUpstreamForwardsWithRealKey(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := newTestForwarder(t, srv)
-	resp, err := f.Forward(context.Background(), UpstreamRequest{Body: []byte(`{"model":"gpt-test","messages":[]}`)})
+	u := newTestUpstream(t, srv)
+	p := testProvider(domain.ProviderOpenAICompatible, srv.URL, "gpt-test", testUpstreamKey)
+	resp, err := u.Forward(context.Background(), p, UpstreamRequest{Body: []byte(`{"model":"gpt-test","messages":[]}`)})
 	if err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
@@ -55,8 +54,9 @@ func TestUpstreamConverts429ToError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := newTestForwarder(t, srv)
-	_, err := f.Forward(context.Background(), UpstreamRequest{Body: []byte(`{}`)})
+	u := newTestUpstream(t, srv)
+	p := testProvider(domain.ProviderOpenAICompatible, srv.URL, "gpt-test", testUpstreamKey)
+	_, err := u.Forward(context.Background(), p, UpstreamRequest{Body: []byte(`{}`)})
 	if err == nil {
 		t.Fatal("expected UpstreamError for 429")
 	}
@@ -75,8 +75,9 @@ func TestUpstreamConverts500ToError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := newTestForwarder(t, srv)
-	_, err := f.Forward(context.Background(), UpstreamRequest{Body: []byte(`{}`)})
+	u := newTestUpstream(t, srv)
+	p := testProvider(domain.ProviderOpenAICompatible, srv.URL, "gpt-test", testUpstreamKey)
+	_, err := u.Forward(context.Background(), p, UpstreamRequest{Body: []byte(`{}`)})
 	if err == nil {
 		t.Fatal("expected UpstreamError for 500")
 	}
@@ -92,8 +93,9 @@ func TestUpstreamPassesThrough200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := newTestForwarder(t, srv)
-	resp, err := f.Forward(context.Background(), UpstreamRequest{Body: []byte(`{}`)})
+	u := newTestUpstream(t, srv)
+	p := testProvider(domain.ProviderOpenAICompatible, srv.URL, "gpt-test", testUpstreamKey)
+	resp, err := u.Forward(context.Background(), p, UpstreamRequest{Body: []byte(`{}`)})
 	if err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
@@ -112,24 +114,16 @@ func TestUpstreamNeverLogsKey(t *testing.T) {
 	defer srv.Close()
 
 	var logBuf bytes.Buffer
-	f := newTestForwarder(t, srv)
-	f.SetLogger(log.New(&logBuf, "", 0))
+	u := newTestUpstream(t, srv)
+	u.SetLogger(log.New(&logBuf, "", 0))
 
-	_, err := f.Forward(context.Background(), UpstreamRequest{Body: []byte(`{}`)})
+	p := testProvider(domain.ProviderOpenAICompatible, srv.URL, "gpt-test", testUpstreamKey)
+	_, err := u.Forward(context.Background(), p, UpstreamRequest{Body: []byte(`{}`)})
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	if strings.Contains(logBuf.String(), testUpstreamKey) {
 		t.Fatalf("upstream key leaked into log: %s", logBuf.String())
-	}
-}
-
-func TestUpstreamRejectsEmptyConfig(t *testing.T) {
-	if _, err := NewForwarder("", "k", nil); err == nil {
-		t.Fatal("expected baseURL error")
-	}
-	if _, err := NewForwarder("http://x", "", nil); err == nil {
-		t.Fatal("expected apiKey error")
 	}
 }
 
@@ -139,10 +133,34 @@ func TestUpstreamContextCancel(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := newTestForwarder(t, srv)
+	u := newTestUpstream(t, srv)
+	p := testProvider(domain.ProviderOpenAICompatible, srv.URL, "gpt-test", testUpstreamKey)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := f.Forward(ctx, UpstreamRequest{Body: []byte(`{}`)}); err == nil {
+	if _, err := u.Forward(ctx, p, UpstreamRequest{Body: []byte(`{}`)}); err == nil {
 		t.Fatal("expected context cancellation error")
+	}
+}
+
+func TestUpstreamAnthropicUsesXApiKey(t *testing.T) {
+	var gotKey, gotVersion string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("x-api-key")
+		gotVersion = r.Header.Get("anthropic-version")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	u := newTestUpstream(t, srv)
+	p := testProvider(domain.ProviderAnthropicMessages, srv.URL, "claude-test", testUpstreamKey)
+	_, err := u.Forward(context.Background(), p, UpstreamRequest{Body: []byte(`{}`)})
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	if gotKey != testUpstreamKey {
+		t.Fatalf("x-api-key = %q, want %q", gotKey, testUpstreamKey)
+	}
+	if gotVersion != "2023-06-01" {
+		t.Fatalf("anthropic-version = %q, want 2023-06-01", gotVersion)
 	}
 }

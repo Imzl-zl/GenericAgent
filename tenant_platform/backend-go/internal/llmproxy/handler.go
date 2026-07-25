@@ -3,18 +3,32 @@ package llmproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // MaxWorkerRequestBytes bounds the Worker request body read by the Proxy.
 const MaxWorkerRequestBytes = 4 * 1024 * 1024
 
 // handleChatCompletions validates the capability_token and forwards the body
-// upstream. Upstream 429 is preserved; 5xx and transport errors become 502.
-// No path silently succeeds.
+// upstream. The active provider must be OpenAI-compatible for this path.
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.handleProviderPath(w, r, domain.ProviderOpenAICompatible)
+}
+
+// handleMessages is the Anthropic Messages API proxy path. The active provider
+// must be anthropic_messages for this path.
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	s.handleProviderPath(w, r, domain.ProviderAnthropicMessages)
+}
+
+func (s *Server) handleProviderPath(w http.ResponseWriter, r *http.Request, wantType domain.LLMProviderType) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use POST")
 		return
@@ -38,9 +52,25 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "request exceeds limit")
 		return
 	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), defaultUpstreamTimeout)
 	defer cancel()
-	resp, err := s.forwarder.Forward(ctx, UpstreamRequest{Body: body})
+	p, err := s.currentProvider(ctx)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusServiceUnavailable, "NO_PROVIDER", "no default LLM provider configured")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "PROVIDER_RESOLVE", err.Error())
+		return
+	}
+	if p.ProviderType != wantType {
+		writeError(w, http.StatusConflict, "PROVIDER_MISMATCH",
+			"active provider is "+string(p.ProviderType)+", expected "+string(wantType))
+		return
+	}
+
+	resp, err := s.upstream.Forward(ctx, p, UpstreamRequest{Body: body})
 	if err != nil {
 		status := http.StatusBadGateway
 		if ue, ok := err.(*UpstreamError); ok && ue.Code == http.StatusTooManyRequests {

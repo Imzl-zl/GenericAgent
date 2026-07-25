@@ -6,15 +6,19 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 func testConfig() Config {
 	return Config{
-		Listen:          "127.0.0.1:0",
-		UpstreamBaseURL: "http://127.0.0.1:18999/v1",
-		UpstreamAPIKey:  "upstream-key-not-real",
-		SigningKey:      []byte("test-signing-key-0123456789ab"),
-		TokenTTL:        time.Minute,
+		Listen:     "127.0.0.1:0",
+		SigningKey: []byte("test-signing-key-0123456789ab"),
+		TokenTTL:   time.Minute,
+		ProviderSource: &fakeProviderSource{
+			provider: testProvider(domain.ProviderOpenAICompatible, "http://127.0.0.1:18999", "gpt-test", testUpstreamKey),
+		},
+		Cipher: &fakeCipher{wantVersion: 1},
 	}
 }
 
@@ -37,6 +41,22 @@ func TestNewServerRejectsShortSigningKey(t *testing.T) {
 	cfg.SigningKey = []byte("short")
 	if _, err := NewServer(cfg); err == nil {
 		t.Fatal("expected signing key length error")
+	}
+}
+
+func TestNewServerRejectsMissingProviderSource(t *testing.T) {
+	cfg := testConfig()
+	cfg.ProviderSource = nil
+	if _, err := NewServer(cfg); err == nil {
+		t.Fatal("expected provider source validation error")
+	}
+}
+
+func TestNewServerRejectsMissingCipher(t *testing.T) {
+	cfg := testConfig()
+	cfg.Cipher = nil
+	if _, err := NewServer(cfg); err == nil {
+		t.Fatal("expected cipher validation error")
 	}
 }
 

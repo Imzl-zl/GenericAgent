@@ -23,6 +23,8 @@ type TokenClaims struct {
 	IssuedAt           int64  `json:"issued_at"`     // unix seconds
 	ExpiresAt          int64  `json:"expires_at"`    // unix seconds
 	ModelPolicyVersion string `json:"model_policy_version"`
+	ProviderType       string `json:"provider_type,omitempty"`
+	Model              string `json:"model,omitempty"`
 }
 
 // Issuer issues signed capability_tokens bound to a session. The platform
@@ -45,8 +47,9 @@ func NewIssuer(signingKey []byte, ttl time.Duration) (*Issuer, error) {
 }
 
 // Issue creates a signed token for sessionKey. Returns the token string and
-// the validated claims.
-func (i *Issuer) Issue(sessionKey, modelPolicyVersion string) (string, TokenClaims, error) {
+// the validated claims. providerType and model are stamped for audit and to
+// prevent cross-provider token reuse.
+func (i *Issuer) Issue(sessionKey, modelPolicyVersion, providerType, model string) (string, TokenClaims, error) {
 	if sessionKey == "" {
 		return "", TokenClaims{}, fmt.Errorf("session_key is required")
 	}
@@ -61,6 +64,8 @@ func (i *Issuer) Issue(sessionKey, modelPolicyVersion string) (string, TokenClai
 		IssuedAt:           now.Unix(),
 		ExpiresAt:          now.Add(i.ttl).Unix(),
 		ModelPolicyVersion: modelPolicyVersion,
+		ProviderType:       providerType,
+		Model:              model,
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {

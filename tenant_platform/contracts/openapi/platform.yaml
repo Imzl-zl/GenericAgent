@@ -285,6 +285,160 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/admin/llm-providers:
+    get:
+      operationId: adminListLLMProviders
+      summary: List all LLM providers (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      responses:
+        "200":
+          description: Provider list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - providers
+                properties:
+                  providers:
+                    type: array
+                    items: {$ref: "#/components/schemas/LLMProvider"}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: adminCreateLLMProvider
+      summary: Create an upstream LLM provider (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateLLMProviderRequest"
+      responses:
+        "201":
+          description: Provider created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMProvider"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/admin/llm-providers/{provider_id}:
+    get:
+      operationId: adminGetLLMProvider
+      summary: Get an LLM provider by ID (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        "200":
+          description: Provider record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMProvider"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    put:
+      operationId: adminUpdateLLMProvider
+      summary: Update an LLM provider (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateLLMProviderRequest"
+      responses:
+        "200":
+          description: Updated provider
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMProvider"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: adminDeleteLLMProvider
+      summary: Delete an LLM provider (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        "204":
+          description: Provider deleted
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/admin/llm-providers/{provider_id}/default:
+    post:
+      operationId: adminSetDefaultLLMProvider
+      summary: Set the default LLM provider (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        "200":
+          description: Default provider set
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - provider_id
+                  - is_default
+                properties:
+                  provider_id:
+                    type: integer
+                    format: int64
+                  is_default:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/bindings:
     post:
       operationId: createBinding
@@ -855,3 +1009,93 @@ components:
           example: ["update_working_checkpoint", "code_run", "file_read"]
         description:
           type: string
+    LLMProvider:
+      type: object
+      required:
+        - provider_id
+        - name
+        - provider_type
+        - base_url
+        - model
+        - is_default
+        - state
+        - created_at
+        - updated_at
+      properties:
+        provider_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+          example: "openai-default"
+        provider_type:
+          type: string
+          enum: [openai_compatible, anthropic_messages]
+        base_url:
+          type: string
+          format: uri
+          example: "https://api.openai.com"
+        model:
+          type: string
+          example: "gpt-4o"
+        is_default:
+          type: boolean
+        state:
+          type: string
+          enum: [active, disabled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateLLMProviderRequest:
+      type: object
+      required:
+        - name
+        - provider_type
+        - base_url
+        - model
+        - api_key
+      properties:
+        name:
+          type: string
+          example: "openai-default"
+        provider_type:
+          type: string
+          enum: [openai_compatible, anthropic_messages]
+        base_url:
+          type: string
+          format: uri
+          example: "https://api.openai.com"
+        model:
+          type: string
+          example: "gpt-4o"
+        api_key:
+          type: string
+          description: Upstream provider API key; encrypted at rest by the platform
+    UpdateLLMProviderRequest:
+      type: object
+      required:
+        - name
+        - provider_type
+        - base_url
+        - model
+        - api_key
+      properties:
+        name:
+          type: string
+          example: "anthropic-default"
+        provider_type:
+          type: string
+          enum: [openai_compatible, anthropic_messages]
+        base_url:
+          type: string
+          format: uri
+          example: "https://api.anthropic.com"
+        model:
+          type: string
+          example: "claude-3-5-sonnet-20240620"
+        api_key:
+          type: string
+          description: Upstream provider API key; encrypted at rest by the platform

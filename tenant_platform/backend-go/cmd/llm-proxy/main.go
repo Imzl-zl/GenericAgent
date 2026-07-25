@@ -1,6 +1,12 @@
 // Command llm-proxy is the LLM Proxy deployment unit: the sole holder of the
 // real upstream LLM key. It validates short-lived session capability_tokens
 // and forwards approved requests upstream. Binds loopback only.
+//
+// The proxy can run in two modes:
+//   - Static provider mode (standalone/dev): configure --upstream-base-url,
+//     --upstream-apikey, --provider-type and --model directly.
+//   - Database provider mode: pass --database-url and --llm-provider-key; the
+//     proxy reads the admin-configured default provider from the platform DB.
 package main
 
 import (
@@ -11,10 +17,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
 )
 
 func main() {
@@ -31,15 +43,35 @@ func run() error {
 		upstreamAPIKey  = flag.String("upstream-apikey", "", "real upstream API key (or LLM_PROXY_UPSTREAM_APIKEY); prefer host env")
 		signingKey      = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY)")
 		tokenTTL        = flag.Duration("token-ttl", llmproxy.DefaultTokenTTL, "capability_token lifetime")
+		providerType    = flag.String("provider-type", string(domain.ProviderOpenAICompatible), "provider type: openai_compatible | anthropic_messages")
+		model           = flag.String("model", "gpt-4o-mini", "model identifier forwarded upstream")
+		databaseURL     = flag.String("database-url", "", "PostgreSQL URL to read admin-configured providers (or DATABASE_URL)")
+		cipherKeyHex    = flag.String("llm-provider-key", os.Getenv("LLM_PROVIDER_KEY"), "AES-256-GCM hex key for decrypting provider API keys (or LLM_PROVIDER_KEY)")
 	)
 	flag.Parse()
 
+	key := []byte(firstNonEmpty(*signingKey, os.Getenv("LLM_PROXY_CAPABILITY_SIGNING_KEY")))
+	if len(key) < llmproxy.MinSigningKeyLen {
+		return fmt.Errorf("capability signing key must be at least %d bytes", llmproxy.MinSigningKeyLen)
+	}
+
+	cipher, err := loadCipher(*cipherKeyHex, key)
+	if err != nil {
+		return fmt.Errorf("load cipher: %w", err)
+	}
+
+	providerSource, err := buildProviderSource(*databaseURL, *upstreamBaseURL, *upstreamAPIKey,
+		domain.LLMProviderType(*providerType), *model, cipher)
+	if err != nil {
+		return err
+	}
+
 	cfg := llmproxy.Config{
-		Listen:          *listen,
-		UpstreamBaseURL: firstNonEmpty(*upstreamBaseURL, os.Getenv("LLM_PROXY_UPSTREAM_BASEURL")),
-		UpstreamAPIKey:  firstNonEmpty(*upstreamAPIKey, os.Getenv("LLM_PROXY_UPSTREAM_APIKEY")),
-		SigningKey:      []byte(firstNonEmpty(*signingKey, os.Getenv("LLM_PROXY_CAPABILITY_SIGNING_KEY"))),
-		TokenTTL:        *tokenTTL,
+		Listen:         *listen,
+		SigningKey:     key,
+		TokenTTL:       *tokenTTL,
+		ProviderSource: providerSource,
+		Cipher:         cipher,
 	}
 
 	srv, err := llmproxy.NewServer(cfg)
@@ -81,4 +113,63 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+func loadCipher(cipherKeyHex string, signingKey []byte) (secret.TokenCipher, error) {
+	if cipherKeyHex != "" {
+		return secret.NewStaticKeyCipherFromHex(cipherKeyHex)
+	}
+	// Dev fallback: derive a 32-byte key from the signing key. This is only
+	// suitable for local development; production deployments must provide
+	// --llm-provider-key from a secret manager.
+	return secret.NewStaticKeyCipher(signingKey[:32])
+}
+
+func buildProviderSource(databaseURL, upstreamBaseURL, upstreamAPIKey string,
+	providerType domain.LLMProviderType, model string, cipher secret.TokenCipher) (llmproxy.ProviderSource, error) {
+	if databaseURL != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool, err := pgxpool.New(ctx, databaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("connect postgres: %w", err)
+		}
+		defer pool.Close()
+		store, err := postgres.NewStore(pool)
+		if err != nil {
+			return nil, fmt.Errorf("create store: %w", err)
+		}
+		return store, nil
+	}
+
+	if upstreamBaseURL == "" {
+		return nil, fmt.Errorf("--upstream-base-url required in static mode (or use --database-url)")
+	}
+	if upstreamAPIKey == "" {
+		return nil, fmt.Errorf("--upstream-apikey required in static mode (or use --database-url)")
+	}
+	ciphertext, version, err := cipher.Encrypt([]byte(upstreamAPIKey))
+	if err != nil {
+		return nil, fmt.Errorf("encrypt upstream key: %w", err)
+	}
+	return &staticProviderSource{
+		provider: domain.LLMProvider{
+			ProviderType:     providerType,
+			BaseURL:          upstreamBaseURL,
+			Model:            model,
+			APIKeyCiphertext: ciphertext,
+			APIKeyKeyVersion: strconv.Itoa(version),
+			IsDefault:        true,
+			State:            "active",
+		},
+	}, nil
+}
+
+type staticProviderSource struct {
+	provider domain.LLMProvider
+}
+
+func (s *staticProviderSource) GetDefaultProvider(ctx context.Context) (domain.LLMProvider, error) {
+	_ = ctx
+	return s.provider, nil
 }

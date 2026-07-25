@@ -1,14 +1,25 @@
 package application
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
 )
+
+type fakeLLMProviderSource struct{}
+
+func (fakeLLMProviderSource) GetDefaultProvider(ctx context.Context) (domain.LLMProvider, error) {
+	return domain.LLMProvider{
+		ProviderType: domain.ProviderOpenAICompatible,
+		Model:        "gpt-test",
+	}, nil
+}
 
 func TestWriteTokenOnlyMyKey_ContainsTokenAndProxyNotRealKey(t *testing.T) {
 	dir := t.TempDir()
@@ -21,7 +32,7 @@ func TestWriteTokenOnlyMyKey_ContainsTokenAndProxyNotRealKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, _, err := issuer.Issue("session-xyz", "foundation.no-host-tools.v1")
+	token, _, err := issuer.Issue("session-xyz", "foundation.no-host-tools.v1", "openai_compatible", "gpt-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,8 +57,8 @@ func TestWriteTokenOnlyMyKey_ContainsTokenAndProxyNotRealKey(t *testing.T) {
 	if strings.Contains(s, signingKey) {
 		t.Fatal("HMAC signing key leaked into mykey.py")
 	}
-	if !strings.Contains(s, "platform-capability-token") {
-		t.Error("mykey.py missing platform-capability-token name marker")
+	if !strings.Contains(s, "platform-default") {
+		t.Error("mykey.py missing platform-default name marker")
 	}
 	// Validate file mode (POSIX only; Windows ignores WriteFile perm bits).
 	if runtime.GOOS != "windows" {
@@ -83,7 +94,7 @@ func TestWriteTokenOnlyMyKey_OverwritesExistingFile(t *testing.T) {
 
 func TestScheduler_IssueAndWriteCredential_NoIssuerReturnsEmpty(t *testing.T) {
 	s := &scheduler{}
-	jti, err := s.issueAndWriteCredential("session-1")
+	jti, err := s.issueAndWriteCredential(context.Background(), "session-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,11 +111,12 @@ func TestScheduler_IssueAndWriteCredential_WritesTokenAndReturnsJTI(t *testing.T
 	}
 	s := &scheduler{cfg: SchedulerConfig{
 		TokenIssuer:        issuer,
+		LLMProvider:        fakeLLMProviderSource{},
 		LLMProxyAddr:       "http://127.0.0.1:9999",
 		ConfigRoot:         dir,
 		ModelPolicyVersion: "test.v1",
 	}}
-	jti, err := s.issueAndWriteCredential("session-issue-test")
+	jti, err := s.issueAndWriteCredential(context.Background(), "session-issue-test")
 	if err != nil {
 		t.Fatal(err)
 	}

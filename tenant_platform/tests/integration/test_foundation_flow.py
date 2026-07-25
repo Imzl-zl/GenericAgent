@@ -43,6 +43,7 @@ DEV_USER_ID = "1"
 # Worker receives only a capability_token + Proxy URL (security red line).
 OAI_TOKEN = "foundation-integration-oai-token-not-real"
 CAPABILITY_SIGNING_KEY = "foundation-integration-signing-key"
+BOT_TOKEN_KEY = "0000000000000000000000000000000000000000000000000000000000000000"
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
@@ -232,6 +233,7 @@ def _start_platform(
     env["LLM_PROXY_UPSTREAM_BASEURL"] = fixture.base_url
     env["LLM_PROXY_UPSTREAM_APIKEY"] = OAI_TOKEN
     env["LLM_PROXY_CAPABILITY_SIGNING_KEY"] = CAPABILITY_SIGNING_KEY
+    env["BOT_TOKEN_KEY"] = BOT_TOKEN_KEY
     if reset_db:
         _reset_db()
     relative_policy = os.path.relpath(POLICY_PATH, BACKEND_GO)

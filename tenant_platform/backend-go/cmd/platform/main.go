@@ -23,6 +23,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/api"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
@@ -83,12 +84,40 @@ func buildWorkerRuntime(mode, managerAddr string, boot application.DevBootstrapC
 }
 
 // llmProxyConfig carries LLM Proxy startup parameters. The real upstream key
-// is injected via host env (preferred) and never persisted.
+// is fetched from the admin-configured provider store and decrypted with the
+// cipher; it is never part of this static config.
 type llmProxyConfig struct {
-	externalAddr    string // when non-empty, use external Proxy (no in-process start)
-	upstreamBaseURL string // real upstream OpenAI-compatible base URL
-	upstreamAPIKey  string // real upstream API key (host env preferred)
-	signingKey      string // HMAC signing key for capability_tokens (>=16 bytes)
+	externalAddr   string              // when non-empty, use external Proxy (no in-process start)
+	signingKey     string              // HMAC signing key for capability_tokens (>=16 bytes)
+	providerSource llmproxy.ProviderSource
+	cipher         llmproxy.TokenCipher
+}
+
+// ensureDevDefaultLLMProvider seeds a default OpenAI-compatible provider in
+// dev-loopback mode when the legacy LLM_PROXY_UPSTREAM_* env vars are present
+// and no provider has been configured yet. This preserves the old dev/test
+// path where the upstream URL/key were supplied purely by environment.
+func ensureDevDefaultLLMProvider(ctx context.Context, store *postgres.Store, cipher secret.TokenCipher) error {
+	_, err := store.GetDefaultProvider(ctx)
+	if err == nil {
+		return nil
+	}
+	baseURL := strings.TrimSpace(os.Getenv("LLM_PROXY_UPSTREAM_BASEURL"))
+	apiKey := strings.TrimSpace(os.Getenv("LLM_PROXY_UPSTREAM_APIKEY"))
+	if baseURL == "" || apiKey == "" {
+		// No legacy env config; rely on admin API to create a provider later.
+		return nil
+	}
+	ciphertext, version, encErr := cipher.Encrypt([]byte(apiKey))
+	if encErr != nil {
+		return fmt.Errorf("encrypt dev provider api key: %w", encErr)
+	}
+	if _, createErr := store.CreateProvider(ctx, "dev-default",
+		domain.ProviderOpenAICompatible, baseURL, "gpt-4o", ciphertext, strconv.Itoa(version)); createErr != nil {
+		return fmt.Errorf("create dev default provider: %w", createErr)
+	}
+	fmt.Fprintf(os.Stderr, "platform: dev-loopback seeded default llm_provider base_url=%s\n", baseURL)
+	return nil
 }
 
 // startLLMProxy starts the in-process LLM Proxy when externalAddr is empty,
@@ -98,25 +127,25 @@ func startLLMProxy(ctx context.Context, cfg llmProxyConfig) (string, func(), err
 	if cfg.externalAddr != "" {
 		return strings.TrimRight(cfg.externalAddr, "/"), func() {}, nil
 	}
-	if cfg.upstreamBaseURL == "" {
-		return "", nil, fmt.Errorf("LLM Proxy upstream base URL required (use --llm-proxy-upstream-baseurl or LLM_PROXY_UPSTREAM_BASEURL)")
-	}
-	if cfg.upstreamAPIKey == "" {
-		return "", nil, fmt.Errorf("LLM Proxy upstream API key required (use --llm-proxy-upstream-apikey or LLM_PROXY_UPSTREAM_APIKEY)")
-	}
 	if len(cfg.signingKey) < llmproxy.MinSigningKeyLen {
 		return "", nil, fmt.Errorf("capability signing key must be at least %d bytes (use --capability-signing-key or LLM_PROXY_CAPABILITY_SIGNING_KEY)", llmproxy.MinSigningKeyLen)
+	}
+	if cfg.providerSource == nil {
+		return "", nil, fmt.Errorf("LLM Proxy provider source is required")
+	}
+	if cfg.cipher == nil {
+		return "", nil, fmt.Errorf("LLM Proxy cipher is required")
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", nil, fmt.Errorf("llm-proxy listen: %w", err)
 	}
 	proxyCfg := llmproxy.Config{
-		Listen:          ln.Addr().String(),
-		UpstreamBaseURL: cfg.upstreamBaseURL,
-		UpstreamAPIKey:  cfg.upstreamAPIKey,
-		SigningKey:      []byte(cfg.signingKey),
-		TokenTTL:        llmproxy.DefaultTokenTTL,
+		Listen:         ln.Addr().String(),
+		SigningKey:     []byte(cfg.signingKey),
+		TokenTTL:       llmproxy.DefaultTokenTTL,
+		ProviderSource: cfg.providerSource,
+		Cipher:         cfg.cipher,
 	}
 	srv, err := llmproxy.NewServer(proxyCfg)
 	if err != nil {
@@ -126,7 +155,7 @@ func startLLMProxy(ctx context.Context, cfg llmProxyConfig) (string, func(), err
 	httpSrv := &http.Server{Handler: srv.Handler()}
 	go func() { _ = httpSrv.Serve(ln) }()
 	addr := "http://" + ln.Addr().String()
-	fmt.Fprintf(os.Stderr, "platform: in-process llm-proxy listen=%s upstream=%s\n", ln.Addr().String(), cfg.upstreamBaseURL)
+	fmt.Fprintf(os.Stderr, "platform: in-process llm-proxy listen=%s provider_source=store\n", ln.Addr().String())
 	shutdown := func() {
 		shutCtx, shutCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer shutCancel()
@@ -210,8 +239,6 @@ func run() error {
 		workerPython = flag.String("worker-python", "", "python interpreter for worker")
 		workerSrc    = flag.String("worker-src", "", "path to worker-python/src")
 		llmProxyAddr         = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
-		llmProxyUpstreamURL  = flag.String("llm-proxy-upstream-baseurl", "", "real upstream OpenAI-compatible base URL the Proxy forwards to (or LLM_PROXY_UPSTREAM_BASEURL)")
-		llmProxyUpstreamKey  = flag.String("llm-proxy-upstream-apikey", "", "real upstream API key; host env preferred (or LLM_PROXY_UPSTREAM_APIKEY)")
 		capabilitySigningKey = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=16 bytes")
 		modelPolicyVersion   = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
 		devExtraUsers = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
@@ -364,22 +391,44 @@ func run() error {
 		return fmt.Errorf("foundation platform currently requires --dev-loopback (local coordinator); production path is out of scope for this slice")
 	}
 
+	// Bot token cipher: required for bot registration, iLink transport, and
+	// LLM provider API key encryption. The key is injected via env/flag and
+	// never committed to source.
+	var cipher secret.TokenCipher
+	if keyHex := strings.TrimSpace(*botTokenKey); keyHex != "" {
+		c, err := secret.NewStaticKeyCipherFromHex(keyHex)
+		if err != nil {
+			return fmt.Errorf("bot token cipher: %w", err)
+		}
+		cipher = c
+	}
+
+	// Dev-loopback auto-provider: if no admin-configured LLM provider exists
+	// and the legacy env vars are present, seed a default provider so the
+	// in-process Proxy can resolve it. This keeps the existing dev/test path
+	// working without requiring a manual admin API call.
+	if *devLoopback && cipher != nil {
+		if err := ensureDevDefaultLLMProvider(ctx, store, cipher); err != nil {
+			return fmt.Errorf("ensure dev default llm provider: %w", err)
+		}
+	}
+
 	// LLM Proxy: the sole holder of the real upstream key. In dev-loopback,
 	// when --llm-proxy-addr is empty, an in-process Proxy is started on a free
 	// loopback port. The Worker only ever receives the Proxy addr + a
 	// short-lived capability_token (never the real key).
+	signingKey := firstNonEmpty(*capabilitySigningKey, os.Getenv("LLM_PROXY_CAPABILITY_SIGNING_KEY"))
 	proxyAddr, proxyShutdown, err := startLLMProxy(ctx, llmProxyConfig{
 		externalAddr:   strings.TrimSpace(*llmProxyAddr),
-		upstreamBaseURL: strings.TrimSpace(firstNonEmpty(*llmProxyUpstreamURL, os.Getenv("LLM_PROXY_UPSTREAM_BASEURL"))),
-		upstreamAPIKey:  strings.TrimSpace(firstNonEmpty(*llmProxyUpstreamKey, os.Getenv("LLM_PROXY_UPSTREAM_APIKEY"))),
-		signingKey:      firstNonEmpty(*capabilitySigningKey, os.Getenv("LLM_PROXY_CAPABILITY_SIGNING_KEY")),
+		signingKey:     signingKey,
+		providerSource: store,
+		cipher:         cipher,
 	})
 	if err != nil {
 		return err
 	}
 	defer proxyShutdown()
 
-	signingKey := firstNonEmpty(*capabilitySigningKey, os.Getenv("LLM_PROXY_CAPABILITY_SIGNING_KEY"))
 	issuer, err := llmproxy.NewIssuer([]byte(signingKey), llmproxy.DefaultTokenTTL)
 	if err != nil {
 		return fmt.Errorf("capability token issuer: %w", err)
@@ -406,6 +455,7 @@ func run() error {
 		TokenIssuer:         issuer,
 		TokenRevoker:        revoker,
 		ModelPolicyVersion:  strings.TrimSpace(*modelPolicyVersion),
+		LLMProvider:         store,
 	})
 	if err != nil {
 		return err
@@ -446,17 +496,6 @@ func run() error {
 		return err
 	}
 
-	// Bot token cipher: required for bot registration and real iLink transport.
-	// The key is injected via env/flag and never committed to source.
-	var cipher secret.TokenCipher
-	if keyHex := strings.TrimSpace(*botTokenKey); keyHex != "" {
-		c, err := secret.NewStaticKeyCipherFromHex(keyHex)
-		if err != nil {
-			return fmt.Errorf("bot token cipher: %w", err)
-		}
-		cipher = c
-	}
-
 	// Bot transport: real iLink when configured, otherwise in-process loopback
 	// for dev/test. The loopback transport records sent messages for assertions.
 	var botTransport transport.BotTransportAdapter
@@ -492,17 +531,18 @@ func run() error {
 	}
 
 	server, err := api.NewServer(api.ServerConfig{
-		Service:    svc,
-		Users:      userSvc,
-		Binding:    bindingSvc,
-		Router:     routerSvc,
-		Registry:   reg,
-		Policies:   store, // admin command/policy management (migration 0004)
-		Bots:       store,
-		Cipher:     cipher,
-		DevToken:   boot.DevToken,
-		DevUserID:  devCtx.UserID,
-		SessionKey: devCtx.SessionKey,
+		Service:      svc,
+		Users:        userSvc,
+		Binding:      bindingSvc,
+		Router:       routerSvc,
+		Registry:     reg,
+		Policies:     store, // admin command/policy management (migration 0004)
+		Bots:         store,
+		LLMProviders: store, // admin LLM provider management (migration 0007)
+		Cipher:       cipher,
+		DevToken:     boot.DevToken,
+		DevUserID:    devCtx.UserID,
+		SessionKey:   devCtx.SessionKey,
 	})
 	if err != nil {
 		return err

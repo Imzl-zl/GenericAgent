@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // MaxUpstreamResponseBytes bounds the upstream response body read into memory.
@@ -15,7 +17,7 @@ const MaxUpstreamResponseBytes = 8 * 1024 * 1024
 
 // UpstreamRequest is a validated request to forward upstream.
 type UpstreamRequest struct {
-	Body []byte // raw OpenAI chat-completions JSON body
+	Body []byte // raw request body in the provider's native format
 }
 
 // UpstreamResponse is the upstream's non-streaming response.
@@ -35,49 +37,66 @@ func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("upstream returned %d: %s", e.Code, truncateForLog(e.Body, 256))
 }
 
-// Forwarder forwards validated request bodies to the real upstream
-// OpenAI-compatible API. The real key is injected here and never logged.
-type Forwarder struct {
-	baseURL string
-	apiKey  string
-	client  *http.Client
-	log     *log.Logger
+// Upstream forwards validated request bodies to the real upstream using the
+// provider's protocol. The real key is injected here and never logged.
+type Upstream struct {
+	client *http.Client
+	log    *log.Logger
 }
 
-// NewForwarder validates baseURL/apiKey and applies defaults.
-func NewForwarder(baseURL, apiKey string, client *http.Client) (*Forwarder, error) {
-	if baseURL == "" {
-		return nil, fmt.Errorf("upstream base URL is required")
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("upstream API key is required")
-	}
+// NewUpstream creates an Upstream with the given HTTP client.
+func NewUpstream(client *http.Client) *Upstream {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &Forwarder{baseURL: baseURL, apiKey: apiKey, client: client, log: log.Default()}, nil
+	return &Upstream{client: client, log: log.Default()}
 }
 
 // SetLogger injects a logger. Used by tests to assert no key leakage.
-func (f *Forwarder) SetLogger(l *log.Logger) {
+func (u *Upstream) SetLogger(l *log.Logger) {
 	if l != nil {
-		f.log = l
+		u.log = l
 	}
 }
 
-// Forward posts body to upstream /chat/completions and returns the response.
-// Upstream 429/5xx produce an UpstreamError (no silent success). The real
-// key is sent only in the Authorization header and never appears in logs.
-func (f *Forwarder) Forward(ctx context.Context, req UpstreamRequest) (UpstreamResponse, error) {
-	url := strings.TrimRight(f.baseURL, "/") + "/chat/completions"
+// Forward posts the body to the upstream endpoint matching the provider type.
+// Upstream 429/5xx produce an UpstreamError (no silent success).
+func (u *Upstream) Forward(ctx context.Context, p domain.LLMProvider, req UpstreamRequest) (UpstreamResponse, error) {
+	switch p.ProviderType {
+	case domain.ProviderOpenAICompatible:
+		return u.forwardOpenAI(ctx, p, req)
+	case domain.ProviderAnthropicMessages:
+		return u.forwardAnthropic(ctx, p, req)
+	default:
+		return UpstreamResponse{}, fmt.Errorf("unsupported provider type: %s", p.ProviderType)
+	}
+}
+
+func (u *Upstream) forwardOpenAI(ctx context.Context, p domain.LLMProvider, req UpstreamRequest) (UpstreamResponse, error) {
+	url := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(req.Body))
 	if err != nil {
 		return UpstreamResponse{}, fmt.Errorf("build upstream request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+f.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+p.APIKey)
+	return u.do(httpReq)
+}
 
-	resp, err := f.client.Do(httpReq)
+func (u *Upstream) forwardAnthropic(ctx context.Context, p domain.LLMProvider, req UpstreamRequest) (UpstreamResponse, error) {
+	url := strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(req.Body))
+	if err != nil {
+		return UpstreamResponse{}, fmt.Errorf("build upstream request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", p.APIKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	return u.do(httpReq)
+}
+
+func (u *Upstream) do(httpReq *http.Request) (UpstreamResponse, error) {
+	resp, err := u.client.Do(httpReq)
 	if err != nil {
 		return UpstreamResponse{}, fmt.Errorf("upstream request: %w", err)
 	}
@@ -92,8 +111,7 @@ func (f *Forwarder) Forward(ctx context.Context, req UpstreamRequest) (UpstreamR
 	}
 	out := UpstreamResponse{StatusCode: resp.StatusCode, Body: body}
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		// Log only status/URL/byte count — never the key or full body.
-		f.log.Printf("upstream error status=%d url=%s bytes=%d", resp.StatusCode, url, len(body))
+		u.log.Printf("upstream error status=%d url=%s bytes=%d", resp.StatusCode, httpReq.URL.String(), len(body))
 		return out, &UpstreamError{Code: resp.StatusCode, Body: body}
 	}
 	return out, nil

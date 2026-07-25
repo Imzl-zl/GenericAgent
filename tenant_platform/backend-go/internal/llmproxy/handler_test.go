@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 const testSigningKey = "test-signing-key-0123456789ab"
@@ -15,11 +17,13 @@ const testSigningKey = "test-signing-key-0123456789ab"
 func newTestServer(t *testing.T, upstream *httptest.Server) *Server {
 	t.Helper()
 	cfg := Config{
-		Listen:          "127.0.0.1:0",
-		UpstreamBaseURL: upstream.URL,
-		UpstreamAPIKey:  testUpstreamKey,
-		SigningKey:      []byte(testSigningKey),
-		TokenTTL:        time.Hour,
+		Listen:     "127.0.0.1:0",
+		SigningKey: []byte(testSigningKey),
+		TokenTTL:   time.Hour,
+		ProviderSource: &fakeProviderSource{
+			provider: testProvider(domain.ProviderOpenAICompatible, upstream.URL, "gpt-test", testUpstreamKey),
+		},
+		Cipher: &fakeCipher{wantVersion: 1},
 	}
 	srv, err := NewServer(cfg)
 	if err != nil {
@@ -43,7 +47,7 @@ func TestHandlerChatCompletionsValidToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, _, err := iss.Issue("personal:42", "foundation.no-host-tools.v1")
+	token, _, err := iss.Issue("personal:42", "foundation.no-host-tools.v1", string(domain.ProviderOpenAICompatible), "gpt-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +71,7 @@ func TestHandlerAliasChatCompletionsPath(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, _, _ := iss.Issue("personal:1", "p")
+	token, _, _ := iss.Issue("personal:1", "p", string(domain.ProviderOpenAICompatible), "gpt-test")
 
 	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
 		rec := httptest.NewRecorder()
@@ -111,7 +115,7 @@ func TestHandlerUpstream500Returns502(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, _, _ := iss.Issue("personal:1", "p")
+	token, _, _ := iss.Issue("personal:1", "p", string(domain.ProviderOpenAICompatible), "gpt-test")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
@@ -132,7 +136,7 @@ func TestHandlerUpstream429Returns429(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, _, _ := iss.Issue("personal:1", "p")
+	token, _, _ := iss.Issue("personal:1", "p", string(domain.ProviderOpenAICompatible), "gpt-test")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
@@ -150,7 +154,7 @@ func TestHandlerRevocationEndpoint(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, claims, _ := iss.Issue("personal:1", "p")
+	token, claims, _ := iss.Issue("personal:1", "p", string(domain.ProviderOpenAICompatible), "gpt-test")
 
 	// First call succeeds.
 	rec := httptest.NewRecorder()
@@ -199,7 +203,7 @@ func TestHandlerForwardsBodyUnmodified(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, _, _ := iss.Issue("personal:1", "p")
+	token, _, _ := iss.Issue("personal:1", "p", string(domain.ProviderOpenAICompatible), "gpt-test")
 
 	body := `{"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}`
 	rec := httptest.NewRecorder()
@@ -210,3 +214,4 @@ func TestHandlerForwardsBodyUnmodified(t *testing.T) {
 		t.Fatalf("forwarded body = %q, want %q", gotBody, body)
 	}
 }
+

@@ -1,12 +1,11 @@
 // Package llmproxy implements the LLM Proxy: the sole holder of the real
 // upstream LLM key. It validates short-lived session capability_tokens and
-// forwards approved requests to the upstream OpenAI-compatible API.
+// forwards approved requests to the configured upstream provider.
 package llmproxy
 
 import (
 	"fmt"
 	"net"
-	"net/url"
 	"time"
 )
 
@@ -16,14 +15,22 @@ const DefaultTokenTTL = 1 * time.Hour
 // MinSigningKeyLen is the minimum HMAC signing key length in bytes.
 const MinSigningKeyLen = 16
 
+// TokenCipher decrypts provider API keys stored in the platform database.
+// The key version is persisted alongside the ciphertext so the platform can
+// rotate keys without re-encrypting every provider.
+type TokenCipher interface {
+	Decrypt(ciphertext []byte, keyVersion int) ([]byte, error)
+}
+
 // Config holds LLM Proxy runtime configuration. The real upstream key is
-// injected via host environment and never logged.
+// fetched from the provider store and decrypted with the cipher; it is never
+// part of this static config.
 type Config struct {
-	Listen          string
-	UpstreamBaseURL string
-	UpstreamAPIKey  string
-	SigningKey      []byte
-	TokenTTL        time.Duration
+	Listen         string
+	SigningKey     []byte
+	TokenTTL       time.Duration
+	ProviderSource ProviderSource
+	Cipher         TokenCipher
 }
 
 // WithDefaults applies zero-value defaults.
@@ -42,15 +49,11 @@ func (c Config) Validate() error {
 	if !isLoopbackAddr(c.Listen) {
 		return fmt.Errorf("listen address must be loopback: %s", c.Listen)
 	}
-	if c.UpstreamBaseURL == "" {
-		return fmt.Errorf("upstream base URL is required")
+	if c.ProviderSource == nil {
+		return fmt.Errorf("provider source is required")
 	}
-	u, err := url.Parse(c.UpstreamBaseURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("upstream base URL is invalid: %s", c.UpstreamBaseURL)
-	}
-	if c.UpstreamAPIKey == "" {
-		return fmt.Errorf("upstream API key is required (host env)")
+	if c.Cipher == nil {
+		return fmt.Errorf("cipher is required")
 	}
 	if len(c.SigningKey) < MinSigningKeyLen {
 		return fmt.Errorf("signing key must be at least %d bytes", MinSigningKeyLen)
