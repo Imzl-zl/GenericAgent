@@ -24,6 +24,31 @@ func (r *fakeRouter) HandleMessage(_ context.Context, _ application.IncomingMess
 
 func (r *fakeRouter) InvalidateCommandCache() {}
 
+// fakeBotLifecycle records calls for assertion.
+type fakeBotLifecycle struct {
+	persistBufBotUUID string
+	persistBuf        string
+	expiredBotUUID    string
+	startBotBot       domain.Bot
+	persistErr        error
+}
+
+func (f *fakeBotLifecycle) StartBotForBoundUser(_ context.Context, bot domain.Bot) error {
+	f.startBotBot = bot
+	return nil
+}
+func (f *fakeBotLifecycle) StopBot(_ context.Context, _ string) error { return nil }
+func (f *fakeBotLifecycle) RestoreActiveBots(_ context.Context) error { return nil }
+func (f *fakeBotLifecycle) PersistUpdatesBuf(_ context.Context, botUUID, buf string) error {
+	f.persistBufBotUUID = botUUID
+	f.persistBuf = buf
+	return f.persistErr
+}
+func (f *fakeBotLifecycle) HandleAuthExpired(_ context.Context, botUUID string) error {
+	f.expiredBotUUID = botUUID
+	return nil
+}
+
 func TestIMWebhookRoutesMessage(t *testing.T) {
 	router := &fakeRouter{result: application.RouterResult{
 		Action: application.ActionTaskCreated,
@@ -33,10 +58,10 @@ func TestIMWebhookRoutesMessage(t *testing.T) {
 	server := newTestServerWithRouter(t, router)
 
 	body, _ := json.Marshal(imWebhookBody{
-		BotUUID:     "bot-1",
+		BotUUID:    "bot-1",
 		IlinkUserID: "user-1",
-		MessageID:   "msg-1",
-		Text:        "hello",
+		MessageID:  "msg-1",
+		Text:       "hello",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -65,15 +90,67 @@ func TestIMWebhookRejectsMissingFields(t *testing.T) {
 	}
 }
 
+func TestIMWebhookAuthExpired(t *testing.T) {
+	lc := &fakeBotLifecycle{}
+	server := newTestServerWithRouterAndLifecycle(t, &fakeRouter{}, lc)
+
+	body, _ := json.Marshal(imWebhookBody{BotUUID: "bot-1", AuthExpired: true})
+	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+	if lc.expiredBotUUID != "bot-1" {
+		t.Fatalf("HandleAuthExpired not called with bot-1, got %q", lc.expiredBotUUID)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp["action"] != "auth_expired" {
+		t.Fatalf("unexpected action: %v", resp["action"])
+	}
+}
+
+func TestIMWebhookPersistsUpdatesBuf(t *testing.T) {
+	lc := &fakeBotLifecycle{}
+	router := &fakeRouter{result: application.RouterResult{Action: application.ActionTaskCreated}}
+	server := newTestServerWithRouterAndLifecycle(t, router, lc)
+
+	body, _ := json.Marshal(imWebhookBody{
+		BotUUID:    "bot-1",
+		IlinkUserID: "user-1",
+		MessageID:  "msg-1",
+		Text:       "hello",
+		UpdatesBuf: "cursor-123",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+	if lc.persistBufBotUUID != "bot-1" || lc.persistBuf != "cursor-123" {
+		t.Fatalf("PersistUpdatesBuf not called correctly: bot=%q buf=%q",
+			lc.persistBufBotUUID, lc.persistBuf)
+	}
+}
+
 func newTestServerWithRouter(t *testing.T, router application.Router) *Server {
+	return newTestServerWithRouterAndLifecycle(t, router, nil)
+}
+
+func newTestServerWithRouterAndLifecycle(t *testing.T, router application.Router, lc application.BotLifecycleService) *Server {
 	t.Helper()
 	srv, err := NewServer(ServerConfig{
-		Service:    &fakeTaskService{},
-		Registry:   &fakeRegistry{},
-		Router:     router,
-		DevToken:   "dev-token",
-		DevUserID:  1,
-		SessionKey: "personal:1",
+		Service:      &fakeTaskService{},
+		Registry:     &fakeRegistry{},
+		Router:       router,
+		BotLifecycle: lc,
+		DevToken:     "dev-token",
+		DevUserID:    1,
+		SessionKey:   "personal:1",
 	})
 	if err != nil {
 		t.Fatalf("server: %v", err)

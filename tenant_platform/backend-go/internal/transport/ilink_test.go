@@ -8,145 +8,116 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/poller"
 )
 
-type fakeBotResolver struct {
-	bot domain.Bot
-	err error
-}
-
-func (r *fakeBotResolver) GetBotByUUID(_ context.Context, _ string) (domain.Bot, error) {
-	return r.bot, r.err
-}
-
-func setupILinkTest(t *testing.T, handler http.HandlerFunc) (*ILinkAdapter, *httptest.Server, *secret.StaticKeyCipher) {
+// newPollerAdapter starts an httptest server mimicking the Python Bot Poller
+// and returns an ILinkAdapter pointed at it. The handler receives POST /send.
+func newPollerAdapter(t *testing.T, handler http.HandlerFunc) (*ILinkAdapter, *httptest.Server) {
 	t.Helper()
-	cipher := secretMust(t)
 	server := httptest.NewServer(handler)
-	adapter, err := NewILinkAdapter(ILinkAdapterConfig{
-		BaseURL:  server.URL,
-		Cipher:   cipher,
-		Resolver: &fakeBotResolver{},
-	})
+	t.Cleanup(server.Close)
+	pollerClient, err := poller.NewClient(server.URL)
+	if err != nil {
+		t.Fatalf("poller client: %v", err)
+	}
+	adapter, err := NewILinkAdapter(ILinkAdapterConfig{Poller: pollerClient})
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
 	}
-	return adapter, server, cipher
-}
-
-func secretMust(t *testing.T) *secret.StaticKeyCipher {
-	t.Helper()
-	c, err := secret.NewStaticKeyCipherFromHex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
-	if err != nil {
-		t.Fatalf("cipher: %v", err)
-	}
-	return c
+	return adapter, server
 }
 
 func TestILinkAdapterSendMessage(t *testing.T) {
-	var received *ilinkSendRequest
-	adapter, server, cipher := setupILinkTest(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/messages/send" {
+	var received poller.SendMessageRequest
+	adapter, _ := newPollerAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/send" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		body, _ := io.ReadAll(r.Body)
-		var req ilinkSendRequest
-		if err := json.Unmarshal(body, &req); err != nil {
+		if err := json.Unmarshal(body, &received); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
-		received = &req
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"sent":true}`))
 	})
-	defer server.Close()
 
-	ct, ver, _ := cipher.Encrypt([]byte("bot-token-123"))
-	adapter.cfg.Resolver = &fakeBotResolver{bot: domain.Bot{
-		BotUUID:         "bot-1",
-		IlinkUserID:     "user-1",
-		TokenCiphertext: ct,
-		TokenKeyVersion: ver,
-	}}
-
-	ctx := context.Background()
-	err := adapter.SendMessage(ctx, "bot-1", "user-1", "hello")
+	err := adapter.SendMessage(context.Background(), "bot-1", "user-1", "hello")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if received == nil {
-		t.Fatal("no request received")
+	if received.BotUUID != "bot-1" {
+		t.Fatalf("bot_uuid mismatch: %q", received.BotUUID)
 	}
-	if received.Token != "bot-token-123" {
-		t.Fatalf("token mismatch: %q", received.Token)
+	if received.ILinkUserID != "user-1" {
+		t.Fatalf("ilink_user_id mismatch: %q", received.ILinkUserID)
 	}
-	if received.ToUser != "user-1" {
-		t.Fatalf("to_user mismatch: %q", received.ToUser)
-	}
-	if received.Content != "hello" {
-		t.Fatalf("content mismatch: %q", received.Content)
+	if received.Text != "hello" {
+		t.Fatalf("text mismatch: %q", received.Text)
 	}
 }
 
-func TestILinkAdapterSendMessageFailure(t *testing.T) {
-	adapter, server, cipher := setupILinkTest(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte("invalid token"))
+func TestILinkAdapterSendMessagePollerFailure(t *testing.T) {
+	adapter, _ := newPollerAdapter(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("poller downstream error"))
 	})
-	defer server.Close()
-
-	ct, ver, _ := cipher.Encrypt([]byte("bot-token"))
-	adapter.cfg.Resolver = &fakeBotResolver{bot: domain.Bot{
-		BotUUID:         "bot-1",
-		IlinkUserID:     "user-1",
-		TokenCiphertext: ct,
-		TokenKeyVersion: ver,
-	}}
 
 	err := adapter.SendMessage(context.Background(), "bot-1", "user-1", "hello")
 	if err == nil {
-		t.Fatal("expected error")
+		t.Fatal("expected error on poller failure")
 	}
 }
 
-func TestILinkAdapterRejectsMismatchedUserID(t *testing.T) {
-	adapter, server, cipher := setupILinkTest(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+func TestILinkAdapterSendMessageRejectsEmpty(t *testing.T) {
+	adapter, _ := newPollerAdapter(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("poller should not be called")
 	})
-	defer server.Close()
 
-	ct, ver, _ := cipher.Encrypt([]byte("bot-token"))
-	adapter.cfg.Resolver = &fakeBotResolver{bot: domain.Bot{
-		BotUUID:         "bot-1",
-		IlinkUserID:     "user-1",
-		TokenCiphertext: ct,
-		TokenKeyVersion: ver,
-	}}
-
-	err := adapter.SendMessage(context.Background(), "bot-1", "user-2", "hello")
-	if err == nil {
-		t.Fatal("expected mismatch error")
+	cases := []struct{ botUUID, ilinkUserID, text string }{
+		{"", "user-1", "hello"},
+		{"bot-1", "", "hello"},
+		{"bot-1", "user-1", ""},
+	}
+	for _, c := range cases {
+		if err := adapter.SendMessage(context.Background(), c.botUUID, c.ilinkUserID, c.text); err == nil {
+			t.Fatalf("expected error for %+v", c)
+		}
 	}
 }
 
 func TestILinkAdapterRecordIdempotency(t *testing.T) {
-	adapter, server, _ := setupILinkTest(t, func(w http.ResponseWriter, _ *http.Request) {})
-	defer server.Close()
+	adapter, _ := newPollerAdapter(t, func(w http.ResponseWriter, _ *http.Request) {})
 
 	ctx := context.Background()
 	first, err := adapter.RecordMessageIdempotency(ctx, "bot-1", "msg-1")
 	if err != nil || !first {
-		t.Fatalf("first: %v %v", first, err)
+		t.Fatalf("first: first=%v err=%v", first, err)
 	}
 	second, err := adapter.RecordMessageIdempotency(ctx, "bot-1", "msg-1")
 	if err != nil || second {
-		t.Fatalf("second: %v %v", second, err)
+		t.Fatalf("second: first=%v err=%v", second, err)
+	}
+	// Different message under same bot → first.
+	third, err := adapter.RecordMessageIdempotency(ctx, "bot-1", "msg-2")
+	if err != nil || !third {
+		t.Fatalf("third: first=%v err=%v", third, err)
 	}
 }
 
-func TestNewILinkAdapterRejectsMissingConfig(t *testing.T) {
-	_, err := NewILinkAdapter(ILinkAdapterConfig{})
-	if err == nil {
-		t.Fatal("expected error")
+func TestILinkAdapterIdempotencyRejectsEmpty(t *testing.T) {
+	adapter, _ := newPollerAdapter(t, func(w http.ResponseWriter, _ *http.Request) {})
+
+	if _, err := adapter.RecordMessageIdempotency(context.Background(), "", "msg-1"); err == nil {
+		t.Fatal("expected error for empty bot uuid")
+	}
+	if _, err := adapter.RecordMessageIdempotency(context.Background(), "bot-1", ""); err == nil {
+		t.Fatal("expected error for empty message id")
+	}
+}
+
+func TestNewILinkAdapterRejectsNilPoller(t *testing.T) {
+	if _, err := NewILinkAdapter(ILinkAdapterConfig{}); err == nil {
+		t.Fatal("expected error for nil poller")
 	}
 }
