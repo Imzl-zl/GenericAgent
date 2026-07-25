@@ -57,13 +57,19 @@ def test_worker_credential_has_no_real_key_reference() -> None:
     assert "proxyAddr" in src or "proxy_addr" in src, "worker_credential.go must use the proxy addr param"
 
 
-def test_scheduler_requires_token_issuer_when_dial_worker_nil() -> None:
-    """NewScheduler must reject construction without TokenIssuer for real Worker path."""
+def test_scheduler_requires_token_issuer_for_real_worker_path() -> None:
+    """NewScheduler must reject construction without TokenIssuer for real Worker path.
+
+    The real Worker path uses WorkerRuntime (no injected DialWorker). The scheduler
+    wraps a legacy DialWorker into worker.StaticRuntime for test migration, but
+    when DialWorker is nil it MUST require TokenIssuer/Revoker/LLMProxyAddr so the
+    Worker never receives the real upstream key.
+    """
     src = _read("internal/application/scheduler.go")
     assert "TokenIssuer" in src, "scheduler must reference TokenIssuer"
-    assert "DialWorker" in src, "scheduler must reference DialWorker"
+    assert "Runtime" in src, "scheduler must reference WorkerRuntime"
     assert "TokenIssuer is required" in src, "scheduler must enforce TokenIssuer requirement"
-    assert "DialWorker is nil" in src, "scheduler must gate on DialWorker nil"
+    assert "DialWorker == nil" in src or "cfg.DialWorker == nil" in src, "scheduler must gate on real Worker path"
 
 
 def test_no_legacy_oai_fixture_code_remains() -> None:

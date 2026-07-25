@@ -258,6 +258,33 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/admin/bots:
+    post:
+      operationId: adminCreateBot
+      summary: Register a WeChat/iLink bot for a platform user
+      description: >
+        Stores the upstream bot token encrypted at rest. The plaintext token
+        is returned to the caller only once (from iLink); the platform never
+        persists or logs it in plaintext.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBotRequest"
+      responses:
+        "201":
+          description: Bot registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotRecord"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/bindings:
     post:
       operationId: createBinding
@@ -593,6 +620,47 @@ components:
           type: string
           format: date-time
           nullable: true
+    CreateBotRequest:
+      type: object
+      required:
+        - owner_id
+        - bot_uuid
+        - token
+      properties:
+        owner_id:
+          type: integer
+          format: int64
+          minimum: 1
+        bot_uuid:
+          type: string
+          format: uuid
+        token:
+          type: string
+          description: Upstream iLink bot token; encrypted at rest by the platform
+    BotRecord:
+      type: object
+      required:
+        - bot_id
+        - bot_uuid
+        - owner_id
+        - state
+        - created_at
+      properties:
+        bot_id:
+          type: integer
+          format: int64
+        bot_uuid:
+          type: string
+          format: uuid
+        owner_id:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum: [active, expired, revoked]
+        created_at:
+          type: string
+          format: date-time
     CreateBindingRequest:
       type: object
       required:

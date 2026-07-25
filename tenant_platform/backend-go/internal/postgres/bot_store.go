@@ -38,20 +38,20 @@ RETURNING id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_ver
 // GetBotByUUID returns the bot with the given bot_uuid.
 func (s *Store) GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error) {
 	var b domain.Bot
-	err := s.pool.QueryRow(ctx, `
+	err := scanBot(s.pool.QueryRow(ctx, `
 SELECT id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_version, state, created_at, updated_at
 FROM bots WHERE bot_uuid = $1::uuid
-`, botUUID).Scan(&b.ID, &b.BotUUID, &b.OwnerID, &b.IlinkUserID, &b.TokenCiphertext, &b.TokenKeyVersion, &b.State, &b.CreatedAt, &b.UpdatedAt)
+`, botUUID), &b)
 	return b, err
 }
 
 // GetBotByOwner returns the bot owned by userID. Returns pgx.ErrNoRows if none.
 func (s *Store) GetBotByOwner(ctx context.Context, ownerID int64) (domain.Bot, error) {
 	var b domain.Bot
-	err := s.pool.QueryRow(ctx, `
+	err := scanBot(s.pool.QueryRow(ctx, `
 SELECT id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_version, state, created_at, updated_at
 FROM bots WHERE owner_id = $1
-`, ownerID).Scan(&b.ID, &b.BotUUID, &b.OwnerID, &b.IlinkUserID, &b.TokenCiphertext, &b.TokenKeyVersion, &b.State, &b.CreatedAt, &b.UpdatedAt)
+`, ownerID), &b)
 	return b, err
 }
 
@@ -62,11 +62,11 @@ func (s *Store) GetBoundBotByIlinkUser(ctx context.Context, ilinkUserID string) 
 		return domain.Bot{}, fmt.Errorf("ilink user id is required")
 	}
 	var b domain.Bot
-	err := s.pool.QueryRow(ctx, `
+	err := scanBot(s.pool.QueryRow(ctx, `
 SELECT id, bot_uuid, owner_id, ilink_user_id, token_ciphertext, token_key_version, state, created_at, updated_at
 FROM bots
 WHERE ilink_user_id = $1 AND state = 'active'
-`, ilinkUserID).Scan(&b.ID, &b.BotUUID, &b.OwnerID, &b.IlinkUserID, &b.TokenCiphertext, &b.TokenKeyVersion, &b.State, &b.CreatedAt, &b.UpdatedAt)
+`, ilinkUserID), &b)
 	return b, err
 }
 
@@ -130,5 +130,13 @@ func (s *Store) GetUserByID(ctx context.Context, userID int64) (id int64, userna
 }
 
 func scanBot(row pgx.Row, b *domain.Bot) error {
-	return row.Scan(&b.ID, &b.BotUUID, &b.OwnerID, &b.IlinkUserID, &b.TokenCiphertext, &b.TokenKeyVersion, &b.State, &b.CreatedAt, &b.UpdatedAt)
+	var ilinkUserID *string
+	err := row.Scan(&b.ID, &b.BotUUID, &b.OwnerID, &ilinkUserID, &b.TokenCiphertext, &b.TokenKeyVersion, &b.State, &b.CreatedAt, &b.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if ilinkUserID != nil {
+		b.IlinkUserID = *ilinkUserID
+	}
+	return nil
 }

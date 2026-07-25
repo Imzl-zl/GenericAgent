@@ -14,7 +14,24 @@
 > - Token revocation via in-memory denylist (`/internal/revoke` endpoint); per-session issuance, revoked on Worker cleanup.
 > - `cmd/platform` starts an in-process LLM Proxy in dev-loopback (or accepts `--llm-proxy-addr` for external deployment).
 > - Smoke + integration tests updated to use the Proxy path end-to-end; 10-test security audit suite added (`tenant_platform/tests/security/test_no_real_key_leak.py`).
-> - Container isolation (Slice 2b, rootless Podman) deferred — requires Linux host. See [Slice 2a SPEC](../../../.codex-tasks/20260725-llm-proxy-slice-2a/SPEC.md) for full scope.
+>
+> **Session 2026-07-25 — Slice 2b (Worker Containerization, rootless Podman):**
+> - Closed the #2 P0 security gap: Worker execution moved from host subprocess to rootless Podman container per active session.
+> - Introduced `WorkerRuntime` interface (`internal/worker/runtime.go`) with `LoopbackWorkerRuntime` (dev/Windows) and `ManagerWorkerRuntime` (podman) implementations.
+> - Added `genericagent.worker.manager.v1` gRPC contract and generated Go bindings.
+> - Implemented `cmd/worker-manager` and `internal/workermanager` (server + Podman runtime) to own container allocate/release/list lifecycle.
+> - Added `tenant_platform/worker-python/Dockerfile` + `.dockerignore` based on `python:3.11-slim`.
+> - Wired `--worker-runtime=loopback|podman` and `--worker-manager-addr` into `cmd/platform`; podman mode uses session-scoped config dirs.
+> - Go unit tests pass for manager client, Podman runtime (fake executor), and platform runtime switch. Real Podman end-to-end remains Linux-only and is deferred to deployment verification.
+>
+> **Session 2026-07-25 — Slice 3b (IM Gateway / iLink real access):**
+> - Added encrypted bot registration admin API (`POST /v1/admin/bots`) with AES-256-GCM token storage.
+> - Implemented production `ILinkAdapter` (`internal/transport/ilink.go`) that resolves bot tokens, decrypts them, and calls the iLink send-message HTTP API.
+> - Implemented `DeliveryService` (`internal/application/delivery_service.go`) that polls the `task_deliveries` outbox, retries with exponential backoff, and dead-letters expired rows.
+> - Wired iLink transport, cipher, bot store, and delivery service into `cmd/platform` via `--ilink-base-url`, `--bot-token-key`, and `BOT_TOKEN_KEY`/`ILINK_BASE_URL` env vars.
+> - Added unit tests for delivery retry/dead-letter/ack logic.
+>
+> **Windows/Linux compatibility note:** GA Core (`agentmain.py`) remains cross-platform and runs on Windows unchanged. The Go platform layer defaults to `--worker-runtime=loopback`, which starts a local Python Worker subprocess and works on Windows. Only the optional `--worker-runtime=podman` path (container isolation via rootless Podman) is Linux-only. iLink delivery works on any platform that can reach the iLink base URL.
 >
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

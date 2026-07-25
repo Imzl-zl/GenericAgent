@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package genericagent.worker.manager.v1;
+option go_package = "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/manager/v1;managerv1";
+
+import "google/protobuf/timestamp.proto";
+
+message AllocateWorkerRequest {
+  string session_key = 1;
+  string policy_file_path = 2;
+  string config_root_path = 3;
+  string runtime_root_path = 4;
+  string capability_token = 5;
+  string llm_proxy_addr = 6;
+}
+
+message AllocateWorkerResponse {
+  string worker_instance_id = 1;
+  string dial_address = 2;
+}
+
+message ReleaseWorkerRequest {
+  string worker_instance_id = 1;
+}
+
+message ReleaseWorkerResponse {
+  bool released = 1;
+}
+
+message ListWorkersRequest {}
+
+message ListWorkersResponse {
+  repeated WorkerInstance workers = 1;
+}
+
+message WorkerInstance {
+  string worker_instance_id = 1;
+  string session_key = 2;
+  string dial_address = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+}
+
+service WorkerManagerService {
+  rpc AllocateWorker(AllocateWorkerRequest) returns (AllocateWorkerResponse);
+  rpc ReleaseWorker(ReleaseWorkerRequest) returns (ReleaseWorkerResponse);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}

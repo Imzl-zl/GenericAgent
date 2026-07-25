@@ -1,0 +1,111 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
+)
+
+type fakeRouter struct {
+	result application.RouterResult
+	err    error
+}
+
+func (r *fakeRouter) HandleMessage(_ context.Context, _ application.IncomingMessage) (application.RouterResult, error) {
+	return r.result, r.err
+}
+
+func (r *fakeRouter) InvalidateCommandCache() {}
+
+func TestIMWebhookRoutesMessage(t *testing.T) {
+	router := &fakeRouter{result: application.RouterResult{
+		Action: application.ActionTaskCreated,
+		Reply:  "task queued",
+		UserID: 42,
+	}}
+	server := newTestServerWithRouter(t, router)
+
+	body, _ := json.Marshal(imWebhookBody{
+		BotUUID:     "bot-1",
+		IlinkUserID: "user-1",
+		MessageID:   "msg-1",
+		Text:        "hello",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["action"] != "task_created" {
+		t.Fatalf("unexpected action: %v", resp["action"])
+	}
+}
+
+func TestIMWebhookRejectsMissingFields(t *testing.T) {
+	server := newTestServerWithRouter(t, &fakeRouter{})
+	body, _ := json.Marshal(imWebhookBody{BotUUID: "bot-1"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request, got %d", rec.Code)
+	}
+}
+
+func newTestServerWithRouter(t *testing.T, router application.Router) *Server {
+	t.Helper()
+	srv, err := NewServer(ServerConfig{
+		Service:    &fakeTaskService{},
+		Registry:   &fakeRegistry{},
+		Router:     router,
+		DevToken:   "dev-token",
+		DevUserID:  1,
+		SessionKey: "personal:1",
+	})
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	return srv
+}
+
+type fakeRegistry struct{}
+
+func (r *fakeRegistry) Digest() string { return "sha256:test" }
+func (r *fakeRegistry) Resolve(_, version string) (policy.ToolPolicy, error) {
+	return policy.ToolPolicy{Version: version, AllowedTools: []string{"shell", "python"}}, nil
+}
+
+type fakeTaskService struct{}
+
+func (s *fakeTaskService) SubmitTask(_ context.Context, _ domain.SubmitTaskCommand) (domain.Task, error) {
+	return domain.Task{}, nil
+}
+func (s *fakeTaskService) GetTask(_ context.Context, _ string) (domain.Task, error) {
+	return domain.Task{}, nil
+}
+func (s *fakeTaskService) CancelTask(_ context.Context, _ string, _ int64) (domain.Task, error) {
+	return domain.Task{}, nil
+}
+func (s *fakeTaskService) ClaimNextTask(_ context.Context, _, _ string) (domain.Task, bool, error) {
+	return domain.Task{}, false, nil
+}
+func (s *fakeTaskService) RecoverAfterRestart(_ context.Context, _ string) error { return nil }
+func (s *fakeTaskService) ReadResult(_ context.Context, _ string) (domain.ResultPayload, error) {
+	return domain.ResultPayload{}, nil
+}
+
+var _ application.TaskService = (*fakeTaskService)(nil)
+var _ policy.Registry = (*fakeRegistry)(nil)

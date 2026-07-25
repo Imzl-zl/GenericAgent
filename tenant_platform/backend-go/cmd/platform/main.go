@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -25,7 +26,9 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/transport"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/worker"
 )
 
 func main() {
@@ -48,6 +51,35 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// buildWorkerRuntime selects the loopback or podman runtime based on mode.
+// It returns the runtime and a bool indicating whether config should be
+// session-scoped (required for container isolation).
+func buildWorkerRuntime(mode, managerAddr string, boot application.DevBootstrapConfig) (worker.WorkerRuntime, bool, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "loopback", "":
+		runtime, err := worker.NewLoopback(worker.LoopbackConfig{
+			Python:     boot.WorkerPython,
+			WorkerSrc:  boot.WorkerSrc,
+			LegacyRoot: boot.LegacyRoot,
+		})
+		if err != nil {
+			return nil, false, fmt.Errorf("loopback runtime: %w", err)
+		}
+		return runtime, false, nil
+	case "podman":
+		if strings.TrimSpace(managerAddr) == "" {
+			return nil, false, fmt.Errorf("--worker-manager-addr is required for podman runtime")
+		}
+		runtime, err := worker.NewManager(worker.ManagerConfig{ManagerAddr: managerAddr})
+		if err != nil {
+			return nil, false, fmt.Errorf("manager runtime: %w", err)
+		}
+		return runtime, true, nil
+	default:
+		return nil, false, fmt.Errorf("unknown --worker-runtime %q", mode)
+	}
 }
 
 // llmProxyConfig carries LLM Proxy startup parameters. The real upstream key
@@ -184,6 +216,10 @@ func run() error {
 		modelPolicyVersion   = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
 		devExtraUsers = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
 		devTeam      = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
+		workerRuntime     = flag.String("worker-runtime", "loopback", "worker runtime mode: loopback or podman")
+		workerManagerAddr = flag.String("worker-manager-addr", os.Getenv("GA_WORKER_MANAGER_ADDR"), "worker-manager gRPC address (required for podman mode)")
+		botTokenKey      = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
+		ilinkBaseURL     = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
 	)
 	flag.Parse()
 
@@ -350,19 +386,22 @@ func run() error {
 	}
 	revoker := application.NewHTTPTokenRevoker(proxyAddr)
 
+	runtime, sessionScopedConfig, err := buildWorkerRuntime(*workerRuntime, *workerManagerAddr, boot)
+	if err != nil {
+		return err
+	}
+
 	sched, err := application.NewScheduler(application.SchedulerConfig{
-		PlatformInstanceID: instanceID,
-		ClaimLease:         *claimLease,
-		PollInterval:       500 * time.Millisecond,
-		Store:              store,
-		Registry:           reg,
-		Coordinator:        coord,
-		PolicyFile:         resolvedPolicyFile,
-		ConfigRoot:         boot.ConfigRoot,
-		LegacyRoot:         boot.LegacyRoot,
-		RuntimeRoot:        boot.RuntimeRoot,
-		WorkerPython:       boot.WorkerPython,
-		WorkerSrc:          boot.WorkerSrc,
+		PlatformInstanceID:  instanceID,
+		ClaimLease:          *claimLease,
+		PollInterval:        500 * time.Millisecond,
+		Store:               store,
+		Registry:            reg,
+		Coordinator:         coord,
+		Runtime:             runtime,
+		ConfigRoot:          boot.ConfigRoot,
+		SessionScopedConfig: sessionScopedConfig,
+		RuntimeRoot:         boot.RuntimeRoot,
 		LLMProxyAddr:        proxyAddr,
 		TokenIssuer:         issuer,
 		TokenRevoker:        revoker,
@@ -407,14 +446,43 @@ func run() error {
 		return err
 	}
 
-	// LoopbackTransport: in-process mock for the foundation slice. The real
-	// iLink BotTransportAdapter is deferred to Slice 3b (spec §7.3).
-	loopback := transport.NewLoopbackTransport()
+	// Bot token cipher: required for bot registration and real iLink transport.
+	// The key is injected via env/flag and never committed to source.
+	var cipher secret.TokenCipher
+	if keyHex := strings.TrimSpace(*botTokenKey); keyHex != "" {
+		c, err := secret.NewStaticKeyCipherFromHex(keyHex)
+		if err != nil {
+			return fmt.Errorf("bot token cipher: %w", err)
+		}
+		cipher = c
+	}
+
+	// Bot transport: real iLink when configured, otherwise in-process loopback
+	// for dev/test. The loopback transport records sent messages for assertions.
+	var botTransport transport.BotTransportAdapter
+	if baseURL := strings.TrimSpace(*ilinkBaseURL); baseURL != "" {
+		if cipher == nil {
+			return fmt.Errorf("--ilink-base-url requires --bot-token-key/BOT_TOKEN_KEY")
+		}
+		ilinkAdapter, err := transport.NewILinkAdapter(transport.ILinkAdapterConfig{
+			BaseURL:  baseURL,
+			Cipher:   cipher,
+			Resolver: store,
+		})
+		if err != nil {
+			return fmt.Errorf("ilink adapter: %w", err)
+		}
+		botTransport = ilinkAdapter
+		fmt.Fprintf(os.Stderr, "platform: ilink transport base_url=%s\n", baseURL)
+	} else {
+		botTransport = transport.NewLoopbackTransport()
+	}
+
 	routerSvc, err := application.NewRouter(application.RouterConfig{
 		Store:          store,
 		Binding:        bindingSvc,
 		Tasks:          svc,
-		Transport:      loopback,
+		Transport:      botTransport,
 		Commands:       store, // DB-driven command registry (migration 0004)
 		ToolPolicy:     strings.TrimSpace(*modelPolicyVersion),
 		SourceInstance: instanceID,
@@ -430,6 +498,8 @@ func run() error {
 		Router:     routerSvc,
 		Registry:   reg,
 		Policies:   store, // admin command/policy management (migration 0004)
+		Bots:       store,
+		Cipher:     cipher,
 		DevToken:   boot.DevToken,
 		DevUserID:  devCtx.UserID,
 		SessionKey: devCtx.SessionKey,
@@ -438,10 +508,39 @@ func run() error {
 		return err
 	}
 
+	// Delivery service: polls task terminal state and sends notifications.
+	// It requires the cipher (to resolve/decrypt bot tokens) and a coordinator
+	// that can read bounded result refs.
+	var deliverySvc application.DeliveryService
+	if cipher != nil && coord != nil {
+		deliveryCfg := application.DeliveryServiceConfig{
+			Store:        store,
+			Tasks:        store,
+			Bots:         store,
+			Transport:    botTransport,
+			Results:      coord,
+			PollInterval: 2 * time.Second,
+			ClaimLease:   30 * time.Second,
+			RetryWindow:  5 * time.Minute,
+		}
+		deliverySvc, err = application.NewDeliveryService(deliveryCfg)
+		if err != nil {
+			return fmt.Errorf("delivery service: %w", err)
+		}
+	}
+
 	schedulerDone := make(chan error, 1)
 	go func() {
 		schedulerDone <- sched.Run(ctx)
 	}()
+
+	if deliverySvc != nil {
+		go func() {
+			if err := deliverySvc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("delivery service error: %v", err)
+			}
+		}()
+	}
 
 	fmt.Fprintf(os.Stderr, "platform: instance_id=%s listen=%s session=%s policy_digest=%s\n",
 		instanceID, *listen, devCtx.SessionKey, reg.Digest())

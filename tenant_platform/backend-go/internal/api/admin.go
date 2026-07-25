@@ -3,6 +3,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ func (s *Server) registerLifecycleRoutes() {
 	}
 	if s.router != nil {
 		s.mux.HandleFunc("POST /v1/router/messages", s.auth(s.handleRouterMessage))
+		s.mux.HandleFunc("POST /v1/im/webhook", s.handleIMWebhook)
 	}
 	if s.policies != nil {
 		s.mux.HandleFunc("GET /v1/admin/commands", s.auth(s.handleListCommands))
@@ -34,6 +36,9 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("GET /v1/admin/tool-policies", s.auth(s.handleListToolPolicies))
 		s.mux.HandleFunc("POST /v1/admin/tool-policies", s.auth(s.handleCreateToolPolicy))
 		s.mux.HandleFunc("PUT /v1/admin/users/{user_id}/tool-policy", s.auth(s.handleUpdateUserToolPolicy))
+	}
+	if s.bots != nil && s.cipher != nil {
+		s.mux.HandleFunc("POST /v1/admin/bots", s.auth(s.handleAdminCreateBot))
 	}
 }
 
@@ -96,6 +101,59 @@ func (s *Server) handleAdminListPending(w http.ResponseWriter, r *http.Request) 
 		out = append(out, userReply(u))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
+}
+
+type createBotBody struct {
+	OwnerID int64  `json:"owner_id"`
+	BotUUID string `json:"bot_uuid"`
+	Token   string `json:"token"`
+}
+
+func (s *Server) handleAdminCreateBot(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	var body createBotBody
+	if err := decodeStrict(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+		return
+	}
+	if err := validateCreateBot(body); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
+		return
+	}
+	cipherText, _, err := s.cipher.Encrypt([]byte(body.Token))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "ENCRYPT_FAILED", err.Error(), tid)
+		return
+	}
+	bot, err := s.bots.CreateBot(r.Context(), body.BotUUID, body.OwnerID, cipherText)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "BOT_CREATE_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusCreated, botReply(bot))
+}
+
+func validateCreateBot(b createBotBody) error {
+	if b.OwnerID <= 0 {
+		return fmt.Errorf("owner_id must be positive")
+	}
+	if strings.TrimSpace(b.BotUUID) == "" {
+		return fmt.Errorf("bot_uuid is required")
+	}
+	if strings.TrimSpace(b.Token) == "" {
+		return fmt.Errorf("token is required")
+	}
+	return nil
+}
+
+func botReply(b domain.Bot) map[string]any {
+	return map[string]any{
+		"bot_id":     b.ID,
+		"bot_uuid":   b.BotUUID,
+		"owner_id":   b.OwnerID,
+		"state":      string(b.State),
+		"created_at": b.CreatedAt.UTC().Format(time.RFC3339),
+	}
 }
 
 // userReply serializes a domain.User into a JSON-friendly map.

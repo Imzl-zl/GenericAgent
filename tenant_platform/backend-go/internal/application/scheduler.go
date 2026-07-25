@@ -6,19 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
@@ -27,6 +19,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/worker"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/workerclient"
 )
 
@@ -45,20 +38,26 @@ type SchedulerConfig struct {
 	PollInterval       time.Duration
 	Store              TaskStore
 	Registry           policy.Registry
-	Coordinator        checkpoint.Coordinator
-	// Worker process environment (dev-loopback).
-	PolicyFile   string
-	ConfigRoot   string
-	LegacyRoot   string
-	RuntimeRoot  string
-	WorkerPython string
-	WorkerSrc    string
-	// Optional injected Worker factory for unit tests. When set, the scheduler
-	// calls it once per session_key to obtain a dedicated worker instance.
+	Coordinator checkpoint.Coordinator
+	// Runtime creates a Worker instance for a session. Required.
+	Runtime worker.WorkerRuntime
+	// ConfigRoot is where the platform writes the token-only mykey.py for the
+	// Worker. It may be global in loopback dev mode or session-scoped in
+	// container mode.
+	ConfigRoot string
+	// SessionScopedConfig, when true, writes mykey.py under
+	// ConfigRoot/<session-key> and passes that path as ConfigDir to the runtime.
+	// Required for container mode so each container mounts only its own config.
+	SessionScopedConfig bool
+	// RuntimeRoot is the parent directory for checkpoint/runtime data.
+	RuntimeRoot string
+	// Optional injected Worker factory for unit tests. Deprecated: prefer
+	// passing a worker.StaticRuntime as Runtime. When set and Runtime is nil,
+	// the scheduler wraps it in a static runtime.
 	DialWorker func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(), error)
-	// LLM Proxy capability_token issuance. Required when DialWorker is nil
-	// (real Worker path): the platform issues a short-lived, session-bound
-	// token and writes a token-only mykey.py (no real upstream key).
+	// LLM Proxy capability_token issuance. Required for real Worker path: the
+	// platform issues a short-lived, session-bound token and writes a token-only
+	// mykey.py (no real upstream key).
 	TokenIssuer       *llmproxy.Issuer
 	TokenRevoker      TokenRevoker
 	LLMProxyAddr      string // e.g. "http://127.0.0.1:8081"
@@ -72,22 +71,6 @@ const workerShutdownTimeout = 5 * time.Second
 type cancelCall struct {
 	once sync.Once
 	err  error
-}
-
-type workerProcessCleanup struct {
-	client      workerclient.WorkerClient
-	closeConn   func() error
-	killProcess func() error
-	waitProcess func() error
-}
-
-func (c workerProcessCleanup) run(timeout time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	_ = c.client.Shutdown(ctx, "scheduler-stop")
-	cancel()
-	_ = c.closeConn()
-	_ = c.killProcess()
-	_ = c.waitProcess()
 }
 
 type dispatchHeartbeat struct {
@@ -177,21 +160,27 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 	if cfg.Store == nil || cfg.Registry == nil {
 		return nil, fmt.Errorf("store and registry are required")
 	}
+	if cfg.Runtime == nil && cfg.DialWorker != nil {
+		cfg.Runtime = worker.NewStaticRuntime(cfg.DialWorker)
+	}
+	if cfg.Runtime == nil {
+		return nil, fmt.Errorf("SchedulerConfig.Runtime is required")
+	}
 	// Real Worker path (no injected DialWorker) MUST go through the LLM Proxy:
 	// token issuer + revoker + Proxy address + config root for token-only
 	// mykey.py. This is the spec §7.1 security red line.
 	if cfg.DialWorker == nil {
 		if cfg.TokenIssuer == nil {
-			return nil, fmt.Errorf("SchedulerConfig.TokenIssuer is required when DialWorker is nil (real Worker must use capability_token)")
+			return nil, fmt.Errorf("SchedulerConfig.TokenIssuer is required for real Worker path")
 		}
 		if cfg.TokenRevoker == nil {
-			return nil, fmt.Errorf("SchedulerConfig.TokenRevoker is required when DialWorker is nil")
+			return nil, fmt.Errorf("SchedulerConfig.TokenRevoker is required for real Worker path")
 		}
 		if strings.TrimSpace(cfg.LLMProxyAddr) == "" {
-			return nil, fmt.Errorf("SchedulerConfig.LLMProxyAddr is required when DialWorker is nil")
+			return nil, fmt.Errorf("SchedulerConfig.LLMProxyAddr is required for real Worker path")
 		}
 		if strings.TrimSpace(cfg.ConfigRoot) == "" {
-			return nil, fmt.Errorf("SchedulerConfig.ConfigRoot is required when DialWorker is nil")
+			return nil, fmt.Errorf("SchedulerConfig.ConfigRoot is required for real Worker path")
 		}
 	}
 	if cfg.PollInterval <= 0 {
@@ -667,11 +656,21 @@ func (s *scheduler) issueAndWriteCredential(sessionKey string) (string, error) {
 		return "", fmt.Errorf("issue capability_token: %w", err)
 	}
 	if s.cfg.LLMProxyAddr != "" && s.cfg.ConfigRoot != "" {
-		if err := writeTokenOnlyMyKey(s.cfg.ConfigRoot, s.cfg.LLMProxyAddr, token); err != nil {
+		configDir := s.configDirFor(sessionKey)
+		if err := writeTokenOnlyMyKey(configDir, s.cfg.LLMProxyAddr, token); err != nil {
 			return "", fmt.Errorf("write token-only mykey.py: %w", err)
 		}
 	}
 	return claims.Jti, nil
+}
+
+// configDirFor returns the directory that holds mykey.py for the session.
+// When SessionScopedConfig is false the global ConfigRoot is used.
+func (s *scheduler) configDirFor(sessionKey string) string {
+	if !s.cfg.SessionScopedConfig {
+		return s.cfg.ConfigRoot
+	}
+	return s.cfg.ConfigRoot + "/" + sessionKey
 }
 
 // revokeTokenBestEffort attempts a revocation; failures are logged (token TTL
@@ -723,59 +722,18 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	return nil
 }
 
-// startWorkerProcess launches a Python Worker subprocess (or an injected test
-// double) and returns its client. The token-only mykey.py has already been
-// written by ensureWorker; this function only launches the process and dials
-// its gRPC port. The real upstream key is never on this code path.
+// startWorkerProcess asks the configured WorkerRuntime to create a Worker for
+// the session. The token-only mykey.py has already been written by ensureWorker.
 func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string) (workerclient.WorkerClient, string, func(), error) {
-	if s.cfg.DialWorker != nil {
-		client, cleanup, err := s.cfg.DialWorker(ctx, sessionKey)
-		if err != nil {
-			return nil, "", nil, err
-		}
-		return client, "injected-worker", cleanup, nil
-	}
-
-	python := s.cfg.WorkerPython
-	if python == "" {
-		python = defaultPython(s.cfg.LegacyRoot)
-	}
-	workerSrc := s.cfg.WorkerSrc
-	if workerSrc == "" {
-		workerSrc = filepath.Join(s.cfg.LegacyRoot, "tenant_platform", "worker-python", "src")
-	}
-	proc, listen, err := startPythonWorker(python, workerSrc, s.cfg.ConfigRoot, s.cfg.LegacyRoot, s.cfg.RuntimeRoot, s.cfg.PolicyFile)
+	inst, err := s.cfg.Runtime.Start(ctx, worker.StartRequest{
+		SessionKey: sessionKey,
+		ConfigDir:  s.configDirFor(sessionKey),
+		RuntimeDir: s.cfg.RuntimeRoot,
+	})
 	if err != nil {
 		return nil, "", nil, err
 	}
-	if !isLoopbackAddr(listen) {
-		_ = proc.Process.Kill()
-		return nil, "", nil, fmt.Errorf("worker not loopback: %s", listen)
-	}
-	conn, err := grpc.DialContext(ctx, listen, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
-	if err != nil {
-		_ = proc.Process.Kill()
-		return nil, "", nil, err
-	}
-	client, err := workerclient.New(conn)
-	if err != nil {
-		_ = conn.Close()
-		_ = proc.Process.Kill()
-		return nil, "", nil, err
-	}
-	instID := "loopback-" + listen
-	cleanup := func() {
-		workerProcessCleanup{
-			client:      client,
-			closeConn:   conn.Close,
-			killProcess: proc.Process.Kill,
-			waitProcess: func() error {
-				_, err := proc.Process.Wait()
-				return err
-			},
-		}.run(workerShutdownTimeout)
-	}
-	return client, instID, cleanup, nil
+	return inst.Client, inst.InstID, inst.Cleanup, nil
 }
 
 // shutdownAllWorkers revokes all active capability_tokens and tears down every
@@ -804,129 +762,4 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-// --- worker process helpers (dev loopback) ---
 
-var workerListenRE = regexp.MustCompile(`WORKER_LISTEN=(\S+)`)
-
-func startPythonWorker(python, workerSrc, configRoot, legacyRoot, runtimeDir, policyFile string) (*exec.Cmd, string, error) {
-	listen := "127.0.0.1:0"
-	cmd := exec.Command(python, "-m", "ga_worker.entrypoint", "--listen", listen, "--grace-seconds", "5")
-	configureWorkerProcess(cmd)
-	if base := filepath.Base(workerSrc); base == "src" {
-		cmd.Dir = filepath.Dir(workerSrc)
-	} else {
-		cmd.Dir = workerSrc
-	}
-	env := os.Environ()
-	env = setEnv(env, "GA_CONFIG_ROOT", configRoot)
-	env = setEnv(env, "GA_LEGACY_ROOT", legacyRoot)
-	env = setEnv(env, "GA_RUNTIME_DIR", runtimeDir)
-	env = setEnv(env, "GA_POLICY_FILE", policyFile)
-	env = setEnv(env, "GA_WORKER_LISTEN", listen)
-	env = unsetEnv(env, "OPENAI_API_KEY")
-	env = unsetEnv(env, "ANTHROPIC_API_KEY")
-	pp := workerSrc
-	if existing := getEnv(env, "PYTHONPATH"); existing != "" {
-		pp = workerSrc + string(os.PathListSeparator) + existing
-	}
-	env = setEnv(env, "PYTHONPATH", pp)
-	cmd.Env = env
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, "", err
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		return nil, "", err
-	}
-	listenAddr, err := waitWorkerListen(stdout, 30*time.Second)
-	if err != nil {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		rest, _ := io.ReadAll(stdout)
-		return nil, "", fmt.Errorf("%w\nworker output:\n%s", err, string(rest))
-	}
-	go func() { _, _ = io.Copy(io.Discard, stdout) }()
-	return cmd, listenAddr, nil
-}
-
-func waitWorkerListen(r io.Reader, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 512)
-	for time.Now().Before(deadline) {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if m := workerListenRE.FindSubmatch(buf); m != nil {
-				return string(m[1]), nil
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return "", fmt.Errorf("worker exited before WORKER_LISTEN; output:\n%s", string(buf))
-			}
-			return "", err
-		}
-	}
-	return "", fmt.Errorf("timeout waiting for WORKER_LISTEN; output:\n%s", string(buf))
-}
-
-func isLoopbackAddr(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-func setEnv(env []string, key, value string) []string {
-	prefix := key + "="
-	out := env[:0]
-	for _, e := range env {
-		if !strings.HasPrefix(e, prefix) {
-			out = append(out, e)
-		}
-	}
-	return append(out, prefix+value)
-}
-
-func unsetEnv(env []string, key string) []string {
-	prefix := key + "="
-	out := env[:0]
-	for _, e := range env {
-		if !strings.HasPrefix(e, prefix) {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-func getEnv(env []string, key string) string {
-	prefix := key + "="
-	for _, e := range env {
-		if strings.HasPrefix(e, prefix) {
-			return strings.TrimPrefix(e, prefix)
-		}
-	}
-	return ""
-}
-
-func defaultPython(legacyRoot string) string {
-	candidates := []string{
-		filepath.Join(legacyRoot, ".venv", "Scripts", "python.exe"),
-		filepath.Join(legacyRoot, ".venv", "bin", "python"),
-		"python3",
-		"python",
-	}
-	for _, c := range candidates {
-		if c == "python3" || c == "python" {
-			return c
-		}
-		if st, err := os.Stat(c); err == nil && !st.IsDir() {
-			return c
-		}
-	}
-	return "python"
-}

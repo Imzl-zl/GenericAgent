@@ -279,8 +279,20 @@ def _start_platform(
         try:
             status, body = _http_json("GET", base + "/healthz", token=None)
             if status == 200 and body.get("status") == "ok":
-                startup_line = proc.stdout.readline() if proc.stdout else ""
-                log_path.write_text(startup_line, encoding="utf-8")
+                # Capture startup stdout until the instance_id line is emitted.
+                # The platform prints LLM-proxy and scheduler startup lines before
+                # the instance_id summary, so reading just one line is fragile.
+                captured: list[str] = []
+                line_deadline = time.time() + 3
+                while time.time() < line_deadline:
+                    line = proc.stdout.readline() if proc.stdout else ""
+                    if line:
+                        captured.append(line)
+                        if "instance_id=" in line:
+                            break
+                    else:
+                        time.sleep(0.05)
+                log_path.write_text("".join(captured), encoding="utf-8")
                 return proc, base, config_root, runtime_root, log_path, fixture
             last = (status, body)
         except Exception as exc:  # noqa: BLE001

@@ -883,39 +883,3 @@ func (w *blockedShutdownWorker) Shutdown(ctx context.Context, _ string) error {
 	close(w.deadlineObserved)
 	return ctx.Err()
 }
-
-func TestWorkerProcessCleanupBoundsShutdownAndContinuesProcessCleanup(t *testing.T) {
-	worker := &blockedShutdownWorker{
-		controlledWorker: newControlledWorker(),
-		deadlineObserved: make(chan struct{}),
-	}
-	var closeCalled, killCalled, waitCalled atomic.Bool
-	cleanup := workerProcessCleanup{
-		client: worker,
-		closeConn: func() error {
-			closeCalled.Store(true)
-			return nil
-		},
-		killProcess: func() error {
-			killCalled.Store(true)
-			return nil
-		},
-		waitProcess: func() error {
-			waitCalled.Store(true)
-			return nil
-		},
-	}
-	started := time.Now()
-	cleanup.run(50 * time.Millisecond)
-	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
-		t.Fatalf("cleanup exceeded outer budget: %s", elapsed)
-	}
-	select {
-	case <-worker.deadlineObserved:
-	default:
-		t.Fatal("Worker Shutdown did not observe context deadline")
-	}
-	if !closeCalled.Load() || !killCalled.Load() || !waitCalled.Load() {
-		t.Fatalf("cleanup did not continue: close=%v kill=%v wait=%v", closeCalled.Load(), killCalled.Load(), waitCalled.Load())
-	}
-}

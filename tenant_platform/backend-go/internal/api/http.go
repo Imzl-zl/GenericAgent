@@ -17,6 +17,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
 )
 
 // Server is the loopback HTTP API.
@@ -27,6 +28,8 @@ type Server struct {
 	router     application.Router
 	registry   policy.Registry
 	policies   PolicyStore
+	bots       BotStore
+	cipher     secret.TokenCipher
 	devToken   string
 	devUserID  int64
 	sessionKey string
@@ -44,6 +47,12 @@ type PolicyStore interface {
 	UpdateUserToolPolicy(ctx context.Context, userID int64, version string, updatedBy int64) error
 }
 
+// BotStore creates and resolves bot records with encrypted tokens.
+type BotStore interface {
+	CreateBot(ctx context.Context, botUUID string, ownerID int64, tokenCiphertext []byte) (domain.Bot, error)
+	GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error)
+}
+
 // ServerConfig configures the foundation API.
 type ServerConfig struct {
 	Service    application.TaskService
@@ -52,6 +61,8 @@ type ServerConfig struct {
 	Router     application.Router
 	Registry   policy.Registry
 	Policies   PolicyStore
+	Bots       BotStore
+	Cipher     secret.TokenCipher
 	DevToken   string
 	DevUserID  int64
 	SessionKey string
@@ -78,6 +89,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		router:     cfg.Router,
 		registry:   cfg.Registry,
 		policies:   cfg.Policies,
+		bots:       cfg.Bots,
+		cipher:     cfg.Cipher,
 		devToken:   cfg.DevToken,
 		devUserID:  cfg.DevUserID,
 		sessionKey: cfg.SessionKey,
