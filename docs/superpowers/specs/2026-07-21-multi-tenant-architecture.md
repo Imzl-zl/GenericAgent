@@ -1,7 +1,7 @@
 # 多租户 IM 个人助手平台 — 架构设计
 
 **日期：** 2026-07-23  
-**状态：** 设计已确认；Foundation 垂直切片已实现（2026-07-24）；LLM Proxy + capability_token 切片已实现（2026-07-25，Slice 2a — 真实上游 Key 仅存于 `cmd/llm-proxy`）；Worker 容器隔离切片已实现（2026-07-25，Slice 2b — `WorkerRuntime` + `worker-manager` + rootless Podman，见 [Slice 2b SPEC](../../../.codex-tasks/20260725-worker-containerization-slice-2b/SPEC.md)）；P0 完整闭环仍待后续切片（Web UI / IM Gateway / Linux 部署验证）  
+**状态：** 设计已确认；Foundation 垂直切片已实现（2026-07-24）；LLM Proxy + capability_token 切片已实现（2026-07-25，Slice 2a — 真实上游 Key 仅存于 `cmd/llm-proxy`）；Worker 容器隔离切片已实现（2026-07-25，Slice 2b — `WorkerRuntime` + `worker-manager` + rootless Podman，见 [Slice 2b SPEC](../../../.codex-tasks/20260725-worker-containerization-slice-2b/SPEC.md)）；iLink 官方绑定流程 + 媒体收发（任意文件格式）+ Windows loopback 端到端验证已完成（2026-07-25，Slice 3c — 见 [iLink 绑定流程 SPEC](2026-07-25-ilink-official-binding-flow.md)）；P0 剩余：Linux Podman 端到端验证、资源配额/准入控制、文件上传/工作区  
 **对应 PRD：** [2026-07-21-multi-tenant-im-platform-design.md](2026-07-21-multi-tenant-im-platform-design.md)  
 **试运行目标：** 一台 Linux 服务器，先服务约 10–20 名已批准用户；容量由部署前压测结果决定，不作未经验证的并发承诺。
 **当前 P0 验证基线：** 目标主机为 2 vCPU / 4 GiB RAM；该硬件只用于容量实验，不构成用户数、并发数或响应时间承诺。
@@ -302,7 +302,7 @@ P0 使用 PostgreSQL。每个状态变更在事务中完成，并附加审计事
 |---|---|
 | `users` | `username` 规范化后唯一；`status ∈ pending, approved, blocked`；密码使用强 KDF 哈希；blocked 立即撤销会话和调度权 |
 | `auth_sessions` | 仅存哈希后的 session/refresh token；到期、撤销和设备审计 |
-| `binding_attempts` | 绑定码哈希、平台 user、状态、过期时间；一次性 `/activate` 完成微信身份配对 |
+| `wechat_qr_sessions` | QR 会话 token、平台 user、状态、过期时间；iLink 官方扫码 `confirmed` 时直接返回 `ilink_bot_id`/`bot_token`/`ilink_user_id`/`baseurl` 顶层字段完成绑定，无需 `/activate`（见 [iLink 绑定流程 SPEC](2026-07-25-ilink-official-binding-flow.md)） |
 | `bots` | `owner_id` 唯一；`bot_uuid` 唯一；`ilink_user_id` 在激活后绑定；token 密文、状态、密钥版本 |
 | `bot_transport_state` | 每 bot 独立加密 update cursor、重连状态、错误时间；禁止共享本地 token 文件 |
 | `context_tokens` | `(bot_id, ilink_user_id)` 唯一；加密、到期、最后使用时间；视为能力凭证 |
@@ -326,7 +326,7 @@ requested → qr_pending → awaiting_activation → active
                         └→ revoked
 ```
 
-Web 创建 `BindingAttempt` 后展示二维码。二维码确认仅证明获得 bot token，不假定回包可靠含有用户 iLink ID。用户必须从该 bot 发送一次性 `/activate <code>`；Gateway 以 `bot_uuid + from_user_id + code hash` 原子绑定 `ilink_user_id`。之后每条消息都必须同时匹配 bot 与绑定的 `from_user_id`。
+Web 创建 `wechat_qr_session` 后展示二维码（前端用 `qrcode.react` 本地生成，不直接用 iLink 返回的 URL 做 `<img>`）。平台轮询 iLink `get_qrcode_status`，`confirmed` 时直接拿到 `ilink_bot_id`/`bot_token`/`ilink_user_id`/`baseurl` 顶层字段，原子写入 `bots` 表完成绑定，无需用户额外发 `/activate`。之后每条消息都必须同时匹配 bot 与绑定的 `ilink_user_id`。
 
 ### 5.2 团队邀请状态机
 
@@ -372,7 +372,7 @@ P0 不引入 RabbitMQ、Redis、Celery 等外部消息队列。PostgreSQL `tasks
 
 | 优先级 | 条件 | 动作 |
 |---|---|---|
-| 1 | 绑定激活 | `/activate <one-time-code>` 仅在 `awaiting_activation` 使用 |
+| 1 | 绑定激活 | 已废弃：iLink 官方扫码 `confirmed` 时直接完成绑定，无需 `/activate`（见 [iLink 绑定流程 SPEC](2026-07-25-ilink-official-binding-flow.md) §6.5） |
 | 2 | 活跃 relay | `/断开` 结束；其它非平台保留命令转发；不进入 AI |
 | 3 | pending relay | `/同意 r-123`、`/拒绝 r-123`；仅一个候选时可省短 ID |
 | 4 | pending team 流程 | `/同意 t-456`（成员接受直接邀请）、`/批准 t-456`（Owner 批准成员加入）、`/拒绝 t-456`（任一方拒绝）；Router 按发送者角色与邀请当前状态分发；仅一个候选时可省短 ID |

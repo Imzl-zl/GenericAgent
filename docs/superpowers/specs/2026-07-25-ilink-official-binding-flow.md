@@ -142,10 +142,12 @@ GET /ilink/bot/get_qrcode_status?qrcode={qrcode}
 | 1    | `text_item`    | 文本                          |
 | 2    | `image_item`   | 图片（含缩略图，CDN 加密）   |
 | 3    | `voice_item`   | 语音（.silk）                 |
-| 4    | `file_item`    | 文件                          |
+| 4    | `file_item`    | 文件（**任意格式**：Word/Excel/PDF/ZIP 等，协议层无扩展名白名单） |
 | 5    | `video_item`   | 视频                          |
 
 下载链路：`GET https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=...` → AES-128-ECB 解密。GA Core 的 `frontends/wxbot_media.py` 已实现 4 种入站媒体的下载与解密。
+
+> **文件格式说明：** `file_item` 是通用文件类型，协议层只携带 `file_name`/`md5`/`len` 三个字段，**无扩展名白名单**。Word(.docx)、Excel(.xlsx)、PDF、ZIP 等任意格式均可收发。实际限制来自微信侧（文件大小上限约 100MB/文件、内容安全策略），不是 iLink 协议限制。来源：iLink Bot 协议规范 §5.1 五大消息类型，`FileItem { media, file_name, md5, len }` "支持任意文件格式"。
 
 ### 5.2 发送消息
 
@@ -305,4 +307,14 @@ GA Core 的 [`frontends/wechatapp.py`](file:///c:/sudy/github/GenericAgent/front
    - Go `poller.Client.SendMessageRequest` 新增 `MsgType` / `FilePath` 字段
    - Go `im_webhook.go` webhook body 新增 `media_paths` 字段，路由到 `IncomingMessage.MediaPaths`，并在 prompt 末尾追加 `[Attached files: ...]` 让 GA 的文件工具可读
    - 新增 `--media-dir` flag 控制是否下载入站媒体；空则禁用（保持纯文本模式）
-5. **端到端验证**：需要 mock iLink 服务器 + Poller + 平台联调测试。
+5. **端到端验证**：✅ 已完成（2026-07-25，Windows loopback 模式）。完整链路跑通：mock iLink → Bot Poller → 平台 webhook → Router → Loopback Worker 子进程 → LLM Proxy → deepseek-v4-flash → 回复经 Poller 回送 mock iLink。任务 `succeeded`，mock iLink 收到真实 LLM 回复。
+
+### 7.5 验证期间修复的 bug（2026-07-25）
+
+1. **`bot_transport_store.go` NULL scan 崩溃**：`GetBotTransportState` 把可空的 `last_error_code` 列 scan 进 `string`，NULL 时导致 `RestoreActiveBots` 启动恢复失败。改为 `*string` 解引用。
+2. **`LoopbackConfig` 漏传 `PolicyFile`**：`LoopbackWorkerRuntime.Start` 未设置 `GA_POLICY_FILE` 环境变量，worker 子进程 `entrypoint.py` 因缺少必需 env 直接退出（`REQUIRED_ENV` 校验失败）。`LoopbackConfig` 新增 `PolicyFile` 字段，`cmd/platform` 把 `boot.PolicyFile` 透传进去。
+
+### 7.6 平台边界确认
+
+- **媒体收发走微信，不走 Web**：入站 `wxbot_media.download_media` → `media_paths` → webhook → router 追加到 prompt；出站 `poller.Client.SendMessage(msg_type=image/video/file)` → `WxBotClient.send_image/send_video/send_file` → iLink CDN。Web 端仅做管理面（注册/审批/绑定/人设/provider 配置），不承担对话。
+- **其他 IM 平台复用 GA 封装**：GA `frontends/` 已有 `qqapp.py`/`fsapp.py`/`dingtalkapp.py`/`wecomapp.py`/`tgapp.py`，都继承 `AgentChatMixin`（`on_message` + `send_text`）。接入新平台照搬 WeChat Poller 模式即可，Go 侧 `BotTransportAdapter` 接口平台无关。

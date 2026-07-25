@@ -32,6 +32,12 @@
 > - Added unit tests for delivery retry/dead-letter/ack logic.
 >
 > **Windows/Linux compatibility note:** GA Core (`agentmain.py`) remains cross-platform and runs on Windows unchanged. The Go platform layer defaults to `--worker-runtime=loopback`, which starts a local Python Worker subprocess and works on Windows. Only the optional `--worker-runtime=podman` path (container isolation via rootless Podman) is Linux-only. iLink delivery works on any platform that can reach the iLink base URL.
+
+> **Session 2026-07-25 — Slice 3c (iLink media + Windows loopback E2E + bug fixes):**
+> - Media file send/receive fully wired through WeChat (iLink CDN), NOT through Web UI. Inbound: `wxbot_media.download_media` → `media_paths` in webhook body → router appends to prompt. Outbound: `poller.Client.SendMessage(msg_type=image/video/file)` → `WxBotClient.send_image/send_video/send_file` → iLink CDN upload. `file_item` (iLink type 4) supports any file format (Word/Excel/PDF/ZIP) per official protocol — no extension whitelist at protocol level.
+> - Windows loopback mode (`--worker-runtime=loopback`) verified end-to-end: mock iLink → Bot Poller → Platform → Loopback Worker subprocess → LLM Proxy → deepseek-v4-flash → reply back to mock iLink. No container required on Windows.
+> - Two bugs fixed during verification: (1) `bot_transport_store.go` `last_error_code` NULL scan crash on bot restore — changed to `*string` deref; (2) `LoopbackConfig` missing `PolicyFile` field caused worker subprocess to exit (missing `GA_POLICY_FILE` env var) — added field and wired `boot.PolicyFile` through.
+> - Web UI is management-only (registration/approval/binding/persona/provider config); chat happens in WeChat. Other IM platforms (QQ/Feishu/DingTalk/WeCom/Telegram) can reuse GA's existing `frontends/*.py` via the same Poller pattern. See [iLink binding flow SPEC](../specs/2026-07-25-ilink-official-binding-flow.md) §7.5–§7.6.
 >
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -913,7 +919,7 @@ Record the observed Worker RSS, checkpoint size/time, task latency, and failure 
 
 - `tenant_platform` rootless Podman worker-manager and host capacity.
 - LLM Proxy capability/security hardening.
-- Go iLink BotTransportAdapter and `/activate` binding.
+- Go iLink BotTransportAdapter and QR-based binding (iLink official `confirmed` flow, no `/activate`; see [iLink binding SPEC](../specs/2026-07-25-ilink-official-binding-flow.md)).
 - React Web P0 registration/approval/binding/status UI.
 - Structured `ToolProgress` mapping once the legacy runtime exposes a non-text progress signal; foundation must not infer it from chunk text.
 

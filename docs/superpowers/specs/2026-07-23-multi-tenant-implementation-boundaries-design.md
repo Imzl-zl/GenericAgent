@@ -142,7 +142,7 @@ Worker 镜像构建初期可以在独立构建上下文中携带现有根目录 
 
 - 在 `backend-go/internal/transport/ilink` 实现多 bot token/cursor、长轮询、发送、媒体下载和 token 过期状态。
 - 以现有 `frontends/wechatapp.py` 的可观察协议行为作为迁移参考，不复用其全局 Agent、共享 token 文件或进程级状态。
-- 实现 Web QR 绑定、微信 `/activate` 配对和 from_user_id 复核。
+- 实现 Web QR 绑定（iLink 官方扫码 `confirmed` 时直接完成，无需 `/activate`）和 `ilink_user_id` 复核。详见 [iLink 绑定流程 SPEC](2026-07-25-ilink-official-binding-flow.md)。
 - 验收：多 bot 状态互不覆盖；未批准、未绑定或身份不匹配的消息不能创建 task。
 
 ### Slice 7：React Web

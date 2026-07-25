@@ -19,7 +19,7 @@
 | D5 | 人设 | persona-in-task；团队按 `member.persona_id → team_persona_id → default` |
 | D6 | 持久化 | 每个成功 task 采用文件与数据库分阶段 checkpoint；恢复只认最后一个 committed snapshot；崩溃 running task 不自动重放 |
 | D7 | 密钥 | 真实 LLM Key 只在 LLM Proxy；bot/token/cursor 字段加密 |
-| D8 | 绑定 | QR 后必须 `/activate` 配对 bot UUID 与 `from_user_id` |
+| D8 | 绑定 | QR 扫码即绑定，无需 `/activate`；iLink 官方流程在 `confirmed` 时直接返回 `ilink_bot_id`/`bot_token`/`ilink_user_id`/`baseurl` 顶层字段（见 [iLink 绑定流程 SPEC](2026-07-25-ilink-official-binding-flow.md)） |
 | D9 | 中继 | 仅整句 `@username`；命令冲突用短 ID 状态机 |
 | D10 | 团队邀请 | 邀请码和直接邀请都走双确认 |
 | D11 | 团队 key_info | 共享；PRD 明示隐私边界 |
