@@ -38,7 +38,13 @@ func (s *Server) handleProviderPath(w http.ResponseWriter, r *http.Request, want
 		writeError(w, http.StatusUnauthorized, "MISSING_TOKEN", "Authorization Bearer required")
 		return
 	}
-	claims, err := s.validator.Validate(token, "")
+	// ValidateUnscoped: the LLM Proxy ingress does not have the caller's
+	// session context (the Worker holds it). Signature + expiry + revocation
+	// are still enforced. Per-session binding is enforced by the Worker before
+	// it mints the token, and by the platform before it hands the token to the
+	// Worker: a stolen token can only be used within its own TTL, not replayed
+	// across sessions once the issuing session is revoked.
+	claims, err := s.validator.ValidateUnscoped(token)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", err.Error())
 		return

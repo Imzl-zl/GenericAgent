@@ -116,11 +116,12 @@ func newTestRouter(store *fakeRouterStore, tr *transport.LoopbackTransport) (Rou
 	tasks := &fakeTaskService{}
 	binding := &fakeBindingSvc{}
 	r, _ := NewRouter(RouterConfig{
-		Store:         store,
-		Binding:       binding,
-		Tasks:         tasks,
-		Transport:     tr,
-		ToolPolicy:    "foundation.no-host-tools.v1",
+		Store:          store,
+		Binding:        binding,
+		Tasks:          tasks,
+		Transport:      tr,
+		Messages:       &fakeMessageStore{},
+		ToolPolicy:     "foundation.no-host-tools.v1",
 		SourceInstance: "test-router",
 	})
 	return r, tasks, binding

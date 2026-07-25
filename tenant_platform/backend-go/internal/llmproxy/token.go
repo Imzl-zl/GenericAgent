@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -96,14 +97,40 @@ func NewValidator(signingKey []byte) (*Validator, error) {
 }
 
 // Validate checks signature, expiry, session binding, and revocation.
-// expectedSessionKey, if non-empty, must match the token's session_key.
+// expectedSessionKey MUST be non-empty: a capability_token is always bound to
+// a session, and skipping the binding check would let one session's token
+// mint requests for another. Use ValidateUnscoped only for paths that
+// explicitly do not bind to a session (e.g. LLM Proxy ingress before the
+// caller's session is known).
 func (v *Validator) Validate(token, expectedSessionKey string) (TokenClaims, error) {
+	if expectedSessionKey == "" {
+		return TokenClaims{}, errors.New("expectedSessionKey is required; use ValidateUnscoped for unscoped validation")
+	}
 	claims, err := v.parseAndVerify(token)
 	if err != nil {
 		return TokenClaims{}, err
 	}
-	if expectedSessionKey != "" && claims.SessionKey != expectedSessionKey {
+	if claims.SessionKey != expectedSessionKey {
 		return claims, fmt.Errorf("session_key mismatch: token=%q expected=%q", claims.SessionKey, expectedSessionKey)
+	}
+	now := v.clock().Unix()
+	if claims.ExpiresAt <= now {
+		return claims, fmt.Errorf("token expired at %d (now %d)", claims.ExpiresAt, now)
+	}
+	if v.IsRevoked(claims.Jti) {
+		return claims, fmt.Errorf("token revoked: jti=%s", claims.Jti)
+	}
+	return claims, nil
+}
+
+// ValidateUnscoped checks signature, expiry, and revocation without binding to
+// a session. Use this only when the caller does not have a session context
+// (e.g. LLM Proxy ingress before resolving the worker session). All other
+// paths should use Validate with the session_key from the task context.
+func (v *Validator) ValidateUnscoped(token string) (TokenClaims, error) {
+	claims, err := v.parseAndVerify(token)
+	if err != nil {
+		return TokenClaims{}, err
 	}
 	now := v.clock().Unix()
 	if claims.ExpiresAt <= now {

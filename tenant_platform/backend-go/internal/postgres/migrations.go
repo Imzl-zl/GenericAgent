@@ -43,6 +43,8 @@ func migrationFiles() []string {
 		"0010_user_password_hash.sql",
 		"0011_wechat_qr_session.sql",
 		"0012_bot_transport_cursor_key_version.sql",
+		"0013_messages.sql",
+		"0014_media_assets.sql",
 	}
 }
 
@@ -64,10 +66,14 @@ var pendingMigrations = []struct {
 	{"0010_user_password_hash.sql", "migration_0010_user_password_hash_marker"},
 	{"0011_wechat_qr_session.sql", "migration_0011_wechat_qr_session_marker"},
 	{"0012_bot_transport_cursor_key_version.sql", "migration_0012_bot_transport_cursor_key_version_marker"},
+	{"0013_messages.sql", "migration_0013_messages_marker"},
+	{"0014_media_assets.sql", "migration_0014_media_assets_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
 var foundationTableNames = []string{
+	"media_assets",
+	"messages",
 	"llm_providers",
 	"audit_events",
 	"context_tokens",
@@ -86,6 +92,8 @@ var foundationTableNames = []string{
 	"tool_policies",
 	"migration_0008_user_id_serial_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
+	"migration_0013_messages_marker",
+	"migration_0014_media_assets_marker",
 }
 
 // DropFoundationSchema removes foundation tables and leftover composite types.

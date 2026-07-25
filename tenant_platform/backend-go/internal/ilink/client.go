@@ -19,6 +19,12 @@ const defaultTimeout = 20 * time.Second
 const (
 	qrRetryAttempts = 6
 	qrRetryBase     = 2 * time.Second
+
+	// GetQRCodeStatus is polled by the frontend every 1-2s, so retries must
+	// stay short: 3 attempts with 200ms+400ms backoff caps total wait under
+	// 1s. Network blips should not surface as "binding failed" to the user.
+	qrStatusRetryAttempts   = 3
+	qrStatusRetryBaseDelay  = 200 * time.Millisecond
 )
 
 // ClientConfig wires the iLink client.
@@ -153,18 +159,44 @@ func (c *Client) GetBotQRCode(ctx context.Context) (QRCodeResponse, error) {
 	return QRCodeResponse{}, fmt.Errorf("exhausted %d attempts: %w", c.cfg.RetryAttempts, lastErr)
 }
 
-// GetQRCodeStatus polls the scan status of a QR code.
+// GetQRCodeStatus polls the scan status of a QR code. It retries on transient
+// network errors and 5xx responses so a brief iLink blip does not surface as
+// "binding failed" to the user. 4xx and business errors (ret != 0) are not
+// retried: they reflect an authoritative server decision.
 func (c *Client) GetQRCodeStatus(ctx context.Context, qrCode string) (QRCodeStatusResponse, error) {
 	if qrCode == "" {
 		return QRCodeStatusResponse{}, errors.New("qrcode is required")
 	}
 	url := fmt.Sprintf("%s/ilink/bot/get_qrcode_status?qrcode=%s", strings.TrimRight(c.cfg.BaseURL, "/"), qrCode)
+	var lastErr error
+	for attempt := 0; attempt < qrStatusRetryAttempts; attempt++ {
+		if attempt > 0 {
+			sleep := qrStatusRetryBaseDelay << (attempt - 1) // 200ms, 400ms
+			select {
+			case <-ctx.Done():
+				return QRCodeStatusResponse{}, ctx.Err()
+			case <-time.After(sleep):
+			}
+		}
+		resp, err := c.doQRStatusRequest(ctx, url)
+		if err == nil {
+			return resp, nil
+		}
+		if !isRetryableStatusErr(err) {
+			return resp, err
+		}
+		lastErr = err
+	}
+	return QRCodeStatusResponse{}, fmt.Errorf("exhausted %d attempts: %w", qrStatusRetryAttempts, lastErr)
+}
+
+// doQRStatusRequest builds and sends one get_qrcode_status request.
+func (c *Client) doQRStatusRequest(ctx context.Context, url string) (QRCodeStatusResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return QRCodeStatusResponse{}, fmt.Errorf("build request: %w", err)
 	}
 	c.setCommonHeaders(req)
-
 	var resp QRCodeStatusResponse
 	if err := c.do(req, &resp); err != nil {
 		return QRCodeStatusResponse{}, err
@@ -176,6 +208,32 @@ func (c *Client) GetQRCodeStatus(ctx context.Context, qrCode string) (QRCodeStat
 		return QRCodeStatusResponse{}, errors.New("ilink returned empty status")
 	}
 	return resp, nil
+}
+
+// isRetryableStatusErr reports whether the error is worth retrying. Network
+// errors and 5xx HTTP responses are retryable; 4xx and business errors (ret
+// != 0) are not, because the server has given an authoritative answer.
+func isRetryableStatusErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *httpStatusError
+	if errors.As(err, &httpErr) {
+		return httpErr.status >= 500
+	}
+	// Network / connection errors: retry.
+	return true
+}
+
+// httpStatusError wraps a non-2xx HTTP response so callers can branch on
+// status class. Created by Client.do.
+type httpStatusError struct {
+	status int
+	body   string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("ilink status %d: %s", e.status, e.body)
 }
 
 func (c *Client) setCommonHeaders(req *http.Request) {
@@ -195,7 +253,9 @@ func (c *Client) do(req *http.Request, out any) error {
 		return fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("ilink status %d: %s", resp.StatusCode, string(body))
+		// Return a typed error so callers (e.g. GetQRCodeStatus retry) can
+		// branch on status class to decide retryability.
+		return &httpStatusError{status: resp.StatusCode, body: string(body)}
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("decode body: %w (body=%s)", err, string(body))

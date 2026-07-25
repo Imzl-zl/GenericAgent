@@ -15,6 +15,7 @@ func TestNewDeliveryServiceRequiresAllPorts(t *testing.T) {
 	bots := &fakeBotResolver{}
 	transport := &fakeTransport{}
 	results := &fakeResultReader{}
+	messages := &fakeMessageStore{}
 
 	mustFail := func(name string, cfg DeliveryServiceConfig) {
 		t.Helper()
@@ -24,11 +25,12 @@ func TestNewDeliveryServiceRequiresAllPorts(t *testing.T) {
 		}
 	}
 
-	mustFail("missing store", DeliveryServiceConfig{Tasks: tasks, Bots: bots, Transport: transport, Results: results})
-	mustFail("missing tasks", DeliveryServiceConfig{Store: store, Bots: bots, Transport: transport, Results: results})
-	mustFail("missing bots", DeliveryServiceConfig{Store: store, Tasks: tasks, Transport: transport, Results: results})
-	mustFail("missing transport", DeliveryServiceConfig{Store: store, Tasks: tasks, Bots: bots, Results: results})
-	mustFail("missing results", DeliveryServiceConfig{Store: store, Tasks: tasks, Bots: bots, Transport: transport})
+	mustFail("missing store", DeliveryServiceConfig{Tasks: tasks, Bots: bots, Transport: transport, Results: results, Messages: messages})
+	mustFail("missing tasks", DeliveryServiceConfig{Store: store, Bots: bots, Transport: transport, Results: results, Messages: messages})
+	mustFail("missing bots", DeliveryServiceConfig{Store: store, Tasks: tasks, Transport: transport, Results: results, Messages: messages})
+	mustFail("missing transport", DeliveryServiceConfig{Store: store, Tasks: tasks, Bots: bots, Results: results, Messages: messages})
+	mustFail("missing results", DeliveryServiceConfig{Store: store, Tasks: tasks, Bots: bots, Transport: transport, Messages: messages})
+	mustFail("missing messages", DeliveryServiceConfig{Store: store, Tasks: tasks, Bots: bots, Transport: transport, Results: results})
 }
 
 func TestDeliveryServiceAcksTaskComplete(t *testing.T) {
@@ -124,6 +126,7 @@ type deliveryDeps struct {
 	bots      *fakeBotResolver
 	transport *fakeTransport
 	results   *fakeResultReader
+	messages  *fakeMessageStore
 }
 
 func setupDeliveryService(t *testing.T) (context.Context, *deliveryService, deliveryDeps) {
@@ -134,6 +137,7 @@ func setupDeliveryService(t *testing.T) (context.Context, *deliveryService, deli
 		bots:      &fakeBotResolver{},
 		transport: &fakeTransport{},
 		results:   &fakeResultReader{},
+		messages:  &fakeMessageStore{},
 	}
 	svc, err := NewDeliveryService(DeliveryServiceConfig{
 		Store:     deps.store,
@@ -141,6 +145,7 @@ func setupDeliveryService(t *testing.T) (context.Context, *deliveryService, deli
 		Bots:      deps.bots,
 		Transport: deps.transport,
 		Results:   deps.results,
+		Messages:  deps.messages,
 		Now:       func() time.Time { return time.Now().UTC() },
 	})
 	if err != nil {
@@ -241,4 +246,37 @@ type fakeResultReader struct {
 
 func (r *fakeResultReader) ReadResult(_ context.Context, _, _ string) (domain.ResultPayload, error) {
 	return r.payload, r.err
+}
+
+type fakeMessageStore struct {
+	inbound  []domain.Message
+	outbound []domain.Message
+	assets   []domain.MediaAsset
+	inErr    error
+	outErr   error
+	assetErr error
+}
+
+func (s *fakeMessageStore) InsertInboundMessage(_ context.Context, m domain.Message) (domain.Message, error) {
+	if s.inErr != nil {
+		return domain.Message{}, s.inErr
+	}
+	s.inbound = append(s.inbound, m)
+	return m, nil
+}
+
+func (s *fakeMessageStore) InsertOutboundMessage(_ context.Context, m domain.Message) (domain.Message, error) {
+	if s.outErr != nil {
+		return domain.Message{}, s.outErr
+	}
+	s.outbound = append(s.outbound, m)
+	return m, nil
+}
+
+func (s *fakeMessageStore) InsertMediaAsset(_ context.Context, m domain.MediaAsset) (domain.MediaAsset, error) {
+	if s.assetErr != nil {
+		return domain.MediaAsset{}, s.assetErr
+	}
+	s.assets = append(s.assets, m)
+	return m, nil
 }

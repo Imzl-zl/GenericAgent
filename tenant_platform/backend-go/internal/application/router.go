@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -43,10 +44,23 @@ type IncomingMessage struct {
 	IlinkUserID string
 	MessageID   string
 	Text        string
-	// MediaPaths are local file paths of inbound media downloaded by the
-	// Bot Poller. Empty for text-only messages. The router surfaces them in
-	// the task prompt so GA's file tools can read them.
+	// MediaPaths are absolute local file paths of inbound media downloaded by
+	// the Bot Poller. Surfaced in the task prompt so GA's file tools can read
+	// them. Empty for text-only messages.
 	MediaPaths []string
+	// MediaItems is the metadata for each media file (file_name, relative
+	// storage_path, content_type, size). Used to populate the media_assets
+	// table for audit / Web UI history / cross-instance idempotency.
+	MediaItems []IncomingMediaItem
+}
+
+// IncomingMediaItem is the per-file metadata forwarded by the Bot Poller.
+// StoragePath is RELATIVE to media_dir so the same row works across mount points.
+type IncomingMediaItem struct {
+	FileName    string
+	StoragePath string
+	ContentType string
+	Size        int64
 }
 
 // RouterStore is the persistence port for router identity resolution.
@@ -55,6 +69,15 @@ type RouterStore interface {
 	GetUserStatus(ctx context.Context, userID int64) (domain.UserStatus, error)
 	GetUserToolPolicy(ctx context.Context, userID int64) (string, error)
 	FindRunningTaskBySession(ctx context.Context, sessionKey string) (domain.Task, error)
+}
+
+// MessageStore persists inbound and outbound WeChat messages for history,
+// audit, and Web UI rendering. The router uses it as the durable idempotency
+// backstop (replacing the in-memory seen map as the source of truth).
+type MessageStore interface {
+	InsertInboundMessage(ctx context.Context, m domain.Message) (domain.Message, error)
+	InsertOutboundMessage(ctx context.Context, m domain.Message) (domain.Message, error)
+	InsertMediaAsset(ctx context.Context, m domain.MediaAsset) (domain.MediaAsset, error)
 }
 
 // CommandRegistry supplies the admin-configurable command list.
@@ -74,6 +97,7 @@ type RouterConfig struct {
 	Tasks          TaskService
 	Transport      transport.BotTransportAdapter
 	Commands       CommandRegistry
+	Messages       MessageStore
 	ToolPolicy     string
 	SourceInstance string
 }
@@ -94,6 +118,7 @@ type router struct {
 	tasks          TaskService
 	transport      transport.BotTransportAdapter
 	commands       CommandRegistry
+	messages       MessageStore
 	toolPolicy     string
 	sourceInstance string
 	// Trigger-invalidated cache for command registry. Admin update handlers
@@ -108,6 +133,9 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 	if cfg.Store == nil || cfg.Binding == nil || cfg.Tasks == nil || cfg.Transport == nil {
 		return nil, fmt.Errorf("store, binding, tasks, and transport are required")
 	}
+	if cfg.Messages == nil {
+		return nil, fmt.Errorf("message store is required")
+	}
 	if cfg.ToolPolicy == "" {
 		return nil, fmt.Errorf("tool policy version is required")
 	}
@@ -120,6 +148,7 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 		tasks:          cfg.Tasks,
 		transport:      cfg.Transport,
 		commands:       cfg.Commands,
+		messages:       cfg.Messages,
 		toolPolicy:     cfg.ToolPolicy,
 		sourceInstance: cfg.SourceInstance,
 	}, nil
@@ -144,6 +173,18 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 		reply := "unknown bot"
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 		return RouterResult{Action: ActionRejected, Reply: reply}, nil
+	}
+	// Persist inbound message for history/audit and as the cross-instance
+	// idempotency backstop. The partial UNIQUE(bot_id, message_id) index
+	// rejects duplicates when the in-memory seen map is cold (restart) or
+	// split across instances. Persistence failure is non-fatal: the message
+	// is still routed so the user is not blocked; the missing audit row is
+	// acceptable, but we log loudly so DB issues surface fast.
+	if _, perr := r.persistInbound(ctx, msg, bot); perr != nil {
+		if errors.Is(perr, domain.ErrDuplicateInboundMessage) {
+			return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
+		}
+		log.Printf("router: persist inbound message %s failed: %v", msg.MessageID, perr)
 	}
 	// Unbound bot: only /activate is allowed (spec §6.1 step 2).
 	if !bot.IsBound() {
@@ -441,6 +482,60 @@ func parseActivateCommand(text string) (string, bool) {
 // personalSessionKey returns the session key for a user's personal workspace.
 func personalSessionKey(userID int64) string {
 	return fmt.Sprintf("personal:%d", userID)
+}
+
+// persistInbound writes the received message to the message store and inserts
+// a media_assets row for each media item. The first media path (if any) is
+// persisted alongside the text body for quick access. Media asset insertions
+// are best-effort: failures are logged but do not block message routing, and
+// duplicates (ErrDuplicateMediaAsset) are silent successes (the cross-instance
+// UNIQUE constraint already recorded the file).
+func (r *router) persistInbound(ctx context.Context, msg IncomingMessage, bot domain.Bot) (domain.Message, error) {
+	mediaPath := ""
+	if len(msg.MediaPaths) > 0 {
+		mediaPath = msg.MediaPaths[0]
+	}
+	msgRow, err := r.messages.InsertInboundMessage(ctx, domain.Message{
+		UserID:      bot.OwnerID,
+		BotID:       bot.ID,
+		SessionKey:  personalSessionKey(bot.OwnerID),
+		MessageID:   msg.MessageID,
+		MessageType: inferMessageType(msg.MediaPaths),
+		Content:     msg.Text,
+		MediaPath:   mediaPath,
+	})
+	if err != nil {
+		return msgRow, err
+	}
+	// Insert media_assets metadata. Idempotent (UNIQUE on message_id +
+	// storage_path). Failure is non-fatal: the message is already persisted
+	// and routed; a missing media audit row is acceptable.
+	for _, item := range msg.MediaItems {
+		_, merr := r.messages.InsertMediaAsset(ctx, domain.MediaAsset{
+			UserID:      bot.OwnerID,
+			BotID:       bot.ID,
+			MessageID:   msgRow.ID,
+			FileName:    item.FileName,
+			StoragePath: item.StoragePath,
+			ContentType: item.ContentType,
+			SizeBytes:   item.Size,
+			Direction:   domain.MessageInbound,
+		})
+		if merr != nil && !errors.Is(merr, domain.ErrDuplicateMediaAsset) {
+			log.Printf("router: persist media asset %s failed: %v", item.StoragePath, merr)
+		}
+	}
+	return msgRow, nil
+}
+
+// inferMessageType maps media presence to a coarse type. The Poller does not
+// currently forward the iLink item type, so all media is labelled "file".
+// Upgrading the webhook body to carry item type will enable image/voice/video.
+func inferMessageType(mediaPaths []string) string {
+	if len(mediaPaths) == 0 {
+		return domain.MessageTypeText
+	}
+	return domain.MessageTypeFile
 }
 
 // nowFunc is overridable for tests.

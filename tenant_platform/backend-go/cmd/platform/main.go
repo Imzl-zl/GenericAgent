@@ -593,6 +593,7 @@ func run() error {
 		Tasks:          svc,
 		Transport:      botTransport,
 		Commands:       store, // DB-driven command registry (migration 0004)
+		Messages:       store, // messages table (migration 0013)
 		ToolPolicy:     strings.TrimSpace(*modelPolicyVersion),
 		SourceInstance: instanceID,
 	})
@@ -634,6 +635,7 @@ func run() error {
 			Bots:         store,
 			Transport:    botTransport,
 			Results:      coord,
+			Messages:     store, // audit outbound replies (migration 0013)
 			PollInterval: 2 * time.Second,
 			ClaimLease:   30 * time.Second,
 			RetryWindow:  5 * time.Minute,

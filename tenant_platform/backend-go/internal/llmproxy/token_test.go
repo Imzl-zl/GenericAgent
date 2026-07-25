@@ -113,9 +113,23 @@ func TestTokenRevocation(t *testing.T) {
 func TestTokenRejectsMalformed(t *testing.T) {
 	v := newTestValidator(t)
 	for _, bad := range []string{"", "garbage", "a.b.c", "a.b"} {
-		if _, err := v.Validate(bad, ""); err == nil {
+		if _, err := v.ValidateUnscoped(bad); err == nil {
 			t.Fatalf("expected error for %q", bad)
 		}
+	}
+}
+
+// TestTokenValidateRejectsEmptySession ensures callers cannot accidentally
+// skip session binding by passing an empty string.
+func TestTokenValidateRejectsEmptySession(t *testing.T) {
+	iss := newTestIssuer(t, time.Hour)
+	token, _, err := iss.Issue("personal:42", "p", "openai_compatible", "gpt-test")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	v := newTestValidator(t)
+	if _, err := v.Validate(token, ""); err == nil {
+		t.Fatal("expected error when Validate is called with empty session_key")
 	}
 }
 

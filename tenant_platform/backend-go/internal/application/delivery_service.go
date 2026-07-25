@@ -62,6 +62,7 @@ type DeliveryServiceConfig struct {
 	Bots         BotResolverByOwner
 	Transport    transport.BotTransportAdapter
 	Results      ResultReader
+	Messages     MessageStore
 	PollInterval time.Duration
 	ClaimLease   time.Duration
 	RetryWindow  time.Duration
@@ -109,6 +110,9 @@ func NewDeliveryService(cfg DeliveryServiceConfig) (DeliveryService, error) {
 	}
 	if cfg.Results == nil {
 		return nil, errors.New("ResultReader is required")
+	}
+	if cfg.Messages == nil {
+		return nil, errors.New("MessageStore is required")
 	}
 	return &deliveryService{cfg: cfg}, nil
 }
@@ -178,6 +182,20 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 	defer cancel()
 	if err := s.cfg.Transport.SendMessage(sendCtx, bot.BotUUID, bot.IlinkUserID, text); err != nil {
 		return s.retryOrDeadLetter(ctx, d, task, "SEND_FAILED", err.Error(), now)
+	}
+	// Audit the outbound reply. Failure is non-fatal: the message has been
+	// sent, so we still ack the delivery. The alternative (not acking) would
+	// cause a duplicate send on the next tick, which is worse than a missing
+	// audit row. The log surfaces DB issues without blocking the user.
+	if _, err := s.cfg.Messages.InsertOutboundMessage(ctx, domain.Message{
+		UserID:      bot.OwnerID,
+		BotID:       bot.ID,
+		SessionKey:  personalSessionKey(bot.OwnerID),
+		MessageType: domain.MessageTypeText,
+		Content:     text,
+		TaskID:      task.ID,
+	}); err != nil {
+		log.Printf("delivery: audit outbound for delivery %s failed: %v", d.DeliveryID, err)
 	}
 	return s.cfg.Store.MarkDeliveryAcked(ctx, d.DeliveryID, now)
 }

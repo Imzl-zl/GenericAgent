@@ -46,6 +46,36 @@ from wxbot_media import download_media  # noqa: E402
 POLL_TIMEOUT = 30
 WEBHOOK_TIMEOUT = 10
 
+# Map file extension to MIME content_type. Used to populate media_assets
+# metadata when the Poller forwards inbound media to the platform webhook.
+# iLink does not surface a content_type field in item_list, so we infer from
+# the file_name returned by wxbot_media.download_media.
+_EXT_CONTENT_TYPES = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.gif': 'image/gif', '.bmp': 'image/bmp', '.webp': 'image/webp',
+    '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo',
+    '.pdf': 'application/pdf',
+    '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xls': 'application/vnd.ms-excel',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.ppt': 'application/vnd.ms-powerpoint',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.zip': 'application/zip', '.rar': 'application/x-rar-compressed',
+    '.7z': 'application/x-7z-compressed', '.tar': 'application/x-tar',
+    '.gz': 'application/gzip',
+    '.silk': 'audio/silk', '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
+    '.m4a': 'audio/mp4', '.aac': 'audio/aac',
+    '.txt': 'text/plain', '.md': 'text/markdown',
+    '.csv': 'text/csv', '.json': 'application/json',
+}
+
+
+def _guess_content_type(file_name):
+    """Infer MIME type from file extension. Defaults to octet-stream."""
+    ext = os.path.splitext(file_name)[1].lower()
+    return _EXT_CONTENT_TYPES.get(ext, 'application/octet-stream')
+
 
 def _parse_listen_addr(listen):
     """Parse 'host:port' into (host, port_int). Raises ValueError on bad input."""
@@ -124,9 +154,11 @@ class BotManager:
         """Forward one inbound message to the platform webhook.
 
         Downloads any media items via wxbot_media.download_media and includes
-        the resulting local file paths in the webhook body as `media_paths`.
-        Text is still extracted so text-only routing (commands, /stop, etc.)
-        keeps working when a message contains both text and media items.
+        the resulting local file paths in the webhook body as `media_paths`
+        (for the worker to read) plus `media_items` (metadata for the
+        platform to persist in media_assets). Text is still extracted so
+        text-only routing (commands, /stop, etc.) keeps working when a
+        message contains both text and media items.
         """
         mid = str(msg.get('message_id', 0))
         if not entry.client.is_user_msg(msg) or mid in seen:
@@ -138,14 +170,47 @@ class BotManager:
         uid = msg.get('from_user_id', '')
         ctx = msg.get('context_token', '')
         media_paths = []
+        media_items = []
         if entry.media_dir:
             try:
                 media_paths = download_media(msg.get('item_list', []), dest_dir=entry.media_dir)
+                media_items = self._collect_media_items(media_paths)
             except Exception as exc:
                 print(f'[Poller] media dl err ({entry.bot_uuid}): {exc}', flush=True)
-        self._post_webhook(entry, uid, mid, text, ctx, media_paths)
+        self._post_webhook(entry, uid, mid, text, ctx, media_paths, media_items)
 
-    def _post_webhook(self, entry, uid, mid, text, ctx, media_paths):
+    def _collect_media_items(self, paths):
+        """Build metadata for each downloaded media file.
+
+        Returns list of dicts with file_name, storage_path (relative to
+        media_root), content_type, size. storage_path uses forward slashes
+        for cross-platform compatibility (Windows backslashes normalized)
+        so the same DB row works when media_root is re-pointed to NFS or
+        an S3 mount.
+        """
+        if not paths:
+            return []
+        items = []
+        for path in paths:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            file_name = os.path.basename(path)
+            if self._media_root:
+                rel = os.path.relpath(path, self._media_root)
+            else:
+                rel = file_name
+            storage_path = rel.replace('\\', '/')
+            items.append({
+                'file_name': file_name,
+                'storage_path': storage_path,
+                'content_type': _guess_content_type(file_name),
+                'size': size,
+            })
+        return items
+
+    def _post_webhook(self, entry, uid, mid, text, ctx, media_paths, media_items):
         body = {
             'bot_uuid': entry.bot_uuid,
             'ilink_user_id': uid,
@@ -154,6 +219,7 @@ class BotManager:
             'context_token': ctx,
             'updates_buf': entry.client.updates_buf,
             'media_paths': media_paths or [],
+            'media_items': media_items or [],
         }
         try:
             requests.post(entry.webhook_url, json=body, timeout=WEBHOOK_TIMEOUT)

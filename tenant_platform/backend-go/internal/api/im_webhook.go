@@ -12,17 +12,48 @@ import (
 // The Poller reuses GA Core's WxBotClient and forwards every inbound message
 // here. Two payload variants exist:
 //   - normal message: bot_uuid, ilink_user_id, message_id, text, updates_buf,
-//     context_token, media_paths (downloaded inbound media file paths)
+//     context_token, media_paths (absolute local paths for the worker),
+//     media_items (metadata for media_assets persistence)
 //   - auth-expired signal: bot_uuid, auth_expired=true
 type imWebhookBody struct {
-	BotUUID      string   `json:"bot_uuid"`
-	IlinkUserID  string   `json:"ilink_user_id"`
-	MessageID    string   `json:"message_id"`
-	Text         string   `json:"text"`
-	UpdatesBuf   string   `json:"updates_buf"`
-	ContextToken string   `json:"context_token"`
-	AuthExpired  bool     `json:"auth_expired"`
-	MediaPaths   []string `json:"media_paths"`
+	BotUUID      string         `json:"bot_uuid"`
+	IlinkUserID  string         `json:"ilink_user_id"`
+	MessageID    string         `json:"message_id"`
+	Text         string         `json:"text"`
+	UpdatesBuf   string         `json:"updates_buf"`
+	ContextToken string         `json:"context_token"`
+	AuthExpired  bool           `json:"auth_expired"`
+	MediaPaths   []string       `json:"media_paths"`
+	MediaItems   []webhookMedia `json:"media_items"`
+}
+
+// webhookMedia is one media item's metadata forwarded by the Bot Poller.
+// storage_path is RELATIVE to the poller's --media-dir so the DB row is
+// portable across mount points (local disk -> NFS -> S3 mount).
+type webhookMedia struct {
+	FileName    string `json:"file_name"`
+	StoragePath string `json:"storage_path"`
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
+}
+
+// convertWebhookMedia maps the wire-format media items to the application
+// layer's IncomingMediaItem. The split keeps the API struct free of
+// application-layer imports.
+func convertWebhookMedia(items []webhookMedia) []application.IncomingMediaItem {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]application.IncomingMediaItem, 0, len(items))
+	for _, it := range items {
+		out = append(out, application.IncomingMediaItem{
+			FileName:    it.FileName,
+			StoragePath: it.StoragePath,
+			ContentType: it.ContentType,
+			Size:        it.Size,
+		})
+	}
+	return out
 }
 
 // handleIMWebhook receives inbound messages from the Bot Poller and routes them
@@ -77,6 +108,7 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 		MessageID:   body.MessageID,
 		Text:        body.Text,
 		MediaPaths:  body.MediaPaths,
+		MediaItems:  convertWebhookMedia(body.MediaItems),
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "ROUTER_ERROR", err.Error(), tid)
