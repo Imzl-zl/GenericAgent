@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -40,9 +43,17 @@ type RuntimeConfig struct {
 	Executor Executor
 }
 
+// sessionKeyPattern guards against path traversal and container-name
+// injection. Allowed chars: alphanumerics, underscore, dot, colon, hyphen.
+// Length capped at 128 to bound filesystem paths and container names.
+var sessionKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,128}$`)
+
 // Runtime owns container allocation and release for the worker-manager.
+// All map mutations are guarded by mu; container create/stop are run outside
+// the write lock so a slow Podman call cannot block List/Release of others.
 type Runtime struct {
 	cfg        RuntimeConfig
+	mu         sync.RWMutex
 	containers map[string]*Container
 }
 
@@ -67,10 +78,33 @@ func validateRuntimeConfig(cfg RuntimeConfig) error {
 	return nil
 }
 
+// validateSessionKey rejects empty or pattern-mismatched keys, preventing
+// path traversal (../, /, NUL) and container-name injection.
+func validateSessionKey(sessionKey string) error {
+	if sessionKey == "" {
+		return fmt.Errorf("session key is required")
+	}
+	if !sessionKeyPattern.MatchString(sessionKey) {
+		return fmt.Errorf("session key contains illegal characters or exceeds 128 bytes: %q", sessionKey)
+	}
+	return nil
+}
+
+// safeSessionDir joins root and sessionKey and verifies the result stays
+// inside root (defense-in-depth against traversal even after pattern check).
+func safeSessionDir(root, sessionKey string) (string, error) {
+	cleanRoot := filepath.Clean(root)
+	joined := filepath.Join(cleanRoot, sessionKey)
+	if !strings.HasPrefix(joined+string(filepath.Separator), cleanRoot+string(filepath.Separator)) {
+		return "", fmt.Errorf("session path escapes root: %q", joined)
+	}
+	return joined, nil
+}
+
 // Allocate runs a new container for the session and returns its metadata.
 func (r *Runtime) Allocate(ctx context.Context, sessionKey, configRoot, runtimeRoot string) (*Container, error) {
-	if sessionKey == "" {
-		return nil, fmt.Errorf("session key is required")
+	if err := validateSessionKey(sessionKey); err != nil {
+		return nil, err
 	}
 	if err := prepareSessionDirs(runtimeRoot, sessionKey); err != nil {
 		return nil, err
@@ -85,7 +119,9 @@ func (r *Runtime) Allocate(ctx context.Context, sessionKey, configRoot, runtimeR
 		SocketPath: socketPath(runtimeRoot, sessionKey),
 		CreatedAt:  time.Now(),
 	}
+	r.mu.Lock()
 	r.containers[c.ID] = c
+	r.mu.Unlock()
 	return c, nil
 }
 
@@ -99,25 +135,30 @@ func (r *Runtime) Release(ctx context.Context, id string) error {
 		return fmt.Errorf("stop container %s: %w", id, err)
 	}
 	_, _ = r.cfg.Executor.Run(ctx, []string{"rm", id})
+	r.mu.Lock()
 	delete(r.containers, id)
+	r.mu.Unlock()
 	return nil
 }
 
 // List returns a snapshot of active containers.
 func (r *Runtime) List() []*Container {
+	r.mu.RLock()
 	out := make([]*Container, 0, len(r.containers))
 	for _, c := range r.containers {
 		out = append(out, c)
 	}
+	r.mu.RUnlock()
 	return out
 }
 
 func prepareSessionDirs(runtimeRoot, sessionKey string) error {
-	dirs := []string{
-		runtimeDir(runtimeRoot, sessionKey),
-		socketDir(runtimeRoot, sessionKey),
+	base, err := safeSessionDir(runtimeRoot, sessionKey)
+	if err != nil {
+		return err
 	}
-	for _, d := range dirs {
+	for _, sub := range []string{"runtime", "rpc"} {
+		d := filepath.Join(base, sub)
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
@@ -136,12 +177,15 @@ func (r *Runtime) runContainer(ctx context.Context, sessionKey, configRoot, runt
 
 func (r *Runtime) containerArgs(sessionKey, configRoot, runtimeRoot string) []string {
 	name := containerName(sessionKey)
+	base, _ := safeSessionDir(runtimeRoot, sessionKey)
 	return []string{
 		"run", "-d", "--rm",
 		"--name", name,
-		"-v", configRoot + ":/ga/config:ro",
-		"-v", runtimeDir(runtimeRoot, sessionKey) + ":/ga/runtime:rw",
-		"-v", socketDir(runtimeRoot, sessionKey) + ":/ga/rpc:rw",
+		// P1 hardening: drop all capabilities, run as non-root, read-only rootfs.
+		// "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+		"-v", filepath.Clean(configRoot) + ":/ga/config:ro",
+		"-v", filepath.Join(base, "runtime") + ":/ga/runtime:rw",
+		"-v", filepath.Join(base, "rpc") + ":/ga/rpc:rw",
 		"-e", "GA_CONFIG_ROOT=/ga/config",
 		"-e", "GA_LEGACY_ROOT=/ga/legacy",
 		"-e", "GA_RUNTIME_DIR=/ga/runtime",
@@ -156,18 +200,7 @@ func containerName(sessionKey string) string {
 	return "ga-worker-" + sessionKey
 }
 
-func runtimeDir(runtimeRoot, sessionKey string) string {
-	return sessionDir(runtimeRoot, sessionKey) + "/runtime"
-}
-
-func socketDir(runtimeRoot, sessionKey string) string {
-	return sessionDir(runtimeRoot, sessionKey) + "/rpc"
-}
-
 func socketPath(runtimeRoot, sessionKey string) string {
-	return runtimeRoot + "/" + sessionKey + "/rpc/worker.sock"
-}
-
-func sessionDir(runtimeRoot, sessionKey string) string {
-	return runtimeRoot + "/" + sessionKey
+	base, _ := safeSessionDir(runtimeRoot, sessionKey)
+	return filepath.Join(base, "rpc", "worker.sock")
 }

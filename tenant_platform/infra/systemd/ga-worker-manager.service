@@ -26,15 +26,18 @@ User=ga
 Group=ga
 WorkingDirectory=/opt/ga
 
-# ExecStart — listens on a Unix socket so the platform connects without
-# exposing the manager to the network. The socket is created by systemd
-# via a paired .socket unit (see ga-worker-manager.socket).
+# ExecStart — listens on loopback TCP. P2 hardening: switch to a systemd
+# .socket unit and unix:// listen address to avoid any network exposure.
+# Flags must match cmd/worker-manager/main.go exactly:
+#   --listen   gRPC listen address (default 127.0.0.1:50051)
+#   --image    Worker container image
+#   --podman   Podman binary path
+# config-root/runtime-root are passed per-allocate via gRPC metadata
+# (P2 enhancement: add --config-root/--runtime-root server-side defaults).
 ExecStart=/opt/ga/bin/worker-manager \
-  --listen=unix:///run/ga/worker-manager.sock \
-  --podman-binary=/usr/bin/podman \
-  --worker-image=ghcr.io/imzl-zl/genericagent-worker:latest \
-  --config-root=/etc/ga/config \
-  --runtime-root=/var/lib/ga/runtime
+  --listen=127.0.0.1:50051 \
+  --image=ghcr.io/imzl-zl/genericagent-worker:latest \
+  --podman=/usr/bin/podman
 
 NoNewPrivileges=true
 PrivateTmp=true

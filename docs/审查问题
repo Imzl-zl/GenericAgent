@@ -1,0 +1,844 @@
+# Storage/Delivery/Migrations 模块深度静态审查报告
+
+## CRITICAL
+
+### C1. `RecoverAfterRestart` 单实例部署下自身过期任务永远卡死
+**文件**: `backend-go/internal/postgres/store.go:540-580`
+
+```sql
+WHERE status IN ('starting','running')
+  AND claim_owner IS NOT NULL
+  AND claim_owner <> $1          -- 跳过自身实例
+  AND claim_lease_until < timezone('utc', now())
+```
+
+**问题**: 函数过滤 `claim_owner <> $1`,只恢复"其他"实例的过期任务。在单实例部署中,如果该实例崩溃重启,它自身的 starting/running 任务的 lease 会过期,但因为 `claim_owner == $1` 被跳过,永远不会被恢复。
+
+**影响**: 单实例部署下,实例崩溃重启后,所有 starting/running 任务永久卡死,占用 `one_running_task_per_session` 唯一索引,该 session 再也无法调度新任务。调度槽被永久占用。
+
+**建议方向**: 区分"重启前"和"重启后"的实例身份(例如用 instance 启动时间戳或 epoch),或者让 RecoverAfterRestart 也恢复自身过期 lease 的任务(因为重启后内存状态已丢失,旧 lease 已无效)。
+
+---
+
+## HIGH
+
+### H1. Delivery Outbox 死信/ACK 竞态:状态机无防护 UPDATE
+**文件**: `backend-go/internal/postgres/delivery_store.go:72-118`
+
+`DeadLetterExpiredDeliveries`、`MarkDeliveryAcked`、`MarkDeliveryRetry`、`MarkDeliveryDeadLetter` 四个函数的 UPDATE 都**不检查当前 status**:
+
+```sql
+-- MarkDeliveryAcked (line 92)
+UPDATE task_deliveries SET status = 'acked', ... WHERE delivery_id = $1
+-- DeadLetterExpiredDeliveries (line 73)
+UPDATE task_deliveries d SET status = 'dead_letter', ...
+WHERE d.status IN ('pending','sending') AND ...
+```
+
+**竞态场景**:
+1. 实例 A: `ClaimPendingDeliveries` 认领行 R(status→'sending', lease=30s)
+2. 实例 A 处理 R(发送 iLink RPC,耗时接近 lease)
+3. 实例 B: `DeadLetterExpiredDeliveries` 看到 R 的 retry window 已过期(R 仍在 'sending'),将 R→'dead_letter'
+4. 实例 A 发送完成,调用 `MarkDeliveryAcked`,把 'dead_letter'→'acked',死信状态丢失
+
+**影响**: 同一条投递既被死信又被 ACK,状态机被破坏。如果死信触发了告警/人工处理流程,会产生重复通知或误导运维。`delivery_service.tick()` 中 Recover→Claim 的顺序只保证单实例内的顺序,跨实例无防护。
+
+**建议方向**: 所有状态变更 UPDATE 加 `WHERE status IN (...)` 前置状态守卫(只允许从特定状态转移),或者用乐观锁(version 列)。至少 `MarkDeliveryAcked` 应该限定 `WHERE status = 'sending'`。
+
+---
+
+### H2. `CancelTask` 与并发 Cancel 的竞态返回误导性错误
+**文件**: `backend-go/internal/postgres/store.go:499-511`
+
+```go
+if t.CancelRequestedAt == nil {
+    row = tx.QueryRow(ctx, `
+UPDATE tasks SET cancel_requested_at = timezone('utc', now()), ...
+WHERE id = $1 AND cancel_requested_at IS NULL
+RETURNING ...`, taskID)
+    t, err = scanTask(row)
+    if err != nil {
+        return err  // 并发 cancel 时返回 pgx.ErrNoRows
+    }
+}
+```
+
+**问题**: 两个并发 `CancelTask` 调用同一 starting/running 任务。第一个设置 `cancel_requested_at` 并提交;第二个在 `FOR UPDATE` 锁释放后读到 `t.CancelRequestedAt != nil`,跳过 UPDATE 分支,直接 `task = t; needWorker = true` 返回。这看起来正确。
+
+但实际场景更复杂:如果第二个 CancelTask 在第一个提交前读到了 `CancelRequestedAt == nil`(因为 FOR UPDATE 序列化),它会进入 UPDATE 分支,但此时第一个已经设置了 `cancel_requested_at`,所以 `WHERE cancel_requested_at IS NULL` 匹配 0 行,`scanTask` 返回 `pgx.ErrNoRows`,函数把这个错误返回给调用者。
+
+**影响**: 调用者收到 `pgx.ErrNoRows` 而非"已取消"的语义化错误,可能误判为"任务不存在"并重试或报错。
+
+**建议方向**: UPDATE 返回 0 行时,重新 `SELECT ... FOR UPDATE` 获取最新任务状态并返回(幂等返回已取消状态)。
+
+---
+
+### H3. 缺少 `(requester_user_id, status)` 索引,热路径全表扫描
+**文件**: `infra/postgres/migrations/0001_foundation.sql` + `store.go:201-209, 849-878`
+
+以下热路径查询都过滤 `requester_user_id` + `status`,但 0001-0020 迁移中**没有** `(requester_user_id, status)` 索引:
+
+1. `CountQueuedTasksByRequesterTx` (store.go:871) — 每次 `SubmitTask` 都调用,在 workspace 锁内
+   ```sql
+   SELECT COUNT(*) FROM tasks WHERE requester_user_id = $1 AND status = 'queued'
+   ```
+2. `ListClaimableSessionKeys` (store.go:806-810) — 调度器每 tick 调用
+   ```sql
+   SELECT 1 FROM tasks t3 WHERE t3.requester_user_id = t.requester_user_id AND t3.status IN ('starting','running') HAVING COUNT(*) >= $2
+   ```
+3. `BlockUser` (user_store.go:117-129) — 阻塞用户时批量更新
+   ```sql
+   UPDATE tasks SET status = 'cancelled' ... WHERE requester_user_id = $1 AND status = 'queued'
+   ```
+
+**影响**: tasks 表行数增长后,这些查询退化为全表扫描。`SubmitTask` 是用户消息热路径,延迟会直接影响用户体验。`ListClaimableSessionKeys` 是调度器心跳,慢查询会拖垮调度吞吐。
+
+**建议方向**: 新增迁移添加 `CREATE INDEX IF NOT EXISTS tasks_requester_status_idx ON tasks (requester_user_id, status)`,或更精细的 partial index `WHERE status = 'queued'` 和 `WHERE status IN ('starting','running')`。
+
+---
+
+### H4. `UpsertBotTransportState` CAS 用 Go 时钟对比 DB 时钟,且非游标更新会污染 `updated_at`
+**文件**: `backend-go/internal/postgres/bot_transport_store.go:46-87`
+
+```go
+now := time.Now().UTC()  // Go 进程时钟
+// SQL 中:
+WHEN $6 >= bot_transport_state.updated_at  // 对比 DB 服务器时钟
+```
+
+两个问题:
+
+1. **时钟偏移**: `$6` 是 Go 进程的 `time.Now().UTC()`,而 `bot_transport_state.updated_at` 由 PostgreSQL 的 `timezone('utc', now())` 写入。如果 Go 与 PG 时钟有几十毫秒偏移,CAS 会误判:新游标被当作旧游标丢弃,或旧游标被当作新游标写入。
+
+2. **非游标更新污染 updated_at**(line 80-84):
+   ```sql
+   updated_at = CASE
+       WHEN EXCLUDED.update_cursor_ciphertext IS NOT NULL AND $6 < bot_transport_state.updated_at
+           THEN bot_transport_state.updated_at  -- 游标被拒,保留旧 updated_at
+       ELSE $6  -- 无游标或游标被接受,bump updated_at
+   END
+   ```
+   一个只更新 `reconnect_state`/`last_error_code` 的请求(无游标)会把 `updated_at` 推到 `$6`。之后一个携带稍早 `now` 的合法新游标到达,会因为 `$6 < updated_at` 被误拒。
+
+**影响**: iLink 游标是单调的,但 CAS 代理变量(`updated_at`)被非游标更新污染后,合法游标被丢弃,导致消息漏拉或重复拉取。
+
+**建议方向**: CAS 应该基于游标自身的单调性(如游标内嵌序号),而不是 `updated_at`。或者分离 `cursor_updated_at` 和 `state_updated_at` 两个时间戳。
+
+---
+
+### H5. `PrepareCheckpoint` 不检查已存在的 'writing' 快照,产生孤儿快照
+**文件**: `backend-go/internal/postgres/store.go:589-637`
+
+```sql
+INSERT INTO workspace_snapshots (..., state, generation, lease_until, ...)
+VALUES (..., 'writing', $4, $6, ...)
+```
+
+**问题**: 函数直接 INSERT 新的 'writing' 快照,不检查是否已有未提交的 'writing' 快照。如果 Worker 重试 `PrepareCheckpoint`(网络抖动、超时重发),会创建多个 'writing' 快照,只有最后一个会被 `CompleteSucceeded` 提交,其余成为孤儿(占用 `workspace_snapshots` 行,直到 `lease_until` 过期)。
+
+**影响**: 孤儿 'writing' 快照占用存储,且 `generation` 序号被消耗(导致 generation 跳号)。虽然 lease 2 分钟后过期,但期间资源泄漏。
+
+**建议方向**: INSERT 前 `SELECT id FROM workspace_snapshots WHERE task_id = $1 AND state = 'writing' FOR UPDATE`,如果存在则复用或先隔离。
+
+---
+
+## MEDIUM
+
+### M1. `insertNextEvent` 对不存在的 task 静默丢弃事件
+**文件**: `backend-go/internal/postgres/store.go:1047-1061`
+
+```sql
+WITH next_seq AS (
+  UPDATE tasks SET last_event_sequence_no = last_event_sequence_no + 1
+  WHERE id = $1
+  RETURNING last_event_sequence_no
+)
+INSERT INTO task_events (...) SELECT ... FROM next_seq
+```
+
+**问题**: 如果 task 行不存在(被删除或 ID 错误),`UPDATE...RETURNING` 返回 0 行,`INSERT...SELECT FROM next_seq` 插入 0 行,`tx.Exec` 返回 `nil` error。事件被静默丢弃,无任何告警。
+
+**影响**: 虽然任务行不会被删除(terminal 状态保留),但如果传入错误 taskID(代码 bug),事件丢失且无报错,难以排查。
+
+**建议方向**: 检查 `tag.RowsAffected()`,如果为 0 则返回错误。
+
+---
+
+### M2. 连接池使用默认配置,无 MaxConns/IdleTimeout 调优
+**文件**: `backend-go/cmd/platform/main.go:323`, `cmd/llm-proxy/main.go:133`
+
+```go
+pool, err := pgxpool.New(ctx, dbURL)
+```
+
+**问题**: 直接用 `pgxpool.New(ctx, url)`,依赖连接字符串中的参数。代码中没有显式设置 `max_conns`、`max_conn_lifetime`、`max_conn_idle_time`、`health_check_period`。pgxpool 默认 `max_conns` = `max(4, runtime.GOMAXPROCS())`,在生产负载下(scheduler + delivery + router + admin HTTP 并发)可能不足。
+
+**影响**: 高并发下连接池耗尽,请求排队甚至超时;空闲连接不回收,占用 DB 端连接。
+
+**建议方向**: 用 `pgxpool.ParseConfig` 解析后显式设置 `config.MaxConns`、`config.MaxConnLifetime`、`config.MaxConnIdleTime`,从环境变量读取。
+
+---
+
+### M3. `messages.message_id` (TEXT) 与 `media_assets.message_id` (BIGINT) 类型不一致
+**文件**: `infra/postgres/migrations/0013_messages.sql:24`, `0014_media_assets.sql:26`
+
+```sql
+-- 0013
+message_id   TEXT,        -- iLink 字符串消息 ID
+-- 0014
+message_id   BIGINT,      -- 数值,注释说是 messages.id 的软引用
+```
+
+**问题**: 同名字段类型不一致。`media_assets.message_id` 实际引用 `messages.id`(BIGSERIAL),但字段名暗示引用 iLink message_id。命名歧义会导致开发者误用,且无法直接 JOIN。
+
+**影响**: 维护成本高,新人容易写错 JOIN 条件。无 FK 约束,数据完整性靠应用层保证。
+
+**建议方向**: 重命名 `media_assets.message_id` 为 `message_pk_id` 或加 FK 约束 `REFERENCES messages(id) ON DELETE SET NULL`。
+
+---
+
+### M4. `MarkRunning` 不检查 `cancel_requested_at`,与 `MarkDispatchStarted` 行为不一致
+**文件**: `backend-go/internal/postgres/store.go:413-432`
+
+```go
+// MarkDispatchStarted (line 388) 检查:
+if t.CancelRequestedAt != nil {
+    return fmt.Errorf("task %s cancel already requested before dispatch", taskID)
+}
+// MarkRunning (line 413) 不检查 cancel_requested_at:
+UPDATE tasks SET status = 'running', ... WHERE id = $1 AND claim_owner = $2 AND status = 'starting' AND worker_dispatch_started_at IS NOT NULL
+```
+
+**问题**: `MarkDispatchStarted` 拒绝已请求取消的任务,但 `MarkRunning` 不拒绝。如果 cancel 在 dispatch 之后、running 之前到达,任务仍会进入 running。这是协作式取消的设计(Worker 接受后异步取消),但两个函数对 cancel 的态度不一致,语义混乱。
+
+**影响**: 取消时机依赖 Worker 配合,可能产生"已取消但仍 running"的瞬态,增加调试难度。
+
+**建议方向**: 文档化取消语义,或让 MarkRunning 也记录 cancel_requested 状态到事件流。
+
+---
+
+### M5. `delivery_service` 用 `personalSessionKey` 记录出站审计,与任务 session 不一致
+**文件**: `backend-go/internal/application/delivery_service.go:221`
+
+```go
+SessionKey:  personalSessionKey(bot.OwnerID),  // "personal:{owner_id}"
+```
+
+**问题**: 任务可能在 team workspace 提交(`session_key = "team:{team_id}"`),但投递成功后记录出站消息时用了 `personal:{owner_id}`。审计轨迹中,任务的 session_key 与出站消息的 session_key 不匹配,无法通过 session_key 关联完整对话。
+
+**影响**: 团队任务的投递审计无法通过 session_key 回溯到原任务,审计完整性受损。
+
+**建议方向**: 用 `task.SessionKey` 而非 `personalSessionKey(bot.OwnerID)`。
+
+---
+
+### M6. `EnsureToolPolicyExists` TOCTOU 竞态 + 用 `!=` 而非 `errors.Is`
+**文件**: `backend-go/internal/postgres/policy_store.go:184-195`
+
+```go
+_, err := s.GetToolPolicy(ctx, version)
+if err == nil { return nil }
+if err != pgx.ErrNoRows { return err }  // 应为 !errors.Is(err, pgx.ErrNoRows)
+_, err = s.CreateToolPolicy(ctx, version, ...)
+```
+
+**问题**:
+1. Get-then-Create 无事务,两个并发调用都看到"不存在",都尝试 Create,第二个因 unique 约束失败。
+2. `err != pgx.ErrNoRows` 用直接比较,如果 `GetToolPolicy` 未来包装错误,此判断失效。
+
+**影响**: 启动时并发 seed 同一 policy 会报错;代码脆弱。
+
+**建议方向**: 用 `INSERT ... ON CONFLICT (version) DO NOTHING`,或用 `errors.Is`。
+
+---
+
+### M7. `BlockUser` 事务外追加审计,审计失败被静默吞掉
+**文件**: `backend-go/internal/postgres/user_store.go:148-153`
+
+```go
+_ = s.AppendAuditEvent(ctx, domain.AuditEvent{...})  // 错误被忽略
+```
+
+**问题**: 注释说"审计失败不回滚安全关键的 block",但 `_ =` 完全吞掉错误,连日志都没有。如果审计持续失败(DB 连接问题),运维无法察觉。
+
+**影响**: 安全关键操作(block user)的审计轨迹可能静默丢失,合规风险。
+
+**建议方向**: 至少 `slog.ErrorContext` 记录审计失败,不要完全静默。
+
+---
+
+### M8. `RecordChunkEvent` 不校验任务状态,可为终态任务写事件
+**文件**: `backend-go/internal/postgres/store.go:436-449`
+
+```go
+err := s.withTx(ctx, func(tx pgx.Tx) error {
+    var lockedTaskID string
+    if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&lockedTaskID); err != nil {
+        return err
+    }
+    // 没有检查 t.Status 是否已终态
+    if err := insertNextEvent(...); err != nil { return err }
+    ...
+})
+```
+
+**问题**: FOR UPDATE 锁住任务行后,不检查 `status`。如果任务在 chunk 到达前已被 `CancelTask`/`RecoverAfterRestart` 终态化,chunk 事件仍被写入,且 `last_activity_at` 被更新(虽然终态任务不会触发 reaper,但 `updated_at` 被污染)。
+
+**影响**: 终态任务的事件流出现"幽灵 chunk",审计轨迹混乱。
+
+**建议方向**: 锁定后检查 `status IN ('starting','running')`,否则返回 `ErrTaskNotActive`。
+
+---
+
+### M9. `ListInviteCodes` / `ListPendingUsers` / `ListAllCommands` 无分页
+**文件**: `invite_store.go:82-102`, `user_store.go:158-176`, `policy_store.go:61-82`
+
+**问题**: 这些函数返回全表数据,无 LIMIT/OFFSET。`ListInviteCodes` 和 `ListPendingUsers` 是 admin 接口,数据量增长后单次查询可能返回数千行,内存和延迟飙升。
+
+**影响**: admin 接口在数据量大时变慢,潜在 OOM。
+
+**建议方向**: 加 `limit, offset` 参数,与 `ListMessagesByUser` 一致。
+
+---
+
+## LOW
+
+### L1. `insertEvent` 绕过原子计数器,硬编码 seq=0
+**文件**: `store.go:1032-1039, 241`
+
+`SubmitTask` 调用 `insertEvent(...seq=0)` 插入首个事件,但 `insertEvent` 不更新 `last_event_sequence_no`。后续 `insertNextEvent` 从 0 递增到 1。目前因新任务 `last_event_sequence_no` 默认 0 而正确,但如果 `insertEvent` 被误用于非首事件,seq 会冲突。建议统一用 `insertNextEvent`。
+
+### L2. `loopback.go` 的 `seen` map 无容量上限
+**文件**: `transport/loopback.go:22`
+
+测试用 `seen map[string]bool` 无 TTL/容量限制。长期运行的 dev loopback 会内存泄漏。测试环境可接受,但应加注释说明仅限测试。
+
+### L3. `ResetWorkspace` 无授权校验
+**文件**: `store.go:775-781`
+
+只接收 `sessionKey` 就重置 workspace,不校验调用者是否拥有该 session。依赖上层 router 鉴权,但 store 层缺乏防御。如果上层漏鉴权,任意用户可重置他人 session。
+
+### L4. `DropFoundationSchema` 用 `fmt.Sprintf` 拼接表名
+**文件**: `migrations.go:126, 133`
+
+```go
+pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, name))
+```
+
+`name` 来自硬编码 `foundationTableNames`,无注入风险。但模式危险,若未来接受外部输入则成注入点。可加注释强调"仅限硬编码常量"。
+
+### L5. `EnsureSchema` 中 `applyPendingMigrations` 提交后 defer Rollback 无害但误导
+**文件**: `migrations.go:255-277`
+
+`applyPendingMigrations` 内部 `tx.Commit(ctx)` 后返回,`EnsureSchema` 的 `defer tx.Rollback(ctx)` 对已提交事务是 no-op。逻辑正确,但控制流不直观,易误读为"提交后又回滚"。
+
+### L6. `idx_workspaces_reset_at` 部分索引可能未被使用
+**文件**: `0018_session_reset.sql:7`
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_workspaces_reset_at ON workspaces (session_key) WHERE reset_at IS NOT NULL;
+```
+
+`SubmitTask` 用 `SELECT ... FROM workspaces WHERE session_key = $1 FOR UPDATE`,优先走唯一索引 `workspaces_session_key_uq`。该部分索引可能从未被查询规划器选用。属冗余索引,增加写入成本。
+
+### L7. `delivery_service.go` 出站审计失败不 ack 会重复发送;选择 ack 则审计缺失
+**文件": `delivery_service.go:218-233`
+
+注释已说明权衡("not acking causes duplicate send, which is worse"),设计合理。但出站审计失败时,审计轨迹永久缺失且无补偿机制。可考虑异步重试审计写入。
+
+---
+
+## 模块总体评价
+
+**Storage 层**(store.go / *_store.go)整体架构扎实:任务生命周期用 `FOR UPDATE` + 行锁 + `SKIP LOCKED` 实现并发安全,跨租户隔离依赖 `session_key` 唯一性 + `authorizeSubmitter` 授权,Outbox 模式实现至少一次投递。但存在几个**真实的并发与运维缺陷**:`RecoverAfterRestart` 在单实例下永久卡死自身过期任务(C1)、Delivery 状态机 UPDATE 无前置状态守卫导致死信/ACK 竞态(H1)、缺 `(requester_user_id, status)` 索引使热路径全表扫描(H3)。这些问题在生产负载下会逐步暴露。
+
+**Migration 层**设计严谨:20 个迁移文件全部用 marker 表实现幂等,`EnsureSchema` 用 advisory lock 防并发,0001 foundation 的 CHECK 约束和部分唯一索引覆盖了核心不变量。但 `applyPendingMigrations` 依赖 marker 表存在性而非版本号表,新增迁移时若忘记注册 marker 会静默跳过;`DropFoundationSchema` 的 `CASCADE` 在生产环境是危险操作。`UpsertBotTransportState` 的 CAS 用 `updated_at` 作游标单调性代理,被非游标更新污染后会产生误拒(H4),是 Transport 层最隐蔽的 bug。
+
+**Delivery/Transport 层**的 outbox 轮询 + 指数退避 + 死信机制设计合理,但状态变更缺乏前置状态检查(H1)是跨实例竞态的根因。`idempotency.go` 的分片 TTL 缓存设计良好,`loopback.go` 作为测试替身足够。建议优先修复 C1、H1、H3 三个问题。
+        
+          
+我已完整读取所有 19 个文件以及支撑代码（postgres/store.go 中的 PrepareCheckpoint/LoadSnapshotToken、checkpoint/policy 测试、api/http.go 的 ServeContext、llmproxy.MinSigningKeyLen）。下面是严格、具体到代码片段的深度静态审查报告。
+
+---
+
+# Cross-cutting 模块静态审查报告
+
+## CRITICAL（安全漏洞 / 功能不可用）
+
+### C1. `cmd/llm-proxy/main.go:130-143` — `defer pool.Close()` 关闭后仍被使用
+```go
+pool, err := pgxpool.New(ctx, databaseURL)
+...
+defer pool.Close()              // ← buildProviderSource 返回时即关闭
+store, err := postgres.NewStore(pool)
+...
+return store, nil              // ← store 持有的 pool 已被关闭
+```
+`buildProviderSource` 返回的 `store` 在 `run()` 中被赋给 `providerSource` 并传给 `llmproxy.NewServer` 长期使用，但 `defer pool.Close()` 在函数返回瞬间关闭了底层 pool，之后所有 DB 查询都会失败（`pool closed`）。
+**影响**：DB 模式下 LLM Proxy 一启动即不可用，所有上游密钥解析失败。
+**建议方向**：将 `pool.Close()` 生命周期上移到 `run()` 主流程，由 `run()` 在 shutdown 时关闭；或返回 `io.Closer` 一并交给调用方。
+
+### C2. `cmd/llm-proxy/main.go:125` — 切片越界 panic
+```go
+return secret.NewStaticKeyCipher(signingKey[:32])
+```
+`MinSigningKeyLen = 16`（`llmproxy/config.go:16`），但这里直接 `signingKey[:32]`。当用户用 16–31 字节的合法 signing key 触发"dev fallback"分支时，`signingKey[:32]` 越界 panic。
+**影响**：进程崩溃，systemd 进入重启循环。
+**建议方向**：显式校验 `len(signingKey) >= 32`，否则直接报错拒绝；或用 HKDF 从 signing key 派生 32 字节密钥（顺便修复下面 H6 的密钥混用问题）。
+
+### C3. `ga-llm-proxy.service` 与 `cmd/llm-proxy/main.go` — `Type=notify` 但二进制不发送 READY
+unit 文件 `ga-llm-proxy.service:9` 声明 `Type=notify`、`WatchdogSec=15s`，但 `cmd/llm-proxy/main.go` 全文搜索 `sd_notify / systemd / Notifier / ReadyAndServe` **零匹配**，从未通知 systemd。
+**影响**：systemd 启动后等不到 READY=1，达到 `StartLimitBurst=5` 后进入 failed 状态，服务无法对外提供。
+**建议方向**：在 `run()` 中用 `systemd.ReadyAndServe(ctx, serve)` 包裹 `httpSrv.ListenAndServe`，与 platform 保持一致。
+
+### C4. `ga-worker-manager.service` 与 `cmd/worker-manager/main.go` — 同 C3
+`ga-worker-manager.service:9` `Type=notify`，但 `cmd/worker-manager/main.go` 同样不调用 sd_notify。
+
+### C5. `ga-worker-manager.service:33-37` — flag 名称与监听协议全部不匹配
+unit 文件：
+```
+--listen=unix:///run/ga/worker-manager.sock
+--podman-binary=/usr/bin/podman
+--worker-image=...
+--config-root=...
+--runtime-root=...
+```
+但 `cmd/worker-manager/main.go:28-31` 实际定义的 flag 是 `listen / image / podman`，并且 `net.Listen("tcp", *addr)`（line 50）硬编码 tcp，不支持 `unix://`。  
+**影响**：service 启动即 `flag provided but not defined` 报错退出，进入重启循环；即使修复 flag 名，`net.Listen("tcp", "unix://...")` 也会失败。
+**建议方向**：用 `net.Listen` 解析 scheme 派发，或参考 `ga-worker-manager.socket`（注释提及但仓库内不存在）通过 systemd socket activation；统一 unit 文件与二进制的 flag 命名。
+
+### C6. `ga-llm-proxy.service:34` — `--signing-key-file` flag 不存在
+unit 文件使用 `--signing-key-file=/etc/ga/llm-proxy.signing-key`，但 `cmd/llm-proxy/main.go:44` 实际 flag 是 `--capability-signing-key`，且只接受字符串值而非文件路径。
+**影响**：service 启动报错退出。
+**建议方向**：要么改为 `--capability-signing-key-file` 并在二进制里加文件读取逻辑，要么用 `EnvironmentFile` 注入 `LLM_PROXY_CAPABILITY_SIGNING_KEY` 环境变量（main.go 已支持）。
+
+### C7. `infra/postgres/.env.example:8,15` — 提交了真实可用的弱口令
+```
+POSTGRES_PASSWORD=REDACTED
+postgresql://admin:REDACTED@127.0.0.1:5432/genericagent?sslmode=disable
+```
+`REDACTED` 看起来像真实口令而非占位符（不像 `changeme` / `<set-me>`），且用户名 `admin` 是字典攻击常用名。文件被提交到仓库，复制为 `.env` 即可直接拉起一个弱口令的 postgres。
+**影响**：开发者照搬即可得到一个弱口令实例；若误暴露到公网（即使注释声明 loopback-only）也极易被攻破。
+**建议方向**：占位符改为 `POSTGRES_PASSWORD=CHANGE_ME_BEFORE_UP`，并在 compose 启动时检测是否被改；或彻底移除连接串示例，只保留字段说明。
+
+---
+
+## HIGH（逻辑错误 / 并发问题 / 资源泄漏）
+
+### H1. `checkpoint/local.go:107-129` — TOCTOU + 并发 Commit 的 .tmp 文件竞争
+`Commit` 调用 `c.store.LoadSnapshotToken`（`store.go:639-651`）仅是单条 `SELECT ... WHERE id AND token`，**无 `FOR UPDATE`**。校验通过后到 `atomicWrite(committedPath, raw)`（local.go:167）之间没有任何 DB 锁。  
+若同一 `snapshotID` 被并发 Commit 两次（Worker 重试 + scheduler 触发），两个 goroutine 同时执行 `atomicWrite`，而 `atomicWrite`（local.go:238）使用 **确定性的临时路径** `path + ".tmp"`：
+```go
+tmp := path + ".tmp"
+f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+...
+f.Sync()
+os.Rename(tmp, path)
+```
+两个 goroutine 会同时打开/截断同一个 `.tmp` 文件，先 Sync 的可能被另一个的 Write 覆盖后才 Rename，导致提交的内容与 checksum 不一致；最坏情况是 torn write 后 rename，破坏 committed bundle 的完整性。下游 `CompleteSucceeded`（store.go:654）虽有 `FOR UPDATE` + `IsTerminal` 检查能阻止 DB 重复 finalize，但**本地文件已被污染**。
+**影响**：committed bundle 文件损坏或内容错乱，结果不可重现。
+**建议方向**：在 DB 侧用单条 `UPDATE ... WHERE state='writing' RETURNING ...` 原子推进状态（影响行数为 0 即说明已被别人提交）；`atomicWrite` 的 tmp 路径加入随机后缀（`pid + crypto/rand`）。
+
+### H2. `checkpoint/local.go:153-164` — result digest 完整性校验被跳过
+```go
+body, _ := resultObj["body"].(string)
+resultDigest, _ := bundle["result_digest"].(string)
+if resultDigest == "" {
+    resultDigest = "sha256:" + hex.EncodeToString(hashBytes([]byte(body)))
+}
+if ready.ResultDigest != "" && ready.ResultDigest != resultDigest {
+    return CommittedCheckpoint{}, fmt.Errorf("result digest mismatch")
+}
+```
+当 bundle 不含 `result_digest` **且** Worker 不传 `ready.ResultDigest` 时，整个 `if` 条件为 `false`，**完全不进行任何完整性校验**。bundle 的 `result.body` 可以被任意篡改而不被发现。两处类型断言用 `_` 丢弃错误，若字段是非字符串（数字 / null），静默变为空字符串同样进入"无校验"分支。
+**影响**：checkpoint 结果链的端到端完整性保护存在断点，篡改可绕过。
+**建议方向**：bundle 必须包含 `result_digest`，否则拒绝；与 worker 协议明确要求 `ResultDigest` 非空；类型断言改为带 ok 检查。
+
+### H3. `checkpoint/local.go:183-188` — sidecar 索引写入非原子
+```go
+if err := writeIndex(c.runtimeRoot, fileRef, committedPath); err != nil { return ..., err }
+if err := writeIndex(c.runtimeRoot, resultRef, resultPath); err != nil { return ..., err }
+```
+第二个 `writeIndex` 失败时，第一个已经写入；committed/result 文件已经落盘但只暴露了 `fileRef`。调用方拿到错误，无法判断是否可重试。同时 `os.Remove(ready.StagingRef)`（line 171）已经执行——staging 已删，无法回滚。
+**影响**：失败后状态不一致，难以恢复。
+**建议方向**：先全部写到 `.tmp` 再统一 rename；或仅暴露单一 ref 并在 ReadResult 内派生路径，避免 sidecar 索引。
+
+### H4. `application/token_revoker.go:45-67` — 无重试、无队列、无失败处理
+- 单次 5 秒超时（`revokeTimeout`），无重试退避。
+- 失败仅返回 error，调用方若忽略则该 capability_token 在 TTL 内仍可用。
+- 无排队：1000 个会话同时结束会触发 1000 个并发 HTTP 请求，可能压垮 LLM Proxy。
+- 仅接受 204（line 63），若上游合约演化为 200 即视为失败。
+**影响**：撤销失效或被放大为 DoS。
+**建议方向**：失败入持久化重试队列（DB 表 + 后台 worker），限流（token bucket），状态码范围校验。
+
+### H5. `secret/token.go` — 无密钥轮换支持
+wire format `[1 byte version][12 byte nonce][ciphertext]` 暗示多版本设计，但实现只有 `currentKeyVersion=1`，`StaticKeyCipher.Decrypt` 严格 `keyVersion != c.version` 即拒绝（line 84-86）。一旦密钥泄露，无法在线轮换；旧密文无法用新密钥解密，且没有 `MultiKeyCipher` 之类多版本路由。
+**影响**：密钥事故响应无法平滑轮换。
+**建议方向**：实现多版本 cipher（按 keyVersion 路由），并提供 re-encrypt 工具/接口。
+
+### H6. `cmd/llm-proxy/main.go:118-126` — 加密密钥派生自签名密钥
+```go
+return secret.NewStaticKeyCipher(signingKey[:32])
+```
+dev fallback 直接用 HMAC 签名密钥作为 AES 加密密钥。这违反密钥分离原则：HMAC 与对称加密共享同一密钥，一旦其中一者泄露即双失守；且截断到 32 字节可能丢失熵。配合 C2 的越界问题，这条路径既不安全也不健壮。
+**影响**：dev 模式下凭据保护强度退化。
+**建议方向**：用 HKDF-SHA256 从 signing key 派生独立的 `enc_key` 和 `mac_key`；或在 dev 模式强制要求 `--llm-provider-key`。
+
+### H7. `cmd/platform/main.go:175-176` — 内嵌 LLM Proxy 无 ReadHeaderTimeout
+```go
+httpSrv := &http.Server{Handler: srv.Handler()}
+go func() { _ = httpSrv.Serve(ln) }()
+```
+对比 `cmd/llm-proxy/main.go:85-89` 设了 `ReadHeaderTimeout: 10s`，这里完全没设。任意客户端只要打开 TCP 后不发完整 header，即可长期占用 fd。
+**影响**：slowloris 类 DoS 直接耗尽 `LimitNOFILE=4096`。
+**建议方向**：与 llm-proxy 一致设置 `ReadHeaderTimeout`、`IdleTimeout`、`WriteTimeout`。
+
+### H8. `cmd/platform/main.go:179-184` — shutdown 使用已取消的 ctx
+```go
+shutdown := func() {
+    shutCtx, shutCancel := context.WithTimeout(ctx, 5*time.Second)  // ctx 此时通常已被 cancel
+    defer shutCancel()
+    _ = httpSrv.Shutdown(shutCtx)
+}
+```
+`shutdown` 在 `defer proxyShutdown()` 中于 `run()` 退出时调用，此时 `ctx`（line 320 的 `signal.NotifyContext`）几乎肯定已被 cancel。`context.WithTimeout(已取消的 ctx, 5s)` 立即返回已取消的 ctx，`httpSrv.Shutdown` 不会等待任何进行中的请求，直接强制断连。对比 `cmd/llm-proxy/main.go:103` 正确使用 `context.Background()`。
+**影响**：在途 LLM 请求被硬切，下游 worker 调用失败。
+**建议方向**：改用 `context.Background()` 派生 shutdown ctx。
+
+### H9. `checkpoint/syncdir_windows.go:12-25` — FlushFileBuffers 不等同于 POSIX fsync 目录
+Windows 对目录 handle 调用 `FlushFileBuffers` 文档明确表示对目录无效（不像 Linux 的 `fsync(dirfd)` 能持久化目录条目变更）。`atomicWrite` 依赖 `syncDirectory(filepath.Dir(path))`（local.go:261）保证 rename 后目录元数据落盘，在 Windows 上这一保证**实际不存在**。
+**影响**：Windows 部署下断电可能丢失 rename，committed 文件名不存在但内容已写入 `.tmp`，重启后无法定位 committed bundle。
+**建议方向**：使用 `windows.FlushFileBuffers` 配合 `FILE_FLAG_WRITE_THROUGH`，或在 Windows 路径上额外用 `fsutil` 触发卷 flush；文档明确 Windows 仅 best-effort。
+
+### H10. `cmd/worker-manager/main.go:67` — GracefulStop 无超时
+```go
+case <-ctx.Done():
+    grpcServer.GracefulStop()
+    return nil
+```
+`GracefulStop` 等待所有活动 RPC 完成。若一个 Worker 容器长流式 RPC 不退出，主进程会无限挂起，systemd `TimeoutStopSec`（默认 90s）之后被 SIGKILL。
+**影响**：服务停止阻塞，可能留下僵尸容器。
+**建议方向**：先 `GracefulStop()`，配合 `time.After` 兜底调用 `Stop()` 强制关闭。
+
+---
+
+## MEDIUM（边界情况 / 错误处理不完整）
+
+### M1. `checkpoint/local.go:87-89` — stagingRefFor 回调参数 `generation` 完全未使用
+```go
+stagingRefFor := func(snapshotID, token string, generation int64) string {
+    return filepath.Join(c.runtimeRoot, "staging", token+".bundle.json")  // generation 被丢弃
+}
+```
+`store.go:587` 的 `StagingRefFunc` 签名包含 `generation`，且 store 内会为每次 Prepare 自增 generation（store.go:610）。但 LocalCoordinator 的实现忽略 generation，仅用 token。这削弱了"同 workspace 多次 checkpoint 的隔离性"——目前靠 token 中的 UUID 自带随机性兜底，但 generation 维度被白白丢弃。
+**建议方向**：要么 staging 路径包含 generation（`staging/<wsID>/g<gen>/<token>.bundle.json`），要么修改 `StagingRefFunc` 签名移除 generation。
+
+### M2. `checkpoint/local.go:171` — staging 清理错误被吞
+```go
+_ = os.Remove(ready.StagingRef)
+```
+若删除失败（权限/网络文件系统），staging 残留，无人知晓；下次同 token 不会再触发（token 含 UUID），但磁盘空间会累积。
+**建议方向**：失败时 slog.Warn 记录路径与错误。
+
+### M3. `checkpoint/local.go:127` — 前缀检查缺少分隔符边界
+```go
+if !strings.HasPrefix(filepath.Clean(ready.StagingRef), filepath.Clean(c.runtimeRoot)) {
+```
+若 `runtimeRoot = /var/lib/ga/runtime`，则 `/var/lib/ga/runtime-evil/x.json` 也会通过前缀检查。目前依赖 DB 端 `stagingRef != ready.StagingRef`（line 124）兜底，但 layer defense 应更严格。
+**建议方向**：在比较时附加 `string(os.PathSeparator)`。
+
+### M4. `systemd/sdnotify.go:117` — watchdog 错误被静默丢弃
+```go
+case <-ticker.C:
+    _ = n.Notify(Watchdog)
+```
+Notify 错误（如 socket 已断）被吞，watchdog 永久失效，仅靠 systemd WatchdogSec 触发 restart 才暴露。这虽然符合"fail-loud via restart"的设计意图，但缺少至少一次的 stderr 输出，排障困难。
+**建议方向**：错误时 `fmt.Fprintf(os.Stderr, ...)` 至少打一次，避免刷屏可用 `sync.Once`。
+
+### M5. `logging/logging.go:32-44` — 非 systemd 部署无日志 rotation
+注释称 "systemd's journal captures stdout automatically, so no separate logrotate is needed"。但 dev 模式直接 `go run`、容器内 stdout 重定向到文件等场景都无 rotation，长跑会撑爆磁盘。`log.SetOutput` 把 legacy `log.Printf` 也桥到 stdout，进一步放大。
+**建议方向**：检测 `NOTIFY_SOCKET` 是否存在，未在 systemd 下时改用 `lumberjack` 之类轮转 writer，或文档显式声明仅支持 systemd 部署。
+
+### M6. `logging/logging.go:33-36` — `level == 0` 同时匹配 "INFO" 与无效值
+```go
+level := levelByName[strings.ToUpper(strings.TrimSpace(os.Getenv("LOG_LEVEL")))]
+if level == 0 {
+    level = slog.LevelInfo
+}
+```
+`slog.LevelInfo` 本身就是 0，map 命中 "INFO" 时 `level == 0` 也会进入 if 分支重置为 INFO，结果一致但语义混淆；后续若有人把 `slog.LevelInfo` 改成非 0 常量，行为会变。
+**建议方向**：用 `ok, exists := levelByName[...]` 模式显式区分"未命中"与"命中 INFO"。
+
+### M7. `cmd/platform/main.go:432-435` — 死代码分支
+```go
+} else {
+    if boot.UserID != 0 && os.Getenv("PLATFORM_DEV_FORCE") == "" {
+        // Still refuse EnsureDevelopmentContext path by not calling it.
+    }
+    return fmt.Errorf("foundation platform currently requires --dev-loopback ...")
+}
+```
+if 体只有注释、什么都不做，紧接着无条件 return error。读起来像"做了某种检查"但实际没有。
+**建议方向**：删除空 if；或把 `PLATFORM_DEV_FORCE` 真正接入逻辑（允许非 dev-loopback 走生产路径）。
+
+### M8. `cmd/platform/main.go:703-709` — delivery service 无 shutdown 同步
+```go
+go func() {
+    if err := deliverySvc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+        slog.ErrorContext(ctx, "delivery service error", "error", err)
+    }
+}()
+```
+`finishPlatform` 仅等待 `schedulerDone`（line 234-241），完全不等待 delivery service。`cancel()` 后 delivery 收到 ctx.Done 退出，但中途的通知可能被截断。
+**建议方向**：与 scheduler 一样用 `chan error` 收集，纳入 `finishPlatform` 的等待集合。
+
+### M9. `secret/token.go:134-137` — `IntToBytes` 导出但本包未使用
+```go
+func IntToBytes(v int64) []byte { ... }
+```
+全包无任何调用方，看起来是历史遗留 / 计划用于其他模块。违反 YAGNI。
+**建议方向**：删除；如确有外部使用，迁移到调用方所在包。
+
+### M10. `infra/postgres/docker-compose.yml` — 缺资源/日志/安全加固
+- 无 `mem_limit / cpus`：单容器可吃满宿主资源。
+- 无 `logging.driver: json-file` + `max-size`：日志可撑爆磁盘。
+- 无 `security_opt: [no-new-privileges:true]`。
+- `env_file: .env` 把整个 .env 注入容器，若 .env 含其他变量会泄漏到 postgres 进程环境。
+**建议方向**：补齐 `deploy.resources.limits`、`logging.options.max-size`、`security_opt`；改用 `environment:` 显式列举需要的变量。
+
+### M11. `infra/systemd/ga-platform.service:26` — `EnvironmentFile=-` 前缀让配置缺失被吞
+```
+EnvironmentFile=-/etc/ga/platform.env
+```
+`-` 前缀表示文件不存在时静默忽略。若运维误删 `/etc/ga/platform.env`，service 会以空环境启动，立刻因缺 `DATABASE_URL` 失败，但错误信息会让人误以为是别的问题。
+**建议方向**：移除 `-`，让缺文件直接报错。
+
+### M12. `infra/systemd/ga-platform.service:20` — `TasksMax=512` 可能偏低
+平台每个 HTTP 连接、每条 worker gRPC stream、每个 scheduler poll、delivery poll 都消耗一个 task。在多租户场景下 512 较紧张，接近上限时新 goroutine 创建失败。
+**建议方向**：根据压测调整，或参考 `LimitNOFILE` 同步上调。
+
+### M13. `infra/systemd/ga-platform.service:4` — `postgresql.service` 依赖发行版相关
+`After=network-online.target postgresql.service` 假设服务名是 `postgresql.service`。RHEL 系列是 `postgresql-16.service`，容器化部署可能是 `docker.service` + 自定义 unit。
+**建议方向**：注释说明按发行版调整；或改用 `Requires=network-online.target` + 在脚本中探测数据库就绪。
+
+---
+
+## LOW（代码质量 / 可维护性）
+
+### L1. `checkpoint/local.go:103-197` — `Commit` 函数 95 行，超出 50 行硬限
+单函数承载：参数校验、状态校验、文件读取、checksum 校验、JSON 解析、result 提取、原子写、staging 清理、sidecar 索引、返回值组装。职责混杂，圈复杂度高。
+**建议方向**：拆分为 `validateLease / readAndVerifyBundle / persistCommitted / publishOpaqueRefs`。
+
+### L2. `coordinator.go` — 接口缺 lifecycle 文档
+`Coordinator` 接口仅有 `Prepare / Commit / ReadResult` 三个方法签名，注释里没有说明"Prepare 与 Commit 必须配对"、"Commit 后才能 ReadResult"、"`StagingRef` 由平台生成不可由 Worker 修改"等契约。Worker 侧实现者只能靠读 LocalCoordinator 源码反推。
+**建议方向**：在接口注释里写明状态机与不变量。
+
+### L3. `secret/token.go:129-131` — `ConstantTimeEqual` 导出但 Decrypt 未用
+GCM 内部 tag 验证已是常量时间，导出函数会误导调用者以为解密路径需要额外常量时间比较。
+**建议方向**：删除或加注释说明仅用于外部调用方比较 digest。
+
+### L4. `policy/registry.go:110-122` — Resolve 错误路径 O(N) 扫描
+为了在 `toolPolicyVersion` 不属于当前 capability 时给出更友好的错误信息，遍历所有 capability 检查是否属于其他 capability。policy 文件通常很小，可接受；但若后续 capability 数量增长，错误路径反而比成功路径慢。
+**建议方向**：构建时预计算 `policyVersion -> capability` 反向索引。
+
+### L5. `application/instance_id.go` — 不持久化，靠 lease 隐式处理冲突
+每次进程启动生成新 UUID，老 instance 拥有的任务需经 `sched.Recover(ctx, instanceID)`（platform/main.go:512）回收。函数本身正确（RFC 4122 v4，crypto/rand），但缺文档说明"instance ID 与 claim_owner 的关系"。
+**建议方向**：在 `NewPlatformInstanceID` 注释中补一段说明：调用方必须自己持久化（若需要跨重启保持所有权）或依赖 Recover 流程。
+
+### L6. `cmd/resetdb/main.go` — 无 `--force` 确认
+直接 `DropFoundationSchema` + `ApplyMigrations`，无任何确认。dev 工具可接受，但若误连生产 DB 会造成数据丢失。
+**建议方向**：检测 `DATABASE_URL` 是否包含 `prod` / `production` 关键字，若是则要求 `--force`。
+
+### L7. `checkpoint/local.go:107` — 8 返回值变量难读
+```go
+wsID, taskID, stagingRef, leaseOwner, leaseUntil, _, maxBundleBytes, state, err := c.store.LoadSnapshotToken(...)
+```
+9 个返回值，调用方还需要 `_ = wsID` 显式忽略。`LoadSnapshotToken` 的返回结构应该封装为 struct。
+**建议方向**：在 store.go 把 `LoadSnapshotToken` 返回值改为 named struct。
+
+### L8. `cmd/platform/main.go:233-246` — `finishPlatform` 的 `serveErr` 语义模糊
+函数同时处理：scheduler 退出错误、scheduler 超时、`serveErr` 为 `context.Canceled` 时转换为 nil。调用方（仅 `run()`）传 `serveErr` 但又提前 `cancel()`，使 `serveErr` 几乎必然是 `context.Canceled`。控制流绕了一圈才回到 nil。
+**建议方向**：把 graceful shutdown 拆成显式 `waitForScheduler / waitForHTTP / waitForDelivery` 三个阶段。
+
+---
+
+# 模块总体评价
+
+**Cross-cutting 模块整体设计意图清晰、分层合理**——checkpoint 走 DB token + 文件 staging 的双轨设计能避免大部分竞态；policy registry 用文件 sha256 digest 做不可变快照，签名链清晰；systemd sd_notify 在 dial 失败时降级为 no-op 的策略是务实的；secret cipher 的 wire format 预留了 version 字节为后续轮换埋了钩子。这些都是值得肯定的工程判断。
+
+**但生产可用性存在系统性短板**：(1) **systemd unit 与二进制严重不对齐**——`ga-llm-proxy.service` 与 `ga-worker-manager.service` 都声明 `Type=notify` 但对应二进制从不调用 sd_notify，必触发重启循环；`ga-worker-manager.service` 的 flag 名（`--podman-binary`、`--worker-image`、`--config-root`、`--runtime-root`）和监听协议（`unix://` vs `net.Listen("tcp", ...)`）全部对不上，service 文件等于不可用。(2) **llm-proxy 的 `defer pool.Close()`（C1）与 `signingKey[:32]` 越界（C2）是上线即崩的两个独立 fatal bug**。(3) **checkpoint 的并发安全靠 DB 单点 `FOR UPDATE` 撑住，但 LocalCoordinator 自身在 Commit 路径上对 `.tmp` 文件路径没有任何隔离（H1），且 result digest 完整性校验存在可被绕过的"双空"路径（H2）**——这两条都是已经写出"看起来在验证"但实际不验证的代码，比缺校验更危险。(4) **`.env.example` 把弱口令 `REDACTED` 写进了仓库**，配合 `User=admin`，是事故现场级的安全气味。建议优先修复 C 级 7 条与 H1/H2/H8/H9 这四条涉及正确性与完整性的问题，其余可在后续迭代中分批收敛。
+        
+          
+7 个模块全部审查完毕。更新进度并汇总最终报告。
+        
+            
+toolName: todo_write
+            
+status: success
+          
+Todos updated: 8 items
+          
+# 静态审查总结报告
+
+7 个模块审查完毕，去重后共发现 **18 个 CRITICAL + 43 个 HIGH + 61 个 MEDIUM + 45 个 LOW**。下文按优先级主题汇总，所有问题均给出文件:行号。
+
+---
+
+## 一、CRITICAL — 上线即崩或安全红线（必须先修）
+
+### A. 上线即崩（默认配置无法启动）
+
+| # | 问题 | 位置 |
+|---|------|------|
+| C1 | **TASK_TIMEOUT_SECONDS=0 与 Worker 校验冲突**：platform 默认 0=disabled，但 [session_lifecycle.py:67-73](file:///c:/sudy/github/GenericAgent/tenant_platform/worker-python/src/ga_worker/session_lifecycle.py#L67-73) 校验 `<=0` 拒绝，默认配置下所有 StartSession 被拒，系统无法启动任何 task | [cmd/platform/main.go:282](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/platform/main.go#L282) |
+| C2 | **signingKey[:32] 切片越界 panic**：`MinSigningKeyLen=16`，但 dev fallback 直接 `signingKey[:32]`，16-31 字节签名密钥触发 panic | [cmd/llm-proxy/main.go:118-126](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/llm-proxy/main.go#L118-126) |
+| C3 | **defer pool.Close() 关闭返回的 store 池**：`buildProviderSource` 函数返回时关闭 pool，但 store 仍持有，DB 模式 LLM Proxy 启动即不可用 | [cmd/llm-proxy/main.go:131-143](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/llm-proxy/main.go#L131-143) |
+| C4 | **systemd Type=notify 但二进制不发送 READY=1**：`ga-llm-proxy.service` 和 `ga-worker-manager.service` 都声明 `Type=notify`+`WatchdogSec=15s`，但二进制从不调用 `sd_notify`，systemd 达到 StartLimitBurst 后进入 failed | [ga-llm-proxy.service:9](file:///c:/sudy/github/GenericAgent/tenant_platform/infra/systemd/ga-llm-proxy.service#L9) + [cmd/llm-proxy/main.go](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/llm-proxy/main.go) |
+| C5 | **worker-manager.service flag 与二进制全部不匹配**：unit 用 `--podman-binary/--worker-image/--config-root/--runtime-root/--listen=unix://`，二进制实际是 `--image/--podman/--listen`，且 `net.Listen("tcp", ...)` 不支持 unix://，启动即报错退出 | [ga-worker-manager.service:33-37](file:///c:/sudy/github/GenericAgent/tenant_platform/infra/systemd/ga-worker-manager.service#L33-37) vs [cmd/worker-manager/main.go:28-50](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/worker-manager/main.go#L28-50) |
+| C6 | **ga-llm-proxy.service --signing-key-file flag 不存在**：实际 flag 是 `--capability-signing-key`，只接受字符串非文件路径 | [ga-llm-proxy.service:34](file:///c:/sudy/github/GenericAgent/tenant_platform/infra/systemd/ga-llm-proxy.service#L34) vs [cmd/llm-proxy/main.go:44](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/llm-proxy/main.go#L44) |
+
+### B. 安全后门 / 违反硬约束
+
+| # | 问题 | 位置 |
+|---|------|------|
+| C7 | **手动 Bot ID/Token 绑定端点违反硬约束#2**：`POST /v1/users/me/bots` 接收 JSON body 中的 `ilink_bot_id`+明文 `token`，无 dev 门控。直接违反"不允许手动输入 Bot ID/Token"约束，且产出的 bot 因 `ilink_user_id` 为空而不可用（既不安全又无用） | [api/admin.go:36](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/api/admin.go#L36) + [api/bot_binding.go:10-42](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/api/bot_binding.go#L10-42) |
+| C8 | **RequesterUserID 可从请求体伪造**：`handleCreateTask` 仅校验 dev token，然后直接使用 body 中的 `RequesterUserID` 作任务发起人，可冒充任意用户提交/取消任务，绕过租户隔离 | [api/http.go:245-248](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/api/http.go#L245-248) |
+| C9 | **路径遍历 + 任意宿主路径挂载容器（容器逃逸）**：`sessionKey` 来自 gRPC 请求未净化，`sessionDir/socketPath` 直接字符串拼接；`configRoot/runtimeRoot` 也由调用方控制，可挂载 `/etc/shadow`/`docker.sock` 到容器 | [workermanager/podman.go:137-172](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/workermanager/podman.go#L137-172) |
+| C10 | **.env.example 提交真实弱口令**：`POSTGRES_PASSWORD=REDACTED` + 用户名 `admin` 被提交到仓库，复制即可拉起弱口令 postgres | [infra/postgres/.env.example:8,15](file:///c:/sudy/github/GenericAgent/tenant_platform/infra/postgres/.env.example#L8) |
+
+### C. 并发崩溃 / 数据损坏
+
+| # | 问题 | 位置 |
+|---|------|------|
+| C11 | **Runtime.containers map 无锁并发写**：gRPC server 每请求一 goroutine，并发 Allocate/Release/List 触发 `fatal error: concurrent map writes` 崩溃 worker-manager 进程 | [workermanager/podman.go:44-47,88,102,109](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/workermanager/podman.go#L44-47) |
+| C12 | **handleRevoke 无认证 + 无 body 大小限制**：`/internal/revoke` 完全无认证，JTI 无长度限制直接写入 map，本地任意进程可批量撤销任意 JTI 造成 DoS 或耗尽内存 | [llmproxy/handler.go:97-115](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/llmproxy/handler.go#L97-115) |
+| C13 | **RecoverAfterRestart 单实例部署下自身过期任务永久卡死**：过滤 `claim_owner <> $1` 跳过自身，单实例崩溃重启后所有 starting/running 任务永久占用 session slot | [postgres/store.go:540-580](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/postgres/store.go#L540-580) |
+
+---
+
+## 二、HIGH — 关键逻辑错误（第二优先级）
+
+### 鉴权与会话
+
+- **BlockUser 不撤销 user_sessions**：被封禁用户 30 天内仍可登录使用所有 `/v1/users/me/*` 端点 — [user_service.go:75-93](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/user_service.go#L75-93) + [invite_service.go:178-187](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/invite_service.go#L178-187)
+- **登录时序侧信道**：用户不存在时直接返回，用户存在时执行 bcrypt，可枚举用户名 — [invite_service.go:160-166](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/invite_service.go#L160-166)
+- **WechatQRCodeStatus IDOR**：未校验 QR code 归属，任何已认证用户可枚举他人 bot 绑定信息 — [api/wechat_binding.go:32-53](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/api/wechat_binding.go#L32-53)
+- **Webhook secret 空时 fail-open**：`return true` 静默放行，违反 "No Silent Fallbacks" 全局规则 — [im_webhook.go:158-164](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/api/im_webhook.go#L158-164)
+
+### iLink / Poller 可靠性
+
+- **Poller webhook 失败静默吞，破坏 exactly-once**：`except Exception: print(...)` 只打印不重试不回退游标，消息永久丢失 — [poller_server.py:144-157,219-255](file:///c:/sudy/github/GenericAgent/tenant_platform/bot_poller/poller_server.py#L144-157)
+- **Poller.stop join(timeout=5) 与 POLL_TIMEOUT=30 不匹配**：线程可能仍阻塞在长轮询，返回的 cursor 处于中间状态 — [poller_server.py:48,257-264](file:///c:/sudy/github/GenericAgent/tenant_platform/bot_poller/poller_server.py#L48)
+- **RestoreActiveBots 静默吞所有失败**：`g.Wait()` 永远返回 nil，90% bot 恢复失败仍报"启动成功" — [bot_lifecycle_service.go:151-177](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/bot_lifecycle_service.go#L151-177)
+- **Poller seen 集合剪枝错误**：`set(list(seen)[-2000:])` 取的是任意元素（Python set 无序），破坏幂等性 — [poller_server.py:173-174](file:///c:/sudy/github/GenericAgent/tenant_platform/bot_poller/poller_server.py#L173)
+
+### Scheduler / Task 并发
+
+- **perUserQueueLimit TOCTOU**：多 session 用户并发 submit 锁不同 workspace row，可绕过队列上限 — [store.go:201-209,866-878](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/postgres/store.go#L201-209)
+- **reapIdleTasks finalize 后不 cancel dispatch goroutine**：dispatch 多存活 `ClaimLease/3 + 5s`，可能创建孤儿 snapshot — [scheduler.go:264-280,601-646](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/scheduler.go#L264-280)
+- **CancelWorker sync.Once 不重试**：transient 错误后永远不重试，cancel 延迟最坏 5 分钟 — [scheduler.go:442-458](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/scheduler.go#L442-458)
+
+### Worker 进程管理
+
+- **AllocateWorker 成功但 dialWorker 失败时容器泄漏**：未调用 ReleaseWorker — [manager_runtime.go:59-72](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/worker/manager_runtime.go#L59-72)
+- **waitWorkerListen 假超时**：`r.Read` 阻塞调用，deadline 永远不再求值，30s 超时形同虚设 — [runtime.go:190-210](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/worker/runtime.go#L190-210)
+- **begin_checkpoint 锁释放后写文件**：两个并发 Commit 同一 task_id 都通过校验，后者覆盖前者 — [managed_agent.py:110-121](file:///c:/sudy/github/GenericAgent/tenant_platform/worker-python/src/ga_worker/managed_agent.py#L110-121)
+- **StdoutPipe + 后台 io.Copy + Wait 违反 exec 契约**：可能丢日志/zombie 进程 — [runtime.go:99-114,131-141](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/worker/runtime.go#L99-114)
+- **无进程组隔离**：Posix 未设 `Setpgid`，Python worker 子进程变孤儿 — [process_posix.go:5](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/worker/process_posix.go#L5)
+- **Dockerfile 以 root 运行 + 镜像未固定**：`python:3.11-slim` 浮动 tag，无 USER 指令，与 C9 叠加形成容器逃逸链 — [worker-python/Dockerfile:3-25](file:///c:/sudy/github/GenericAgent/tenant_platform/worker-python/Dockerfile#L3-25)
+
+### Router / Relay / Team
+
+- **authorizeSubmitter 未过滤 status='approved'**：被移除/待批准成员仍可提交团队任务，直接违反硬约束#2 — [team_store.go:162-170](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/postgres/team_store.go#L162-170)
+- **persistInbound 硬编码 personalSessionKey**：团队消息被记录到个人 session，与任务 session_key 不一致 — [router.go:556](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/router.go#L556)
+- **relay audit 同步执行 + 不记失败 + 缺 status 字段**：违反约束#7（异步、记元数据、含 status）三重偏差 — [relay_service.go:131,149-166](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/relay_service.go#L131)
+- **被移除成员的已排队任务仍在团队 workspace 执行**：RemoveMember 未清理遗留 queued tasks — [team_member_store.go:90-137](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/postgres/team_member_store.go#L90-137)
+
+### Storage / Delivery
+
+- **Delivery 死信/ACK 竞态**：状态变更 UPDATE 无前置状态守卫，同一投递既被死信又被 ACK — [delivery_store.go:72-118](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/postgres/delivery_store.go#L72-118)
+- **CancelTask 并发返回 pgx.ErrNoRows 误导**：调用方误判为"任务不存在" — [store.go:499-511](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/postgres/store.go#L499-511)
+- **缺 `(requester_user_id, status)` 索引**：SubmitTask / 调度器 tick 退化为全表扫描 — [migrations/0001_foundation.sql](file:///c:/sudy/github/GenericAgent/tenant_platform/infra/postgres/migrations/0001_foundation.sql)
+- **UpsertBotTransportState CAS 用 Go 时钟对比 DB 时钟**：时钟偏移导致游标误判，非游标更新污染 `updated_at` — [bot_transport_store.go:46-87](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/postgres/bot_transport_store.go#L46-87)
+- **PrepareCheckpoint 不检查已存在 'writing' 快照**：重试产生孤儿快照，generation 跳号 — [store.go:589-637](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/postgres/store.go#L589-637)
+
+### Cross-cutting
+
+- **checkpoint Commit TOCTOU + .tmp 文件竞争**：`LoadSnapshotToken` 无 FOR UPDATE，`atomicWrite` 用确定性 .tmp 路径 — [checkpoint/local.go:107-129](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/checkpoint/local.go#L107-129)
+- **result digest 完整性校验可被绕过**：bundle 无 `result_digest` 且 Worker 不传 `ready.ResultDigest` 时完全跳过校验 — [checkpoint/local.go:153-164](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/checkpoint/local.go#L153-164)
+- **token_revoker 无重试无队列**：1000 会话同时结束会触发 1000 并发 HTTP 请求，失败则 token 在 TTL 内仍可用 — [token_revoker.go:45-67](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/application/token_revoker.go#L45-67)
+- **secret cipher 无密钥轮换支持**：`keyVersion != c.version` 即拒绝，密钥泄露后无法在线轮换 — [secret/token.go:84-86](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/secret/token.go#L84-86)
+- **加密密钥派生自签名密钥**：dev fallback 用 HMAC 签名密钥作 AES 加密密钥，违反密钥分离 — [cmd/llm-proxy/main.go:118-126](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/llm-proxy/main.go#L118-126)
+- **platform shutdown 复用已取消 ctx**：`context.WithTimeout(ctx, 5s)` 派生的 shutCtx 立即取消，在途请求被硬切 — [cmd/platform/main.go:179-184](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/platform/main.go#L179-184)
+- **Windows syncDirectory FlushFileBuffers 对目录无效**：committed 文件 rename 后目录元数据未落盘，断电可能丢失 — [checkpoint/syncdir_windows.go:12-25](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/checkpoint/syncdir_windows.go#L12-25)
+- **worker-manager GracefulStop 无超时**：长流式 RPC 不退出时进程无限挂起 — [cmd/worker-manager/main.go:67](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/cmd/worker-manager/main.go#L67)
+
+### LLM Proxy / 上游
+
+- **LLM Proxy 无限流计费审计**：`_ = claims` 显式忽略，被盗 token 在 TTL 内可发起无限请求 — [llmproxy/handler.go:31-93](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/llmproxy/handler.go#L31-93)
+- **上游错误响应体原样回传客户端**：泄漏 provider 账号/配额信息 — [llmproxy/handler.go:88-90](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/llmproxy/handler.go#L88-90)
+- **HTTP server 无超时配置**：平台 API server 完全无 ReadTimeout/WriteTimeout/IdleTimeout，易受 Slowloris 攻击 — [api/http.go:403](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/api/http.go#L403)
+- **内部错误消息直接返回客户端**：`err.Error()` 含 SQL 错误/表名/路径，泄漏 DB schema — [http.go:260](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/api/http.go#L260), [admin.go:128](file:///c:/sudy/github/GenericAgent/tenant_platform/backend-go/internal/api/admin.go#L128) 等多处
+
+---
+
+## 三、MEDIUM / LOW 概要（61 + 45 条）
+
+主要主题：
+
+- **relay 子模块与设计文档系统性脱节**：约束#4（内存 map + reaper）完全未实现，relayAtPrefix="@" 过于宽泛，跨租户隔离缺失，无限流
+- **Worker 管理安全加固缺失**：Podman 无 `--cap-drop=ALL`/`--security-opt`/资源 limit，gRPC 全程明文无 mTLS
+- **错误处理普遍偏差**：`err != pgx.ErrNoRows` 应为 `errors.Is`，`_, _ =` 静默吞错误，`readBody` 不返回错误
+- **请求体大小无限制**：所有 POST 端点直接 `json.NewDecoder(r.Body)`，无 `MaxBytesReader`
+- **撤销列表无界增长**：`revoked` map 只增不删，重启即失效
+- **/new 命令延迟执行**：`stopSessionWorker` 仅在下一任务 dispatch 时触发，Worker 进程持续占用
+- **多处无分页**：ListInviteCodes/ListPendingUsers/ListUserTeams 全量返回
+- **Python worker gRPC 仅 8 线程**：长任务可饿死 Health/Shutdown 控制 RPC
+- **技术债**：`insertEvent` 绕过原子计数器，`reapStuckTasks` 注释残留，`ConstantTimeEqual` 死代码，跨文件重复实现
+
+详细列表见各模块审查报告。
+
+---
+
+## 四、修复优先级建议
+
+### P0 — 上线前必修（阻塞生产部署）
+
+1. **C1-C6**：6 个"上线即崩"问题，默认配置 systemd 拉不起来
+2. **C7-C10**：4 个安全后门（手动绑定端点、RequesterUserID 伪造、容器逃逸、弱口令）
+3. **C11-C13**：3 个并发崩溃/数据损坏
+
+### P1 — 上线后第一迭代
+
+4. 鉴权与会话：BlockUser 不撤销 session、登录时序、WechatQR IDOR、webhook fail-open
+5. iLink 可靠性：Poller webhook 失败重试、stop join 修复、RestoreActiveBots 失败可见性
+6. Scheduler 并发：perUserQueueLimit TOCTOU、reapIdleTasks cancel dispatch、CancelWorker 重试
+7. Worker 进程：容器泄漏、假超时、checkpoint 锁、StdoutPipe 契约、进程组隔离
+8. Router/Relay：authorizeSubmitter 加 status 过滤、persistInbound session_key、relay audit 异步
+9. Storage：Delivery 状态守卫、热路径索引、UpsertBotTransportState CAS 修复
+10. Checkpoint：Commit TOCTOU、result digest 校验、Windows fsync
+
+### P2 — 后续迭代
+
+11. LLM Proxy：限流计费、上游重试熔断、流式响应、错误响应包装
+12. HTTP 健壮性：超时配置、请求体大小限制、错误信息脱敏
+13. 安全加固：Podman capability drop、gRPC mTLS、密钥轮换、token_revoker 重试队列
+14. 技术债清理：M/L 级问题
+
+---
+
+## 五、模块评价摘要
+
+| 模块 | 设计成熟度 | 实现完成度 | 主要风险 |
+|------|-----------|-----------|---------|
+| iLink 集成 | 高 | 中 | 手动绑定后门 + Poller 可靠性缺口 |
+| Router/Relay/Team | 高 | 中 | authorizeSubmitter 缺 status 过滤 + relay 子模块与设计脱节 |
+| Scheduler/Task | 高 | 中 | TASK_TIMEOUT 默认值冲突 + perUserQueueLimit TOCTOU |
+| Worker 管理 | 中 | 低 | 路径遍历 + map 无锁 + 容器安全加固缺失 |
+| API/Auth/LLM Proxy | 中 | 低 | signingKey 越界 + pool.Close + dev-only 鉴权 |
+| Storage/Delivery | 高 | 中 | RecoverAfterRestart 单实例 + Delivery 状态机竞态 |
+| Cross-cutting | 中 | 低 | systemd unit 与二进制严重不对齐 + checkpoint TOCTOU |
+
+**核心结论**：项目设计层（约束、状态机、lease/heartbeat/三路兜底）是扎实的，但实现层在 systemd 部署链路（unit 文件 vs 二进制）、并发安全（containers map、checkpoint .tmp、perUserQueueLimit）、安全边界（路径遍历、伪造 RequesterUserID、容器逃逸）三方面存在系统性短板。**建议优先修复 P0 的 13 个 CRITICAL**，否则 `systemctl start` 后服务无法进入 ready 状态，且存在多个安全红线问题。
+
+完整审查详情已由 7 个 subagent 输出在上方对话中，可按文件:行号定位每条问题。

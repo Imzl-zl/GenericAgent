@@ -27,6 +27,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/systemd"
 )
 
 func main() {
@@ -89,26 +90,34 @@ func run() error {
 		Addr:              cfg.Listen,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		fmt.Fprintf(os.Stderr, "llm-proxy: listen=%s token_ttl=%s\n", cfg.Listen, cfg.TokenTTL)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-			return
+	serve := func() error {
+		errCh := make(chan error, 1)
+		go func() {
+			fmt.Fprintf(os.Stderr, "llm-proxy: listen=%s token_ttl=%s\n", cfg.Listen, cfg.TokenTTL)
+			if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+				return
+			}
+			errCh <- nil
+		}()
+		select {
+		case <-ctx.Done():
+			// Derive shutdown ctx from Background, not ctx (which is already cancelled).
+			shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer shutCancel()
+			return httpSrv.Shutdown(shutCtx)
+		case err := <-errCh:
+			return err
 		}
-		errCh <- nil
-	}()
-
-	select {
-	case <-ctx.Done():
-		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shutCancel()
-		return httpSrv.Shutdown(shutCtx)
-	case err := <-errCh:
-		return err
 	}
+
+	return systemd.ReadyAndServe(ctx, serve)
 }
 
 func firstNonEmpty(a, b string) string {

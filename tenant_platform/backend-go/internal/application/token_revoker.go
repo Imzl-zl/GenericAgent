@@ -13,6 +13,18 @@ import (
 // revokeTimeout bounds a single best-effort token revocation call.
 const revokeTimeout = 5 * time.Second
 
+// revokeMaxAttempts caps retry count so a permanently-down LLM Proxy does
+// not stall session teardown indefinitely.
+const revokeMaxAttempts = 3
+
+// revokeBackoff is exponential: 100ms, 500ms, 2s. Index 0 is the delay
+// before the 2nd attempt; the 1st attempt has no delay.
+var revokeBackoff = []time.Duration{
+	100 * time.Millisecond,
+	500 * time.Millisecond,
+	2 * time.Second,
+}
+
 // TokenRevoker revokes a capability_token by JTI. The platform calls this
 // when a Worker session ends (process cleanup) so the token cannot be reused.
 type TokenRevoker interface {
@@ -50,6 +62,25 @@ func (r *httpTokenRevoker) Revoke(ctx context.Context, jti string) error {
 	if err != nil {
 		return fmt.Errorf("marshal revoke body: %w", err)
 	}
+	var lastErr error
+	for attempt := 0; attempt < revokeMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("revoke cancelled during backoff: %w", ctx.Err())
+			case <-time.After(revokeBackoff[attempt-1]):
+			}
+		}
+		if err := r.doRevoke(ctx, body); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("revoke failed after %d attempts: %w", revokeMaxAttempts, lastErr)
+}
+
+func (r *httpTokenRevoker) doRevoke(ctx context.Context, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.proxyAddr+"/internal/revoke", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build revoke request: %w", err)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -12,6 +13,10 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
+
+// maxJTIMaxLen bounds JTI length to prevent unbounded memory growth in the
+// revoked-jti map. UUIDs are 36 chars; 128 leaves headroom for other formats.
+const maxJTIMaxLen = 128
 
 // MaxWorkerRequestBytes bounds the Worker request body read by the Proxy.
 const MaxWorkerRequestBytes = 4 * 1024 * 1024
@@ -82,7 +87,23 @@ func (s *Server) handleProviderPath(w http.ResponseWriter, r *http.Request, want
 		if ue, ok := err.(*UpstreamError); ok && ue.Code == http.StatusTooManyRequests {
 			status = http.StatusTooManyRequests
 		}
-		writeError(w, status, "UPSTREAM_ERROR", err.Error())
+		// Log full error server-side; return generic message to client so
+		// provider URL, API key fragments, or quota details don't leak.
+		slog.ErrorContext(r.Context(), "llmproxy: upstream forward failed",
+			"status", status,
+			"error", err.Error(),
+		)
+		writeError(w, status, "UPSTREAM_ERROR", "upstream request failed")
+		return
+	}
+	// Only forward 2xx upstream bodies to the client. Non-2xx bodies may
+	// contain provider account info, quota usage, or internal error traces.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.WarnContext(r.Context(), "llmproxy: upstream non-2xx",
+			"status", resp.StatusCode,
+			"body_len", len(resp.Body),
+		)
+		writeError(w, http.StatusBadGateway, "UPSTREAM_ERROR", "upstream returned non-success status")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -108,6 +129,10 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Jti == "" {
 		writeError(w, http.StatusBadRequest, "MISSING_JTI", "jti required")
+		return
+	}
+	if len(req.Jti) > maxJTIMaxLen {
+		writeError(w, http.StatusBadRequest, "JTI_TOO_LONG", "jti exceeds max length")
 		return
 	}
 	s.validator.Revoke(req.Jti)

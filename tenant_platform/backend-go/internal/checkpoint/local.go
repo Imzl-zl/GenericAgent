@@ -155,12 +155,20 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 		return CommittedCheckpoint{}, fmt.Errorf("bundle missing result")
 	}
 	body, _ := resultObj["body"].(string)
+	// result_digest in bundle is authoritative when present; otherwise derive
+	// from body for backward compatibility with older Worker bundles.
 	resultDigest, _ := bundle["result_digest"].(string)
 	if resultDigest == "" {
 		resultDigest = "sha256:" + hex.EncodeToString(hashBytes([]byte(body)))
 	}
-	if ready.ResultDigest != "" && ready.ResultDigest != resultDigest {
-		return CommittedCheckpoint{}, fmt.Errorf("result digest mismatch")
+	// Worker MUST supply ready.ResultDigest so a tampered staging file (body
+	// swapped after PrepareCheckpoint) is detected. Empty ResultDigest is
+	// rejected outright — it previously bypassed the integrity check.
+	if ready.ResultDigest == "" {
+		return CommittedCheckpoint{}, fmt.Errorf("ready.ResultDigest is required (integrity check cannot be skipped)")
+	}
+	if ready.ResultDigest != resultDigest {
+		return CommittedCheckpoint{}, fmt.Errorf("result digest mismatch: worker=%s bundle=%s", ready.ResultDigest, resultDigest)
 	}
 
 	committedPath := filepath.Join(c.runtimeRoot, "committed", ready.SnapshotID+".bundle.json")
@@ -235,27 +243,33 @@ func atomicWrite(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	// Use a unique temp name per call to avoid collisions between concurrent
+	// commits of the same target path. Two Commit goroutines racing for the
+	// same committedPath would otherwise clobber each other's .tmp file.
+	// os.CreateTemp replaces ".*" in the pattern with a random suffix.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
+	// Best-effort cleanup if any step below fails before Rename.
+	defer func() {
+		if _, statErr := os.Stat(tmp); statErr == nil {
+			_ = os.Remove(tmp)
+		}
+	}()
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	if err := syncDirectory(filepath.Dir(path)); err != nil {

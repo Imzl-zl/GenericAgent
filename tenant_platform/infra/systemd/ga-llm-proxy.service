@@ -27,11 +27,17 @@ Group=ga
 WorkingDirectory=/opt/ga
 
 # ExecStart — binds loopback only. The platform's Worker calls this address
-# via the LLM_PROXY_ADDR environment variable. capability_token signing key
-# MUST match the platform's --capability-signing-key.
+# via the LLM_PROXY_ADDR environment variable. Flags must match
+# cmd/llm-proxy/main.go exactly:
+#   --capability-signing-key  HMAC key for capability_token (>=16 bytes)
+#   --llm-provider-key        AES-256-GCM key (hex) for provider API key at-rest
+#   --database-url            postgres connection string
+# Both keys are sourced from EnvironmentFile (/etc/ga/llm-proxy.env) which
+# must define CAPABILITY_SIGNING_KEY and LLM_PROVIDER_KEY as hex strings.
 ExecStart=/opt/ga/bin/llm-proxy \
   --listen=127.0.0.1:8081 \
-  --signing-key-file=/etc/ga/llm-proxy.signing-key \
+  --capability-signing-key=${CAPABILITY_SIGNING_KEY} \
+  --llm-provider-key=${LLM_PROVIDER_KEY} \
   --database-url=${DATABASE_URL}
 
 NoNewPrivileges=true

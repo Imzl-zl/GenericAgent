@@ -10,12 +10,19 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 
 	managerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/manager/v1"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/systemd"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/workermanager"
 )
+
+// gracefulStopTimeout caps how long GracefulStop waits for in-flight RPCs
+// before forcing a hard Stop. Prevents a stuck streaming RPC from pinning
+// the service in shutdown forever.
+const gracefulStopTimeout = 10 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -58,15 +65,31 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- grpcServer.Serve(ln) }()
-
-	fmt.Fprintf(os.Stderr, "worker-manager: listening on %s\n", ln.Addr().String())
-	select {
-	case <-ctx.Done():
-		grpcServer.GracefulStop()
-		return nil
-	case err := <-errCh:
-		return err
+	serve := func() error {
+		errCh := make(chan error, 1)
+		go func() { errCh <- grpcServer.Serve(ln) }()
+		fmt.Fprintf(os.Stderr, "worker-manager: listening on %s\n", ln.Addr().String())
+		select {
+		case <-ctx.Done():
+			// GracefulStop with timeout: give in-flight RPCs a bounded window,
+			// then force Stop so the process exits within gracefulStopTimeout.
+			done := make(chan struct{})
+			go func() {
+				grpcServer.GracefulStop()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(gracefulStopTimeout):
+				fmt.Fprintf(os.Stderr, "worker-manager: GracefulStop timed out after %s, forcing Stop\n", gracefulStopTimeout)
+				grpcServer.Stop()
+				<-done
+			}
+			return nil
+		case err := <-errCh:
+			return err
+		}
 	}
+
+	return systemd.ReadyAndServe(ctx, serve)
 }

@@ -1,5 +1,7 @@
 # Build context must be the project root so legacy files are accessible:
 #   podman build -f tenant_platform/worker-python/Dockerfile -t ga-worker .
+# P2 hardening: pin digest for reproducible builds:
+#   FROM python:3.11-slim@sha256:<digest>
 FROM python:3.11-slim
 
 WORKDIR /ga
@@ -20,6 +22,13 @@ ENV GA_LEGACY_ROOT=/ga/legacy
 ENV PYTHONPATH=/ga/worker-python/src:/ga/legacy
 
 # Mount points for bind-mounted config, runtime data, and gRPC socket.
-RUN mkdir -p /ga/config /ga/runtime /ga/rpc
+# Create them with non-root ownership so the USER below can write runtime/rpc.
+RUN mkdir -p /ga/config /ga/runtime /ga/rpc \
+    && chown -R 1000:1000 /ga/runtime /ga/rpc
+
+# Run as non-root: even if the container is compromised, the process has no
+# privileged capabilities. Pair with Podman --cap-drop=ALL --security-opt
+# no-new-privileges for defense in depth.
+USER 1000:1000
 
 ENTRYPOINT ["python", "-m", "ga_worker.entrypoint", "--listen", "unix:/ga/rpc/worker.sock"]

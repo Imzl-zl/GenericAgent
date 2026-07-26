@@ -177,7 +177,11 @@ func startLLMProxy(ctx context.Context, cfg llmProxyConfig) (string, func(), err
 	addr := "http://" + ln.Addr().String()
 	fmt.Fprintf(os.Stderr, "platform: in-process llm-proxy listen=%s provider_source=store\n", ln.Addr().String())
 	shutdown := func() {
-		shutCtx, shutCancel := context.WithTimeout(ctx, 5*time.Second)
+		// Derive from Background, not ctx: by the time shutdown runs, ctx is
+		// already cancelled (signal handler triggered), so WithTimeout(ctx)
+		// would yield an immediately-expired context and hard-cut in-flight
+		// requests. We want a graceful 5s window for handlers to finish.
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutCancel()
 		_ = httpSrv.Shutdown(shutCtx)
 	}
