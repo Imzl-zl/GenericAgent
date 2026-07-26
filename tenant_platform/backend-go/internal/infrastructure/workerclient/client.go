@@ -185,9 +185,15 @@ func (c *Client) Health(ctx context.Context) (*workerv1.HealthResponse, error) {
 func (c *Client) Shutdown(ctx context.Context, reason string) error {
 	callCtx, cancel := withDeadline(ctx, defaultUnaryTimeout)
 	defer cancel()
-	_, err := c.raw.Shutdown(callCtx, &workerv1.ShutdownRequest{Reason: reason})
+	resp, err := c.raw.Shutdown(callCtx, &workerv1.ShutdownRequest{Reason: reason})
 	if err != nil {
 		return wrapRPC("Shutdown", err)
+	}
+	// accepted=false means the Worker's runner thread did not drain within its
+	// grace period — the stop was not clean. Surface it so callers escalate to
+	// a hard process/container kill instead of assuming graceful teardown.
+	if !resp.GetAccepted() {
+		return fmt.Errorf("worker shutdown not accepted (runner still draining); escalate to hard kill")
 	}
 	return nil
 }

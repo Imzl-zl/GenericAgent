@@ -18,6 +18,41 @@ from ga_worker.state import TaskRunState
 ERROR_MSG_MAX_LEN = 500
 
 
+def map_exception_code(exc: BaseException) -> str:
+    """Map a Python exception to a structured terminal error code.
+
+    Before this, every unhandled exception surfaced as TASK_EXCEPTION, which
+    made "LLM rate-limited" indistinguishable from "disk full" in task_events
+    and delivery messages. Order matters: most specific first.
+    """
+    if isinstance(exc, MemoryError):
+        return "OUT_OF_MEMORY"
+    if isinstance(exc, TimeoutError):
+        return "TASK_TIMEOUT"
+    if isinstance(exc, PermissionError):
+        return "PERMISSION_DENIED"
+    if isinstance(exc, OSError):
+        if getattr(exc, "errno", None) == 28:  # ENOSPC
+            return "DISK_FULL"
+        return "IO_ERROR"
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        return "INTERRUPTED"
+    # Requests/HTTP-shaped errors from the LLM client (duck-typed: works for
+    # requests.HTTPError and any exception exposing a response.status_code).
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        if status == 429:
+            return "LLM_RATE_LIMITED"
+        if status >= 500:
+            return "LLM_SERVER_ERROR"
+        if status in (401, 403):
+            return "LLM_AUTH_ERROR"
+        return "LLM_CLIENT_ERROR"
+    if exc.__class__.__name__ in ("ConnectionError", "ConnectTimeout", "ReadTimeout"):
+        return "LLM_CONNECT_ERROR"
+    return "TASK_EXCEPTION"
+
+
 def emit_error_terminal(
     adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState, error_msg: Any,
 ) -> Iterator[worker_pb2.WorkerEvent]:
@@ -109,9 +144,10 @@ def emit_missing_terminal_if_needed(
 def emit_exception_terminal(
     adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState | None, exc: Exception,
 ) -> Iterator[worker_pb2.WorkerEvent]:
+    code = map_exception_code(exc)
     term = adapter._terminal(
         task.task_id, worker_pb2.TASK_FAILED,
-        user_message=str(exc)[:ERROR_MSG_MAX_LEN], error_code="TASK_EXCEPTION",
+        user_message=f"{code}: {exc}"[:ERROR_MSG_MAX_LEN], error_code=code,
     )
     agent = state.agent if state is not None else None
     try:

@@ -88,6 +88,13 @@ type Validator struct {
 	mu         sync.RWMutex
 }
 
+// revokedRetention is how long a revoked JTI stays in the denylist. Tokens are
+// short-lived (issuer TTL is minutes), so any entry older than this belongs to
+// a token that has long since expired and is rejected by the ExpiresAt check
+// anyway. Lazy pruning on each Revoke keeps the map bounded on a long-running
+// Proxy (pattern: JWT denylist with TTL-scoped retention).
+const revokedRetention = 24 * time.Hour
+
 // NewValidator validates the signing key.
 func NewValidator(signingKey []byte) (*Validator, error) {
 	if len(signingKey) < MinSigningKeyLen {
@@ -142,14 +149,23 @@ func (v *Validator) ValidateUnscoped(token string) (TokenClaims, error) {
 	return claims, nil
 }
 
-// Revoke adds jti to the denylist. Idempotent.
+// Revoke adds jti to the denylist. Idempotent. Entries older than
+// revokedRetention are pruned lazily so the map stays bounded on a
+// long-running Proxy.
 func (v *Validator) Revoke(jti string) {
 	if jti == "" {
 		return
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.revoked[jti] = v.clock()
+	now := v.clock()
+	cutoff := now.Add(-revokedRetention)
+	for id, at := range v.revoked {
+		if at.Before(cutoff) {
+			delete(v.revoked, id)
+		}
+	}
+	v.revoked[jti] = now
 }
 
 // IsRevoked reports whether jti is on the denylist.

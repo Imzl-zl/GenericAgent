@@ -30,6 +30,11 @@ const (
 	minDeliveryBackoff     = time.Second
 	maxDeliveryBackoff     = 5 * time.Minute
 	deliverySendTimeout    = 15 * time.Second
+	// maxDeliveryAttempts is a hard cap independent of the retry window. The
+	// 5-minute window already bounds attempts to ~8-10 under exponential
+	// backoff, but a clock anomaly or a task with NULL terminal_at (zero
+	// deadline) would otherwise retry forever. Pattern: SQS maxReceiveCount.
+	maxDeliveryAttempts = 10
 )
 
 // DeliveryStore is the persistence port for the terminal delivery outbox.
@@ -235,6 +240,9 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 
 func (s *deliveryService) buildText(ctx context.Context, d domain.Delivery, task domain.Task) (string, error) {
 	switch d.DeliveryType {
+	case domain.DeliveryTaskStarted:
+		// Initial notification: let user know processing has begun
+		return "🤖 正在处理您的任务...", nil
 	case domain.DeliveryTaskComplete:
 		if d.PayloadRef == "" {
 			return "", errors.New("task_complete missing payload_ref")
@@ -257,6 +265,10 @@ func (s *deliveryService) buildText(ctx context.Context, d domain.Delivery, task
 }
 
 func (s *deliveryService) retryOrDeadLetter(ctx context.Context, d domain.Delivery, task domain.Task, code, message string, now time.Time) error {
+	if d.AttemptCount >= maxDeliveryAttempts {
+		return s.deadLetter(ctx, d, "MAX_ATTEMPTS_EXCEEDED",
+			fmt.Sprintf("%s (after %d attempts)", message, d.AttemptCount), now)
+	}
 	deadline := retryDeadline(task, s.cfg.RetryWindow)
 	next := nextRetryAt(d, now)
 	if !deadline.IsZero() && next.After(deadline) {

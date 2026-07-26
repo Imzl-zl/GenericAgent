@@ -114,6 +114,18 @@ RETURNING `+taskSelectColumns, t.ID, string(status), code, message, traceID, res
 
 func insertDelivery(ctx context.Context, tx pgx.Tx, taskID string, dt domain.DeliveryType, ref, digest, code, message, traceID string) error {
 	id := domain.StableDeliveryID(taskID, dt)
+	// task_started and task_complete don't have error fields per schema constraint
+	if dt == domain.DeliveryTaskStarted || dt == domain.DeliveryTaskComplete {
+		_, err := tx.Exec(ctx, `
+INSERT INTO task_deliveries (
+  delivery_id, task_id, delivery_type, status,
+  payload_ref, payload_digest
+) VALUES ($1,$2,$3,'pending',$4,$5)
+ON CONFLICT (task_id, delivery_type) DO NOTHING
+`, id, taskID, string(dt), nullIfEmpty(ref), nullIfEmpty(digest))
+		return err
+	}
+	// error deliveries (failed/cancelled/interrupted) require error fields
 	_, err := tx.Exec(ctx, `
 INSERT INTO task_deliveries (
   delivery_id, task_id, delivery_type, status,

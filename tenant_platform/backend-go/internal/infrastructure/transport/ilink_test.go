@@ -17,7 +17,7 @@ func newPollerAdapter(t *testing.T, handler http.HandlerFunc) (*ILinkAdapter, *h
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	pollerClient, err := poller.NewClient(server.URL)
+	pollerClient, err := poller.NewClient(server.URL, "") // empty apiSecret for test
 	if err != nil {
 		t.Fatalf("poller client: %v", err)
 	}

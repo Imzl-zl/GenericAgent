@@ -7,10 +7,16 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/transport"
 )
+
+// relaySendTimeout bounds the iLink send of one relay message so a hung
+// Poller cannot block the inbound webhook request indefinitely. Matches
+// deliverySendTimeout in delivery_service.go.
+const relaySendTimeout = 15 * time.Second
 
 // RelayStore is the persistence port for relay recipient resolution and
 // opt-out preference management. *postgres.Store implements it implicitly.
@@ -122,7 +128,11 @@ func (s *relayService) Relay(ctx context.Context, fromUserID int64, toUsername, 
 	}
 
 	relayText := fmt.Sprintf("[来自 %s 的消息] %s", fromUsername, text)
-	if err := s.transport.SendMessage(ctx, recipient.BotUUID, recipient.IlinkUserID, relayText); err != nil {
+	// Bounded send: without a timeout a hung Poller would block the whole
+	// inbound HTTP request. Mirrors deliverySendTimeout in delivery_service.go.
+	sendCtx, cancel := context.WithTimeout(ctx, relaySendTimeout)
+	defer cancel()
+	if err := s.transport.SendMessage(sendCtx, recipient.BotUUID, recipient.IlinkUserID, relayText); err != nil {
 		return fmt.Errorf("send relay: %w", err)
 	}
 

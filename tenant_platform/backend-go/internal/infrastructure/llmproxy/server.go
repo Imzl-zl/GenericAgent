@@ -45,7 +45,18 @@ func NewServer(cfg Config) (*Server, error) {
 	// (context.WithTimeout(defaultUpstreamTimeout)) is the single source of
 	// truth for request lifetime. A redundant client-level timeout would race
 	// with ctx and could fire first, obscuring the real cancellation reason.
-	u := NewUpstream(&http.Client{})
+	//
+	// The transport is tuned for one (or few) upstream LLM hosts: the Go
+	// default MaxIdleConnsPerHost of 2 would force a fresh TCP+TLS handshake
+	// for almost every concurrent Worker request. 32 idle conns per host
+	// covers the expected concurrency with headroom (same rationale as
+	// poller/client.go).
+	u := NewUpstream(&http.Client{Transport: &http.Transport{
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}})
 	return &Server{cfg: cfg, validator: v, upstream: u}, nil
 }
 

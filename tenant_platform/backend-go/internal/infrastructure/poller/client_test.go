@@ -2,6 +2,9 @@ package poller
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,16 +13,16 @@ import (
 )
 
 func TestNewClientRejectsEmptyURL(t *testing.T) {
-	if _, err := NewClient(""); err == nil {
+	if _, err := NewClient("", ""); err == nil {
 		t.Fatal("expected error for empty URL")
 	}
-	if _, err := NewClient("   "); err == nil {
+	if _, err := NewClient("   ", ""); err == nil {
 		t.Fatal("expected error for whitespace URL")
 	}
 }
 
 func TestNewClientTrimsTrailingSlash(t *testing.T) {
-	c, err := NewClient("http://localhost:8090/")
+	c, err := NewClient("http://localhost:8090/", "")
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -41,7 +44,7 @@ func TestStartBot(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(server.URL)
+	c, err := NewClient(server.URL, "")
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -65,7 +68,7 @@ func TestStartBot(t *testing.T) {
 }
 
 func TestStartBotRejectsMissingFields(t *testing.T) {
-	c, err := NewClient("http://127.0.0.1:1")
+	c, err := NewClient("http://127.0.0.1:1", "")
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -89,7 +92,7 @@ func TestStopBot(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(server.URL)
+	c, err := NewClient(server.URL, "")
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -118,7 +121,7 @@ func TestSendMessage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(server.URL)
+	c, err := NewClient(server.URL, "")
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -140,11 +143,11 @@ func TestSendMessage(t *testing.T) {
 
 func TestSendMessageMedia(t *testing.T) {
 	tests := []struct {
-		name    string
-		msgType string
-		text    string
+		name     string
+		msgType  string
+		text     string
 		filePath string
-		wantErr bool
+		wantErr  bool
 	}{
 		{name: "image", msgType: MsgTypeImage, filePath: "/tmp/a.jpg"},
 		{name: "video", msgType: MsgTypeVideo, filePath: "/tmp/a.mp4"},
@@ -163,7 +166,7 @@ func TestSendMessageMedia(t *testing.T) {
 			}))
 			defer server.Close()
 
-			c, err := NewClient(server.URL)
+			c, err := NewClient(server.URL, "")
 			if err != nil {
 				t.Fatalf("new client: %v", err)
 			}
@@ -203,7 +206,7 @@ func TestHealth(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(server.URL)
+	c, err := NewClient(server.URL, "")
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -223,7 +226,7 @@ func TestPollerErrorPropagates(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(server.URL)
+	c, err := NewClient(server.URL, "")
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -231,5 +234,60 @@ func TestPollerErrorPropagates(t *testing.T) {
 		BotUUID: "bot-1", ILinkUserID: "user-1", Text: "hi",
 	}); err == nil {
 		t.Fatal("expected error on 500")
+	}
+}
+
+func TestPostSignsRequestWithAPISecret(t *testing.T) {
+	const secret = "test-api-secret"
+	var gotSig string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-API-Signature")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"sent":true}`))
+	}))
+	defer server.Close()
+
+	c, err := NewClient(server.URL, secret)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	if err := c.SendMessage(context.Background(), SendMessageRequest{
+		BotUUID: "b1", ILinkUserID: "u1", Text: "hello",
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if gotSig == "" {
+		t.Fatal("expected X-API-Signature header, got empty")
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(gotBody)
+	want := hex.EncodeToString(mac.Sum(nil))
+	if gotSig != want {
+		t.Fatalf("signature mismatch: got %s want %s", gotSig, want)
+	}
+}
+
+func TestPostOmitsSignatureWithoutSecret(t *testing.T) {
+	var sawHeader bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, sawHeader = r.Header["X-Api-Signature"]
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"sent":true}`))
+	}))
+	defer server.Close()
+
+	c, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	if err := c.SendMessage(context.Background(), SendMessageRequest{
+		BotUUID: "b1", ILinkUserID: "u1", Text: "hello",
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if sawHeader {
+		t.Fatal("did not expect X-API-Signature header without secret")
 	}
 }

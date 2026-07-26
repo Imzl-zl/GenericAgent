@@ -4,6 +4,7 @@ package domain
 type DeliveryType string
 
 const (
+	DeliveryTaskStarted     DeliveryType = "task_started"     // Initial "processing..." notification
 	DeliveryTaskComplete    DeliveryType = "task_complete"
 	DeliveryTaskFailed      DeliveryType = "task_failed"
 	DeliveryTaskCancelled   DeliveryType = "task_cancelled"

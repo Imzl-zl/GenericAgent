@@ -21,6 +21,7 @@ wxbot_media.download_media covers all 4 inbound types.
 """
 
 import argparse
+import collections
 import hashlib
 import hmac
 import json
@@ -47,6 +48,12 @@ from wxbot_media import download_media  # noqa: E402
 
 POLL_TIMEOUT = 30
 WEBHOOK_TIMEOUT = 10
+# Webhook delivery retry: exponential backoff base/cap. Retrying blocks the
+# bot's dispatch loop on purpose — that is the backpressure that stops the
+# cursor from advancing past an undelivered message (same model as a Kafka
+# consumer that refuses to commit an offset it failed to process).
+WEBHOOK_RETRY_BASE_SECONDS = 2.0
+WEBHOOK_RETRY_CAP_SECONDS = 60.0
 
 # Map file extension to MIME content_type. Used to populate media_assets
 # metadata when the Poller forwards inbound media to the platform webhook.
@@ -93,6 +100,28 @@ MSG_TYPE_IMAGE = 'image'
 MSG_TYPE_VIDEO = 'video'
 MSG_TYPE_FILE = 'file'
 _VALID_MSG_TYPES = {MSG_TYPE_TEXT, MSG_TYPE_IMAGE, MSG_TYPE_VIDEO, MSG_TYPE_FILE}
+
+
+class _DedupWindow:
+    """Bounded FIFO dedup window: O(1) membership via set, FIFO eviction via deque.
+
+    Single-threaded use only (each bot thread owns its own instance).
+    """
+
+    def __init__(self, maxlen=2000):
+        self._maxlen = maxlen
+        self._set = set()
+        self._fifo = collections.deque()
+
+    def add(self, key):
+        """Add key; returns True if new, False if already present."""
+        if key in self._set:
+            return False
+        self._set.add(key)
+        self._fifo.append(key)
+        if len(self._fifo) > self._maxlen:
+            self._set.discard(self._fifo.popleft())
+        return True
 
 
 class BotEntry:
@@ -143,7 +172,14 @@ class BotManager:
 
     def _run(self, entry):
         """Long-poll loop for one bot. Exits on stop_event or AuthExpired."""
-        seen = set()
+        # Bounded FIFO dedup window, local to this bot's thread (no sharing).
+        # The old implementation trimmed with `seen = set(list(seen)[-2000:])`
+        # inside _dispatch, which only rebound the local parameter — the
+        # caller's set was never trimmed, so memory grew without bound.
+        # set gives O(1) lookup; deque(maxlen) evicts oldest ids in FIFO order.
+        # The platform's (bot_id, message_id) idempotency key remains the
+        # final defense; this window only avoids redundant webhook POSTs.
+        seen = _DedupWindow(maxlen=2000)
         while not entry.stop_event.is_set():
             try:
                 for msg in entry.client.get_updates(POLL_TIMEOUT):
@@ -167,11 +203,8 @@ class BotManager:
         message contains both text and media items.
         """
         mid = str(msg.get('message_id', 0))
-        if not entry.client.is_user_msg(msg) or mid in seen:
+        if not entry.client.is_user_msg(msg) or not seen.add(mid):
             return
-        seen.add(mid)
-        if len(seen) > 5000:
-            seen = set(list(seen)[-2000:])
         text = entry.client.extract_text(msg)
         uid = msg.get('from_user_id', '')
         ctx = msg.get('context_token', '')
@@ -231,14 +264,31 @@ class BotManager:
 
     def _notify_expired(self, entry):
         body = {'bot_uuid': entry.bot_uuid, 'auth_expired': True}
-        self._post_webhook_body(entry, body)
+        # Bounded attempts: the bot loop is exiting either way; the platform
+        # also detects expiry via send failures, so losing this signal is
+        # recoverable and must not wedge the thread forever.
+        self._post_webhook_body(entry, body, max_attempts=5)
 
-    def _post_webhook_body(self, entry, body):
+    def _post_webhook_body(self, entry, body, max_attempts=None):
         """POST webhook with deterministic JSON + HMAC-SHA256 signature.
 
         We serialize once and send as raw bytes so the signature matches the
         exact bytes on the wire (requests' json= would re-serialize and could
         diverge on key ordering/whitespace across versions).
+
+        Delivery contract (matches im_webhook.go, which returns 5xx expecting
+        a retry, e.g. CURSOR_PERSIST_FAILED):
+          - 2xx  -> delivered, return True.
+          - 4xx  -> permanent rejection (bad signature / validation); log
+                    loudly and drop, return False. Retrying cannot heal it.
+          - 5xx / network error -> retry with capped exponential backoff,
+                    blocking this bot's loop (backpressure keeps ordering and
+                    stops the cursor from advancing past an undelivered
+                    message). Platform (bot_id, message_id) dedup absorbs any
+                    resulting at-least-once redelivery.
+
+        max_attempts=None retries until stop_event is set.
+        Returns True when delivered, False when dropped or interrupted.
         """
         body_bytes = json.dumps(body, separators=(',', ':')).encode('utf-8')
         headers = {'Content-Type': 'application/json'}
@@ -249,10 +299,34 @@ class BotManager:
                 hashlib.sha256,
             ).hexdigest()
             headers['X-Webhook-Signature'] = sig
-        try:
-            requests.post(entry.webhook_url, data=body_bytes, headers=headers, timeout=WEBHOOK_TIMEOUT)
-        except Exception as exc:
-            print(f'[Poller] webhook post err ({entry.bot_uuid}): {exc}', flush=True)
+
+        attempt = 0
+        while not entry.stop_event.is_set():
+            attempt += 1
+            try:
+                resp = requests.post(entry.webhook_url, data=body_bytes,
+                                     headers=headers, timeout=WEBHOOK_TIMEOUT)
+                if 200 <= resp.status_code < 300:
+                    return True
+                if 400 <= resp.status_code < 500:
+                    print(f'[Poller] webhook PERMANENTLY rejected ({entry.bot_uuid}) '
+                          f'status={resp.status_code} body={resp.text[:200]} — message dropped',
+                          flush=True)
+                    return False
+                err_desc = f'status={resp.status_code} body={resp.text[:200]}'
+            except Exception as exc:
+                err_desc = f'error={exc}'
+
+            if max_attempts is not None and attempt >= max_attempts:
+                print(f'[Poller] webhook delivery gave up after {attempt} attempts '
+                      f'({entry.bot_uuid}): {err_desc}', flush=True)
+                return False
+            backoff = min(WEBHOOK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                          WEBHOOK_RETRY_CAP_SECONDS)
+            print(f'[Poller] webhook post failed ({entry.bot_uuid}) attempt={attempt} '
+                  f'{err_desc}; retrying in {backoff:.0f}s', flush=True)
+            entry.stop_event.wait(backoff)
+        return False
 
     def stop(self, bot_uuid):
         with self._lock:
@@ -297,6 +371,7 @@ class PollerHandler(BaseHTTPRequestHandler):
     """HTTP API: /start /stop /send /health."""
 
     manager = None  # set by serve()
+    api_secret = ''  # set by serve(); HMAC-SHA256 shared secret for inbound API auth
 
     def log_message(self, fmt, *args):
         pass  # silence default access log
@@ -315,6 +390,26 @@ class PollerHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(length))
 
+    def _verify_request_signature(self, body_bytes):
+        """Verify X-API-Signature header against HMAC-SHA256(body_bytes, api_secret).
+
+        Returns True if valid or api_secret is empty (dev/test mode).
+        Returns False if signature is missing or mismatched.
+        """
+        if not self.api_secret:
+            return True  # no auth configured, allow (dev/test only)
+
+        received_sig = self.headers.get('X-API-Signature', '')
+        if not received_sig:
+            return False
+
+        expected_sig = hmac.new(
+            self.api_secret.encode('utf-8'),
+            body_bytes,
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(received_sig, expected_sig)
+
     def do_GET(self):
         if self.path == '/health':
             self._reply(200, self.manager.health())
@@ -323,7 +418,16 @@ class PollerHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            body = self._read_json()
+            length = int(self.headers.get('Content-Length', 0))
+            body_bytes = self.rfile.read(length) if length > 0 else b'{}'
+
+            # Verify signature before processing (except /health is GET-only)
+            if not self._verify_request_signature(body_bytes):
+                self._reply(401, {'error': 'invalid or missing X-API-Signature'})
+                return
+
+            body = json.loads(body_bytes) if body_bytes != b'{}' else {}
+
             if self.path == '/start':
                 self.manager.start(
                     body['bot_uuid'], body['bot_token'], body.get('ilink_bot_id', ''),
@@ -350,11 +454,13 @@ class PollerHandler(BaseHTTPRequestHandler):
             self._reply(500, {'error': str(exc)})
 
 
-def serve(listen, grace_seconds=10.0, media_root=None, webhook_secret=''):
+def serve(listen, grace_seconds=10.0, media_root=None, webhook_secret='', api_secret=''):
     PollerHandler.manager = BotManager(media_root=media_root, webhook_secret=webhook_secret)
+    PollerHandler.api_secret = api_secret or ''
     host, port = _parse_listen_addr(listen)
     server = ThreadingHTTPServer((host, port), PollerHandler)
-    print(f'bot_poller listening on {host}:{port} (media_root={media_root or "disabled"}, auth={"on" if webhook_secret else "off"})', flush=True)
+    auth_status = 'on' if api_secret else 'off (INSECURE - dev/test only)'
+    print(f'bot_poller listening on {host}:{port} (media_root={media_root or "disabled"}, api_auth={auth_status}, webhook_auth={"on" if webhook_secret else "off"})', flush=True)
 
     # serve_forever() blocks the main thread; SIGINT/SIGTERM raise KeyboardInterrupt
     # on Windows (SIGTERM) or interrupt the call (SIGINT), letting us shut down cleanly.
@@ -375,10 +481,13 @@ def main(argv=None):
                         help='Root directory for inbound media files. Empty disables media download.')
     parser.add_argument('--webhook-secret', default=os.environ.get('PLATFORM_WEBHOOK_SECRET', ''),
                         help='HMAC-SHA256 secret shared with the Go platform to sign /v1/im/webhook requests (or PLATFORM_WEBHOOK_SECRET). Empty = unauthenticated (dev/test only).')
+    parser.add_argument('--api-secret', default=os.environ.get('BOT_POLLER_API_SECRET', ''),
+                        help='HMAC-SHA256 secret for authenticating inbound /start /stop /send requests (or BOT_POLLER_API_SECRET). Empty = unauthenticated (INSECURE - dev/test only).')
     args = parser.parse_args(argv)
     serve(args.listen, args.grace_seconds,
           media_root=args.media_dir or None,
-          webhook_secret=args.webhook_secret or '')
+          webhook_secret=args.webhook_secret or '',
+          api_secret=args.api_secret or '')
 
 
 if __name__ == '__main__':

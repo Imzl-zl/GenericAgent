@@ -231,7 +231,7 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
-	task, err := r.tasks.SubmitTask(ctx, domain.SubmitTaskCommand{
+	_, err = r.tasks.SubmitTask(ctx, domain.SubmitTaskCommand{
 		SessionKey:        sessionKey,
 		RequesterUserID:   bot.OwnerID,
 		Source:            domain.SourceWechat,
@@ -246,7 +246,10 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	reply := fmt.Sprintf("task %s queued", task.ID)
+	// Send immediate ack so user knows message was received (synchronous fast path).
+	// The delivery_service will also send "🤖 正在处理..." notification via task_started
+	// delivery (asynchronous reliable path, survives restarts).
+	reply := "✓ 收到"
 	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 	return RouterResult{Action: ActionTaskCreated, Reply: reply, UserID: bot.OwnerID}, nil
 }

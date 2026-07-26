@@ -67,3 +67,50 @@ func formatActivityTime(lastActivity time.Time, dispatchStarted *time.Time) stri
 	}
 	return "unknown"
 }
+
+// evictIdleWorkers tears down resident Worker processes whose session has no
+// active owned task and whose lastUsedAt is older than WorkerIdleTTL. This is
+// the WORKER_IDLE_TIMEOUT behavior from architecture §8.3: idle Workers hold
+// memory (Python process + GA history) but no model concurrency, so they are
+// reclaimed after a grace window. Session continuity is preserved because the
+// next task cold-starts a Worker from the last committed snapshot
+// (StartSessionRequest.SnapshotId).
+//
+// Safety: sessions present in `owned` (starting/running on this instance) are
+// never evicted. The lastUsedAt freshness check additionally protects the
+// microsecond window between ensureWorker and MarkDispatchStarted in dispatch,
+// since TTL is minutes while that window is not.
+func (s *scheduler) evictIdleWorkers(owned []domain.Task) {
+	if s.cfg.WorkerIdleTTL <= 0 {
+		return
+	}
+	cutoff := time.Now().UTC().Add(-s.cfg.WorkerIdleTTL)
+	active := make(map[string]struct{}, len(owned))
+	for _, t := range owned {
+		active[t.SessionKey] = struct{}{}
+	}
+
+	s.mu.Lock()
+	var victims []*workerEntry
+	for sk, entry := range s.workers {
+		if _, busy := active[sk]; busy {
+			continue
+		}
+		if entry.lastUsedAt.After(cutoff) {
+			continue
+		}
+		victims = append(victims, entry)
+		delete(s.workers, sk)
+	}
+	s.mu.Unlock()
+
+	for _, entry := range victims {
+		slog.Info("scheduler: evicting idle worker",
+			"session_key", entry.sessionKey,
+			"worker_instance_id", entry.instID,
+			"idle_ttl_seconds", int(s.cfg.WorkerIdleTTL.Seconds()),
+			"last_used_at", entry.lastUsedAt.UTC().Format(time.RFC3339))
+		s.revokeTokenBestEffort(context.Background(), entry.jti)
+		entry.cleanup()
+	}
+}

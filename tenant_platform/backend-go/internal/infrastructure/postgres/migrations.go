@@ -51,6 +51,8 @@ func migrationFiles() []string {
 		"0018_session_reset.sql",
 		"0019_drop_binding_attempts.sql",
 		"0020_task_event_sequence_counter.sql",
+		"0021_tasks_requester_status_index.sql",
+		"0022_task_started_delivery.sql",
 	}
 }
 
@@ -80,6 +82,8 @@ var pendingMigrations = []struct {
 	{"0018_session_reset.sql", "migration_0018_session_reset_marker"},
 	{"0019_drop_binding_attempts.sql", "migration_0019_drop_binding_attempts_marker"},
 	{"0020_task_event_sequence_counter.sql", "migration_0020_task_event_sequence_counter_marker"},
+	{"0021_tasks_requester_status_index.sql", "migration_0021_tasks_requester_status_index_marker"},
+	{"0022_task_started_delivery.sql", "migration_0022_task_started_delivery_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).

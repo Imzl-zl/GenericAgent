@@ -112,6 +112,11 @@ RETURNING `+taskSelectColumns, taskID, workspaceID, cmd.SessionKey, nextSeq, req
 			if err := insertEvent(ctx, tx, t.ID, "status_transition", 0, nil, nil, "", "queued", "", ""); err != nil {
 				return err
 			}
+			// Create initial "task started" delivery for immediate user feedback.
+			// This gives users a "processing..." notification instead of silent waiting.
+			if err := insertDelivery(ctx, tx, t.ID, domain.DeliveryTaskStarted, "", "", "", "", ""); err != nil {
+				return err
+			}
 			return nil
 		}
 		if !errors.Is(scanErr, pgx.ErrNoRows) {

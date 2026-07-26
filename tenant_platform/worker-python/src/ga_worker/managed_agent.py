@@ -141,4 +141,11 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
         # P-M4: bounded join so shutdown never hangs forever.
         if runner is not None and runner.is_alive():
             runner.join(timeout=SHUTDOWN_JOIN_TIMEOUT_S)
+            if runner.is_alive():
+                # The runner did not drain within the grace period (hung LLM
+                # call / stuck tool). Report accepted=False so the platform
+                # knows the stop was NOT clean and escalates to a hard kill of
+                # the process/container instead of assuming graceful teardown
+                # (Lambda SIGTERM→SIGKILL escalation pattern).
+                return worker_pb2.ShutdownResponse(accepted=False)
         return worker_pb2.ShutdownResponse(accepted=True)

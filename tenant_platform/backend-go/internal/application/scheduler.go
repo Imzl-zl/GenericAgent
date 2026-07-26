@@ -84,6 +84,13 @@ type SchedulerConfig struct {
 	// Worker keeps last_activity_at fresh via chunk events + drain poll
 	// heartbeats. Zero disables idle reaping (dev/test only).
 	IdleTimeout time.Duration
+	// WorkerIdleTTL sets how long a Worker process can stay resident after its
+	// session becomes idle (no queued/starting/running task). When > 0, the
+	// scheduler evicts idle Workers to reclaim memory. Pattern: Kubernetes pod
+	// eviction + AWS Lambda container reuse window. Real deployments should
+	// set 5-15 minutes to balance cold-start overhead vs memory pressure.
+	// Zero keeps Workers resident indefinitely (dev/test or tiny fleets).
+	WorkerIdleTTL time.Duration
 }
 
 // LLMProviderSource returns the platform's current default LLM provider.
@@ -259,6 +266,11 @@ func (s *scheduler) tick(ctx context.Context) error {
 			slog.ErrorContext(ctx, "scheduler: reap idle tasks failed", "error", err)
 		}
 	}
+	// Reclaim memory from Workers whose session has been idle past the TTL
+	// (architecture §8.3 WORKER_IDLE_TIMEOUT). Sessions with active owned
+	// tasks are never touched; the next task cold-starts from the last
+	// committed snapshot.
+	s.evictIdleWorkers(owned)
 	// If we already own a non-terminal starting/running task, continue dispatch if needed.
 	for _, t := range owned {
 		if t.Status == domain.TaskStarting && t.WorkerDispatchStartedAt == nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -24,6 +25,10 @@ type workerEntry struct {
 	startOnce  sync.Once
 	startErr   error
 	started    bool
+	// lastUsedAt is updated every time a task is dispatched to this Worker.
+	// Used by the idle eviction reaper to reclaim memory from long-idle
+	// sessions (pattern: Kubernetes pod eviction, AWS Lambda container TTL).
+	lastUsedAt time.Time
 }
 
 // startSession invokes StartSession on the worker exactly once. Subsequent
@@ -76,6 +81,7 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry, ok := s.workers[task.SessionKey]; ok {
+		entry.lastUsedAt = time.Now().UTC() // refresh idle-eviction clock on reuse
 		return entry.client, entry, nil
 	}
 
@@ -96,6 +102,7 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 		instID:     instID,
 		sessionKey: task.SessionKey,
 		jti:        jti,
+		lastUsedAt: time.Now().UTC(),
 	}
 	s.workers[task.SessionKey] = entry
 	return client, entry, nil

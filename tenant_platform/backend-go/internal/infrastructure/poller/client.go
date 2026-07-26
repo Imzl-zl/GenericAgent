@@ -8,6 +8,9 @@ package poller
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,15 +33,19 @@ const (
 
 // Client calls the Python Bot Poller HTTP API.
 type Client struct {
-	baseURL string
-	http    *http.Client
+	baseURL   string
+	http      *http.Client
+	apiSecret string // HMAC-SHA256 shared secret for X-API-Signature auth
 }
 
 // NewClient validates the poller base URL and returns a client with a tuned
 // transport: keep-alive is on, idle conns per host are raised above the Go
 // default (2) so concurrent StartBot/SendMessage/Health calls reuse conns
 // instead of churning TCP handshakes.
-func NewClient(baseURL string) (*Client, error) {
+//
+// apiSecret is the HMAC-SHA256 shared secret used to sign requests with
+// X-API-Signature. Empty string disables signing (insecure; dev/test only).
+func NewClient(baseURL, apiSecret string) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, errors.New("poller base URL is required")
 	}
@@ -48,8 +55,9 @@ func NewClient(baseURL string) (*Client, error) {
 		IdleConnTimeout:     defaultIdleConnTimeout,
 	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: defaultTimeout, Transport: transport},
+		baseURL:   strings.TrimRight(baseURL, "/"),
+		http:      &http.Client{Timeout: defaultTimeout, Transport: transport},
+		apiSecret: apiSecret,
 	}, nil
 }
 
@@ -184,6 +192,15 @@ func (c *Client) post(ctx context.Context, path string, body any) ([]byte, error
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// Sign request with X-API-Signature if apiSecret is set
+	if c.apiSecret != "" {
+		mac := hmac.New(sha256.New, []byte(c.apiSecret))
+		mac.Write(payload)
+		sig := hex.EncodeToString(mac.Sum(nil))
+		req.Header.Set("X-API-Signature", sig)
+	}
+
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("poller request %s: %w", path, err)

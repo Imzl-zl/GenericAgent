@@ -111,6 +111,12 @@ func (r *router) switchToTeamByName(ctx context.Context, msg IncomingMessage, bo
 	}
 	var matched []domain.Team
 	for _, t := range teams {
+		// Exact team ID always wins: it is the disambiguator for duplicate
+		// names, and UUIDs cannot collide with human team names.
+		if t.ID == name {
+			matched = []domain.Team{t}
+			break
+		}
 		if t.Name == name {
 			matched = append(matched, t)
 		}
@@ -121,7 +127,13 @@ func (r *router) switchToTeamByName(ctx context.Context, msg IncomingMessage, bo
 		return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if len(matched) > 1 {
-		reply := fmt.Sprintf("存在多个同名团队【%s】，请联系管理员", name)
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("找到 %d 个同名团队【%s】，请用 ID 精确切换：\n", len(matched), name))
+		for i, t := range matched {
+			sb.WriteString(fmt.Sprintf("%d. %s (ID: %s)\n", i+1, t.Name, t.ID))
+		}
+		sb.WriteString("\n发送 /团队 <ID> 进入")
+		reply := sb.String()
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 		return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 	}
