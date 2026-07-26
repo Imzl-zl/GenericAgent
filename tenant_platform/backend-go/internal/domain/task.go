@@ -66,6 +66,12 @@ type Task struct {
 	ResultRef             string
 	ResultDigest          string
 	WorkerInstanceID      string
+	// LastActivityAt is updated on every chunk event and Worker heartbeat
+	// (drain_display_queue empty poll). Reaper uses it to detect "Worker alive
+	// but deadlocked" (LLM HTTP call hung, GIL deadlock) — the scenario gRPC
+	// stream errors + heartbeat lease loss cannot catch. Pattern: Temporal
+	// HeartbeatTimeout / Kubernetes liveness probe.
+	LastActivityAt time.Time
 	// WorkerDispatchStartedAt is set when the scheduler records dispatch intent.
 	WorkerDispatchStartedAt *time.Time
 	CancelRequestedAt       *time.Time

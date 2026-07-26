@@ -25,6 +25,10 @@ type TaskStore interface {
 	MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string) (domain.Task, error)
 	MarkRunning(ctx context.Context, taskID, platformInstanceID string) (domain.Task, error)
 	RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error
+	// RecordHeartbeat refreshes tasks.last_activity_at without writing a chunk
+	// event. Called when the Worker sends an empty-text Chunk as a heartbeat
+	// (see task_drain.HEARTBEAT_INTERVAL_S). Used by the idle reaper.
+	RecordHeartbeat(ctx context.Context, taskID string) error
 	// CountRunningTasks returns the global number of tasks in starting/running
 	// status. Used by the scheduler to enforce MaxRunningTasks.
 	CountRunningTasks(ctx context.Context) (int, error)

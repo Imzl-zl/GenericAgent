@@ -79,6 +79,14 @@ type SchedulerConfig struct {
 	// detection relies on gRPC stream errors and heartbeat lease loss instead.
 	// Zero disables the Worker soft timer (dev/test).
 	TaskTimeoutSeconds int
+	// IdleTimeout enables Temporal-HeartbeatTimeout-style idle detection.
+	// When a running task's last_activity_at is older than now()-IdleTimeout,
+	// the reaper finalizes it as failed (WORKER_IDLE). This catches "Worker
+	// alive but deadlocked" (LLM HTTP call hung, GIL deadlock, infinite loop)
+	// — the scenario gRPC stream errors + heartbeat lease loss cannot catch.
+	// Worker keeps last_activity_at fresh via chunk events + drain poll
+	// heartbeats. Zero disables idle reaping (dev/test only).
+	IdleTimeout time.Duration
 }
 
 // LLMProviderSource returns the platform's current default LLM provider.
@@ -237,6 +245,37 @@ func (s *scheduler) KickSession(ctx context.Context, sessionKey string) error {
 	return nil
 }
 
+// reapIdleTasks finalizes running tasks whose last_activity_at is older than
+// now-idle. This is the "Worker alive but deadlocked" detector (Temporal
+// HeartbeatTimeout pattern). Legitimate long tasks keep last_activity_at fresh
+// via RecordChunkEvent (each chunk) and RecordHeartbeat (drain poll), so they
+// are NOT reaped. Only called when SchedulerConfig.IdleTimeout > 0.
+func (s *scheduler) reapIdleTasks(ctx context.Context, owned []domain.Task, idle time.Duration) error {
+	cutoff := time.Now().UTC().Add(-idle)
+	for _, t := range owned {
+		if t.Status != domain.TaskRunning {
+			continue
+		}
+		if t.LastActivityAt.IsZero() {
+			// Cold-started task that has not produced any activity yet; skip
+			// (give Worker a chance to send first chunk/heartbeat).
+			continue
+		}
+		if t.LastActivityAt.After(cutoff) {
+			continue
+		}
+		slog.ErrorContext(ctx, "scheduler: reaping idle task (Worker alive but deadlocked)",
+			"task_id", t.ID,
+			"session_key", t.SessionKey,
+			"last_activity_at", t.LastActivityAt.UTC().Format(time.RFC3339),
+			"idle_threshold_seconds", int(idle.Seconds()))
+		_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
+			"WORKER_IDLE", "Worker heartbeat went silent; possible deadlock or hung I/O", "")
+		_ = s.KickSession(ctx, t.SessionKey)
+	}
+	return nil
+}
+
 func (s *scheduler) Recover(ctx context.Context, platformInstanceID string) error {
 	if platformInstanceID == "" {
 		platformInstanceID = s.cfg.PlatformInstanceID
@@ -306,21 +345,22 @@ func (s *scheduler) tick(ctx context.Context) error {
 			s.maybeCancelWorker(ctx, t)
 		}
 	}
-	// Stuck-task reaping is intentionally NOT done via a wall-clock multiplier
-	// on TaskTimeoutSeconds. A legitimate task may run many times longer than
-	// a single LLM call (multi-step file processing, slow thinking models,
-	// long tool chains). Instead, stuck detection relies on two signals:
+	// Stuck-task reaping uses idle detection (Temporal HeartbeatTimeout pattern):
 	//   1. gRPC stream error/close — Worker process crashed or network died.
 	//      The dispatch loop's streamErr path finalizes the task immediately.
 	//   2. Heartbeat lease loss — dispatch goroutine died (panic, Goexit) so
 	//      HeartbeatClaim stopped being called. The tick loop's ErrLeaseExpired
 	//      path finalizes the task on the next tick.
-	// These two paths cover the failure modes the platform can detect without
-	// false-positive killing legitimate long tasks. The Worker's own
-	// RuntimePolicy.TaskTimeoutSeconds remains as its internal soft timer.
-	// If we later need to detect "Worker alive but deadlocked", we'll add an
-	// idle heuristic (last_activity_at column + chunk-event timestamps) rather
-	// than a wall-clock kill switch.
+	//   3. Idle timeout — Worker alive but deadlocked (LLM HTTP call hung, GIL
+	//      deadlock, infinite loop). Reaper checks last_activity_at (updated by
+	//      RecordChunkEvent on every chunk and RecordHeartbeat on drain poll)
+	//      against TASK_IDLE_TIMEOUT_SECONDS. Legitimate long tasks keep
+	//      producing chunks or heartbeats, so they are not reaped.
+	if s.cfg.IdleTimeout > 0 {
+		if err := s.reapIdleTasks(ctx, owned, s.cfg.IdleTimeout); err != nil {
+			slog.ErrorContext(ctx, "scheduler: reap idle tasks failed", "error", err)
+		}
+	}
 	// If we already own a non-terminal starting/running task, continue dispatch if needed.
 	for _, t := range owned {
 		if t.Status == domain.TaskStarting && t.WorkerDispatchStartedAt == nil {
@@ -528,6 +568,16 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			}
 			if ev.IsChunk() && ev.Chunk != nil {
 				text := ev.Chunk.GetText()
+				// Empty-text Chunk is a Worker heartbeat (see task_drain.HEARTBEAT_INTERVAL_S).
+				// Refresh last_activity_at without writing a chunk event, so the
+				// reaper does not trip during slow LLM thinking / file processing.
+				if text == "" {
+					if err := s.cfg.Store.RecordHeartbeat(ctx, task.ID); err != nil {
+						slog.WarnContext(ctx, "scheduler: record heartbeat failed",
+							"task_id", task.ID, "error", err)
+					}
+					continue
+				}
 				sum := sha256.Sum256([]byte(text))
 				digest := "sha256:" + hex.EncodeToString(sum[:])
 				if err := s.cfg.Store.RecordChunkEvent(ctx, task.ID, len([]byte(text)), digest); err != nil {

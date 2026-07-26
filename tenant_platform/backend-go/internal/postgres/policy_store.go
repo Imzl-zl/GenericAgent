@@ -95,8 +95,8 @@ WHERE id = $1
 RETURNING id, command, action, handler, COALESCE(help_text, ''), enabled, sort_order,
           COALESCE(updated_by, 0), updated_at
 `, id, action, helpText, enabled, sortOrder, updatedBy).Scan(
-	&c.ID, &c.Command, &c.Action, &c.Handler, &c.HelpText,
-	&c.Enabled, &c.SortOrder, &c.UpdatedBy, &c.UpdatedAt)
+		&c.ID, &c.Command, &c.Action, &c.Handler, &c.HelpText,
+		&c.Enabled, &c.SortOrder, &c.UpdatedBy, &c.UpdatedAt)
 	return c, err
 }
 
@@ -111,7 +111,7 @@ SELECT id, version, allowed_tools, COALESCE(description, ''), enabled,
 FROM tool_policies
 WHERE version = $1 AND enabled = true
 `, version).Scan(&p.ID, &p.Version, &toolsJSON, &p.Description, &p.Enabled,
-	&p.CreatedBy, &p.CreatedAt, &p.UpdatedAt)
+		&p.CreatedBy, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return domain.ToolPolicy{}, err
 	}
@@ -168,8 +168,8 @@ VALUES ($1, $2::jsonb, $3, $4)
 RETURNING id, version, allowed_tools, COALESCE(description, ''), enabled,
           COALESCE(created_by, 0), created_at, updated_at
 `, version, toolsJSON, description, createdBy).Scan(
-	&p.ID, &p.Version, &storedJSON, &p.Description, &p.Enabled,
-	&p.CreatedBy, &p.CreatedAt, &p.UpdatedAt)
+		&p.ID, &p.Version, &storedJSON, &p.Description, &p.Enabled,
+		&p.CreatedBy, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return domain.ToolPolicy{}, err
 	}

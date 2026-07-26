@@ -22,6 +22,24 @@ ABORT_WAIT_TIMEOUT_S = 0.5
 HANDLER_WRAP_RETRIES = 100
 HANDLER_WRAP_SLEEP_S = 0.01
 
+# Worker-side heartbeat: while the display queue is empty (LLM still thinking,
+# large file processing, between tool calls), emit an empty-text Chunk so the
+# platform's scheduler can refresh tasks.last_activity_at. This is the
+# Temporal-HeartbeatTimeout pattern: as long as the Worker is alive and polling,
+# last_activity_at stays fresh; if the Worker deadlocks (GIL, hung I/O), the
+# reaper finalizes the task after TASK_IDLE_TIMEOUT_SECONDS.
+# Empty-text Chunk is used as the heartbeat carrier to avoid a proto change
+# (no protoc on Windows dev). Go scheduler identifies text=="" as heartbeat.
+HEARTBEAT_INTERVAL_S = 30.0
+
+
+def _emit_heartbeat(task: worker_pb2.TaskEnvelope, state: TaskRunState) -> worker_pb2.WorkerEvent:
+    """Emit an empty-text Chunk as a heartbeat signal (see HEARTBEAT_INTERVAL_S)."""
+    state.last_heartbeat_at = time.monotonic()
+    return worker_pb2.WorkerEvent(
+        chunk=worker_pb2.Chunk(task_id=task.task_id, text="", turn=0)
+    )
+
 
 def put_task_and_wrap_handler(
     adapter: Any, task: worker_pb2.TaskEnvelope, pending: PendingTask, state: TaskRunState,
@@ -67,12 +85,21 @@ def _handle_empty_poll(
     adapter: Any, task: worker_pb2.TaskEnvelope, pending: PendingTask,
     state: TaskRunState, display_q: queue.Queue,
 ) -> Iterator[worker_pb2.WorkerEvent]:
-    """Handle queue.Empty: re-wrap handler, check cancel/timeout. Returns True if should break."""
+    """Handle queue.Empty: re-wrap handler, check cancel/timeout, emit heartbeat.
+
+    Returns True if should break.
+    """
     from ga_worker.legacy_instrument import install_handler_print_counter
     h = getattr(state.agent, "handler", None)
     if h is not None and not getattr(h, "_adapter_print_wrapped", False):
         install_handler_print_counter(state.agent, state.count_fn, adapter._legacy_mods)
+    # Heartbeat: keep platform's tasks.last_activity_at fresh while LLM is
+    # thinking or files are processing. Skipped when cancel/timeout is pending
+    # (terminal path takes over).
     if not (pending.cancel_requested or state.timed_out["v"]):
+        now = time.monotonic()
+        if now - state.last_heartbeat_at >= HEARTBEAT_INTERVAL_S:
+            yield _emit_heartbeat(task, state)
         return False  # continue polling
     try:
         item = display_q.get(timeout=ABORT_WAIT_TIMEOUT_S)

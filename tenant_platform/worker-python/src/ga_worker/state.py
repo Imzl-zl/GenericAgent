@@ -93,6 +93,8 @@ class TaskRunState:
     terminal_emitted: bool = False
     display_history: list[dict[str, Any]] = field(default_factory=list)
     count_fn: Callable[[str], bool] | None = None
+    # monotonic clock of the last heartbeat emission; see task_drain.HEARTBEAT_INTERVAL_S.
+    last_heartbeat_at: float = 0.0
 
 
 AgentFactory = Callable[[], Any]

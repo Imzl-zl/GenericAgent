@@ -39,8 +39,8 @@ type DevelopmentContext struct {
 
 // Store is the PostgreSQL-backed task store.
 type Store struct {
-	pool                *pgxpool.Pool
-	perUserQueueLimit   int // 0 = disabled (dev/test); enforced inside SubmitTask tx
+	pool              *pgxpool.Pool
+	perUserQueueLimit int // 0 = disabled (dev/test); enforced inside SubmitTask tx
 }
 
 // NewStore wraps a pgx pool.
@@ -420,6 +420,7 @@ RETURNING `+taskSelectColumns, taskID, platformInstanceID)
 }
 
 // RecordChunkEvent stores bounded chunk metadata only (no text).
+// Also updates last_activity_at for idle/deadlock detection (reaper).
 func (s *Store) RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		var lockedTaskID string
@@ -427,8 +428,19 @@ func (s *Store) RecordChunkEvent(ctx context.Context, taskID string, byteCount i
 			return err
 		}
 		bc := byteCount
-		return insertNextEvent(ctx, tx, lockedTaskID, "chunk", &bc, strPtr(digest), "", "", "", "")
+		if err := insertNextEvent(ctx, tx, lockedTaskID, "chunk", &bc, strPtr(digest), "", "", "", ""); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE tasks SET last_activity_at = timezone('utc', now()), updated_at = timezone('utc', now()) WHERE id = $1`, lockedTaskID)
+		return err
 	})
+}
+
+// RecordHeartbeat updates last_activity_at without writing a chunk event.
+// Called when Worker drain_display_queue polls empty (LLM still thinking).
+func (s *Store) RecordHeartbeat(ctx context.Context, taskID string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE tasks SET last_activity_at = timezone('utc', now()) WHERE id = $1 AND status IN ('starting','running')`, taskID)
+	return err
 }
 
 // CancelTask applies durable cancel decision under row lock.
@@ -874,7 +886,7 @@ status, COALESCE(claim_owner,''), claim_lease_until,
 COALESCE(worker_instance_id,''), worker_dispatch_started_at, cancel_requested_at,
 snapshot_id::text, COALESCE(snapshot_checksum,''), COALESCE(result_ref,''), COALESCE(result_digest,''),
 COALESCE(terminal_error_code,''), COALESCE(terminal_error_message,''), COALESCE(terminal_error_trace_id,''),
-created_at, updated_at, started_at, succeeded_at, terminal_at
+created_at, updated_at, started_at, succeeded_at, terminal_at, last_activity_at
 `
 
 type scannable interface {
@@ -895,7 +907,7 @@ func scanTask(row scannable) (domain.Task, error) {
 		&t.WorkerInstanceID, &dispatchAt, &cancelAt,
 		&snapshotID, &t.SnapshotChecksum, &t.ResultRef, &t.ResultDigest,
 		&t.TerminalErrorCode, &t.TerminalErrorMessage, &t.TerminalErrorTraceID,
-		&t.CreatedAt, &t.UpdatedAt, &startedAt, &succeededAt, &terminalAt,
+		&t.CreatedAt, &t.UpdatedAt, &startedAt, &succeededAt, &terminalAt, &t.LastActivityAt,
 	)
 	if err != nil {
 		return domain.Task{}, err

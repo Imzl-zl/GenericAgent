@@ -45,6 +45,7 @@ func migrationFiles() []string {
 		"0012_bot_transport_cursor_key_version.sql",
 		"0013_messages.sql",
 		"0014_media_assets.sql",
+		"0015_task_last_activity_at.sql",
 	}
 }
 
@@ -68,6 +69,7 @@ var pendingMigrations = []struct {
 	{"0012_bot_transport_cursor_key_version.sql", "migration_0012_bot_transport_cursor_key_version_marker"},
 	{"0013_messages.sql", "migration_0013_messages_marker"},
 	{"0014_media_assets.sql", "migration_0014_media_assets_marker"},
+	{"0015_task_last_activity_at.sql", "migration_0015_task_last_activity_at_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -94,6 +96,7 @@ var foundationTableNames = []string{
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",
+	"migration_0015_task_last_activity_at_marker",
 }
 
 // DropFoundationSchema removes foundation tables and leftover composite types.
