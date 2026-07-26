@@ -70,6 +70,7 @@ export const router = createBrowserRouter([
       { path: 'invite-codes', element: <InviteCodesPage /> },
       { path: 'personas', element: <PersonaReviewPage /> },
       { path: 'providers', element: <LLMProvidersPage /> },
+      { path: 'binding', element: <BindingPage /> },
       { path: 'settings', element: <SettingsPage /> },
     ],
   },

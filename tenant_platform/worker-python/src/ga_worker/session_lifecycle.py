@@ -120,6 +120,16 @@ class SessionLifecycleMixin:
         )
 
     def _create_agent(self, overlay_dir: Path, manifest: dict[str, Any]) -> Any:
+        # 在导入 GA Core 之前，确保 mykey.py 是最新的
+        from ga_worker.config_fetcher import ensure_mykey, get_platform_config_from_env
+
+        platform_url, token = get_platform_config_from_env()
+        try:
+            ensure_mykey(self.config_root, platform_url, token)
+        except Exception as exc:
+            # 配置加载失败是致命错误
+            raise WorkerAdapterError("CONFIG_FETCH_ERROR", str(exc)) from exc
+
         if self.agent_factory is None:
             try:
                 self._legacy_mods = import_legacy_runtime(

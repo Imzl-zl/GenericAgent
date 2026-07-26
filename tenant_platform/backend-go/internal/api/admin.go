@@ -36,8 +36,13 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("GET /v1/users/me/bots", s.userAuth(s.handleGetOwnBot))
 	}
 	if s.wechatBinding != nil {
+		// 普通用户的微信绑定接口
 		s.mux.HandleFunc("POST /v1/users/me/wechat-qrcode", s.userAuth(s.handleCreateWechatQRCode))
 		s.mux.HandleFunc("GET /v1/users/me/wechat-qrcode/status", s.userAuth(s.handleGetWechatQRCodeStatus))
+
+		// 管理员的微信绑定接口（使用开发者 user_id）
+		s.mux.HandleFunc("POST /v1/admin/me/wechat-qrcode", s.auth(s.handleAdminCreateWechatQRCode))
+		s.mux.HandleFunc("GET /v1/admin/me/wechat-qrcode/status", s.auth(s.handleAdminGetWechatQRCodeStatus))
 	}
 	if s.personas != nil {
 		s.mux.HandleFunc("GET /v1/personas", s.userAuth(s.handleListPersonas))
@@ -69,6 +74,9 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("PUT /v1/admin/llm-providers/{provider_id}", s.auth(s.handleAdminUpdateLLMProvider))
 		s.mux.HandleFunc("DELETE /v1/admin/llm-providers/{provider_id}", s.auth(s.handleAdminDeleteLLMProvider))
 		s.mux.HandleFunc("POST /v1/admin/llm-providers/{provider_id}/default", s.auth(s.handleAdminSetDefaultLLMProvider))
+
+		// Worker 拉取 mykey.py 配置（使用 Worker 的认证机制）
+		s.mux.HandleFunc("GET /v1/config/mykey.py", s.auth(s.handleGetMykeyConfig))
 	}
 }
 

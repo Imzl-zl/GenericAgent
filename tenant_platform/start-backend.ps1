@@ -1,8 +1,18 @@
+param([string]$root)
+
+# 兼容双击 / Start-Process / -Command 等启动方式
+$ErrorActionPreference = 'Stop'
+if (-not $root) {
+    $root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+}
+if (-not $root) {
+    throw "Unable to determine script directory. Please run this script from its own directory or pass -root."
+}
+
 # 加载 .env 到当前进程环境变量
-$envFile = Join-Path $PSScriptRoot ".env"
+$envFile = Join-Path $root ".env"
 if (-not (Test-Path $envFile)) {
-    Write-Error "Missing .env file at $envFile"
-    exit 1
+    throw "Missing .env file at $envFile"
 }
 
 Get-Content $envFile | ForEach-Object {
@@ -15,7 +25,6 @@ Get-Content $envFile | ForEach-Object {
 }
 
 # 将相对路径解析为绝对路径
-$root = $PSScriptRoot
 function Resolve-ProjectPath($path) {
     if ([System.IO.Path]::IsPathRooted($path)) { return $path }
     return Join-Path $root $path
@@ -43,4 +52,11 @@ go run ./cmd/platform/main.go `
   --policy-file=$policyFile `
   --claim-lease=30s `
   --listen=127.0.0.1:8080 `
-  --database-url=$env:DATABASE_URL
+  --database-url=$env:DATABASE_URL `
+  --bot-token-key=$env:BOT_TOKEN_KEY `
+  --ilink-base-url=$env:ILINK_BASE_URL `
+  --ilink-app-id=$env:ILINK_APP_ID `
+  --ilink-client-version=$env:ILINK_CLIENT_VERSION `
+  --bot-poller-url=$env:BOT_POLLER_URL `
+  --bot-poller-api-secret=$env:BOT_POLLER_API_SECRET `
+  --platform-webhook-url=$env:PLATFORM_WEBHOOK_URL

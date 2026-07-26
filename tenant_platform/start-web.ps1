@@ -1,8 +1,18 @@
+param([string]$root)
+
+# 兼容双击 / Start-Process / -Command 等启动方式
+$ErrorActionPreference = 'Stop'
+if (-not $root) {
+    $root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+}
+if (-not $root) {
+    throw "Unable to determine script directory. Please run this script from its own directory or pass -root."
+}
+
 # 加载 .env 到当前进程环境变量
-$envFile = Join-Path $PSScriptRoot ".env"
+$envFile = Join-Path $root ".env"
 if (-not (Test-Path $envFile)) {
-    Write-Error "Missing .env file at $envFile"
-    exit 1
+    throw "Missing .env file at $envFile"
 }
 
 Get-Content $envFile | ForEach-Object {
@@ -17,5 +27,5 @@ Get-Content $envFile | ForEach-Object {
 Write-Host "Starting GenericAgent Platform web frontend..."
 Write-Host "  URL: http://localhost:5173"
 
-Set-Location (Join-Path $PSScriptRoot "web")
+Set-Location (Join-Path $root "web")
 npm run dev

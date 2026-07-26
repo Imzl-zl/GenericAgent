@@ -11,19 +11,21 @@ import (
 )
 
 type createLLMProviderBody struct {
-	Name         string `json:"name"`
-	ProviderType string `json:"provider_type"`
-	BaseURL      string `json:"base_url"`
-	Model        string `json:"model"`
-	APIKey       string `json:"api_key"`
+	Name         string                      `json:"name"`
+	ProviderType string                      `json:"provider_type"`
+	BaseURL      string                      `json:"base_url"`
+	Model        string                      `json:"model"`
+	APIKey       string                      `json:"api_key"`
+	Config       domain.LLMProviderConfig    `json:"config"` // GA Core 配置
 }
 
 type updateLLMProviderBody struct {
-	Name         string `json:"name"`
-	ProviderType string `json:"provider_type"`
-	BaseURL      string `json:"base_url"`
-	Model        string `json:"model"`
-	APIKey       string `json:"api_key"`
+	Name         string                      `json:"name"`
+	ProviderType string                      `json:"provider_type"`
+	BaseURL      string                      `json:"base_url"`
+	Model        string                      `json:"model"`
+	APIKey       string                      `json:"api_key"`
+	Config       domain.LLMProviderConfig    `json:"config"` // GA Core 配置
 }
 
 func (s *Server) handleAdminCreateLLMProvider(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +50,7 @@ func (s *Server) handleAdminCreateLLMProvider(w http.ResponseWriter, r *http.Req
 		return
 	}
 	provider, err := s.llmProviders.CreateProvider(r.Context(), body.Name,
-		providerType, body.BaseURL, body.Model, ciphertext, strconv.Itoa(version))
+		providerType, body.BaseURL, body.Model, ciphertext, strconv.Itoa(version), body.Config)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "PROVIDER_CREATE_FAILED", err.Error(), tid)
 		return
@@ -118,7 +120,7 @@ func (s *Server) handleAdminUpdateLLMProvider(w http.ResponseWriter, r *http.Req
 		return
 	}
 	provider, err := s.llmProviders.UpdateProvider(r.Context(), id, body.Name,
-		providerType, body.BaseURL, body.Model, ciphertext, strconv.Itoa(version))
+		providerType, body.BaseURL, body.Model, ciphertext, strconv.Itoa(version), body.Config)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "PROVIDER_UPDATE_FAILED", err.Error(), tid)
 		return
@@ -174,9 +176,9 @@ func validateLLMProviderBody(name, providerType, baseURL, model, apiKey string) 
 		return "", fmt.Errorf("api_key is required")
 	}
 	t := domain.LLMProviderType(providerType)
-	if t != domain.ProviderOpenAICompatible && t != domain.ProviderAnthropicMessages {
+	if t != domain.ProviderNativeOAI && t != domain.ProviderNativeClaude {
 		return "", fmt.Errorf("provider_type must be one of %s|%s",
-			domain.ProviderOpenAICompatible, domain.ProviderAnthropicMessages)
+			domain.ProviderNativeOAI, domain.ProviderNativeClaude)
 	}
 	return t, nil
 }
@@ -198,6 +200,7 @@ func llmProviderReply(p domain.LLMProvider) map[string]any {
 		"provider_type": string(p.ProviderType),
 		"base_url":      p.BaseURL,
 		"model":         p.Model,
+		"config":        p.Config,
 		"is_default":    p.IsDefault,
 		"state":         p.State,
 		"created_at":    p.CreatedAt.UTC().Format(time.RFC3339),

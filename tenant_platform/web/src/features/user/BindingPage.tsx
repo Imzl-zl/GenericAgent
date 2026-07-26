@@ -4,14 +4,24 @@ import { Button } from '../../components/ui/Button';
 import { Badge } from '../../components/ui/Badge';
 import { QrCode, RefreshCw, Shield, Smartphone, Clock } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
-import { createWechatQRCode, getWechatQRCodeStatus, getOwnBot } from '../../api/bots';
+import {
+  createWechatQRCode,
+  getWechatQRCodeStatus,
+  createAdminWechatQRCode,
+  getAdminWechatQRCodeStatus,
+  getOwnBot
+} from '../../api/bots';
 import { ApiClientError } from '../../api/client';
+import { useAuth } from '../../contexts/AuthContext';
 import type { Bot, WechatQRCode, WechatQRCodeStatus } from '../../api/types';
 import './UserPages.css';
 
 const POLL_INTERVAL_MS = 3000;
 
 export function BindingPage() {
+  const { state } = useAuth();
+  const isAdmin = state?.isAdmin ?? false;
+
   const [boundBot, setBoundBot] = useState<Bot | null>(null);
   const [qr, setQr] = useState<WechatQRCode | null>(null);
   const [status, setStatus] = useState<WechatQRCodeStatus | null>(null);
@@ -50,7 +60,10 @@ export function BindingPage() {
     stopPolling();
     const tick = async () => {
       try {
-        const s = await getWechatQRCodeStatus(qrcodeToken);
+        // 根据用户类型调用不同的 API
+        const s = isAdmin
+          ? await getAdminWechatQRCodeStatus(qrcodeToken)
+          : await getWechatQRCodeStatus(qrcodeToken);
         setStatus(s);
         if (s.status === 'confirmed' || s.status === 'expired') {
           stopPolling();
@@ -74,7 +87,10 @@ export function BindingPage() {
     stopPolling();
     setIsGenerating(true);
     try {
-      const code = await createWechatQRCode();
+      // 根据用户类型调用不同的 API
+      const code = isAdmin
+        ? await createAdminWechatQRCode()
+        : await createWechatQRCode();
       setQr(code);
       startPolling(code.qrcode_token);
     } catch (err) {

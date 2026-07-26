@@ -28,15 +28,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   });
 
   const login = useCallback((username: string, token: string, isAdmin = false) => {
+    // 完全清空之前的登录状态，防止串用
+    localStorage.removeItem('ga_username');
+    localStorage.removeItem('ga_admin_token');
+    localStorage.removeItem('ga_user_token');
+    localStorage.removeItem('ga_is_admin');
+    localStorage.removeItem('ga_user_id');
+
+    // 设置新的登录状态
     localStorage.setItem('ga_username', username);
     localStorage.setItem('ga_is_admin', String(isAdmin));
     if (isAdmin) {
       localStorage.setItem('ga_admin_token', token);
-      localStorage.removeItem('ga_user_token');
       setState({ username, isAdmin, adminToken: token });
     } else {
       localStorage.setItem('ga_user_token', token);
-      localStorage.removeItem('ga_admin_token');
       setState({ username, isAdmin, userToken: token });
     }
   }, []);
@@ -46,6 +52,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem('ga_admin_token');
     localStorage.removeItem('ga_user_token');
     localStorage.removeItem('ga_is_admin');
+    localStorage.removeItem('ga_user_id');
     setState(null);
   }, []);
 

@@ -28,6 +28,24 @@ func (s *Server) handleCreateWechatQRCode(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// handleAdminCreateWechatQRCode is the admin-auth version that uses the dev user id.
+func (s *Server) handleAdminCreateWechatQRCode(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	// Admin uses the platform dev user id (configured via --dev-user-id)
+	sess, err := s.wechatBinding.GenerateQRCode(r.Context(), s.devUserID)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "ILINK_QR_FAILED", err.Error(), tid)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"qrcode_token":   sess.ILINKQRCode,
+		"qrcode_url":     sess.QRCodeImgURL,
+		"status":         string(sess.Status),
+		"expires_at":     sess.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
 // handleGetWechatQRCodeStatus polls the iLink scan status and creates the bot on confirmation.
 func (s *Server) handleGetWechatQRCodeStatus(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
@@ -79,4 +97,10 @@ func (s *Server) handleGetWechatQRCodeStatus(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	writeJSON(w, http.StatusOK, reply)
+}
+
+// handleAdminGetWechatQRCodeStatus is the admin-auth version.
+func (s *Server) handleAdminGetWechatQRCodeStatus(w http.ResponseWriter, r *http.Request) {
+	// Admin and user share the same logic for status polling
+	s.handleGetWechatQRCodeStatus(w, r)
 }
