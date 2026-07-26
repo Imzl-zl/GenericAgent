@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 )
 
 const CapabilityVersion = "foundation.v1"

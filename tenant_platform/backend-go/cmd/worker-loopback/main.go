@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/workerclient"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

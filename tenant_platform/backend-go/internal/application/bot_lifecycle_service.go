@@ -10,8 +10,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/poller"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/poller"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
 )
 
 // BotLifecycleStore is the persistence port for bot lifecycle orchestration.

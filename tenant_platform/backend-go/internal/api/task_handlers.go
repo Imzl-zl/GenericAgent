@@ -1,0 +1,187 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
+)
+
+// handleHealthz is the unauthenticated liveness probe.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// createTaskBody is the JSON body for POST /v1/sessions/{session_key}/tasks.
+type createTaskBody struct {
+	MessageID         string   `json:"message_id"`
+	SourceInstanceID  string   `json:"source_instance_id"`
+	Prompt            string   `json:"prompt"`
+	Source            string   `json:"source"`
+	PersonaSnapshot   []string `json:"persona_snapshot"`
+	ToolPolicyVersion string   `json:"tool_policy_version"`
+}
+
+func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	sessionKey := r.PathValue("session_key")
+	if strings.TrimSpace(sessionKey) == "" {
+		writeErr(w, http.StatusBadRequest, "SESSION_REQUIRED", "session_key is required", tid)
+		return
+	}
+	var body createTaskBody
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+		return
+	}
+	if err := validateCreate(body); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
+		return
+	}
+	if _, err := s.registry.Resolve(application.CapabilityVersion, body.ToolPolicyVersion); err != nil {
+		writeErr(w, http.StatusBadRequest, "POLICY_REJECTED", err.Error(), tid)
+		return
+	}
+	// RequesterUserID is taken from the authenticated principal, never from the
+	// request body. In dev-token mode (s.auth) this is the configured devUserID;
+	// when this endpoint moves to userAuth (P1 production hardening), it will
+	// come from userIDFromContext. Allowing the body to override it would let
+	// any dev-token holder impersonate arbitrary users.
+	requester := s.devUserID
+	if uid, ok := userIDFromContext(r.Context()); ok {
+		requester = uid
+	}
+	task, err := s.svc.SubmitTask(r.Context(), domain.SubmitTaskCommand{
+		SessionKey:        sessionKey,
+		RequesterUserID:   requester,
+		Source:            body.Source,
+		SourceInstanceID:  body.SourceInstanceID,
+		MessageID:         body.MessageID,
+		Prompt:            body.Prompt,
+		PersonaSnapshot:   body.PersonaSnapshot,
+		ToolPolicyVersion: body.ToolPolicyVersion,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "SUBMIT_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"task_id": task.ID,
+		"status":  string(task.Status),
+	})
+}
+
+func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	taskID := r.PathValue("task_id")
+	task, err := s.svc.GetTask(r.Context(), taskID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "NOT_FOUND", err.Error(), tid)
+		return
+	}
+	out := map[string]any{
+		"task_id":     task.ID,
+		"session_key": task.SessionKey,
+		"status":      string(task.Status),
+	}
+	if task.SnapshotID != "" {
+		out["snapshot_id"] = task.SnapshotID
+	}
+	if task.SnapshotChecksum != "" {
+		out["snapshot_checksum"] = task.SnapshotChecksum
+	}
+	if task.ResultRef != "" {
+		out["result_ref"] = task.ResultRef
+	}
+	if task.ResultDigest != "" {
+		out["result_digest"] = task.ResultDigest
+	}
+	if task.TerminalErrorCode != "" {
+		out["terminal_error"] = map[string]string{
+			"code":         task.TerminalErrorCode,
+			"user_message": task.TerminalErrorMessage,
+			"trace_id":     task.TerminalErrorTraceID,
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	taskID := r.PathValue("task_id")
+	// Optional query result_ref must match opaque stored ref when provided; never a host path.
+	if ref := r.URL.Query().Get("result_ref"); ref != "" {
+		if strings.ContainsAny(ref, `/\`) || strings.Contains(ref, "..") {
+			writeErr(w, http.StatusBadRequest, "INVALID_RESULT_REF", "path-like result_ref rejected", tid)
+			return
+		}
+	}
+	payload, err := s.svc.ReadResult(r.Context(), taskID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "RESULT_UNAVAILABLE", err.Error(), tid)
+		return
+	}
+	if q := r.URL.Query().Get("result_ref"); q != "" && q != payload.Ref {
+		writeErr(w, http.StatusConflict, "RESULT_REF_MISMATCH", "result_ref does not match committed ref", tid)
+		return
+	}
+	// Plan Task 3 Step 5: result body is text/plain UTF-8; result_digest is
+	// sha256 over these exact bytes. OpenAPI declares payload as string.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result_ref":    payload.Ref,
+		"result_digest": payload.Digest,
+		"content_type":  "text/plain; charset=utf-8",
+		"payload":       string(payload.Body),
+	})
+}
+
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	taskID := r.PathValue("task_id")
+	requester := s.devUserID
+	if q := r.URL.Query().Get("requester_user_id"); q != "" {
+		if v, err := strconv.ParseInt(q, 10, 64); err == nil && v > 0 {
+			requester = v
+		}
+	}
+	task, err := s.svc.CancelTask(r.Context(), taskID, requester)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "CANCEL_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accepted": true,
+		"status":   string(task.Status),
+	})
+}
+
+// validateCreate enforces non-empty + length limits on createTaskBody fields.
+// Limits match the postgres constants used by the store layer.
+func validateCreate(b createTaskBody) error {
+	if strings.TrimSpace(b.MessageID) == "" || len(b.MessageID) > postgres.MaxMessageIDLen {
+		return fmt.Errorf("message_id is required and must be <= %d bytes", postgres.MaxMessageIDLen)
+	}
+	if strings.TrimSpace(b.SourceInstanceID) == "" || len(b.SourceInstanceID) > postgres.MaxSourceInstanceLen {
+		return fmt.Errorf("source_instance_id is required and must be <= %d bytes", postgres.MaxSourceInstanceLen)
+	}
+	if strings.TrimSpace(b.Prompt) == "" || len([]byte(b.Prompt)) > postgres.MaxPromptBytes {
+		return fmt.Errorf("prompt is required and must be <= %d bytes", postgres.MaxPromptBytes)
+	}
+	if strings.TrimSpace(b.Source) == "" || !domain.IsValidSource(b.Source) {
+		return fmt.Errorf("source must be one of %s|%s", domain.SourceWechat, domain.SourceWeb)
+	}
+	if b.PersonaSnapshot == nil {
+		return fmt.Errorf("persona_snapshot is required")
+	}
+	if strings.TrimSpace(b.ToolPolicyVersion) == "" || len(b.ToolPolicyVersion) > postgres.MaxToolPolicyVersionLen {
+		return fmt.Errorf("tool_policy_version is required and must be <= %d bytes", postgres.MaxToolPolicyVersionLen)
+	}
+	return nil
+}

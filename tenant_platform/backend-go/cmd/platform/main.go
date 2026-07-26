@@ -22,18 +22,18 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/api"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/ilink"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/logging"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/poller"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/systemd"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/transport"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/worker"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/logging"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/poller"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/systemd"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/transport"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/worker"
 )
 
 func main() {
@@ -73,34 +73,20 @@ func envInt(name string, fallback int) int {
 	return n
 }
 
-// buildWorkerRuntime selects the loopback or podman runtime based on mode.
-// It returns the runtime and a bool indicating whether config should be
-// session-scoped (required for container isolation).
-func buildWorkerRuntime(mode, managerAddr string, boot application.DevBootstrapConfig) (worker.WorkerRuntime, bool, error) {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "loopback", "":
-		runtime, err := worker.NewLoopback(worker.LoopbackConfig{
-			Python:     boot.WorkerPython,
-			WorkerSrc:  boot.WorkerSrc,
-			LegacyRoot: boot.LegacyRoot,
-			PolicyFile: boot.PolicyFile,
-		})
-		if err != nil {
-			return nil, false, fmt.Errorf("loopback runtime: %w", err)
-		}
-		return runtime, false, nil
-	case "podman":
-		if strings.TrimSpace(managerAddr) == "" {
-			return nil, false, fmt.Errorf("--worker-manager-addr is required for podman runtime")
-		}
-		runtime, err := worker.NewManager(worker.ManagerConfig{ManagerAddr: managerAddr})
-		if err != nil {
-			return nil, false, fmt.Errorf("manager runtime: %w", err)
-		}
-		return runtime, true, nil
-	default:
-		return nil, false, fmt.Errorf("unknown --worker-runtime %q", mode)
+// buildWorkerRuntime constructs the loopback Worker runtime. Podman/container
+// mode was abandoned (single-instance multi-tenant deployment); loopback is
+// the only supported runtime.
+func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRuntime, error) {
+	runtime, err := worker.NewLoopback(worker.LoopbackConfig{
+		Python:     boot.WorkerPython,
+		WorkerSrc:  boot.WorkerSrc,
+		LegacyRoot: boot.LegacyRoot,
+		PolicyFile: boot.PolicyFile,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("loopback runtime: %w", err)
 	}
+	return runtime, nil
 }
 
 // llmProxyConfig carries LLM Proxy startup parameters. The real upstream key
@@ -271,8 +257,6 @@ func run() error {
 		modelPolicyVersion    = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
 		devExtraUsers         = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
 		devTeam               = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
-		workerRuntime         = flag.String("worker-runtime", "loopback", "worker runtime mode: loopback or podman")
-		workerManagerAddr     = flag.String("worker-manager-addr", os.Getenv("GA_WORKER_MANAGER_ADDR"), "worker-manager gRPC address (required for podman mode)")
 		botTokenKey           = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
 		ilinkBaseURL          = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
 		ilinkAppID            = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
@@ -482,10 +466,11 @@ func run() error {
 	}
 	revoker := application.NewHTTPTokenRevoker(proxyAddr)
 
-	runtime, sessionScopedConfig, err := buildWorkerRuntime(*workerRuntime, *workerManagerAddr, boot)
+	runtime, err := buildWorkerRuntime(boot)
 	if err != nil {
 		return err
 	}
+	sessionScopedConfig := false
 
 	sched, err := application.NewScheduler(application.SchedulerConfig{
 		PlatformInstanceID:    instanceID,

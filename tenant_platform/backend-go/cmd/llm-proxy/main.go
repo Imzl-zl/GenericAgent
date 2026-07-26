@@ -24,10 +24,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/llmproxy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/systemd"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/systemd"
 )
 
 func main() {

@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/ilink"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
 )
 
 // QRSessionTTL is how long a WeChat QR login session remains valid.

@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
 )
 
 func llmProviderServerFixture(t *testing.T) (*Server, *postgres.Store, string) {

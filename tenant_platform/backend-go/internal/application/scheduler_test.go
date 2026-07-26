@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/workerclient"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
 
 func TestSchedulerConfigValidation(t *testing.T) {

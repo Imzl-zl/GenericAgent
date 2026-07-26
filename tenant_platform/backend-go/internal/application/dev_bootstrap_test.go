@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 )
 
 func TestEnsureDevelopmentContext_RequiresFlag(t *testing.T) {

@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 )
 
 func apiFixture(t *testing.T) (*Server, string) {

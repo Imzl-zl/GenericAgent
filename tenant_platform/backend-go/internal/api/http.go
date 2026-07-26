@@ -5,20 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
 )
 
 // MaxRequestBodyBytes caps JSON bodies on user-facing endpoints to prevent
@@ -165,228 +161,14 @@ func (s *Server) ListenAndServe(addr string) error {
 	return http.ListenAndServe(addr, s.mux)
 }
 
-func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tok := r.Header.Get("X-Platform-Dev-Token")
-		if tok == "" || tok != s.devToken {
-			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid X-Platform-Dev-Token", traceID())
-			return
-		}
-		next(w, r)
-	}
-}
-
-type ctxKey int
-
-const ctxUserIDKey ctxKey = 0
-
-func (s *Server) userAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.invite == nil {
-			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "user authentication not configured", traceID())
-			return
-		}
-		header := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(header, prefix) {
-			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing Authorization header", traceID())
-			return
-		}
-		token := strings.TrimSpace(header[len(prefix):])
-		if token == "" {
-			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "empty bearer token", traceID())
-			return
-		}
-		userID, err := s.invite.ValidateSession(r.Context(), token)
-		if err != nil {
-			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), traceID())
-			return
-		}
-		next(w, r.WithContext(context.WithValue(r.Context(), ctxUserIDKey, userID)))
-	}
-}
-
-func userIDFromContext(ctx context.Context) (int64, bool) {
-	v, ok := ctx.Value(ctxUserIDKey).(int64)
-	return v, ok
-}
-
-func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-type createTaskBody struct {
-	MessageID         string   `json:"message_id"`
-	SourceInstanceID  string   `json:"source_instance_id"`
-	Prompt            string   `json:"prompt"`
-	Source            string   `json:"source"`
-	PersonaSnapshot   []string `json:"persona_snapshot"`
-	ToolPolicyVersion string   `json:"tool_policy_version"`
-}
-
-func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
-	tid := traceID()
-	sessionKey := r.PathValue("session_key")
-	if strings.TrimSpace(sessionKey) == "" {
-		writeErr(w, http.StatusBadRequest, "SESSION_REQUIRED", "session_key is required", tid)
-		return
-	}
-	var body createTaskBody
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
-		return
-	}
-	if err := validateCreate(body); err != nil {
-		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
-		return
-	}
-	if _, err := s.registry.Resolve(application.CapabilityVersion, body.ToolPolicyVersion); err != nil {
-		writeErr(w, http.StatusBadRequest, "POLICY_REJECTED", err.Error(), tid)
-		return
-	}
-	// RequesterUserID is taken from the authenticated principal, never from the
-	// request body. In dev-token mode (s.auth) this is the configured devUserID;
-	// when this endpoint moves to userAuth (P1 production hardening), it will
-	// come from userIDFromContext. Allowing the body to override it would let
-	// any dev-token holder impersonate arbitrary users.
-	requester := s.devUserID
-	if uid, ok := userIDFromContext(r.Context()); ok {
-		requester = uid
-	}
-	task, err := s.svc.SubmitTask(r.Context(), domain.SubmitTaskCommand{
-		SessionKey:        sessionKey,
-		RequesterUserID:   requester,
-		Source:            body.Source,
-		SourceInstanceID:  body.SourceInstanceID,
-		MessageID:         body.MessageID,
-		Prompt:            body.Prompt,
-		PersonaSnapshot:   body.PersonaSnapshot,
-		ToolPolicyVersion: body.ToolPolicyVersion,
-	})
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "SUBMIT_FAILED", err.Error(), tid)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"task_id": task.ID,
-		"status":  string(task.Status),
-	})
-}
-
-func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
-	tid := traceID()
-	taskID := r.PathValue("task_id")
-	task, err := s.svc.GetTask(r.Context(), taskID)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, "NOT_FOUND", err.Error(), tid)
-		return
-	}
-	out := map[string]any{
-		"task_id":     task.ID,
-		"session_key": task.SessionKey,
-		"status":      string(task.Status),
-	}
-	if task.SnapshotID != "" {
-		out["snapshot_id"] = task.SnapshotID
-	}
-	if task.SnapshotChecksum != "" {
-		out["snapshot_checksum"] = task.SnapshotChecksum
-	}
-	if task.ResultRef != "" {
-		out["result_ref"] = task.ResultRef
-	}
-	if task.ResultDigest != "" {
-		out["result_digest"] = task.ResultDigest
-	}
-	if task.TerminalErrorCode != "" {
-		out["terminal_error"] = map[string]string{
-			"code":         task.TerminalErrorCode,
-			"user_message": task.TerminalErrorMessage,
-			"trace_id":     task.TerminalErrorTraceID,
-		}
-	}
-	writeJSON(w, http.StatusOK, out)
-}
-
-func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
-	tid := traceID()
-	taskID := r.PathValue("task_id")
-	// Optional query result_ref must match opaque stored ref when provided; never a host path.
-	if ref := r.URL.Query().Get("result_ref"); ref != "" {
-		if strings.ContainsAny(ref, `/\`) || strings.Contains(ref, "..") {
-			writeErr(w, http.StatusBadRequest, "INVALID_RESULT_REF", "path-like result_ref rejected", tid)
-			return
-		}
-	}
-	payload, err := s.svc.ReadResult(r.Context(), taskID)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "RESULT_UNAVAILABLE", err.Error(), tid)
-		return
-	}
-	if q := r.URL.Query().Get("result_ref"); q != "" && q != payload.Ref {
-		writeErr(w, http.StatusConflict, "RESULT_REF_MISMATCH", "result_ref does not match committed ref", tid)
-		return
-	}
-	// Plan Task 3 Step 5: result body is text/plain UTF-8; result_digest is
-	// sha256 over these exact bytes. OpenAPI declares payload as string.
-	writeJSON(w, http.StatusOK, map[string]any{
-		"result_ref":    payload.Ref,
-		"result_digest": payload.Digest,
-		"content_type":  "text/plain; charset=utf-8",
-		"payload":       string(payload.Body),
-	})
-}
-
-func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	tid := traceID()
-	taskID := r.PathValue("task_id")
-	requester := s.devUserID
-	if q := r.URL.Query().Get("requester_user_id"); q != "" {
-		if v, err := strconv.ParseInt(q, 10, 64); err == nil && v > 0 {
-			requester = v
-		}
-	}
-	task, err := s.svc.CancelTask(r.Context(), taskID, requester)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "CANCEL_FAILED", err.Error(), tid)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"accepted": true,
-		"status":   string(task.Status),
-	})
-}
-
-func validateCreate(b createTaskBody) error {
-	if strings.TrimSpace(b.MessageID) == "" || len(b.MessageID) > postgres.MaxMessageIDLen {
-		return fmt.Errorf("message_id is required and must be <= %d bytes", postgres.MaxMessageIDLen)
-	}
-	if strings.TrimSpace(b.SourceInstanceID) == "" || len(b.SourceInstanceID) > postgres.MaxSourceInstanceLen {
-		return fmt.Errorf("source_instance_id is required and must be <= %d bytes", postgres.MaxSourceInstanceLen)
-	}
-	if strings.TrimSpace(b.Prompt) == "" || len([]byte(b.Prompt)) > postgres.MaxPromptBytes {
-		return fmt.Errorf("prompt is required and must be <= %d bytes", postgres.MaxPromptBytes)
-	}
-	if strings.TrimSpace(b.Source) == "" || !domain.IsValidSource(b.Source) {
-		return fmt.Errorf("source must be one of %s|%s", domain.SourceWechat, domain.SourceWeb)
-	}
-	if b.PersonaSnapshot == nil {
-		return fmt.Errorf("persona_snapshot is required")
-	}
-	if strings.TrimSpace(b.ToolPolicyVersion) == "" || len(b.ToolPolicyVersion) > postgres.MaxToolPolicyVersionLen {
-		return fmt.Errorf("tool_policy_version is required and must be <= %d bytes", postgres.MaxToolPolicyVersionLen)
-	}
-	return nil
-}
-
+// writeJSON encodes v as JSON and writes it with the given status.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeErr is the standard error envelope: {code, message, trace_id}.
 func writeErr(w http.ResponseWriter, status int, code, message, tid string) {
 	writeJSON(w, status, map[string]any{
 		"code":     code,
@@ -395,72 +177,7 @@ func writeErr(w http.ResponseWriter, status int, code, message, tid string) {
 	})
 }
 
+// traceID returns a fresh UUIDv4 for request tracing.
 func traceID() string {
 	return uuid.NewString()
-}
-
-// ServeContext runs the HTTP server with sane timeouts and middleware until
-// ctx is cancelled. The handler chain applies: body-size limit (prevents
-// memory exhaustion), panic recovery (logs stack trace, returns 500 without
-// leaking internals). Timeouts protect against Slowloris and stuck writers.
-func ServeContext(ctx context.Context, addr string, h http.Handler) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return err
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("platform API must bind loopback, got %s", addr)
-	}
-	wrapped := recoverMiddleware(bodyLimitMiddleware(MaxRequestBodyBytes)(h))
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           wrapped,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1 MiB
-	}
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
-	select {
-	case <-ctx.Done():
-		shctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shctx)
-		return ctx.Err()
-	case err := <-errCh:
-		return err
-	}
-}
-
-// bodyLimitMiddleware wraps r.Body with http.MaxBytesReader so any single
-// request body beyond max bytes is rejected with 413.
-func bodyLimitMiddleware(max int64) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r.Body = http.MaxBytesReader(w, r.Body, max)
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-// recoverMiddleware catches panics from handlers, logs the stack trace, and
-// returns a generic 500 so internal details (SQL errors, file paths, stack
-// frames) don't leak to clients.
-func recoverMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if rec := recover(); rec != nil {
-				slog.ErrorContext(r.Context(), "api: panic recovered",
-					"method", r.Method,
-					"path", r.URL.Path,
-					"panic", rec,
-				)
-				writeErr(w, http.StatusInternalServerError, "INTERNAL", "internal server error", traceID())
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
 }

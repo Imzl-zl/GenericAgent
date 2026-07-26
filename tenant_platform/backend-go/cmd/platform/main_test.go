@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 )
 
 func TestResolvePolicyPathSurvivesWorkerWorkingDirectoryChange(t *testing.T) {
@@ -35,42 +35,12 @@ func TestResolvePolicyPathSurvivesWorkerWorkingDirectoryChange(t *testing.T) {
 
 func TestBuildWorkerRuntimeLoopbackDefault(t *testing.T) {
 	boot := application.DevBootstrapConfig{LegacyRoot: t.TempDir()}
-	rt, scoped, err := buildWorkerRuntime("", "", boot)
+	rt, err := buildWorkerRuntime(boot)
 	if err != nil {
 		t.Fatalf("buildWorkerRuntime: %v", err)
 	}
 	if rt == nil {
 		t.Fatal("expected runtime")
-	}
-	if scoped {
-		t.Fatal("loopback runtime must not require session-scoped config")
-	}
-}
-
-func TestBuildWorkerRuntimePodmanRequiresManagerAddr(t *testing.T) {
-	_, _, err := buildWorkerRuntime("podman", "", application.DevBootstrapConfig{})
-	if err == nil {
-		t.Fatal("expected error when manager address is missing")
-	}
-}
-
-func TestBuildWorkerRuntimePodmanSessionScoped(t *testing.T) {
-	rt, scoped, err := buildWorkerRuntime("podman", "127.0.0.1:50051", application.DevBootstrapConfig{})
-	if err != nil {
-		t.Fatalf("buildWorkerRuntime: %v", err)
-	}
-	if rt == nil {
-		t.Fatal("expected runtime")
-	}
-	if !scoped {
-		t.Fatal("podman runtime must use session-scoped config")
-	}
-}
-
-func TestBuildWorkerRuntimeRejectsUnknownMode(t *testing.T) {
-	_, _, err := buildWorkerRuntime("unknown", "", application.DevBootstrapConfig{})
-	if err == nil {
-		t.Fatal("expected error for unknown runtime mode")
 	}
 }
 
