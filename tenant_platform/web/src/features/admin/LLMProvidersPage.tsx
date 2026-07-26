@@ -317,7 +317,7 @@ export function LLMProvidersPage() {
             </div>
 
             <div className="provider-form-full">
-              <Collapsible title="🔄 传输与协议" defaultOpen={false}>
+              <Collapsible title="🔄 传输" defaultOpen={false}>
                 <div>
                   <label className="input-label">
                     <input
@@ -329,8 +329,12 @@ export function LLMProvidersPage() {
                     Stream（流式传输）
                   </label>
                 </div>
+              </Collapsible>
+            </div>
 
-                {form.provider_type === 'native_oai' && (
+            {form.provider_type === 'native_oai' && (
+              <div className="provider-form-full">
+                <Collapsible title="🎯 API 端点模式" defaultOpen={false}>
                   <div>
                     <label className="input-label">API Mode</label>
                     <select
@@ -339,14 +343,17 @@ export function LLMProvidersPage() {
                       onChange={(e) => setForm({ ...form, config: { ...form.config, api_mode: e.target.value as any || undefined } })}
                       style={{ width: '100%', padding: '8px 12px' }}
                     >
-                      <option value="">默认（chat_completions）</option>
-                      <option value="chat_completions">chat_completions</option>
-                      <option value="responses">responses</option>
+                      <option value="">默认 (chat_completions)</option>
+                      <option value="chat_completions">chat_completions - /v1/chat/completions</option>
+                      <option value="responses">responses - /v1/responses</option>
                     </select>
+                    <small style={{ color: '#666', fontSize: '0.85em', marginTop: '4px', display: 'block' }}>
+                      仅 NativeOAISession 生效，决定使用哪个 OpenAI API 端点
+                    </small>
                   </div>
-                )}
-              </Collapsible>
-            </div>
+                </Collapsible>
+              </div>
+            )}
 
             {form.provider_type === 'native_claude' && (
               <div className="provider-form-full">
