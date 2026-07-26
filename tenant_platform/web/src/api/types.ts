@@ -76,11 +76,42 @@ export interface Persona {
 export interface LLMProvider {
   provider_id: number;
   name: string;
-  provider_type: string;
+  provider_type: 'native_oai' | 'native_claude';
   base_url: string;
   model: string;
+  config?: LLMProviderConfig;
   is_default: boolean;
   state: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface LLMProviderConfig {
+  // ── 推理 / 思考 ──
+  thinking_type?: 'adaptive' | 'enabled' | 'disabled';
+  thinking_budget_tokens?: number;
+  reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+  // ── 采样 ──
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+
+  // ── 容量 / 超时 ──
+  context_win?: number;
+  max_retries?: number;
+  connect_timeout?: number;
+  read_timeout?: number;
+  timeout?: number;
+
+  // ── 传输 ──
+  stream?: boolean;
+  api_mode?: 'chat_completions' | 'responses';
+
+  // ── Claude 专属 ──
+  fake_cc_system_prompt?: boolean;
+  user_agent?: string;
+
+  // ── 网络 ──
+  proxy?: string;
 }
