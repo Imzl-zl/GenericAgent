@@ -348,6 +348,44 @@ export function LLMProvidersPage() {
               </Collapsible>
             </div>
 
+            {form.provider_type === 'native_claude' && (
+              <div className="provider-form-full">
+                <Collapsible title="🤖 Claude 专属" defaultOpen={false}>
+                  <div>
+                    <label className="input-label">
+                      <input
+                        type="checkbox"
+                        checked={form.config.fake_cc_system_prompt || false}
+                        onChange={(e) => setForm({ ...form, config: { ...form.config, fake_cc_system_prompt: e.target.checked } })}
+                        style={{ marginRight: '8px' }}
+                      />
+                      Fake CC System Prompt（CC 透传渠道必须启用）
+                    </label>
+                  </div>
+
+                  <Input
+                    label="User Agent"
+                    type="text"
+                    placeholder="自定义 User-Agent（可选）"
+                    value={form.config.user_agent || ''}
+                    onChange={(e) => setForm({ ...form, config: { ...form.config, user_agent: e.target.value || undefined } })}
+                  />
+                </Collapsible>
+              </div>
+            )}
+
+            <div className="provider-form-full">
+              <Collapsible title="🌐 网络" defaultOpen={false}>
+                <Input
+                  label="Proxy"
+                  type="text"
+                  placeholder="HTTP 代理地址（例如 http://proxy.example.com:8080）"
+                  value={form.config.proxy || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, proxy: e.target.value || undefined } })}
+                />
+              </Collapsible>
+            </div>
+
             <div className="provider-form-full provider-actions">
               <Button type="submit">保存</Button>
             </div>
