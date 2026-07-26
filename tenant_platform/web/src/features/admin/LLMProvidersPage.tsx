@@ -272,21 +272,50 @@ export function LLMProvidersPage() {
               </Collapsible>
             </div>
 
-            <Input
-              label="Max Retries"
-              type="number"
-              placeholder="例如 3"
-              value={form.config.max_retries || ''}
-              onChange={(e) => setForm({ ...form, config: { ...form.config, max_retries: e.target.value ? parseInt(e.target.value) : undefined } })}
-            />
+            <div className="provider-form-full">
+              <Collapsible title="⏱️ 容量与超时" defaultOpen={false}>
+                <Input
+                  label="Context Win"
+                  type="number"
+                  placeholder="例如 30000"
+                  value={form.config.context_win || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, context_win: e.target.value ? parseInt(e.target.value) : undefined } })}
+                />
 
-            <Input
-              label="Timeout (秒)"
-              type="number"
-              placeholder="例如 60"
-              value={form.config.timeout || ''}
-              onChange={(e) => setForm({ ...form, config: { ...form.config, timeout: e.target.value ? parseInt(e.target.value) : undefined } })}
-            />
+                <Input
+                  label="Max Retries"
+                  type="number"
+                  placeholder="例如 3"
+                  value={form.config.max_retries || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, max_retries: e.target.value ? parseInt(e.target.value) : undefined } })}
+                />
+
+                <Input
+                  label="Connect Timeout (秒)"
+                  type="number"
+                  placeholder="例如 5"
+                  value={form.config.connect_timeout || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, connect_timeout: e.target.value ? parseInt(e.target.value) : undefined } })}
+                />
+
+                <Input
+                  label="Read Timeout (秒)"
+                  type="number"
+                  placeholder="例如 30"
+                  value={form.config.read_timeout || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, read_timeout: e.target.value ? parseInt(e.target.value) : undefined } })}
+                />
+
+                <Input
+                  label="Timeout (秒)"
+                  type="number"
+                  placeholder="例如 60"
+                  value={form.config.timeout || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, timeout: e.target.value ? parseInt(e.target.value) : undefined } })}
+                />
+              </Collapsible>
+            </div>
+
             <div className="provider-form-full provider-actions">
               <Button type="submit">保存</Button>
             </div>
