@@ -24,7 +24,6 @@ import (
 type Server struct {
 	svc           application.TaskService
 	users         application.UserService
-	binding       application.BindingService
 	wechatBinding application.WechatQRBindingService
 	botSvc        application.BotService
 	invite        application.InviteService
@@ -80,7 +79,6 @@ type LLMProviderStore interface {
 type ServerConfig struct {
 	Service       application.TaskService
 	Users         application.UserService
-	Binding       application.BindingService
 	WechatBinding application.WechatQRBindingService
 	BotService    application.BotService
 	Invite        application.InviteService
@@ -117,7 +115,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	s := &Server{
 		svc:           cfg.Service,
 		users:         cfg.Users,
-		binding:       cfg.Binding,
 		wechatBinding: cfg.WechatBinding,
 		botSvc:        cfg.BotService,
 		invite:        cfg.Invite,

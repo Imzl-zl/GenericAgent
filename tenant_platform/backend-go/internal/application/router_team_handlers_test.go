@@ -78,10 +78,8 @@ func (f *fakeTeamService) ListPendingMembers(_ context.Context, _ string, _ int6
 
 func newTeamTestRouter(store *fakeRouterStore, tr *transport.LoopbackTransport, teams TeamService) Router {
 	tasks := &fakeTaskService{}
-	binding := &fakeBindingSvc{}
 	r, _ := NewRouter(RouterConfig{
 		Store:          store,
-		Binding:        binding,
 		Tasks:          tasks,
 		Transport:      tr,
 		Messages:       &fakeMessageStore{},
@@ -151,7 +149,7 @@ func TestRouterTeamCommandsDisabledWhenServiceNil(t *testing.T) {
 	store := boundBotStore(42)
 	tr := transport.NewLoopbackTransport()
 	r, _ := NewRouter(RouterConfig{
-		Store: store, Binding: &fakeBindingSvc{}, Tasks: &fakeTaskService{},
+		Store: store, Tasks: &fakeTaskService{},
 		Transport: tr, Messages: &fakeMessageStore{},
 		ToolPolicy: "v1", SourceInstance: "t",
 		Teams: nil, // P0 mode
@@ -280,7 +278,7 @@ func TestRouterNormalMessageRoutesToTeamContext(t *testing.T) {
 	}
 	tasks := &fakeTaskService{}
 	r, _ := NewRouter(RouterConfig{
-		Store: store, Binding: &fakeBindingSvc{}, Tasks: tasks,
+		Store: store, Tasks: tasks,
 		Transport: tr, Messages: &fakeMessageStore{},
 		ToolPolicy: "v1", SourceInstance: "t", Teams: teams,
 	})
@@ -304,7 +302,7 @@ func TestRouterNormalMessageRoutesToPersonalByDefault(t *testing.T) {
 	}
 	tasks := &fakeTaskService{}
 	r, _ := NewRouter(RouterConfig{
-		Store: store, Binding: &fakeBindingSvc{}, Tasks: tasks,
+		Store: store, Tasks: tasks,
 		Transport: tr, Messages: &fakeMessageStore{},
 		ToolPolicy: "v1", SourceInstance: "t", Teams: teams,
 	})

@@ -45,7 +45,6 @@ func newTestRouterWithRelay(store *fakeRouterStore, tr *transport.LoopbackTransp
 	fakeRelay, _ := relay.(*fakeRelayService)
 	r, _ := NewRouter(RouterConfig{
 		Store:          store,
-		Binding:        &fakeBindingSvc{},
 		Tasks:          &fakeTaskService{},
 		Transport:      tr,
 		Messages:       &fakeMessageStore{},
@@ -256,7 +255,7 @@ func TestRouterRelayNilServiceFallsThrough(t *testing.T) {
 	store := approvedStoreWithBot(bot)
 	tr := transport.NewLoopbackTransport()
 	// Router with NO relay service — @-text should fall through to normal task.
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@bob hello",
@@ -332,7 +331,7 @@ func TestRouterRelayOffWhenServiceNil(t *testing.T) {
 	store := approvedStoreWithBot(bot)
 	tr := transport.NewLoopbackTransport()
 	// Router with NO relay service — /relay_off should say feature disabled.
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/relay_off",

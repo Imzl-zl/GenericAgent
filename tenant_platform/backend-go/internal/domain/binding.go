@@ -31,41 +31,6 @@ type User struct {
 	ApprovedAt      *time.Time
 }
 
-// BindingState is the binding attempt lifecycle (spec §5.1).
-//
-//	requested → qr_pending → awaiting_activation → active
-//	                            ├→ expired
-//	                            └→ revoked
-type BindingState string
-
-const (
-	BindingRequested           BindingState = "requested"
-	BindingQrPending           BindingState = "qr_pending"
-	BindingAwaitingActivation  BindingState = "awaiting_activation"
-	BindingActive              BindingState = "active"
-	BindingExpired             BindingState = "expired"
-	BindingRevoked             BindingState = "revoked"
-)
-
-// IsConsumable reports whether a binding in this state can be activated.
-func (s BindingState) IsConsumable() bool {
-	return s == BindingRequested || s == BindingQrPending || s == BindingAwaitingActivation
-}
-
-// BindingAttempt is a one-time WeChat binding code (spec §5.1).
-// code_hash stores SHA-256(plaintext_code); plaintext is never persisted.
-type BindingAttempt struct {
-	ID          int64
-	UserID      int64
-	CodeHash    string
-	State       BindingState
-	BotUUID     string
-	ExpiresAt   time.Time
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	ActivatedAt *time.Time
-}
-
 // BotState is the bot lifecycle (spec §5: bots).
 type BotState string
 
@@ -76,8 +41,8 @@ const (
 )
 
 // Bot is a WeChat bot owned by a platform user (spec §5).
-// ilink_user_id is bound after /activate; token_ciphertext is the encrypted
-// upstream bot token, never plaintext.
+// ilink_user_id is set via the official iLink QR binding flow;
+// token_ciphertext is the encrypted upstream bot token, never plaintext.
 type Bot struct {
 	ID                int64
 	BotUUID           string
@@ -155,13 +120,9 @@ func (t ContextToken) IsExpired(now time.Time) bool { return now.After(t.Expires
 type AuditAction string
 
 const (
-	AuditUserCreated         AuditAction = "user_created"
-	AuditUserApproved        AuditAction = "user_approved"
-	AuditUserBlocked         AuditAction = "user_blocked"
-	AuditBindingGenerated    AuditAction = "binding_generated"
-	AuditBindingActivated    AuditAction = "binding_activated"
-	AuditBindingExpired      AuditAction = "binding_expired"
-	AuditBindingRevoked      AuditAction = "binding_revoked"
+	AuditUserCreated          AuditAction = "user_created"
+	AuditUserApproved         AuditAction = "user_approved"
+	AuditUserBlocked          AuditAction = "user_blocked"
 	AuditTaskCancelledByBlock AuditAction = "task_cancelled_by_block"
 	AuditRelayForwarded       AuditAction = "relay_forwarded"
 )

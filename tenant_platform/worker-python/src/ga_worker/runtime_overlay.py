@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 from pathlib import Path
 from typing import Any
@@ -106,11 +105,18 @@ def _copy_manifest_entry(src_root: Path, dest_root: Path, rel: str) -> str:
         src = real
     dest = dest_root / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
+    # Hard link (O(1), no data copy, no extra disk space). Both src and dest
+    # share the same inode; _make_readonly below makes the inode read-only,
+    # which also protects the source from runtime modification — a desirable
+    # security property since legacy modules should be immutable in production.
+    # If src and dest are on different filesystems, os.link raises OSError
+    # (EXDEV on POSIX); the error surfaces clearly so the operator can fix
+    # the deployment (same filesystem) rather than silently degrading.
+    os.link(src, dest)
     digest = _sha256_file(dest)
     expected = _sha256_file(src)
     if digest != expected:
-        raise OverlayError(f"SHA-256 mismatch after copy: {rel}")
+        raise OverlayError(f"SHA-256 mismatch after link: {rel}")
     _make_readonly(dest)
     return digest
 

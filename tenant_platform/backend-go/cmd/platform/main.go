@@ -537,13 +537,6 @@ func run() error {
 		return err
 	}
 
-	bindingSvc, err := application.NewBindingService(application.BindingServiceConfig{
-		Store: store,
-	})
-	if err != nil {
-		return err
-	}
-
 	botSvc, err := application.NewBotService(store)
 	if err != nil {
 		return err
@@ -644,7 +637,6 @@ func run() error {
 
 	routerSvc, err := application.NewRouter(application.RouterConfig{
 		Store:          store,
-		Binding:        bindingSvc,
 		Tasks:          svc,
 		Transport:      botTransport,
 		Commands:       store, // DB-driven command registry (migration 0004)
@@ -661,7 +653,6 @@ func run() error {
 	server, err := api.NewServer(api.ServerConfig{
 		Service:       svc,
 		Users:         userSvc,
-		Binding:       bindingSvc,
 		WechatBinding: wechatBindingSvc,
 		BotService:    botSvc,
 		Invite:        inviteSvc,

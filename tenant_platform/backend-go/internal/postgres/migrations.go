@@ -47,7 +47,10 @@ func migrationFiles() []string {
 		"0014_media_assets.sql",
 		"0015_task_last_activity_at.sql",
 		"0016_team_lifecycle.sql",
+		"0017_relay_opt_in.sql",
 		"0018_session_reset.sql",
+		"0019_drop_binding_attempts.sql",
+		"0020_task_event_sequence_counter.sql",
 	}
 }
 
@@ -59,7 +62,7 @@ var pendingMigrations = []struct {
 	markerTable string
 }{
 	{"0002_team_tables.sql", "teams"},
-	{"0003_user_lifecycle.sql", "binding_attempts"},
+	{"0003_user_lifecycle.sql", "bots"},
 	{"0004_configurable_policies.sql", "platform_commands"},
 	{"0005_per_user_tool_policy.sql", "users"},
 	{"0006_delivery_outbox_indexes.sql", "task_deliveries"},
@@ -73,7 +76,10 @@ var pendingMigrations = []struct {
 	{"0014_media_assets.sql", "migration_0014_media_assets_marker"},
 	{"0015_task_last_activity_at.sql", "migration_0015_task_last_activity_at_marker"},
 	{"0016_team_lifecycle.sql", "migration_0016_team_lifecycle_marker"},
+	{"0017_relay_opt_in.sql", "relay_preferences"},
 	{"0018_session_reset.sql", "migration_0018_session_reset_marker"},
+	{"0019_drop_binding_attempts.sql", "migration_0019_drop_binding_attempts_marker"},
+	{"0020_task_event_sequence_counter.sql", "migration_0020_task_event_sequence_counter_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -96,6 +102,7 @@ var foundationTableNames = []string{
 	"teams",
 	"platform_commands",
 	"tool_policies",
+	"relay_preferences",
 	"migration_0008_user_id_serial_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
@@ -103,6 +110,8 @@ var foundationTableNames = []string{
 	"migration_0015_task_last_activity_at_marker",
 	"migration_0016_team_lifecycle_marker",
 	"migration_0018_session_reset_marker",
+	"migration_0019_drop_binding_attempts_marker",
+	"migration_0020_task_event_sequence_counter_marker",
 	"team_invite_codes",
 	"active_contexts",
 }

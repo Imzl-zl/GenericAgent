@@ -19,7 +19,6 @@ import (
 type RouterAction string
 
 const (
-	ActionActivated   RouterAction = "activated"
 	ActionStopped     RouterAction = "stopped"
 	ActionNewSession  RouterAction = "new_session"
 	ActionTaskCreated RouterAction = "task_created"
@@ -98,7 +97,6 @@ type CommandRegistry interface {
 // RouterConfig wires the router's dependencies.
 type RouterConfig struct {
 	Store          RouterStore
-	Binding        BindingService
 	Tasks          TaskService
 	Transport      transport.BotTransportAdapter
 	Commands       CommandRegistry
@@ -125,7 +123,6 @@ type Router interface {
 
 type router struct {
 	store          RouterStore
-	binding        BindingService
 	tasks          TaskService
 	transport      transport.BotTransportAdapter
 	commands       CommandRegistry
@@ -143,8 +140,8 @@ type router struct {
 
 // NewRouter constructs the router.
 func NewRouter(cfg RouterConfig) (Router, error) {
-	if cfg.Store == nil || cfg.Binding == nil || cfg.Tasks == nil || cfg.Transport == nil {
-		return nil, fmt.Errorf("store, binding, tasks, and transport are required")
+	if cfg.Store == nil || cfg.Tasks == nil || cfg.Transport == nil {
+		return nil, fmt.Errorf("store, tasks, and transport are required")
 	}
 	if cfg.Messages == nil {
 		return nil, fmt.Errorf("message store is required")
@@ -157,7 +154,6 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 	}
 	return &router{
 		store:          cfg.Store,
-		binding:        cfg.Binding,
 		tasks:          cfg.Tasks,
 		transport:      cfg.Transport,
 		commands:       cfg.Commands,
@@ -204,9 +200,14 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 			"bot_uuid", msg.BotUUID,
 			"error", perr)
 	}
-	// Unbound bot: only /activate is allowed (spec §6.1 step 2).
+	// Unbound bot: with the official iLink QR binding flow, bots are always
+	// created with ilink_user_id set. An unbound bot means it was created
+	// outside the QR flow (legacy path) or the binding was revoked. Either
+	// way, the bot cannot process messages; reject and surface the state.
 	if !bot.IsBound() {
-		return r.handleUnboundMessage(ctx, msg, bot)
+		reply := "bot not bound; contact admin to rebind via WeChat QR"
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	// Bound bot: verify from_user_id matches (spec §6.1 step 2).
 	if bot.IlinkUserID != msg.IlinkUserID {
@@ -226,25 +227,6 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	}
 	// Steps 4-7: parse command and route.
 	return r.routeBoundMessage(ctx, msg, bot)
-}
-
-// handleUnboundMessage processes a message from an unbound bot (only /activate).
-func (r *router) handleUnboundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
-	code, ok := parseActivateCommand(msg.Text)
-	if !ok {
-		reply := "bot not bound; send /activate <code> to pair"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
-		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
-	}
-	_, err := r.binding.Activate(ctx, code, msg.BotUUID, msg.IlinkUserID)
-	if err != nil {
-		reply := fmt.Sprintf("activation failed: %s", err.Error())
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
-		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
-	}
-	reply := "binding successful; you can now send messages"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
-	return RouterResult{Action: ActionActivated, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
 // routeBoundMessage parses platform-level commands and routes everything else
@@ -550,20 +532,6 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	reply := fmt.Sprintf("task %s queued", task.ID)
 	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 	return RouterResult{Action: ActionTaskCreated, Reply: reply, UserID: bot.OwnerID}, nil
-}
-
-// parseActivateCommand extracts the code from "/activate <code>".
-// Returns the code and true if the message matches; empty and false otherwise.
-func parseActivateCommand(text string) (string, bool) {
-	text = strings.TrimSpace(text)
-	if !strings.HasPrefix(text, "/activate") {
-		return "", false
-	}
-	rest := strings.TrimSpace(strings.TrimPrefix(text, "/activate"))
-	if rest == "" {
-		return "", false
-	}
-	return rest, true
 }
 
 // personalSessionKey returns the session key for a user's personal workspace.

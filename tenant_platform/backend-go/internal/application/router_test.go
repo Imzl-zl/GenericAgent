@@ -2,7 +2,6 @@ package application
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 
@@ -99,41 +98,22 @@ func (f *fakeTaskService) ReadResult(_ context.Context, _ string) (domain.Result
 	return domain.ResultPayload{}, nil
 }
 
-// fakeBindingSvc is a minimal BindingService for router tests.
-type fakeBindingSvc struct {
-	activateErr error
-	activated   bool
-}
-
-func (f *fakeBindingSvc) GenerateBindingCode(_ context.Context, _ int64) (string, domain.BindingAttempt, error) {
-	return "", domain.BindingAttempt{}, nil
-}
-func (f *fakeBindingSvc) Activate(_ context.Context, _, _, _ string) (domain.BindingAttempt, error) {
-	if f.activateErr != nil {
-		return domain.BindingAttempt{}, f.activateErr
-	}
-	f.activated = true
-	return domain.BindingAttempt{State: domain.BindingActive}, nil
-}
-
-func newTestRouter(store *fakeRouterStore, tr *transport.LoopbackTransport) (Router, *fakeTaskService, *fakeBindingSvc) {
+func newTestRouter(store *fakeRouterStore, tr *transport.LoopbackTransport) (Router, *fakeTaskService) {
 	tasks := &fakeTaskService{}
-	binding := &fakeBindingSvc{}
 	r, _ := NewRouter(RouterConfig{
 		Store:          store,
-		Binding:        binding,
 		Tasks:          tasks,
 		Transport:      tr,
 		Messages:       &fakeMessageStore{},
 		ToolPolicy:     "foundation.no-host-tools.v1",
 		SourceInstance: "test-router",
 	})
-	return r, tasks, binding
+	return r, tasks
 }
 
 func TestRouterRejectsMissingFields(t *testing.T) {
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(newFakeRouterStore(), tr)
+	r, _ := newTestRouter(newFakeRouterStore(), tr)
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{})
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +126,7 @@ func TestRouterRejectsMissingFields(t *testing.T) {
 func TestRouterDuplicateMessageIgnored(t *testing.T) {
 	store := newFakeRouterStore()
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}
 	if _, err := r.HandleMessage(context.Background(), msg); err != nil {
 		t.Fatal(err)
@@ -163,7 +143,7 @@ func TestRouterDuplicateMessageIgnored(t *testing.T) {
 func TestRouterUnknownBotRejected(t *testing.T) {
 	store := newFakeRouterStore()
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "unknown", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
 	})
@@ -172,29 +152,20 @@ func TestRouterUnknownBotRejected(t *testing.T) {
 	}
 }
 
-func TestRouterUnboundBotOnlyActivateAllowed(t *testing.T) {
+func TestRouterUnboundBotRejected(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, State: domain.BotActive}
 	tr := transport.NewLoopbackTransport()
-	r, _, binding := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
 	})
 	if res.Action != ActionRejected {
-		t.Fatalf("expected rejected for non-activate, got %s", res.Action)
+		t.Fatalf("expected rejected for unbound bot, got %s", res.Action)
 	}
-	if binding.activated {
-		t.Fatal("binding should not be activated for normal message")
-	}
-	// Now send /activate
-	res, _ = r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m2", Text: "/activate ABC123",
-	})
-	if res.Action != ActionActivated {
-		t.Fatalf("expected activated, got %s", res.Action)
-	}
-	if !binding.activated {
-		t.Fatal("binding should be activated")
+	last, ok := tr.LastSentMessage()
+	if !ok || !contains(last.Text, "not bound") {
+		t.Fatalf("expected 'not bound' reply, got %q", last.Text)
 	}
 }
 
@@ -202,7 +173,7 @@ func TestRouterIdentityMismatchRejected(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "correct-user", State: domain.BotActive}
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "wrong-user", MessageID: "m1", Text: "hello",
 	})
@@ -216,7 +187,7 @@ func TestRouterBlockedUserRejected(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserBlocked
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
 	})
@@ -230,7 +201,7 @@ func TestRouterPendingUserRejected(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserPending
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
 	})
@@ -244,7 +215,7 @@ func TestRouterNormalMessageCreatesTask(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, tasks, _ := newTestRouter(store, tr)
+	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "do something",
 	})
@@ -267,7 +238,7 @@ func TestRouterMediaPathsAppendedToPrompt(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, tasks, _ := newTestRouter(store, tr)
+	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "check this image",
 		MediaPaths: []string{"/tmp/media/b1/img.jpg"},
@@ -286,7 +257,7 @@ func TestRouterMediaOnlyMessageUsesPlaceholder(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, tasks, _ := newTestRouter(store, tr)
+	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "",
 		MediaPaths: []string{"/tmp/media/b1/a.pdf", "/tmp/media/b1/b.pdf"},
@@ -306,7 +277,7 @@ func TestRouterStopCancelsRunningTask(t *testing.T) {
 	store.statuses[42] = domain.UserApproved
 	store.runningTask = &domain.Task{ID: "task-running", SessionKey: "personal:42", Status: domain.TaskRunning}
 	tr := transport.NewLoopbackTransport()
-	r, tasks, _ := newTestRouter(store, tr)
+	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/stop",
 	})
@@ -323,7 +294,7 @@ func TestRouterStopWithNoRunningTask(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/stop",
 	})
@@ -337,7 +308,7 @@ func TestRouterNewCommandAcknowledged(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/new",
 	})
@@ -351,7 +322,7 @@ func TestRouterHelpCommand(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/help",
 	})
@@ -369,7 +340,7 @@ func TestRouterStatusIdle(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/status",
 	})
@@ -388,7 +359,7 @@ func TestRouterStatusRunning(t *testing.T) {
 	store.statuses[42] = domain.UserApproved
 	store.runningTask = &domain.Task{ID: "task-1", Status: domain.TaskRunning}
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/status",
 	})
@@ -406,7 +377,7 @@ func TestRouterLLMCommand(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/llm",
 	})
@@ -424,7 +395,7 @@ func TestRouterUnknownSlashCommandForwardedAsTask(t *testing.T) {
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, tasks, _ := newTestRouter(store, tr)
+	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/restore",
 	})
@@ -436,30 +407,12 @@ func TestRouterUnknownSlashCommandForwardedAsTask(t *testing.T) {
 	}
 }
 
-func TestRouterActivateFailsSendsErrorReply(t *testing.T) {
-	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, State: domain.BotActive}
-	tr := transport.NewLoopbackTransport()
-	r, _, binding := newTestRouter(store, tr)
-	binding.activateErr = errors.New("code expired")
-	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/activate BADCODE",
-	})
-	if res.Action != ActionRejected {
-		t.Fatalf("expected rejected, got %s", res.Action)
-	}
-	last, ok := tr.LastSentMessage()
-	if !ok || !contains(last.Text, "activation failed") {
-		t.Fatalf("expected 'activation failed' reply, got %q", last.Text)
-	}
-}
-
 func TestRouterSendsReplyViaTransport(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, _, _ := newTestRouter(store, tr)
+	r, _ := newTestRouter(store, tr)
 	_, _ = r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
 	})
@@ -469,26 +422,6 @@ func TestRouterSendsReplyViaTransport(t *testing.T) {
 	}
 	if sent[0].BotUUID != "b1" || sent[0].IlinkUserID != "u1" {
 		t.Fatalf("reply sent to wrong recipient: %+v", sent[0])
-	}
-}
-
-func TestParseActivateCommand(t *testing.T) {
-	cases := []struct {
-		input string
-		code  string
-		ok    bool
-	}{
-		{"/activate ABC123", "ABC123", true},
-		{"/activate  ABC123 ", "ABC123", true},
-		{"/activate", "", false},
-		{"hello", "", false},
-		{"", "", false},
-	}
-	for _, c := range cases {
-		code, ok := parseActivateCommand(c.input)
-		if code != c.code || ok != c.ok {
-			t.Errorf("parseActivateCommand(%q) = (%q, %v), want (%q, %v)", c.input, code, ok, c.code, c.ok)
-		}
 	}
 }
 

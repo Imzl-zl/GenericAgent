@@ -1038,13 +1038,24 @@ INSERT INTO task_events (
 	return err
 }
 
+// insertNextEvent appends a task_event using the atomic per-task counter
+// last_event_sequence_no (migration 0020). The UPDATE ... RETURNING in the
+// CTE takes a row-level lock on the tasks row, serializing concurrent event
+// inserts within the same transaction and across transactions. This replaces
+// the old COALESCE(MAX(sequence_no),0)+1 pattern which required every caller
+// to hold a FOR UPDATE lock and scanned task_events on every insert.
 func insertNextEvent(ctx context.Context, tx pgx.Tx, taskID, eventType string, byteCount *int, digest *string, fromStatus, toStatus, worker, errCode string) error {
 	_, err := tx.Exec(ctx, `
+WITH next_seq AS (
+  UPDATE tasks SET last_event_sequence_no = last_event_sequence_no + 1
+  WHERE id = $1
+  RETURNING last_event_sequence_no
+)
 INSERT INTO task_events (
   task_id, event_type, sequence_no, byte_count, digest, from_status, to_status, worker_instance, error_code, created_at
 )
-SELECT $1, $2, COALESCE(MAX(sequence_no), 0) + 1, $3, $4, NULLIF($5,''), NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), timezone('utc', now())
-FROM task_events WHERE task_id = $1
+SELECT $1, $2, next_seq.last_event_sequence_no, $3, $4, NULLIF($5,''), NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), timezone('utc', now())
+FROM next_seq
 `, taskID, eventType, byteCount, digest, fromStatus, toStatus, worker, errCode)
 	return err
 }

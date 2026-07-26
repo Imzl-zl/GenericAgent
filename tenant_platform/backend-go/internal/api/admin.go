@@ -36,10 +36,6 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("POST /v1/users/me/bots", s.userAuth(s.handleBindOwnBot))
 		s.mux.HandleFunc("GET /v1/users/me/bots", s.userAuth(s.handleGetOwnBot))
 	}
-	if s.binding != nil {
-		s.mux.HandleFunc("POST /v1/bindings", s.userAuth(s.handleCreateBinding))
-		s.mux.HandleFunc("POST /v1/activate", s.auth(s.handleActivate))
-	}
 	if s.wechatBinding != nil {
 		s.mux.HandleFunc("POST /v1/users/me/wechat-qrcode", s.userAuth(s.handleCreateWechatQRCode))
 		s.mux.HandleFunc("GET /v1/users/me/wechat-qrcode/status", s.userAuth(s.handleGetWechatQRCodeStatus))
