@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Card } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
+import { Collapsible } from '../../components/ui/Collapsible';
 import { Trash2, Star } from 'lucide-react';
 import {
   listProviders,
@@ -195,18 +196,50 @@ export function LLMProvidersPage() {
               <h4 style={{ marginBottom: '12px', fontSize: '14px', fontWeight: 500 }}>高级配置（可选）</h4>
             </div>
 
-            <div>
-              <label className="input-label">Thinking Type</label>
-              <select
-                className="input-field"
-                value={form.config.thinking_type || 'adaptive'}
-                onChange={(e) => setForm({ ...form, config: { ...form.config, thinking_type: e.target.value as any } })}
-                style={{ width: '100%', padding: '8px 12px' }}
-              >
-                <option value="adaptive">Adaptive（自适应）</option>
-                <option value="enabled">Enabled（启用）</option>
-                <option value="disabled">Disabled（禁用）</option>
-              </select>
+            <div className="provider-form-full">
+              <Collapsible title="🧠 推理与思考" defaultOpen={false}>
+                <div>
+                  <label className="input-label">Thinking Type</label>
+                  <select
+                    className="input-field"
+                    value={form.config.thinking_type || 'adaptive'}
+                    onChange={(e) => setForm({ ...form, config: { ...form.config, thinking_type: e.target.value as any } })}
+                    style={{ width: '100%', padding: '8px 12px' }}
+                  >
+                    <option value="adaptive">Adaptive（自适应）</option>
+                    <option value="enabled">Enabled（启用）</option>
+                    <option value="disabled">Disabled（禁用）</option>
+                  </select>
+                </div>
+
+                {form.config.thinking_type === 'enabled' && (
+                  <Input
+                    label="Thinking Budget Tokens"
+                    type="number"
+                    placeholder="例如 10000"
+                    value={form.config.thinking_budget_tokens || ''}
+                    onChange={(e) => setForm({ ...form, config: { ...form.config, thinking_budget_tokens: e.target.value ? parseInt(e.target.value) : undefined } })}
+                  />
+                )}
+
+                <div>
+                  <label className="input-label">Reasoning Effort</label>
+                  <select
+                    className="input-field"
+                    value={form.config.reasoning_effort || ''}
+                    onChange={(e) => setForm({ ...form, config: { ...form.config, reasoning_effort: e.target.value as any || undefined } })}
+                    style={{ width: '100%', padding: '8px 12px' }}
+                  >
+                    <option value="">默认</option>
+                    <option value="none">None</option>
+                    <option value="minimal">Minimal</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="xhigh">XHigh</option>
+                  </select>
+                </div>
+              </Collapsible>
             </div>
 
             <Input
