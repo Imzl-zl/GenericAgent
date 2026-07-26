@@ -21,7 +21,9 @@ func (s *scheduler) issueAndWriteCredential(ctx context.Context, sessionKey stri
 	if err != nil {
 		return "", fmt.Errorf("resolve LLM provider: %w", err)
 	}
-	token, claims, err := s.cfg.TokenIssuer.Issue(sessionKey, s.cfg.ModelPolicyVersion, string(provider.ProviderType), provider.Model)
+	// Map database provider_type to Worker-expected type for JWT token
+	workerProviderType := providerTypeForWorker(provider.ProviderType)
+	token, claims, err := s.cfg.TokenIssuer.Issue(sessionKey, s.cfg.ModelPolicyVersion, workerProviderType, provider.Model)
 	if err != nil {
 		return "", fmt.Errorf("issue capability_token: %w", err)
 	}
@@ -78,6 +80,20 @@ func buildMyKeyContent(proxyAddr, token string, provider domain.LLMProvider) str
 				"}\n",
 			token, base+"/v1", provider.Model,
 		)
+	}
+}
+
+// providerTypeForWorker maps database provider_type to Worker-expected type.
+// Database uses native_oai/native_claude, but Worker expects openai_compatible/anthropic_messages.
+func providerTypeForWorker(dbType domain.LLMProviderType) string {
+	switch dbType {
+	case domain.ProviderNativeOAI:
+		return "openai_compatible"
+	case domain.ProviderNativeClaude:
+		return "anthropic_messages"
+	default:
+		// Fallback: use database type as-is (for legacy types)
+		return string(dbType)
 	}
 }
 

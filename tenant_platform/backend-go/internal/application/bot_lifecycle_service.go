@@ -200,7 +200,11 @@ func (s *botLifecycleService) HandleAuthExpired(ctx context.Context, botUUID str
 	if err := s.store.UpdateBotState(ctx, botUUID, domain.BotExpired); err != nil {
 		return fmt.Errorf("mark bot expired: %w", err)
 	}
-	return s.store.UpsertBotTransportState(ctx, bot.ID, nil, 0, "error", "AUTH_EXPIRED")
+	// Pass keyVersion=1 (the default) instead of 0 to avoid violating the NOT NULL
+	// constraint when this is the first transport_state insert for this bot.
+	// cursorCiphertext=nil means "keep existing cursor", which works for both
+	// INSERT (no cursor yet) and UPDATE (preserve last known cursor).
+	return s.store.UpsertBotTransportState(ctx, bot.ID, nil, 1, "error", "AUTH_EXPIRED")
 }
 
 // persistCursor encrypts the plaintext cursor and upserts the transport state.
@@ -208,7 +212,10 @@ func (s *botLifecycleService) HandleAuthExpired(ctx context.Context, botUUID str
 // future key rotation can still decrypt old cursors.
 func (s *botLifecycleService) persistCursor(ctx context.Context, botID int64, plaintextBuf, reconnectState, errorCode string) error {
 	if plaintextBuf == "" {
-		return s.store.UpsertBotTransportState(ctx, botID, nil, 0, reconnectState, errorCode)
+		// No cursor to persist; just update reconnect_state/error fields.
+		// Pass keyVersion=1 (the default) instead of 0 to avoid violating NOT NULL
+		// constraint on first insert. cursorCiphertext=nil means "keep existing".
+		return s.store.UpsertBotTransportState(ctx, botID, nil, 1, reconnectState, errorCode)
 	}
 	ct, version, err := s.cipher.Encrypt([]byte(plaintextBuf))
 	if err != nil {

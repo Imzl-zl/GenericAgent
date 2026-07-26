@@ -38,6 +38,8 @@ RETURNING id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ci
 }
 
 // CreateBotFromQRSession creates a fully-bound bot from a confirmed WechatQRSession.
+// If a bot already exists for this owner_id, it updates the existing bot with new credentials.
+// This allows users to re-bind by scanning a new QR code without manual cleanup.
 func (s *Store) CreateBotFromQRSession(ctx context.Context, sess domain.WechatQRSession, tokenKeyVersion int) (domain.Bot, error) {
 	if sess.ID == "" {
 		return domain.Bot{}, fmt.Errorf("session is required")
@@ -50,6 +52,16 @@ func (s *Store) CreateBotFromQRSession(ctx context.Context, sess domain.WechatQR
 		return scanBot(tx.QueryRow(ctx, `
 INSERT INTO bots (bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state)
 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, 'active')
+ON CONFLICT (owner_id)
+DO UPDATE SET
+  bot_uuid = EXCLUDED.bot_uuid,
+  ilink_bot_id = EXCLUDED.ilink_bot_id,
+  ilink_user_id = EXCLUDED.ilink_user_id,
+  baseurl = EXCLUDED.baseurl,
+  token_ciphertext = EXCLUDED.token_ciphertext,
+  token_key_version = EXCLUDED.token_key_version,
+  state = 'active',
+  updated_at = timezone('utc', now())
 RETURNING id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
 `, uuid.New().String(), sess.ILINKBotID, sess.UserID, sess.ILINKUserID, nullString(sess.BaseURL), sess.BotTokenCiphertext, tokenKeyVersion), &b)
 	})

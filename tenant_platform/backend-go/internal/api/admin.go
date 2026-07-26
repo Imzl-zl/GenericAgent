@@ -3,6 +3,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -78,6 +79,45 @@ func (s *Server) registerLifecycleRoutes() {
 		// Worker 拉取 mykey.py 配置（使用 Worker 的认证机制）
 		s.mux.HandleFunc("GET /v1/config/mykey.py", s.auth(s.handleGetMykeyConfig))
 	}
+	// Dashboard statistics endpoint
+	s.mux.HandleFunc("GET /v1/admin/dashboard/stats", s.auth(s.handleAdminDashboardStats))
+}
+
+// TaskStoreStats is a minimal interface for fetching dashboard statistics.
+type TaskStoreStats interface {
+	CountRunningTasks(ctx context.Context) (int, error)
+}
+
+type dashboardStatsResponse struct {
+	PendingUsers  int `json:"pending_users"`
+	ApprovedUsers int `json:"approved_users"`
+	RunningTasks  int `json:"running_tasks"`
+	ActiveWorkers int `json:"active_workers"`
+}
+
+func (s *Server) handleAdminDashboardStats(w http.ResponseWriter, r *http.Request) {
+	stats := dashboardStatsResponse{}
+
+	// 查询待审批用户数
+	if s.users != nil {
+		if pending, err := s.users.CountPendingUsers(r.Context()); err == nil {
+			stats.PendingUsers = pending
+		}
+		if approved, err := s.users.CountApprovedUsers(r.Context()); err == nil {
+			stats.ApprovedUsers = approved
+		}
+	}
+
+	// 查询运行中任务数
+	// TODO: 需要通过 TaskStoreStats 接口访问，或者让 TaskService 暴露此方法
+	// 当前暂时返回 0
+	stats.RunningTasks = 0
+
+	// TODO: 活跃 Worker 数统计（需要实现 Worker 心跳机制）
+	// 目前暂时返回 0
+	stats.ActiveWorkers = 0
+
+	writeJSON(w, http.StatusOK, stats)
 }
 
 type createUserBody struct {

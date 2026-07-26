@@ -18,6 +18,8 @@ type UserStore interface {
 	ListPendingUsers(ctx context.Context) ([]domain.User, error)
 	GetUserStatus(ctx context.Context, userID int64) (domain.UserStatus, error)
 	GetUserByID(ctx context.Context, userID int64) (int64, string, domain.UserStatus, error)
+	CountPendingUsers(ctx context.Context) (int, error)
+	CountApprovedUsers(ctx context.Context) (int, error)
 }
 
 // UserServiceConfig wires the user store and optional worker-cancel callback.
@@ -32,6 +34,8 @@ type UserService interface {
 	ApproveUser(ctx context.Context, userID int64) (domain.User, error)
 	BlockUser(ctx context.Context, userID int64) (domain.User, error)
 	ListPendingUsers(ctx context.Context) ([]domain.User, error)
+	CountPendingUsers(ctx context.Context) (int, error)
+	CountApprovedUsers(ctx context.Context) (int, error)
 }
 
 type userService struct {
@@ -94,6 +98,14 @@ func (s *userService) BlockUser(ctx context.Context, userID int64) (domain.User,
 
 func (s *userService) ListPendingUsers(ctx context.Context) ([]domain.User, error) {
 	return s.store.ListPendingUsers(ctx)
+}
+
+func (s *userService) CountPendingUsers(ctx context.Context) (int, error) {
+	return s.store.CountPendingUsers(ctx)
+}
+
+func (s *userService) CountApprovedUsers(ctx context.Context) (int, error) {
+	return s.store.CountApprovedUsers(ctx)
 }
 
 // MaxUsernameLen is the application-enforced username byte limit.

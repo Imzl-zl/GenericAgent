@@ -175,6 +175,20 @@ FROM users WHERE status = 'pending' ORDER BY created_at
 	return users, rows.Err()
 }
 
+// CountPendingUsers returns the count of users with status 'pending'.
+func (s *Store) CountPendingUsers(ctx context.Context) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE status = 'pending'`).Scan(&count)
+	return count, err
+}
+
+// CountApprovedUsers returns the count of users with status 'approved'.
+func (s *Store) CountApprovedUsers(ctx context.Context) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE status = 'approved'`).Scan(&count)
+	return count, err
+}
+
 func scanUser(row pgx.Row, u *domain.User) error {
 	return row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Status, &u.BootstrapMarker, &u.CreatedAt, &u.ApprovedAt)
 }

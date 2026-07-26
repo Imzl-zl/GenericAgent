@@ -50,10 +50,13 @@ func GenerateMykeyPy(providers []domain.LLMProvider, cipher Cipher) (string, err
 		varName := fmt.Sprintf("native_%s_config_%d",
 			strings.ReplaceAll(string(p.ProviderType), "native_", ""), i)
 
+		// 将 native_* 类型映射回 GA Core 期望的类型
+		workerType := mapProviderTypeForWorker(p.ProviderType)
+
 		sb.WriteString(fmt.Sprintf("# Provider: %s (Type: %s)\n", p.Name, p.ProviderType))
 		sb.WriteString(fmt.Sprintf("%s = {\n", varName))
 		sb.WriteString(fmt.Sprintf("    'name': '%s',\n", p.Name))
-		sb.WriteString(fmt.Sprintf("    'type': '%s',\n", p.ProviderType))
+		sb.WriteString(fmt.Sprintf("    'type': '%s',\n", workerType))
 		sb.WriteString(fmt.Sprintf("    'apikey': '%s',\n", string(apiKey)))
 		sb.WriteString(fmt.Sprintf("    'apibase': '%s',\n", p.BaseURL))
 		sb.WriteString(fmt.Sprintf("    'model': '%s',\n", p.Model))
@@ -136,4 +139,17 @@ func GenerateMykeyPy(providers []domain.LLMProvider, cipher Cipher) (string, err
 	}
 
 	return sb.String(), nil
+}
+
+// mapProviderTypeForWorker 将数据库中的 native_* 类型映射回 GA Core Worker 期望的类型
+func mapProviderTypeForWorker(dbType domain.LLMProviderType) string {
+	switch dbType {
+	case domain.ProviderNativeOAI:
+		return "openai_compatible"
+	case domain.ProviderNativeClaude:
+		return "anthropic_messages"
+	default:
+		// 如果已经是旧类型，直接返回
+		return string(dbType)
+	}
 }

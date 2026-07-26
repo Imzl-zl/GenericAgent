@@ -1,7 +1,31 @@
+import { useEffect, useState } from 'react';
 import { Card } from '../../components/ui/Card';
+import { getDashboardStats } from '../../api/stats';
+import type { DashboardStats } from '../../api/stats';
 import './AdminPages.css';
 
 export function AdminDashboardPage() {
+  const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const loadStats = async () => {
+      setIsLoading(true);
+      setError('');
+      try {
+        const data = await getDashboardStats();
+        setStats(data);
+      } catch (err) {
+        setError('加载统计数据失败');
+        console.error('加载统计数据失败', err);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    loadStats();
+  }, []);
+
   return (
     <div className="admin-page">
       <header className="admin-header animate-fade-in-up">
@@ -11,22 +35,36 @@ export function AdminDashboardPage() {
         </div>
       </header>
 
+      {error && (
+        <div style={{ color: 'var(--color-error)', marginBottom: '16px' }}>
+          {error}
+        </div>
+      )}
+
       <div className="admin-grid admin-grid-4">
         <Card className="animate-fade-in-up animate-delay-1">
           <p className="admin-metric-label">待审批用户</p>
-          <p className="admin-metric-value">3</p>
+          <p className="admin-metric-value">
+            {isLoading ? '...' : stats?.pending_users ?? 0}
+          </p>
         </Card>
         <Card className="animate-fade-in-up animate-delay-2">
           <p className="admin-metric-label">已批准用户</p>
-          <p className="admin-metric-value accent">12</p>
+          <p className="admin-metric-value accent">
+            {isLoading ? '...' : stats?.approved_users ?? 0}
+          </p>
         </Card>
         <Card className="animate-fade-in-up animate-delay-3">
           <p className="admin-metric-label">运行中任务</p>
-          <p className="admin-metric-value cyan">2</p>
+          <p className="admin-metric-value cyan">
+            {isLoading ? '...' : stats?.running_tasks ?? 0}
+          </p>
         </Card>
         <Card className="animate-fade-in-up animate-delay-4">
           <p className="admin-metric-label">活跃 Worker</p>
-          <p className="admin-metric-value">4</p>
+          <p className="admin-metric-value">
+            {isLoading ? '...' : stats?.active_workers ?? 0}
+          </p>
         </Card>
       </div>
 
