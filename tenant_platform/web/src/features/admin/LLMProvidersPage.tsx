@@ -10,17 +10,46 @@ import {
   setDefaultProvider,
 } from '../../api/providers';
 import { ApiClientError } from '../../api/client';
-import type { LLMProvider } from '../../api/types';
+import type { LLMProvider, LLMProviderConfig } from '../../api/types';
 import './AdminPages.css';
 
 export function LLMProvidersPage() {
   const [providers, setProviders] = useState<LLMProvider[]>([]);
   const [form, setForm] = useState({
     name: '',
-    provider_type: 'openai',
+    provider_type: 'native_oai' as 'native_oai' | 'native_claude',
     base_url: '',
     model: '',
     api_key: '',
+    config: {
+      // ── 推理 / 思考 ──
+      thinking_type: 'adaptive' as 'adaptive' | 'enabled' | 'disabled' | undefined,
+      thinking_budget_tokens: undefined as number | undefined,
+      reasoning_effort: undefined as 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | undefined,
+
+      // ── 采样 ──
+      max_tokens: undefined as number | undefined,
+      temperature: undefined as number | undefined,
+      top_p: undefined as number | undefined,
+
+      // ── 容量 / 超时 ──
+      context_win: undefined as number | undefined,
+      max_retries: undefined as number | undefined,
+      connect_timeout: undefined as number | undefined,
+      read_timeout: undefined as number | undefined,
+      timeout: undefined as number | undefined,
+
+      // ── 传输 ──
+      stream: true as boolean | undefined,
+      api_mode: undefined as 'chat_completions' | 'responses' | undefined,
+
+      // ── Claude 专属 ──
+      fake_cc_system_prompt: undefined as boolean | undefined,
+      user_agent: undefined as string | undefined,
+
+      // ── 网络 ──
+      proxy: undefined as string | undefined,
+    } as LLMProviderConfig,
   });
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
@@ -47,7 +76,42 @@ export function LLMProvidersPage() {
     setError('');
     try {
       await createProvider(form);
-      setForm({ name: '', provider_type: 'openai', base_url: '', model: '', api_key: '' });
+      setForm({
+        name: '',
+        provider_type: 'native_oai',
+        base_url: '',
+        model: '',
+        api_key: '',
+        config: {
+          // ── 推理 / 思考 ──
+          thinking_type: 'adaptive',
+          thinking_budget_tokens: undefined,
+          reasoning_effort: undefined,
+
+          // ── 采样 ──
+          max_tokens: undefined,
+          temperature: undefined,
+          top_p: undefined,
+
+          // ── 容量 / 超时 ──
+          context_win: undefined,
+          max_retries: undefined,
+          connect_timeout: undefined,
+          read_timeout: undefined,
+          timeout: undefined,
+
+          // ── 传输 ──
+          stream: true,
+          api_mode: undefined,
+
+          // ── Claude 专属 ──
+          fake_cc_system_prompt: undefined,
+          user_agent: undefined,
+
+          // ── 网络 ──
+          proxy: undefined,
+        },
+      });
       await loadProviders();
     } catch (err) {
       setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '保存失败');
@@ -92,12 +156,18 @@ export function LLMProvidersPage() {
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
             />
-            <Input
-              label="类型"
-              placeholder="openai | anthropic"
-              value={form.provider_type}
-              onChange={(e) => setForm({ ...form, provider_type: e.target.value })}
-            />
+            <div>
+              <label className="input-label">类型</label>
+              <select
+                className="input-field"
+                value={form.provider_type}
+                onChange={(e) => setForm({ ...form, provider_type: e.target.value as 'native_oai' | 'native_claude' })}
+                style={{ width: '100%', padding: '8px 12px' }}
+              >
+                <option value="native_oai">OpenAI (native_oai)</option>
+                <option value="native_claude">Anthropic Claude (native_claude)</option>
+              </select>
+            </div>
             <Input
               label="Base URL"
               placeholder="https://api.openai.com/v1"
@@ -119,6 +189,67 @@ export function LLMProvidersPage() {
                 onChange={(e) => setForm({ ...form, api_key: e.target.value })}
               />
             </div>
+
+            {/* GA Core 配置项 */}
+            <div className="provider-form-full" style={{ borderTop: '1px solid var(--border)', paddingTop: '16px', marginTop: '8px' }}>
+              <h4 style={{ marginBottom: '12px', fontSize: '14px', fontWeight: 500 }}>高级配置（可选）</h4>
+            </div>
+
+            <div>
+              <label className="input-label">Thinking Type</label>
+              <select
+                className="input-field"
+                value={form.config.thinking_type || 'adaptive'}
+                onChange={(e) => setForm({ ...form, config: { ...form.config, thinking_type: e.target.value as any } })}
+                style={{ width: '100%', padding: '8px 12px' }}
+              >
+                <option value="adaptive">Adaptive（自适应）</option>
+                <option value="enabled">Enabled（启用）</option>
+                <option value="disabled">Disabled（禁用）</option>
+              </select>
+            </div>
+
+            <Input
+              label="Max Tokens"
+              type="number"
+              placeholder="例如 8192"
+              value={form.config.max_tokens || ''}
+              onChange={(e) => setForm({ ...form, config: { ...form.config, max_tokens: e.target.value ? parseInt(e.target.value) : undefined } })}
+            />
+
+            <Input
+              label="Temperature"
+              type="number"
+              step="0.01"
+              placeholder="0.0 - 2.0"
+              value={form.config.temperature || ''}
+              onChange={(e) => setForm({ ...form, config: { ...form.config, temperature: e.target.value ? parseFloat(e.target.value) : undefined } })}
+            />
+
+            <Input
+              label="Top P"
+              type="number"
+              step="0.01"
+              placeholder="0.0 - 1.0"
+              value={form.config.top_p || ''}
+              onChange={(e) => setForm({ ...form, config: { ...form.config, top_p: e.target.value ? parseFloat(e.target.value) : undefined } })}
+            />
+
+            <Input
+              label="Max Retries"
+              type="number"
+              placeholder="例如 3"
+              value={form.config.max_retries || ''}
+              onChange={(e) => setForm({ ...form, config: { ...form.config, max_retries: e.target.value ? parseInt(e.target.value) : undefined } })}
+            />
+
+            <Input
+              label="Timeout (秒)"
+              type="number"
+              placeholder="例如 60"
+              value={form.config.timeout || ''}
+              onChange={(e) => setForm({ ...form, config: { ...form.config, timeout: e.target.value ? parseInt(e.target.value) : undefined } })}
+            />
             <div className="provider-form-full provider-actions">
               <Button type="submit">保存</Button>
             </div>
