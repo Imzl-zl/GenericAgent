@@ -12,7 +12,15 @@ import (
 )
 
 // defaultUpstreamTimeout bounds a single upstream forward call.
-const defaultUpstreamTimeout = 60 * time.Second
+//
+// Must exceed the Worker's GA Core read_timeout (configured to 120s in
+// worker_credential.go buildMyKeyContent). Proxy timeout < GA Core timeout
+// causes the Proxy to cancel the request while GA Core is still waiting,
+// wasting upstream LLM quota (the request already reached the provider).
+// Industry standard (Nginx proxy_read_timeout, Envoy timeout): proxy layer
+// timeout > backend timeout. 150s = 120s GA Core read_timeout + 30s buffer
+// for connection/TLS overhead.
+const defaultUpstreamTimeout = 150 * time.Second
 
 // Server is the LLM Proxy HTTP server. It validates capability_tokens,
 // fetches the active provider from the platform store, decrypts the real key,
@@ -33,7 +41,11 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	u := NewUpstream(&http.Client{Timeout: defaultUpstreamTimeout})
+	// http.Client.Timeout is intentionally NOT set: the handler-level ctx
+	// (context.WithTimeout(defaultUpstreamTimeout)) is the single source of
+	// truth for request lifetime. A redundant client-level timeout would race
+	// with ctx and could fire first, obscuring the real cancellation reason.
+	u := NewUpstream(&http.Client{})
 	return &Server{cfg: cfg, validator: v, upstream: u}, nil
 }
 

@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/checkpoint"
-	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/workerclient"
+	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/workerclient"
 )
 
 func TestSchedulerConfigValidation(t *testing.T) {
@@ -27,16 +27,16 @@ func TestSchedulerConfigValidation(t *testing.T) {
 }
 
 type controlledWorker struct {
-	events         chan workerclient.WorkerEvent
-	errs           chan error
-	executeStarted chan struct{}
-	streamDone     chan struct{}
-	cancelObserved chan bool
-	cancelCalls    atomic.Int32
-	closeOnce      sync.Once
-	checkpointReady *workerv1.CheckpointReady
-	startSessionEntered chan struct{}
-	releaseStartSession chan struct{}
+	events                 chan workerclient.WorkerEvent
+	errs                   chan error
+	executeStarted         chan struct{}
+	streamDone             chan struct{}
+	cancelObserved         chan bool
+	cancelCalls            atomic.Int32
+	closeOnce              sync.Once
+	checkpointReady        *workerv1.CheckpointReady
+	startSessionEntered    chan struct{}
+	releaseStartSession    chan struct{}
 	beginCheckpointEntered chan struct{}
 	releaseBeginCheckpoint chan struct{}
 	beginCheckpointErr     error
@@ -110,7 +110,7 @@ func (w *controlledWorker) Shutdown(context.Context, string) error { return nil 
 
 func (w *controlledWorker) succeed() {
 	w.events <- workerclient.WorkerEvent{
-		Kind: workerclient.KindTerminal,
+		Kind:     workerclient.KindTerminal,
 		Terminal: &workerv1.Terminal{Status: workerv1.TerminalStatus_TASK_SUCCEEDED},
 	}
 	w.closeOnce.Do(func() {
@@ -121,7 +121,7 @@ func (w *controlledWorker) succeed() {
 }
 func (w *controlledWorker) interrupt() {
 	w.events <- workerclient.WorkerEvent{
-		Kind: workerclient.KindTerminal,
+		Kind:     workerclient.KindTerminal,
 		Terminal: &workerv1.Terminal{Status: workerv1.TerminalStatus_TASK_INTERRUPTED},
 	}
 	w.closeOnce.Do(func() {
@@ -164,7 +164,6 @@ func (c *successfulCoordinator) ReadResult(context.Context, string, string) (dom
 	return domain.ResultPayload{Ref: "result:success", Digest: "sha256:result", Body: []byte("result")}, nil
 }
 
-
 type readFailCoordinator struct {
 	store *postgres.Store
 	owner string
@@ -189,7 +188,6 @@ func (c *readFailCoordinator) Commit(context.Context, checkpoint.ReadyCheckpoint
 func (c *readFailCoordinator) ReadResult(context.Context, string, string) (domain.ResultPayload, error) {
 	return domain.ResultPayload{}, errors.New("digest-checked result read failed")
 }
-
 
 func TestScheduler_AcceptedRunningCancelReachesWorkerBeforeStreamCompletionAndWinsSuccessRace(t *testing.T) {
 	_, store, reg, dev := serviceFixture(t)
@@ -573,7 +571,9 @@ func TestScheduler_HeartbeatsWhileStartSessionIsBlocked(t *testing.T) {
 	worker.releaseStartSession = make(chan struct{})
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "blocked-start-owner", ClaimLease: lease, Store: store, Registry: reg,
-		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+			return worker, func() {}, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -644,7 +644,9 @@ func TestScheduler_HeartbeatsThroughBlockedCheckpointCommit(t *testing.T) {
 	coord := &successfulCoordinator{store: store, owner: "checkpoint-owner"}
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "checkpoint-owner", ClaimLease: lease, Store: store, Registry: reg, Coordinator: coord,
-		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+			return worker, func() {}, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -712,7 +714,9 @@ func TestScheduler_HeartbeatLossDuringCheckpointCannotPublishSuccess(t *testing.
 	coord := &successfulCoordinator{store: store, owner: "checkpoint-loss-owner"}
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "checkpoint-loss-owner", ClaimLease: lease, Store: store, Registry: reg, Coordinator: coord,
-		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+			return worker, func() {}, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -770,7 +774,9 @@ func TestScheduler_CancelRacingStreamErrorCommitsInterrupted(t *testing.T) {
 	worker := newControlledWorker()
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "cancel-stream-owner", ClaimLease: time.Second, Store: store, Registry: reg,
-		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+			return worker, func() {}, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -833,7 +839,9 @@ func TestScheduler_CancelRacingCheckpointErrorCommitsInterrupted(t *testing.T) {
 	schedulerAPI, err := NewScheduler(SchedulerConfig{
 		PlatformInstanceID: "cancel-checkpoint-owner", ClaimLease: time.Second,
 		Store: store, Registry: reg, Coordinator: coord,
-		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) { return worker, func() {}, nil },
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+			return worker, func() {}, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -870,6 +878,88 @@ func TestScheduler_CancelRacingCheckpointErrorCommitsInterrupted(t *testing.T) {
 	}
 	if _, err := store.GetDelivery(ctx, task.ID, domain.DeliveryTaskFailed); err == nil {
 		t.Fatal("unexpected task_failed delivery")
+	}
+}
+
+func TestShouldReapIdleTask(t *testing.T) {
+	now := time.Now().UTC()
+	cutoff := now.Add(-5 * time.Minute)
+	dispatchRecent := now.Add(-1 * time.Minute)
+	dispatchStale := now.Add(-10 * time.Minute)
+	activityRecent := now.Add(-1 * time.Minute)
+	activityStale := now.Add(-10 * time.Minute)
+
+	tests := []struct {
+		name string
+		task domain.Task
+		want bool
+	}{
+		{
+			name: "non-running task never reaped",
+			task: domain.Task{Status: domain.TaskQueued, LastActivityAt: activityStale},
+			want: false,
+		},
+		{
+			name: "active task with recent activity not reaped",
+			task: domain.Task{Status: domain.TaskRunning, LastActivityAt: activityRecent},
+			want: false,
+		},
+		{
+			name: "running task with stale activity reaped",
+			task: domain.Task{Status: domain.TaskRunning, LastActivityAt: activityStale},
+			want: true,
+		},
+		{
+			name: "cold-start with nil dispatch not reaped",
+			task: domain.Task{Status: domain.TaskRunning, LastActivityAt: time.Time{}},
+			want: false,
+		},
+		{
+			name: "cold-start with recent dispatch not reaped (grace period)",
+			task: domain.Task{
+				Status:                  domain.TaskRunning,
+				LastActivityAt:          time.Time{},
+				WorkerDispatchStartedAt: &dispatchRecent,
+			},
+			want: false,
+		},
+		{
+			name: "cold-start with stale dispatch reaped (Worker stuck before first chunk)",
+			task: domain.Task{
+				Status:                  domain.TaskRunning,
+				LastActivityAt:          time.Time{},
+				WorkerDispatchStartedAt: &dispatchStale,
+			},
+			want: true,
+		},
+		{
+			name: "exactly at cutoff boundary is reaped (After is exclusive)",
+			task: domain.Task{Status: domain.TaskRunning, LastActivityAt: cutoff},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldReapIdleTask(tt.task, cutoff); got != tt.want {
+				t.Fatalf("shouldReapIdleTask = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatActivityTime(t *testing.T) {
+	ts := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	dispatch := time.Date(2026, 7, 26, 11, 55, 0, 0, time.UTC)
+
+	if got := formatActivityTime(ts, &dispatch); got != "2026-07-26T12:00:00Z" {
+		t.Fatalf("non-zero activity: got %q", got)
+	}
+	if got := formatActivityTime(time.Time{}, &dispatch); got != "dispatch:2026-07-26T11:55:00Z" {
+		t.Fatalf("zero activity with dispatch: got %q", got)
+	}
+	if got := formatActivityTime(time.Time{}, nil); got != "unknown" {
+		t.Fatalf("zero activity without dispatch: got %q", got)
 	}
 }
 
