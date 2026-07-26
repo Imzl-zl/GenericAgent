@@ -242,31 +242,35 @@ export function LLMProvidersPage() {
               </Collapsible>
             </div>
 
-            <Input
-              label="Max Tokens"
-              type="number"
-              placeholder="例如 8192"
-              value={form.config.max_tokens || ''}
-              onChange={(e) => setForm({ ...form, config: { ...form.config, max_tokens: e.target.value ? parseInt(e.target.value) : undefined } })}
-            />
+            <div className="provider-form-full">
+              <Collapsible title="🎛️ 采样参数" defaultOpen={false}>
+                <Input
+                  label="Temperature"
+                  type="number"
+                  step="0.01"
+                  placeholder="0.0 - 2.0"
+                  value={form.config.temperature || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, temperature: e.target.value ? parseFloat(e.target.value) : undefined } })}
+                />
 
-            <Input
-              label="Temperature"
-              type="number"
-              step="0.01"
-              placeholder="0.0 - 2.0"
-              value={form.config.temperature || ''}
-              onChange={(e) => setForm({ ...form, config: { ...form.config, temperature: e.target.value ? parseFloat(e.target.value) : undefined } })}
-            />
+                <Input
+                  label="Max Tokens"
+                  type="number"
+                  placeholder="例如 8192"
+                  value={form.config.max_tokens || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, max_tokens: e.target.value ? parseInt(e.target.value) : undefined } })}
+                />
 
-            <Input
-              label="Top P"
-              type="number"
-              step="0.01"
-              placeholder="0.0 - 1.0"
-              value={form.config.top_p || ''}
-              onChange={(e) => setForm({ ...form, config: { ...form.config, top_p: e.target.value ? parseFloat(e.target.value) : undefined } })}
-            />
+                <Input
+                  label="Top P"
+                  type="number"
+                  step="0.01"
+                  placeholder="0.0 - 1.0"
+                  value={form.config.top_p || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, top_p: e.target.value ? parseFloat(e.target.value) : undefined } })}
+                />
+              </Collapsible>
+            </div>
 
             <Input
               label="Max Retries"
