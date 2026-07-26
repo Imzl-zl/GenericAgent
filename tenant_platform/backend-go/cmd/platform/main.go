@@ -119,7 +119,7 @@ func ensureDevDefaultLLMProvider(ctx context.Context, store *postgres.Store, cip
 		return fmt.Errorf("encrypt dev provider api key: %w", encErr)
 	}
 	if _, createErr := store.CreateProvider(ctx, "dev-default",
-		domain.ProviderOpenAICompatible, baseURL, "gpt-4o", ciphertext, strconv.Itoa(version)); createErr != nil {
+		domain.ProviderOpenAICompatible, baseURL, "gpt-4o", ciphertext, strconv.Itoa(version), domain.LLMProviderConfig{}); createErr != nil {
 		return fmt.Errorf("create dev default provider: %w", createErr)
 	}
 	fmt.Fprintf(os.Stderr, "platform: dev-loopback seeded default llm_provider base_url=%s\n", baseURL)
