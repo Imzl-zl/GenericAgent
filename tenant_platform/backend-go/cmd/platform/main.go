@@ -626,6 +626,20 @@ func run() error {
 		botTransport = transport.NewLoopbackTransport()
 	}
 
+	teamSvc, err := application.NewTeamService(store)
+	if err != nil {
+		return fmt.Errorf("team service: %w", err)
+	}
+
+	relaySvc, err := application.NewRelayService(application.RelayServiceConfig{
+		Store:     store,
+		Transport: botTransport,
+		Messages:  store, // reuses messages table (migration 0013) for outbound audit
+	})
+	if err != nil {
+		return fmt.Errorf("relay service: %w", err)
+	}
+
 	routerSvc, err := application.NewRouter(application.RouterConfig{
 		Store:          store,
 		Binding:        bindingSvc,
@@ -635,6 +649,8 @@ func run() error {
 		Messages:       store, // messages table (migration 0013)
 		ToolPolicy:     strings.TrimSpace(*modelPolicyVersion),
 		SourceInstance: instanceID,
+		Teams:          teamSvc, // P1 team lifecycle (migration 0016)
+		Relay:          relaySvc, // P1 @username relay (migration 0017)
 	})
 	if err != nil {
 		return err

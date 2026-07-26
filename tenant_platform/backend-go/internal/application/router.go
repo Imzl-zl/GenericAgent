@@ -29,6 +29,10 @@ const (
 	ActionHelp        RouterAction = "help"
 	ActionStatus      RouterAction = "status"
 	ActionModelInfo   RouterAction = "model_info"
+	// ActionReplied covers team/context commands whose outcome is a user-facing
+	// reply (identity, switch, invite submit, member approve/reject/remove).
+	// Keeping a single action avoids action-type sprawl for one-shot commands.
+	ActionReplied RouterAction = "replied"
 )
 
 // RouterResult is the outcome of processing an incoming message.
@@ -100,6 +104,12 @@ type RouterConfig struct {
 	Messages       MessageStore
 	ToolPolicy     string
 	SourceInstance string
+	// Teams is the team lifecycle service. Optional in P0; when nil, team
+	// commands reply with "功能未启用" and messages always route to personal.
+	Teams TeamService
+	// Relay is the @username forwarding service. Optional; when nil,
+	// @-mentions fall through to normal task routing.
+	Relay RelayService
 }
 
 // Router processes incoming bot messages: identity resolution, status check,
@@ -119,6 +129,8 @@ type router struct {
 	transport      transport.BotTransportAdapter
 	commands       CommandRegistry
 	messages       MessageStore
+	teams          TeamService
+	relay          RelayService
 	toolPolicy     string
 	sourceInstance string
 	// Trigger-invalidated cache for command registry. Admin update handlers
@@ -149,6 +161,8 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 		transport:      cfg.Transport,
 		commands:       cfg.Commands,
 		messages:       cfg.Messages,
+		teams:          cfg.Teams,
+		relay:          cfg.Relay,
 		toolPolicy:     cfg.ToolPolicy,
 		sourceInstance: cfg.SourceInstance,
 	}, nil
@@ -245,6 +259,13 @@ func (r *router) handleUnboundMessage(ctx context.Context, msg IncomingMessage, 
 // (migration 0004). If CommandRegistry is nil (tests), falls back to defaults.
 func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
 	text := strings.TrimSpace(msg.Text)
+	// Relay intercept: "@<username> <body>" is forwarded directly to the
+	// named user's WeChat, bypassing the LLM/Worker. Checked before command
+	// resolution so @-mentions never collide with slash commands. When the
+	// RelayService is nil, handleRelay falls through to handleNormalMessage.
+	if strings.HasPrefix(text, relayAtPrefix) {
+		return r.handleRelay(ctx, msg, bot, text)
+	}
 	cmd, found := r.resolveCommand(ctx, text)
 	if !found || cmd.Action == domain.CommandPassthrough {
 		return r.handleNormalMessage(ctx, msg, bot, text)
@@ -267,6 +288,26 @@ func (r *router) dispatchHandler(ctx context.Context, msg IncomingMessage, bot d
 		return r.handleHelp(ctx, msg, bot)
 	case "llm":
 		return r.handleLLM(ctx, msg, bot)
+	case "identity":
+		return r.handleIdentity(ctx, msg, bot)
+	case "personal":
+		return r.handlePersonal(ctx, msg, bot)
+	case "team":
+		return r.handleTeam(ctx, msg, bot, text)
+	case "invite_code":
+		return r.handleInviteCode(ctx, msg, bot, text)
+	case "accept":
+		return r.handleAcceptInvite(ctx, msg, bot, text)
+	case "approve":
+		return r.handleApprove(ctx, msg, bot, text)
+	case "reject":
+		return r.handleReject(ctx, msg, bot, text)
+	case "remove":
+		return r.handleRemove(ctx, msg, bot, text)
+	case "relay_off":
+		return r.handleRelayOff(ctx, msg, bot)
+	case "relay_on":
+		return r.handleRelayOn(ctx, msg, bot)
 	default:
 		// Unknown handler key in DB → treat as passthrough (safe default).
 		return r.handleNormalMessage(ctx, msg, bot, text)
@@ -274,13 +315,20 @@ func (r *router) dispatchHandler(ctx context.Context, msg IncomingMessage, bot d
 }
 
 // resolveCommand checks if text matches an enabled command in the registry.
-// Returns the command entry and whether it was found. Uses a TTL cache to
-// avoid hitting the DB on every message; admin changes take effect within
-// commandCacheTTL (60s). When CommandRegistry is nil, uses built-in defaults.
+// Exact match is tried first; if that fails, a prefix match on the first
+// token is attempted so that "/团队 项目组" resolves to the "/团队" command.
+// Returns the command entry and whether it was found.
 func (r *router) resolveCommand(ctx context.Context, text string) (domain.PlatformCommand, bool) {
 	commands := r.loadCommands(ctx)
-	cmd, ok := commands[text]
-	return cmd, ok
+	if cmd, ok := commands[text]; ok {
+		return cmd, true
+	}
+	if idx := strings.IndexByte(text, ' '); idx > 0 {
+		if cmd, ok := commands[text[:idx]]; ok {
+			return cmd, true
+		}
+	}
+	return domain.PlatformCommand{}, false
 }
 
 // InvalidateCommandCache clears the command registry cache. Called by admin
@@ -323,7 +371,7 @@ func (r *router) loadCommands(ctx context.Context) map[string]domain.PlatformCom
 }
 
 // defaultCommands is the built-in fallback when no CommandRegistry is wired
-// (e.g. unit tests). Matches the seed data in migration 0004.
+// (e.g. unit tests). Matches the seed data in migrations 0004 + 0016.
 func defaultCommands() map[string]domain.PlatformCommand {
 	defaults := []domain.PlatformCommand{
 		{Command: "/help", Action: domain.CommandIntercept, Handler: "help"},
@@ -331,6 +379,16 @@ func defaultCommands() map[string]domain.PlatformCommand {
 		{Command: "/stop", Action: domain.CommandIntercept, Handler: "stop"},
 		{Command: "/new", Action: domain.CommandIntercept, Handler: "new"},
 		{Command: "/llm", Action: domain.CommandIntercept, Handler: "llm"},
+		{Command: "/我的身份", Action: domain.CommandIntercept, Handler: "identity"},
+		{Command: "/个人", Action: domain.CommandIntercept, Handler: "personal"},
+		{Command: "/团队", Action: domain.CommandIntercept, Handler: "team"},
+		{Command: "/邀请码", Action: domain.CommandIntercept, Handler: "invite_code"},
+		{Command: "/同意", Action: domain.CommandIntercept, Handler: "accept"},
+		{Command: "/批准", Action: domain.CommandIntercept, Handler: "approve"},
+		{Command: "/拒绝", Action: domain.CommandIntercept, Handler: "reject"},
+		{Command: "/移除", Action: domain.CommandIntercept, Handler: "remove"},
+		{Command: "/relay_off", Action: domain.CommandIntercept, Handler: "relay_off"},
+		{Command: "/relay_on", Action: domain.CommandIntercept, Handler: "relay_on"},
 	}
 	m := make(map[string]domain.PlatformCommand, len(defaults))
 	for _, c := range defaults {
@@ -340,7 +398,10 @@ func defaultCommands() map[string]domain.PlatformCommand {
 }
 
 func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
-	sessionKey := personalSessionKey(bot.OwnerID)
+	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
+	if err != nil {
+		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
+	}
 	task, err := r.store.FindRunningTaskBySession(ctx, sessionKey)
 	if errors.Is(err, pgx.ErrNoRows) {
 		reply := "no running task to stop"
@@ -371,8 +432,11 @@ func (r *router) handleNew(ctx context.Context, msg IncomingMessage, bot domain.
 
 // handleStatus reports whether there is a running task for the user's session.
 func (r *router) handleStatus(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
-	sessionKey := personalSessionKey(bot.OwnerID)
-	_, err := r.store.FindRunningTaskBySession(ctx, sessionKey)
+	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
+	if err != nil {
+		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
+	}
+	_, err = r.store.FindRunningTaskBySession(ctx, sessionKey)
 	var reply string
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -447,7 +511,10 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	if userPolicy == "" {
 		userPolicy = r.toolPolicy // fallback to global default
 	}
-	sessionKey := personalSessionKey(bot.OwnerID)
+	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
+	if err != nil {
+		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
+	}
 	task, err := r.tasks.SubmitTask(ctx, domain.SubmitTaskCommand{
 		SessionKey:        sessionKey,
 		RequesterUserID:   bot.OwnerID,
