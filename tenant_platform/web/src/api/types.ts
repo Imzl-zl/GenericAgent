@@ -114,4 +114,12 @@ export interface LLMProviderConfig {
 
   // ── 网络 ──
   proxy?: string;
+  verify?: boolean;
+
+  // ── 高级 ──
+  service_tier?: 'auto' | 'default' | 'priority' | 'flex';
+  omit_thinking?: boolean;
+  extra_sys_prompt?: string;
+  extra_sys_prompt_file?: string;
+  trim_keep_prefix?: number;
 }

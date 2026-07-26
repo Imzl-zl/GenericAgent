@@ -111,6 +111,26 @@ func GenerateMykeyPy(providers []domain.LLMProvider, cipher Cipher) (string, err
 		if p.Config.Proxy != "" {
 			sb.WriteString(fmt.Sprintf("    'proxy': '%s',\n", p.Config.Proxy))
 		}
+		if p.Config.Verify != nil {
+			sb.WriteString(fmt.Sprintf("    'verify': %t,\n", *p.Config.Verify))
+		}
+
+		// 新增字段：高级
+		if p.Config.ServiceTier != "" {
+			sb.WriteString(fmt.Sprintf("    'service_tier': '%s',\n", p.Config.ServiceTier))
+		}
+		if p.Config.OmitThinking != nil {
+			sb.WriteString(fmt.Sprintf("    'omit_thinking': %t,\n", *p.Config.OmitThinking))
+		}
+		if p.Config.ExtraSysPrompt != "" {
+			sb.WriteString(fmt.Sprintf("    'extra_sys_prompt': '%s',\n", p.Config.ExtraSysPrompt))
+		}
+		if p.Config.ExtraSysPromptFile != "" {
+			sb.WriteString(fmt.Sprintf("    'extra_sys_prompt_file': '%s',\n", p.Config.ExtraSysPromptFile))
+		}
+		if p.Config.TrimKeepPrefix > 0 {
+			sb.WriteString(fmt.Sprintf("    'trim_keep_prefix': %d,\n", p.Config.TrimKeepPrefix))
+		}
 
 		sb.WriteString("}\n\n")
 	}

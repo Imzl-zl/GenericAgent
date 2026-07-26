@@ -191,6 +191,38 @@ export function LLMProvidersPage() {
               />
             </div>
 
+            {/* 传输协议 - 常用配置，置顶显示 */}
+            <div className="provider-form-full">
+              <label className="input-label">
+                <input
+                  type="checkbox"
+                  checked={form.config.stream !== false}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, stream: e.target.checked } })}
+                  style={{ marginRight: '8px' }}
+                />
+                Stream（流式传输）
+              </label>
+            </div>
+
+            {form.provider_type === 'native_oai' && (
+              <div className="provider-form-full">
+                <label className="input-label">API Mode</label>
+                <select
+                  className="input-field"
+                  value={form.config.api_mode || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, api_mode: e.target.value as any || undefined } })}
+                  style={{ width: '100%', padding: '8px 12px' }}
+                >
+                  <option value="">默认 (chat_completions)</option>
+                  <option value="chat_completions">chat_completions - /v1/chat/completions</option>
+                  <option value="responses">responses - /v1/responses</option>
+                </select>
+                <small style={{ color: '#666', fontSize: '0.85em', marginTop: '4px', display: 'block' }}>
+                  仅 NativeOAISession 生效，决定使用哪个 OpenAI API 端点
+                </small>
+              </div>
+            )}
+
             {/* GA Core 配置项 */}
             <div className="provider-form-full" style={{ borderTop: '1px solid var(--border)', paddingTop: '16px', marginTop: '8px' }}>
               <h4 style={{ marginBottom: '12px', fontSize: '14px', fontWeight: 500 }}>高级配置（可选）</h4>
@@ -316,45 +348,6 @@ export function LLMProvidersPage() {
               </Collapsible>
             </div>
 
-            <div className="provider-form-full">
-              <Collapsible title="🔄 传输" defaultOpen={false}>
-                <div>
-                  <label className="input-label">
-                    <input
-                      type="checkbox"
-                      checked={form.config.stream !== false}
-                      onChange={(e) => setForm({ ...form, config: { ...form.config, stream: e.target.checked } })}
-                      style={{ marginRight: '8px' }}
-                    />
-                    Stream（流式传输）
-                  </label>
-                </div>
-              </Collapsible>
-            </div>
-
-            {form.provider_type === 'native_oai' && (
-              <div className="provider-form-full">
-                <Collapsible title="🎯 API 端点模式" defaultOpen={false}>
-                  <div>
-                    <label className="input-label">API Mode</label>
-                    <select
-                      className="input-field"
-                      value={form.config.api_mode || ''}
-                      onChange={(e) => setForm({ ...form, config: { ...form.config, api_mode: e.target.value as any || undefined } })}
-                      style={{ width: '100%', padding: '8px 12px' }}
-                    >
-                      <option value="">默认 (chat_completions)</option>
-                      <option value="chat_completions">chat_completions - /v1/chat/completions</option>
-                      <option value="responses">responses - /v1/responses</option>
-                    </select>
-                    <small style={{ color: '#666', fontSize: '0.85em', marginTop: '4px', display: 'block' }}>
-                      仅 NativeOAISession 生效，决定使用哪个 OpenAI API 端点
-                    </small>
-                  </div>
-                </Collapsible>
-              </div>
-            )}
-
             {form.provider_type === 'native_claude' && (
               <div className="provider-form-full">
                 <Collapsible title="🤖 Claude 专属" defaultOpen={false}>
@@ -389,6 +382,74 @@ export function LLMProvidersPage() {
                   placeholder="HTTP 代理地址（例如 http://proxy.example.com:8080）"
                   value={form.config.proxy || ''}
                   onChange={(e) => setForm({ ...form, config: { ...form.config, proxy: e.target.value || undefined } })}
+                />
+
+                <div>
+                  <label className="input-label">
+                    <input
+                      type="checkbox"
+                      checked={form.config.verify !== false}
+                      onChange={(e) => setForm({ ...form, config: { ...form.config, verify: e.target.checked } })}
+                      style={{ marginRight: '8px' }}
+                    />
+                    Verify SSL（验证 SSL 证书）
+                  </label>
+                </div>
+              </Collapsible>
+            </div>
+
+            <div className="provider-form-full">
+              <Collapsible title="🔧 高级" defaultOpen={false}>
+                <div>
+                  <label className="input-label">Service Tier</label>
+                  <select
+                    className="input-field"
+                    value={form.config.service_tier || ''}
+                    onChange={(e) => setForm({ ...form, config: { ...form.config, service_tier: e.target.value as any || undefined } })}
+                    style={{ width: '100%', padding: '8px 12px' }}
+                  >
+                    <option value="">默认 (auto)</option>
+                    <option value="auto">auto - 自动</option>
+                    <option value="default">default - 默认</option>
+                    <option value="priority">priority - 优先</option>
+                    <option value="flex">flex - 灵活</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="input-label">
+                    <input
+                      type="checkbox"
+                      checked={form.config.omit_thinking || false}
+                      onChange={(e) => setForm({ ...form, config: { ...form.config, omit_thinking: e.target.checked } })}
+                      style={{ marginRight: '8px' }}
+                    />
+                    Omit Thinking（从历史中排除 thinking 块）
+                  </label>
+                </div>
+
+                <Input
+                  label="Extra Sys Prompt"
+                  type="text"
+                  placeholder="额外的系统提示词（可选）"
+                  value={form.config.extra_sys_prompt || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, extra_sys_prompt: e.target.value || undefined } })}
+                />
+
+                <Input
+                  label="Extra Sys Prompt File"
+                  type="text"
+                  placeholder="系统提示词文件路径（可选）"
+                  value={form.config.extra_sys_prompt_file || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, extra_sys_prompt_file: e.target.value || undefined } })}
+                />
+
+                <Input
+                  label="Trim Keep Prefix"
+                  type="number"
+                  placeholder="保留前缀消息数（可选）"
+                  value={form.config.trim_keep_prefix || ''}
+                  onChange={(e) => setForm({ ...form, config: { ...form.config, trim_keep_prefix: e.target.value ? parseInt(e.target.value) : undefined } })}
                 />
               </Collapsible>
             </div>

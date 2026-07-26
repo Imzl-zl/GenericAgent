@@ -44,8 +44,16 @@ type LLMProviderConfig struct {
 	FakeCCSystemPrompt *bool  `json:"fake_cc_system_prompt,omitempty"` // CC 透传渠道必须 true
 	UserAgent          string `json:"user_agent,omitempty"`            // 可选 UA 覆盖
 
-	// ── 其他 ──
-	Proxy string `json:"proxy,omitempty"` // HTTP 代理
+	// ── 网络 ──
+	Proxy  string `json:"proxy,omitempty"`  // HTTP 代理
+	Verify *bool  `json:"verify,omitempty"` // 验证 SSL 证书，默认 true
+
+	// ── 高级 ──
+	ServiceTier       string `json:"service_tier,omitempty"`        // auto | default | priority | flex
+	OmitThinking      *bool  `json:"omit_thinking,omitempty"`       // 从历史中排除 thinking 块
+	ExtraSysPrompt    string `json:"extra_sys_prompt,omitempty"`    // 额外系统提示词
+	ExtraSysPromptFile string `json:"extra_sys_prompt_file,omitempty"` // 系统提示词文件路径
+	TrimKeepPrefix    int    `json:"trim_keep_prefix,omitempty"`    // 保留前缀消息数
 }
 
 // LLMProvider is an admin-configured upstream LLM. Only one row should be
