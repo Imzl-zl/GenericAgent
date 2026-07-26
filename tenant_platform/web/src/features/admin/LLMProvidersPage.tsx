@@ -316,6 +316,38 @@ export function LLMProvidersPage() {
               </Collapsible>
             </div>
 
+            <div className="provider-form-full">
+              <Collapsible title="🔄 传输与协议" defaultOpen={false}>
+                <div>
+                  <label className="input-label">
+                    <input
+                      type="checkbox"
+                      checked={form.config.stream !== false}
+                      onChange={(e) => setForm({ ...form, config: { ...form.config, stream: e.target.checked } })}
+                      style={{ marginRight: '8px' }}
+                    />
+                    Stream（流式传输）
+                  </label>
+                </div>
+
+                {form.provider_type === 'native_oai' && (
+                  <div>
+                    <label className="input-label">API Mode</label>
+                    <select
+                      className="input-field"
+                      value={form.config.api_mode || ''}
+                      onChange={(e) => setForm({ ...form, config: { ...form.config, api_mode: e.target.value as any || undefined } })}
+                      style={{ width: '100%', padding: '8px 12px' }}
+                    >
+                      <option value="">默认（chat_completions）</option>
+                      <option value="chat_completions">chat_completions</option>
+                      <option value="responses">responses</option>
+                    </select>
+                  </div>
+                )}
+              </Collapsible>
+            </div>
+
             <div className="provider-form-full provider-actions">
               <Button type="submit">保存</Button>
             </div>
