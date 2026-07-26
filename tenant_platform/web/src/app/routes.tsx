@@ -3,11 +3,13 @@ import { AppLayout } from '../components/layout/AppLayout';
 import { AdminLayout } from '../components/layout/AdminLayout';
 import { RequireAuth } from '../components/auth/RequireAuth';
 import { LoginPage } from '../features/auth/LoginPage';
+import { AdminLoginPage } from '../features/auth/AdminLoginPage';
 import { RegisterPage } from '../features/auth/RegisterPage';
 import { DashboardPage } from '../features/user/DashboardPage';
 import { BindingPage } from '../features/user/BindingPage';
 import { PersonaPage } from '../features/user/PersonaPage';
 import { StatusPage } from '../features/user/StatusPage';
+import { DocsPage } from '../features/docs/DocsPage';
 import { AdminDashboardPage } from '../features/admin/AdminDashboardPage';
 import { UsersPage } from '../features/admin/UsersPage';
 import { InviteCodesPage } from '../features/admin/InviteCodesPage';
@@ -41,6 +43,10 @@ export const router = createBrowserRouter([
     element: <LoginPage />,
   },
   {
+    path: '/admin/login',
+    element: <AdminLoginPage />,
+  },
+  {
     path: '/register',
     element: <RegisterPage />,
   },
@@ -52,6 +58,7 @@ export const router = createBrowserRouter([
       { path: 'binding', element: <BindingPage /> },
       { path: 'persona', element: <PersonaPage /> },
       { path: 'status', element: <StatusPage /> },
+      { path: 'docs', element: <DocsPage /> },
     ],
   },
   {

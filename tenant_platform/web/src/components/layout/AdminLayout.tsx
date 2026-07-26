@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { Shield, Users, Ticket, UserCog, Cpu, Settings, LogOut } from 'lucide-react';
+import { Shield, Users, Ticket, UserCog, Cpu, Settings, BookOpen, LogOut } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import './Layout.css';
 
@@ -10,6 +10,7 @@ const navItems = [
   { to: '/admin/personas', label: '人设审核', icon: UserCog },
   { to: '/admin/providers', label: 'LLM 供应', icon: Cpu },
   { to: '/admin/settings', label: '策略设置', icon: Settings },
+  { to: '/app/docs', label: '使用文档', icon: BookOpen },
 ];
 
 export function AdminLayout() {

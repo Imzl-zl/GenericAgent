@@ -11,7 +11,7 @@ export function RequireAuth({ children, adminOnly }: RequireAuthProps) {
   const { state } = useAuth();
 
   if (!state) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to={adminOnly ? '/admin/login' : '/login'} replace />;
   }
 
   if (adminOnly && (!state.isAdmin || !state.adminToken)) {
