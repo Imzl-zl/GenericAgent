@@ -154,7 +154,12 @@ def _setup_runtime(
         agent, adapter._session.seed_working, adapter.agent_factory, adapter._legacy_mods,
     )
     state.count_fn = _make_count_fn(state, adapter)
-    install_handler_print_counter(agent, state.count_fn, adapter._legacy_mods)
+    # Store on state dynamically (state.py cannot be modified per task scope);
+    # _cleanup_task reads it back via getattr and calls it to restore the
+    # agent class / handler class so counters do not leak across tasks.
+    state.print_counter_unwrap = install_handler_print_counter(  # type: ignore[attr-defined]
+        agent, state.count_fn, adapter._legacy_mods,
+    )
     if state.max_turns > 0:
         state.loop_unwrap = install_max_turns(agent, state.max_turns, adapter._legacy_mods)
     _arm_deadline_timer(adapter, task, state)
@@ -226,7 +231,11 @@ def _cleanup_task(adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunSta
     if state is not None:
         if state.deadline_timer is not None:
             state.deadline_timer.cancel()
-        for unwrap in (state.loop_unwrap, state.dispatch_unwrap, state.seed_unwrap):
+        # print_counter_unwrap is attached dynamically in _setup_runtime
+        # (state.py is out of scope for this change). Placed before seed_unwrap
+        # so handler.print is restored before the handler class is restored.
+        print_counter_unwrap = getattr(state, "print_counter_unwrap", None)
+        for unwrap in (state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap, state.seed_unwrap):
             if unwrap is not None:
                 try:
                     unwrap()

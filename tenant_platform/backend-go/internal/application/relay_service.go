@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,6 +22,12 @@ type RelayStore interface {
 	SetRelayOptOut(ctx context.Context, userID int64, optOut bool) error
 }
 
+// AuditRecorder records relay metadata (no content) to audit_events.
+// *postgres.Store implements this via AppendAuditEvent.
+type AuditRecorder interface {
+	AppendAuditEvent(ctx context.Context, event domain.AuditEvent) error
+}
+
 // RelayService forwards @username messages between platform users via their
 // bound WeChat bots, bypassing the LLM/Worker entirely. The router intercepts
 // "@<username> <text>" and delegates here.
@@ -38,18 +45,18 @@ type RelayService interface {
 type RelayServiceConfig struct {
 	Store     RelayStore
 	Transport transport.BotTransportAdapter
-	Messages  MessageStore
+	Audit     AuditRecorder
 }
 
 type relayService struct {
 	store     RelayStore
 	transport transport.BotTransportAdapter
-	messages  MessageStore
+	audit     AuditRecorder
 }
 
-// NewRelayService constructs the service. store, transport, and messages are
+// NewRelayService constructs the service. store, transport, and audit are
 // all required: relay needs recipient resolution, message delivery, and
-// outbound audit.
+// metadata-only audit (no content recorded, per spec §6 R6).
 func NewRelayService(cfg RelayServiceConfig) (RelayService, error) {
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("relay store is required")
@@ -57,13 +64,13 @@ func NewRelayService(cfg RelayServiceConfig) (RelayService, error) {
 	if cfg.Transport == nil {
 		return nil, fmt.Errorf("transport is required")
 	}
-	if cfg.Messages == nil {
-		return nil, fmt.Errorf("message store is required")
+	if cfg.Audit == nil {
+		return nil, fmt.Errorf("audit recorder is required")
 	}
 	return &relayService{
 		store:     cfg.Store,
 		transport: cfg.Transport,
-		messages:  cfg.Messages,
+		audit:     cfg.Audit,
 	}, nil
 }
 
@@ -119,9 +126,9 @@ func (s *relayService) Relay(ctx context.Context, fromUserID int64, toUsername, 
 		return fmt.Errorf("send relay: %w", err)
 	}
 
-	// Best-effort outbound audit. The relay is already delivered; a missing
-	// audit row is acceptable but logged so DB issues surface fast.
-	s.persistRelayOutbound(ctx, recipient, relayText)
+	// Best-effort metadata-only audit (spec §6 R6: no content recorded).
+	// The relay is already delivered; a missing audit row is acceptable.
+	s.persistRelayAudit(ctx, fromUserID, fromUsername, recipient, len(text))
 	return nil
 }
 
@@ -136,20 +143,25 @@ func (s *relayService) SetOptOut(ctx context.Context, userID int64, optOut bool)
 	return nil
 }
 
-// persistRelayOutbound records the delivered relay message for audit. Failures
-// are logged but do not fail the relay (the message was already sent).
-func (s *relayService) persistRelayOutbound(ctx context.Context, r domain.RelayRecipient, content string) {
-	if _, err := s.messages.InsertOutboundMessage(ctx, domain.Message{
-		UserID:      r.UserID,
-		BotID:       r.BotID,
-		SessionKey:  "", // relay is cross-session, not tied to a workspace
-		Direction:   domain.MessageOutbound,
-		MessageType: domain.MessageTypeText,
-		Content:     content,
+// persistRelayAudit records relay metadata (participants, content length) to
+// audit_events. No message content is stored (spec §6 R6). Failures are logged
+// but do not fail the relay (the message was already sent).
+func (s *relayService) persistRelayAudit(ctx context.Context, fromUserID int64, fromUsername string, r domain.RelayRecipient, contentLen int) {
+	detail, _ := json.Marshal(map[string]any{
+		"from_user":    fromUsername,
+		"to_user_id":   r.UserID,
+		"content_len":  contentLen,
+	})
+	if err := s.audit.AppendAuditEvent(ctx, domain.AuditEvent{
+		ActorUserID: fromUserID,
+		Action:      domain.AuditRelayForwarded,
+		TargetType:  "user",
+		TargetID:    fmt.Sprintf("%d", r.UserID),
+		Detail:      detail,
 	}); err != nil {
-		slog.ErrorContext(ctx, "relay: persist outbound audit failed",
+		slog.ErrorContext(ctx, "relay: persist audit failed",
+			"from_user_id", fromUserID,
 			"recipient_user_id", r.UserID,
-			"bot_id", r.BotID,
 			"error", err)
 	}
 }

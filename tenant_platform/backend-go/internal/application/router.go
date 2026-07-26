@@ -73,6 +73,7 @@ type RouterStore interface {
 	GetUserStatus(ctx context.Context, userID int64) (domain.UserStatus, error)
 	GetUserToolPolicy(ctx context.Context, userID int64) (string, error)
 	FindRunningTaskBySession(ctx context.Context, sessionKey string) (domain.Task, error)
+	ResetWorkspace(ctx context.Context, sessionKey string) error
 }
 
 // MessageStore persists inbound and outbound WeChat messages for history,
@@ -263,7 +264,9 @@ func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot
 	// named user's WeChat, bypassing the LLM/Worker. Checked before command
 	// resolution so @-mentions never collide with slash commands. When the
 	// RelayService is nil, handleRelay falls through to handleNormalMessage.
-	if strings.HasPrefix(text, relayAtPrefix) {
+	// Only triggered in personal context; in team context @username is a
+	// normal message to the team AI (spec §6 R4).
+	if strings.HasPrefix(text, relayAtPrefix) && r.isPersonalContext(ctx, bot.OwnerID) {
 		return r.handleRelay(ctx, msg, bot, text)
 	}
 	cmd, found := r.resolveCommand(ctx, text)
@@ -421,11 +424,25 @@ func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain
 	return RouterResult{Action: ActionStopped, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
-// handleNew acknowledges a new-session request. In the platform model each
-// task is independent; clearing Worker conversation history is a Worker-level
-// concern handled by checkpoint/snapshot coordination, not by the router.
+// handleNew implements /new: cancels any running task for the session and
+// marks the workspace for fresh start. The next submitted task carries
+// fresh_session=true, causing the scheduler to restart the Worker without
+// loading the prior snapshot (spec §7 /new).
 func (r *router) handleNew(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
-	reply := "new session acknowledged"
+	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
+	if err != nil {
+		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
+	}
+	if task, err := r.store.FindRunningTaskBySession(ctx, sessionKey); err == nil {
+		if _, err := r.tasks.CancelTask(ctx, task.ID, bot.OwnerID); err != nil {
+			slog.ErrorContext(ctx, "router: /new cancel running task failed",
+				"task_id", task.ID, "error", err)
+		}
+	}
+	if err := r.store.ResetWorkspace(ctx, sessionKey); err != nil {
+		return RouterResult{}, fmt.Errorf("reset workspace: %w", err)
+	}
+	reply := "已开启新会话，history 和 working 已清空"
 	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 	return RouterResult{Action: ActionNewSession, Reply: reply, UserID: bot.OwnerID}, nil
 }

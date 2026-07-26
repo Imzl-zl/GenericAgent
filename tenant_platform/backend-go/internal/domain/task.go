@@ -72,6 +72,10 @@ type Task struct {
 	// stream errors + heartbeat lease loss cannot catch. Pattern: Temporal
 	// HeartbeatTimeout / Kubernetes liveness probe.
 	LastActivityAt time.Time
+	// FreshSession is set when /new was issued since the last committed
+	// snapshot. The scheduler stops the old Worker so the next task starts
+	// with cleared history and working state (spec §7 /new).
+	FreshSession bool
 	// WorkerDispatchStartedAt is set when the scheduler records dispatch intent.
 	WorkerDispatchStartedAt *time.Time
 	CancelRequestedAt       *time.Time

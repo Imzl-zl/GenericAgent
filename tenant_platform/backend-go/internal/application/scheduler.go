@@ -72,6 +72,9 @@ type SchedulerConfig struct {
 	// tasks. Zero disables the check (dev/test only). Production should set
 	// this to a value derived from host capacity testing.
 	MaxRunningTasks int
+	// PerTenantRunningLimit caps the number of simultaneously starting/running
+	// tasks per requester (across all their sessions). Zero disables the check.
+	PerTenantRunningLimit int
 	// TaskTimeoutSeconds is passed to the Worker as RuntimePolicy.TaskTimeoutSeconds
 	// for its internal soft timer (e.g. cancelling a single hung LLM call). The
 	// platform does NOT use it as a hard wall-clock kill switch — legitimate
@@ -94,7 +97,15 @@ type LLMProviderSource interface {
 	GetDefaultProvider(ctx context.Context) (domain.LLMProvider, error)
 }
 
-const workerShutdownTimeout = 5 * time.Second
+const (
+	defaultMaxTurns           = 6
+	defaultMaxHistoryBytes    = 256 * 1024
+	defaultMaxWorkingBytes    = 64 * 1024
+	defaultMaxOutputBytes     = 256 * 1024
+	defaultWorkerShutdownSecs = 5
+
+	workerShutdownTimeout = defaultWorkerShutdownSecs * time.Second
+)
 
 // ErrLeaseExpired is re-exported from domain for callers in the application
 // layer. The postgres store returns this when a heartbeat updates 0 rows.
@@ -377,7 +388,7 @@ func (s *scheduler) tick(ctx context.Context) error {
 			return nil
 		}
 	}
-	keys, err := s.cfg.Store.ListClaimableSessionKeys(ctx, 16)
+	keys, err := s.cfg.Store.ListClaimableSessionKeys(ctx, 16, s.cfg.PerTenantRunningLimit)
 	if err != nil {
 		return err
 	}
@@ -432,6 +443,15 @@ func (s *scheduler) CancelWorker(ctx context.Context, task domain.Task) error {
 }
 
 func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			returnErr = fmt.Errorf("dispatch panic: %v", r)
+			slog.ErrorContext(ctx, "scheduler: dispatch panic",
+				"task_id", task.ID, "panic", r)
+			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+				"DISPATCH_PANIC", fmt.Sprintf("%v", r), "")
+		}
+	}()
 	// Re-check under store: may have been cancelled before dispatch.
 	cur, err := s.cfg.Store.GetTask(ctx, task.ID)
 	if err != nil {
@@ -465,6 +485,12 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}()
 	ctx = heartbeat.ctx
 
+	// /new was issued: stop any existing Worker for this session so the
+	// next task starts with cleared history and working state.
+	if task.FreshSession {
+		s.stopSessionWorker(task.SessionKey)
+	}
+
 	client, entry, err := s.ensureWorker(ctx, task)
 	if err != nil {
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
@@ -487,7 +513,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	// instead of finalizing immediately.
 	cur, err = s.cfg.Store.MarkDispatchStarted(ctx, task.ID, s.cfg.PlatformInstanceID, entry.instID)
 	if err != nil {
-		// Likely cancelled before dispatch.
+		slog.ErrorContext(ctx, "scheduler: MarkDispatchStarted failed",
+			"task_id", task.ID, "error", err)
 		return nil
 	}
 
@@ -603,6 +630,11 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		}
 	}
 	if streamErr != nil && terminal == nil {
+		if errors.Is(streamErr, context.Canceled) {
+			slog.InfoContext(ctx, "scheduler: stream cancelled by context",
+				"task_id", task.ID)
+			return nil
+		}
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_STREAM_ERROR", streamErr.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -825,10 +857,10 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	startReq := &workerv1.StartSessionRequest{
 		SessionKey: task.SessionKey,
 		RuntimePolicy: &workerv1.RuntimePolicy{
-			MaxTurns:           6,
-			MaxHistoryBytes:    256 * 1024,
-			MaxWorkingBytes:    64 * 1024,
-			MaxOutputBytes:     256 * 1024,
+			MaxTurns:           defaultMaxTurns,
+			MaxHistoryBytes:    defaultMaxHistoryBytes,
+			MaxWorkingBytes:    defaultMaxWorkingBytes,
+			MaxOutputBytes:     defaultMaxOutputBytes,
 			TaskTimeoutSeconds: uint32(s.cfg.TaskTimeoutSeconds),
 			CapabilityVersion:  CapabilityVersion,
 			PolicyDigest:       s.cfg.Registry.Digest(),
@@ -872,6 +904,19 @@ func (s *scheduler) shutdownAllWorkers(ctx context.Context) {
 		s.revokeTokenBestEffort(ctx, entry.jti)
 		entry.cleanup()
 		delete(s.workers, sk)
+	}
+}
+
+// stopSessionWorker evicts the Worker for a session without cancelling any
+// task. Used by /new to force a fresh Worker on the next dispatch.
+func (s *scheduler) stopSessionWorker(sessionKey string) {
+	s.mu.Lock()
+	entry := s.workers[sessionKey]
+	delete(s.workers, sessionKey)
+	s.mu.Unlock()
+	if entry != nil {
+		s.revokeTokenBestEffort(context.Background(), entry.jti)
+		entry.cleanup()
 	}
 }
 

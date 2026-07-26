@@ -47,6 +47,7 @@ func migrationFiles() []string {
 		"0014_media_assets.sql",
 		"0015_task_last_activity_at.sql",
 		"0016_team_lifecycle.sql",
+		"0018_session_reset.sql",
 	}
 }
 
@@ -54,7 +55,7 @@ func migrationFiles() []string {
 // that indicates it has already been applied. applyPendingMigrations applies
 // each file only when its marker table is absent.
 var pendingMigrations = []struct {
-	file       string
+	file        string
 	markerTable string
 }{
 	{"0002_team_tables.sql", "teams"},
@@ -72,6 +73,7 @@ var pendingMigrations = []struct {
 	{"0014_media_assets.sql", "migration_0014_media_assets_marker"},
 	{"0015_task_last_activity_at.sql", "migration_0015_task_last_activity_at_marker"},
 	{"0016_team_lifecycle.sql", "migration_0016_team_lifecycle_marker"},
+	{"0018_session_reset.sql", "migration_0018_session_reset_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -100,6 +102,7 @@ var foundationTableNames = []string{
 	"migration_0014_media_assets_marker",
 	"migration_0015_task_last_activity_at_marker",
 	"migration_0016_team_lifecycle_marker",
+	"migration_0018_session_reset_marker",
 	"team_invite_codes",
 	"active_contexts",
 }

@@ -21,7 +21,7 @@ type TaskStore interface {
 	CompleteFailedTerminal(ctx context.Context, taskID string, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) (domain.Task, error)
 	ListOwnedActiveTasks(ctx context.Context, platformInstanceID string) ([]domain.Task, error)
 	HeartbeatClaim(ctx context.Context, taskID, platformInstanceID string, claimLease time.Duration) error
-	ListClaimableSessionKeys(ctx context.Context, limit int) ([]string, error)
+	ListClaimableSessionKeys(ctx context.Context, limit, perUserRunningLimit int) ([]string, error)
 	MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string) (domain.Task, error)
 	MarkRunning(ctx context.Context, taskID, platformInstanceID string) (domain.Task, error)
 	RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error
@@ -35,4 +35,6 @@ type TaskStore interface {
 	// CountQueuedTasksByRequester returns the number of queued tasks for a
 	// given requester. Used by SubmitTask to enforce PerUserQueueLimit.
 	CountQueuedTasksByRequester(ctx context.Context, requesterUserID int64) (int, error)
+	// ResetWorkspace marks the session for fresh start (/new command).
+	ResetWorkspace(ctx context.Context, sessionKey string) error
 }

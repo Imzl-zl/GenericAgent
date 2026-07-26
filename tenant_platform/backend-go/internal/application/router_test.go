@@ -63,6 +63,8 @@ func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string) 
 	return *f.runningTask, nil
 }
 
+func (f *fakeRouterStore) ResetWorkspace(_ context.Context, _ string) error { return nil }
+
 // fakeTaskService is a minimal TaskService for router tests.
 type fakeTaskService struct {
 	submittedTask domain.Task
@@ -79,7 +81,9 @@ func (f *fakeTaskService) SubmitTask(_ context.Context, cmd domain.SubmitTaskCom
 	return f.submittedTask, nil
 }
 
-func (f *fakeTaskService) GetTask(_ context.Context, _ string) (domain.Task, error) { return domain.Task{}, nil }
+func (f *fakeTaskService) GetTask(_ context.Context, _ string) (domain.Task, error) {
+	return domain.Task{}, nil
+}
 func (f *fakeTaskService) CancelTask(_ context.Context, taskID string, _ int64) (domain.Task, error) {
 	f.cancelledID = taskID
 	if f.cancelErr != nil {

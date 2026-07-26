@@ -163,6 +163,7 @@ const (
 	AuditBindingExpired      AuditAction = "binding_expired"
 	AuditBindingRevoked      AuditAction = "binding_revoked"
 	AuditTaskCancelledByBlock AuditAction = "task_cancelled_by_block"
+	AuditRelayForwarded       AuditAction = "relay_forwarded"
 )
 
 // AuditEvent is an append-only record of a lifecycle or authorization action.

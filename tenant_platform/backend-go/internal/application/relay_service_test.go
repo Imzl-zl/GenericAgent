@@ -48,11 +48,25 @@ func (f *fakeRelayStore) SetRelayOptOut(_ context.Context, userID int64, optOut 
 	return nil
 }
 
+// fakeAuditRecorder is an in-memory AuditRecorder for relay service tests.
+type fakeAuditRecorder struct {
+	events []domain.AuditEvent
+	err    error
+}
+
+func (f *fakeAuditRecorder) AppendAuditEvent(_ context.Context, event domain.AuditEvent) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.events = append(f.events, event)
+	return nil
+}
+
 func newRelayServiceForTest(store *fakeRelayStore, tr *transport.LoopbackTransport) RelayService {
 	svc, _ := NewRelayService(RelayServiceConfig{
 		Store:     store,
 		Transport: tr,
-		Messages:  &fakeMessageStore{},
+		Audit:     &fakeAuditRecorder{},
 	})
 	return svc
 }
@@ -280,6 +294,6 @@ func TestNewRelayServiceValidation(t *testing.T) {
 		Store:     &fakeRelayStore{},
 		Transport: transport.NewLoopbackTransport(),
 	}); err == nil {
-		t.Fatal("expected error for nil messages")
+		t.Fatal("expected error for nil audit")
 	}
 }

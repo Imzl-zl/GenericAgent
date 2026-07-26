@@ -166,9 +166,10 @@ func (s *Store) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (d
 		var workspaceID uuid.UUID
 		var ownerID int64
 		var kind, teamID string
+		var resetAt *time.Time
 		err := tx.QueryRow(ctx, `
-SELECT id, owner_user_id, kind, COALESCE(team_id::text, '') FROM workspaces WHERE session_key = $1 FOR UPDATE
-`, cmd.SessionKey).Scan(&workspaceID, &ownerID, &kind, &teamID)
+SELECT id, owner_user_id, kind, COALESCE(team_id::text, ''), reset_at FROM workspaces WHERE session_key = $1 FOR UPDATE
+`, cmd.SessionKey).Scan(&workspaceID, &ownerID, &kind, &teamID, &resetAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("workspace not found for session_key %q", cmd.SessionKey)
@@ -181,6 +182,16 @@ SELECT id, owner_user_id, kind, COALESCE(team_id::text, '') FROM workspaces WHER
 		}
 		if err := authorizeSubmitter(tx, ctx, kind, ownerID, teamID, requester); err != nil {
 			return err
+		}
+		// /new was issued since the last committed snapshot: the next task
+		// starts with cleared history and working state. Clear the marker in
+		// the same workspace-locked tx so a concurrent submit cannot miss it.
+		freshSession := false
+		if resetAt != nil {
+			freshSession = true
+			if _, err := tx.Exec(ctx, `UPDATE workspaces SET reset_at = NULL WHERE session_key = $1`, cmd.SessionKey); err != nil {
+				return err
+			}
 		}
 
 		// Hard per-user queue cap inside the workspace lock. Concurrent
@@ -211,17 +222,18 @@ INSERT INTO tasks (
   id, workspace_id, session_key, session_sequence, requester_user_id,
   source, source_instance_id, message_id, message_idempotency_key,
   prompt, persona_snapshot, tool_policy_version, prompt_bytes, persona_bytes,
-  status
+  status, fresh_session
 ) VALUES (
   $1,$2,$3,$4,$5,
   $6,$7,$8,$9,
   $10,$11::jsonb,$12,$13,$14,
-  'queued'
+  'queued', $15
 )
 ON CONFLICT (source, source_instance_id, message_idempotency_key) DO NOTHING
 RETURNING `+taskSelectColumns, taskID, workspaceID, cmd.SessionKey, nextSeq, requester,
 			cmd.Source, cmd.SourceInstanceID, cmd.MessageID, idemKey,
 			cmd.Prompt, string(personaRaw), cmd.ToolPolicyVersion, promptBytes, personaBytes,
+			freshSession,
 		)
 		t, scanErr := scanTask(row)
 		if scanErr == nil {
@@ -757,23 +769,52 @@ func (s *Store) CompleteFailedTerminal(ctx context.Context, taskID string, statu
 	return task, err
 }
 
-// ListClaimableSessionKeys returns session keys with queued work and no active claim.
-func (s *Store) ListClaimableSessionKeys(ctx context.Context, limit int) ([]string, error) {
+// ResetWorkspace marks the session for fresh start: the next submitted task
+// will have fresh_session=true and the Worker will be restarted without
+// loading the prior snapshot. Implements /new (spec §7).
+func (s *Store) ResetWorkspace(ctx context.Context, sessionKey string) error {
+	_, err := s.pool.Exec(ctx, `
+UPDATE workspaces SET reset_at = timezone('utc', now())
+WHERE session_key = $1
+`, sessionKey)
+	return err
+}
+
+// ListClaimableSessionKeys returns session keys with queued work and no active
+// claim, ordered by cross-tenant round-robin fairness: each requester's oldest
+// queued task gets a ROW_NUMBER, and sessions are ordered by (rn, oldest) so
+// every requester rotates through instead of one user monopolizing the queue.
+// When perUserRunningLimit > 0, sessions whose next-task requester already has
+// >= perUserRunningLimit starting/running tasks are excluded.
+func (s *Store) ListClaimableSessionKeys(ctx context.Context, limit, perUserRunningLimit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 32
 	}
 	rows, err := s.pool.Query(ctx, `
-SELECT t.session_key
-FROM tasks t
-WHERE t.status = 'queued'
+SELECT session_key FROM (
+  SELECT
+    t.session_key,
+    ROW_NUMBER() OVER (PARTITION BY t.requester_user_id ORDER BY MIN(t.created_at)) AS rn,
+    MIN(t.created_at) AS oldest
+  FROM tasks t
+  WHERE t.status = 'queued'
   AND NOT EXISTS (
-    SELECT 1 FROM tasks r
-    WHERE r.session_key = t.session_key AND r.status IN ('starting','running')
+    SELECT 1 FROM tasks t2
+    WHERE t2.session_key = t.session_key AND t2.status IN ('starting','running')
   )
-GROUP BY t.session_key
-ORDER BY MIN(t.created_at)
+  AND (
+    $2 = 0 OR NOT EXISTS (
+      SELECT 1 FROM tasks t3
+      WHERE t3.requester_user_id = t.requester_user_id
+      AND t3.status IN ('starting','running')
+      HAVING COUNT(*) >= $2
+    )
+  )
+  GROUP BY t.session_key, t.requester_user_id
+) ranked
+ORDER BY ranked.rn, ranked.oldest
 LIMIT $1
-`, limit)
+`, limit, perUserRunningLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -886,7 +927,7 @@ status, COALESCE(claim_owner,''), claim_lease_until,
 COALESCE(worker_instance_id,''), worker_dispatch_started_at, cancel_requested_at,
 snapshot_id::text, COALESCE(snapshot_checksum,''), COALESCE(result_ref,''), COALESCE(result_digest,''),
 COALESCE(terminal_error_code,''), COALESCE(terminal_error_message,''), COALESCE(terminal_error_trace_id,''),
-created_at, updated_at, started_at, succeeded_at, terminal_at, last_activity_at
+created_at, updated_at, started_at, succeeded_at, terminal_at, last_activity_at, fresh_session
 `
 
 type scannable interface {
@@ -907,7 +948,7 @@ func scanTask(row scannable) (domain.Task, error) {
 		&t.WorkerInstanceID, &dispatchAt, &cancelAt,
 		&snapshotID, &t.SnapshotChecksum, &t.ResultRef, &t.ResultDigest,
 		&t.TerminalErrorCode, &t.TerminalErrorMessage, &t.TerminalErrorTraceID,
-		&t.CreatedAt, &t.UpdatedAt, &startedAt, &succeededAt, &terminalAt, &t.LastActivityAt,
+		&t.CreatedAt, &t.UpdatedAt, &startedAt, &succeededAt, &terminalAt, &t.LastActivityAt, &t.FreshSession,
 	)
 	if err != nil {
 		return domain.Task{}, err
@@ -998,13 +1039,14 @@ INSERT INTO task_events (
 }
 
 func insertNextEvent(ctx context.Context, tx pgx.Tx, taskID, eventType string, byteCount *int, digest *string, fromStatus, toStatus, worker, errCode string) error {
-	var sequence int64
-	if err := tx.QueryRow(ctx, `
-SELECT COALESCE(MAX(sequence_no), -1) + 1 FROM task_events WHERE task_id = $1
-`, taskID).Scan(&sequence); err != nil {
-		return err
-	}
-	return insertEvent(ctx, tx, taskID, eventType, sequence, byteCount, digest, fromStatus, toStatus, worker, errCode)
+	_, err := tx.Exec(ctx, `
+INSERT INTO task_events (
+  task_id, event_type, sequence_no, byte_count, digest, from_status, to_status, worker_instance, error_code, created_at
+)
+SELECT $1, $2, COALESCE(MAX(sequence_no), 0) + 1, $3, $4, NULLIF($5,''), NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), timezone('utc', now())
+FROM task_events WHERE task_id = $1
+`, taskID, eventType, byteCount, digest, fromStatus, toStatus, worker, errCode)
+	return err
 }
 
 func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {

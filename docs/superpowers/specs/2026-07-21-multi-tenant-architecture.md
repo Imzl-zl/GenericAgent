@@ -45,7 +45,7 @@
 | 工具 | Shell/Python 可用，但仅在 Worker；默认无任意外网、无宿主机挂载、无容器管理 socket |
 | 团队人设 | `team_members.persona_id → teams.team_persona_id → platform default` |
 | 团队 key_info | 团队会话内共享；PRD 必须明示该隐私边界 |
-| 中继 | 仅整条消息为 `@username` 时发起；不调用 AI；中继和团队邀请使用带短 ID 的确定性状态机 |
+| 中继 | `@username <消息内容>` 直接转发给目标 bot，不调用 AI，不进 task 队列；仅个人上下文触发，团队上下文里 `@username` 作为普通消息给 AI；接收方可用 `/relay_off` 拒收 |
 | P0 物理部署 | §3.1 的组件是逻辑边界；默认部署为 `platform`、`worker-manager`、`llm-proxy` 三个应用进程加 PostgreSQL，不要求一组件一进程 |
 | 容量准入 | `MAX_ACTIVE_WORKERS` 只是硬上限；调度必须同时检查 running/idle Worker 内存、CPU、PID、磁盘、模型并发和租户配额 |
 | 管理员并发配置 | 受保护的运营操作可运行时调整 `MAX_RUNNING_TASKS`；值不得超过目标主机测得硬上限；每次修改记录 actor、原因和 config version |
@@ -314,8 +314,7 @@ P0 使用 PostgreSQL。每个状态变更在事务中完成，并附加审计事
 | `tasks` | task_id、session、requester、message idempotency key、状态、顺序号、result_ref/result_digest、最终用量、succeeded_at、terminal_at；每 session 同时最多一个 running task |
 | `task_deliveries` | `(task_id, delivery_type)` 唯一；delivery_id、状态 ∈ pending/sending/acked/dead_letter、payload_ref/payload_digest 或 bounded error payload、尝试次数、next_attempt_at、attempt_lease_until、delivery_deadline_at、sent_at、acked_at、terminal_at；用于终态结果恢复与去重，不作为 task 事实来源 |
 | `task_events` | 状态转换、Worker ID、错误码、时间；不存模型 Key 或完整敏感 prompt |
-| `relay_sessions` | 发起人/接收人、状态、过期时间、短 ID；每参与者同时至多一个 pending/active relay，由事务约束保证 |
-| `relay_blocks` | blocker、blocked、创建时间 |
+| `relay_preferences` | user_id、opt_out bool、updated_at；控制是否接收 `@username` 转发消息，默认 opt_out=false |
 | `audit_events` | 登录、审批、绑定、策略拒绝、密钥访问、任务生命周期和管理操作；默认不记录中继正文 |
 
 ### 5.1 绑定状态机
@@ -373,12 +372,10 @@ P0 不引入 RabbitMQ、Redis、Celery 等外部消息队列。PostgreSQL `tasks
 | 优先级 | 条件 | 动作 |
 |---|---|---|
 | 1 | 绑定激活 | 已废弃：iLink 官方扫码 `confirmed` 时直接完成绑定，无需 `/activate`（见 [iLink 绑定流程 SPEC](2026-07-25-ilink-official-binding-flow.md) §6.5） |
-| 2 | 活跃 relay | `/断开` 结束；其它非平台保留命令转发；不进入 AI |
-| 3 | pending relay | `/同意 r-123`、`/拒绝 r-123`；仅一个候选时可省短 ID |
-| 4 | pending team 流程 | `/同意 t-456`（成员接受直接邀请）、`/批准 t-456`（Owner 批准成员加入）、`/拒绝 t-456`（任一方拒绝）；Router 按发送者角色与邀请当前状态分发；仅一个候选时可省短 ID |
-| 5 | session 命令 | `/个人`、`/团队`、`/new`、`/stop`、`/邀请码 <code>`、`/移除 @username`（Owner）、`/我的身份`、`/状态` |
-| 6 | relay 发起 | 整条消息严格等于 `@username` |
-| 7 | 普通消息 | 创建 task 并入队 |
+| 2 | pending team 流程 | `/同意 t-456`（成员接受直接邀请）、`/批准 t-456`（Owner 批准成员加入）、`/拒绝 t-456`（任一方拒绝）；Router 按发送者角色与邀请当前状态分发；仅一个候选时可省短 ID |
+| 3 | session 命令 | `/个人`、`/团队`、`/new`、`/stop`、`/邀请码 <code>`、`/relay_on`、`/relay_off`、`/移除 @username`（Owner）、`/我的身份`、`/状态` |
+| 4 | relay 转发 | 个人上下文下 `@username <消息内容>`：直接转发给目标 bot，不调 AI，不进 task 队列；团队上下文里 `@username <消息内容>` 作为普通消息给 AI |
+| 5 | 普通消息 | 创建 task 并入队 |
 
 命令语义补充：
 

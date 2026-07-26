@@ -149,12 +149,15 @@ def install_dispatch_guard(
     return unwrap
 
 
-def install_handler_print_counter(
-    agent: Any,
+def _make_handler_wrapper(
     count_fn: Callable[[str], bool],
-    legacy_mods: dict[str, Any] | None,
-) -> None:
-    """Wrap handler.print to count output bytes against the quota."""
+    wrapped: list[tuple[Any, Any]],
+) -> Callable[[Any], None]:
+    """Build a _wrap_handler closure that instruments handler.print.
+
+    Each wrapped handler is recorded in `wrapped` as (handler, original_print)
+    so the caller can restore it later.
+    """
 
     def _wrap_handler(handler: Any) -> None:
         if handler is None or getattr(handler, "_adapter_print_wrapped", False):
@@ -171,37 +174,117 @@ def install_handler_print_counter(
 
         handler.print = counted_print  # type: ignore[assignment]
         handler._adapter_print_wrapped = True  # type: ignore[attr-defined]
+        wrapped.append((handler, original_print))
 
-    _wrap_handler(getattr(agent, "handler", None))
+    return _wrap_handler
 
-    if legacy_mods:
-        ga_mod = legacy_mods.get("ga")
-        if ga_mod is not None and hasattr(ga_mod, "GenericAgentHandler"):
-            original_cls = ga_mod.GenericAgentHandler
-            if getattr(original_cls, "_adapter_print_factory", None) is not count_fn:
-                base_init = original_cls.__init__
 
-                def init_with_counter(self, *args, **kwargs):
-                    base_init(self, *args, **kwargs)
-                    _wrap_handler(self)
-
-                original_cls.__init__ = init_with_counter  # type: ignore[method-assign]
-                original_cls._adapter_print_factory = count_fn  # type: ignore[attr-defined]
-
-    # Scripted agents often set handler inside run().
-    if not getattr(agent, "_adapter_handler_watch", False):
-        agent._adapter_handler_watch = True
+def _restore_wrapped_handlers(wrapped: list[tuple[Any, Any]]) -> None:
+    """Restore original handler.print and clear wrap markers."""
+    for handler, original_print in wrapped:
+        if not getattr(handler, "_adapter_print_wrapped", False):
+            continue
         try:
-            def watching_setattr(name, value, _orig=object.__setattr__):
-                _orig(agent, name, value)
-                if name == "handler":
-                    _wrap_handler(value)
-
-            object.__setattr__(agent, "__class__", type(agent.__class__.__name__, (agent.__class__,), {
-                "__setattr__": lambda self, n, v: watching_setattr(n, v),
-            }))
+            if original_print is not None:
+                handler.print = original_print  # type: ignore[assignment]
+            elif hasattr(handler, "print"):
+                delattr(handler, "print")
         except Exception:
-            agent._adapter_wrap_handler = _wrap_handler
+            pass
+        try:
+            delattr(handler, "_adapter_print_wrapped")
+        except Exception:
+            handler._adapter_print_wrapped = False  # type: ignore[attr-defined]
+
+
+def _swap_counted_handler(
+    ga_mod: Any,
+    count_fn: Callable[[str], bool],
+    wrap_handler: Callable[[Any], None],
+) -> tuple[Any, Any]:
+    """Swap ga_mod.GenericAgentHandler to a counted subclass.
+
+    Returns (original_cls, counted_cls). counted_cls is None when no swap
+    occurred (already installed for this count_fn, or no target).
+    """
+    if ga_mod is None or not hasattr(ga_mod, "GenericAgentHandler"):
+        return None, None
+    original_cls = ga_mod.GenericAgentHandler
+    if getattr(original_cls, "_adapter_print_factory", None) is count_fn:
+        return original_cls, None
+
+    class _CountedHandler(original_cls):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            wrap_handler(self)
+
+    _CountedHandler._adapter_print_factory = count_fn  # type: ignore[attr-defined]
+    ga_mod.GenericAgentHandler = _CountedHandler  # type: ignore[assignment]
+    return original_cls, _CountedHandler
+
+
+def _swap_watched_agent(
+    agent: Any,
+    wrap_handler: Callable[[Any], None],
+) -> tuple[Any, Any]:
+    """Swap agent.__class__ to a watched subclass that wraps handler on assign.
+
+    Returns (original_class, watched_cls). watched_cls is None when no swap
+    occurred (already watched, or __class__ reassignment failed).
+    """
+    original_class = agent.__class__
+    if getattr(agent, "_adapter_handler_watch", False):
+        return original_class, None
+    agent._adapter_handler_watch = True  # type: ignore[attr-defined]
+    try:
+        class _WatchedAgent(original_class):  # type: ignore[misc,valid-type]
+            def __setattr__(self, name, value):
+                super().__setattr__(name, value)
+                if name == "handler":
+                    wrap_handler(value)
+
+        object.__setattr__(agent, "__class__", _WatchedAgent)
+        return original_class, _WatchedAgent
+    except Exception:
+        agent._adapter_wrap_handler = wrap_handler  # type: ignore[attr-defined]
+        return original_class, None
+
+
+def install_handler_print_counter(
+    agent: Any,
+    count_fn: Callable[[str], bool],
+    legacy_mods: dict[str, Any] | None,
+) -> Callable[[], None]:
+    """Wrap handler.print to count output bytes against the quota.
+
+    Returns an unwrap callable that restores the original agent class, the
+    original GenericAgentHandler class, and each wrapped handler's print, so
+    the same agent can be reused across tasks without counter leakage
+    (P-M2 pattern, matching install_dispatch_guard/install_max_turns).
+    """
+    wrapped: list[tuple[Any, Any]] = []
+    wrap_handler = _make_handler_wrapper(count_fn, wrapped)
+    wrap_handler(getattr(agent, "handler", None))
+
+    ga_mod = legacy_mods.get("ga") if legacy_mods else None
+    original_handler_cls, counted_cls = _swap_counted_handler(ga_mod, count_fn, wrap_handler)
+    original_agent_class, watched_cls = _swap_watched_agent(agent, wrap_handler)
+
+    def unwrap() -> None:
+        if watched_cls is not None and agent.__class__ is watched_cls:
+            object.__setattr__(agent, "__class__", original_agent_class)
+        if (counted_cls is not None and ga_mod is not None
+                and getattr(ga_mod, "GenericAgentHandler", None) is counted_cls):
+            ga_mod.GenericAgentHandler = original_handler_cls  # type: ignore[assignment]
+        _restore_wrapped_handlers(wrapped)
+        for attr in ("_adapter_handler_watch", "_adapter_wrap_handler"):
+            if hasattr(agent, attr):
+                try:
+                    delattr(agent, attr)
+                except Exception:
+                    pass
+
+    return unwrap
 
 
 def install_max_turns(

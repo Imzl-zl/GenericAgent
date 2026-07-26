@@ -251,35 +251,36 @@ func run() error {
 	logging.Init()
 
 	var (
-		policyFile           = flag.String("policy-file", "", "path to capability policy manifest (required)")
-		claimLease           = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
-		devLoopback          = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
-		listen               = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
-		databaseURL          = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
-		migration            = flag.String("migration", "", "path to 0001_foundation.sql")
-		runtimeRoot          = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
-		configRoot           = flag.String("config-root", "", "GA_CONFIG_ROOT for token-only mykey.py")
-		legacyRoot           = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
-		workerPython         = flag.String("worker-python", "", "python interpreter for worker")
-		workerSrc            = flag.String("worker-src", "", "path to worker-python/src")
-		llmProxyAddr         = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
-		capabilitySigningKey = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=16 bytes")
-		modelPolicyVersion   = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
-		devExtraUsers        = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
-		devTeam              = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
-		workerRuntime        = flag.String("worker-runtime", "loopback", "worker runtime mode: loopback or podman")
-		workerManagerAddr    = flag.String("worker-manager-addr", os.Getenv("GA_WORKER_MANAGER_ADDR"), "worker-manager gRPC address (required for podman mode)")
-		botTokenKey          = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
-		ilinkBaseURL         = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
-		ilinkAppID           = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
-		ilinkClientVersion   = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
-		botPollerURL         = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
-		platformWebhookURL   = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
-		webhookSecret        = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
-		maxRunningTasks      = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
-		perUserQueueLimit    = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
-		taskTimeoutSeconds   = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
-		taskIdleTimeoutSec   = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
+		policyFile            = flag.String("policy-file", "", "path to capability policy manifest (required)")
+		claimLease            = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
+		devLoopback           = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
+		listen                = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
+		databaseURL           = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
+		migration             = flag.String("migration", "", "path to 0001_foundation.sql")
+		runtimeRoot           = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
+		configRoot            = flag.String("config-root", "", "GA_CONFIG_ROOT for token-only mykey.py")
+		legacyRoot            = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
+		workerPython          = flag.String("worker-python", "", "python interpreter for worker")
+		workerSrc             = flag.String("worker-src", "", "path to worker-python/src")
+		llmProxyAddr          = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
+		capabilitySigningKey  = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=16 bytes")
+		modelPolicyVersion    = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
+		devExtraUsers         = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
+		devTeam               = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
+		workerRuntime         = flag.String("worker-runtime", "loopback", "worker runtime mode: loopback or podman")
+		workerManagerAddr     = flag.String("worker-manager-addr", os.Getenv("GA_WORKER_MANAGER_ADDR"), "worker-manager gRPC address (required for podman mode)")
+		botTokenKey           = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
+		ilinkBaseURL          = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
+		ilinkAppID            = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
+		ilinkClientVersion    = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
+		botPollerURL          = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
+		platformWebhookURL    = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
+		webhookSecret         = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
+		maxRunningTasks       = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
+		perTenantRunningLimit = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
+		perUserQueueLimit     = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
+		taskTimeoutSeconds    = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
+		taskIdleTimeoutSec    = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
 	)
 	flag.Parse()
 
@@ -483,24 +484,25 @@ func run() error {
 	}
 
 	sched, err := application.NewScheduler(application.SchedulerConfig{
-		PlatformInstanceID:  instanceID,
-		ClaimLease:          *claimLease,
-		PollInterval:        500 * time.Millisecond,
-		Store:               store,
-		Registry:            reg,
-		Coordinator:         coord,
-		Runtime:             runtime,
-		ConfigRoot:          boot.ConfigRoot,
-		SessionScopedConfig: sessionScopedConfig,
-		RuntimeRoot:         boot.RuntimeRoot,
-		LLMProxyAddr:        proxyAddr,
-		TokenIssuer:         issuer,
-		TokenRevoker:        revoker,
-		ModelPolicyVersion:  strings.TrimSpace(*modelPolicyVersion),
-		LLMProvider:         store,
-		MaxRunningTasks:     *maxRunningTasks,
-		TaskTimeoutSeconds:  *taskTimeoutSeconds,
-		IdleTimeout:         time.Duration(*taskIdleTimeoutSec) * time.Second,
+		PlatformInstanceID:    instanceID,
+		ClaimLease:            *claimLease,
+		PollInterval:          500 * time.Millisecond,
+		Store:                 store,
+		Registry:              reg,
+		Coordinator:           coord,
+		Runtime:               runtime,
+		ConfigRoot:            boot.ConfigRoot,
+		SessionScopedConfig:   sessionScopedConfig,
+		RuntimeRoot:           boot.RuntimeRoot,
+		LLMProxyAddr:          proxyAddr,
+		TokenIssuer:           issuer,
+		TokenRevoker:          revoker,
+		ModelPolicyVersion:    strings.TrimSpace(*modelPolicyVersion),
+		LLMProvider:           store,
+		MaxRunningTasks:       *maxRunningTasks,
+		PerTenantRunningLimit: *perTenantRunningLimit,
+		TaskTimeoutSeconds:    *taskTimeoutSeconds,
+		IdleTimeout:           time.Duration(*taskIdleTimeoutSec) * time.Second,
 	})
 	if err != nil {
 		return err
@@ -634,7 +636,7 @@ func run() error {
 	relaySvc, err := application.NewRelayService(application.RelayServiceConfig{
 		Store:     store,
 		Transport: botTransport,
-		Messages:  store, // reuses messages table (migration 0013) for outbound audit
+		Audit:     store, // audit_events table (migration 0001) for metadata-only audit
 	})
 	if err != nil {
 		return fmt.Errorf("relay service: %w", err)
@@ -649,7 +651,7 @@ func run() error {
 		Messages:       store, // messages table (migration 0013)
 		ToolPolicy:     strings.TrimSpace(*modelPolicyVersion),
 		SourceInstance: instanceID,
-		Teams:          teamSvc, // P1 team lifecycle (migration 0016)
+		Teams:          teamSvc,  // P1 team lifecycle (migration 0016)
 		Relay:          relaySvc, // P1 @username relay (migration 0017)
 	})
 	if err != nil {

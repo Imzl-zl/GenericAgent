@@ -20,7 +20,7 @@
 | D6 | 持久化 | 每个成功 task 采用文件与数据库分阶段 checkpoint；恢复只认最后一个 committed snapshot；崩溃 running task 不自动重放 |
 | D7 | 密钥 | 真实 LLM Key 只在 LLM Proxy；bot/token/cursor 字段加密 |
 | D8 | 绑定 | QR 扫码即绑定，无需 `/activate`；iLink 官方流程在 `confirmed` 时直接返回 `ilink_bot_id`/`bot_token`/`ilink_user_id`/`baseurl` 顶层字段（见 [iLink 绑定流程 SPEC](2026-07-25-ilink-official-binding-flow.md)） |
-| D9 | 中继 | 仅整句 `@username`；命令冲突用短 ID 状态机 |
+| D9 | 中继 | `@username <消息内容>` 直接转发，无状态；接收方 `/relay_off` 拒收；仅个人上下文触发，团队上下文里 `@username` 作为普通消息给 AI |
 | D10 | 团队邀请 | 邀请码和直接邀请都走双确认 |
 | D11 | 团队 key_info | 共享；PRD 明示隐私边界 |
 | D12 | `/stop` | 仅取消 requester 自己的 running task |
