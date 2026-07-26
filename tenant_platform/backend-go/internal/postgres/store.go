@@ -409,7 +409,10 @@ RETURNING `+taskSelectColumns, taskID, workerInstanceID, platformInstanceID)
 	return task, err
 }
 
-// MarkRunning advances starting -> running after Worker acceptance.
+// MarkRunning advances starting -> running after Worker acceptance. If the
+// row no longer matches (cancelled, lease lost, or already terminal), the
+// UPDATE returns zero rows; we re-read the current state so callers can
+// distinguish "task was cancelled" from "task not found".
 func (s *Store) MarkRunning(ctx context.Context, taskID, platformInstanceID string) (domain.Task, error) {
 	var task domain.Task
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
@@ -417,9 +420,21 @@ func (s *Store) MarkRunning(ctx context.Context, taskID, platformInstanceID stri
 UPDATE tasks SET status = 'running', updated_at = timezone('utc', now())
 WHERE id = $1 AND claim_owner = $2 AND status = 'starting'
   AND worker_dispatch_started_at IS NOT NULL
+  AND cancel_requested_at IS NULL
 RETURNING `+taskSelectColumns, taskID, platformInstanceID)
 		t, err := scanTask(row)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// UPDATE matched nothing; re-read to surface the real reason
+				// (cancelled, lease lost, state changed) instead of ErrNoRows.
+				r2 := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1`, taskID)
+				t2, err2 := scanTask(r2)
+				if err2 != nil {
+					return err
+				}
+				task = t2
+				return nil
+			}
 			return err
 		}
 		if err := insertNextEvent(ctx, tx, t.ID, "status_transition", nil, nil, "starting", "running", t.WorkerInstanceID, ""); err != nil {
@@ -433,10 +448,15 @@ RETURNING `+taskSelectColumns, taskID, platformInstanceID)
 
 // RecordChunkEvent stores bounded chunk metadata only (no text).
 // Also updates last_activity_at for idle/deadlock detection (reaper).
+// No-op when the task is already terminal: avoids inserting chunk events and
+// refreshing last_activity_at on cancelled/completed tasks.
 func (s *Store) RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		var lockedTaskID string
-		if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&lockedTaskID); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 AND status IN ('starting','running') FOR UPDATE`, taskID).Scan(&lockedTaskID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
 			return err
 		}
 		bc := byteCount
@@ -536,7 +556,11 @@ RETURNING `+taskSelectColumns, taskID)
 	return task, needWorker, err
 }
 
-// RecoverAfterRestart interrupts expired foreign-owner starting/running rows.
+// RecoverAfterRestart interrupts expired starting/running rows whose claim
+// lease has lapsed. Both foreign owners (multi-instance failover) and self
+// (single-instance restart) are recovered: after a restart the prior lease
+// is stale even if claim_owner matches this instance, so excluding self would
+// leave those rows stuck forever.
 func (s *Store) RecoverAfterRestart(ctx context.Context, platformInstanceID string) (int, error) {
 	if strings.TrimSpace(platformInstanceID) == "" {
 		return 0, fmt.Errorf("platform instance id is required")
@@ -547,11 +571,10 @@ func (s *Store) RecoverAfterRestart(ctx context.Context, platformInstanceID stri
 SELECT `+taskSelectColumns+` FROM tasks
 WHERE status IN ('starting','running')
   AND claim_owner IS NOT NULL
-  AND claim_owner <> $1
   AND claim_lease_until IS NOT NULL
   AND claim_lease_until < timezone('utc', now())
 FOR UPDATE
-`, platformInstanceID)
+`)
 		if err != nil {
 			return err
 		}

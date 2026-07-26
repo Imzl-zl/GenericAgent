@@ -60,10 +60,13 @@ func run() error {
 		return fmt.Errorf("load cipher: %w", err)
 	}
 
-	providerSource, err := buildProviderSource(*databaseURL, *upstreamBaseURL, *upstreamAPIKey,
+	providerSource, providerCleanup, err := buildProviderSource(*databaseURL, *upstreamBaseURL, *upstreamAPIKey,
 		domain.LLMProviderType(*providerType), *model, cipher)
 	if err != nil {
 		return err
+	}
+	if providerCleanup != nil {
+		defer providerCleanup()
 	}
 
 	cfg := llmproxy.Config{
@@ -116,41 +119,40 @@ func firstNonEmpty(a, b string) string {
 }
 
 func loadCipher(cipherKeyHex string, signingKey []byte) (secret.TokenCipher, error) {
-	if cipherKeyHex != "" {
-		return secret.NewStaticKeyCipherFromHex(cipherKeyHex)
+	_ = signingKey
+	if cipherKeyHex == "" {
+		return nil, fmt.Errorf("--llm-provider-key (or LLM_PROVIDER_KEY) is required; the AES-256-GCM key must be provided explicitly from a secret manager")
 	}
-	// Dev fallback: derive a 32-byte key from the signing key. This is only
-	// suitable for local development; production deployments must provide
-	// --llm-provider-key from a secret manager.
-	return secret.NewStaticKeyCipher(signingKey[:32])
+	return secret.NewStaticKeyCipherFromHex(cipherKeyHex)
 }
 
 func buildProviderSource(databaseURL, upstreamBaseURL, upstreamAPIKey string,
-	providerType domain.LLMProviderType, model string, cipher secret.TokenCipher) (llmproxy.ProviderSource, error) {
+	providerType domain.LLMProviderType, model string, cipher secret.TokenCipher) (llmproxy.ProviderSource, func(), error) {
 	if databaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		pool, err := pgxpool.New(ctx, databaseURL)
 		if err != nil {
-			return nil, fmt.Errorf("connect postgres: %w", err)
+			return nil, nil, fmt.Errorf("connect postgres: %w", err)
 		}
-		defer pool.Close()
 		store, err := postgres.NewStore(pool)
 		if err != nil {
-			return nil, fmt.Errorf("create store: %w", err)
+			pool.Close()
+			return nil, nil, fmt.Errorf("create store: %w", err)
 		}
-		return store, nil
+		// Caller owns pool lifetime; closing it here would break the returned store.
+		return store, pool.Close, nil
 	}
 
 	if upstreamBaseURL == "" {
-		return nil, fmt.Errorf("--upstream-base-url required in static mode (or use --database-url)")
+		return nil, nil, fmt.Errorf("--upstream-base-url required in static mode (or use --database-url)")
 	}
 	if upstreamAPIKey == "" {
-		return nil, fmt.Errorf("--upstream-apikey required in static mode (or use --database-url)")
+		return nil, nil, fmt.Errorf("--upstream-apikey required in static mode (or use --database-url)")
 	}
 	ciphertext, version, err := cipher.Encrypt([]byte(upstreamAPIKey))
 	if err != nil {
-		return nil, fmt.Errorf("encrypt upstream key: %w", err)
+		return nil, nil, fmt.Errorf("encrypt upstream key: %w", err)
 	}
 	return &staticProviderSource{
 		provider: domain.LLMProvider{
@@ -162,7 +164,7 @@ func buildProviderSource(databaseURL, upstreamBaseURL, upstreamAPIKey string,
 			IsDefault:        true,
 			State:            "active",
 		},
-	}, nil
+	}, nil, nil
 }
 
 type staticProviderSource struct {

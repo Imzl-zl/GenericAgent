@@ -32,8 +32,7 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("GET /v1/admin/invite-codes", s.auth(s.handleAdminListInviteCodes))
 		s.mux.HandleFunc("DELETE /v1/admin/invite-codes/{code}", s.auth(s.handleAdminRevokeInviteCode))
 	}
-	if s.botSvc != nil && s.cipher != nil {
-		s.mux.HandleFunc("POST /v1/users/me/bots", s.userAuth(s.handleBindOwnBot))
+	if s.botSvc != nil {
 		s.mux.HandleFunc("GET /v1/users/me/bots", s.userAuth(s.handleGetOwnBot))
 	}
 	if s.wechatBinding != nil {

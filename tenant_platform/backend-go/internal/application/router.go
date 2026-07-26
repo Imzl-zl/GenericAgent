@@ -185,13 +185,22 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 		return RouterResult{Action: ActionRejected, Reply: reply}, nil
 	}
+	// Resolve active context early so persistInbound records the correct
+	// session_key (personal:{user_id} vs team:{team_id}). Falls back to
+	// personal session when teams are disabled or context lookup fails.
+	inboundSessionKey := personalSessionKey(bot.OwnerID)
+	if r.teams != nil {
+		if ac, err := r.teams.GetActiveContext(ctx, bot.OwnerID); err == nil {
+			inboundSessionKey = ac.SessionKey(bot.OwnerID)
+		}
+	}
 	// Persist inbound message for history/audit and as the cross-instance
 	// idempotency backstop. The partial UNIQUE(bot_id, message_id) index
 	// rejects duplicates when the in-memory seen map is cold (restart) or
 	// split across instances. Persistence failure is non-fatal: the message
 	// is still routed so the user is not blocked; the missing audit row is
 	// acceptable, but we log loudly so DB issues surface fast.
-	if _, perr := r.persistInbound(ctx, msg, bot); perr != nil {
+	if _, perr := r.persistInbound(ctx, msg, bot, inboundSessionKey); perr != nil {
 		if errors.Is(perr, domain.ErrDuplicateInboundMessage) {
 			return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
 		}
@@ -545,7 +554,7 @@ func personalSessionKey(userID int64) string {
 // are best-effort: failures are logged but do not block message routing, and
 // duplicates (ErrDuplicateMediaAsset) are silent successes (the cross-instance
 // UNIQUE constraint already recorded the file).
-func (r *router) persistInbound(ctx context.Context, msg IncomingMessage, bot domain.Bot) (domain.Message, error) {
+func (r *router) persistInbound(ctx context.Context, msg IncomingMessage, bot domain.Bot, sessionKey string) (domain.Message, error) {
 	mediaPath := ""
 	if len(msg.MediaPaths) > 0 {
 		mediaPath = msg.MediaPaths[0]
@@ -553,7 +562,7 @@ func (r *router) persistInbound(ctx context.Context, msg IncomingMessage, bot do
 	msgRow, err := r.messages.InsertInboundMessage(ctx, domain.Message{
 		UserID:      bot.OwnerID,
 		BotID:       bot.ID,
-		SessionKey:  personalSessionKey(bot.OwnerID),
+		SessionKey:  sessionKey,
 		MessageID:   msg.MessageID,
 		MessageType: inferMessageType(msg.MediaPaths),
 		Content:     msg.Text,

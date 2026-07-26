@@ -59,18 +59,24 @@ class SessionLifecycleMixin:
                 "UNKNOWN_CAPABILITY",
                 f"unknown capability_version: {policy.capability_version}",
             )
+        # task_timeout_seconds=0 means disabled (matches platform --task-timeout-seconds=0
+        # convention); only positive values are enforced as a wall-clock deadline.
         for name, value in (
             ("max_turns", policy.max_turns),
             ("max_history_bytes", policy.max_history_bytes),
             ("max_working_bytes", policy.max_working_bytes),
             ("max_output_bytes", policy.max_output_bytes),
-            ("task_timeout_seconds", policy.task_timeout_seconds),
         ):
             if int(value) <= 0:
                 raise WorkerAdapterError(
                     "INVALID_RUNTIME_POLICY",
                     f"{name} must be positive, got {value}",
                 )
+        if int(policy.task_timeout_seconds) < 0:
+            raise WorkerAdapterError(
+                "INVALID_RUNTIME_POLICY",
+                f"task_timeout_seconds must be non-negative, got {policy.task_timeout_seconds}",
+            )
 
     def _create_session(self, request: worker_pb2.StartSessionRequest) -> worker_pb2.StartSessionResponse:
         try:

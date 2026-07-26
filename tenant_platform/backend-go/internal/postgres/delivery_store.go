@@ -87,33 +87,39 @@ WHERE d.task_id = t.id
 	return tag.RowsAffected(), nil
 }
 
-// MarkDeliveryAcked records that the carrier accepted the message.
+// MarkDeliveryAcked records that the carrier accepted the message. Only
+// pending/sending rows can transition to acked; if the row is already acked
+// or dead_letter, the UPDATE matches zero rows and this is a no-op (idempotent).
 func (s *Store) MarkDeliveryAcked(ctx context.Context, deliveryID string, ackedAt time.Time) error {
 	_, err := s.pool.Exec(ctx, `
 UPDATE task_deliveries
 SET status = 'acked', acked_at = $2, updated_at = $2
-WHERE delivery_id = $1
+WHERE delivery_id = $1 AND status IN ('pending','sending')
 `, deliveryID, ackedAt)
 	return err
 }
 
-// MarkDeliveryRetry returns a failed delivery to pending for a future attempt.
+// MarkDeliveryRetry returns a failed sending delivery to pending for a future
+// attempt. Only rows still in 'sending' can retry; acked/dead_letter rows are
+// left untouched.
 func (s *Store) MarkDeliveryRetry(ctx context.Context, deliveryID string, nextAttemptAt time.Time, now time.Time) error {
 	_, err := s.pool.Exec(ctx, `
 UPDATE task_deliveries
 SET status = 'pending', next_attempt_at = $2, attempt_lease_until = NULL, updated_at = $3
-WHERE delivery_id = $1
+WHERE delivery_id = $1 AND status = 'sending'
 `, deliveryID, nextAttemptAt, now)
 	return err
 }
 
-// MarkDeliveryDeadLetter moves a delivery to the dead-letter state.
+// MarkDeliveryDeadLetter moves a delivery to the dead-letter state. Only
+// pending/sending rows can be dead-lettered; already-acked rows are left
+// untouched (carrier already accepted the message).
 func (s *Store) MarkDeliveryDeadLetter(ctx context.Context, deliveryID string, errCode, errMessage string, terminalAt time.Time) error {
 	_, err := s.pool.Exec(ctx, `
 UPDATE task_deliveries
 SET status = 'dead_letter', error_code = $2, error_message = $3,
     terminal_at = $4, updated_at = $4
-WHERE delivery_id = $1
+WHERE delivery_id = $1 AND status IN ('pending','sending')
 `, deliveryID, errCode, errMessage, terminalAt)
 	return err
 }

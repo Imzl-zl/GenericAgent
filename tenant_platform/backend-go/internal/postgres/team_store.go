@@ -160,14 +160,14 @@ func authorizeSubmitter(tx pgx.Tx, ctx context.Context, kind string, ownerID int
 			return nil
 		}
 		var count int
-		if err := tx.QueryRow(ctx, `
-SELECT COUNT(*) FROM team_members WHERE team_id = $1::uuid AND user_id = $2
+	if err := tx.QueryRow(ctx, `
+SELECT COUNT(*) FROM team_members WHERE team_id = $1::uuid AND user_id = $2 AND status = 'approved'
 `, teamID, requester).Scan(&count); err != nil {
-			return err
-		}
-		if count == 0 {
-			return fmt.Errorf("requester %d is not a member of team %s", requester, teamID)
-		}
+		return err
+	}
+	if count == 0 {
+		return fmt.Errorf("requester %d is not an approved member of team %s", requester, teamID)
+	}
 		return nil
 	default:
 		return fmt.Errorf("unknown workspace kind %q", kind)
@@ -182,7 +182,7 @@ func (s *Store) IsTeamMember(ctx context.Context, teamID string, userID int64) (
 	}
 	var count int
 	err := s.pool.QueryRow(ctx, `
-SELECT COUNT(*) FROM team_members WHERE team_id = $1::uuid AND user_id = $2
+SELECT COUNT(*) FROM team_members WHERE team_id = $1::uuid AND user_id = $2 AND status = 'approved'
 `, teamID, userID).Scan(&count)
 	if err != nil {
 		return false, err

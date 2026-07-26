@@ -60,13 +60,12 @@ func TestIMWebhookRoutesMessage(t *testing.T) {
 	}}
 	server := newTestServerWithRouter(t, router)
 
-	body, _ := json.Marshal(imWebhookBody{
+	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
 		BotUUID:    "bot-1",
 		IlinkUserID: "user-1",
 		MessageID:  "msg-1",
 		Text:       "hello",
 	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 
@@ -84,8 +83,7 @@ func TestIMWebhookRoutesMessage(t *testing.T) {
 
 func TestIMWebhookRejectsMissingFields(t *testing.T) {
 	server := newTestServerWithRouter(t, &fakeRouter{})
-	body, _ := json.Marshal(imWebhookBody{BotUUID: "bot-1"})
-	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
+	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{BotUUID: "bot-1"})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -97,8 +95,7 @@ func TestIMWebhookAuthExpired(t *testing.T) {
 	lc := &fakeBotLifecycle{}
 	server := newTestServerWithRouterAndLifecycle(t, &fakeRouter{}, lc)
 
-	body, _ := json.Marshal(imWebhookBody{BotUUID: "bot-1", AuthExpired: true})
-	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
+	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{BotUUID: "bot-1", AuthExpired: true})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 
@@ -120,14 +117,13 @@ func TestIMWebhookPersistsUpdatesBuf(t *testing.T) {
 	router := &fakeRouter{result: application.RouterResult{Action: application.ActionTaskCreated}}
 	server := newTestServerWithRouterAndLifecycle(t, router, lc)
 
-	body, _ := json.Marshal(imWebhookBody{
+	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
 		BotUUID:    "bot-1",
 		IlinkUserID: "user-1",
 		MessageID:  "msg-1",
 		Text:       "hello",
 		UpdatesBuf: "cursor-123",
 	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 
@@ -147,14 +143,13 @@ func TestIMWebhookForwardsMediaPaths(t *testing.T) {
 	captured := &captureRouter{result: application.RouterResult{Action: application.ActionTaskCreated}}
 	server := newTestServerWithRouter(t, captured)
 
-	body, _ := json.Marshal(imWebhookBody{
+	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
 		BotUUID:    "bot-1",
 		IlinkUserID: "user-1",
 		MessageID:  "msg-1",
 		Text:       "see attached",
 		MediaPaths: []string{"/tmp/media/bot-1/img.jpg", "/tmp/media/bot-1/img2.jpg"},
 	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 
@@ -196,6 +191,7 @@ func newTestServerWithRouterAndLifecycle(t *testing.T, router application.Router
 		DevToken:     "dev-token",
 		DevUserID:    1,
 		SessionKey:   "personal:1",
+		WebhookSecret: "test-secret",
 	})
 	if err != nil {
 		t.Fatalf("server: %v", err)

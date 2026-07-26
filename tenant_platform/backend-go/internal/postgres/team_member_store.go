@@ -127,6 +127,25 @@ WHERE user_id = $1
 `, m.UserID, now); err != nil {
 			return err
 		}
+		// Cancel the removed member's queued tasks in this team's workspace.
+		// Without this, tasks submitted before removal would still dispatch to
+		// a Worker after the member lost access (authorizeSubmitter would now
+		// reject, but the task is already queued and may be claimed).
+		teamSessionKey := fmt.Sprintf("team:%s", m.TeamID)
+		if _, err := tx.Exec(ctx, `
+UPDATE tasks SET
+  status = 'cancelled',
+  claim_owner = NULL,
+  claim_lease_until = NULL,
+  claimed_at = NULL,
+  terminal_error_code = 'TASK_CANCELLED',
+  terminal_error_message = 'member removed from team',
+  terminal_at = timezone('utc', now()),
+  updated_at = timezone('utc', now())
+WHERE requester_user_id = $1 AND session_key = $2 AND status = 'queued'
+`, m.UserID, teamSessionKey); err != nil {
+			return err
+		}
 		m.Status = domain.MemberRemoved
 		m.RemovedAt = &now
 		m.UpdatedAt = now

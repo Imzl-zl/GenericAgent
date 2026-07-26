@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 )
@@ -65,15 +64,12 @@ func convertWebhookMedia(items []webhookMedia) []application.IncomingMediaItem {
 // HMAC-SHA256(secret, body) computed by the Bot Poller.
 const webhookSignatureHeader = "X-Webhook-Signature"
 
-// emptySecretOnce gates a one-shot warning so the operator sees exactly one
-// log line when running without webhook auth (dev/test only).
-var emptySecretOnce sync.Once
-
 // handleIMWebhook receives inbound messages from the Bot Poller and routes
-// them through the router pipeline. When webhookSecret is set, the request
-// must carry X-Webhook-Signature = hex(HMAC-SHA256(secret, body)); this
-// prevents unauthenticated callers from injecting fake inbound messages.
-// When the secret is empty (dev/test), a one-shot warning is logged.
+// them through the router pipeline. The request must carry
+// X-Webhook-Signature = hex(HMAC-SHA256(secret, body)); this prevents
+// unauthenticated callers from injecting fake inbound messages. When
+// webhookSecret is empty, every request is rejected (fail-closed). Configure
+// --webhook-secret (even a dummy value for dev/test) to allow inbound.
 func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	bodyBytes := readBody(r)
@@ -152,15 +148,12 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 // verifyWebhookSignature returns true when the request signature matches
-// HMAC-SHA256(secret, body). When secret is empty the check is skipped
-// (dev/test only) and a one-shot warning is logged so production deployments
-// don't accidentally run unauthenticated.
+// HMAC-SHA256(secret, body). Empty secret is fail-closed: every request is
+// rejected. Configure --webhook-secret (even a dummy value for dev/test) to
+// allow inbound webhooks.
 func (s *Server) verifyWebhookSignature(body []byte, sigHex string) bool {
 	if s.webhookSecret == "" {
-		emptySecretOnce.Do(func() {
-			slog.Warn("im_webhook: webhook secret empty; /v1/im/webhook is unauthenticated (dev/test only)")
-		})
-		return true
+		return false
 	}
 	if sigHex == "" {
 		return false

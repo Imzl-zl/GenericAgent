@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -19,6 +20,10 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/secret"
 )
+
+// MaxRequestBodyBytes caps JSON bodies on user-facing endpoints to prevent
+// memory exhaustion from oversized payloads (Slowloris-style).
+const MaxRequestBodyBytes int64 = 1 << 20 // 1 MiB
 
 // Server is the loopback HTTP API.
 type Server struct {
@@ -217,7 +222,6 @@ type createTaskBody struct {
 	Source            string   `json:"source"`
 	PersonaSnapshot   []string `json:"persona_snapshot"`
 	ToolPolicyVersion string   `json:"tool_policy_version"`
-	RequesterUserID   int64    `json:"requester_user_id,omitempty"`
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -242,9 +246,14 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "POLICY_REJECTED", err.Error(), tid)
 		return
 	}
+	// RequesterUserID is taken from the authenticated principal, never from the
+	// request body. In dev-token mode (s.auth) this is the configured devUserID;
+	// when this endpoint moves to userAuth (P1 production hardening), it will
+	// come from userIDFromContext. Allowing the body to override it would let
+	// any dev-token holder impersonate arbitrary users.
 	requester := s.devUserID
-	if body.RequesterUserID > 0 {
-		requester = body.RequesterUserID
+	if uid, ok := userIDFromContext(r.Context()); ok {
+		requester = uid
 	}
 	task, err := s.svc.SubmitTask(r.Context(), domain.SubmitTaskCommand{
 		SessionKey:        sessionKey,
@@ -390,7 +399,10 @@ func traceID() string {
 	return uuid.NewString()
 }
 
-// ServeContext starts the server and shuts down on ctx cancel.
+// ServeContext runs the HTTP server with sane timeouts and middleware until
+// ctx is cancelled. The handler chain applies: body-size limit (prevents
+// memory exhaustion), panic recovery (logs stack trace, returns 500 without
+// leaking internals). Timeouts protect against Slowloris and stuck writers.
 func ServeContext(ctx context.Context, addr string, h http.Handler) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -400,7 +412,16 @@ func ServeContext(ctx context.Context, addr string, h http.Handler) error {
 	if ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("platform API must bind loopback, got %s", addr)
 	}
-	srv := &http.Server{Addr: addr, Handler: h}
+	wrapped := recoverMiddleware(bodyLimitMiddleware(MaxRequestBodyBytes)(h))
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           wrapped,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
+	}
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 	select {
@@ -412,4 +433,34 @@ func ServeContext(ctx context.Context, addr string, h http.Handler) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// bodyLimitMiddleware wraps r.Body with http.MaxBytesReader so any single
+// request body beyond max bytes is rejected with 413.
+func bodyLimitMiddleware(max int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, max)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// recoverMiddleware catches panics from handlers, logs the stack trace, and
+// returns a generic 500 so internal details (SQL errors, file paths, stack
+// frames) don't leak to clients.
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.ErrorContext(r.Context(), "api: panic recovered",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"panic", rec,
+				)
+				writeErr(w, http.StatusInternalServerError, "INTERNAL", "internal server error", traceID())
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
