@@ -87,3 +87,29 @@ func TestHealthzReturnsOk(t *testing.T) {
 		t.Fatalf("status field = %q, want ok", body["status"])
 	}
 }
+
+func TestNewHTTPServerUsesStreamingSafeTimeouts(t *testing.T) {
+	server := NewHTTPServer("127.0.0.1:0", http.NotFoundHandler())
+	if server.ReadHeaderTimeout != 10*time.Second || server.ReadTimeout != 30*time.Second {
+		t.Fatalf("read timeouts = %s/%s", server.ReadHeaderTimeout, server.ReadTimeout)
+	}
+	if server.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %s, want no whole-response timeout", server.WriteTimeout)
+	}
+	if server.IdleTimeout != 120*time.Second || server.MaxHeaderBytes != 1<<20 {
+		t.Fatalf("idle/header limits = %s/%d", server.IdleTimeout, server.MaxHeaderBytes)
+	}
+}
+
+func TestParseNetworkPolicyList(t *testing.T) {
+	got := ParseNetworkPolicyList(" 10.0.0.0/8, 192.168.0.0/16\napi.internal:8080 ,, ")
+	want := []string{"10.0.0.0/8", "192.168.0.0/16", "api.internal:8080"}
+	if len(got) != len(want) {
+		t.Fatalf("got=%v want=%v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got=%v want=%v", got, want)
+		}
+	}
+}

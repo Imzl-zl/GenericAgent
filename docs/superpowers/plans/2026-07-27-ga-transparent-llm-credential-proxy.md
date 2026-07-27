@@ -918,13 +918,13 @@ git commit --only -m "feat: add safe native llm routing policy" -- tenant_platfo
 - Create: `tenant_platform/backend-go/internal/infrastructure/llmproxy/reverse_proxy_test.go`
 - Modify: `tenant_platform/backend-go/cmd/llm-proxy/main.go`
 - Modify: `tenant_platform/backend-go/cmd/platform/main.go`
-- Delete: `tenant_platform/backend-go/internal/application/token_revoker.go`
+- Verify unchanged: `tenant_platform/backend-go/internal/application/token_revoker.go` remains the persistent scheduler revocation port; no HTTP revoker is retained.
 
 **Interfaces:**
 - Consumes: strict JWT validator, `ProviderSource.GetProvider(id)`, revocation store, target/header/transport policies.
 - Produces: transparent `http.Handler` for chat, Responses, and messages with SSE.
 
-- [ ] **Step 1: Write failing end-to-end proxy tests**
+- [x] **Step 1: Write failing end-to-end proxy tests**
 
 Use `httptest.Server` fixture routes for:
 
@@ -949,7 +949,7 @@ upstreamDone := make(chan struct{})
 // Client must read the first event before upstreamDone closes.
 ```
 
-- [ ] **Step 2: Run proxy tests and observe RED**
+- [x] **Step 2: Run proxy tests and observe RED**
 
 ```bash
 cd tenant_platform/backend-go
@@ -958,7 +958,7 @@ go test ./internal/infrastructure/llmproxy -run 'TestReverseProxy|TestSSE|TestCa
 
 Expected: failures because current routes omit Responses, buffer responses, drop headers, and ignore claims.
 
-- [ ] **Step 3: Implement request validation context**
+- [x] **Step 3: Implement request validation context**
 
 ```go
 type proxyRequestContext struct {
@@ -979,11 +979,11 @@ target resolution -> decrypted key -> attach context -> ReverseProxy.ServeHTTP
 
 Return stable error codes; never fall back to default Provider.
 
-- [ ] **Step 4: Implement one shared ReverseProxy**
+- [x] **Step 4: Implement one shared ReverseProxy**
 
 `Rewrite` reads `proxyRequestContext`, calls `SetURL`, sets Host, rebuilds allowlisted request headers, and injects auth. A routing `RoundTripper` chooses the cached transport from context. `ModifyResponse` always rebuilds response headers from the exact allowlist `Content-Type`, `Content-Length`, `Content-Encoding`, `Cache-Control`, `Vary`, `Retry-After`, `X-Request-Id`, `Request-Id`, `OpenAI-Request-Id`, and `Anthropic-Request-Id`. For 2xx it does not read the body; for non-2xx it retains status and allowed retry/request metadata while replacing the body with a bounded generic JSON envelope. Set `FlushInterval = -1` for immediate streaming writes.
 
-- [ ] **Step 5: Correct HTTP server timeouts**
+- [x] **Step 5: Correct HTTP server timeouts**
 
 Set:
 
@@ -997,11 +997,11 @@ MaxHeaderBytes:    1 << 20,
 
 Do not add a whole-response `http.Client.Timeout` or handler `context.WithTimeout` that truncates SSE. Task wall-clock and client cancellation own total lifetime.
 
-- [ ] **Step 6: Remove old forwarder and HTTP revocation path**
+- [x] **Step 6: Remove old forwarder and HTTP revocation path**
 
-Delete buffered `Upstream`, `/internal/revoke`, and `HTTPTokenRevoker`. Scheduler writes revocations through the persistence port. Rename tests so no file or identifier claims protocol reconstruction remains.
+Delete buffered `Upstream` and ensure `/internal/revoke` and `HTTPTokenRevoker` remain absent. Retain `persistentTokenRevoker`, because Scheduler writes revocations through that persistence port.
 
-- [ ] **Step 7: Run all Proxy tests**
+- [x] **Step 7: Run all Proxy tests**
 
 ```bash
 cd tenant_platform/backend-go
@@ -1011,13 +1011,12 @@ go test ./cmd/llm-proxy -count=1
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit Task 7**
+- [x] **Step 8: Commit Task 7**
 
 ```bash
-git mv tenant_platform/backend-go/internal/infrastructure/llmproxy/upstream_test.go tenant_platform/backend-go/internal/infrastructure/llmproxy/reverse_proxy_test.go
-git rm tenant_platform/backend-go/internal/infrastructure/llmproxy/upstream.go tenant_platform/backend-go/internal/application/token_revoker.go
+git rm tenant_platform/backend-go/internal/infrastructure/llmproxy/upstream.go tenant_platform/backend-go/internal/infrastructure/llmproxy/upstream_test.go
 git add tenant_platform/backend-go/internal/infrastructure/llmproxy tenant_platform/backend-go/cmd/llm-proxy/main.go tenant_platform/backend-go/cmd/platform/main.go
-git commit --only -m "refactor: transparently stream native llm traffic" -- tenant_platform/backend-go/internal/infrastructure/llmproxy tenant_platform/backend-go/cmd/llm-proxy/main.go tenant_platform/backend-go/cmd/platform/main.go tenant_platform/backend-go/internal/application/token_revoker.go
+git commit --only -m "refactor: transparently stream native llm traffic" -- tenant_platform/backend-go/internal/infrastructure/llmproxy tenant_platform/backend-go/cmd/llm-proxy/main.go tenant_platform/backend-go/cmd/platform/main.go
 ```
 
 ### Task 8: Clean Cutover Admin API, OpenAPI, and Web Configuration

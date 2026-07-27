@@ -62,12 +62,14 @@ func run() error {
 	}
 
 	cfg := llmproxy.Config{
-		Listen:         *listen,
-		SigningKey:     key,
-		TokenTTL:       *tokenTTL,
-		ProviderSource: providerSource,
-		Cipher:         cipher,
-		Revocations:    revocations,
+		Listen:               *listen,
+		SigningKey:           key,
+		TokenTTL:             *tokenTTL,
+		ProviderSource:       providerSource,
+		Cipher:               cipher,
+		Revocations:          revocations,
+		AllowedUpstreamCIDRs: llmproxy.ParseNetworkPolicyList(os.Getenv("LLM_PROXY_ALLOWED_UPSTREAM_CIDRS")),
+		AllowedHTTPHosts:     llmproxy.ParseNetworkPolicyList(os.Getenv("LLM_PROXY_ALLOW_HTTP_HOSTS")),
 	}
 
 	srv, err := llmproxy.NewServer(cfg)
@@ -78,15 +80,7 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	httpSrv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1 MiB
-	}
+	httpSrv := llmproxy.NewHTTPServer(cfg.Listen, srv.Handler())
 
 	serve := func() error {
 		errCh := make(chan error, 1)

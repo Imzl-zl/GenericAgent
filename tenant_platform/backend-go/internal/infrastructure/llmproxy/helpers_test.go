@@ -3,9 +3,12 @@ package llmproxy
 import (
 	"context"
 	"errors"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
+
+const testUpstreamKey = "real-upstream-key-do-not-leak"
 
 // fakeCipher is a test cipher that treats the ciphertext as plaintext. It
 // validates the expected key version for tests that exercise version handling.
@@ -17,28 +20,38 @@ func (c *fakeCipher) Decrypt(ciphertext []byte, keyVersion int) ([]byte, error) 
 	if c.wantVersion != 0 && keyVersion != c.wantVersion {
 		return nil, errors.New("key version mismatch")
 	}
-	return ciphertext, nil
+	return append([]byte(nil), ciphertext...), nil
 }
 
-// fakeProviderSource returns a fixed provider for handler tests.
+// fakeProviderSource returns one Provider by its durable ID.
 type fakeProviderSource struct {
-	provider domain.LLMProvider
-	err      error
+	provider    domain.LLMProvider
+	err         error
+	requestedID int64
 }
 
-func (s *fakeProviderSource) GetDefaultProvider(ctx context.Context) (domain.LLMProvider, error) {
+func (s *fakeProviderSource) GetProvider(ctx context.Context, id int64) (domain.LLMProvider, error) {
 	_ = ctx
-	return s.provider, s.err
+	s.requestedID = id
+	if s.err != nil {
+		return domain.LLMProvider{}, s.err
+	}
+	if s.provider.ID != id {
+		return domain.LLMProvider{}, pgx.ErrNoRows
+	}
+	return s.provider, nil
 }
 
 func testProvider(providerType domain.LLMProviderType, baseURL, model, key string) domain.LLMProvider {
 	return domain.LLMProvider{
+		ID:               1,
 		ProviderType:     providerType,
 		BaseURL:          baseURL,
 		Model:            model,
 		APIKeyCiphertext: []byte(key),
 		APIKeyKeyVersion: "1",
 		APIKey:           key,
+		Revision:         1,
 		IsDefault:        true,
 		State:            "active",
 	}

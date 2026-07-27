@@ -107,7 +107,9 @@ func TestNetworkPolicyEnforcesConfiguredCIDRsAndHTTPHosts(t *testing.T) {
 
 func TestTransportUsesExplicitLoopbackPolicyAndDoesNotFollowRedirects(t *testing.T) {
 	targetHits := 0
+	var acceptEncoding string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		acceptEncoding = r.Header.Get("Accept-Encoding")
 		switch r.URL.Path {
 		case "/redirect":
 			w.Header().Set("Location", "/target")
@@ -147,6 +149,9 @@ func TestTransportUsesExplicitLoopbackPolicyAndDoesNotFollowRedirects(t *testing
 	_, _ = io.Copy(io.Discard, response.Body)
 	if response.StatusCode != http.StatusFound || targetHits != 0 {
 		t.Fatalf("status=%d target_hits=%d", response.StatusCode, targetHits)
+	}
+	if acceptEncoding != "" {
+		t.Fatalf("Transport synthesized Accept-Encoding %q", acceptEncoding)
 	}
 }
 

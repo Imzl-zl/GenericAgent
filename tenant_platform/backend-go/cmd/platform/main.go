@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -93,11 +92,13 @@ func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRunti
 // is fetched from the admin-configured provider store and decrypted with the
 // cipher; it is never part of this static config.
 type llmProxyConfig struct {
-	externalAddr   string // when non-empty, use external Proxy (no in-process start)
-	signingKey     string // HMAC signing key for capability JWTs (>=32 bytes)
-	providerSource llmproxy.ProviderSource
-	cipher         llmproxy.TokenCipher
-	revocations    llmproxy.CapabilityRevocationSource
+	externalAddr         string // when non-empty, use external Proxy (no in-process start)
+	signingKey           string // HMAC signing key for capability JWTs (>=32 bytes)
+	providerSource       llmproxy.ProviderSource
+	cipher               llmproxy.TokenCipher
+	revocations          llmproxy.CapabilityRevocationSource
+	allowedUpstreamCIDRs []string
+	allowedHTTPHosts     []string
 }
 
 // ensureDevDefaultLLMProvider seeds a default OpenAI-compatible provider in
@@ -155,19 +156,21 @@ func startLLMProxy(ctx context.Context, cfg llmProxyConfig) (string, func(), err
 		return "", nil, fmt.Errorf("llm-proxy listen: %w", err)
 	}
 	proxyCfg := llmproxy.Config{
-		Listen:         ln.Addr().String(),
-		SigningKey:     []byte(cfg.signingKey),
-		TokenTTL:       llmproxy.DefaultTokenTTL,
-		ProviderSource: cfg.providerSource,
-		Cipher:         cfg.cipher,
-		Revocations:    cfg.revocations,
+		Listen:               ln.Addr().String(),
+		SigningKey:           []byte(cfg.signingKey),
+		TokenTTL:             llmproxy.DefaultTokenTTL,
+		ProviderSource:       cfg.providerSource,
+		Cipher:               cfg.cipher,
+		Revocations:          cfg.revocations,
+		AllowedUpstreamCIDRs: cfg.allowedUpstreamCIDRs,
+		AllowedHTTPHosts:     cfg.allowedHTTPHosts,
 	}
 	srv, err := llmproxy.NewServer(proxyCfg)
 	if err != nil {
 		_ = ln.Close()
 		return "", nil, fmt.Errorf("llm-proxy server: %w", err)
 	}
-	httpSrv := &http.Server{Handler: srv.Handler()}
+	httpSrv := llmproxy.NewHTTPServer("", srv.Handler())
 	go func() { _ = httpSrv.Serve(ln) }()
 	addr := "http://" + ln.Addr().String()
 	fmt.Fprintf(os.Stderr, "platform: in-process llm-proxy listen=%s provider_source=store\n", ln.Addr().String())
@@ -462,11 +465,13 @@ func run() error {
 	// short-lived capability_token (never the real key).
 	signingKey := firstNonEmpty(*capabilitySigningKey, os.Getenv("LLM_PROXY_CAPABILITY_SIGNING_KEY"))
 	proxyAddr, proxyShutdown, err := startLLMProxy(ctx, llmProxyConfig{
-		externalAddr:   strings.TrimSpace(*llmProxyAddr),
-		signingKey:     signingKey,
-		providerSource: store,
-		cipher:         cipher,
-		revocations:    store,
+		externalAddr:         strings.TrimSpace(*llmProxyAddr),
+		signingKey:           signingKey,
+		providerSource:       store,
+		cipher:               cipher,
+		revocations:          store,
+		allowedUpstreamCIDRs: llmproxy.ParseNetworkPolicyList(os.Getenv("LLM_PROXY_ALLOWED_UPSTREAM_CIDRS")),
+		allowedHTTPHosts:     llmproxy.ParseNetworkPolicyList(os.Getenv("LLM_PROXY_ALLOW_HTTP_HOSTS")),
 	})
 	if err != nil {
 		return err

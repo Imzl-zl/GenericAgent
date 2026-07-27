@@ -16,9 +16,11 @@ const testSigningKey = "test-signing-key-at-least-32-bytes"
 func newTestServer(t *testing.T, upstream *httptest.Server) *Server {
 	t.Helper()
 	cfg := Config{
-		Listen:     "127.0.0.1:0",
-		SigningKey: []byte(testSigningKey),
-		TokenTTL:   time.Hour,
+		Listen:               "127.0.0.1:0",
+		SigningKey:           []byte(testSigningKey),
+		TokenTTL:             time.Hour,
+		AllowedUpstreamCIDRs: []string{"127.0.0.0/8", "::1/128"},
+		AllowedHTTPHosts:     []string{upstream.Listener.Addr().String()},
 		ProviderSource: &fakeProviderSource{
 			provider: testProvider(domain.ProviderNativeOAI, upstream.URL, "gpt-test", testUpstreamKey),
 		},
@@ -60,7 +62,7 @@ func TestHandlerChatCompletionsValidToken(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt","messages":[]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-test","messages":[]}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -82,7 +84,7 @@ func TestHandlerAliasChatCompletionsPath(t *testing.T) {
 
 	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"gpt-test"}`))
 		req.Header.Set("Authorization", "Bearer "+token)
 		srv.Handler().ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -115,7 +117,7 @@ func TestHandlerRejectsInvalidToken(t *testing.T) {
 	}
 }
 
-func TestHandlerUpstream500Returns502(t *testing.T) {
+func TestHandlerUpstream500PreservesStatus(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
@@ -125,11 +127,11 @@ func TestHandlerUpstream500Returns502(t *testing.T) {
 	token, _, _ := iss.Issue(handlerCapabilitySpec("personal:1"))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-test"}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	srv.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", rec.Code)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), "UPSTREAM_ERROR") {
 		t.Fatalf("body = %q, want UPSTREAM_ERROR", rec.Body.String())
@@ -146,7 +148,7 @@ func TestHandlerUpstream429Returns429(t *testing.T) {
 	token, _, _ := iss.Issue(handlerCapabilitySpec("personal:1"))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-test"}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusTooManyRequests {
@@ -154,7 +156,7 @@ func TestHandlerUpstream429Returns429(t *testing.T) {
 	}
 }
 
-func TestHandlerRevocationEndpoint(t *testing.T) {
+func TestHandlerRejectsPersistentlyRevokedCapability(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{}`))
 	}))
@@ -165,7 +167,7 @@ func TestHandlerRevocationEndpoint(t *testing.T) {
 
 	// First call succeeds.
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-test"}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -177,7 +179,7 @@ func TestHandlerRevocationEndpoint(t *testing.T) {
 
 	// Second call fails.
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-test"}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
@@ -215,5 +217,26 @@ func TestHandlerForwardsBodyUnmodified(t *testing.T) {
 	srv.Handler().ServeHTTP(rec, req)
 	if gotBody != body {
 		t.Fatalf("forwarded body = %q, want %q", gotBody, body)
+	}
+}
+
+func TestResetRequestBodyDisablesAutomaticPOSTReplay(t *testing.T) {
+	request, err := http.NewRequest(http.MethodPost, "http://proxy.invalid/v1/responses", strings.NewReader("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.GetBody == nil {
+		t.Fatal("fixture request is not rewindable")
+	}
+	resetRequestBody(request, []byte("validated"))
+	if request.GetBody != nil {
+		t.Fatal("validated POST remains rewindable for automatic transport replay")
+	}
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "validated" || request.ContentLength != int64(len("validated")) {
+		t.Fatalf("body=%q content_length=%d", body, request.ContentLength)
 	}
 }

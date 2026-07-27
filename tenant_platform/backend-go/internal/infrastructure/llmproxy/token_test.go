@@ -188,8 +188,12 @@ func TestCapabilityValidatorRejectsWrongIssuerAndAudience(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := validator.Validate(context.Background(), raw); err == nil {
+			_, validationErr := validator.Validate(context.Background(), raw)
+			if validationErr == nil {
 				t.Fatal("expected registered claim rejection")
+			}
+			if name == "audience" && !errors.Is(validationErr, ErrCapabilityAudienceMismatch) {
+				t.Fatalf("audience error = %v", validationErr)
 			}
 		})
 	}

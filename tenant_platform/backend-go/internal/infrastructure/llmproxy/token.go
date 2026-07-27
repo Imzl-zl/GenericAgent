@@ -22,9 +22,10 @@ const (
 )
 
 var (
-	ErrCapabilityInvalid = errors.New("capability token invalid")
-	ErrCapabilityExpired = errors.New("capability token expired")
-	ErrCapabilityRevoked = errors.New("capability token revoked")
+	ErrCapabilityInvalid          = errors.New("capability token invalid")
+	ErrCapabilityExpired          = errors.New("capability token expired")
+	ErrCapabilityRevoked          = errors.New("capability token revoked")
+	ErrCapabilityAudienceMismatch = errors.New("capability token audience mismatch")
 )
 
 type CapabilitySpec struct {
@@ -155,6 +156,9 @@ func (v *Validator) Validate(ctx context.Context, tokenString string) (Capabilit
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
 			return CapabilityClaims{}, fmt.Errorf("%w: %v", ErrCapabilityExpired, err)
+		}
+		if errors.Is(err, jwt.ErrTokenInvalidAudience) {
+			return CapabilityClaims{}, fmt.Errorf("%w: %v", ErrCapabilityAudienceMismatch, err)
 		}
 		return CapabilityClaims{}, fmt.Errorf("%w: %v", ErrCapabilityInvalid, err)
 	}
