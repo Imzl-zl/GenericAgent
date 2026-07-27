@@ -13,12 +13,13 @@ import (
 func testConfig() Config {
 	return Config{
 		Listen:     "127.0.0.1:0",
-		SigningKey: []byte("test-signing-key-0123456789ab"),
+		SigningKey: testJWTKey,
 		TokenTTL:   time.Minute,
 		ProviderSource: &fakeProviderSource{
-			provider: testProvider(domain.ProviderOpenAICompatible, "http://127.0.0.1:18999", "gpt-test", testUpstreamKey),
+			provider: testProvider(domain.ProviderNativeOAI, "http://127.0.0.1:18999", "gpt-test", testUpstreamKey),
 		},
-		Cipher: &fakeCipher{wantVersion: 1},
+		Cipher:      &fakeCipher{wantVersion: 1},
+		Revocations: &fakeRevocationSource{revoked: make(map[[32]byte]bool)},
 	}
 }
 
@@ -57,6 +58,14 @@ func TestNewServerRejectsMissingCipher(t *testing.T) {
 	cfg.Cipher = nil
 	if _, err := NewServer(cfg); err == nil {
 		t.Fatal("expected cipher validation error")
+	}
+}
+
+func TestNewServerRejectsMissingRevocationSource(t *testing.T) {
+	cfg := testConfig()
+	cfg.Revocations = nil
+	if _, err := NewServer(cfg); err == nil {
+		t.Fatal("expected revocation source validation error")
 	}
 }
 

@@ -9,11 +9,11 @@ import (
 	"time"
 )
 
-// DefaultTokenTTL is the default capability_token lifetime.
-const DefaultTokenTTL = 1 * time.Hour
-
-// MinSigningKeyLen is the minimum HMAC signing key length in bytes.
-const MinSigningKeyLen = 16
+const (
+	DefaultTokenTTL            = time.Hour
+	DefaultRevocationRetention = DefaultTokenTTL + time.Minute
+	MinSigningKeyLen           = 32
+)
 
 // TokenCipher decrypts provider API keys stored in the platform database.
 // The key version is persisted alongside the ciphertext so the platform can
@@ -31,6 +31,7 @@ type Config struct {
 	TokenTTL       time.Duration
 	ProviderSource ProviderSource
 	Cipher         TokenCipher
+	Revocations    CapabilityRevocationSource
 }
 
 // WithDefaults applies zero-value defaults.
@@ -54,6 +55,9 @@ func (c Config) Validate() error {
 	}
 	if c.Cipher == nil {
 		return fmt.Errorf("cipher is required")
+	}
+	if c.Revocations == nil {
+		return fmt.Errorf("capability revocation source is required")
 	}
 	if len(c.SigningKey) < MinSigningKeyLen {
 		return fmt.Errorf("signing key must be at least %d bytes", MinSigningKeyLen)

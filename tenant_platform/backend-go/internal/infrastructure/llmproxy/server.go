@@ -37,7 +37,7 @@ func NewServer(cfg Config) (*Server, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	v, err := NewValidator(cfg.SigningKey)
+	v, err := NewValidator(cfg.SigningKey, cfg.Revocations)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +63,7 @@ func NewServer(cfg Config) (*Server, error) {
 // Config returns the validated configuration.
 func (s *Server) Config() Config { return s.cfg }
 
-// Validator returns the token validator (used by tests and the revoke path).
+// Validator returns the token validator for focused tests.
 func (s *Server) Validator() *Validator { return s.validator }
 
 // SetUpstream overrides the upstream forwarder (for tests).
@@ -80,7 +80,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/v1/messages", s.handleMessages)
-	mux.HandleFunc("/internal/revoke", s.handleRevoke)
 	return mux
 }
 

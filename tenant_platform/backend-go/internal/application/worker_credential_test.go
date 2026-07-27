@@ -16,7 +16,9 @@ type fakeLLMProviderSource struct{}
 
 func (fakeLLMProviderSource) GetDefaultProvider(ctx context.Context) (domain.LLMProvider, error) {
 	return domain.LLMProvider{
-		ProviderType: domain.ProviderOpenAICompatible,
+		ID:           1,
+		Revision:     1,
+		ProviderType: domain.ProviderNativeOAI,
 		Model:        "gpt-test",
 	}, nil
 }
@@ -26,13 +28,17 @@ func TestWriteTokenOnlyMyKey_ContainsTokenAndProxyNotRealKey(t *testing.T) {
 	const (
 		proxyAddr  = "http://127.0.0.1:8081"
 		realKey    = "sk-real-upstream-key-must-not-leak-1234567890"
-		signingKey = "test-signing-key-16bytes"
+		signingKey = "test-signing-key-at-least-32-bytes"
 	)
 	issuer, err := llmproxy.NewIssuer([]byte(signingKey), 3600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, _, err := issuer.Issue("session-xyz", "foundation.no-host-tools.v1", "openai_compatible", "gpt-test")
+	token, _, err := issuer.Issue(llmproxy.CapabilitySpec{
+		SessionKey: "session-xyz", ProviderID: 1, ProviderRevision: 1,
+		ProviderType: domain.ProviderNativeOAI, Model: "gpt-test",
+		PolicyVersion: "foundation.no-host-tools.v1",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +111,7 @@ func TestScheduler_IssueAndWriteCredential_NoIssuerReturnsEmpty(t *testing.T) {
 
 func TestScheduler_IssueAndWriteCredential_WritesTokenAndReturnsJTI(t *testing.T) {
 	dir := t.TempDir()
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-16bytes"), 3600)
+	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), 3600)
 	if err != nil {
 		t.Fatal(err)
 	}

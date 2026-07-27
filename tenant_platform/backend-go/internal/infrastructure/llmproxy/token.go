@@ -1,42 +1,69 @@
 package llmproxy
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
-	"sync"
 	"time"
 
-	"crypto/hmac"
+	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
-// TokenClaims is the validated capability_token payload. A capability_token
-// binds one LLM-calling session to a short-lived, revocable credential that
-// carries no real upstream key.
-type TokenClaims struct {
-	Jti                string `json:"jti"`
-	SessionKey         string `json:"session_key"`
-	IssuedAt           int64  `json:"issued_at"`     // unix seconds
-	ExpiresAt          int64  `json:"expires_at"`    // unix seconds
-	ModelPolicyVersion string `json:"model_policy_version"`
-	ProviderType       string `json:"provider_type,omitempty"`
-	Model              string `json:"model,omitempty"`
+const (
+	CapabilityIssuer   = "ga-platform"
+	CapabilityAudience = "ga-llm-proxy"
+	CapabilityType     = "ga-llm-cap+jwt"
+	validationLeeway   = 30 * time.Second
+)
+
+var (
+	ErrCapabilityInvalid = errors.New("capability token invalid")
+	ErrCapabilityExpired = errors.New("capability token expired")
+	ErrCapabilityRevoked = errors.New("capability token revoked")
+)
+
+type CapabilitySpec struct {
+	SessionKey       string
+	ProviderID       int64
+	ProviderRevision int64
+	ProviderType     domain.LLMProviderType
+	Model            string
+	PolicyVersion    string
 }
 
-// Issuer issues signed capability_tokens bound to a session. The platform
-// (scheduler) holds an Issuer; the real upstream key never leaves the Proxy.
+type CapabilityClaims struct {
+	ProviderID       int64                  `json:"provider_id"`
+	ProviderRevision int64                  `json:"provider_revision"`
+	ProviderType     domain.LLMProviderType `json:"provider_type"`
+	Model            string                 `json:"model"`
+	PolicyVersion    string                 `json:"policy_version"`
+	jwt.RegisteredClaims
+}
+
+func (c CapabilityClaims) VerifyAudience(expected string, required bool) bool {
+	for _, audience := range c.Audience {
+		if audience == expected {
+			return true
+		}
+	}
+	return !required
+}
+
+type CapabilityRevocationSource interface {
+	IsCapabilityRevoked(ctx context.Context, jtiHash [32]byte) (bool, error)
+}
+
 type Issuer struct {
 	signingKey []byte
 	ttl        time.Duration
 	clock      func() time.Time
 }
 
-// NewIssuer validates the signing key and ttl.
 func NewIssuer(signingKey []byte, ttl time.Duration) (*Issuer, error) {
 	if len(signingKey) < MinSigningKeyLen {
 		return nil, fmt.Errorf("signing key must be at least %d bytes", MinSigningKeyLen)
@@ -44,176 +71,150 @@ func NewIssuer(signingKey []byte, ttl time.Duration) (*Issuer, error) {
 	if ttl <= 0 {
 		return nil, fmt.Errorf("ttl must be positive")
 	}
-	return &Issuer{signingKey: signingKey, ttl: ttl, clock: time.Now}, nil
+	return &Issuer{signingKey: append([]byte(nil), signingKey...), ttl: ttl, clock: time.Now}, nil
 }
 
-// Issue creates a signed token for sessionKey. Returns the token string and
-// the validated claims. providerType and model are stamped for audit and to
-// prevent cross-provider token reuse.
-func (i *Issuer) Issue(sessionKey, modelPolicyVersion, providerType, model string) (string, TokenClaims, error) {
-	if sessionKey == "" {
-		return "", TokenClaims{}, fmt.Errorf("session_key is required")
+func (i *Issuer) Issue(spec CapabilitySpec) (string, CapabilityClaims, error) {
+	if err := validateCapabilitySpec(spec); err != nil {
+		return "", CapabilityClaims{}, err
 	}
-	now := i.clock()
 	jti, err := newJTI()
 	if err != nil {
-		return "", TokenClaims{}, err
+		return "", CapabilityClaims{}, err
 	}
-	claims := TokenClaims{
-		Jti:                jti,
-		SessionKey:         sessionKey,
-		IssuedAt:           now.Unix(),
-		ExpiresAt:          now.Add(i.ttl).Unix(),
-		ModelPolicyVersion: modelPolicyVersion,
-		ProviderType:       providerType,
-		Model:              model,
+	now := i.clock().UTC()
+	claims := CapabilityClaims{
+		ProviderID:       spec.ProviderID,
+		ProviderRevision: spec.ProviderRevision,
+		ProviderType:     spec.ProviderType,
+		Model:            spec.Model,
+		PolicyVersion:    spec.PolicyVersion,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    CapabilityIssuer,
+			Subject:   spec.SessionKey,
+			Audience:  jwt.ClaimStrings{CapabilityAudience},
+			ExpiresAt: jwt.NewNumericDate(now.Add(i.ttl)),
+			NotBefore: jwt.NewNumericDate(now),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        jti,
+		},
 	}
-	payload, err := json.Marshal(claims)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["typ"] = CapabilityType
+	signed, err := token.SignedString(i.signingKey)
 	if err != nil {
-		return "", TokenClaims{}, fmt.Errorf("marshal claims: %w", err)
+		return "", CapabilityClaims{}, fmt.Errorf("sign capability token: %w", err)
 	}
-	payloadB64 := base64.RawURLEncoding.EncodeToString(payload)
-	sig := hmacSHA256(i.signingKey, []byte(payloadB64))
-	sigB64 := base64.RawURLEncoding.EncodeToString(sig)
-	return payloadB64 + "." + sigB64, claims, nil
+	return signed, claims, nil
 }
 
-// Validator validates capability_tokens and checks a revocation denylist. The
-// Proxy holds one Validator; revocation is in-memory (tokens are short-lived,
-// so a Proxy restart is covered by TTL).
 type Validator struct {
-	signingKey []byte
-	clock      func() time.Time
-	revoked    map[string]time.Time
-	mu         sync.RWMutex
+	signingKey  []byte
+	revocations CapabilityRevocationSource
+	clock       func() time.Time
 }
 
-// revokedRetention is how long a revoked JTI stays in the denylist. Tokens are
-// short-lived (issuer TTL is minutes), so any entry older than this belongs to
-// a token that has long since expired and is rejected by the ExpiresAt check
-// anyway. Lazy pruning on each Revoke keeps the map bounded on a long-running
-// Proxy (pattern: JWT denylist with TTL-scoped retention).
-const revokedRetention = 24 * time.Hour
-
-// NewValidator validates the signing key.
-func NewValidator(signingKey []byte) (*Validator, error) {
+func NewValidator(signingKey []byte, revocations CapabilityRevocationSource) (*Validator, error) {
 	if len(signingKey) < MinSigningKeyLen {
 		return nil, fmt.Errorf("signing key must be at least %d bytes", MinSigningKeyLen)
 	}
-	return &Validator{signingKey: signingKey, clock: time.Now, revoked: map[string]time.Time{}}, nil
+	if revocations == nil {
+		return nil, fmt.Errorf("capability revocation source is required")
+	}
+	return &Validator{
+		signingKey:  append([]byte(nil), signingKey...),
+		revocations: revocations,
+		clock:       time.Now,
+	}, nil
 }
 
-// Validate checks signature, expiry, session binding, and revocation.
-// expectedSessionKey MUST be non-empty: a capability_token is always bound to
-// a session, and skipping the binding check would let one session's token
-// mint requests for another. Use ValidateUnscoped only for paths that
-// explicitly do not bind to a session (e.g. LLM Proxy ingress before the
-// caller's session is known).
-func (v *Validator) Validate(token, expectedSessionKey string) (TokenClaims, error) {
-	if expectedSessionKey == "" {
-		return TokenClaims{}, errors.New("expectedSessionKey is required; use ValidateUnscoped for unscoped validation")
-	}
-	claims, err := v.parseAndVerify(token)
-	if err != nil {
-		return TokenClaims{}, err
-	}
-	if claims.SessionKey != expectedSessionKey {
-		return claims, fmt.Errorf("session_key mismatch: token=%q expected=%q", claims.SessionKey, expectedSessionKey)
-	}
-	now := v.clock().Unix()
-	if claims.ExpiresAt <= now {
-		return claims, fmt.Errorf("token expired at %d (now %d)", claims.ExpiresAt, now)
-	}
-	if v.IsRevoked(claims.Jti) {
-		return claims, fmt.Errorf("token revoked: jti=%s", claims.Jti)
-	}
-	return claims, nil
-}
-
-// ValidateUnscoped checks signature, expiry, and revocation without binding to
-// a session. Use this only when the caller does not have a session context
-// (e.g. LLM Proxy ingress before resolving the worker session). All other
-// paths should use Validate with the session_key from the task context.
-func (v *Validator) ValidateUnscoped(token string) (TokenClaims, error) {
-	claims, err := v.parseAndVerify(token)
-	if err != nil {
-		return TokenClaims{}, err
-	}
-	now := v.clock().Unix()
-	if claims.ExpiresAt <= now {
-		return claims, fmt.Errorf("token expired at %d (now %d)", claims.ExpiresAt, now)
-	}
-	if v.IsRevoked(claims.Jti) {
-		return claims, fmt.Errorf("token revoked: jti=%s", claims.Jti)
-	}
-	return claims, nil
-}
-
-// Revoke adds jti to the denylist. Idempotent. Entries older than
-// revokedRetention are pruned lazily so the map stays bounded on a
-// long-running Proxy.
-func (v *Validator) Revoke(jti string) {
-	if jti == "" {
-		return
-	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	now := v.clock()
-	cutoff := now.Add(-revokedRetention)
-	for id, at := range v.revoked {
-		if at.Before(cutoff) {
-			delete(v.revoked, id)
+func (v *Validator) Validate(ctx context.Context, tokenString string) (CapabilityClaims, error) {
+	claims := CapabilityClaims{}
+	parser := jwt.NewParser(
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(CapabilityIssuer),
+		jwt.WithAudience(CapabilityAudience),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithLeeway(validationLeeway),
+		jwt.WithTimeFunc(v.clock),
+	)
+	token, err := parser.ParseWithClaims(tokenString, &claims, func(token *jwt.Token) (any, error) {
+		if token.Method != jwt.SigningMethodHS256 {
+			return nil, fmt.Errorf("%w: unsupported signing method %q", ErrCapabilityInvalid, token.Method.Alg())
 		}
-	}
-	v.revoked[jti] = now
-}
-
-// IsRevoked reports whether jti is on the denylist.
-func (v *Validator) IsRevoked(jti string) bool {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	_, ok := v.revoked[jti]
-	return ok
-}
-
-func (v *Validator) parseAndVerify(token string) (TokenClaims, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 2 {
-		return TokenClaims{}, fmt.Errorf("invalid token format")
-	}
-	payloadB64, sigB64 := parts[0], parts[1]
-	sig, err := base64.RawURLEncoding.DecodeString(sigB64)
+		return v.signingKey, nil
+	})
 	if err != nil {
-		return TokenClaims{}, fmt.Errorf("invalid signature encoding: %w", err)
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return CapabilityClaims{}, fmt.Errorf("%w: %v", ErrCapabilityExpired, err)
+		}
+		return CapabilityClaims{}, fmt.Errorf("%w: %v", ErrCapabilityInvalid, err)
 	}
-	expected := hmacSHA256(v.signingKey, []byte(payloadB64))
-	if !hmac.Equal(sig, expected) {
-		return TokenClaims{}, fmt.Errorf("invalid signature")
+	if token == nil || !token.Valid {
+		return CapabilityClaims{}, ErrCapabilityInvalid
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if token.Header["typ"] != CapabilityType {
+		return CapabilityClaims{}, fmt.Errorf("%w: token type must be %q", ErrCapabilityInvalid, CapabilityType)
+	}
+	if err := validateCapabilityClaims(claims); err != nil {
+		return CapabilityClaims{}, err
+	}
+	revoked, err := v.revocations.IsCapabilityRevoked(ctx, HashJTI(claims.ID))
 	if err != nil {
-		return TokenClaims{}, fmt.Errorf("invalid payload encoding: %w", err)
+		return CapabilityClaims{}, fmt.Errorf("check capability revocation: %w", err)
 	}
-	var claims TokenClaims
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return TokenClaims{}, fmt.Errorf("invalid payload JSON: %w", err)
-	}
-	if claims.Jti == "" || claims.SessionKey == "" {
-		return claims, fmt.Errorf("token missing required fields")
+	if revoked {
+		return CapabilityClaims{}, fmt.Errorf("%w: jti=%s", ErrCapabilityRevoked, claims.ID)
 	}
 	return claims, nil
 }
 
-func hmacSHA256(key, data []byte) []byte {
-	mac := hmac.New(sha256.New, key)
-	mac.Write(data)
-	return mac.Sum(nil)
+func HashJTI(jti string) [32]byte {
+	return sha256.Sum256([]byte(jti))
+}
+
+func validateCapabilitySpec(spec CapabilitySpec) error {
+	if spec.SessionKey == "" {
+		return fmt.Errorf("session key is required")
+	}
+	if spec.ProviderID <= 0 || spec.ProviderRevision <= 0 {
+		return fmt.Errorf("provider id and revision must be positive")
+	}
+	if spec.ProviderType != domain.ProviderNativeOAI && spec.ProviderType != domain.ProviderNativeClaude {
+		return fmt.Errorf("unsupported provider type %q", spec.ProviderType)
+	}
+	if spec.Model == "" || spec.PolicyVersion == "" {
+		return fmt.Errorf("model and policy version are required")
+	}
+	return nil
+}
+
+func validateCapabilityClaims(claims CapabilityClaims) error {
+	if claims.Subject == "" || claims.ID == "" {
+		return fmt.Errorf("%w: subject and jti are required", ErrCapabilityInvalid)
+	}
+	return wrapCapabilitySpecError(validateCapabilitySpec(CapabilitySpec{
+		SessionKey:       claims.Subject,
+		ProviderID:       claims.ProviderID,
+		ProviderRevision: claims.ProviderRevision,
+		ProviderType:     claims.ProviderType,
+		Model:            claims.Model,
+		PolicyVersion:    claims.PolicyVersion,
+	}))
+}
+
+func wrapCapabilitySpecError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrCapabilityInvalid, err)
 }
 
 func newJTI() (string, error) {
-	b := make([]byte, 16)
-	if _, err := cryptorand.Read(b); err != nil {
+	bytes := make([]byte, 16)
+	if _, err := cryptorand.Read(bytes); err != nil {
 		return "", fmt.Errorf("generate jti: %w", err)
 	}
-	return hex.EncodeToString(b), nil
+	return hex.EncodeToString(bytes), nil
 }

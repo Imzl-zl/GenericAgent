@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 )
 
 // issueAndWriteCredential issues a capability_token for the session and writes
@@ -21,9 +22,11 @@ func (s *scheduler) issueAndWriteCredential(ctx context.Context, sessionKey stri
 	if err != nil {
 		return "", fmt.Errorf("resolve LLM provider: %w", err)
 	}
-	// Map database provider_type to Worker-expected type for JWT token
-	workerProviderType := providerTypeForWorker(provider.ProviderType)
-	token, claims, err := s.cfg.TokenIssuer.Issue(sessionKey, s.cfg.ModelPolicyVersion, workerProviderType, provider.Model)
+	token, claims, err := s.cfg.TokenIssuer.Issue(llmproxy.CapabilitySpec{
+		SessionKey: sessionKey, ProviderID: provider.ID, ProviderRevision: provider.Revision,
+		ProviderType: provider.ProviderType, Model: provider.Model,
+		PolicyVersion: s.cfg.ModelPolicyVersion,
+	})
 	if err != nil {
 		return "", fmt.Errorf("issue capability_token: %w", err)
 	}
@@ -33,7 +36,7 @@ func (s *scheduler) issueAndWriteCredential(ctx context.Context, sessionKey stri
 			return "", fmt.Errorf("write token-only mykey.py: %w", err)
 		}
 	}
-	return claims.Jti, nil
+	return claims.ID, nil
 }
 
 // writeProviderMyKey writes a mykey.py containing ONLY the capability_token
@@ -147,20 +150,6 @@ func writeReadTimeoutField(sb *strings.Builder, value *int) {
 		readTimeout = *value
 	}
 	sb.WriteString(fmt.Sprintf("    'read_timeout': %d,\n", readTimeout))
-}
-
-// providerTypeForWorker maps database provider_type to Worker-expected type.
-// Database uses native_oai/native_claude, but Worker expects openai_compatible/anthropic_messages.
-func providerTypeForWorker(dbType domain.LLMProviderType) string {
-	switch dbType {
-	case domain.ProviderNativeOAI:
-		return "openai_compatible"
-	case domain.ProviderNativeClaude:
-		return "anthropic_messages"
-	default:
-		// Fallback: use database type as-is (for legacy types)
-		return string(dbType)
-	}
 }
 
 // writeTokenOnlyMyKey is kept for tests that do not yet inject a provider.

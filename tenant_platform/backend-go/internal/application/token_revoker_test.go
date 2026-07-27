@@ -2,130 +2,102 @@ package application
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestHTTPTokenRevoker_RevokePostsJTI(t *testing.T) {
-	var (
-		gotJTI    string
-		requests  atomic.Int32
-		mu        sync.Mutex
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		if r.URL.Path != "/internal/revoke" {
-			t.Errorf("path=%s want /internal/revoke", r.URL.Path)
-		}
-		var body map[string]string
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("decode: %v", err)
-		}
-		mu.Lock()
-		gotJTI = body["jti"]
-		mu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-
-	revoker := newHTTPTokenRevoker(srv.URL)
-	if err := revoker.Revoke(context.Background(), "jti-abc-123"); err != nil {
-		t.Fatalf("revoke: %v", err)
-	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("requests=%d want 1", got)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if gotJTI != "jti-abc-123" {
-		t.Fatalf("jti=%q want jti-abc-123", gotJTI)
-	}
+type fakeCapabilityRevocationStore struct {
+	jti       string
+	expiresAt time.Time
+	calls     atomic.Int32
+	err       error
 }
 
-func TestHTTPTokenRevoker_EmptyJTINoCall(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Fatal("unexpected request")
-	}))
-	defer srv.Close()
-	revoker := newHTTPTokenRevoker(srv.URL)
-	if err := revoker.Revoke(context.Background(), ""); err != nil {
-		t.Fatalf("revoke empty: %v", err)
-	}
-}
-
-func TestHTTPTokenRevoker_NonNoContentReturnsError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	revoker := newHTTPTokenRevoker(srv.URL)
-	err := revoker.Revoke(context.Background(), "jti-1")
-	if err == nil || !strings.Contains(err.Error(), "500") {
-		t.Fatalf("want 500 error, got %v", err)
-	}
-}
-
-func TestHTTPTokenRevoker_TimeoutPropagates(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(2 * time.Second)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-	revoker := newHTTPTokenRevoker(srv.URL)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	err := revoker.Revoke(ctx, "jti-1")
-	if err == nil {
-		t.Fatal("expected timeout error")
-	}
-}
-
-func TestNewHTTPTokenRevoker_EmptyAddrReturnsNoop(t *testing.T) {
-	r := NewHTTPTokenRevoker("")
-	if _, ok := r.(noopTokenRevoker); !ok {
-		t.Fatalf("want noopTokenRevoker, got %T", r)
-	}
-	if err := r.Revoke(context.Background(), "any"); err != nil {
-		t.Fatalf("noop revoke: %v", err)
-	}
-}
-
-func TestScheduler_RevokeTokenBestEffort_NoError(t *testing.T) {
-	var revoked atomic.Int32
-	revoker := fakeRevoker{onRevoke: func(_ string) { revoked.Add(1) }}
-	s := &scheduler{cfg: SchedulerConfig{TokenRevoker: revoker}}
-	s.revokeTokenBestEffort(context.Background(), "jti-1")
-	if got := revoked.Load(); got != 1 {
-		t.Fatalf("revoked=%d want 1", got)
-	}
-}
-
-func TestScheduler_RevokeTokenBestEffort_NilRevokerNoPanic(t *testing.T) {
-	s := &scheduler{}
-	s.revokeTokenBestEffort(context.Background(), "jti-1")
-}
-
-func TestScheduler_RevokeTokenBestEffort_EmptyJTINoCall(t *testing.T) {
-	revoker := fakeRevoker{onRevoke: func(_ string) { t.Fatal("must not revoke empty jti") }}
-	s := &scheduler{cfg: SchedulerConfig{TokenRevoker: revoker}}
-	s.revokeTokenBestEffort(context.Background(), "")
-}
-
-// fakeRevoker is a test double for TokenRevoker.
-type fakeRevoker struct {
-	onRevoke func(jti string)
-	err      error
-}
-
-func (f fakeRevoker) Revoke(_ context.Context, jti string) error {
-	if f.onRevoke != nil {
-		f.onRevoke(jti)
-	}
+func (f *fakeCapabilityRevocationStore) RevokeCapability(_ context.Context, jti string, expiresAt time.Time) error {
+	f.calls.Add(1)
+	f.jti = jti
+	f.expiresAt = expiresAt
 	return f.err
+}
+
+func TestPersistentTokenRevokerWritesJTIAndExpiry(t *testing.T) {
+	store := &fakeCapabilityRevocationStore{}
+	revoker, err := NewPersistentTokenRevoker(store, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, 7, 27, 1, 2, 3, 0, time.UTC)
+	revoker.(*persistentTokenRevoker).clock = func() time.Time { return fixedNow }
+	if err := revoker.Revoke(context.Background(), "jti-abc-123"); err != nil {
+		t.Fatal(err)
+	}
+	if store.jti != "jti-abc-123" {
+		t.Fatalf("jti = %q", store.jti)
+	}
+	if !store.expiresAt.Equal(fixedNow.Add(time.Hour)) {
+		t.Fatalf("expires_at = %s", store.expiresAt)
+	}
+}
+
+func TestPersistentTokenRevokerEmptyJTINoWrite(t *testing.T) {
+	store := &fakeCapabilityRevocationStore{}
+	revoker, err := NewPersistentTokenRevoker(store, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := revoker.Revoke(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if store.calls.Load() != 0 {
+		t.Fatalf("calls = %d, want 0", store.calls.Load())
+	}
+}
+
+func TestPersistentTokenRevokerPropagatesStoreError(t *testing.T) {
+	storeErr := errors.New("database unavailable")
+	store := &fakeCapabilityRevocationStore{err: storeErr}
+	revoker, err := NewPersistentTokenRevoker(store, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := revoker.Revoke(context.Background(), "jti-1"); !errors.Is(err, storeErr) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPersistentTokenRevokerRejectsInvalidConfig(t *testing.T) {
+	if _, err := NewPersistentTokenRevoker(nil, time.Hour); err == nil {
+		t.Fatal("expected nil store error")
+	}
+	if _, err := NewPersistentTokenRevoker(&fakeCapabilityRevocationStore{}, 0); err == nil {
+		t.Fatal("expected non-positive retention error")
+	}
+}
+
+func TestSchedulerRevokeTokenBestEffort(t *testing.T) {
+	store := &fakeCapabilityRevocationStore{}
+	revoker, err := NewPersistentTokenRevoker(store, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := &scheduler{cfg: SchedulerConfig{TokenRevoker: revoker}}
+	scheduler.revokeTokenBestEffort(context.Background(), "jti-1")
+	if store.calls.Load() != 1 {
+		t.Fatalf("calls = %d, want 1", store.calls.Load())
+	}
+}
+
+func TestSchedulerRevokeTokenBestEffortNilAndEmptyAreNoops(t *testing.T) {
+	(&scheduler{}).revokeTokenBestEffort(context.Background(), "jti-1")
+	store := &fakeCapabilityRevocationStore{}
+	revoker, err := NewPersistentTokenRevoker(store, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	(&scheduler{cfg: SchedulerConfig{TokenRevoker: revoker}}).revokeTokenBestEffort(context.Background(), "")
+	if store.calls.Load() != 0 {
+		t.Fatalf("calls = %d, want 0", store.calls.Load())
+	}
 }

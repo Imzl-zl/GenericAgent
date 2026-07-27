@@ -1,7 +1,6 @@
 package llmproxy
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +11,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
-const testSigningKey = "test-signing-key-0123456789ab"
+const testSigningKey = "test-signing-key-at-least-32-bytes"
 
 func newTestServer(t *testing.T, upstream *httptest.Server) *Server {
 	t.Helper()
@@ -23,13 +22,21 @@ func newTestServer(t *testing.T, upstream *httptest.Server) *Server {
 		ProviderSource: &fakeProviderSource{
 			provider: testProvider(domain.ProviderNativeOAI, upstream.URL, "gpt-test", testUpstreamKey),
 		},
-		Cipher: &fakeCipher{wantVersion: 1},
+		Cipher:      &fakeCipher{wantVersion: 1},
+		Revocations: &fakeRevocationSource{revoked: make(map[[32]byte]bool)},
 	}
 	srv, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	return srv
+}
+
+func handlerCapabilitySpec(sessionKey string) CapabilitySpec {
+	return CapabilitySpec{
+		SessionKey: sessionKey, ProviderID: 1, ProviderRevision: 1,
+		ProviderType: domain.ProviderNativeOAI, Model: "gpt-test", PolicyVersion: "p",
+	}
 }
 
 func TestHandlerChatCompletionsValidToken(t *testing.T) {
@@ -47,7 +54,7 @@ func TestHandlerChatCompletionsValidToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, _, err := iss.Issue("personal:42", "foundation.no-host-tools.v1", string(domain.ProviderNativeOAI), "gpt-test")
+	token, _, err := iss.Issue(handlerCapabilitySpec("personal:42"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +78,7 @@ func TestHandlerAliasChatCompletionsPath(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, _, _ := iss.Issue("personal:1", "p", string(domain.ProviderNativeOAI), "gpt-test")
+	token, _, _ := iss.Issue(handlerCapabilitySpec("personal:1"))
 
 	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
 		rec := httptest.NewRecorder()
@@ -115,7 +122,7 @@ func TestHandlerUpstream500Returns502(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, _, _ := iss.Issue("personal:1", "p", string(domain.ProviderNativeOAI), "gpt-test")
+	token, _, _ := iss.Issue(handlerCapabilitySpec("personal:1"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
@@ -136,7 +143,7 @@ func TestHandlerUpstream429Returns429(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, _, _ := iss.Issue("personal:1", "p", string(domain.ProviderNativeOAI), "gpt-test")
+	token, _, _ := iss.Issue(handlerCapabilitySpec("personal:1"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
@@ -154,7 +161,7 @@ func TestHandlerRevocationEndpoint(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, claims, _ := iss.Issue("personal:1", "p", string(domain.ProviderNativeOAI), "gpt-test")
+	token, claims, _ := iss.Issue(handlerCapabilitySpec("personal:1"))
 
 	// First call succeeds.
 	rec := httptest.NewRecorder()
@@ -165,12 +172,8 @@ func TestHandlerRevocationEndpoint(t *testing.T) {
 		t.Fatalf("pre-revoke status = %d", rec.Code)
 	}
 
-	// Revoke.
-	rec = httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/revoke", bytes.NewReader([]byte(`{"jti":"`+claims.Jti+`"}`))))
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("revoke status = %d, want 204", rec.Code)
-	}
+	revocations := srv.Config().Revocations.(*fakeRevocationSource)
+	revocations.revoked[HashJTI(claims.ID)] = true
 
 	// Second call fails.
 	rec = httptest.NewRecorder()
@@ -203,7 +206,7 @@ func TestHandlerForwardsBodyUnmodified(t *testing.T) {
 	defer upstream.Close()
 	srv := newTestServer(t, upstream)
 	iss, _ := NewIssuer([]byte(testSigningKey), time.Hour)
-	token, _, _ := iss.Issue("personal:1", "p", string(domain.ProviderNativeOAI), "gpt-test")
+	token, _, _ := iss.Issue(handlerCapabilitySpec("personal:1"))
 
 	body := `{"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}`
 	rec := httptest.NewRecorder()

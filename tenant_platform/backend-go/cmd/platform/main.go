@@ -94,9 +94,10 @@ func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRunti
 // cipher; it is never part of this static config.
 type llmProxyConfig struct {
 	externalAddr   string // when non-empty, use external Proxy (no in-process start)
-	signingKey     string // HMAC signing key for capability_tokens (>=16 bytes)
+	signingKey     string // HMAC signing key for capability JWTs (>=32 bytes)
 	providerSource llmproxy.ProviderSource
 	cipher         llmproxy.TokenCipher
+	revocations    llmproxy.CapabilityRevocationSource
 }
 
 // ensureDevDefaultLLMProvider seeds a default OpenAI-compatible provider in
@@ -146,6 +147,9 @@ func startLLMProxy(ctx context.Context, cfg llmProxyConfig) (string, func(), err
 	if cfg.cipher == nil {
 		return "", nil, fmt.Errorf("LLM Proxy cipher is required")
 	}
+	if cfg.revocations == nil {
+		return "", nil, fmt.Errorf("LLM Proxy revocation source is required")
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", nil, fmt.Errorf("llm-proxy listen: %w", err)
@@ -156,6 +160,7 @@ func startLLMProxy(ctx context.Context, cfg llmProxyConfig) (string, func(), err
 		TokenTTL:       llmproxy.DefaultTokenTTL,
 		ProviderSource: cfg.providerSource,
 		Cipher:         cfg.cipher,
+		Revocations:    cfg.revocations,
 	}
 	srv, err := llmproxy.NewServer(proxyCfg)
 	if err != nil {
@@ -460,6 +465,7 @@ func run() error {
 		signingKey:     signingKey,
 		providerSource: store,
 		cipher:         cipher,
+		revocations:    store,
 	})
 	if err != nil {
 		return err
@@ -470,7 +476,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("capability token issuer: %w", err)
 	}
-	revoker := application.NewHTTPTokenRevoker(proxyAddr)
+	revoker, err := application.NewPersistentTokenRevoker(store, llmproxy.DefaultRevocationRetention)
+	if err != nil {
+		return fmt.Errorf("capability token revoker: %w", err)
+	}
 
 	runtime, err := buildWorkerRuntime(boot)
 	if err != nil {
