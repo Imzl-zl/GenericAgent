@@ -27,6 +27,13 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
             _abort(context, exc)
             return worker_pb2.StartSessionResponse()
 
+    def ReloadCredentials(self, request, context):
+        try:
+            return self._adapter.reload_credentials(request)
+        except WorkerAdapterError as exc:
+            _abort(context, exc)
+            return worker_pb2.ReloadCredentialsResponse()
+
     def ExecuteTask(self, request, context):
         try:
             for event in self._adapter.execute_task(request):

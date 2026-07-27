@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#genericagent/worker/v1/worker.proto\x12\x16genericagent.worker.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc3\x01\n\rRuntimePolicy\x12\x11\n\tmax_turns\x18\x01 \x01(\r\x12\x19\n\x11max_history_bytes\x18\x02 \x01(\x04\x12\x19\n\x11max_working_bytes\x18\x03 \x01(\x04\x12\x18\n\x10max_output_bytes\x18\x04 \x01(\x04\x12\x1c\n\x14task_timeout_seconds\x18\x05 \x01(\r\x12\x1a\n\x12\x63\x61pability_version\x18\x06 \x01(\t\x12\x15\n\rpolicy_digest\x18\x07 \x01(\t\"\xaf\x01\n\x13StartSessionRequest\x12\x13\n\x0bsession_key\x18\x01 \x01(\t\x12\x14\n\x0csnapshot_ref\x18\x02 \x01(\t\x12=\n\x0eruntime_policy\x18\x03 \x01(\x0b\x32%.genericagent.worker.v1.RuntimePolicy\x12\x13\n\x0bsnapshot_id\x18\x04 \x01(\t\x12\x19\n\x11snapshot_checksum\x18\x05 \x01(\t\"G\n\x14StartSessionResponse\x12\x13\n\x0bsession_key\x18\x01 \x01(\t\x12\x1a\n\x12worker_instance_id\x18\x02 \x01(\t\"\x86\x02\n\x0cTaskEnvelope\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x13\n\x0bsession_key\x18\x02 \x01(\t\x12\x19\n\x11requester_user_id\x18\x03 \x01(\x03\x12\x0e\n\x06source\x18\x04 \x01(\t\x12\x1a\n\x12source_instance_id\x18\x05 \x01(\t\x12\x12\n\nmessage_id\x18\x06 \x01(\t\x12\x0e\n\x06prompt\x18\x07 \x01(\t\x12\x18\n\x10persona_snapshot\x18\x08 \x03(\t\x12\x1b\n\x13tool_policy_version\x18\t \x01(\t\x12.\n\ncreated_at\x18\n \x01(\x0b\x32\x1a.google.protobuf.Timestamp\"H\n\x12\x45xecuteTaskRequest\x12\x32\n\x04task\x18\x01 \x01(\x0b\x32$.genericagent.worker.v1.TaskEnvelope\"4\n\x05\x43hunk\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x0c\n\x04turn\x18\x03 \x01(\r\";\n\x0cToolProgress\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x0c\n\x04turn\x18\x03 \x01(\r\"r\n\x16\x42\x65ginCheckpointRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x18\n\x10\x63heckpoint_token\x18\x02 \x01(\t\x12\x13\n\x0bstaging_ref\x18\x03 \x01(\t\x12\x18\n\x10max_bundle_bytes\x18\x04 \x01(\x04\"z\n\x0f\x43heckpointReady\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x18\n\x10\x63heckpoint_token\x18\x02 \x01(\t\x12\x13\n\x0bstaging_ref\x18\x03 \x01(\t\x12\x10\n\x08\x63hecksum\x18\x04 \x01(\t\x12\x15\n\rresult_digest\x18\x05 \x01(\t\"E\n\rErrorEnvelope\x12\x0c\n\x04\x63ode\x18\x01 \x01(\t\x12\x14\n\x0cuser_message\x18\x02 \x01(\t\x12\x10\n\x08trace_id\x18\x03 \x01(\t\"\xb6\x01\n\x08Terminal\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x36\n\x06status\x18\x02 \x01(\x0e\x32&.genericagent.worker.v1.TerminalStatus\x12\x15\n\rresult_digest\x18\x03 \x01(\t\x12\x14\n\x0cuser_message\x18\x04 \x01(\t\x12\x34\n\x05\x65rror\x18\x05 \x01(\x0b\x32%.genericagent.worker.v1.ErrorEnvelope\"\xbd\x01\n\x0bWorkerEvent\x12.\n\x05\x63hunk\x18\x01 \x01(\x0b\x32\x1d.genericagent.worker.v1.ChunkH\x00\x12=\n\rtool_progress\x18\x02 \x01(\x0b\x32$.genericagent.worker.v1.ToolProgressH\x00\x12\x34\n\x08terminal\x18\x03 \x01(\x0b\x32 .genericagent.worker.v1.TerminalH\x00\x42\t\n\x07payload\"$\n\x11\x43\x61ncelTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"&\n\x12\x43\x61ncelTaskResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\"\x0f\n\rHealthRequest\"P\n\x0eHealthResponse\x12\x1a\n\x12worker_instance_id\x18\x01 \x01(\t\x12\x13\n\x0bsession_key\x18\x02 \x01(\t\x12\r\n\x05ready\x18\x03 \x01(\x08\"!\n\x0fShutdownRequest\x12\x0e\n\x06reason\x18\x01 \x01(\t\"$\n\x10ShutdownResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08*\x80\x01\n\x0eTerminalStatus\x12\x1f\n\x1bTERMINAL_STATUS_UNSPECIFIED\x10\x00\x12\x12\n\x0eTASK_SUCCEEDED\x10\x01\x12\x0f\n\x0bTASK_FAILED\x10\x02\x12\x12\n\x0eTASK_CANCELLED\x10\x03\x12\x14\n\x10TASK_INTERRUPTED\x10\x04\x32\xe5\x04\n\rWorkerService\x12i\n\x0cStartSession\x12+.genericagent.worker.v1.StartSessionRequest\x1a,.genericagent.worker.v1.StartSessionResponse\x12`\n\x0b\x45xecuteTask\x12*.genericagent.worker.v1.ExecuteTaskRequest\x1a#.genericagent.worker.v1.WorkerEvent0\x01\x12j\n\x0f\x42\x65ginCheckpoint\x12..genericagent.worker.v1.BeginCheckpointRequest\x1a\'.genericagent.worker.v1.CheckpointReady\x12\x63\n\nCancelTask\x12).genericagent.worker.v1.CancelTaskRequest\x1a*.genericagent.worker.v1.CancelTaskResponse\x12W\n\x06Health\x12%.genericagent.worker.v1.HealthRequest\x1a&.genericagent.worker.v1.HealthResponse\x12]\n\x08Shutdown\x12\'.genericagent.worker.v1.ShutdownRequest\x1a(.genericagent.worker.v1.ShutdownResponseB\\ZZgithub.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1;workerv1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#genericagent/worker/v1/worker.proto\x12\x16genericagent.worker.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc3\x01\n\rRuntimePolicy\x12\x11\n\tmax_turns\x18\x01 \x01(\r\x12\x19\n\x11max_history_bytes\x18\x02 \x01(\x04\x12\x19\n\x11max_working_bytes\x18\x03 \x01(\x04\x12\x18\n\x10max_output_bytes\x18\x04 \x01(\x04\x12\x1c\n\x14task_timeout_seconds\x18\x05 \x01(\r\x12\x1a\n\x12\x63\x61pability_version\x18\x06 \x01(\t\x12\x15\n\rpolicy_digest\x18\x07 \x01(\t\"\xaf\x01\n\x13StartSessionRequest\x12\x13\n\x0bsession_key\x18\x01 \x01(\t\x12\x14\n\x0csnapshot_ref\x18\x02 \x01(\t\x12=\n\x0eruntime_policy\x18\x03 \x01(\x0b\x32%.genericagent.worker.v1.RuntimePolicy\x12\x13\n\x0bsnapshot_id\x18\x04 \x01(\t\x12\x19\n\x11snapshot_checksum\x18\x05 \x01(\t\"G\n\x14StartSessionResponse\x12\x13\n\x0bsession_key\x18\x01 \x01(\t\x12\x1a\n\x12worker_instance_id\x18\x02 \x01(\t\"R\n\x18ReloadCredentialsRequest\x12\x1d\n\x15\x63redential_generation\x18\x01 \x01(\x04\x12\x17\n\x0f\x63onfig_checksum\x18\x02 \x01(\t\"S\n\x19ReloadCredentialsResponse\x12\x1d\n\x15\x63redential_generation\x18\x01 \x01(\x04\x12\x17\n\x0f\x63onfig_checksum\x18\x02 \x01(\t\"\x86\x02\n\x0cTaskEnvelope\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x13\n\x0bsession_key\x18\x02 \x01(\t\x12\x19\n\x11requester_user_id\x18\x03 \x01(\x03\x12\x0e\n\x06source\x18\x04 \x01(\t\x12\x1a\n\x12source_instance_id\x18\x05 \x01(\t\x12\x12\n\nmessage_id\x18\x06 \x01(\t\x12\x0e\n\x06prompt\x18\x07 \x01(\t\x12\x18\n\x10persona_snapshot\x18\x08 \x03(\t\x12\x1b\n\x13tool_policy_version\x18\t \x01(\t\x12.\n\ncreated_at\x18\n \x01(\x0b\x32\x1a.google.protobuf.Timestamp\"H\n\x12\x45xecuteTaskRequest\x12\x32\n\x04task\x18\x01 \x01(\x0b\x32$.genericagent.worker.v1.TaskEnvelope\"4\n\x05\x43hunk\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x0c\n\x04turn\x18\x03 \x01(\r\";\n\x0cToolProgress\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x0c\n\x04turn\x18\x03 \x01(\r\"r\n\x16\x42\x65ginCheckpointRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x18\n\x10\x63heckpoint_token\x18\x02 \x01(\t\x12\x13\n\x0bstaging_ref\x18\x03 \x01(\t\x12\x18\n\x10max_bundle_bytes\x18\x04 \x01(\x04\"z\n\x0f\x43heckpointReady\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x18\n\x10\x63heckpoint_token\x18\x02 \x01(\t\x12\x13\n\x0bstaging_ref\x18\x03 \x01(\t\x12\x10\n\x08\x63hecksum\x18\x04 \x01(\t\x12\x15\n\rresult_digest\x18\x05 \x01(\t\"E\n\rErrorEnvelope\x12\x0c\n\x04\x63ode\x18\x01 \x01(\t\x12\x14\n\x0cuser_message\x18\x02 \x01(\t\x12\x10\n\x08trace_id\x18\x03 \x01(\t\"\xb6\x01\n\x08Terminal\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x36\n\x06status\x18\x02 \x01(\x0e\x32&.genericagent.worker.v1.TerminalStatus\x12\x15\n\rresult_digest\x18\x03 \x01(\t\x12\x14\n\x0cuser_message\x18\x04 \x01(\t\x12\x34\n\x05\x65rror\x18\x05 \x01(\x0b\x32%.genericagent.worker.v1.ErrorEnvelope\"\xbd\x01\n\x0bWorkerEvent\x12.\n\x05\x63hunk\x18\x01 \x01(\x0b\x32\x1d.genericagent.worker.v1.ChunkH\x00\x12=\n\rtool_progress\x18\x02 \x01(\x0b\x32$.genericagent.worker.v1.ToolProgressH\x00\x12\x34\n\x08terminal\x18\x03 \x01(\x0b\x32 .genericagent.worker.v1.TerminalH\x00\x42\t\n\x07payload\"$\n\x11\x43\x61ncelTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"&\n\x12\x43\x61ncelTaskResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\"\x0f\n\rHealthRequest\"P\n\x0eHealthResponse\x12\x1a\n\x12worker_instance_id\x18\x01 \x01(\t\x12\x13\n\x0bsession_key\x18\x02 \x01(\t\x12\r\n\x05ready\x18\x03 \x01(\x08\"!\n\x0fShutdownRequest\x12\x0e\n\x06reason\x18\x01 \x01(\t\"$\n\x10ShutdownResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08*\x80\x01\n\x0eTerminalStatus\x12\x1f\n\x1bTERMINAL_STATUS_UNSPECIFIED\x10\x00\x12\x12\n\x0eTASK_SUCCEEDED\x10\x01\x12\x0f\n\x0bTASK_FAILED\x10\x02\x12\x12\n\x0eTASK_CANCELLED\x10\x03\x12\x14\n\x10TASK_INTERRUPTED\x10\x04\x32\xdf\x05\n\rWorkerService\x12i\n\x0cStartSession\x12+.genericagent.worker.v1.StartSessionRequest\x1a,.genericagent.worker.v1.StartSessionResponse\x12x\n\x11ReloadCredentials\x12\x30.genericagent.worker.v1.ReloadCredentialsRequest\x1a\x31.genericagent.worker.v1.ReloadCredentialsResponse\x12`\n\x0b\x45xecuteTask\x12*.genericagent.worker.v1.ExecuteTaskRequest\x1a#.genericagent.worker.v1.WorkerEvent0\x01\x12j\n\x0f\x42\x65ginCheckpoint\x12..genericagent.worker.v1.BeginCheckpointRequest\x1a\'.genericagent.worker.v1.CheckpointReady\x12\x63\n\nCancelTask\x12).genericagent.worker.v1.CancelTaskRequest\x1a*.genericagent.worker.v1.CancelTaskResponse\x12W\n\x06Health\x12%.genericagent.worker.v1.HealthRequest\x1a&.genericagent.worker.v1.HealthResponse\x12]\n\x08Shutdown\x12\'.genericagent.worker.v1.ShutdownRequest\x1a(.genericagent.worker.v1.ShutdownResponseB\\ZZgithub.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1;workerv1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,44 +33,48 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'genericagent.worker.v1.work
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'ZZgithub.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1;workerv1'
-  _globals['_TERMINALSTATUS']._serialized_start=1938
-  _globals['_TERMINALSTATUS']._serialized_end=2066
+  _globals['_TERMINALSTATUS']._serialized_start=2107
+  _globals['_TERMINALSTATUS']._serialized_end=2235
   _globals['_RUNTIMEPOLICY']._serialized_start=97
   _globals['_RUNTIMEPOLICY']._serialized_end=292
   _globals['_STARTSESSIONREQUEST']._serialized_start=295
   _globals['_STARTSESSIONREQUEST']._serialized_end=470
   _globals['_STARTSESSIONRESPONSE']._serialized_start=472
   _globals['_STARTSESSIONRESPONSE']._serialized_end=543
-  _globals['_TASKENVELOPE']._serialized_start=546
-  _globals['_TASKENVELOPE']._serialized_end=808
-  _globals['_EXECUTETASKREQUEST']._serialized_start=810
-  _globals['_EXECUTETASKREQUEST']._serialized_end=882
-  _globals['_CHUNK']._serialized_start=884
-  _globals['_CHUNK']._serialized_end=936
-  _globals['_TOOLPROGRESS']._serialized_start=938
-  _globals['_TOOLPROGRESS']._serialized_end=997
-  _globals['_BEGINCHECKPOINTREQUEST']._serialized_start=999
-  _globals['_BEGINCHECKPOINTREQUEST']._serialized_end=1113
-  _globals['_CHECKPOINTREADY']._serialized_start=1115
-  _globals['_CHECKPOINTREADY']._serialized_end=1237
-  _globals['_ERRORENVELOPE']._serialized_start=1239
-  _globals['_ERRORENVELOPE']._serialized_end=1308
-  _globals['_TERMINAL']._serialized_start=1311
-  _globals['_TERMINAL']._serialized_end=1493
-  _globals['_WORKEREVENT']._serialized_start=1496
-  _globals['_WORKEREVENT']._serialized_end=1685
-  _globals['_CANCELTASKREQUEST']._serialized_start=1687
-  _globals['_CANCELTASKREQUEST']._serialized_end=1723
-  _globals['_CANCELTASKRESPONSE']._serialized_start=1725
-  _globals['_CANCELTASKRESPONSE']._serialized_end=1763
-  _globals['_HEALTHREQUEST']._serialized_start=1765
-  _globals['_HEALTHREQUEST']._serialized_end=1780
-  _globals['_HEALTHRESPONSE']._serialized_start=1782
-  _globals['_HEALTHRESPONSE']._serialized_end=1862
-  _globals['_SHUTDOWNREQUEST']._serialized_start=1864
-  _globals['_SHUTDOWNREQUEST']._serialized_end=1897
-  _globals['_SHUTDOWNRESPONSE']._serialized_start=1899
-  _globals['_SHUTDOWNRESPONSE']._serialized_end=1935
-  _globals['_WORKERSERVICE']._serialized_start=2069
-  _globals['_WORKERSERVICE']._serialized_end=2682
+  _globals['_RELOADCREDENTIALSREQUEST']._serialized_start=545
+  _globals['_RELOADCREDENTIALSREQUEST']._serialized_end=627
+  _globals['_RELOADCREDENTIALSRESPONSE']._serialized_start=629
+  _globals['_RELOADCREDENTIALSRESPONSE']._serialized_end=712
+  _globals['_TASKENVELOPE']._serialized_start=715
+  _globals['_TASKENVELOPE']._serialized_end=977
+  _globals['_EXECUTETASKREQUEST']._serialized_start=979
+  _globals['_EXECUTETASKREQUEST']._serialized_end=1051
+  _globals['_CHUNK']._serialized_start=1053
+  _globals['_CHUNK']._serialized_end=1105
+  _globals['_TOOLPROGRESS']._serialized_start=1107
+  _globals['_TOOLPROGRESS']._serialized_end=1166
+  _globals['_BEGINCHECKPOINTREQUEST']._serialized_start=1168
+  _globals['_BEGINCHECKPOINTREQUEST']._serialized_end=1282
+  _globals['_CHECKPOINTREADY']._serialized_start=1284
+  _globals['_CHECKPOINTREADY']._serialized_end=1406
+  _globals['_ERRORENVELOPE']._serialized_start=1408
+  _globals['_ERRORENVELOPE']._serialized_end=1477
+  _globals['_TERMINAL']._serialized_start=1480
+  _globals['_TERMINAL']._serialized_end=1662
+  _globals['_WORKEREVENT']._serialized_start=1665
+  _globals['_WORKEREVENT']._serialized_end=1854
+  _globals['_CANCELTASKREQUEST']._serialized_start=1856
+  _globals['_CANCELTASKREQUEST']._serialized_end=1892
+  _globals['_CANCELTASKRESPONSE']._serialized_start=1894
+  _globals['_CANCELTASKRESPONSE']._serialized_end=1932
+  _globals['_HEALTHREQUEST']._serialized_start=1934
+  _globals['_HEALTHREQUEST']._serialized_end=1949
+  _globals['_HEALTHRESPONSE']._serialized_start=1951
+  _globals['_HEALTHRESPONSE']._serialized_end=2031
+  _globals['_SHUTDOWNREQUEST']._serialized_start=2033
+  _globals['_SHUTDOWNREQUEST']._serialized_end=2066
+  _globals['_SHUTDOWNRESPONSE']._serialized_start=2068
+  _globals['_SHUTDOWNRESPONSE']._serialized_end=2104
+  _globals['_WORKERSERVICE']._serialized_start=2238
+  _globals['_WORKERSERVICE']._serialized_end=2973
 # @@protoc_insertion_point(module_scope)

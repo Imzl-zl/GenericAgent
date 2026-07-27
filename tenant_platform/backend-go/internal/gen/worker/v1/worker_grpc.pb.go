@@ -19,12 +19,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	WorkerService_StartSession_FullMethodName    = "/genericagent.worker.v1.WorkerService/StartSession"
-	WorkerService_ExecuteTask_FullMethodName     = "/genericagent.worker.v1.WorkerService/ExecuteTask"
-	WorkerService_BeginCheckpoint_FullMethodName = "/genericagent.worker.v1.WorkerService/BeginCheckpoint"
-	WorkerService_CancelTask_FullMethodName      = "/genericagent.worker.v1.WorkerService/CancelTask"
-	WorkerService_Health_FullMethodName          = "/genericagent.worker.v1.WorkerService/Health"
-	WorkerService_Shutdown_FullMethodName        = "/genericagent.worker.v1.WorkerService/Shutdown"
+	WorkerService_StartSession_FullMethodName      = "/genericagent.worker.v1.WorkerService/StartSession"
+	WorkerService_ReloadCredentials_FullMethodName = "/genericagent.worker.v1.WorkerService/ReloadCredentials"
+	WorkerService_ExecuteTask_FullMethodName       = "/genericagent.worker.v1.WorkerService/ExecuteTask"
+	WorkerService_BeginCheckpoint_FullMethodName   = "/genericagent.worker.v1.WorkerService/BeginCheckpoint"
+	WorkerService_CancelTask_FullMethodName        = "/genericagent.worker.v1.WorkerService/CancelTask"
+	WorkerService_Health_FullMethodName            = "/genericagent.worker.v1.WorkerService/Health"
+	WorkerService_Shutdown_FullMethodName          = "/genericagent.worker.v1.WorkerService/Shutdown"
 )
 
 // WorkerServiceClient is the client API for WorkerService service.
@@ -32,6 +33,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type WorkerServiceClient interface {
 	StartSession(ctx context.Context, in *StartSessionRequest, opts ...grpc.CallOption) (*StartSessionResponse, error)
+	ReloadCredentials(ctx context.Context, in *ReloadCredentialsRequest, opts ...grpc.CallOption) (*ReloadCredentialsResponse, error)
 	ExecuteTask(ctx context.Context, in *ExecuteTaskRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WorkerEvent], error)
 	BeginCheckpoint(ctx context.Context, in *BeginCheckpointRequest, opts ...grpc.CallOption) (*CheckpointReady, error)
 	CancelTask(ctx context.Context, in *CancelTaskRequest, opts ...grpc.CallOption) (*CancelTaskResponse, error)
@@ -51,6 +53,16 @@ func (c *workerServiceClient) StartSession(ctx context.Context, in *StartSession
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StartSessionResponse)
 	err := c.cc.Invoke(ctx, WorkerService_StartSession_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) ReloadCredentials(ctx context.Context, in *ReloadCredentialsRequest, opts ...grpc.CallOption) (*ReloadCredentialsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReloadCredentialsResponse)
+	err := c.cc.Invoke(ctx, WorkerService_ReloadCredentials_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +133,7 @@ func (c *workerServiceClient) Shutdown(ctx context.Context, in *ShutdownRequest,
 // for forward compatibility.
 type WorkerServiceServer interface {
 	StartSession(context.Context, *StartSessionRequest) (*StartSessionResponse, error)
+	ReloadCredentials(context.Context, *ReloadCredentialsRequest) (*ReloadCredentialsResponse, error)
 	ExecuteTask(*ExecuteTaskRequest, grpc.ServerStreamingServer[WorkerEvent]) error
 	BeginCheckpoint(context.Context, *BeginCheckpointRequest) (*CheckpointReady, error)
 	CancelTask(context.Context, *CancelTaskRequest) (*CancelTaskResponse, error)
@@ -138,6 +151,9 @@ type UnimplementedWorkerServiceServer struct{}
 
 func (UnimplementedWorkerServiceServer) StartSession(context.Context, *StartSessionRequest) (*StartSessionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method StartSession not implemented")
+}
+func (UnimplementedWorkerServiceServer) ReloadCredentials(context.Context, *ReloadCredentialsRequest) (*ReloadCredentialsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReloadCredentials not implemented")
 }
 func (UnimplementedWorkerServiceServer) ExecuteTask(*ExecuteTaskRequest, grpc.ServerStreamingServer[WorkerEvent]) error {
 	return status.Errorf(codes.Unimplemented, "method ExecuteTask not implemented")
@@ -189,6 +205,24 @@ func _WorkerService_StartSession_Handler(srv interface{}, ctx context.Context, d
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(WorkerServiceServer).StartSession(ctx, req.(*StartSessionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_ReloadCredentials_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReloadCredentialsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).ReloadCredentials(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_ReloadCredentials_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).ReloadCredentials(ctx, req.(*ReloadCredentialsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -286,6 +320,10 @@ var WorkerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StartSession",
 			Handler:    _WorkerService_StartSession_Handler,
+		},
+		{
+			MethodName: "ReloadCredentials",
+			Handler:    _WorkerService_ReloadCredentials_Handler,
 		},
 		{
 			MethodName: "BeginCheckpoint",

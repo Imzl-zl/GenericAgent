@@ -28,6 +28,7 @@ type scriptedWorker struct {
 	health      *workerv1.HealthResponse
 	startResp   *workerv1.StartSessionResponse
 	startErr    error
+	lastReload  *workerv1.ReloadCredentialsRequest
 	checkpoint  *workerv1.CheckpointReady
 	checkpointE error
 	cancelResp  *workerv1.CancelTaskResponse
@@ -68,6 +69,16 @@ func (s *scriptedWorker) StartSession(ctx context.Context, req *workerv1.StartSe
 	return &workerv1.StartSessionResponse{
 		SessionKey:       req.GetSessionKey(),
 		WorkerInstanceId: "test-worker-1",
+	}, nil
+}
+
+func (s *scriptedWorker) ReloadCredentials(_ context.Context, req *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReload = req
+	return &workerv1.ReloadCredentialsResponse{
+		CredentialGeneration: req.GetCredentialGeneration(),
+		ConfigChecksum:       req.GetConfigChecksum(),
 	}, nil
 }
 

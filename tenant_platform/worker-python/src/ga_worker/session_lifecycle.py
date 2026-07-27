@@ -22,6 +22,7 @@ from ga_worker.checkpoint import (
     result_digest_for,
     write_checkpoint_atomic,
 )
+from ga_worker.credential_config import CredentialConfigError, load_runtime_metadata
 from ga_worker.legacy_import import LegacyImportError, import_legacy_runtime
 from ga_worker.runtime_overlay import (
     OverlayError,
@@ -90,6 +91,10 @@ class SessionLifecycleMixin:
             raise WorkerAdapterError("OVERLAY_ERROR", str(exc)) from exc
 
         seed_working, seed_backend, seed_agent, seed_display = self._load_snapshot_if_any(request)
+        try:
+            credential_metadata = load_runtime_metadata(self.config_root)
+        except CredentialConfigError as exc:
+            raise WorkerAdapterError("CREDENTIAL_CONFIG_ERROR", str(exc)) from exc
         agent = self._create_agent(overlay_dir, manifest)
         self._restore_histories(agent, seed_agent, seed_backend)
 
@@ -108,6 +113,9 @@ class SessionLifecycleMixin:
             manifest=manifest,
             agent=agent,
             runner_thread=runner,
+            credential_generation=credential_metadata.generation,
+            credential_checksum=credential_metadata.checksum,
+            routing_snapshot_id=credential_metadata.routing_snapshot_id,
             seed_working=seed_working,
             seed_backend_history=seed_backend,
             seed_agent_history=seed_agent,
@@ -120,15 +128,6 @@ class SessionLifecycleMixin:
         )
 
     def _create_agent(self, overlay_dir: Path, manifest: dict[str, Any]) -> Any:
-        # 在导入 GA Core 之前，确保 mykey.py 是最新的
-        from ga_worker.config_fetcher import ensure_mykey, get_platform_config_from_env
-
-        platform_url, token = get_platform_config_from_env()
-        try:
-            ensure_mykey(self.config_root, platform_url, token)
-        except Exception as exc:
-            # 配置加载失败是致命错误
-            raise WorkerAdapterError("CONFIG_FETCH_ERROR", str(exc)) from exc
 
         if self.agent_factory is None:
             try:

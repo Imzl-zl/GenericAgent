@@ -152,20 +152,37 @@ def oai_fixture():
     thread.join(timeout=2)
 
 
-def _write_mykey(config_root: Path, apibase: str) -> None:
+def _write_mykey(config_root: Path, apibase: str, generation: int = 1) -> str:
     config_root.mkdir(parents=True, exist_ok=True)
+    placeholder = "0" * 64
+    document = {
+        "_platform_runtime": {
+            "credential_generation": generation,
+            "config_checksum": placeholder,
+            "routing_snapshot_id": f"integration-{generation}",
+        },
+        "platform_native_oai_provider_1_config": {
+            "name": "provider-1",
+            "apikey": TEST_TOKEN,
+            "apibase": apibase,
+            "model": "gpt-test",
+            "api_mode": "chat_completions",
+            "stream": False,
+            "read_timeout": 30,
+        },
+    }
+    canonical = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    checksum = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    (config_root / "mykey.runtime.json").write_bytes(canonical.replace(placeholder, checksum, 1).encode("utf-8"))
     (config_root / "mykey.py").write_text(
-        "native_oai_config = {\n"
-        "    'name': 'fixture-gpt',\n"
-        f"    'apikey': {TEST_TOKEN!r},\n"
-        f"    'apibase': {apibase!r},\n"
-        "    'model': 'gpt-test',\n"
-        "    'api_mode': 'chat_completions',\n"
-        "    'stream': False,\n"
-        "    'read_timeout': 30,\n"
-        "}\n",
+        "import json as _json\n"
+        "from pathlib import Path as _Path\n"
+        "_config = _json.loads(_Path(__file__).with_name(\"mykey.runtime.json\").read_text(encoding=\"utf-8\"))\n"
+        "globals().update(_config)\n"
+        "del _config\n",
         encoding="utf-8",
     )
+    return checksum
 
 
 def _start_worker(config_root: Path, runtime_root: Path) -> tuple[subprocess.Popen, str]:
@@ -315,6 +332,14 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 )
                 assert s1.session_key == "personal:1"
                 assert s1.worker_instance_id
+
+                checksum2 = _write_mykey(config_root, apibase, generation=2)
+                reloaded = stub.ReloadCredentials(worker_pb2.ReloadCredentialsRequest(
+                    credential_generation=2,
+                    config_checksum=checksum2,
+                ))
+                assert reloaded.credential_generation == 2
+                assert reloaded.config_checksum == checksum2
 
                 h1 = stub.Health(worker_pb2.HealthRequest())
                 assert h1.ready is True

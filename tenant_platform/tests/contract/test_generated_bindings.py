@@ -14,6 +14,7 @@ def test_worker_generated_bindings_expose_required_service_surface():
     method_names = {method.name for method in service.methods}
     assert method_names == {
         "StartSession",
+        "ReloadCredentials",
         "ExecuteTask",
         "BeginCheckpoint",
         "CancelTask",

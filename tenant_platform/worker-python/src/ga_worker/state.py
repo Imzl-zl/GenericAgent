@@ -58,6 +58,9 @@ class SessionState:
     manifest: dict[str, Any]
     agent: Any
     runner_thread: threading.Thread
+    credential_generation: int
+    credential_checksum: str
+    routing_snapshot_id: str
     seed_working: dict[str, Any] = field(default_factory=dict)
     seed_backend_history: list[Any] = field(default_factory=list)
     seed_agent_history: list[Any] = field(default_factory=list)

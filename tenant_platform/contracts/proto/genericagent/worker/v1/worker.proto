@@ -36,6 +36,16 @@ message StartSessionResponse {
   string worker_instance_id = 2;
 }
 
+message ReloadCredentialsRequest {
+  uint64 credential_generation = 1;
+  string config_checksum = 2;
+}
+
+message ReloadCredentialsResponse {
+  uint64 credential_generation = 1;
+  string config_checksum = 2;
+}
+
 message TaskEnvelope {
   string task_id = 1;
   string session_key = 2;
@@ -113,6 +123,7 @@ message ShutdownResponse { bool accepted = 1; }
 
 service WorkerService {
   rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+  rpc ReloadCredentials(ReloadCredentialsRequest) returns (ReloadCredentialsResponse);
   rpc ExecuteTask(ExecuteTaskRequest) returns (stream WorkerEvent);
   rpc BeginCheckpoint(BeginCheckpointRequest) returns (CheckpointReady);
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);

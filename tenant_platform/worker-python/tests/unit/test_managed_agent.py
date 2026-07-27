@@ -271,6 +271,7 @@ def roots(tmp_path: Path):
         "native_oai_config = {'name':'test','apikey':'test-token','apibase':'http://127.0.0.1:9/v1','model':'test','stream':False}\n",
         encoding="utf-8",
     )
+    _write_runtime_config(config_root, 1)
     return {
         "config_root": config_root,
         "legacy_root": legacy_root,
@@ -293,6 +294,134 @@ def _make_adapter(roots, registry, factory=None) -> ManagedAgentAdapter:
         registry=registry,
         agent_factory=factory,
     )
+
+def _write_runtime_config(config_root: Path, generation: int, checksum: str = "") -> str:
+    placeholder = "0" * 64
+    document: dict[str, Any] = {
+        "_platform_runtime": {
+            "credential_generation": generation,
+            "config_checksum": placeholder,
+            "routing_snapshot_id": f"snapshot-{generation}",
+        },
+        "platform_native_oai_provider_1_config": {
+            "name": "provider-1",
+            "apikey": f"token-{generation}",
+            "apibase": "http://127.0.0.1:9/v1",
+            "model": "test",
+        },
+    }
+    canonical = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    calculated = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    active_checksum = checksum or calculated
+    encoded = canonical.replace(placeholder, active_checksum, 1)
+    (config_root / "mykey.runtime.json").write_bytes(encoded.encode("utf-8"))
+    return active_checksum
+
+
+def test_reload_credentials_reloads_ga_sessions_and_advances_generation(roots, foundation_registry):
+    agent = ScriptedAgent()
+    reloads: list[int] = []
+    agent.load_llm_sessions = lambda: reloads.append(1)
+    checksum1 = _write_runtime_config(roots["config_root"], 1)
+    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
+    adapter.start_session(_start_req())
+    assert adapter._session is not None
+    assert adapter._session.credential_generation == 1
+    assert adapter._session.credential_checksum == checksum1
+
+    checksum2 = _write_runtime_config(roots["config_root"], 2)
+    response = adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        credential_generation=2,
+        config_checksum=checksum2,
+    ))
+    assert response.credential_generation == 2
+    assert response.config_checksum == checksum2
+    assert reloads == [1]
+    assert adapter._session.credential_generation == 2
+
+
+def test_reload_credentials_rejects_stale_checksum_and_active_task(roots, foundation_registry):
+    agent = ScriptedAgent()
+    agent.load_llm_sessions = lambda: None
+    _write_runtime_config(roots["config_root"], 1)
+    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
+    adapter.start_session(_start_req())
+
+    checksum2 = _write_runtime_config(roots["config_root"], 2)
+    with pytest.raises(WorkerAdapterError) as checksum_error:
+        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+            credential_generation=2,
+            config_checksum="wrong-checksum",
+        ))
+    assert checksum_error.value.code == "CONFIG_CHECKSUM_MISMATCH"
+    assert adapter._session is not None
+    assert adapter._session.credential_generation == 1
+
+    adapter._session.active_task_id = "task-active"
+    with pytest.raises(WorkerAdapterError) as task_error:
+        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+            credential_generation=2,
+            config_checksum=checksum2,
+        ))
+    assert task_error.value.code == "TASK_ACTIVE"
+    assert adapter._session.credential_generation == 1
+
+
+def test_reload_credentials_restores_previous_clients_on_failure(roots, foundation_registry):
+    agent = ScriptedAgent()
+    original_clients = [object()]
+    agent.llmclients = original_clients
+
+    def fail_reload():
+        agent.llmclients = []
+        raise RuntimeError("reload failed")
+
+    agent.load_llm_sessions = fail_reload
+    _write_runtime_config(roots["config_root"], 1)
+    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
+    adapter.start_session(_start_req())
+    checksum2 = _write_runtime_config(roots["config_root"], 2)
+
+    with pytest.raises(WorkerAdapterError) as reload_error:
+        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+            credential_generation=2,
+            config_checksum=checksum2,
+        ))
+    assert reload_error.value.code == "CREDENTIAL_RELOAD_FAILED"
+    assert agent.llmclients is original_clients
+    assert adapter._session is not None
+    assert adapter._session.credential_generation == 1
+
+
+def test_reload_credentials_restores_previous_clients_when_new_config_is_empty(roots, foundation_registry):
+    agent = ScriptedAgent()
+    original_clients = [object()]
+    agent.llmclients = original_clients
+    agent.load_llm_sessions = lambda: setattr(agent, "llmclients", [])
+    _write_runtime_config(roots["config_root"], 1)
+    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
+    adapter.start_session(_start_req())
+    checksum2 = _write_runtime_config(roots["config_root"], 2)
+
+    with pytest.raises(WorkerAdapterError) as reload_error:
+        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+            credential_generation=2,
+            config_checksum=checksum2,
+        ))
+    assert reload_error.value.code == "CREDENTIAL_CONFIG_EMPTY"
+    assert agent.llmclients is original_clients
+    assert adapter._session is not None
+    assert adapter._session.credential_generation == 1
+
+
+def test_reload_credentials_requires_started_session(roots, foundation_registry):
+    adapter = _make_adapter(roots, foundation_registry, factory=ScriptedAgent)
+    with pytest.raises(WorkerAdapterError) as session_error:
+        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+            credential_generation=2,
+            config_checksum="checksum",
+        ))
+    assert session_error.value.code == "SESSION_NOT_STARTED"
 
 
 def test_capability_registry_load_and_resolve(foundation_registry: CapabilityRegistry):

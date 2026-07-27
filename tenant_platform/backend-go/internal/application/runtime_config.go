@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	runtimeConfigFilename = "mykey.runtime.json"
-	myKeyLoaderFilename   = "mykey.py"
+	runtimeConfigFilename      = "mykey.runtime.json"
+	myKeyLoaderFilename        = "mykey.py"
+	runtimeChecksumPlaceholder = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
 const MyKeyLoader = `import json as _json
@@ -72,6 +73,7 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 	document := make(map[string]any, len(input.Providers)+2)
 	metadata := RuntimeConfigMetadata{
 		CredentialGeneration: input.Generation,
+		ConfigChecksum:       runtimeChecksumPlaceholder,
 		RoutingSnapshotID:    input.RoutingSnapshotID,
 	}
 	document["_platform_runtime"] = metadata
@@ -99,16 +101,13 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 		document["mixin_config"] = map[string]any{"llm_nos": mixinNames}
 	}
 
-	checksum, err := checksumRuntimeDocument(document)
+	encodedWithPlaceholder, err := marshalRuntimeDocument(document)
 	if err != nil {
 		return RuntimeConfigFiles{}, err
 	}
-	metadata.ConfigChecksum = checksum
-	document["_platform_runtime"] = metadata
-	encoded, err := marshalRuntimeDocument(document)
-	if err != nil {
-		return RuntimeConfigFiles{}, err
-	}
+	digest := sha256.Sum256(encodedWithPlaceholder)
+	checksum := hex.EncodeToString(digest[:])
+	encoded := bytes.Replace(encodedWithPlaceholder, []byte(runtimeChecksumPlaceholder), []byte(checksum), 1)
 	return RuntimeConfigFiles{
 		JSON: encoded, Loader: []byte(MyKeyLoader), Generation: input.Generation,
 		Checksum: checksum, SnapshotID: input.RoutingSnapshotID,
@@ -220,18 +219,15 @@ func buildRuntimeProviderConfig(proxyBase *url.URL, binding RuntimeProviderBindi
 	return config, nil
 }
 
-func checksumRuntimeDocument(document map[string]any) (string, error) {
-	metadata, ok := document["_platform_runtime"].(RuntimeConfigMetadata)
-	if !ok {
-		return "", fmt.Errorf("runtime metadata missing")
+func checksumRuntimeJSON(encoded []byte, checksum string) (string, error) {
+	if len(checksum) != len(runtimeChecksumPlaceholder) {
+		return "", fmt.Errorf("runtime checksum must be 64 hexadecimal characters")
 	}
-	metadata.ConfigChecksum = ""
-	document["_platform_runtime"] = metadata
-	encoded, err := marshalRuntimeDocument(document)
-	if err != nil {
-		return "", err
+	placeholderBytes := bytes.Replace(encoded, []byte(checksum), []byte(runtimeChecksumPlaceholder), 1)
+	if bytes.Equal(placeholderBytes, encoded) {
+		return "", fmt.Errorf("runtime checksum not present in document")
 	}
-	digest := sha256.Sum256(encoded)
+	digest := sha256.Sum256(placeholderBytes)
 	return hex.EncodeToString(digest[:]), nil
 }
 

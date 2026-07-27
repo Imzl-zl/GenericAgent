@@ -16,6 +16,10 @@ func (blockedShutdownClient) StartSession(context.Context, *workerv1.StartSessio
 	return nil, nil
 }
 
+func (blockedShutdownClient) ReloadCredentials(context.Context, *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
+	return nil, nil
+}
+
 func (blockedShutdownClient) ExecuteTask(context.Context, *workerv1.ExecuteTaskRequest) (<-chan workerclient.WorkerEvent, <-chan error) {
 	return nil, nil
 }
@@ -39,8 +43,8 @@ func TestProcessCleanerBoundsShutdownAndContinuesCleanup(t *testing.T) {
 	worker := blockedShutdownClient{}
 	var closeCalled, killCalled, waitCalled atomic.Bool
 	cleanup := processCleaner{
-		client:    worker,
-		closeConn: func() error { closeCalled.Store(true); return nil },
+		client:      worker,
+		closeConn:   func() error { closeCalled.Store(true); return nil },
 		killProcess: func() error { killCalled.Store(true); return nil },
 		waitProcess: func() error { waitCalled.Store(true); return nil },
 	}

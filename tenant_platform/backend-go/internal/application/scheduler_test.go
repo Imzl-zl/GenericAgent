@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
@@ -64,6 +64,13 @@ func (w *controlledWorker) StartSession(ctx context.Context, _ *workerv1.StartSe
 		}
 	}
 	return &workerv1.StartSessionResponse{}, nil
+}
+
+func (w *controlledWorker) ReloadCredentials(_ context.Context, request *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
+	return &workerv1.ReloadCredentialsResponse{
+		CredentialGeneration: request.GetCredentialGeneration(),
+		ConfigChecksum:       request.GetConfigChecksum(),
+	}, nil
 }
 
 func (w *controlledWorker) ExecuteTask(context.Context, *workerv1.ExecuteTaskRequest) (<-chan workerclient.WorkerEvent, <-chan error) {
