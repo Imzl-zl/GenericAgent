@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/worker"
@@ -35,13 +35,11 @@ type SchedulerConfig struct {
 	Coordinator        checkpoint.Coordinator
 	// Runtime creates a Worker instance for a session. Required.
 	Runtime worker.WorkerRuntime
-	// ConfigRoot is where the platform writes the token-only mykey.py for the
-	// Worker. It may be global in loopback dev mode or session-scoped in
-	// container mode.
+	// ConfigRoot holds the token-only runtime JSON and fixed mykey.py loader.
+	// Production uses a hashed session-scoped subdirectory per Worker.
 	ConfigRoot string
-	// SessionScopedConfig, when true, writes mykey.py under
-	// ConfigRoot/<session-key> and passes that path as ConfigDir to the runtime.
-	// Required for container mode so each container mounts only its own config.
+	// SessionScopedConfig writes each session under a SHA-256 directory and
+	// passes only that directory to the Worker runtime.
 	SessionScopedConfig bool
 	// RuntimeRoot is the parent directory for checkpoint/runtime data.
 	RuntimeRoot string
@@ -49,17 +47,18 @@ type SchedulerConfig struct {
 	// passing a worker.StaticRuntime as Runtime. When set and Runtime is nil,
 	// the scheduler wraps it in a static runtime.
 	DialWorker func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(), error)
-	// LLM Proxy capability_token issuance. Required for real Worker path: the
-	// platform issues a short-lived, session-bound token and writes a token-only
-	// mykey.py (no real upstream key).
+	// LLM Proxy capability issuance. Required for real Worker paths.
 	TokenIssuer        *llmproxy.Issuer
-	TokenRevoker       TokenRevoker
-	LLMProxyAddr       string // e.g. "http://127.0.0.1:8081"
+	CapabilityStore    CapabilityStore
+	Audit              AuditRecorder
+	LLMProxyAddr       string
 	ModelPolicyVersion string
-	// LLMProvider is the admin-configured upstream provider. Required when
-	// TokenIssuer is set so the scheduler can stamp provider/model into the
-	// capability_token and write the matching mykey.py variable.
+	// LLMProvider resolves an immutable provider routing snapshot per Worker.
 	LLMProvider LLMProviderSource
+	// TokenTTL must cover a complete task plus the pre-dispatch refresh skew.
+	TokenTTL         time.Duration
+	TokenRefreshSkew time.Duration
+	MaxTaskWallClock time.Duration
 	// MaxBundleBytes for checkpoint prepare.
 	MaxBundleBytes uint64
 	// MaxRunningTasks caps the global number of simultaneously starting/running
@@ -93,9 +92,14 @@ type SchedulerConfig struct {
 	WorkerIdleTTL time.Duration
 }
 
-// LLMProviderSource returns the platform's current default LLM provider.
+// LLMProviderSource resolves active routing order and individual live revisions.
 type LLMProviderSource interface {
-	GetDefaultProvider(ctx context.Context) (domain.LLMProvider, error)
+	ListActiveProviders(ctx context.Context) ([]domain.LLMProvider, error)
+	GetProvider(ctx context.Context, id int64) (domain.LLMProvider, error)
+}
+
+type CapabilityStore interface {
+	RevokeCapability(ctx context.Context, jti string, expiresAt time.Time) error
 }
 
 const (
@@ -105,7 +109,9 @@ const (
 	defaultMaxOutputBytes     = 256 * 1024
 	defaultWorkerShutdownSecs = 5
 
-	workerShutdownTimeout = defaultWorkerShutdownSecs * time.Second
+	DefaultTokenRefreshSkew = 5 * time.Minute
+	DefaultMaxTaskWallClock = 45 * time.Minute
+	workerShutdownTimeout   = defaultWorkerShutdownSecs * time.Second
 )
 
 // ErrLeaseExpired is re-exported from domain for callers in the application
@@ -138,15 +144,17 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 	if cfg.Runtime == nil {
 		return nil, fmt.Errorf("SchedulerConfig.Runtime is required")
 	}
-	// Real Worker path (no injected DialWorker) MUST go through the LLM Proxy:
-	// token issuer + revoker + Proxy address + config root for token-only
-	// mykey.py. This is the spec §7.1 security red line.
+	// Real Worker paths MUST use the LLM Proxy, persistent capability
+	// revocation, and session-scoped token-only runtime configuration.
 	if cfg.DialWorker == nil {
 		if cfg.TokenIssuer == nil {
 			return nil, fmt.Errorf("SchedulerConfig.TokenIssuer is required for real Worker path")
 		}
-		if cfg.TokenRevoker == nil {
-			return nil, fmt.Errorf("SchedulerConfig.TokenRevoker is required for real Worker path")
+		if cfg.CapabilityStore == nil {
+			return nil, fmt.Errorf("SchedulerConfig.CapabilityStore is required for real Worker path")
+		}
+		if cfg.Audit == nil {
+			return nil, fmt.Errorf("SchedulerConfig.Audit is required for real Worker path")
 		}
 		if strings.TrimSpace(cfg.LLMProxyAddr) == "" {
 			return nil, fmt.Errorf("SchedulerConfig.LLMProxyAddr is required for real Worker path")
@@ -157,6 +165,18 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 		if cfg.LLMProvider == nil {
 			return nil, fmt.Errorf("SchedulerConfig.LLMProvider is required for real Worker path")
 		}
+	}
+	if cfg.MaxTaskWallClock == 0 && cfg.DialWorker != nil {
+		cfg.MaxTaskWallClock = DefaultMaxTaskWallClock
+	}
+	if cfg.TokenRefreshSkew == 0 && cfg.DialWorker != nil {
+		cfg.TokenRefreshSkew = DefaultTokenRefreshSkew
+	}
+	if cfg.TokenTTL == 0 && cfg.DialWorker != nil {
+		cfg.TokenTTL = llmproxy.DefaultTokenTTL
+	}
+	if err := validateSchedulerCredentialTiming(cfg); err != nil {
+		return nil, err
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = time.Second
@@ -169,6 +189,22 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 		wake:    make(chan struct{}, 1),
 		workers: make(map[string]*workerEntry),
 	}, nil
+}
+
+func validateSchedulerCredentialTiming(cfg SchedulerConfig) error {
+	if cfg.MaxTaskWallClock <= 0 {
+		return fmt.Errorf("SchedulerConfig.MaxTaskWallClock must be positive")
+	}
+	if cfg.TokenRefreshSkew < 0 {
+		return fmt.Errorf("SchedulerConfig.TokenRefreshSkew must not be negative")
+	}
+	if cfg.TokenTTL < cfg.MaxTaskWallClock+cfg.TokenRefreshSkew {
+		return fmt.Errorf("SchedulerConfig.TokenTTL must cover MaxTaskWallClock plus TokenRefreshSkew")
+	}
+	if cfg.TokenIssuer != nil && cfg.TokenIssuer.TTL() != cfg.TokenTTL {
+		return fmt.Errorf("SchedulerConfig.TokenTTL must match TokenIssuer TTL")
+	}
+	return nil
 }
 
 func (s *scheduler) KickSession(ctx context.Context, sessionKey string) error {

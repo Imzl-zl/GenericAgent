@@ -74,6 +74,13 @@ func NewIssuer(signingKey []byte, ttl time.Duration) (*Issuer, error) {
 	return &Issuer{signingKey: append([]byte(nil), signingKey...), ttl: ttl, clock: time.Now}, nil
 }
 
+func (i *Issuer) TTL() time.Duration {
+	if i == nil {
+		return 0
+	}
+	return i.ttl
+}
+
 func (i *Issuer) Issue(spec CapabilitySpec) (string, CapabilityClaims, error) {
 	if err := validateCapabilitySpec(spec); err != nil {
 		return "", CapabilityClaims{}, err

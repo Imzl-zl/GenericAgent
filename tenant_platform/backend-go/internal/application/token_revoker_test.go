@@ -75,29 +75,3 @@ func TestPersistentTokenRevokerRejectsInvalidConfig(t *testing.T) {
 		t.Fatal("expected non-positive retention error")
 	}
 }
-
-func TestSchedulerRevokeTokenBestEffort(t *testing.T) {
-	store := &fakeCapabilityRevocationStore{}
-	revoker, err := NewPersistentTokenRevoker(store, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scheduler := &scheduler{cfg: SchedulerConfig{TokenRevoker: revoker}}
-	scheduler.revokeTokenBestEffort(context.Background(), "jti-1")
-	if store.calls.Load() != 1 {
-		t.Fatalf("calls = %d, want 1", store.calls.Load())
-	}
-}
-
-func TestSchedulerRevokeTokenBestEffortNilAndEmptyAreNoops(t *testing.T) {
-	(&scheduler{}).revokeTokenBestEffort(context.Background(), "jti-1")
-	store := &fakeCapabilityRevocationStore{}
-	revoker, err := NewPersistentTokenRevoker(store, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	(&scheduler{cfg: SchedulerConfig{TokenRevoker: revoker}}).revokeTokenBestEffort(context.Background(), "")
-	if store.calls.Load() != 0 {
-		t.Fatalf("calls = %d, want 0", store.calls.Load())
-	}
-}

@@ -11,8 +11,8 @@ import (
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 )
 
 // finalizeOrFail records a terminal task state + delivery and surfaces any
@@ -30,6 +30,18 @@ func (s *scheduler) finalizeOrFail(ctx context.Context, task domain.Task, status
 		return task
 	}
 	return t
+}
+
+func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) error {
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.CancelWorker(cancelCtx, task); err != nil {
+		slog.WarnContext(ctx, "scheduler: deadline cancel failed", "task_id", task.ID, "error", err)
+	}
+	s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+		"TASK_DEADLINE_EXCEEDED", "task exceeded maximum wall-clock duration", "")
+	_ = s.KickSession(ctx, task.SessionKey)
+	return context.DeadlineExceeded
 }
 
 func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr error) {
@@ -83,11 +95,13 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 
 	client, entry, err := s.ensureWorker(ctx, task)
 	if err != nil {
+		s.auditRoutingBinding(ctx, task, entry, "error", "WORKER_CREDENTIAL_PREPARE_FAILED")
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_START_FAILED", err.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
+	s.auditRoutingBinding(ctx, task, entry, "success", "")
 
 	s.workerCallMu.Lock()
 	workerCallLocked := true
@@ -156,17 +170,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		},
 	}
 
-	// Hard wall-clock timeout is intentionally NOT applied here. A single
-	// task may legitimately run for minutes (slow LLM thinking, multi-step
-	// file processing, long tool chains). Killing the gRPC stream on a fixed
-	// budget would abort legitimate work. Instead, stuck-task detection uses
-	// an idle heuristic (see reapStuckTasks): a task is only reaped when it
-	// has produced no activity for longer than the idle threshold, which
-	// distinguishes "slow but working" from "deadlocked". The Worker's own
-	// RuntimePolicy.TaskTimeoutSeconds remains as a soft timer for its
-	// internal use (e.g. cancelling a single hung LLM call), not as a
-	// process-level kill switch.
-	executeCtx, cancelExecute := context.WithCancel(ctx)
+	taskDeadline := time.Now().Add(s.cfg.MaxTaskWallClock)
+	executeCtx, cancelExecute := context.WithTimeout(ctx, s.cfg.MaxTaskWallClock)
 	defer cancelExecute()
 	events, errs := client.ExecuteTask(executeCtx, req)
 	releaseWorkerCall()
@@ -175,8 +180,11 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	eventsOpen, errsOpen := true, true
 	for eventsOpen || errsOpen {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-executeCtx.Done():
+			if !time.Now().Before(taskDeadline) {
+				return s.finalizeTaskDeadline(ctx, task)
+			}
+			return executeCtx.Err()
 		case ev, ok := <-events:
 			if !ok {
 				eventsOpen = false
@@ -219,6 +227,9 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			}
 		}
 	}
+	if !time.Now().Before(taskDeadline) {
+		return s.finalizeTaskDeadline(ctx, task)
+	}
 	if streamErr != nil && terminal == nil {
 		if errors.Is(streamErr, context.Canceled) {
 			slog.InfoContext(ctx, "scheduler: stream cancelled by context",
@@ -246,6 +257,9 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			"TASK_INTERRUPTED", "task interrupted after accepted cancellation", "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
+	}
+	if !time.Now().Before(taskDeadline) {
+		return s.finalizeTaskDeadline(ctx, task)
 	}
 	switch terminal.GetStatus() {
 	case workerv1.TerminalStatus_TASK_SUCCEEDED:

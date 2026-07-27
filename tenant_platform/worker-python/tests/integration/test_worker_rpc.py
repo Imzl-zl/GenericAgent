@@ -341,6 +341,13 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 assert reloaded.credential_generation == 2
                 assert reloaded.config_checksum == checksum2
 
+                repeated_reload = stub.ReloadCredentials(worker_pb2.ReloadCredentialsRequest(
+                    credential_generation=2,
+                    config_checksum=checksum2,
+                ))
+                assert repeated_reload.credential_generation == 2
+                assert repeated_reload.config_checksum == checksum2
+
                 h1 = stub.Health(worker_pb2.HealthRequest())
                 assert h1.ready is True
                 assert h1.session_key == "personal:1"

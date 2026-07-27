@@ -257,7 +257,7 @@ func run() error {
 		databaseURL           = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
 		migration             = flag.String("migration", "", "path to 0001_foundation.sql")
 		runtimeRoot           = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
-		configRoot            = flag.String("config-root", "", "GA_CONFIG_ROOT for token-only mykey.py")
+		configRoot            = flag.String("config-root", "", "GA_CONFIG_ROOT for session-scoped token-only runtime configuration")
 		legacyRoot            = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
 		workerPython          = flag.String("worker-python", "", "python interpreter for worker")
 		workerSrc             = flag.String("worker-src", "", "path to worker-python/src")
@@ -278,6 +278,7 @@ func run() error {
 		perTenantRunningLimit = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
 		perUserQueueLimit     = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
 		taskTimeoutSeconds    = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
+		maxTaskWallClockSec   = flag.Int("max-task-wall-clock-seconds", envInt("MAX_TASK_WALL_CLOCK_SECONDS", 2700), "hard task wall-clock limit; capability TTL must cover this plus refresh skew")
 		taskIdleTimeoutSec    = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
 		workerIdleTTLSec      = flag.Int("worker-idle-ttl-seconds", envInt("WORKER_IDLE_TTL_SECONDS", 600), "Worker eviction threshold (or WORKER_IDLE_TTL_SECONDS). Default 600s (10min). Idle Worker processes (no active task) older than this are torn down to reclaim memory (pattern: Kubernetes pod eviction + AWS Lambda container reuse window). Next task cold-starts from last snapshot. 0 = keep Workers resident indefinitely (dev/test or tiny fleets).")
 	)
@@ -476,16 +477,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("capability token issuer: %w", err)
 	}
-	revoker, err := application.NewPersistentTokenRevoker(store, llmproxy.DefaultRevocationRetention)
-	if err != nil {
-		return fmt.Errorf("capability token revoker: %w", err)
-	}
 
 	runtime, err := buildWorkerRuntime(boot)
 	if err != nil {
 		return err
 	}
-	sessionScopedConfig := false
+	sessionScopedConfig := true
 
 	sched, err := application.NewScheduler(application.SchedulerConfig{
 		PlatformInstanceID:    instanceID,
@@ -500,9 +497,13 @@ func run() error {
 		RuntimeRoot:           boot.RuntimeRoot,
 		LLMProxyAddr:          proxyAddr,
 		TokenIssuer:           issuer,
-		TokenRevoker:          revoker,
+		CapabilityStore:       store,
+		Audit:                 store,
 		ModelPolicyVersion:    strings.TrimSpace(*modelPolicyVersion),
 		LLMProvider:           store,
+		TokenTTL:              llmproxy.DefaultTokenTTL,
+		TokenRefreshSkew:      application.DefaultTokenRefreshSkew,
+		MaxTaskWallClock:      time.Duration(*maxTaskWallClockSec) * time.Second,
 		MaxRunningTasks:       *maxRunningTasks,
 		PerTenantRunningLimit: *perTenantRunningLimit,
 		TaskTimeoutSeconds:    *taskTimeoutSeconds,

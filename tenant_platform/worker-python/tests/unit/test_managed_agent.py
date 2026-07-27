@@ -339,6 +339,14 @@ def test_reload_credentials_reloads_ga_sessions_and_advances_generation(roots, f
     assert reloads == [1]
     assert adapter._session.credential_generation == 2
 
+    repeated = adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        credential_generation=2,
+        config_checksum=checksum2,
+    ))
+    assert repeated.credential_generation == 2
+    assert repeated.config_checksum == checksum2
+    assert reloads == [1]
+
 
 def test_reload_credentials_rejects_stale_checksum_and_active_task(roots, foundation_registry):
     agent = ScriptedAgent()

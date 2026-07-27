@@ -10,6 +10,7 @@ Public API only; internals split into:
 
 from __future__ import annotations
 
+import hmac
 import threading
 import uuid
 from pathlib import Path
@@ -95,11 +96,15 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
                 raise WorkerAdapterError("SESSION_NOT_STARTED", "session not started")
             if self._pending is not None or self._session.active_task_id:
                 raise WorkerAdapterError("TASK_ACTIVE", "cannot reload credentials during a task")
-            if request.credential_generation <= self._session.credential_generation:
-                raise WorkerAdapterError(
-                    "CREDENTIAL_GENERATION_STALE",
-                    "credential generation must increase",
+            if request.credential_generation == self._session.credential_generation:
+                if not hmac.compare_digest(request.config_checksum, self._session.credential_checksum):
+                    raise WorkerAdapterError("CONFIG_CHECKSUM_MISMATCH", "CONFIG_CHECKSUM_MISMATCH")
+                return worker_pb2.ReloadCredentialsResponse(
+                    credential_generation=self._session.credential_generation,
+                    config_checksum=self._session.credential_checksum,
                 )
+            if request.credential_generation < self._session.credential_generation:
+                raise WorkerAdapterError("CREDENTIAL_GENERATION_STALE", "credential generation must increase")
             try:
                 metadata = load_runtime_metadata(self.config_root)
                 validate_reload_request(

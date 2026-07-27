@@ -2,29 +2,32 @@ package application
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/worker"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
 
 // workerEntry holds a dedicated Worker process bound to one session_key.
 type workerEntry struct {
-	client     workerclient.WorkerClient
-	cleanup    func()
-	instID     string
-	sessionKey string
-	jti        string // capability_token JTI; revoked on Worker cleanup
-	startOnce  sync.Once
-	startErr   error
-	started    bool
+	client             workerclient.WorkerClient
+	cleanup            func()
+	instID             string
+	sessionKey         string
+	credentials        workerCredentialSet
+	pendingRefresh     *pendingCredentialRefresh
+	pendingRevocations []workerCredentialSet
+	lifecycleMu        sync.Mutex
+	startOnce          sync.Once
+	startErr           error
+	started            bool
 	// lastUsedAt is updated every time a task is dispatched to this Worker.
 	// Used by the idle eviction reaper to reclaim memory from long-idle
 	// sessions (pattern: Kubernetes pod eviction, AWS Lambda container TTL).
@@ -73,39 +76,106 @@ func (s *scheduler) CancelWorker(ctx context.Context, task domain.Task) error {
 // later by dispatch after MarkDispatchStarted so that cancel-during-StartSession
 // sees WorkerDispatchStartedAt != nil and records a durable cancel request.
 //
-// On first use for a session, a capability_token is issued (via TokenIssuer)
-// and a token-only mykey.py is written to ConfigRoot. The real upstream key
-// never enters the Worker (spec §7.1). The token JTI is stored for revocation
-// when the Worker process is cleaned up.
+// On first use, one capability token per routed Provider is written to the
+// session-scoped runtime JSON. The real upstream keys never enter the Worker.
+// Credential sets remain tracked until their JTIs are durably revoked.
 func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerclient.WorkerClient, *workerEntry, error) {
+	for {
+		s.mu.Lock()
+		entry := s.workers[task.SessionKey]
+		if entry == nil {
+			entry = &workerEntry{sessionKey: task.SessionKey}
+			entry.lifecycleMu.Lock()
+			s.workers[task.SessionKey] = entry
+			s.mu.Unlock()
+			return s.initializeWorkerEntry(ctx, task.SessionKey, entry)
+		}
+		s.mu.Unlock()
+
+		entry.lifecycleMu.Lock()
+		if !s.workerEntryIsCurrent(task.SessionKey, entry) {
+			entry.lifecycleMu.Unlock()
+			continue
+		}
+		replace, err := s.prepareWorkerEntry(ctx, entry)
+		if err != nil {
+			entry.lifecycleMu.Unlock()
+			return nil, entry, err
+		}
+		if !replace {
+			entry.lastUsedAt = time.Now().UTC()
+			client := entry.client
+			entry.lifecycleMu.Unlock()
+			return client, entry, nil
+		}
+
+		s.removeWorkerEntry(task.SessionKey, entry)
+		s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+		entry.lifecycleMu.Unlock()
+	}
+}
+
+func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) (bool, error) {
+	if err := s.flushPendingCredentialRevocations(ctx, entry); err != nil {
+		return false, fmt.Errorf("flush pending credential revocations: %w", err)
+	}
+	if entry.pendingRefresh != nil {
+		if err := s.refreshWorkerCredentials(ctx, entry); err != nil {
+			return false, err
+		}
+	}
+	if s.cfg.TokenIssuer == nil {
+		return false, nil
+	}
+	replace, err := s.routingSnapshotRequiresReplacement(ctx, entry.credentials.Snapshot)
+	if err != nil || replace {
+		return replace, err
+	}
+	if s.credentialsNeedRefresh(entry.credentials) {
+		if err := s.refreshWorkerCredentials(ctx, entry); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func (s *scheduler) initializeWorkerEntry(
+	ctx context.Context, sessionKey string, entry *workerEntry,
+) (workerclient.WorkerClient, *workerEntry, error) {
+	credentials, err := s.issueInitialWorkerCredentials(ctx, sessionKey)
+	if err != nil {
+		s.removeWorkerEntry(sessionKey, entry)
+		entry.lifecycleMu.Unlock()
+		return nil, nil, err
+	}
+	client, instID, cleanup, err := s.startWorkerProcess(ctx, sessionKey)
+	if err != nil {
+		s.removeWorkerEntry(sessionKey, entry)
+		s.revokeCredentialSetBestEffort(context.Background(), credentials)
+		entry.lifecycleMu.Unlock()
+		return nil, nil, err
+	}
+	entry.client = client
+	entry.cleanup = cleanup
+	entry.instID = instID
+	entry.credentials = credentials
+	entry.lastUsedAt = time.Now().UTC()
+	entry.lifecycleMu.Unlock()
+	return client, entry, nil
+}
+
+func (s *scheduler) workerEntryIsCurrent(sessionKey string, entry *workerEntry) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if entry, ok := s.workers[task.SessionKey]; ok {
-		entry.lastUsedAt = time.Now().UTC() // refresh idle-eviction clock on reuse
-		return entry.client, entry, nil
-	}
+	return s.workers[sessionKey] == entry
+}
 
-	jti, err := s.issueAndWriteCredential(ctx, task.SessionKey)
-	if err != nil {
-		return nil, nil, err
+func (s *scheduler) removeWorkerEntry(sessionKey string, entry *workerEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.workers[sessionKey] == entry {
+		delete(s.workers, sessionKey)
 	}
-
-	client, instID, cleanup, err := s.startWorkerProcess(ctx, task.SessionKey)
-	if err != nil {
-		s.revokeTokenBestEffort(context.Background(), jti)
-		return nil, nil, err
-	}
-
-	entry := &workerEntry{
-		client:     client,
-		cleanup:    cleanup,
-		instID:     instID,
-		sessionKey: task.SessionKey,
-		jti:        jti,
-		lastUsedAt: time.Now().UTC(),
-	}
-	s.workers[task.SessionKey] = entry
-	return client, entry, nil
 }
 
 // configDirFor returns the directory that holds mykey.py for the session.
@@ -114,23 +184,25 @@ func (s *scheduler) configDirFor(sessionKey string) string {
 	if !s.cfg.SessionScopedConfig {
 		return s.cfg.ConfigRoot
 	}
-	return s.cfg.ConfigRoot + "/" + sessionKey
+	digest := sha256.Sum256([]byte(sessionKey))
+	return filepath.Join(s.cfg.ConfigRoot, hex.EncodeToString(digest[:]))
 }
 
-// revokeTokenBestEffort attempts a revocation; failures are logged (token TTL
-// is the safety net). Never blocks the caller on revocation errors.
-func (s *scheduler) revokeTokenBestEffort(ctx context.Context, jti string) {
-	if s.cfg.TokenRevoker == nil || jti == "" {
-		return
+func (s *scheduler) cleanupWorkerEntryBestEffort(ctx context.Context, entry *workerEntry) {
+	if entry.cleanup != nil {
+		entry.cleanup()
 	}
-	revokeCtx, cancel := context.WithTimeout(ctx, revokeTimeout)
-	defer cancel()
-	if err := s.cfg.TokenRevoker.Revoke(revokeCtx, jti); err != nil {
-		slog.WarnContext(ctx, "scheduler: best-effort revoke failed",
-			"jti", jti,
-			"error", err)
+	if entry.pendingRefresh != nil {
+		s.revokeCredentialSetBestEffort(ctx, entry.pendingRefresh.Next)
 	}
+	for _, set := range entry.pendingRevocations {
+		s.revokeCredentialSetBestEffort(ctx, set)
+	}
+	s.revokeCredentialSetBestEffort(ctx, entry.credentials)
 }
+
+// revokeCredentialSetBestEffort persists every JTI with the token's exact
+// expiry. Token material and full JTIs are never logged.
 
 // startSessionOnWorker calls StartSession on the worker bound to task.SessionKey.
 // Must be called AFTER MarkDispatchStarted. Idempotent per worker via startOnce.
@@ -141,16 +213,18 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	if entry == nil {
 		return fmt.Errorf("no worker for session %s", task.SessionKey)
 	}
+	entry.lifecycleMu.Lock()
+	defer entry.lifecycleMu.Unlock()
+	if !s.workerEntryIsCurrent(task.SessionKey, entry) {
+		return fmt.Errorf("worker replaced for session %s", task.SessionKey)
+	}
 	startReq := &workerv1.StartSessionRequest{
 		SessionKey: task.SessionKey,
 		RuntimePolicy: &workerv1.RuntimePolicy{
-			MaxTurns:           defaultMaxTurns,
-			MaxHistoryBytes:    defaultMaxHistoryBytes,
-			MaxWorkingBytes:    defaultMaxWorkingBytes,
-			MaxOutputBytes:     defaultMaxOutputBytes,
+			MaxTurns: defaultMaxTurns, MaxHistoryBytes: defaultMaxHistoryBytes,
+			MaxWorkingBytes: defaultMaxWorkingBytes, MaxOutputBytes: defaultMaxOutputBytes,
 			TaskTimeoutSeconds: uint32(s.cfg.TaskTimeoutSeconds),
-			CapabilityVersion:  CapabilityVersion,
-			PolicyDigest:       s.cfg.Registry.Digest(),
+			CapabilityVersion:  CapabilityVersion, PolicyDigest: s.cfg.Registry.Digest(),
 		},
 	}
 	if task.SnapshotID != "" {
@@ -158,18 +232,15 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 		startReq.SnapshotChecksum = task.SnapshotChecksum
 	}
 	if err := entry.startSession(ctx, startReq); err != nil {
-		s.mu.Lock()
-		delete(s.workers, task.SessionKey)
-		s.mu.Unlock()
-		s.revokeTokenBestEffort(context.Background(), entry.jti)
-		entry.cleanup()
+		s.removeWorkerEntry(task.SessionKey, entry)
+		s.cleanupWorkerEntryBestEffort(context.Background(), entry)
 		return err
 	}
 	return nil
 }
 
-// startWorkerProcess asks the configured WorkerRuntime to create a Worker for
-// the session. The token-only mykey.py has already been written by ensureWorker.
+// startWorkerProcess creates the Worker after its runtime JSON and fixed
+// mykey.py loader have been written.
 func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string) (workerclient.WorkerClient, string, func(), error) {
 	inst, err := s.cfg.Runtime.Start(ctx, worker.StartRequest{
 		SessionKey: sessionKey,
@@ -182,15 +253,20 @@ func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string) (
 	return inst.Client, inst.InstID, inst.Cleanup, nil
 }
 
-// shutdownAllWorkers revokes all active capability_tokens and tears down every
+// shutdownAllWorkers revokes active capability sets and tears down every
 // Worker process. Called once on platform shutdown.
 func (s *scheduler) shutdownAllWorkers(ctx context.Context) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for sk, entry := range s.workers {
-		s.revokeTokenBestEffort(ctx, entry.jti)
-		entry.cleanup()
-		delete(s.workers, sk)
+	entries := make([]*workerEntry, 0, len(s.workers))
+	for sessionKey, entry := range s.workers {
+		entries = append(entries, entry)
+		delete(s.workers, sessionKey)
+	}
+	s.mu.Unlock()
+	for _, entry := range entries {
+		entry.lifecycleMu.Lock()
+		s.cleanupWorkerEntryBestEffort(ctx, entry)
+		entry.lifecycleMu.Unlock()
 	}
 }
 
@@ -199,90 +275,15 @@ func (s *scheduler) shutdownAllWorkers(ctx context.Context) {
 func (s *scheduler) stopSessionWorker(sessionKey string) {
 	s.mu.Lock()
 	entry := s.workers[sessionKey]
-	delete(s.workers, sessionKey)
 	s.mu.Unlock()
-	if entry != nil {
-		s.revokeTokenBestEffort(context.Background(), entry.jti)
-		entry.cleanup()
+	if entry == nil {
+		return
 	}
-}
-
-func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, terminal *workerv1.Terminal) error {
-	if s.cfg.Coordinator == nil {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-			"NO_COORDINATOR", "checkpoint coordinator not configured", "")
-		return fmt.Errorf("no coordinator")
+	entry.lifecycleMu.Lock()
+	defer entry.lifecycleMu.Unlock()
+	if !s.workerEntryIsCurrent(sessionKey, entry) {
+		return
 	}
-	lease, err := s.cfg.Coordinator.Prepare(ctx, checkpoint.CheckpointPrepareRequest{
-		TaskID:         task.ID,
-		WorkspaceID:    task.WorkspaceID,
-		SessionKey:     task.SessionKey,
-		MaxBundleBytes: s.cfg.MaxBundleBytes,
-	})
-	if err != nil {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-			"CHECKPOINT_PREPARE_FAILED", err.Error(), "")
-		return err
-	}
-	client, _, err := s.ensureWorker(ctx, task)
-	if err != nil {
-		return err
-	}
-	ready, err := client.BeginCheckpoint(ctx, &workerv1.BeginCheckpointRequest{
-		TaskId:          task.ID,
-		CheckpointToken: lease.Token,
-		StagingRef:      lease.StagingRef,
-		MaxBundleBytes:  lease.MaxBundleBytes,
-	})
-	if err != nil {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-			"BEGIN_CHECKPOINT_FAILED", err.Error(), "")
-		return err
-	}
-	committed, err := s.cfg.Coordinator.Commit(ctx, checkpoint.ReadyCheckpoint{
-		TaskID:          task.ID,
-		SnapshotID:      lease.SnapshotID,
-		CheckpointToken: lease.Token,
-		StagingRef:      ready.GetStagingRef(),
-		Checksum:        ready.GetChecksum(),
-		ResultDigest:    firstNonEmpty(ready.GetResultDigest(), terminal.GetResultDigest()),
-	})
-	if err != nil {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-			"CHECKPOINT_COMMIT_FAILED", err.Error(), "")
-		return err
-	}
-	// Digest consistency with terminal when present.
-	if terminal.GetResultDigest() != "" && committed.ResultDigest != "" && terminal.GetResultDigest() != committed.ResultDigest {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-			"RESULT_DIGEST_MISMATCH", "terminal and checkpoint result digests differ", "")
-		return fmt.Errorf("result digest mismatch")
-	}
-	payload, err := s.cfg.Coordinator.ReadResult(ctx, committed.ResultRef, committed.ResultDigest)
-	if err != nil {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-			"RESULT_READ_FAILED", err.Error(), "")
-		return err
-	}
-	resultBytes := len(payload.Body)
-	if _, err := s.cfg.Store.CompleteSucceeded(ctx, task.ID, s.cfg.PlatformInstanceID,
-		committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, resultBytes); err != nil {
-		return err
-	}
-	_ = s.KickSession(ctx, task.SessionKey)
-	return nil
-}
-
-func boundMsg(s string) string {
-	if len(s) > postgres.MaxTerminalErrorBytes {
-		return s[:postgres.MaxTerminalErrorBytes]
-	}
-	return s
-}
-
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
+	s.removeWorkerEntry(sessionKey, entry)
+	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
 }

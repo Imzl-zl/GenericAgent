@@ -125,6 +125,7 @@ const (
 	AuditUserBlocked          AuditAction = "user_blocked"
 	AuditTaskCancelledByBlock AuditAction = "task_cancelled_by_block"
 	AuditRelayForwarded       AuditAction = "relay_forwarded"
+	AuditLLMRoutingBound      AuditAction = "llm_routing_bound"
 )
 
 // AuditEvent is an append-only record of a lifecycle or authorization action.

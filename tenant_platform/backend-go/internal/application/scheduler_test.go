@@ -26,6 +26,50 @@ func TestSchedulerConfigValidation(t *testing.T) {
 	_ = time.Second
 }
 
+func TestCredentialReloadDoesNotHoldGlobalWorkersLock(t *testing.T) {
+	reloadingWorker := newControlledWorker()
+	reloadingWorker.reloadEntered = make(chan struct{})
+	reloadingWorker.releaseReload = make(chan struct{})
+	otherWorker := newControlledWorker()
+	oldSet := workerCredentialSet{Generation: 1, Checksum: "old", JTIs: []string{"old"}}
+	newSet := workerCredentialSet{Generation: 2, Checksum: "new", JTIs: []string{"new"}}
+	reloadingEntry := &workerEntry{
+		client: reloadingWorker, sessionKey: "personal:1", credentials: oldSet,
+		pendingRefresh: &pendingCredentialRefresh{Previous: oldSet, Next: newSet},
+	}
+	otherEntry := &workerEntry{client: otherWorker, sessionKey: "personal:2"}
+	s := &scheduler{
+		workers: map[string]*workerEntry{"personal:1": reloadingEntry, "personal:2": otherEntry},
+		cfg:     SchedulerConfig{},
+	}
+	reloadDone := make(chan error, 1)
+	go func() {
+		_, _, err := s.ensureWorker(context.Background(), domain.Task{SessionKey: "personal:1"})
+		reloadDone <- err
+	}()
+	select {
+	case <-reloadingWorker.reloadEntered:
+	case <-time.After(time.Second):
+		t.Fatal("credential reload did not start")
+	}
+	cancelDone := make(chan error, 1)
+	go func() {
+		cancelDone <- s.CancelWorker(context.Background(), domain.Task{ID: "task-2", SessionKey: "personal:2"})
+	}()
+	select {
+	case err := <-cancelDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated session cancellation blocked behind credential reload")
+	}
+	close(reloadingWorker.releaseReload)
+	if err := <-reloadDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 type controlledWorker struct {
 	events                 chan workerclient.WorkerEvent
 	errs                   chan error
@@ -40,6 +84,10 @@ type controlledWorker struct {
 	beginCheckpointEntered chan struct{}
 	releaseBeginCheckpoint chan struct{}
 	beginCheckpointErr     error
+	reloadErr              error
+	reloadRequests         []*workerv1.ReloadCredentialsRequest
+	reloadEntered          chan struct{}
+	releaseReload          chan struct{}
 }
 
 func newControlledWorker() *controlledWorker {
@@ -66,7 +114,21 @@ func (w *controlledWorker) StartSession(ctx context.Context, _ *workerv1.StartSe
 	return &workerv1.StartSessionResponse{}, nil
 }
 
-func (w *controlledWorker) ReloadCredentials(_ context.Context, request *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
+func (w *controlledWorker) ReloadCredentials(ctx context.Context, request *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
+	w.reloadRequests = append(w.reloadRequests, request)
+	if w.reloadEntered != nil {
+		close(w.reloadEntered)
+	}
+	if w.releaseReload != nil {
+		select {
+		case <-w.releaseReload:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if w.reloadErr != nil {
+		return nil, w.reloadErr
+	}
 	return &workerv1.ReloadCredentialsResponse{
 		CredentialGeneration: request.GetCredentialGeneration(),
 		ConfigChecksum:       request.GetConfigChecksum(),
@@ -271,6 +333,50 @@ func TestScheduler_AcceptedRunningCancelReachesWorkerBeforeStreamCompletionAndWi
 	}
 }
 
+func TestSchedulerDeadlineCancelsWorkerAndCannotSucceed(t *testing.T) {
+	_, store, reg, dev := serviceFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
+		Source: "web", SourceInstanceID: "deadline", MessageID: "deadline",
+		Prompt: "hold", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "deadline-owner", time.Second)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	worker := newControlledWorker()
+	schedulerAPI, err := NewScheduler(SchedulerConfig{
+		PlatformInstanceID: "deadline-owner", ClaimLease: time.Second,
+		Store: store, Registry: reg, MaxTaskWallClock: 50 * time.Millisecond,
+		TokenTTL: time.Hour,
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+			return worker, func() {}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = schedulerAPI.(*scheduler).dispatch(ctx, claimed)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("dispatch error=%v", err)
+	}
+	if worker.cancelCalls.Load() != 1 {
+		t.Fatalf("cancel calls=%d", worker.cancelCalls.Load())
+	}
+	final, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != domain.TaskFailed || final.TerminalErrorCode != "TASK_DEADLINE_EXCEEDED" {
+		t.Fatalf("status=%s code=%s", final.Status, final.TerminalErrorCode)
+	}
+}
+
 func TestScheduler_HeartbeatsQuietStreamBeforeLeaseExpires(t *testing.T) {
 	_, store, reg, dev := serviceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -334,6 +440,7 @@ func TestScheduler_HeartbeatsQuietStreamBeforeLeaseExpires(t *testing.T) {
 		t.Fatalf("competing recovery interrupted %d quiet task(s)", recovered)
 	}
 	current, err := store.GetTask(ctx, task.ID)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,6 +450,49 @@ func TestScheduler_HeartbeatsQuietStreamBeforeLeaseExpires(t *testing.T) {
 	worker.interrupt()
 	if err := <-dispatchDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestScheduler_MissingWorkerDuringCheckpointFinalizesFailure(t *testing.T) {
+	_, store, _, dev := serviceFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
+		Source: "web", SourceInstanceID: "missing-worker", MessageID: "missing-worker",
+		Prompt: "checkpoint", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "missing-worker-owner", time.Second)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.MarkDispatchStarted(ctx, task.ID, "missing-worker-owner", "worker-gone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, task.ID, "missing-worker-owner"); err != nil {
+		t.Fatal(err)
+	}
+	s := &scheduler{
+		cfg: SchedulerConfig{
+			PlatformInstanceID: "missing-worker-owner", Store: store,
+			Coordinator:    &successfulCoordinator{store: store, owner: "missing-worker-owner"},
+			MaxBundleBytes: 2 * 1024 * 1024,
+		},
+		workers: make(map[string]*workerEntry), wake: make(chan struct{}, 1),
+	}
+	err = s.completeSuccess(ctx, claimed, &workerv1.Terminal{Status: workerv1.TerminalStatus_TASK_SUCCEEDED})
+	if err == nil {
+		t.Fatal("expected missing Worker error")
+	}
+	final, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != domain.TaskFailed || final.TerminalErrorCode != "CHECKPOINT_WORKER_MISSING" {
+		t.Fatalf("status=%s code=%s", final.Status, final.TerminalErrorCode)
 	}
 }
 

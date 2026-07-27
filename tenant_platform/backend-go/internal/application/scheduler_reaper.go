@@ -86,31 +86,31 @@ func (s *scheduler) evictIdleWorkers(owned []domain.Task) {
 	}
 	cutoff := time.Now().UTC().Add(-s.cfg.WorkerIdleTTL)
 	active := make(map[string]struct{}, len(owned))
-	for _, t := range owned {
-		active[t.SessionKey] = struct{}{}
+	for _, task := range owned {
+		active[task.SessionKey] = struct{}{}
 	}
-
 	s.mu.Lock()
-	var victims []*workerEntry
-	for sk, entry := range s.workers {
-		if _, busy := active[sk]; busy {
-			continue
+	candidates := make([]*workerEntry, 0, len(s.workers))
+	for sessionKey, entry := range s.workers {
+		if _, busy := active[sessionKey]; !busy {
+			candidates = append(candidates, entry)
 		}
-		if entry.lastUsedAt.After(cutoff) {
-			continue
-		}
-		victims = append(victims, entry)
-		delete(s.workers, sk)
 	}
 	s.mu.Unlock()
 
-	for _, entry := range victims {
+	for _, entry := range candidates {
+		entry.lifecycleMu.Lock()
+		if !s.workerEntryIsCurrent(entry.sessionKey, entry) || entry.lastUsedAt.After(cutoff) {
+			entry.lifecycleMu.Unlock()
+			continue
+		}
+		s.removeWorkerEntry(entry.sessionKey, entry)
 		slog.Info("scheduler: evicting idle worker",
 			"session_key", entry.sessionKey,
 			"worker_instance_id", entry.instID,
 			"idle_ttl_seconds", int(s.cfg.WorkerIdleTTL.Seconds()),
 			"last_used_at", entry.lastUsedAt.UTC().Format(time.RFC3339))
-		s.revokeTokenBestEffort(context.Background(), entry.jti)
-		entry.cleanup()
+		s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+		entry.lifecycleMu.Unlock()
 	}
 }
