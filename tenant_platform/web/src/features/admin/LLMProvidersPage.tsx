@@ -1,512 +1,200 @@
 import { useEffect, useState } from 'react';
-import { Card } from '../../components/ui/Card';
-import { Button } from '../../components/ui/Button';
-import { Input } from '../../components/ui/Input';
-import { Collapsible } from '../../components/ui/Collapsible';
-import { Trash2, Star } from 'lucide-react';
+import { Pencil, Star, Trash2 } from 'lucide-react';
+import { ApiClientError } from '../../api/client';
 import {
-  listProviders,
   createProvider,
   deleteProvider,
+  listProviders,
   setDefaultProvider,
+  updateProvider,
+  type UpdateProviderInput,
 } from '../../api/providers';
-import { ApiClientError } from '../../api/client';
-import type { LLMProvider, LLMProviderConfig } from '../../api/types';
+import type { LLMProvider } from '../../api/types';
+import { Card } from '../../components/ui/Card';
+import { LLMProviderForm, type ProviderFormValue } from './LLMProviderForm';
 import './AdminPages.css';
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof ApiClientError ? `${error.code}: ${error.message}` : fallback;
+}
 
 export function LLMProvidersPage() {
   const [providers, setProviders] = useState<LLMProvider[]>([]);
-  const [form, setForm] = useState({
-    name: '',
-    provider_type: 'native_oai' as 'native_oai' | 'native_claude',
-    base_url: '',
-    model: '',
-    api_key: '',
-    config: {
-      // ── 推理 / 思考 ──
-      thinking_type: 'adaptive' as 'adaptive' | 'enabled' | 'disabled' | undefined,
-      thinking_budget_tokens: undefined as number | undefined,
-      reasoning_effort: undefined as 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | undefined,
-
-      // ── 采样 ──
-      max_tokens: undefined as number | undefined,
-      temperature: undefined as number | undefined,
-      top_p: undefined as number | undefined,
-
-      // ── 容量 / 超时 ──
-      context_win: undefined as number | undefined,
-      max_retries: undefined as number | undefined,
-      connect_timeout: undefined as number | undefined,
-      read_timeout: undefined as number | undefined,
-      timeout: undefined as number | undefined,
-
-      // ── 传输 ──
-      stream: true as boolean | undefined,
-      api_mode: undefined as 'chat_completions' | 'responses' | undefined,
-
-      // ── Claude 专属 ──
-      fake_cc_system_prompt: undefined as boolean | undefined,
-      user_agent: undefined as string | undefined,
-
-      // ── 网络 ──
-      proxy: undefined as string | undefined,
-    } as LLMProviderConfig,
-  });
+  const [editingProvider, setEditingProvider] = useState<LLMProvider>();
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
 
   const loadProviders = async () => {
     setIsLoading(true);
-    setError('');
     try {
-      const list = await listProviders();
-      setProviders(list);
-    } catch (err) {
-      setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '加载失败');
+      setProviders(await listProviders());
+    } catch (loadError) {
+      setError(errorMessage(loadError, '加载失败'));
     } finally {
       setIsLoading(false);
     }
   };
 
   useEffect(() => {
-    loadProviders();
+    let active = true;
+    void listProviders()
+      .then((list) => {
+        if (active) setProviders(list);
+      })
+      .catch((loadError: unknown) => {
+        if (active) setError(errorMessage(loadError, '加载失败'));
+      })
+      .finally(() => {
+        if (active) setIsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSave = async (value: ProviderFormValue): Promise<boolean> => {
     setError('');
     try {
-      await createProvider(form);
-      setForm({
-        name: '',
-        provider_type: 'native_oai',
-        base_url: '',
-        model: '',
-        api_key: '',
-        config: {
-          // ── 推理 / 思考 ──
-          thinking_type: 'adaptive',
-          thinking_budget_tokens: undefined,
-          reasoning_effort: undefined,
-
-          // ── 采样 ──
-          max_tokens: undefined,
-          temperature: undefined,
-          top_p: undefined,
-
-          // ── 容量 / 超时 ──
-          context_win: undefined,
-          max_retries: undefined,
-          connect_timeout: undefined,
-          read_timeout: undefined,
-          timeout: undefined,
-
-          // ── 传输 ──
-          stream: true,
-          api_mode: undefined,
-
-          // ── Claude 专属 ──
-          fake_cc_system_prompt: undefined,
-          user_agent: undefined,
-
-          // ── 网络 ──
-          proxy: undefined,
-        },
-      });
+      if (editingProvider) {
+        const { api_key: apiKey, ...fields } = value;
+        const input: UpdateProviderInput = apiKey.trim()
+          ? { ...fields, api_key: apiKey }
+          : fields;
+        await updateProvider(editingProvider.provider_id, input);
+      } else {
+        await createProvider(value);
+      }
+      setEditingProvider(undefined);
       await loadProviders();
-    } catch (err) {
-      setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '保存失败');
+      return true;
+    } catch (saveError) {
+      setError(errorMessage(saveError, '保存失败'));
+      return false;
     }
   };
 
-  const handleDelete = async (id: number) => {
+  const handleDelete = async (provider: LLMProvider) => {
+    if (!window.confirm(`删除 Provider “${provider.name}”？`)) {
+      return;
+    }
+    setError('');
     try {
-      await deleteProvider(id);
+      await deleteProvider(provider.provider_id);
+      if (editingProvider?.provider_id === provider.provider_id) {
+        setEditingProvider(undefined);
+      }
       await loadProviders();
-    } catch (err) {
-      setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '删除失败');
+    } catch (deleteError) {
+      setError(errorMessage(deleteError, '删除失败'));
     }
   };
 
-  const handleSetDefault = async (id: number) => {
+  const handleSetDefault = async (providerId: number) => {
+    setError('');
     try {
-      await setDefaultProvider(id);
+      await setDefaultProvider(providerId);
       await loadProviders();
-    } catch (err) {
-      setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '设置失败');
+    } catch (defaultError) {
+      setError(errorMessage(defaultError, '设置失败'));
     }
   };
 
   return (
-    <div className="admin-page">
+    <div className="admin-page provider-page">
       <header className="admin-header animate-fade-in-up">
         <div>
-          <h1>LLM 供应</h1>
-          <p className="admin-subtitle">配置上游模型与默认 Provider</p>
+          <h1>LLM Providers</h1>
+          <p className="admin-subtitle">上游模型、GA 会话与网络传输</p>
         </div>
       </header>
 
-      <div className="admin-grid admin-grid-2">
-        <Card className="animate-fade-in-up animate-delay-1">
-          <h3>新增 Provider</h3>
-          {error && <span className="input-error" style={{ display: 'block', marginBottom: '12px' }}>{error}</span>}
-          <form className="provider-form" onSubmit={handleSubmit}>
-            <Input
-              label="名称"
-              placeholder="例如 OpenAI Default"
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-            />
-            <div>
-              <label className="input-label">类型</label>
-              <select
-                className="input-field"
-                value={form.provider_type}
-                onChange={(e) => setForm({ ...form, provider_type: e.target.value as 'native_oai' | 'native_claude' })}
-                style={{ width: '100%', padding: '8px 12px' }}
-              >
-                <option value="native_oai">OpenAI (native_oai)</option>
-                <option value="native_claude">Anthropic Claude (native_claude)</option>
-              </select>
-            </div>
-            <Input
-              label="Base URL"
-              placeholder="https://api.openai.com/v1"
-              value={form.base_url}
-              onChange={(e) => setForm({ ...form, base_url: e.target.value })}
-            />
-            <Input
-              label="模型"
-              placeholder="gpt-4o"
-              value={form.model}
-              onChange={(e) => setForm({ ...form, model: e.target.value })}
-            />
-            <div className="provider-form-full">
-              <Input
-                label="API Key"
-                type="password"
-                placeholder="sk-..."
-                value={form.api_key}
-                onChange={(e) => setForm({ ...form, api_key: e.target.value })}
-              />
-            </div>
+      {error && <div className="provider-error" role="alert">{error}</div>}
 
-            {/* 传输协议 - 常用配置，置顶显示 */}
-            <div className="provider-form-full">
-              <label className="input-label">
-                <input
-                  type="checkbox"
-                  checked={form.config.stream !== false}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, stream: e.target.checked } })}
-                  style={{ marginRight: '8px' }}
-                />
-                Stream（流式传输）
-              </label>
-            </div>
-
-            {form.provider_type === 'native_oai' && (
-              <div className="provider-form-full">
-                <label className="input-label">API Mode</label>
-                <select
-                  className="input-field"
-                  value={form.config.api_mode || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, api_mode: e.target.value as any || undefined } })}
-                  style={{ width: '100%', padding: '8px 12px' }}
-                >
-                  <option value="">默认 (chat_completions)</option>
-                  <option value="chat_completions">chat_completions - /v1/chat/completions</option>
-                  <option value="responses">responses - /v1/responses</option>
-                </select>
-                <small style={{ color: '#666', fontSize: '0.85em', marginTop: '4px', display: 'block' }}>
-                  仅 NativeOAISession 生效，决定使用哪个 OpenAI API 端点
-                </small>
-              </div>
-            )}
-
-            {/* GA Core 配置项 */}
-            <div className="provider-form-full" style={{ borderTop: '1px solid var(--border)', paddingTop: '16px', marginTop: '8px' }}>
-              <h4 style={{ marginBottom: '12px', fontSize: '14px', fontWeight: 500 }}>高级配置（可选）</h4>
-            </div>
-
-            <div className="provider-form-full">
-              <Collapsible title="🧠 推理与思考" defaultOpen={false}>
-                <div>
-                  <label className="input-label">Thinking Type</label>
-                  <select
-                    className="input-field"
-                    value={form.config.thinking_type || 'adaptive'}
-                    onChange={(e) => setForm({ ...form, config: { ...form.config, thinking_type: e.target.value as any } })}
-                    style={{ width: '100%', padding: '8px 12px' }}
-                  >
-                    <option value="adaptive">Adaptive（自适应）</option>
-                    <option value="enabled">Enabled（启用）</option>
-                    <option value="disabled">Disabled（禁用）</option>
-                  </select>
-                </div>
-
-                {form.config.thinking_type === 'enabled' && (
-                  <Input
-                    label="Thinking Budget Tokens"
-                    type="number"
-                    placeholder="例如 10000"
-                    value={form.config.thinking_budget_tokens || ''}
-                    onChange={(e) => setForm({ ...form, config: { ...form.config, thinking_budget_tokens: e.target.value ? parseInt(e.target.value) : undefined } })}
-                  />
-                )}
-
-                <div>
-                  <label className="input-label">Reasoning Effort</label>
-                  <select
-                    className="input-field"
-                    value={form.config.reasoning_effort || ''}
-                    onChange={(e) => setForm({ ...form, config: { ...form.config, reasoning_effort: e.target.value as any || undefined } })}
-                    style={{ width: '100%', padding: '8px 12px' }}
-                  >
-                    <option value="">默认</option>
-                    <option value="none">None</option>
-                    <option value="minimal">Minimal</option>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                    <option value="xhigh">XHigh</option>
-                  </select>
-                </div>
-              </Collapsible>
-            </div>
-
-            <div className="provider-form-full">
-              <Collapsible title="🎛️ 采样参数" defaultOpen={false}>
-                <Input
-                  label="Temperature"
-                  type="number"
-                  step="0.01"
-                  placeholder="0.0 - 2.0"
-                  value={form.config.temperature || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, temperature: e.target.value ? parseFloat(e.target.value) : undefined } })}
-                />
-
-                <Input
-                  label="Max Tokens"
-                  type="number"
-                  placeholder="例如 8192"
-                  value={form.config.max_tokens || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, max_tokens: e.target.value ? parseInt(e.target.value) : undefined } })}
-                />
-
-                <Input
-                  label="Top P"
-                  type="number"
-                  step="0.01"
-                  placeholder="0.0 - 1.0"
-                  value={form.config.top_p || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, top_p: e.target.value ? parseFloat(e.target.value) : undefined } })}
-                />
-              </Collapsible>
-            </div>
-
-            <div className="provider-form-full">
-              <Collapsible title="⏱️ 容量与超时" defaultOpen={false}>
-                <Input
-                  label="Context Win"
-                  type="number"
-                  placeholder="例如 30000"
-                  value={form.config.context_win || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, context_win: e.target.value ? parseInt(e.target.value) : undefined } })}
-                />
-
-                <Input
-                  label="Max Retries"
-                  type="number"
-                  placeholder="例如 3"
-                  value={form.config.max_retries || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, max_retries: e.target.value ? parseInt(e.target.value) : undefined } })}
-                />
-
-                <Input
-                  label="Connect Timeout (秒)"
-                  type="number"
-                  placeholder="例如 5"
-                  value={form.config.connect_timeout || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, connect_timeout: e.target.value ? parseInt(e.target.value) : undefined } })}
-                />
-
-                <Input
-                  label="Read Timeout (秒)"
-                  type="number"
-                  placeholder="例如 30"
-                  value={form.config.read_timeout || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, read_timeout: e.target.value ? parseInt(e.target.value) : undefined } })}
-                />
-
-                <Input
-                  label="Timeout (秒)"
-                  type="number"
-                  placeholder="例如 60"
-                  value={form.config.timeout || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, timeout: e.target.value ? parseInt(e.target.value) : undefined } })}
-                />
-              </Collapsible>
-            </div>
-
-            {form.provider_type === 'native_claude' && (
-              <div className="provider-form-full">
-                <Collapsible title="🤖 Claude 专属" defaultOpen={false}>
-                  <div>
-                    <label className="input-label">
-                      <input
-                        type="checkbox"
-                        checked={form.config.fake_cc_system_prompt || false}
-                        onChange={(e) => setForm({ ...form, config: { ...form.config, fake_cc_system_prompt: e.target.checked } })}
-                        style={{ marginRight: '8px' }}
-                      />
-                      Fake CC System Prompt（CC 透传渠道必须启用）
-                    </label>
-                  </div>
-
-                  <Input
-                    label="User Agent"
-                    type="text"
-                    placeholder="自定义 User-Agent（可选）"
-                    value={form.config.user_agent || ''}
-                    onChange={(e) => setForm({ ...form, config: { ...form.config, user_agent: e.target.value || undefined } })}
-                  />
-                </Collapsible>
-              </div>
-            )}
-
-            <div className="provider-form-full">
-              <Collapsible title="🌐 网络" defaultOpen={false}>
-                <Input
-                  label="Proxy"
-                  type="text"
-                  placeholder="HTTP 代理地址（例如 http://proxy.example.com:8080）"
-                  value={form.config.proxy || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, proxy: e.target.value || undefined } })}
-                />
-
-                <div>
-                  <label className="input-label">
-                    <input
-                      type="checkbox"
-                      checked={form.config.verify !== false}
-                      onChange={(e) => setForm({ ...form, config: { ...form.config, verify: e.target.checked } })}
-                      style={{ marginRight: '8px' }}
-                    />
-                    Verify SSL（验证 SSL 证书）
-                  </label>
-                </div>
-              </Collapsible>
-            </div>
-
-            <div className="provider-form-full">
-              <Collapsible title="🔧 高级" defaultOpen={false}>
-                <div>
-                  <label className="input-label">Service Tier</label>
-                  <select
-                    className="input-field"
-                    value={form.config.service_tier || ''}
-                    onChange={(e) => setForm({ ...form, config: { ...form.config, service_tier: e.target.value as any || undefined } })}
-                    style={{ width: '100%', padding: '8px 12px' }}
-                  >
-                    <option value="">默认 (auto)</option>
-                    <option value="auto">auto - 自动</option>
-                    <option value="default">default - 默认</option>
-                    <option value="priority">priority - 优先</option>
-                    <option value="flex">flex - 灵活</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="input-label">
-                    <input
-                      type="checkbox"
-                      checked={form.config.omit_thinking || false}
-                      onChange={(e) => setForm({ ...form, config: { ...form.config, omit_thinking: e.target.checked } })}
-                      style={{ marginRight: '8px' }}
-                    />
-                    Omit Thinking（从历史中排除 thinking 块）
-                  </label>
-                </div>
-
-                <Input
-                  label="Extra Sys Prompt"
-                  type="text"
-                  placeholder="额外的系统提示词（可选）"
-                  value={form.config.extra_sys_prompt || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, extra_sys_prompt: e.target.value || undefined } })}
-                />
-
-                <Input
-                  label="Extra Sys Prompt File"
-                  type="text"
-                  placeholder="系统提示词文件路径（可选）"
-                  value={form.config.extra_sys_prompt_file || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, extra_sys_prompt_file: e.target.value || undefined } })}
-                />
-
-                <Input
-                  label="Trim Keep Prefix"
-                  type="number"
-                  placeholder="保留前缀消息数（可选）"
-                  value={form.config.trim_keep_prefix || ''}
-                  onChange={(e) => setForm({ ...form, config: { ...form.config, trim_keep_prefix: e.target.value ? parseInt(e.target.value) : undefined } })}
-                />
-              </Collapsible>
-            </div>
-
-            <div className="provider-form-full provider-actions">
-              <Button type="submit">保存</Button>
-            </div>
-          </form>
+      <div className="provider-layout">
+        <Card className="provider-editor animate-fade-in-up animate-delay-1">
+          <div className="provider-panel-heading">
+            <h3>{editingProvider ? '编辑 Provider' : '新增 Provider'}</h3>
+            {editingProvider && <span>REV {editingProvider.revision}</span>}
+          </div>
+          <LLMProviderForm
+            key={editingProvider?.provider_id ?? 'create'}
+            provider={editingProvider}
+            onSave={handleSave}
+            onCancel={() => setEditingProvider(undefined)}
+          />
         </Card>
 
-        <Card className="animate-fade-in-up animate-delay-2">
-          <h3>已配置</h3>
+        <Card className="provider-list-panel animate-fade-in-up animate-delay-2">
+          <div className="provider-panel-heading">
+            <h3>已配置</h3>
+            <span>{providers.length} PROVIDERS</span>
+          </div>
           {isLoading ? (
             <p className="admin-empty">加载中...</p>
+          ) : providers.length === 0 ? (
+            <p className="admin-empty">暂无 Provider</p>
           ) : (
-            <table className="admin-table">
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>模型</th>
-                  <th>默认</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {providers.map((provider) => (
-                  <tr key={provider.provider_id}>
-                    <td>{provider.name}</td>
-                    <td>{provider.model}</td>
-                    <td>
-                      {provider.is_default ? (
-                        <Star size={14} color="var(--accent)" fill="var(--accent)" />
-                      ) : (
-                        <button
-                          className="icon-button"
-                          type="button"
-                          onClick={() => handleSetDefault(provider.provider_id)}
-                          aria-label="设为默认"
-                        >
-                          <Star size={16} />
-                        </button>
-                      )}
-                    </td>
-                    <td>
-                      <button
-                        className="icon-button"
-                        type="button"
-                        onClick={() => handleDelete(provider.provider_id)}
-                        aria-label="删除"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </td>
+            <div className="provider-table-scroll">
+              <table className="admin-table provider-table">
+                <thead>
+                  <tr>
+                    <th>Provider</th>
+                    <th>模型</th>
+                    <th>默认</th>
+                    <th aria-label="操作" />
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {providers.map((provider) => (
+                    <tr key={provider.provider_id}>
+                      <td>
+                        <strong>{provider.name}</strong>
+                        <small>{provider.provider_type} · REV {provider.revision}</small>
+                        <small className="provider-model-mobile">{provider.model}</small>
+                      </td>
+                      <td>{provider.model}</td>
+                      <td>
+                        {provider.is_default ? (
+                          <span className="provider-default"><Star size={13} fill="currentColor" /> DEFAULT</span>
+                        ) : (
+                          <button
+                            className="icon-button"
+                            type="button"
+                            title="设为默认"
+                            aria-label={`将 ${provider.name} 设为默认`}
+                            onClick={() => void handleSetDefault(provider.provider_id)}
+                          >
+                            <Star size={16} />
+                          </button>
+                        )}
+                      </td>
+                      <td>
+                        <div className="admin-actions provider-row-actions">
+                          <button
+                            className="icon-button"
+                            type="button"
+                            title="编辑"
+                            aria-label={`编辑 ${provider.name}`}
+                            onClick={() => setEditingProvider(provider)}
+                          >
+                            <Pencil size={16} />
+                          </button>
+                          <button
+                            className="icon-button danger"
+                            type="button"
+                            title="删除"
+                            aria-label={`删除 ${provider.name}`}
+                            onClick={() => void handleDelete(provider)}
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </Card>
       </div>

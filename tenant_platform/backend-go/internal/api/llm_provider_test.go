@@ -243,6 +243,150 @@ func TestAdminLLMProviderRequiresAuth(t *testing.T) {
 	}
 }
 
+func TestAdminUpdateLLMProviderOmittedOrBlankKeyPreservesCiphertext(t *testing.T) {
+	for _, keyMode := range []string{"omitted", "blank"} {
+		t.Run(keyMode, func(t *testing.T) {
+			srv, store, _ := llmProviderServerFixture(t)
+			created := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", providerWritePayload("preserve-"+keyMode))
+			if created.Code != http.StatusCreated {
+				t.Fatalf("create=%d body=%s", created.Code, created.Body.String())
+			}
+			var reply map[string]any
+			if err := json.Unmarshal(created.Body.Bytes(), &reply); err != nil {
+				t.Fatal(err)
+			}
+			id := int64(reply["provider_id"].(float64))
+			before, err := store.GetProvider(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			update := providerWritePayload("preserve-" + keyMode + "-updated")
+			delete(update, "api_key")
+			if keyMode == "blank" {
+				update["api_key"] = "   "
+			}
+			updated := performProviderWrite(t, srv, http.MethodPut, "/v1/admin/llm-providers/"+itoa(id), update)
+			if updated.Code != http.StatusOK {
+				t.Fatalf("update=%d body=%s", updated.Code, updated.Body.String())
+			}
+			after, err := store.GetProvider(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after.APIKeyCiphertext, before.APIKeyCiphertext) || after.APIKeyKeyVersion != before.APIKeyKeyVersion {
+				t.Fatal("omitted or blank api_key rotated stored credentials")
+			}
+		})
+	}
+}
+
+func TestAdminCreateLLMProviderValidatesNestedConfiguration(t *testing.T) {
+	srv, _, _ := llmProviderServerFixture(t)
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "relative base URL", mutate: func(body map[string]any) { body["base_url"] = "not-an-absolute-url" }},
+		{name: "thinking budget required", mutate: func(body map[string]any) {
+			body["session_config"] = map[string]any{"thinking_type": "enabled"}
+		}},
+		{name: "Claude rejects OAI mode", mutate: func(body map[string]any) {
+			body["provider_type"] = "native_claude"
+			body["session_config"] = map[string]any{"api_mode": "responses"}
+		}},
+		{name: "transport timeout positive", mutate: func(body map[string]any) {
+			body["transport_config"] = map[string]any{"auth_mode": "auto", "connect_timeout_seconds": 0}
+		}},
+		{name: "proxy URL has credentials and path", mutate: func(body map[string]any) {
+			body["transport_config"] = map[string]any{
+				"auth_mode": "auto", "proxy_url": "http://user:pass@proxy.example/internal?token=x",
+			}
+		}},
+		{name: "unknown nested field", mutate: func(body map[string]any) {
+			body["session_config"] = map[string]any{"not_a_ga_field": true}
+		}},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := providerWritePayload("invalid-" + strconv.Itoa(index))
+			test.mutate(body)
+			response := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", body)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestAdminCreateLLMProviderPreservesExplicitZeroAndOmitsSecrets(t *testing.T) {
+	srv, _, _ := llmProviderServerFixture(t)
+	body := providerWritePayload("explicit-zero")
+	body["session_config"] = map[string]any{
+		"temperature": 0, "max_retries": 0, "trim_keep_prefix": 0, "stream": false,
+	}
+	body["transport_config"] = map[string]any{"auth_mode": "auto", "tls_verify": false}
+	response := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", body)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var reply map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	session := reply["session_config"].(map[string]any)
+	transport := reply["transport_config"].(map[string]any)
+	if session["temperature"] != float64(0) || session["max_retries"] != float64(0) || session["stream"] != false {
+		t.Fatalf("explicit session values lost: %v", session)
+	}
+	if transport["tls_verify"] != false || reply["revision"].(float64) <= 0 {
+		t.Fatalf("explicit transport/revision values lost: transport=%v revision=%v", transport, reply["revision"])
+	}
+	for _, field := range []string{"api_key", "api_key_ciphertext", "api_key_key_version"} {
+		if _, present := reply[field]; present {
+			t.Fatalf("secret field %q returned: %v", field, reply[field])
+		}
+	}
+}
+
+func TestProviderConfigEndpointRemoved(t *testing.T) {
+	srv, _, _ := llmProviderServerFixture(t)
+	request := httptest.NewRequest(http.MethodGet, "/v1/config/mykey.py", nil)
+	request.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func providerWritePayload(name string) map[string]any {
+	return map[string]any{
+		"name": name, "provider_type": "native_oai", "base_url": "https://api.openai.com/v1",
+		"model": "gpt-test", "api_key": "sk-original", "session_config": map[string]any{},
+		"transport_config": map[string]any{"auth_mode": "auto"},
+	}
+}
+
+func performProviderWrite(
+	t *testing.T,
+	srv *Server,
+	method string,
+	path string,
+	body map[string]any,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(method, path, bytes.NewReader(raw))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, request)
+	return response
+}
+
 func atoi(s string) int {
 	v, _ := strconv.Atoi(s)
 	return v

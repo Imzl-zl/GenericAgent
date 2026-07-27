@@ -76,8 +76,6 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("DELETE /v1/admin/llm-providers/{provider_id}", s.auth(s.handleAdminDeleteLLMProvider))
 		s.mux.HandleFunc("POST /v1/admin/llm-providers/{provider_id}/default", s.auth(s.handleAdminSetDefaultLLMProvider))
 
-		// Worker 拉取 mykey.py 配置（使用 Worker 的认证机制）
-		s.mux.HandleFunc("GET /v1/config/mykey.py", s.auth(s.handleGetMykeyConfig))
 	}
 	// Dashboard statistics endpoint
 	s.mux.HandleFunc("GET /v1/admin/dashboard/stats", s.auth(s.handleAdminDashboardStats))

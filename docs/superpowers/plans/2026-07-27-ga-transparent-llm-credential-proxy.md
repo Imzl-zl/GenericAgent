@@ -1024,6 +1024,7 @@ git commit --only -m "refactor: transparently stream native llm traffic" -- tena
 **Files:**
 - Rewrite: `tenant_platform/backend-go/internal/api/llm_provider.go`
 - Modify: `tenant_platform/backend-go/internal/api/llm_provider_test.go`
+- Modify: `tenant_platform/backend-go/internal/domain/llm_provider.go`
 - Modify: `tenant_platform/backend-go/internal/api/admin.go`
 - Delete: `tenant_platform/backend-go/internal/api/config_handler.go`
 - Delete: `tenant_platform/backend-go/internal/api/mykey_generator.go`
@@ -1031,14 +1032,18 @@ git commit --only -m "refactor: transparently stream native llm traffic" -- tena
 - Modify: `tenant_platform/web/src/api/types.ts`
 - Modify: `tenant_platform/web/src/api/providers.ts`
 - Rewrite: `tenant_platform/web/src/features/admin/LLMProvidersPage.tsx`
-- Modify: `tenant_platform/web/src/features/admin/AdminPages.css` only where the edit form needs existing layout rules
+- Create: `tenant_platform/web/src/features/admin/LLMProviderForm.tsx`
+- Modify: `tenant_platform/web/src/features/admin/AdminPages.css`
+- Modify: `tenant_platform/web/src/components/layout/Layout.css`
+- Modify: `tenant_platform/web/src/index.css`
+- Modify: `tenant_platform/web/src/features/user/UserPages.css`
 
 **Interfaces:**
 - API request/response uses `session_config`, `transport_config`, and `revision`.
 - Update request `api_key` is optional; omitted/blank preserves the encrypted key.
 - Web supports create and edit with exact backend types and no `any`.
 
-- [ ] **Step 1: Write failing API validation tests**
+- [x] **Step 1: Write failing API validation tests**
 
 Cover native-only enum, explicit zero, invalid ranges/combinations, unknown fields, optional update key, no key in replies, and removed config download endpoint:
 
@@ -1076,7 +1081,7 @@ func TestProviderConfigEndpointRemoved(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run API tests and observe RED**
+- [x] **Step 2: Run API tests and observe RED**
 
 ```bash
 cd tenant_platform/backend-go
@@ -1085,7 +1090,7 @@ go test ./internal/api -run 'Test.*LLMProvider|TestProviderConfigEndpointRemoved
 
 Expected: current old enum tests/config route/nested config behavior fail. Requires `TEST_DATABASE_URL`.
 
-- [ ] **Step 3: Implement strict nested API and remove plaintext route**
+- [x] **Step 3: Implement strict nested API and remove plaintext route**
 
 Request shape:
 
@@ -1103,11 +1108,11 @@ type providerWriteBody struct {
 
 Create requires non-empty API key. Update preserves the existing encrypted key when omitted/blank. Validate URL syntax and both config structs before encryption/store mutation. Remove route registration and both generator files.
 
-- [ ] **Step 4: Update OpenAPI as the canonical external contract**
+- [x] **Step 4: Update OpenAPI as the canonical external contract**
 
 Define `GASessionConfig`, `ProviderTransportConfig`, provider auth enum, nullable/optional numeric fields with exact minima, and `revision`. Remove old enums and `/v1/config/mykey.py`. Update create/update schemas so update API key is optional.
 
-- [ ] **Step 5: Write failing Web type/build tests**
+- [x] **Step 5: Write failing Web type/build tests**
 
 First update TypeScript types without page implementation and run:
 
@@ -1118,7 +1123,7 @@ npm run build
 
 Expected: type errors identify every old flat config and missing update API use.
 
-- [ ] **Step 6: Implement the Web form without unsupported fields**
+- [x] **Step 6: Implement the Web form without unsupported fields**
 
 Requirements:
 
@@ -1130,7 +1135,7 @@ Requirements:
 - use typed helpers instead of `as any`;
 - show backend validation errors unchanged.
 
-- [ ] **Step 7: Build and browser-verify the admin workflow**
+- [x] **Step 7: Build and browser-verify the admin workflow**
 
 Run:
 
@@ -1142,7 +1147,7 @@ npm run dev -- --host 127.0.0.1
 
 Use the browser tool at desktop and mobile widths. Verify create/edit/default/delete controls, conditional OAI/Claude fields, zero-valued inputs, no overlap, and no console errors. Stop the dev server after verification unless the user needs the URL.
 
-- [ ] **Step 8: Run API tests and commit Task 8**
+- [x] **Step 8: Run API tests and commit Task 8**
 
 ```bash
 cd tenant_platform/backend-go
@@ -1154,8 +1159,8 @@ npm run build
 Then:
 
 ```bash
-git add tenant_platform/backend-go/internal/api tenant_platform/contracts/openapi/platform.yaml tenant_platform/web/src/api/types.ts tenant_platform/web/src/api/providers.ts tenant_platform/web/src/features/admin/LLMProvidersPage.tsx tenant_platform/web/src/features/admin/AdminPages.css
-git commit --only -m "feat: expose validated native llm provider configuration" -- tenant_platform/backend-go/internal/api tenant_platform/contracts/openapi/platform.yaml tenant_platform/web/src/api/types.ts tenant_platform/web/src/api/providers.ts tenant_platform/web/src/features/admin/LLMProvidersPage.tsx tenant_platform/web/src/features/admin/AdminPages.css
+git add tenant_platform/backend-go/internal/api tenant_platform/backend-go/internal/domain/llm_provider.go tenant_platform/contracts/openapi/platform.yaml tenant_platform/web/src/api/types.ts tenant_platform/web/src/api/providers.ts tenant_platform/web/src/features/admin/LLMProvidersPage.tsx tenant_platform/web/src/features/admin/LLMProviderForm.tsx tenant_platform/web/src/features/admin/AdminPages.css tenant_platform/web/src/components/layout/Layout.css tenant_platform/web/src/index.css tenant_platform/web/src/features/user/UserPages.css
+git commit --only -m "feat: expose validated native llm provider configuration" -- tenant_platform/backend-go/internal/api tenant_platform/backend-go/internal/domain/llm_provider.go tenant_platform/contracts/openapi/platform.yaml tenant_platform/web/src/api/types.ts tenant_platform/web/src/api/providers.ts tenant_platform/web/src/features/admin/LLMProvidersPage.tsx tenant_platform/web/src/features/admin/LLMProviderForm.tsx tenant_platform/web/src/features/admin/AdminPages.css tenant_platform/web/src/components/layout/Layout.css tenant_platform/web/src/index.css tenant_platform/web/src/features/user/UserPages.css
 ```
 
 ### Task 9: End-to-End GA Contract, Security Cleanup, and Cutover Verification

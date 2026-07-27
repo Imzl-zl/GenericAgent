@@ -73,53 +73,47 @@ export interface Persona {
   updated_at: string;
 }
 
-export interface LLMProvider {
-  provider_id: number;
-  name: string;
-  provider_type: 'native_oai' | 'native_claude';
-  base_url: string;
-  model: string;
-  config?: LLMProviderConfig;
-  is_default: boolean;
-  state: string;
-  created_at: string;
-  updated_at: string;
-}
+export type LLMProviderType = 'native_oai' | 'native_claude';
+export type ProviderAuthMode = 'auto' | 'bearer' | 'x_api_key';
 
-export interface LLMProviderConfig {
-  // ── 推理 / 思考 ──
+export interface GASessionConfig {
   thinking_type?: 'adaptive' | 'enabled' | 'disabled';
   thinking_budget_tokens?: number;
-  reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
-
-  // ── 采样 ──
-  max_tokens?: number;
+  reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   temperature?: number;
-  top_p?: number;
-
-  // ── 容量 / 超时 ──
+  max_tokens?: number;
   context_win?: number;
+  trim_keep_prefix?: number;
   max_retries?: number;
-  connect_timeout?: number;
   read_timeout?: number;
-  timeout?: number;
-
-  // ── 传输 ──
   stream?: boolean;
   api_mode?: 'chat_completions' | 'responses';
-
-  // ── Claude 专属 ──
   fake_cc_system_prompt?: boolean;
   user_agent?: string;
-
-  // ── 网络 ──
-  proxy?: string;
-  verify?: boolean;
-
-  // ── 高级 ──
   service_tier?: 'auto' | 'default' | 'priority' | 'flex';
   omit_thinking?: boolean;
   extra_sys_prompt?: string;
-  extra_sys_prompt_file?: string;
-  trim_keep_prefix?: number;
+}
+
+export interface ProviderTransportConfig {
+  auth_mode: ProviderAuthMode;
+  proxy_url?: string;
+  tls_verify?: boolean;
+  connect_timeout_seconds?: number;
+  response_header_timeout_seconds?: number;
+}
+
+export interface LLMProvider {
+  provider_id: number;
+  name: string;
+  provider_type: LLMProviderType;
+  base_url: string;
+  model: string;
+  session_config: GASessionConfig;
+  transport_config: ProviderTransportConfig;
+  revision: number;
+  is_default: boolean;
+  state: 'active' | 'disabled';
+  created_at: string;
+  updated_at: string;
 }

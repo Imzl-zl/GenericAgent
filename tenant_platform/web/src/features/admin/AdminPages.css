@@ -151,3 +151,229 @@
   font-size: 13px;
   color: var(--text-muted);
 }
+
+.provider-page {
+  max-width: 1440px;
+}
+
+.provider-page .admin-header h1 {
+  font-size: 32px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.provider-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.provider-editor,
+.provider-list-panel {
+  min-width: 0;
+}
+
+.provider-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.provider-panel-heading > span {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.provider-error {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  color: var(--danger);
+  background: var(--danger-dim);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: var(--radius-sm);
+  overflow-wrap: anywhere;
+}
+
+.provider-type-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 3px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.provider-type-switch button {
+  min-height: 34px;
+  padding: 6px 10px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.provider-type-switch button.is-active {
+  color: var(--bg-base);
+  background: var(--accent);
+  font-weight: 700;
+}
+
+.provider-inline-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+}
+
+.provider-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.provider-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.collapsible-content > .provider-config-grid {
+  grid-column: 1 / -1;
+}
+
+.provider-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.provider-config-span {
+  grid-column: 1 / -1;
+}
+
+.provider-textarea {
+  min-height: 76px;
+  resize: vertical;
+}
+
+.provider-table-scroll {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.provider-table {
+  min-width: 520px;
+}
+
+.provider-table td:first-child strong,
+.provider-table td:first-child small {
+  display: block;
+}
+
+.provider-table td:first-child strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.provider-table td:first-child small {
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.provider-table td:first-child .provider-model-mobile {
+  display: none;
+}
+
+.provider-default {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.provider-row-actions {
+  justify-content: flex-end;
+  white-space: nowrap;
+}
+
+.icon-button.danger:hover {
+  color: var(--danger);
+  background: var(--danger-dim);
+}
+
+@media (max-width: 1100px) {
+  .provider-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .provider-form,
+  .provider-config-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .provider-form-full,
+  .provider-config-span {
+    grid-column: auto;
+  }
+
+  .provider-actions {
+    justify-content: stretch;
+  }
+
+  .provider-actions .btn {
+    flex: 1 1 0;
+  }
+
+  .provider-table {
+    width: 100%;
+    min-width: 100%;
+    table-layout: fixed;
+  }
+
+  .provider-table th,
+  .provider-table td {
+    padding: 10px 6px;
+  }
+
+  .provider-table th:nth-child(2),
+  .provider-table td:nth-child(2) {
+    display: none;
+  }
+
+  .provider-table th:first-child,
+  .provider-table td:first-child {
+    width: auto;
+    overflow-wrap: anywhere;
+  }
+
+  .provider-table th:nth-child(3),
+  .provider-table td:nth-child(3) {
+    width: 78px;
+  }
+
+  .provider-table th:last-child,
+  .provider-table td:last-child {
+    width: 78px;
+  }
+
+  .provider-table td:first-child .provider-model-mobile {
+    display: block;
+  }
+}

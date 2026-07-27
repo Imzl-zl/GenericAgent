@@ -1009,14 +1009,95 @@ components:
           example: ["update_working_checkpoint", "code_run", "file_read"]
         description:
           type: string
+    LLMProviderType:
+      type: string
+      enum: [native_oai, native_claude]
+    ProviderAuthMode:
+      type: string
+      enum: [auto, bearer, x_api_key]
+    GASessionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        thinking_type:
+          type: [string, "null"]
+          enum: [adaptive, enabled, disabled, null]
+        thinking_budget_tokens:
+          type: [integer, "null"]
+          minimum: 1
+        reasoning_effort:
+          type: [string, "null"]
+          enum: [none, minimal, low, medium, high, xhigh, max, null]
+        temperature:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 2
+        max_tokens:
+          type: [integer, "null"]
+          minimum: 1
+        context_win:
+          type: [integer, "null"]
+          minimum: 1
+        trim_keep_prefix:
+          type: [integer, "null"]
+          minimum: 0
+        max_retries:
+          type: [integer, "null"]
+          minimum: 0
+        read_timeout:
+          type: [integer, "null"]
+          minimum: 5
+          description: GA Core upstream read timeout in seconds
+        stream:
+          type: [boolean, "null"]
+        api_mode:
+          type: [string, "null"]
+          enum: [chat_completions, responses, null]
+          description: Supported only by native_oai
+        fake_cc_system_prompt:
+          type: [boolean, "null"]
+          description: Supported only by native_claude
+        user_agent:
+          type: [string, "null"]
+          minLength: 1
+        service_tier:
+          type: [string, "null"]
+          enum: [auto, default, priority, flex, null]
+          description: Supported only by native_oai
+        omit_thinking:
+          type: [boolean, "null"]
+        extra_sys_prompt:
+          type: [string, "null"]
+    ProviderTransportConfig:
+      type: object
+      additionalProperties: false
+      required: [auth_mode]
+      properties:
+        auth_mode:
+          $ref: "#/components/schemas/ProviderAuthMode"
+        proxy_url:
+          type: [string, "null"]
+          format: uri
+        tls_verify:
+          type: [boolean, "null"]
+        connect_timeout_seconds:
+          type: [integer, "null"]
+          minimum: 1
+        response_header_timeout_seconds:
+          type: [integer, "null"]
+          minimum: 1
     LLMProvider:
       type: object
+      additionalProperties: false
       required:
         - provider_id
         - name
         - provider_type
         - base_url
         - model
+        - session_config
+        - transport_config
+        - revision
         - is_default
         - state
         - created_at
@@ -1025,19 +1106,26 @@ components:
         provider_id:
           type: integer
           format: int64
+          minimum: 1
         name:
           type: string
-          example: "openai-default"
+          minLength: 1
         provider_type:
-          type: string
-          enum: [openai_compatible, anthropic_messages]
+          $ref: "#/components/schemas/LLMProviderType"
         base_url:
           type: string
           format: uri
-          example: "https://api.openai.com"
         model:
           type: string
-          example: "gpt-4o"
+          minLength: 1
+        session_config:
+          $ref: "#/components/schemas/GASessionConfig"
+        transport_config:
+          $ref: "#/components/schemas/ProviderTransportConfig"
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
         is_default:
           type: boolean
         state:
@@ -1051,51 +1139,63 @@ components:
           format: date-time
     CreateLLMProviderRequest:
       type: object
+      additionalProperties: false
       required:
         - name
         - provider_type
         - base_url
         - model
         - api_key
+        - session_config
+        - transport_config
       properties:
         name:
           type: string
-          example: "openai-default"
+          minLength: 1
         provider_type:
-          type: string
-          enum: [openai_compatible, anthropic_messages]
+          $ref: "#/components/schemas/LLMProviderType"
         base_url:
           type: string
           format: uri
-          example: "https://api.openai.com"
         model:
           type: string
-          example: "gpt-4o"
+          minLength: 1
         api_key:
           type: string
-          description: Upstream provider API key; encrypted at rest by the platform
+          minLength: 1
+          writeOnly: true
+          description: Upstream API key; encrypted at rest and never returned
+        session_config:
+          $ref: "#/components/schemas/GASessionConfig"
+        transport_config:
+          $ref: "#/components/schemas/ProviderTransportConfig"
     UpdateLLMProviderRequest:
       type: object
+      additionalProperties: false
       required:
         - name
         - provider_type
         - base_url
         - model
-        - api_key
+        - session_config
+        - transport_config
       properties:
         name:
           type: string
-          example: "anthropic-default"
+          minLength: 1
         provider_type:
-          type: string
-          enum: [openai_compatible, anthropic_messages]
+          $ref: "#/components/schemas/LLMProviderType"
         base_url:
           type: string
           format: uri
-          example: "https://api.anthropic.com"
         model:
           type: string
-          example: "claude-3-5-sonnet-20240620"
+          minLength: 1
         api_key:
           type: string
-          description: Upstream provider API key; encrypted at rest by the platform
+          writeOnly: true
+          description: Optional; omitted or blank preserves the stored key
+        session_config:
+          $ref: "#/components/schemas/GASessionConfig"
+        transport_config:
+          $ref: "#/components/schemas/ProviderTransportConfig"

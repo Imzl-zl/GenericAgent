@@ -83,24 +83,6 @@
   letter-spacing: 0.08em;
 }
 
-.icon-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  color: var(--text-secondary);
-  background: var(--bg-overlay);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: all 180ms var(--ease-out-expo);
-}
-
-.icon-button:hover {
-  color: var(--accent);
-  border-color: var(--accent);
-}
 
 .binding-command {
   margin-top: 16px;

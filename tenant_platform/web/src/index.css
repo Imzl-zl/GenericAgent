@@ -83,24 +83,6 @@ body::after {
 #root {
   min-height: 100svh;
   display: flex;
-  flex-direction: column;
-}
-
-h1, h2, h3, h4 {
-  font-family: var(--font-display);
-  color: var(--text-primary);
-  margin: 0;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  text-transform: uppercase;
-}
-
-h1 {
-  font-size: clamp(2.25rem, 5vw, 3.5rem);
-  line-height: 1.05;
-}
-
-h2 {
   font-size: 1.5rem;
   line-height: 1.2;
 }
@@ -127,6 +109,26 @@ a:hover {
 button {
   font-family: inherit;
 }
+
+.icon-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  color: var(--text-secondary);
+  background: var(--bg-overlay);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 180ms var(--ease-out-expo);
+}
+
+.icon-button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 
 code, pre {
   font-family: var(--font-mono);

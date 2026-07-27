@@ -125,6 +125,12 @@ func (c ProviderTransportConfig) Validate() error {
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			return fmt.Errorf("proxy_url must be an absolute http or https URL")
 		}
+		if parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" {
+			return fmt.Errorf("proxy_url must contain no credentials or fragment")
+		}
+		if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" {
+			return fmt.Errorf("proxy_url must contain no path or query")
+		}
 	}
 	if err := validatePositive("connect_timeout_seconds", c.ConnectTimeoutSeconds); err != nil {
 		return err

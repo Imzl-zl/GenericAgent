@@ -119,11 +119,12 @@
 
 @media (max-width: 1024px) {
   .layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto 1fr;
   }
 
   .layout-sidebar {
+    min-width: 0;
     position: static;
     height: auto;
     flex-direction: row;
@@ -144,6 +145,7 @@
     flex-direction: row;
     flex: 1 1 auto;
     justify-content: flex-end;
+    min-width: 0;
   }
 
   .layout-footer {
@@ -152,5 +154,30 @@
 
   .layout-main {
     padding: 24px;
+    min-width: 0;
+    overflow-x: hidden;
+  }
+}
+
+@media (max-width: 640px) {
+  .layout-brand {
+    flex-basis: 100%;
+  }
+
+  .layout-nav {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    flex-basis: 100%;
+    gap: 4px;
+  }
+
+  .layout-nav-item {
+    min-width: 0;
+    padding: 8px 4px;
+    justify-content: center;
+  }
+
+  .layout-nav-item span {
+    white-space: nowrap;
   }
 }
