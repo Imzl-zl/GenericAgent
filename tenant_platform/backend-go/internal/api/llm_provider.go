@@ -11,22 +11,16 @@ import (
 )
 
 type createLLMProviderBody struct {
-	Name         string                      `json:"name"`
-	ProviderType string                      `json:"provider_type"`
-	BaseURL      string                      `json:"base_url"`
-	Model        string                      `json:"model"`
-	APIKey       string                      `json:"api_key"`
-	Config       domain.LLMProviderConfig    `json:"config"` // GA Core 配置
+	Name            string                         `json:"name"`
+	ProviderType    string                         `json:"provider_type"`
+	BaseURL         string                         `json:"base_url"`
+	Model           string                         `json:"model"`
+	APIKey          string                         `json:"api_key"`
+	SessionConfig   domain.GASessionConfig         `json:"session_config"`
+	TransportConfig domain.ProviderTransportConfig `json:"transport_config"`
 }
 
-type updateLLMProviderBody struct {
-	Name         string                      `json:"name"`
-	ProviderType string                      `json:"provider_type"`
-	BaseURL      string                      `json:"base_url"`
-	Model        string                      `json:"model"`
-	APIKey       string                      `json:"api_key"`
-	Config       domain.LLMProviderConfig    `json:"config"` // GA Core 配置
-}
+type updateLLMProviderBody = createLLMProviderBody
 
 func (s *Server) handleAdminCreateLLMProvider(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
@@ -49,8 +43,11 @@ func (s *Server) handleAdminCreateLLMProvider(w http.ResponseWriter, r *http.Req
 		writeErr(w, http.StatusInternalServerError, "ENCRYPT_FAILED", err.Error(), tid)
 		return
 	}
-	provider, err := s.llmProviders.CreateProvider(r.Context(), body.Name,
-		providerType, body.BaseURL, body.Model, ciphertext, strconv.Itoa(version), body.Config)
+	provider, err := s.llmProviders.CreateProvider(r.Context(), domain.LLMProviderCreate{
+		Name: body.Name, ProviderType: providerType, BaseURL: body.BaseURL, Model: body.Model,
+		APIKeyCiphertext: ciphertext, APIKeyKeyVersion: strconv.Itoa(version),
+		SessionConfig: body.SessionConfig, TransportConfig: body.TransportConfig,
+	})
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "PROVIDER_CREATE_FAILED", err.Error(), tid)
 		return
@@ -119,8 +116,14 @@ func (s *Server) handleAdminUpdateLLMProvider(w http.ResponseWriter, r *http.Req
 		writeErr(w, http.StatusInternalServerError, "ENCRYPT_FAILED", err.Error(), tid)
 		return
 	}
-	provider, err := s.llmProviders.UpdateProvider(r.Context(), id, body.Name,
-		providerType, body.BaseURL, body.Model, ciphertext, strconv.Itoa(version), body.Config)
+	provider, err := s.llmProviders.UpdateProvider(r.Context(), id, domain.LLMProviderUpdate{
+		LLMProviderCreate: domain.LLMProviderCreate{
+			Name: body.Name, ProviderType: providerType, BaseURL: body.BaseURL, Model: body.Model,
+			APIKeyCiphertext: ciphertext, APIKeyKeyVersion: strconv.Itoa(version),
+			SessionConfig: body.SessionConfig, TransportConfig: body.TransportConfig,
+		},
+		RotateAPIKey: true,
+	})
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "PROVIDER_UPDATE_FAILED", err.Error(), tid)
 		return
@@ -195,15 +198,17 @@ func parseProviderID(w http.ResponseWriter, r *http.Request, tid string) (int64,
 
 func llmProviderReply(p domain.LLMProvider) map[string]any {
 	return map[string]any{
-		"provider_id":   p.ID,
-		"name":          p.Name,
-		"provider_type": string(p.ProviderType),
-		"base_url":      p.BaseURL,
-		"model":         p.Model,
-		"config":        p.Config,
-		"is_default":    p.IsDefault,
-		"state":         p.State,
-		"created_at":    p.CreatedAt.UTC().Format(time.RFC3339),
-		"updated_at":    p.UpdatedAt.UTC().Format(time.RFC3339),
+		"provider_id":      p.ID,
+		"name":             p.Name,
+		"provider_type":    string(p.ProviderType),
+		"base_url":         p.BaseURL,
+		"model":            p.Model,
+		"session_config":   p.SessionConfig,
+		"transport_config": p.TransportConfig,
+		"revision":         p.Revision,
+		"is_default":       p.IsDefault,
+		"state":            p.State,
+		"created_at":       p.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":       p.UpdatedAt.UTC().Format(time.RFC3339),
 	}
 }

@@ -50,90 +50,30 @@ func GenerateMykeyPy(providers []domain.LLMProvider, cipher Cipher) (string, err
 		varName := fmt.Sprintf("native_%s_config_%d",
 			strings.ReplaceAll(string(p.ProviderType), "native_", ""), i)
 
-		// 将 native_* 类型映射回 GA Core 期望的类型
-		workerType := mapProviderTypeForWorker(p.ProviderType)
-
 		sb.WriteString(fmt.Sprintf("# Provider: %s (Type: %s)\n", p.Name, p.ProviderType))
 		sb.WriteString(fmt.Sprintf("%s = {\n", varName))
 		sb.WriteString(fmt.Sprintf("    'name': '%s',\n", p.Name))
-		sb.WriteString(fmt.Sprintf("    'type': '%s',\n", workerType))
 		sb.WriteString(fmt.Sprintf("    'apikey': '%s',\n", string(apiKey)))
 		sb.WriteString(fmt.Sprintf("    'apibase': '%s',\n", p.BaseURL))
 		sb.WriteString(fmt.Sprintf("    'model': '%s',\n", p.Model))
 
-		// 添加 config 中的其他字段
-		if p.Config.ThinkingType != "" {
-			sb.WriteString(fmt.Sprintf("    'thinking_type': '%s',\n", p.Config.ThinkingType))
-		}
-		if p.Config.MaxTokens > 0 {
-			sb.WriteString(fmt.Sprintf("    'max_tokens': %d,\n", p.Config.MaxTokens))
-		}
-		if p.Config.Temperature > 0 {
-			sb.WriteString(fmt.Sprintf("    'temperature': %.2f,\n", p.Config.Temperature))
-		}
-		if p.Config.MaxRetries > 0 {
-			sb.WriteString(fmt.Sprintf("    'max_retries': %d,\n", p.Config.MaxRetries))
-		}
-
-		// 新增字段：推理与思考
-		if p.Config.ThinkingBudgetTokens > 0 {
-			sb.WriteString(fmt.Sprintf("    'thinking_budget_tokens': %d,\n", p.Config.ThinkingBudgetTokens))
-		}
-		if p.Config.ReasoningEffort != "" {
-			sb.WriteString(fmt.Sprintf("    'reasoning_effort': '%s',\n", p.Config.ReasoningEffort))
-		}
-
-		// 新增字段：容量与超时
-		if p.Config.ContextWin > 0 {
-			sb.WriteString(fmt.Sprintf("    'context_win': %d,\n", p.Config.ContextWin))
-		}
-		if p.Config.ConnectTimeout > 0 {
-			sb.WriteString(fmt.Sprintf("    'connect_timeout': %d,\n", p.Config.ConnectTimeout))
-		}
-		if p.Config.ReadTimeout > 0 {
-			sb.WriteString(fmt.Sprintf("    'read_timeout': %d,\n", p.Config.ReadTimeout))
-		}
-
-		// 新增字段：传输
-		if p.Config.Stream != nil {
-			sb.WriteString(fmt.Sprintf("    'stream': %t,\n", *p.Config.Stream))
-		}
-		if p.Config.APIMode != "" {
-			sb.WriteString(fmt.Sprintf("    'api_mode': '%s',\n", p.Config.APIMode))
-		}
-
-		// 新增字段：Claude 专属
-		if p.Config.FakeCCSystemPrompt != nil {
-			sb.WriteString(fmt.Sprintf("    'fake_cc_system_prompt': %t,\n", *p.Config.FakeCCSystemPrompt))
-		}
-		if p.Config.UserAgent != "" {
-			sb.WriteString(fmt.Sprintf("    'user_agent': '%s',\n", p.Config.UserAgent))
-		}
-
-		// 新增字段：网络
-		if p.Config.Proxy != "" {
-			sb.WriteString(fmt.Sprintf("    'proxy': '%s',\n", p.Config.Proxy))
-		}
-		if p.Config.Verify != nil {
-			sb.WriteString(fmt.Sprintf("    'verify': %t,\n", *p.Config.Verify))
-		}
-
-		// 新增字段：高级
-		if p.Config.ServiceTier != "" {
-			sb.WriteString(fmt.Sprintf("    'service_tier': '%s',\n", p.Config.ServiceTier))
-		}
-		if p.Config.OmitThinking != nil {
-			sb.WriteString(fmt.Sprintf("    'omit_thinking': %t,\n", *p.Config.OmitThinking))
-		}
-		if p.Config.ExtraSysPrompt != "" {
-			sb.WriteString(fmt.Sprintf("    'extra_sys_prompt': '%s',\n", p.Config.ExtraSysPrompt))
-		}
-		if p.Config.ExtraSysPromptFile != "" {
-			sb.WriteString(fmt.Sprintf("    'extra_sys_prompt_file': '%s',\n", p.Config.ExtraSysPromptFile))
-		}
-		if p.Config.TrimKeepPrefix > 0 {
-			sb.WriteString(fmt.Sprintf("    'trim_keep_prefix': %d,\n", p.Config.TrimKeepPrefix))
-		}
+		cfg := p.SessionConfig
+		writeMyKeyString(&sb, "thinking_type", cfg.ThinkingType)
+		writeMyKeyInt(&sb, "thinking_budget_tokens", cfg.ThinkingBudgetTokens)
+		writeMyKeyString(&sb, "reasoning_effort", cfg.ReasoningEffort)
+		writeMyKeyFloat(&sb, "temperature", cfg.Temperature)
+		writeMyKeyInt(&sb, "max_tokens", cfg.MaxTokens)
+		writeMyKeyInt(&sb, "context_win", cfg.ContextWin)
+		writeMyKeyInt(&sb, "trim_keep_prefix", cfg.TrimKeepPrefix)
+		writeMyKeyInt(&sb, "max_retries", cfg.MaxRetries)
+		writeMyKeyInt(&sb, "read_timeout", cfg.ReadTimeout)
+		writeMyKeyBool(&sb, "stream", cfg.Stream)
+		writeMyKeyString(&sb, "api_mode", cfg.APIMode)
+		writeMyKeyBool(&sb, "fake_cc_system_prompt", cfg.FakeCCSystemPrompt)
+		writeMyKeyString(&sb, "user_agent", cfg.UserAgent)
+		writeMyKeyString(&sb, "service_tier", cfg.ServiceTier)
+		writeMyKeyBool(&sb, "omit_thinking", cfg.OmitThinking)
+		writeMyKeyString(&sb, "extra_sys_prompt", cfg.ExtraSysPrompt)
 
 		sb.WriteString("}\n\n")
 	}
@@ -141,15 +81,31 @@ func GenerateMykeyPy(providers []domain.LLMProvider, cipher Cipher) (string, err
 	return sb.String(), nil
 }
 
-// mapProviderTypeForWorker 将数据库中的 native_* 类型映射回 GA Core Worker 期望的类型
-func mapProviderTypeForWorker(dbType domain.LLMProviderType) string {
-	switch dbType {
-	case domain.ProviderNativeOAI:
-		return "openai_compatible"
-	case domain.ProviderNativeClaude:
-		return "anthropic_messages"
-	default:
-		// 如果已经是旧类型，直接返回
-		return string(dbType)
+func writeMyKeyString(sb *strings.Builder, key string, value *string) {
+	if value != nil {
+		sb.WriteString(fmt.Sprintf("    '%s': %q,\n", key, *value))
 	}
+}
+
+func writeMyKeyInt(sb *strings.Builder, key string, value *int) {
+	if value != nil {
+		sb.WriteString(fmt.Sprintf("    '%s': %d,\n", key, *value))
+	}
+}
+
+func writeMyKeyFloat(sb *strings.Builder, key string, value *float64) {
+	if value != nil {
+		sb.WriteString(fmt.Sprintf("    '%s': %g,\n", key, *value))
+	}
+}
+
+func writeMyKeyBool(sb *strings.Builder, key string, value *bool) {
+	if value == nil {
+		return
+	}
+	pythonValue := "False"
+	if *value {
+		pythonValue = "True"
+	}
+	sb.WriteString(fmt.Sprintf("    '%s': %s,\n", key, pythonValue))
 }

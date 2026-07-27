@@ -54,6 +54,7 @@ func migrationFiles() []string {
 		"0021_tasks_requester_status_index.sql",
 		"0022_task_started_delivery.sql",
 		"0023_llm_provider_ga_config.sql",
+		"0024_transparent_llm_proxy.sql",
 	}
 }
 
@@ -86,10 +87,12 @@ var pendingMigrations = []struct {
 	{"0021_tasks_requester_status_index.sql", "migration_0021_tasks_requester_status_index_marker"},
 	{"0022_task_started_delivery.sql", "migration_0022_task_started_delivery_marker"},
 	{"0023_llm_provider_ga_config.sql", "migration_0023_llm_provider_ga_config_marker"},
+	{"0024_transparent_llm_proxy.sql", "migration_0024_transparent_llm_proxy_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
 var foundationTableNames = []string{
+	"llm_capability_revocations",
 	"media_assets",
 	"messages",
 	"llm_providers",
@@ -110,6 +113,8 @@ var foundationTableNames = []string{
 	"tool_policies",
 	"relay_preferences",
 	"migration_0008_user_id_serial_marker",
+	"migration_0023_llm_provider_ga_config_marker",
+	"migration_0024_transparent_llm_proxy_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",

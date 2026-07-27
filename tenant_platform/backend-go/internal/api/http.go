@@ -66,12 +66,10 @@ type BotStore interface {
 
 // LLMProviderStore is the admin-facing port for configuring upstream LLMs.
 type LLMProviderStore interface {
-	CreateProvider(ctx context.Context, name string, providerType domain.LLMProviderType,
-		baseURL, model string, apiKeyCiphertext []byte, keyVersion string, config domain.LLMProviderConfig) (domain.LLMProvider, error)
+	CreateProvider(ctx context.Context, input domain.LLMProviderCreate) (domain.LLMProvider, error)
 	GetProvider(ctx context.Context, id int64) (domain.LLMProvider, error)
 	ListProviders(ctx context.Context) ([]domain.LLMProvider, error)
-	UpdateProvider(ctx context.Context, id int64, name string, providerType domain.LLMProviderType,
-		baseURL, model string, apiKeyCiphertext []byte, keyVersion string, config domain.LLMProviderConfig) (domain.LLMProvider, error)
+	UpdateProvider(ctx context.Context, id int64, input domain.LLMProviderUpdate) (domain.LLMProvider, error)
 	SetDefaultProvider(ctx context.Context, id int64) error
 	DeleteProvider(ctx context.Context, id int64) error
 }

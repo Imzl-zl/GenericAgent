@@ -22,8 +22,8 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/api"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/logging"
@@ -118,8 +118,12 @@ func ensureDevDefaultLLMProvider(ctx context.Context, store *postgres.Store, cip
 	if encErr != nil {
 		return fmt.Errorf("encrypt dev provider api key: %w", encErr)
 	}
-	if _, createErr := store.CreateProvider(ctx, "dev-default",
-		domain.ProviderOpenAICompatible, baseURL, "gpt-4o", ciphertext, strconv.Itoa(version), domain.LLMProviderConfig{}); createErr != nil {
+	if _, createErr := store.CreateProvider(ctx, domain.LLMProviderCreate{
+		Name: "dev-default", ProviderType: domain.ProviderNativeOAI,
+		BaseURL: baseURL, Model: "gpt-4o", APIKeyCiphertext: ciphertext,
+		APIKeyKeyVersion: strconv.Itoa(version),
+		TransportConfig:  domain.ProviderTransportConfig{AuthMode: domain.ProviderAuthAuto},
+	}); createErr != nil {
 		return fmt.Errorf("create dev default provider: %w", createErr)
 	}
 	fmt.Fprintf(os.Stderr, "platform: dev-loopback seeded default llm_provider base_url=%s\n", baseURL)
