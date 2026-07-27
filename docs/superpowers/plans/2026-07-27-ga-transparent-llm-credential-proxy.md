@@ -829,7 +829,7 @@ git commit --only -m "feat: bind workers to provider routing snapshots" -- tenan
 - Produces: `TransportCache.RoundTripper(provider) (http.RoundTripper, error)`.
 - Produces deployment network policy parsed from allowed CIDRs/HTTP hosts.
 
-- [ ] **Step 1: Write failing URL compatibility tests**
+- [x] **Step 1: Write failing URL compatibility tests**
 
 Table cases must mirror GA `auto_make_url()`:
 
@@ -848,15 +848,15 @@ Table cases must mirror GA `auto_make_url()`:
 
 Also reject type/path mismatch and conflicting query keys.
 
-- [ ] **Step 2: Write failing header security tests**
+- [x] **Step 2: Write failing header security tests**
 
 Assert capability Authorization, cookies, forwarding headers, and incoming x-api-key never reach upstream; GA native beta/UA/Stainless headers do; real auth is injected last. Cover Claude auto/Bearer/x-api-key.
 
-- [ ] **Step 3: Write failing SSRF and transport-cache tests**
+- [x] **Step 3: Write failing SSRF and transport-cache tests**
 
 Reject HTTP/public-policy mismatch, loopback, link-local, metadata IP, redirect, and DNS results outside allowlist. Permit `httptest.Server` only when its CIDR/host is explicitly configured. Assert identical transport hashes reuse a pointer and config change replaces it.
 
-- [ ] **Step 4: Run policy tests and observe RED**
+- [x] **Step 4: Run policy tests and observe RED**
 
 ```bash
 cd tenant_platform/backend-go
@@ -865,11 +865,11 @@ go test ./internal/infrastructure/llmproxy -run 'TestResolveUpstream|TestHeaders
 
 Expected: compile failures for the new policy APIs.
 
-- [ ] **Step 5: Implement target resolution and header policy**
+- [x] **Step 5: Implement target resolution and header policy**
 
 Use parsed `url.URL`, never string concatenation. `$` is stripped only from the configured path terminator. Merge query maps and reject duplicate keys with different values. Header policy uses explicit case-insensitive allowlists; do not copy all headers then subtract.
 
-- [ ] **Step 6: Implement cached transports and network enforcement**
+- [x] **Step 6: Implement cached transports and network enforcement**
 
 Transport settings:
 
@@ -889,7 +889,7 @@ Transport settings:
 
 The custom dialer revalidates the resolved IP immediately before connect to close DNS-rebinding gaps. Disable redirects by using raw `RoundTripper`, not `http.Client.Do` redirect behavior.
 
-- [ ] **Step 7: Run policy tests**
+- [x] **Step 7: Run policy tests**
 
 ```bash
 cd tenant_platform/backend-go
@@ -898,7 +898,7 @@ go test ./internal/infrastructure/llmproxy -run 'TestResolveUpstream|TestHeaders
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit Task 6**
+- [x] **Step 8: Commit Task 6**
 
 ```bash
 git add tenant_platform/backend-go/internal/infrastructure/llmproxy/target.go tenant_platform/backend-go/internal/infrastructure/llmproxy/target_test.go tenant_platform/backend-go/internal/infrastructure/llmproxy/headers.go tenant_platform/backend-go/internal/infrastructure/llmproxy/headers_test.go tenant_platform/backend-go/internal/infrastructure/llmproxy/transport.go tenant_platform/backend-go/internal/infrastructure/llmproxy/transport_test.go tenant_platform/backend-go/internal/infrastructure/llmproxy/config.go

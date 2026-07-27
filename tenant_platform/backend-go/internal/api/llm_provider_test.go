@@ -60,7 +60,7 @@ func TestAdminCreateLLMProviderEncryptsKey(t *testing.T) {
 	srv, store, _ := llmProviderServerFixture(t)
 	body := map[string]any{
 		"name":          "openai-default",
-		"provider_type": "openai_compatible",
+		"provider_type": "native_oai",
 		"base_url":      "https://api.openai.com/v1",
 		"model":         "gpt-4o-mini",
 		"api_key":       "sk-real-upstream-key",
@@ -126,7 +126,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 	// Create.
 	createBody := map[string]any{
 		"name":          "anthropic-default",
-		"provider_type": "anthropic_messages",
+		"provider_type": "native_claude",
 		"base_url":      "https://api.anthropic.com",
 		"model":         "claude-3-5-sonnet",
 		"api_key":       "sk-ant",
@@ -177,7 +177,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 	// Update.
 	updateBody := map[string]any{
 		"name":          "anthropic-updated",
-		"provider_type": "anthropic_messages",
+		"provider_type": "native_claude",
 		"base_url":      "https://api.anthropic.com",
 		"model":         "claude-3-opus",
 		"api_key":       "sk-ant-2",

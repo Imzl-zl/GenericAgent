@@ -26,12 +26,14 @@ type TokenCipher interface {
 // fetched from the provider store and decrypted with the cipher; it is never
 // part of this static config.
 type Config struct {
-	Listen         string
-	SigningKey     []byte
-	TokenTTL       time.Duration
-	ProviderSource ProviderSource
-	Cipher         TokenCipher
-	Revocations    CapabilityRevocationSource
+	Listen               string
+	SigningKey           []byte
+	TokenTTL             time.Duration
+	ProviderSource       ProviderSource
+	Cipher               TokenCipher
+	Revocations          CapabilityRevocationSource
+	AllowedUpstreamCIDRs []string
+	AllowedHTTPHosts     []string
 }
 
 // WithDefaults applies zero-value defaults.
@@ -65,7 +67,14 @@ func (c Config) Validate() error {
 	if c.TokenTTL <= 0 {
 		return fmt.Errorf("token ttl must be positive")
 	}
+	if _, err := NewNetworkPolicy(c.AllowedUpstreamCIDRs, c.AllowedHTTPHosts); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (c Config) NetworkPolicy() (*NetworkPolicy, error) {
+	return NewNetworkPolicy(c.AllowedUpstreamCIDRs, c.AllowedHTTPHosts)
 }
 
 func isLoopbackAddr(addr string) bool {
