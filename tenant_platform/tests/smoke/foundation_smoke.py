@@ -23,14 +23,19 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BACKEND_GO = REPO_ROOT / "tenant_platform" / "backend-go"
 WORKER_SRC = REPO_ROOT / "tenant_platform" / "worker-python" / "src"
-REQUIRED_ENV = ("TEST_DATABASE_URL", "PLATFORM_DEV_USER_ID", "GA_LEGACY_ROOT", "GA_POLICY_FILE")
+REQUIRED_ENV = (
+    "TEST_DATABASE_URL",
+    "PLATFORM_DEV_USER_ID",
+    "GA_LEGACY_ROOT",
+    "GA_POLICY_FILE",
+)
 DEV_TOKEN = "foundation-smoke-dev-token-not-real"
 OAI_TOKEN = "foundation-smoke-oai-token-not-real"
-# The real upstream key (OAI_TOKEN) is injected into the in-process LLM Proxy
-# via LLM_PROXY_UPSTREAM_APIKEY; the Worker only ever receives a short-lived
-# capability_token. The signing key authenticates tokens between the platform
-# and the Proxy (>= 16 bytes per llmproxy.MinSigningKeyLen).
+# The fixture key is submitted through the Admin Provider API. The Worker only
+# receives a short-lived capability token; the signing key authenticates it to
+# the Proxy (>= 32 bytes per llmproxy.MinSigningKeyLen).
 CAPABILITY_SIGNING_KEY = "foundation-smoke-signing-key-not-real"
+BOT_TOKEN_KEY = "0" * 64
 POLICY_VERSION = "foundation.no-host-tools.v1"
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 CHILD_ENV_ALLOWLIST = frozenset(
@@ -61,6 +66,8 @@ WINDOWS_NO_WINDOW = 0x08000000
 
 class SmokeError(RuntimeError):
     pass
+
+
 @dataclass(frozen=True)
 class _StopResult:
     exit_code: int
@@ -90,10 +97,17 @@ class _WindowsJob:
             ]
 
         class _IoCounters(ctypes.Structure):
-            _fields_ = [(name, ctypes.c_ulonglong) for name in (
-                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
-            )]
+            _fields_ = [
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            ]
 
         class _ExtendedLimits(ctypes.Structure):
             _fields_ = [
@@ -112,7 +126,9 @@ class _WindowsJob:
             raise ctypes.WinError(ctypes.get_last_error())
         limits = _ExtendedLimits()
         limits.BasicLimitInformation.LimitFlags = 0x00002000
-        if not kernel32.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        if not kernel32.SetInformationJobObject(
+            handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
             kernel32.CloseHandle(handle)
             raise ctypes.WinError(ctypes.get_last_error())
         self._handle = int(handle)
@@ -122,7 +138,9 @@ class _WindowsJob:
             return
         import ctypes
 
-        if not ctypes.windll.kernel32.AssignProcessToJobObject(self._handle, int(proc._handle)):
+        if not ctypes.windll.kernel32.AssignProcessToJobObject(
+            self._handle, int(proc._handle)
+        ):
             raise ctypes.WinError(ctypes.get_last_error())
 
     def close(self) -> None:
@@ -155,13 +173,16 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
             self._respond(400, {"error": "invalid json"})
             return
-        if not isinstance(payload, dict) or payload.get("stream") is not False:
-            self._respond(400, {"error": "non-stream request required"})
+        if not isinstance(payload, dict) or not isinstance(payload.get("stream"), bool):
+            self._respond(400, {"error": "stream boolean required"})
             return
         self.server.valid_request_count += 1
         self.server.request_arrived.set()
         if not self.server.release_response.wait(timeout=45):
             self._respond(504, {"error": "fixture release timeout"})
+            return
+        if payload["stream"]:
+            self._respond_sse("foundation-smoke-reply")
             return
         self._respond(
             200,
@@ -171,13 +192,54 @@ class _FixtureHandler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": "foundation-smoke-reply"},
+                        "message": {
+                            "role": "assistant",
+                            "content": "foundation-smoke-reply",
+                        },
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             },
         )
+
+    def _respond_sse(self, text: str) -> None:
+        events = [
+            {
+                "id": "chatcmpl-foundation-smoke",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {"index": 0, "delta": {"content": text}, "finish_reason": None}
+                ],
+            },
+            {
+                "id": "chatcmpl-foundation-smoke",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        ]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            for event in events:
+                raw = json.dumps(event, separators=(",", ":")).encode("utf-8")
+                self.wfile.write(b"data: " + raw + b"\n\n")
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _respond(self, status: int, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -210,7 +272,9 @@ class _FixtureServer(ThreadingHTTPServer):
 class _Fixture:
     def __init__(self) -> None:
         self.server = _FixtureServer()
-        self.thread = threading.Thread(target=self.server.serve_forever, name="foundation-oai", daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, name="foundation-oai", daemon=True
+        )
         self.started = False
 
     def start(self) -> None:
@@ -222,7 +286,10 @@ class _Fixture:
             {"model": "self-check", "messages": [], "stream": False},
             headers={"Authorization": "Bearer deliberately-wrong"},
         )
-        _require(code == 401 and self.server.wrong_auth_count == 1, "fixture accepted a wrong bearer token")
+        _require(
+            code == 401 and self.server.wrong_auth_count == 1,
+            "fixture accepted a wrong bearer token",
+        )
 
     def close(self) -> None:
         self.server.release_response.set()
@@ -242,7 +309,9 @@ def _required_environment() -> dict[str, str]:
     values = {name: os.environ.get(name, "").strip() for name in REQUIRED_ENV}
     missing = [name for name, value in values.items() if not value]
     if missing:
-        raise SmokeError("missing required environment variable(s): " + ", ".join(missing))
+        raise SmokeError(
+            "missing required environment variable(s): " + ", ".join(missing)
+        )
     try:
         user_id = int(values["PLATFORM_DEV_USER_ID"])
     except ValueError as exc:
@@ -255,9 +324,14 @@ def _required_environment() -> dict[str, str]:
 def _validate_paths(values: dict[str, str]) -> tuple[Path, Path]:
     legacy_root = Path(values["GA_LEGACY_ROOT"]).resolve()
     policy_file = Path(values["GA_POLICY_FILE"]).resolve()
-    _require((legacy_root / "agentmain.py").is_file(), "GA_LEGACY_ROOT must contain agentmain.py")
+    _require(
+        (legacy_root / "agentmain.py").is_file(),
+        "GA_LEGACY_ROOT must contain agentmain.py",
+    )
     _require(policy_file.is_file(), "GA_POLICY_FILE must name a file")
-    _require((WORKER_SRC / "ga_worker").is_dir(), "real Python Worker source is missing")
+    _require(
+        (WORKER_SRC / "ga_worker").is_dir(), "real Python Worker source is missing"
+    )
     return legacy_root, policy_file
 
 
@@ -274,7 +348,9 @@ def _request_json(
     if body is not None:
         data = json.dumps(body, separators=(",", ":")).encode("utf-8")
         request_headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    request = urllib.request.Request(
+        url, data=data, headers=request_headers, method=method
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
@@ -288,12 +364,39 @@ def _request_json(
         return exc.code, payload
 
 
-def _platform_request(method: str, base: str, path: str, body: dict[str, Any] | None = None):
+def _platform_request(
+    method: str, base: str, path: str, body: dict[str, Any] | None = None
+):
     return _request_json(
         method,
         base + path,
         body,
         headers={"X-Platform-Dev-Token": DEV_TOKEN},
+    )
+
+
+def _create_fixture_provider(base: str, fixture: _Fixture) -> None:
+    code, response = _platform_request(
+        "POST",
+        base,
+        "/v1/admin/llm-providers",
+        {
+            "name": "foundation-smoke-fixture",
+            "provider_type": "native_oai",
+            "base_url": fixture.server.base_url,
+            "model": "gpt-4o",
+            "api_key": OAI_TOKEN,
+            "session_config": {"stream": True, "max_retries": 0},
+            "transport_config": {"auth_mode": "auto"},
+        },
+    )
+    _require(code == 201, f"fixture provider create failed: {response}")
+
+    code, providers = _platform_request("GET", base, "/v1/admin/llm-providers")
+    configured = providers.get("providers", [])
+    _require(
+        code == 200 and len(configured) == 1 and configured[0]["is_default"],
+        f"legacy environment unexpectedly seeded a Provider: {providers}",
     )
 
 
@@ -319,9 +422,17 @@ def _build_platform(output: Path) -> None:
 
 
 def _child_environment(
-    values: dict[str, str], config_root: Path, runtime_root: Path, legacy_root: Path, policy_file: Path
+    values: dict[str, str],
+    config_root: Path,
+    runtime_root: Path,
+    legacy_root: Path,
+    policy_file: Path,
 ) -> dict[str, str]:
-    env = {name: value for name, value in os.environ.items() if name.upper() in CHILD_ENV_ALLOWLIST}
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in CHILD_ENV_ALLOWLIST
+    }
     env.update(
         {
             "DATABASE_URL": values["TEST_DATABASE_URL"],
@@ -332,15 +443,18 @@ def _child_environment(
             "GA_RUNTIME_DIR": str(runtime_root),
             "GA_LEGACY_ROOT": str(legacy_root),
             "GA_POLICY_FILE": str(policy_file),
-            "GA_WORKER_PYTHON": os.environ.get("GA_WORKER_PYTHON", "").strip() or sys.executable,
+            "GA_WORKER_PYTHON": os.environ.get("GA_WORKER_PYTHON", "").strip()
+            or sys.executable,
             "GA_WORKER_SRC": str(WORKER_SRC),
-            # LLM Proxy: the platform starts an in-process Proxy in dev-loopback
-            # that holds the real upstream key (OAI_TOKEN). The Worker receives
-            # only a capability_token + Proxy URL via a token-only mykey.py
-            # generated by the scheduler (security red line: no real key in Worker).
-            "LLM_PROXY_UPSTREAM_BASEURL": values.get("LLM_PROXY_UPSTREAM_BASEURL", ""),
-            "LLM_PROXY_UPSTREAM_APIKEY": values.get("LLM_PROXY_UPSTREAM_APIKEY", ""),
-            "LLM_PROXY_CAPABILITY_SIGNING_KEY": values.get("LLM_PROXY_CAPABILITY_SIGNING_KEY", ""),
+            "BOT_TOKEN_KEY": BOT_TOKEN_KEY,
+            # The fixture key is sent later through the Admin Provider API.
+            "LLM_PROXY_CAPABILITY_SIGNING_KEY": values.get(
+                "LLM_PROXY_CAPABILITY_SIGNING_KEY", ""
+            ),
+            "LLM_PROXY_ALLOWED_UPSTREAM_CIDRS": values.get(
+                "LLM_PROXY_ALLOWED_UPSTREAM_CIDRS", ""
+            ),
+            "LLM_PROXY_ALLOW_HTTP_HOSTS": values.get("LLM_PROXY_ALLOW_HTTP_HOSTS", ""),
         }
     )
     return env
@@ -383,7 +497,14 @@ def _start_platform(
     kwargs: dict[str, Any] = {"start_new_session": os.name != "nt"}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    proc = subprocess.Popen(args, cwd=BACKEND_GO, env=env, stdout=log_file, stderr=subprocess.STDOUT, **kwargs)
+    proc = subprocess.Popen(
+        args,
+        cwd=BACKEND_GO,
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        **kwargs,
+    )
     return proc, base
 
 
@@ -399,7 +520,9 @@ def _wait_health(proc: subprocess.Popen[Any], base: str) -> None:
         except (OSError, urllib.error.URLError) as exc:
             last_error = exc
         time.sleep(0.2)
-    raise SmokeError(f"platform health timeout ({type(last_error).__name__ if last_error else 'not ready'})")
+    raise SmokeError(
+        f"platform health timeout ({type(last_error).__name__ if last_error else 'not ready'})"
+    )
 
 
 def _process_rows() -> list[tuple[int, int, int]]:
@@ -422,14 +545,25 @@ def _process_rows() -> list[tuple[int, int, int]]:
         raw = json.loads(completed.stdout or "[]")
         items = raw if isinstance(raw, list) else [raw]
         return [
-            (int(item["ProcessId"]), int(item["ParentProcessId"]), int(item.get("WorkingSetSize") or 0))
+            (
+                int(item["ProcessId"]),
+                int(item["ParentProcessId"]),
+                int(item.get("WorkingSetSize") or 0),
+            )
             for item in items
         ]
     completed = subprocess.run(
-        ["ps", "-eo", "pid=,ppid=,rss="], capture_output=True, text=True, timeout=10, check=False
+        ["ps", "-eo", "pid=,ppid=,rss="],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
     )
     _require(completed.returncode == 0, "unable to sample Worker RSS")
-    return [(int(pid), int(ppid), int(rss) * 1024) for pid, ppid, rss in map(str.split, completed.stdout.splitlines())]
+    return [
+        (int(pid), int(ppid), int(rss) * 1024)
+        for pid, ppid, rss in map(str.split, completed.stdout.splitlines())
+    ]
 
 
 def _sample_descendants(root_pid: int) -> tuple[set[int], int]:
@@ -456,7 +590,14 @@ def _pid_alive(pid: int) -> bool:
             return False
         try:
             code = ctypes.c_ulong()
-            return bool(ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+            return (
+                bool(
+                    ctypes.windll.kernel32.GetExitCodeProcess(
+                        handle, ctypes.byref(code)
+                    )
+                )
+                and code.value == 259
+            )
         finally:
             ctypes.windll.kernel32.CloseHandle(handle)
     try:
@@ -528,7 +669,9 @@ def _stop_process_tree(
             platform_stopped = True
         except (OSError, subprocess.TimeoutExpired):
             platform_stopped = proc.poll() is not None
-    workers_stopped = sampling_ok and _wait_pids_gone(known_children, min(8.0, grace_seconds))
+    workers_stopped = sampling_ok and _wait_pids_gone(
+        known_children, min(8.0, grace_seconds)
+    )
     if platform_stopped and workers_stopped:
         return _StopResult(int(proc.returncode or 0), True, False)
     _force_process_tree(proc, known_children, job)
@@ -538,7 +681,9 @@ def _stop_process_tree(
     return _StopResult(int(proc.returncode or 0), False, True)
 
 
-def _poll_task(base: str, task_id: str, wanted: set[str], timeout: float) -> dict[str, Any]:
+def _poll_task(
+    base: str, task_id: str, wanted: set[str], timeout: float
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -548,16 +693,24 @@ def _poll_task(base: str, task_id: str, wanted: set[str], timeout: float) -> dic
             if body.get("status") in wanted:
                 return body
         time.sleep(0.25)
-    raise SmokeError(f"task did not reach expected terminal status; last status={last.get('status', 'unknown')}")
+    raise SmokeError(
+        f"task did not reach expected terminal status; last status={last.get('status', 'unknown')}"
+    )
 
 
 def _submit(base: str, session: str, payload: dict[str, Any]) -> dict[str, Any]:
-    code, body = _platform_request("POST", base, f"/v1/sessions/{session}/tasks", payload)
-    _require(code == 202 and isinstance(body.get("task_id"), str), "durable submit failed")
+    code, body = _platform_request(
+        "POST", base, f"/v1/sessions/{session}/tasks", payload
+    )
+    _require(
+        code == 202 and isinstance(body.get("task_id"), str), "durable submit failed"
+    )
     return body
 
 
-def _database_facts(database_url: str, success_id: str, cancel_id: str) -> dict[str, Any]:
+def _database_facts(
+    database_url: str, success_id: str, cancel_id: str
+) -> dict[str, Any]:
     try:
         import psycopg
     except ImportError as exc:
@@ -579,13 +732,18 @@ def _database_facts(database_url: str, success_id: str, cancel_id: str) -> dict[
         cancel_snapshots = conn.execute(
             "SELECT count(*) FROM workspace_snapshots WHERE task_id=%s", (cancel_id,)
         ).fetchone()[0]
-    _require(chunk_count > 0 and chunk_bytes > 0, "real Worker display stream did not produce task chunk events")
+    _require(
+        chunk_count > 0 and chunk_bytes > 0,
+        "real Worker display stream did not produce task chunk events",
+    )
     _require(cancel_snapshots == 0, "cancelled task unexpectedly created a snapshot")
     return {
         "snapshot_id": row[0],
         "checkpoint_digest": row[1],
         "checkpoint_result_digest": row[2],
-        "checkpoint_prepare_to_commit_ms": max(0, int((row[4] - row[3]).total_seconds() * 1000)),
+        "checkpoint_prepare_to_commit_ms": max(
+            0, int((row[4] - row[3]).total_seconds() * 1000)
+        ),
         "chunk_count": int(chunk_count),
         "chunk_bytes": int(chunk_bytes),
     }
@@ -600,26 +758,37 @@ def _launch_stack(
     state: dict[str, Any],
 ) -> tuple[subprocess.Popen[Any], str, Path]:
     config_root, runtime_root = tmp / "config", tmp / "runtime"
+    state["config_root"] = config_root
+    state["runtime_root"] = runtime_root
     runtime_root.mkdir()
-    # NOTE: do NOT write mykey.py here. The scheduler writes a token-only
-    # mykey.py (capability_token + Proxy URL) into GA_CONFIG_ROOT at Worker
-    # startup, overwriting any pre-existing file. The real upstream key
-    # (OAI_TOKEN) lives only in the in-process LLM Proxy.
-    proxy_values = {
+    # The scheduler writes token-only runtime configuration at Worker startup.
+    # The fixture key enters the encrypted Provider store through the Admin API.
+    fixture_host, fixture_port = fixture.server.server_address
+    platform_values = {
         **values,
-        "LLM_PROXY_UPSTREAM_BASEURL": fixture.server.base_url,
-        "LLM_PROXY_UPSTREAM_APIKEY": OAI_TOKEN,
         "LLM_PROXY_CAPABILITY_SIGNING_KEY": CAPABILITY_SIGNING_KEY,
+        "LLM_PROXY_ALLOWED_UPSTREAM_CIDRS": "127.0.0.0/8",
+        "LLM_PROXY_ALLOW_HTTP_HOSTS": f"{fixture_host}:{fixture_port}",
     }
     binary = tmp / ("platform.exe" if os.name == "nt" else "platform")
     _build_platform(binary)
     log_file = (tmp / "children.log").open("w+b")
+    state["log_path"] = tmp / "children.log"
     state["log_file"] = log_file
-    env = _child_environment(proxy_values, config_root, runtime_root, legacy_root, policy_file)
-    proc, base = _start_platform(binary, log_file, env, policy_file, config_root, runtime_root, legacy_root)
+    env = _child_environment(
+        platform_values, config_root, runtime_root, legacy_root, policy_file
+    )
+    # Retired environment values are deliberately present: Platform must ignore
+    # them and accept the sole Provider through the Admin API below.
+    env["LLM_PROXY_UPSTREAM_BASEURL"] = "http://127.0.0.1:1/v1"
+    env["LLM_PROXY_UPSTREAM_APIKEY"] = "retired-upstream-key-not-real"
+    proc, base = _start_platform(
+        binary, log_file, env, policy_file, config_root, runtime_root, legacy_root
+    )
     state["proc"] = proc
     state["job"].assign(proc)
     _wait_health(proc, base)
+    _create_fixture_provider(base, fixture)
     return proc, base, runtime_root
 
 
@@ -633,7 +802,7 @@ def _submit_deduped_success(
         "message_id": f"success-{unique}",
         "source_instance_id": f"foundation-smoke-{unique}",
         "prompt": "Produce the deterministic foundation smoke response.",
-        "source": "smoke",
+        "source": "web",
         "persona_snapshot": ["Use the deterministic local fixture response."],
         "tool_policy_version": POLICY_VERSION,
     }
@@ -642,9 +811,19 @@ def _submit_deduped_success(
     duplicate_payload = dict(payload)
     duplicate_payload["prompt"] = "A duplicate must not replace the durable original."
     duplicate = _submit(base, session, duplicate_payload)
-    _require(duplicate["task_id"] == submitted["task_id"], "same-key submit was not deduplicated")
-    _require(fixture.server.request_arrived.wait(timeout=40), "real Worker never reached the OpenAI fixture")
-    return {"task_id": submitted["task_id"], "dedupe_id": duplicate["task_id"], "started": started}
+    _require(
+        duplicate["task_id"] == submitted["task_id"],
+        "same-key submit was not deduplicated",
+    )
+    _require(
+        fixture.server.request_arrived.wait(timeout=40),
+        "real Worker never reached the OpenAI fixture",
+    )
+    return {
+        "task_id": submitted["task_id"],
+        "dedupe_id": duplicate["task_id"],
+        "started": started,
+    }
 
 
 def _cancel_queued_task(base: str, session: str, unique: str) -> dict[str, Any]:
@@ -656,22 +835,38 @@ def _cancel_queued_task(base: str, session: str, unique: str) -> dict[str, Any]:
             "message_id": f"cancel-{unique}",
             "source_instance_id": f"foundation-smoke-{unique}",
             "prompt": "This queued task must be cancelled before Worker dispatch.",
-            "source": "smoke",
+            "source": "web",
             "persona_snapshot": ["Cancellation smoke task."],
             "tool_policy_version": POLICY_VERSION,
         },
     )
-    code, response = _platform_request("POST", base, f"/v1/tasks/{submitted['task_id']}/cancel")
-    _require(code == 200 and response.get("accepted") is True, "cancellation was not accepted")
+    code, response = _platform_request(
+        "POST", base, f"/v1/tasks/{submitted['task_id']}/cancel"
+    )
+    _require(
+        code == 200 and response.get("accepted") is True,
+        "cancellation was not accepted",
+    )
     task = _poll_task(base, submitted["task_id"], {"cancelled"}, 20)
     elapsed = int((time.monotonic() - started) * 1000)
-    _require(not any(key in task for key in ("snapshot_id", "result_ref", "result_digest")), "cancelled task published result state")
-    result_code, _ = _platform_request("GET", base, f"/v1/tasks/{submitted['task_id']}/result")
+    _require(
+        not any(key in task for key in ("snapshot_id", "result_ref", "result_digest")),
+        "cancelled task published result state",
+    )
+    result_code, _ = _platform_request(
+        "GET", base, f"/v1/tasks/{submitted['task_id']}/result"
+    )
     _require(result_code >= 400, "cancelled task exposed a result")
-    return {"task_id": submitted["task_id"], "status": task["status"], "elapsed": elapsed}
+    return {
+        "task_id": submitted["task_id"],
+        "status": task["status"],
+        "elapsed": elapsed,
+    }
 
 
-def _sample_worker_after_terminal(proc: subprocess.Popen[Any], known_children: set[int]) -> int:
+def _sample_worker_after_terminal(
+    proc: subprocess.Popen[Any], known_children: set[int]
+) -> int:
     children, rss = _sample_descendants(proc.pid)
     known_children.update(children)
     _require(bool(children) and rss > 0, "Worker process was not measurable")
@@ -693,23 +888,59 @@ def _complete_success(
     elapsed = int((time.monotonic() - success["started"]) * 1000)
     _require(task.get("status") == "succeeded", "foundation success task failed")
     result_ref = task.get("result_ref")
-    _require(isinstance(result_ref, str) and "/" not in result_ref and "\\" not in result_ref, "invalid result ref")
-    code, result = _platform_request("GET", base, f"/v1/tasks/{success['task_id']}/result?result_ref={result_ref}")
-    _require(code == 200 and result.get("result_digest") == task.get("result_digest"), "digest-checked result readback failed")
-    payload = result.get("payload")
-    returned_text = payload.get("text") if isinstance(payload, dict) else None
-    _require(isinstance(returned_text, str), "result payload was not the expected text representation")
-    returned_digest = "sha256:" + hashlib.sha256(returned_text.encode("utf-8")).hexdigest()
-    _require(returned_digest == result.get("result_digest"), "returned result body digest mismatch")
+    _require(
+        isinstance(result_ref, str)
+        and "/" not in result_ref
+        and "\\" not in result_ref,
+        "invalid result ref",
+    )
+    code, result = _platform_request(
+        "GET", base, f"/v1/tasks/{success['task_id']}/result?result_ref={result_ref}"
+    )
+    _require(
+        code == 200 and result.get("result_digest") == task.get("result_digest"),
+        "digest-checked result readback failed",
+    )
+    returned_text = result.get("payload")
+    _require(
+        isinstance(returned_text, str),
+        "result payload was not the expected text string",
+    )
+    _require(
+        "!!!Error:" not in returned_text and "[Error:" not in returned_text,
+        "GA returned an LLM error",
+    )
+    returned_digest = (
+        "sha256:" + hashlib.sha256(returned_text.encode("utf-8")).hexdigest()
+    )
+    _require(
+        returned_digest == result.get("result_digest"),
+        "returned result body digest mismatch",
+    )
     facts = _database_facts(database_url, success["task_id"], cancel_id)
-    _require(facts["checkpoint_result_digest"] == task["result_digest"], "checkpoint/result digest mismatch")
+    _require(
+        facts["checkpoint_result_digest"] == task["result_digest"],
+        "checkpoint/result digest mismatch",
+    )
     bundle = runtime_root / "committed" / f"{facts['snapshot_id']}.bundle.json"
     _require(bundle.is_file(), "committed checkpoint bundle is missing")
     raw = bundle.read_bytes()
-    _require("sha256:" + hashlib.sha256(raw).hexdigest() == facts["checkpoint_digest"], "committed checkpoint digest mismatch")
+    _require(
+        "sha256:" + hashlib.sha256(raw).hexdigest() == facts["checkpoint_digest"],
+        "committed checkpoint digest mismatch",
+    )
     rss = _sample_worker_after_terminal(proc, known_children)
-    _require(fixture.server.valid_request_count == 1, "cancelled task reached the OpenAI fixture")
-    return {"task": task, "elapsed": elapsed, "facts": facts, "bundle_bytes": len(raw), "rss": rss}
+    _require(
+        fixture.server.valid_request_count == 1,
+        "cancelled task reached the OpenAI fixture",
+    )
+    return {
+        "task": task,
+        "elapsed": elapsed,
+        "facts": facts,
+        "bundle_bytes": len(raw),
+        "rss": rss,
+    }
 
 
 def _make_outputs(
@@ -754,7 +985,9 @@ def _exercise(
     state: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     total_started = time.monotonic()
-    proc, base, runtime_root = _launch_stack(values, legacy_root, policy_file, tmp, fixture, state)
+    proc, base, runtime_root = _launch_stack(
+        values, legacy_root, policy_file, tmp, fixture, state
+    )
     session = f"personal:{values['PLATFORM_DEV_USER_ID']}"
     unique = uuid.uuid4().hex
     success = _submit_deduped_success(base, session, unique, fixture)
@@ -770,9 +1003,34 @@ def _exercise(
         cancelled["task_id"],
     )
     total_elapsed = int((time.monotonic() - total_started) * 1000)
-    elapsed_values = (completed["elapsed"], cancelled["elapsed"], total_elapsed, completed["facts"]["checkpoint_prepare_to_commit_ms"])
-    _require(all(0 <= value <= 180_000 for value in elapsed_values), "elapsed measurement was out of bounds")
+    elapsed_values = (
+        completed["elapsed"],
+        cancelled["elapsed"],
+        total_elapsed,
+        completed["facts"]["checkpoint_prepare_to_commit_ms"],
+    )
+    _require(
+        all(0 <= value <= 180_000 for value in elapsed_values),
+        "elapsed measurement was out of bounds",
+    )
     return _make_outputs(success, completed, cancelled, total_elapsed)
+
+
+def _assert_no_real_key_artifacts(state: dict[str, Any]) -> None:
+    secrets = (OAI_TOKEN, CAPABILITY_SIGNING_KEY)
+    for key in ("config_root", "runtime_root"):
+        root = Path(state[key])
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            content = path.read_bytes()
+            for secret in secrets:
+                _require(secret.encode() not in content, f"secret leaked into {path}")
+    log_content = Path(state["log_path"]).read_bytes()
+    for secret in secrets:
+        _require(
+            secret.encode() not in log_content, "secret leaked into child process logs"
+        )
 
 
 def run() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -788,7 +1046,9 @@ def run() -> tuple[dict[str, Any], dict[str, Any]]:
     }
     try:
         fixture.start()
-        summary, metrics = _exercise(values, legacy_root, policy_file, Path(temp_context.name), fixture, state)
+        summary, metrics = _exercise(
+            values, legacy_root, policy_file, Path(temp_context.name), fixture, state
+        )
         fixture.server.release_response.set()
         stop_result = _stop_process_tree(
             state["proc"], state["known_children"], job=state["job"]
@@ -801,6 +1061,7 @@ def run() -> tuple[dict[str, Any], dict[str, Any]]:
         if state["log_file"] is not None:
             state["log_file"].close()
             state["log_file"] = None
+        _assert_no_real_key_artifacts(state)
         metrics["platform_shutdown_exit_code"] = stop_result.exit_code
         metrics["worker_descendants_cleaned"] = True
         metrics["worker_graceful_shutdown"] = True
@@ -830,11 +1091,17 @@ def run() -> tuple[dict[str, Any], dict[str, Any]]:
 def main() -> int:
     try:
         summary, metrics = run()
-        observation_file = os.environ.get("FOUNDATION_SMOKE_OBSERVATION_FILE", "").strip()
+        observation_file = os.environ.get(
+            "FOUNDATION_SMOKE_OBSERVATION_FILE", ""
+        ).strip()
         if observation_file:
-            Path(observation_file).write_text(json.dumps(metrics, sort_keys=True) + "\n", encoding="utf-8")
+            Path(observation_file).write_text(
+                json.dumps(metrics, sort_keys=True) + "\n", encoding="utf-8"
+            )
         encoded = json.dumps(summary, separators=(",", ":"), sort_keys=True)
-        _require(len(encoded.encode("utf-8")) <= 2048, "summary exceeded bounded output size")
+        _require(
+            len(encoded.encode("utf-8")) <= 2048, "summary exceeded bounded output size"
+        )
         print(encoded)
         return 0
     except Exception as exc:

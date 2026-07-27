@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -81,6 +82,26 @@ FROM workspace_snapshots WHERE id = $1::uuid AND token = $2
 		maxBundleBytes = uint64(maxBundle)
 	}
 	return
+}
+
+// CurrentWorkspaceSnapshot returns the latest committed snapshot selected by a workspace.
+func (s *Store) CurrentWorkspaceSnapshot(
+	ctx context.Context,
+	workspaceID string,
+) (snapshotID, fileRef, checksum string, ok bool, err error) {
+	err = s.pool.QueryRow(ctx, `
+SELECT snapshot.id::text, snapshot.file_ref, snapshot.checksum
+FROM workspaces AS workspace
+JOIN workspace_snapshots AS snapshot ON snapshot.id = workspace.current_snapshot_id
+WHERE workspace.id = $1::uuid AND snapshot.state = 'committed'
+`, workspaceID).Scan(&snapshotID, &fileRef, &checksum)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", "", false, nil
+	}
+	if err != nil {
+		return "", "", "", false, err
+	}
+	return snapshotID, fileRef, checksum, true, nil
 }
 
 // CompleteSucceeded commits snapshot + task + delivery in one transaction.

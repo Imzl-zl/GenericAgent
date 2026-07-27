@@ -35,7 +35,20 @@ export function InviteCodesPage() {
   };
 
   useEffect(() => {
-    loadCodes();
+    let active = true;
+    void listInviteCodes()
+      .then((list) => {
+        if (active) setCodes(list);
+      })
+      .catch((err: unknown) => {
+        if (active) setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '加载失败');
+      })
+      .finally(() => {
+        if (active) setIsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const handleGenerate = async () => {

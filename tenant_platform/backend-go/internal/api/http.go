@@ -70,6 +70,7 @@ type LLMProviderStore interface {
 	GetProvider(ctx context.Context, id int64) (domain.LLMProvider, error)
 	ListProviders(ctx context.Context) ([]domain.LLMProvider, error)
 	UpdateProvider(ctx context.Context, id int64, input domain.LLMProviderUpdate) (domain.LLMProvider, error)
+	SetProviderState(ctx context.Context, id int64, state domain.LLMProviderState) (domain.LLMProvider, error)
 	SetDefaultProvider(ctx context.Context, id int64) error
 	DeleteProvider(ctx context.Context, id int64) error
 }

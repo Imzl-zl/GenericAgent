@@ -1179,7 +1179,7 @@ git commit --only -m "feat: expose validated native llm provider configuration" 
 - Exercises the complete Scheduler -> runtime JSON -> Worker -> actual GA -> transparent Proxy -> fixture Provider path.
 - Verifies no real key reaches Worker artifacts, environment, logs, or events.
 
-- [ ] **Step 1: Add failing actual-GA integration scenarios**
+- [x] **Step 1: Add failing actual-GA integration scenarios**
 
 Extend fixtures to support native chat, Responses, Claude x-api-key/Bearer, and SSE. Add tests for:
 
@@ -1196,7 +1196,7 @@ key rotation keeps same Provider session working
 
 Every Worker test snapshots GA legacy files before/after and asserts unchanged.
 
-- [ ] **Step 2: Run focused integrations and observe RED**
+- [x] **Step 2: Run focused integrations and observe RED**
 
 ```bash
 cd tenant_platform/worker-python
@@ -1207,7 +1207,7 @@ python -m pytest tests/integration/test_foundation_flow.py -q
 
 Expected: new scenarios fail until every prior task is integrated and correctly assembled.
 
-- [ ] **Step 3: Replace source-string security tests with behavior tests**
+- [x] **Step 3: Replace source-string security tests with behavior tests**
 
 Security tests must inspect generated runtime directories and captured logs/events, not Go source strings. Assertions include:
 
@@ -1221,11 +1221,11 @@ assert capability_token not in proxy_logs
 
 Retain one contract assertion that `/v1/config/mykey.py` is absent from OpenAPI; do not assert internal source ordering.
 
-- [ ] **Step 4: Remove obsolete plaintext scripts and update affected docs**
+- [x] **Step 4: Remove obsolete plaintext scripts and update affected docs**
 
 Delete the two config download scripts. Update existing docs to describe JSON loader, JWT claims, transparent streaming, network allowlists, required task/token lifetime invariant, and clean cutover. Remove every command that downloads or prints a plaintext `mykey.py`.
 
-- [ ] **Step 5: Run complete verification**
+- [x] **Step 5: Run complete verification**
 
 Prerequisites: export a valid `TEST_DATABASE_URL` and start no conflicting Platform/Proxy processes.
 
@@ -1242,7 +1242,7 @@ npm run build
 
 Then run the real smoke path and observe an actual streamed chunk before terminal completion. Expected: all commands exit 0; no skipped security/integration contracts caused by missing prerequisites.
 
-- [ ] **Step 6: Run diagnostics and formatters**
+- [x] **Step 6: Run diagnostics and formatters**
 
 ```bash
 cd tenant_platform/backend-go
@@ -1256,11 +1256,11 @@ npm run lint
 
 Expected: exit 0. Re-run the complete verification commands after formatter changes.
 
-- [ ] **Step 7: Request independent code review**
+- [x] **Step 7: Request independent code review**
 
 Use the `requesting-code-review` skill and a reviewer subagent. Review against every acceptance criterion in `docs/superpowers/specs/2026-07-27-ga-transparent-llm-credential-proxy-design.md`, with special attention to secret flow, SSRF, JWT validation, POST replay, streaming, task deadline races, and GA Core immutability. Resolve all High/Medium findings before completion.
 
-- [ ] **Step 8: Commit final integration and cleanup**
+- [x] **Step 8: Commit final integration and cleanup**
 
 ```bash
 git add tenant_platform/worker-python/tests/integration/test_worker_rpc.py tenant_platform/tests/integration/test_foundation_flow.py tenant_platform/tests/security/test_no_real_key_leak.py tenant_platform/tests/contract/test_contract_sources.py tenant_platform/tests/smoke/foundation_smoke.py tenant_platform/QUICKSTART.md tenant_platform/docs/LLM_PROVIDER_ARCHITECTURE.md tenant_platform/docs/IMPLEMENTATION_SUMMARY.md

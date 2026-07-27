@@ -120,6 +120,14 @@ curl http://localhost:5173
    - 用户名：`admin`
    - 密码：（你在 `.env` 中配置的密码，或使用创建时的密码）
 
+## 配置 LLM Provider（必需）
+
+1. 登录管理后台，进入“LLM Providers”。
+2. 创建 `native_oai` 或 `native_claude` Provider，填写 Base URL、Model 和 API Key。
+3. 按需配置 GA Session 参数与 Proxy Transport 参数，并将一个可用 Provider 设为默认。
+
+API Key 由 Platform 加密写入 PostgreSQL，且不会通过详情接口回显。Worker 运行时只接收 Scheduler 签发的 capability token 和 Proxy URL；不要把真实上游 Key 写入 Worker 环境、`mykey.py` 或静态 Platform 上游环境变量。Platform 启动环境仍需配置数据库、`BOT_TOKEN_KEY` 和 `LLM_PROXY_CAPABILITY_SIGNING_KEY`。
+
 ## 测试微信 Bot
 
 1. 登录管理后台

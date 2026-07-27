@@ -66,7 +66,20 @@ export function PersonaPage() {
   };
 
   useEffect(() => {
-    loadPersonas();
+    let active = true;
+    void listPersonas()
+      .then((list) => {
+        if (active) setPersonas(list);
+      })
+      .catch((err: unknown) => {
+        if (active) setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '加载失败');
+      })
+      .finally(() => {
+        if (active) setIsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const resetForm = () => {

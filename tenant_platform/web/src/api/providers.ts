@@ -50,3 +50,11 @@ export async function deleteProvider(providerId: number): Promise<void> {
 export async function setDefaultProvider(providerId: number): Promise<void> {
   await api.post<void>(`/v1/admin/llm-providers/${providerId}/default`);
 }
+
+export async function setProviderState(
+  providerId: number,
+  state: LLMProvider['state'],
+): Promise<LLMProvider> {
+  const action = state === 'active' ? 'enable' : 'disable';
+  return api.post<LLMProvider>(`/v1/admin/llm-providers/${providerId}/${action}`);
+}

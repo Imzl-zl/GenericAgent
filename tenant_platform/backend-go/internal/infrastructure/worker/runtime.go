@@ -73,29 +73,16 @@ func (r *LoopbackWorkerRuntime) Start(ctx context.Context, req StartRequest) (*I
 		workerSrc = filepath.Join(r.cfg.LegacyRoot, "tenant_platform", "worker-python", "src")
 	}
 	listen := "127.0.0.1:0"
-	cmd := exec.CommandContext(ctx, python, "-m", "ga_worker.entrypoint", "--listen", listen, "--grace-seconds", "5")
+	// Instance.Cleanup owns the resident Worker lifetime. The caller context is
+	// a per-dispatch heartbeat context and is still used below for startup dial.
+	cmd := exec.Command(python, "-m", "ga_worker.entrypoint", "--listen", listen, "--grace-seconds", "5")
 	configureWorkerProcess(cmd)
 	if base := filepath.Base(workerSrc); base == "src" {
 		cmd.Dir = filepath.Dir(workerSrc)
 	} else {
 		cmd.Dir = workerSrc
 	}
-	env := os.Environ()
-	env = setEnv(env, "GA_CONFIG_ROOT", req.ConfigDir)
-	env = setEnv(env, "GA_LEGACY_ROOT", r.cfg.LegacyRoot)
-	env = setEnv(env, "GA_RUNTIME_DIR", req.RuntimeDir)
-	env = setEnv(env, "GA_WORKER_LISTEN", listen)
-	if r.cfg.PolicyFile != "" {
-		env = setEnv(env, "GA_POLICY_FILE", r.cfg.PolicyFile)
-	}
-	env = unsetEnv(env, "OPENAI_API_KEY")
-	env = unsetEnv(env, "ANTHROPIC_API_KEY")
-	pp := workerSrc
-	if existing := getEnv(env, "PYTHONPATH"); existing != "" {
-		pp = workerSrc + string(os.PathListSeparator) + existing
-	}
-	env = setEnv(env, "PYTHONPATH", pp)
-	cmd.Env = env
+	cmd.Env = buildWorkerEnvironment(os.Environ(), r.cfg, req, workerSrc, listen)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -236,34 +223,88 @@ func defaultPython(legacyRoot string) string {
 	return "python"
 }
 
-func setEnv(env []string, key, value string) []string {
-	prefix := key + "="
-	out := env[:0]
-	for _, e := range env {
-		if !strings.HasPrefix(e, prefix) {
-			out = append(out, e)
+var workerInheritedEnvironmentAllowlist = [...]string{
+	"APPDATA",
+	"COMSPEC",
+	"GA_LANG",
+	"HOME",
+	"HOMEDRIVE",
+	"HOMEPATH",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"LOCALAPPDATA",
+	"PATH",
+	"PATHEXT",
+	"PYTHONIOENCODING",
+	"PYTHONUTF8",
+	"REQUESTS_CA_BUNDLE",
+	"SSL_CERT_DIR",
+	"SSL_CERT_FILE",
+	"SYSTEMROOT",
+	"TEMP",
+	"TMP",
+	"TZ",
+	"USERPROFILE",
+	"WINDIR",
+}
+
+func buildWorkerEnvironment(
+	inherited []string,
+	cfg LoopbackConfig,
+	req StartRequest,
+	workerSrc string,
+	listen string,
+) []string {
+	env := make([]string, 0, len(workerInheritedEnvironmentAllowlist)+6)
+	for _, key := range workerInheritedEnvironmentAllowlist {
+		if value, present := lookupEnv(inherited, key); present {
+			env = append(env, key+"="+value)
 		}
 	}
-	return append(out, prefix+value)
+	env = setEnv(env, "GA_CONFIG_ROOT", req.ConfigDir)
+	env = setEnv(env, "GA_LEGACY_ROOT", cfg.LegacyRoot)
+	env = setEnv(env, "GA_RUNTIME_DIR", req.RuntimeDir)
+	env = setEnv(env, "GA_WORKER_LISTEN", listen)
+	if cfg.PolicyFile != "" {
+		env = setEnv(env, "GA_POLICY_FILE", cfg.PolicyFile)
+	}
+	return setEnv(env, "PYTHONPATH", workerSrc)
+}
+
+func lookupEnv(env []string, key string) (string, bool) {
+	for _, entry := range env {
+		name, value, found := strings.Cut(entry, "=")
+		if found && strings.EqualFold(name, key) {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func setEnv(env []string, key, value string) []string {
+	out := env[:0]
+	for _, entry := range env {
+		name, _, found := strings.Cut(entry, "=")
+		if !found || !strings.EqualFold(name, key) {
+			out = append(out, entry)
+		}
+	}
+	return append(out, key+"="+value)
 }
 
 func unsetEnv(env []string, key string) []string {
-	prefix := key + "="
 	out := env[:0]
-	for _, e := range env {
-		if !strings.HasPrefix(e, prefix) {
-			out = append(out, e)
+	for _, entry := range env {
+		name, _, found := strings.Cut(entry, "=")
+		if !found || !strings.EqualFold(name, key) {
+			out = append(out, entry)
 		}
 	}
 	return out
 }
 
 func getEnv(env []string, key string) string {
-	prefix := key + "="
-	for _, e := range env {
-		if strings.HasPrefix(e, prefix) {
-			return strings.TrimPrefix(e, prefix)
-		}
-	}
-	return ""
+	value, _ := lookupEnv(env, key)
+	return value
 }

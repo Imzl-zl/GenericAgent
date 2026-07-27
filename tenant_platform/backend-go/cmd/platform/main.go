@@ -21,7 +21,6 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/api"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
@@ -99,37 +98,6 @@ type llmProxyConfig struct {
 	revocations          llmproxy.CapabilityRevocationSource
 	allowedUpstreamCIDRs []string
 	allowedHTTPHosts     []string
-}
-
-// ensureDevDefaultLLMProvider seeds a default OpenAI-compatible provider in
-// dev-loopback mode when the legacy LLM_PROXY_UPSTREAM_* env vars are present
-// and no provider has been configured yet. This preserves the old dev/test
-// path where the upstream URL/key were supplied purely by environment.
-func ensureDevDefaultLLMProvider(ctx context.Context, store *postgres.Store, cipher secret.TokenCipher) error {
-	_, err := store.GetDefaultProvider(ctx)
-	if err == nil {
-		return nil
-	}
-	baseURL := strings.TrimSpace(os.Getenv("LLM_PROXY_UPSTREAM_BASEURL"))
-	apiKey := strings.TrimSpace(os.Getenv("LLM_PROXY_UPSTREAM_APIKEY"))
-	if baseURL == "" || apiKey == "" {
-		// No legacy env config; rely on admin API to create a provider later.
-		return nil
-	}
-	ciphertext, version, encErr := cipher.Encrypt([]byte(apiKey))
-	if encErr != nil {
-		return fmt.Errorf("encrypt dev provider api key: %w", encErr)
-	}
-	if _, createErr := store.CreateProvider(ctx, domain.LLMProviderCreate{
-		Name: "dev-default", ProviderType: domain.ProviderNativeOAI,
-		BaseURL: baseURL, Model: "gpt-4o", APIKeyCiphertext: ciphertext,
-		APIKeyKeyVersion: strconv.Itoa(version),
-		TransportConfig:  domain.ProviderTransportConfig{AuthMode: domain.ProviderAuthAuto},
-	}); createErr != nil {
-		return fmt.Errorf("create dev default provider: %w", createErr)
-	}
-	fmt.Fprintf(os.Stderr, "platform: dev-loopback seeded default llm_provider base_url=%s\n", baseURL)
-	return nil
 }
 
 // startLLMProxy starts the in-process LLM Proxy when externalAddr is empty,
@@ -265,7 +233,7 @@ func run() error {
 		workerPython          = flag.String("worker-python", "", "python interpreter for worker")
 		workerSrc             = flag.String("worker-src", "", "path to worker-python/src")
 		llmProxyAddr          = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
-		capabilitySigningKey  = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=16 bytes")
+		capabilitySigningKey  = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=32 bytes")
 		modelPolicyVersion    = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
 		devExtraUsers         = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
 		devTeam               = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
@@ -447,16 +415,6 @@ func run() error {
 			return fmt.Errorf("bot token cipher: %w", err)
 		}
 		cipher = c
-	}
-
-	// Dev-loopback auto-provider: if no admin-configured LLM provider exists
-	// and the legacy env vars are present, seed a default provider so the
-	// in-process Proxy can resolve it. This keeps the existing dev/test path
-	// working without requiring a manual admin API call.
-	if *devLoopback && cipher != nil {
-		if err := ensureDevDefaultLLMProvider(ctx, store, cipher); err != nil {
-			return fmt.Errorf("ensure dev default llm provider: %w", err)
-		}
 	}
 
 	// LLM Proxy: the sole holder of the real upstream key. In dev-loopback,

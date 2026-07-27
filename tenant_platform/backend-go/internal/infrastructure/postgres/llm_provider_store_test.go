@@ -36,7 +36,7 @@ func TestLLMProviderStoreRoutingRevisionAndKeyRotation(t *testing.T) {
 		t.Fatalf("initial revision = %d, want 1", created.Revision)
 	}
 
-	routed, err := store.UpdateProvider(ctx, created.ID, domain.LLMProviderUpdate{
+	renamed, err := store.UpdateProvider(ctx, created.ID, domain.LLMProviderUpdate{
 		LLMProviderCreate: domain.LLMProviderCreate{
 			Name:            "primary-renamed",
 			ProviderType:    created.ProviderType,
@@ -49,8 +49,25 @@ func TestLLMProviderStoreRoutingRevisionAndKeyRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if routed.Revision != 2 {
-		t.Fatalf("routing revision = %d, want 2", routed.Revision)
+	if renamed.Revision != created.Revision {
+		t.Fatalf("name-only revision = %d, want %d", renamed.Revision, created.Revision)
+	}
+
+	routed, err := store.UpdateProvider(ctx, created.ID, domain.LLMProviderUpdate{
+		LLMProviderCreate: domain.LLMProviderCreate{
+			Name:            renamed.Name,
+			ProviderType:    renamed.ProviderType,
+			BaseURL:         renamed.BaseURL,
+			Model:           "gpt-next",
+			SessionConfig:   renamed.SessionConfig,
+			TransportConfig: renamed.TransportConfig,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routed.Revision != created.Revision+1 {
+		t.Fatalf("routing revision = %d, want %d", routed.Revision, created.Revision+1)
 	}
 	if !bytes.Equal(routed.APIKeyCiphertext, created.APIKeyCiphertext) {
 		t.Fatal("routing update changed API key ciphertext")
@@ -77,6 +94,59 @@ func TestLLMProviderStoreRoutingRevisionAndKeyRotation(t *testing.T) {
 	}
 	if !bytes.Equal(rotated.APIKeyCiphertext, []byte("cipher-v2")) {
 		t.Fatalf("ciphertext = %q", rotated.APIKeyCiphertext)
+	}
+}
+
+func TestLLMProviderStoreStateTransitions(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	first, err := store.CreateProvider(ctx, providerCreate("state-first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateProvider(ctx, providerCreate("state-second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	disabled, err := store.SetProviderState(ctx, second.ID, domain.ProviderDisabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.State != domain.ProviderDisabled || disabled.Revision != second.Revision+1 {
+		t.Fatalf("disabled provider = %#v", disabled)
+	}
+	repeated, err := store.SetProviderState(ctx, second.ID, domain.ProviderDisabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.Revision != disabled.Revision {
+		t.Fatalf("idempotent disable revision = %d, want %d", repeated.Revision, disabled.Revision)
+	}
+	if err := store.SetDefaultProvider(ctx, second.ID); err == nil {
+		t.Fatal("disabled provider became default")
+	}
+
+	active, err := store.SetProviderState(ctx, second.ID, domain.ProviderActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.State != domain.ProviderActive || active.Revision != disabled.Revision+1 {
+		t.Fatalf("enabled provider = %#v", active)
+	}
+	if _, err := store.SetProviderState(ctx, first.ID, domain.ProviderDisabled); err == nil {
+		t.Fatal("default provider was disabled")
+	}
+	unchanged, err := store.GetProvider(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.State != domain.ProviderActive || unchanged.Revision != first.Revision {
+		t.Fatalf("default provider changed after rejected disable: %#v", unchanged)
 	}
 }
 

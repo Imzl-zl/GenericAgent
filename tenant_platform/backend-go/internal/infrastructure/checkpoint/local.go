@@ -204,6 +204,32 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 	}, nil
 }
 
+// CurrentRestorePoint resolves the workspace's opaque committed snapshot for Worker startup.
+func (c *LocalCoordinator) CurrentRestorePoint(
+	ctx context.Context,
+	workspaceID string,
+) (RestorePoint, bool, error) {
+	snapshotID, fileRef, checksum, ok, err := c.store.CurrentWorkspaceSnapshot(ctx, workspaceID)
+	if err != nil || !ok {
+		return RestorePoint{}, ok, err
+	}
+	if !strings.HasPrefix(fileRef, opaqueFilePrefix) ||
+		strings.Contains(fileRef, `\`) || strings.Contains(fileRef, `/`) || strings.Contains(fileRef, "..") {
+		return RestorePoint{}, false, fmt.Errorf("invalid committed snapshot ref")
+	}
+	path, err := readIndex(c.runtimeRoot, fileRef)
+	if err != nil {
+		return RestorePoint{}, false, err
+	}
+	if !strings.HasPrefix(filepath.Clean(path), filepath.Clean(c.runtimeRoot)) {
+		return RestorePoint{}, false, fmt.Errorf("snapshot path escapes runtime root")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return RestorePoint{}, false, fmt.Errorf("stat committed snapshot: %w", err)
+	}
+	return RestorePoint{SnapshotID: snapshotID, SnapshotRef: path, Checksum: checksum}, true, nil
+}
+
 // ReadResult resolves only opaque result refs and verifies digest.
 func (c *LocalCoordinator) ReadResult(ctx context.Context, ref string, expectedDigest string) (domain.ResultPayload, error) {
 	_ = ctx

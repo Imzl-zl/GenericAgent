@@ -306,9 +306,23 @@
   font-size: 10px;
 }
 
+.provider-state.active {
+  color: var(--accent);
+}
+
+.provider-state.disabled,
+.provider-not-available {
+  color: var(--danger);
+}
+
 .provider-row-actions {
   justify-content: flex-end;
   white-space: nowrap;
+}
+
+.provider-row-actions .icon-button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .icon-button.danger:hover {
@@ -370,7 +384,7 @@
 
   .provider-table th:last-child,
   .provider-table td:last-child {
-    width: 78px;
+    width: 112px;
   }
 
   .provider-table td:first-child .provider-model-mobile {

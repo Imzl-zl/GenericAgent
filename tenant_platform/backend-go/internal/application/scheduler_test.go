@@ -80,6 +80,7 @@ type controlledWorker struct {
 	closeOnce              sync.Once
 	checkpointReady        *workerv1.CheckpointReady
 	startSessionEntered    chan struct{}
+	startSessionRequest    *workerv1.StartSessionRequest
 	releaseStartSession    chan struct{}
 	beginCheckpointEntered chan struct{}
 	releaseBeginCheckpoint chan struct{}
@@ -100,7 +101,8 @@ func newControlledWorker() *controlledWorker {
 	}
 }
 
-func (w *controlledWorker) StartSession(ctx context.Context, _ *workerv1.StartSessionRequest) (*workerv1.StartSessionResponse, error) {
+func (w *controlledWorker) StartSession(ctx context.Context, request *workerv1.StartSessionRequest) (*workerv1.StartSessionResponse, error) {
+	w.startSessionRequest = request
 	if w.startSessionEntered != nil {
 		close(w.startSessionEntered)
 	}
@@ -209,8 +211,11 @@ func (w *controlledWorker) failStream(err error) {
 }
 
 type successfulCoordinator struct {
-	store *postgres.Store
-	owner string
+	store        *postgres.Store
+	owner        string
+	restorePoint checkpoint.RestorePoint
+	hasRestore   bool
+	restoreErr   error
 }
 
 func (c *successfulCoordinator) Prepare(ctx context.Context, request checkpoint.CheckpointPrepareRequest) (checkpoint.CheckpointLease, error) {
@@ -227,6 +232,13 @@ func (c *successfulCoordinator) Commit(_ context.Context, ready checkpoint.Ready
 		SnapshotID: ready.SnapshotID, FileRef: "snapshot:success", Checksum: "sha256:bundle",
 		ResultRef: "result:success", ResultDigest: "sha256:result",
 	}, nil
+}
+
+func (c *successfulCoordinator) CurrentRestorePoint(
+	context.Context,
+	string,
+) (checkpoint.RestorePoint, bool, error) {
+	return c.restorePoint, c.hasRestore, c.restoreErr
 }
 
 func (c *successfulCoordinator) ReadResult(context.Context, string, string) (domain.ResultPayload, error) {
@@ -254,8 +266,43 @@ func (c *readFailCoordinator) Commit(context.Context, checkpoint.ReadyCheckpoint
 	}, nil
 }
 
+func (c *readFailCoordinator) CurrentRestorePoint(
+	context.Context,
+	string,
+) (checkpoint.RestorePoint, bool, error) {
+	return checkpoint.RestorePoint{}, false, nil
+}
+
 func (c *readFailCoordinator) ReadResult(context.Context, string, string) (domain.ResultPayload, error) {
 	return domain.ResultPayload{}, errors.New("digest-checked result read failed")
+}
+
+func TestStartSessionOnWorkerPassesCurrentRestorePoint(t *testing.T) {
+	_, _, registry, _ := serviceFixture(t)
+	worker := newControlledWorker()
+	coordinator := &successfulCoordinator{
+		restorePoint: checkpoint.RestorePoint{
+			SnapshotID: "snapshot-restore", SnapshotRef: "C:/runtime/committed/restore.json",
+			Checksum: "sha256:restore",
+		},
+		hasRestore: true,
+	}
+	entry := &workerEntry{client: worker, sessionKey: "personal:restore"}
+	s := &scheduler{
+		cfg:     SchedulerConfig{Registry: registry, Coordinator: coordinator},
+		workers: map[string]*workerEntry{"personal:restore": entry},
+	}
+	task := domain.Task{SessionKey: "personal:restore", WorkspaceID: "workspace-restore"}
+
+	if err := s.startSessionOnWorker(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	request := worker.startSessionRequest
+	if request == nil || request.GetSnapshotId() != coordinator.restorePoint.SnapshotID ||
+		request.GetSnapshotRef() != coordinator.restorePoint.SnapshotRef ||
+		request.GetSnapshotChecksum() != coordinator.restorePoint.Checksum {
+		t.Fatalf("start request=%+v restore=%+v", request, coordinator.restorePoint)
+	}
 }
 
 func TestScheduler_AcceptedRunningCancelReachesWorkerBeforeStreamCompletionAndWinsSuccessRace(t *testing.T) {

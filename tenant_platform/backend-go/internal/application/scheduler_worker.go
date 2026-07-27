@@ -227,7 +227,20 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 			CapabilityVersion:  CapabilityVersion, PolicyDigest: s.cfg.Registry.Digest(),
 		},
 	}
-	if task.SnapshotID != "" {
+	if !entry.started && !task.FreshSession && s.cfg.Coordinator != nil {
+		restore, ok, err := s.cfg.Coordinator.CurrentRestorePoint(ctx, task.WorkspaceID)
+		if err != nil {
+			s.removeWorkerEntry(task.SessionKey, entry)
+			s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+			return fmt.Errorf("resolve current workspace checkpoint: %w", err)
+		}
+		if ok {
+			startReq.SnapshotId = restore.SnapshotID
+			startReq.SnapshotRef = restore.SnapshotRef
+			startReq.SnapshotChecksum = restore.Checksum
+		}
+	}
+	if !task.FreshSession && startReq.SnapshotId == "" && task.SnapshotID != "" {
 		startReq.SnapshotId = task.SnapshotID
 		startReq.SnapshotChecksum = task.SnapshotChecksum
 	}

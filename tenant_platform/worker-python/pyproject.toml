@@ -16,6 +16,7 @@ dependencies = [
 test = [
   "pytest",
   "grpcio-tools",
+  "psutil",
 ]
 
 [tool.setuptools.packages.find]

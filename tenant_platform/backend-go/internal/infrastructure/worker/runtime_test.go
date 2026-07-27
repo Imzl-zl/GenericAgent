@@ -57,3 +57,53 @@ func TestProcessCleanerBoundsShutdownAndContinuesCleanup(t *testing.T) {
 		t.Fatalf("cleanup did not continue: close=%v kill=%v wait=%v", closeCalled.Load(), killCalled.Load(), waitCalled.Load())
 	}
 }
+
+func TestBuildWorkerEnvironmentExcludesInheritedPlatformSecrets(t *testing.T) {
+	inherited := []string{
+		"PATH=C:\\tools",
+		"LANG=en_US.UTF-8",
+		"LLM_PROVIDER_API_KEY=real-upstream-key",
+		"LLM_PROXY_CAPABILITY_SIGNING_KEY=signing-secret",
+		"DATABASE_URL=postgres://secret",
+		"BOT_TOKEN_KEY=bot-secret",
+		"PLATFORM_DEV_TOKEN=dev-secret",
+		"OPENAI_API_KEY=openai-secret",
+		"ANTHROPIC_API_KEY=anthropic-secret",
+		"UNRELATED_SECRET=must-not-cross-boundary",
+		"PYTHONPATH=untrusted-parent-path",
+	}
+	env := buildWorkerEnvironment(
+		inherited,
+		LoopbackConfig{LegacyRoot: "C:\\ga", PolicyFile: "C:\\policy.json"},
+		StartRequest{ConfigDir: "C:\\config", RuntimeDir: "C:\\runtime"},
+		"C:\\worker-src",
+		"127.0.0.1:0",
+	)
+
+	for _, secret := range []string{
+		"LLM_PROVIDER_API_KEY", "LLM_PROXY_CAPABILITY_SIGNING_KEY", "DATABASE_URL",
+		"BOT_TOKEN_KEY", "PLATFORM_DEV_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "UNRELATED_SECRET",
+	} {
+		if value := getEnv(env, secret); value != "" {
+			t.Fatalf("Worker inherited %s=%q", secret, value)
+		}
+	}
+	if got := getEnv(env, "PATH"); got != "C:\\tools" {
+		t.Fatalf("PATH=%q", got)
+	}
+	if got := getEnv(env, "LANG"); got != "en_US.UTF-8" {
+		t.Fatalf("LANG=%q", got)
+	}
+	for key, want := range map[string]string{
+		"GA_CONFIG_ROOT":   "C:\\config",
+		"GA_LEGACY_ROOT":   "C:\\ga",
+		"GA_RUNTIME_DIR":   "C:\\runtime",
+		"GA_WORKER_LISTEN": "127.0.0.1:0",
+		"GA_POLICY_FILE":   "C:\\policy.json",
+		"PYTHONPATH":       "C:\\worker-src",
+	} {
+		if got := getEnv(env, key); got != want {
+			t.Fatalf("%s=%q, want %q", key, got, want)
+		}
+	}
+}

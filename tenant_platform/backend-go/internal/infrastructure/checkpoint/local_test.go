@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -122,6 +123,23 @@ func TestLocalCoordinator_PrepareCommitRead_TokenMismatch(t *testing.T) {
 	if _, err := store.CompleteSucceeded(ctx, task.ID, "platform-a", committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, len(body)); err != nil {
 		t.Fatal(err)
 	}
+	restore, ok, err := coord.CurrentRestorePoint(ctx, task.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("committed workspace snapshot was not available for restore")
+	}
+	if restore.SnapshotID != committed.SnapshotID || restore.Checksum != committed.Checksum {
+		t.Fatalf("restore=%+v committed=%+v", restore, committed)
+	}
+	restoredRaw, err := os.ReadFile(restore.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restoredRaw, raw) {
+		t.Fatal("restore point did not resolve the committed bundle")
+	}
 
 	payload, err := coord.ReadResult(ctx, committed.ResultRef, committed.ResultDigest)
 	if err != nil {
@@ -164,10 +182,10 @@ func TestLocalCoordinator_CommitRejectsBundleAbovePreparedLimit(t *testing.T) {
 	body := strings.Repeat("x", 512)
 	bundle := map[string]any{
 		"schema_version": snapshotSchemaVersion,
-		"task_id": task.ID,
-		"session_key": task.SessionKey,
-		"result": map[string]any{"body": body},
-		"result_digest": "sha256:" + hex.EncodeToString(hashBytes([]byte(body))),
+		"task_id":        task.ID,
+		"session_key":    task.SessionKey,
+		"result":         map[string]any{"body": body},
+		"result_digest":  "sha256:" + hex.EncodeToString(hashBytes([]byte(body))),
 	}
 	raw, err := json.Marshal(bundle)
 	if err != nil {

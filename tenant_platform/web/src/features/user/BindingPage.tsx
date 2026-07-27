@@ -30,22 +30,22 @@ export function BindingPage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const loadBoundBot = async () => {
-    setIsLoadingBot(true);
-    try {
-      const bot = await getOwnBot();
-      setBoundBot(bot);
-    } catch {
-      setBoundBot(null);
-    } finally {
-      setIsLoadingBot(false);
-    }
-  };
 
   useEffect(() => {
-    loadBoundBot();
+    let active = true;
+    void getOwnBot()
+      .then((bot) => {
+        if (active) setBoundBot(bot);
+      })
+      .catch(() => {
+        if (active) setBoundBot(null);
+      })
+      .finally(() => {
+        if (active) setIsLoadingBot(false);
+      });
     return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
+      active = false;
+      clearInterval(pollRef.current ?? undefined);
     };
   }, []);
 

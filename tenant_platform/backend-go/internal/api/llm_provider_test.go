@@ -233,6 +233,65 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 	}
 }
 
+func TestAdminLLMProviderStateLifecycle(t *testing.T) {
+	srv, _, _ := llmProviderServerFixture(t)
+	first := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", providerWritePayload("state-default"))
+	second := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", providerWritePayload("state-secondary"))
+	if first.Code != http.StatusCreated || second.Code != http.StatusCreated {
+		t.Fatalf("create statuses = %d, %d", first.Code, second.Code)
+	}
+	var firstReply, secondReply map[string]any
+	if err := json.Unmarshal(first.Body.Bytes(), &firstReply); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondReply); err != nil {
+		t.Fatal(err)
+	}
+	firstID := int64(firstReply["provider_id"].(float64))
+	secondID := int64(secondReply["provider_id"].(float64))
+
+	disabled := performProviderCommand(t, srv, "/v1/admin/llm-providers/"+itoa(secondID)+"/disable")
+	if disabled.Code != http.StatusOK {
+		t.Fatalf("disable=%d body=%s", disabled.Code, disabled.Body.String())
+	}
+	var disabledReply map[string]any
+	if err := json.Unmarshal(disabled.Body.Bytes(), &disabledReply); err != nil {
+		t.Fatal(err)
+	}
+	if disabledReply["state"] != "disabled" || disabledReply["revision"] != float64(2) {
+		t.Fatalf("disabled reply = %v", disabledReply)
+	}
+	repeated := performProviderCommand(t, srv, "/v1/admin/llm-providers/"+itoa(secondID)+"/disable")
+	var repeatedReply map[string]any
+	if err := json.Unmarshal(repeated.Body.Bytes(), &repeatedReply); err != nil {
+		t.Fatal(err)
+	}
+	if repeated.Code != http.StatusOK || repeatedReply["revision"] != disabledReply["revision"] {
+		t.Fatalf("repeated disable=%d reply=%v", repeated.Code, repeatedReply)
+	}
+
+	setDisabledDefault := performProviderCommand(t, srv, "/v1/admin/llm-providers/"+itoa(secondID)+"/default")
+	if setDisabledDefault.Code != http.StatusBadRequest {
+		t.Fatalf("disabled default status=%d body=%s", setDisabledDefault.Code, setDisabledDefault.Body.String())
+	}
+	enabled := performProviderCommand(t, srv, "/v1/admin/llm-providers/"+itoa(secondID)+"/enable")
+	if enabled.Code != http.StatusOK {
+		t.Fatalf("enable=%d body=%s", enabled.Code, enabled.Body.String())
+	}
+	var enabledReply map[string]any
+	if err := json.Unmarshal(enabled.Body.Bytes(), &enabledReply); err != nil {
+		t.Fatal(err)
+	}
+	if enabledReply["state"] != "active" || enabledReply["revision"] != float64(3) {
+		t.Fatalf("enabled reply = %v", enabledReply)
+	}
+
+	defaultDisable := performProviderCommand(t, srv, "/v1/admin/llm-providers/"+itoa(firstID)+"/disable")
+	if defaultDisable.Code != http.StatusConflict {
+		t.Fatalf("default disable=%d body=%s", defaultDisable.Code, defaultDisable.Body.String())
+	}
+}
+
 func TestAdminLLMProviderRequiresAuth(t *testing.T) {
 	srv, _, _ := llmProviderServerFixture(t)
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/llm-providers", nil)
@@ -394,4 +453,13 @@ func atoi(s string) int {
 
 func itoa(v int64) string {
 	return strconv.FormatInt(v, 10)
+}
+
+func performProviderCommand(t *testing.T, srv *Server, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, request)
+	return response
 }

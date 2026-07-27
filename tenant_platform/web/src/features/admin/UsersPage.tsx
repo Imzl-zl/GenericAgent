@@ -32,7 +32,20 @@ export function UsersPage() {
   };
 
   useEffect(() => {
-    loadUsers();
+    let active = true;
+    void listPendingUsers()
+      .then((list) => {
+        if (active) setUsers(list);
+      })
+      .catch((err: unknown) => {
+        if (active) setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '加载失败');
+      })
+      .finally(() => {
+        if (active) setIsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const handleApprove = async (userId: number) => {

@@ -49,9 +49,10 @@ type revokedCapability struct {
 }
 
 type routingCapabilityStore struct {
-	revoked      []revokedCapability
-	err          error
-	beforeRevoke func()
+	revoked       []revokedCapability
+	err           error
+	beforeRevoke  func()
+	cleanupBefore []time.Time
 }
 
 func (s *routingCapabilityStore) RevokeCapability(_ context.Context, jti string, expiresAt time.Time) error {
@@ -63,6 +64,44 @@ func (s *routingCapabilityStore) RevokeCapability(_ context.Context, jti string,
 	}
 	s.revoked = append(s.revoked, revokedCapability{jti: jti, expiresAt: expiresAt})
 	return nil
+}
+
+func (s *routingCapabilityStore) DeleteExpiredCapabilityRevocations(
+	_ context.Context,
+	before time.Time,
+) (int64, error) {
+	if s.err != nil {
+		return 0, s.err
+	}
+	s.cleanupBefore = append(s.cleanupBefore, before)
+	return 2, nil
+}
+
+func TestCleanupExpiredCapabilityRevocationsWhenDue(t *testing.T) {
+	store := &routingCapabilityStore{}
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	s := &scheduler{cfg: SchedulerConfig{
+		CapabilityStore: store, RevocationCleanupInterval: time.Minute,
+	}}
+
+	if err := s.cleanupExpiredCapabilityRevocations(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.cleanupBefore) != 1 || !store.cleanupBefore[0].Equal(now) {
+		t.Fatalf("cleanup calls = %v", store.cleanupBefore)
+	}
+	if err := s.cleanupExpiredCapabilityRevocations(context.Background(), now.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.cleanupBefore) != 1 {
+		t.Fatalf("cleanup ran before interval: %v", store.cleanupBefore)
+	}
+	if err := s.cleanupExpiredCapabilityRevocations(context.Background(), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.cleanupBefore) != 2 {
+		t.Fatalf("cleanup calls = %v, want 2", store.cleanupBefore)
+	}
 }
 
 type routingAuditRecorder struct {
@@ -147,9 +186,11 @@ func TestWriteRuntimeConfigOverwritesExistingMyKey(t *testing.T) {
 	}
 }
 
-func TestRoutingSnapshotIsImmutableAndDetectsDefaultSwitchAtBoundary(t *testing.T) {
+func TestRoutingSnapshotIgnoresDefaultSwitchAndDetectsBoundProviderChange(t *testing.T) {
 	defaultProvider := testProvider(2, 4, domain.ProviderNativeClaude, true)
-	secondary := testProvider(1, 7, domain.ProviderNativeOAI, false)
+	stream := true
+	defaultProvider.SessionConfig.Stream = &stream
+	secondary := testProvider(1, 7, domain.ProviderNativeClaude, false)
 	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{defaultProvider, secondary}}
 	s := &scheduler{cfg: SchedulerConfig{LLMProvider: source}}
 
@@ -167,20 +208,34 @@ func TestRoutingSnapshotIsImmutableAndDetectsDefaultSwitchAtBoundary(t *testing.
 	source.providers = []domain.LLMProvider{secondary, defaultProvider}
 	source.providers[0].IsDefault = true
 	source.providers[1].IsDefault = false
+	sameStream := true
+	source.providers[1].SessionConfig.Stream = &sameStream
 	replace, err := s.routingSnapshotRequiresReplacement(context.Background(), snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !replace || snapshot.Providers[0].ID != defaultProvider.ID {
-		t.Fatal("default switch must replace at the next boundary without mutating the bound snapshot")
+	if replace || snapshot.Providers[0].ID != defaultProvider.ID {
+		t.Fatal("default switch must not change an already-bound Worker snapshot")
 	}
+
+	newFallback := testProvider(3, 1, domain.ProviderNativeOAI, false)
+	source.providers = append(source.providers, newFallback)
+	replace, err = s.routingSnapshotRequiresReplacement(context.Background(), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replace {
+		t.Fatal("new active provider must replace the Worker")
+	}
+	source.providers = source.providers[:2]
+
 	source.providers[0].Revision++
 	replace, err = s.routingSnapshotRequiresReplacement(context.Background(), snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !replace {
-		t.Fatal("provider revision change must replace the Worker")
+		t.Fatal("bound provider revision change must replace the Worker")
 	}
 }
 

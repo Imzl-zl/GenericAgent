@@ -439,6 +439,54 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/admin/llm-providers/{provider_id}/disable:
+    post:
+      operationId: adminDisableLLMProvider
+      summary: Disable a non-default LLM provider (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        "200":
+          description: Disabled provider
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMProvider"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/admin/llm-providers/{provider_id}/enable:
+    post:
+      operationId: adminEnableLLMProvider
+      summary: Enable an LLM provider (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        "200":
+          description: Enabled provider
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LLMProvider"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/bindings:
     post:
       operationId: createBinding

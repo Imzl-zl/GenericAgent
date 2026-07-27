@@ -168,6 +168,36 @@ func (s *Server) handleAdminSetDefaultLLMProvider(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusOK, map[string]any{"provider_id": id, "is_default": true})
 }
 
+func (s *Server) handleAdminDisableLLMProvider(w http.ResponseWriter, r *http.Request) {
+	s.handleAdminSetLLMProviderState(w, r, domain.ProviderDisabled)
+}
+
+func (s *Server) handleAdminEnableLLMProvider(w http.ResponseWriter, r *http.Request) {
+	s.handleAdminSetLLMProviderState(w, r, domain.ProviderActive)
+}
+
+func (s *Server) handleAdminSetLLMProviderState(
+	w http.ResponseWriter,
+	r *http.Request,
+	state domain.LLMProviderState,
+) {
+	tid := traceID()
+	if s.llmProviders == nil {
+		writeErr(w, http.StatusServiceUnavailable, "NOT_CONFIGURED", "LLM provider management not configured", tid)
+		return
+	}
+	id, ok := parseProviderID(w, r, tid)
+	if !ok {
+		return
+	}
+	provider, err := s.llmProviders.SetProviderState(r.Context(), id, state)
+	if err != nil {
+		writeErr(w, http.StatusConflict, "PROVIDER_STATE_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, llmProviderReply(provider))
+}
+
 func (b *providerWriteBody) validateAndNormalize(requireAPIKey bool) error {
 	b.Name = strings.TrimSpace(b.Name)
 	b.BaseURL = strings.TrimSpace(b.BaseURL)

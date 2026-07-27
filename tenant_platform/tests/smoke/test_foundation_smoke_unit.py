@@ -4,7 +4,6 @@ import importlib.util
 import os
 import threading
 import time
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +15,9 @@ SMOKE_PATH = Path(__file__).with_name("foundation_smoke.py")
 
 
 def _load_smoke():
-    spec = importlib.util.spec_from_file_location("foundation_smoke_under_test", SMOKE_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "foundation_smoke_under_test", SMOKE_PATH
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -24,7 +25,9 @@ def _load_smoke():
     return module
 
 
-def test_child_environment_uses_allowlist_and_drops_parent_secrets(monkeypatch, tmp_path: Path) -> None:
+def test_child_environment_uses_allowlist_and_drops_parent_secrets(
+    monkeypatch, tmp_path: Path
+) -> None:
     smoke = _load_smoke()
     sentinels = {
         "PARENT_PASSWORD": "sentinel-password",
@@ -43,17 +46,24 @@ def test_child_environment_uses_allowlist_and_drops_parent_secrets(monkeypatch, 
     values = {
         "TEST_DATABASE_URL": "postgresql://test.invalid/db",
         "PLATFORM_DEV_USER_ID": "7",
-        "LLM_PROXY_UPSTREAM_BASEURL": "http://127.0.0.1:1/v1",
-        "LLM_PROXY_UPSTREAM_APIKEY": "upstream-key-sentinel",
         "LLM_PROXY_CAPABILITY_SIGNING_KEY": "signing-key-sentinel",
+        "LLM_PROXY_ALLOWED_UPSTREAM_CIDRS": "127.0.0.0/8",
+        "LLM_PROXY_ALLOW_HTTP_HOSTS": "127.0.0.1:1",
     }
-    env = smoke._child_environment(values, tmp_path / "config", tmp_path / "runtime", tmp_path, tmp_path / "policy.json")
+    env = smoke._child_environment(
+        values,
+        tmp_path / "config",
+        tmp_path / "runtime",
+        tmp_path,
+        tmp_path / "policy.json",
+    )
 
     assert not sentinels.keys() & env.keys()
     assert not set(sentinels.values()) & set(env.values())
     explicit = {
         "DATABASE_URL",
         "PLATFORM_DEV_USER_ID",
+        "BOT_TOKEN_KEY",
         "PLATFORM_DEV_USERNAME",
         "PLATFORM_DEV_TOKEN",
         "GA_CONFIG_ROOT",
@@ -62,9 +72,9 @@ def test_child_environment_uses_allowlist_and_drops_parent_secrets(monkeypatch, 
         "GA_POLICY_FILE",
         "GA_WORKER_PYTHON",
         "GA_WORKER_SRC",
-        "LLM_PROXY_UPSTREAM_BASEURL",
-        "LLM_PROXY_UPSTREAM_APIKEY",
         "LLM_PROXY_CAPABILITY_SIGNING_KEY",
+        "LLM_PROXY_ALLOWED_UPSTREAM_CIDRS",
+        "LLM_PROXY_ALLOW_HTTP_HOSTS",
     }
     assert set(env) <= set(smoke.CHILD_ENV_ALLOWLIST) | explicit
 
@@ -105,7 +115,10 @@ def test_job_fallback_cleans_process_when_sampling_fails() -> None:
             child.kill()
             child.wait(timeout=5)
 
-def test_submit_dedupe_does_not_run_rss_sampler_before_fixture_release(monkeypatch) -> None:
+
+def test_submit_dedupe_does_not_run_rss_sampler_before_fixture_release(
+    monkeypatch,
+) -> None:
     smoke = _load_smoke()
     sampler_calls = 0
 
@@ -131,6 +144,7 @@ def test_submit_dedupe_does_not_run_rss_sampler_before_fixture_release(monkeypat
     assert result["task_id"] == "task-1"
     assert sampler_calls == 0
     assert elapsed < 0.1
+
 
 def test_post_terminal_worker_sample_rejects_empty_descendants(monkeypatch) -> None:
     smoke = _load_smoke()

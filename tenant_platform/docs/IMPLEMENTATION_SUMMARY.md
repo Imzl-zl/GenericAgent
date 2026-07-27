@@ -1,148 +1,81 @@
-# LLM Provider 系统重构完成总结
+# LLM Provider 透明代理切分 — 实现总结
 
-## ✅ 已完成的工作
+## 当前架构结论
 
-### 1. 数据库架构更新
+Tenant Platform 已完成 **透明 LLM 凭证代理** 切分：
 
-**添加了 `config` JSONB 字段到 `llm_providers` 表**：
-- 用于存储 GA Core 原生的配置项（thinking_type、max_tokens、temperature 等）
-- 支持灵活的配置扩展，无需修改表结构
+- Admin 仅通过 **`/v1/admin/llm-providers`** CRUD
+- Provider 类型严格 **`native_oai` | `native_claude`**
+- 嵌套 **`session_config`**（GA）与 **`transport_config`**（Proxy→上游）
+- API Key **加密落库**，列表/详情 **永不回传明文**
+- Scheduler 生成会话级 **`mykey.runtime.json`** + 固定 **`mykey.py` 加载器**（仅 capability JWT + Proxy URL）
+- Worker **委托真实 GA Core** 执行协议
+- Transparent Proxy 校验 capability / provider / model / revision / path 后注入上游密钥
 
-**验证**：
-```bash
-cd tenant_platform && export $(grep -v '^#' .env | xargs) && cd backend-go && go run ./cmd/check-schema/main.go
-```
+不再提供明文配置拉取接口，也不再依赖手工 mykey 生成测试脚本。
 
-### 2. Backend Go 代码更新
+## 已完成能力
 
-#### 2.1 Domain 层 (`internal/domain/llm_provider.go`)
-- ✅ 添加 `LLMProviderConfig` 类型（`map[string]interface{}`）
-- ✅ 更新 `LLMProvider` 结构体，添加 `Config` 字段
-- ✅ 定义标准 Provider 类型常量：`ProviderNativeOAI`、`ProviderNativeClaude`
+### 1. 数据与领域模型
 
-#### 2.2 Store 层 (`internal/infrastructure/postgres/llm_provider_store.go`)
-- ✅ 更新 `CreateProvider` 方法，支持 `config` 参数
-- ✅ 更新 `UpdateProvider` 方法，支持 `config` 参数
-- ✅ 更新 `scanProvider` 函数，解析 `config` JSONB 字段
+- `LLMProvider`：`provider_type`、加密 key 字段、`session_config`、`transport_config`、`revision`、默认与状态
+- `GASessionConfig.Validate(providerType)` / `ProviderTransportConfig.Validate()` 严格校验
+- 名称或密钥-only 更新保留 routing `revision`；运行语义与 state 变化递增
 
-#### 2.3 HTTP Handler 层 (`internal/application/http/llm_provider_handlers.go`)
-- ✅ 更新 `handleCreateProvider` 处理 `config` 字段
-- ✅ 更新 `handleUpdateProvider` 处理 `config` 字段
-- ✅ API Key 加密/解密逻辑保持不变
+### 2. Admin HTTP
 
-#### 2.4 mykey.py 生成器 (`internal/application/http/mykey_generator.go`)
-- ✅ 实现 `GenerateMykeyPy` 函数
-- ✅ 根据数据库中的 Provider 配置生成标准 GA Core 格式的 `mykey.py`
-- ✅ 支持 `mixin_config`（故障转移配置）
-- ✅ 支持多个 Provider 配置
+- `POST/GET/PUT/DELETE /v1/admin/llm-providers`
+- `GET /v1/admin/llm-providers/{provider_id}`
+- `POST /v1/admin/llm-providers/{provider_id}/default`
+- `POST /v1/admin/llm-providers/{provider_id}/disable|enable`
+- 创建必填 `api_key`；更新省略或空 key = 不轮换
+- 响应映射含嵌套配置与 `revision`，无明文 key
 
-#### 2.5 新增 API 端点
-- ✅ `GET /v1/config/mykey.py` - 生成并返回 mykey.py 配置
-- ✅ 路由已注册到 `registerConfigRoutes`
+### 3. Scheduler 与会话凭证
 
-### 3. Frontend 代码更新
+- 活动 Provider 路由快照
+- 按 Provider 签发 capability JWT（覆盖任务墙钟等约束）
+- `BuildRuntimeConfig`：token-only JSON + 固定 loader
+- 持久化 capability 吊销；会话/Worker 拆除时 best-effort revoke
+- Scheduler 周期清理已过期的 capability 撤销记录
+- 密钥-only 轮换不强制替换已绑定 Worker；抬升 revision / 路由变更则替换并吊销旧集
 
-#### 3.1 类型定义 (`web/src/types/provider.ts`)
-- ✅ 更新 `LLMProvider` 接口，添加 `config` 字段
-- ✅ 定义 `LLMProviderConfig` 类型
-- ✅ 更新 `CreateLLMProviderRequest` 和 `UpdateLLMProviderRequest`
+### 4. Worker / GA
 
-#### 3.2 表单组件 (`web/src/components/LLMProviderForm.tsx`)
-- ✅ Provider 类型从输入框改为下拉选择
-- ✅ 添加 `config` 配置表单（thinking_type、max_tokens、temperature）
-- ✅ 根据选择的 Provider 类型动态显示配置项
-- ✅ 表单提交时包含 `config` 字段
+- 会话目录加载 runtime JSON（经固定 `mykey.py`）
+- 真实 GA `NativeOAISession` / `NativeClaudeSession`
+- 出站 base 指向 Proxy，凭证为 capability，非上游 Key
 
-### 4. Worker Python 代码更新
+### 5. Transparent LLM Proxy
 
-#### 4.1 配置加载模块 (`worker-python/src/ga_worker/config_loader.py`)
-- ✅ 实现 `fetch_mykey_config` - 从 Platform API 拉取配置
-- ✅ 实现 `write_mykey` - 写入 mykey.py 文件
-- ✅ 实现 `ensure_mykey` - 确保配置最新（支持降级到本地缓存）
-- ✅ 错误处理和降级逻辑
+- 部署单元持有解密后的上游密钥（来自加密 Provider store）
+- 路径：`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（及类型允许的别名）
+- 流式 / SSE 透传
+- 头清洗 + 按 `transport_config` 注入
+- DB 级吊销在重启后仍有效
 
-#### 4.2 Session 生命周期 (`worker-python/src/ga_worker/session_lifecycle.py`)
-- ✅ 在 `_create_agent` 前调用 `ensure_mykey`
-- ✅ 从环境变量读取 Platform URL 和认证 Token
-- ✅ 配置拉取失败时的错误处理
+### 6. 前端
 
-### 5. 测试和文档
+- Provider 表单：类型下拉、`session_config` / `transport_config`
+- 列表支持设默认、enable/disable、编辑与删除；不展示明文 key
 
-#### 5.1 测试脚本
-- ✅ `test-mykey-generation.sh` - 完整的端到端测试
-  - 管理员登录
-  - 创建 Provider
-  - 获取 mykey.py
-  - 验证内容
-  - 保存到文件
+## 核心优势
 
-#### 5.2 架构文档
-- ✅ `docs/LLM_PROVIDER_ARCHITECTURE.md` - 完整的架构设计文档
-  - 数据流说明
-  - API 接口文档
-  - 配置示例
-  - Worker 集成指南
-  - 常见问题
+1. **密钥边界清晰** — 明文 Key 只在加密存储与 Proxy 内存路径
+2. **复用 GA 协议** — Platform 不重做 chat/responses/messages
+3. **可吊销短时能力** — JWT + 持久吊销，替代把 Key 铺进每个 Worker
+4. **修订与轮换分离** — 密钥-only 可保 revision；路由/模型等变更走新快照
 
----
+## 使用指南
 
-## 🎯 实现的核心优势
+### 添加 Provider（UI）
 
-### 1. ✅ 不重复造轮子
-- **LLM 协议实现完全复用 GA Core**
-- Platform 只负责配置管理和 mykey.py 生成
-- 新增 Provider 类型无需修改 Platform 代码
+1. 管理员登录 → LLM Provider 管理
+2. 添加：名称、类型（`native_oai` / `native_claude`）、Base URL、Model、API Key
+3. 填写 `session_config` / `transport_config`
+4. 保存；需要时设为默认
 
-### 2. ✅ 配置实时生效
-- 新 Worker 启动时自动拉取最新配置
-- 无需重启 Platform
-- 支持降级到本地缓存（Platform 故障时）
-
-### 3. ✅ 完全兼容 GA Core
-- 字段格式对齐 `mykey.py`
-- 支持所有 GA Core 的 Provider 类型
-- 支持所有配置选项
-
-### 4. ✅ 多租户友好
-- 统一配置：所有用户共享
-- 未来可扩展：每用户独立配置
-
----
-
-## 📋 使用指南
-
-### 后端启动
-
-```bash
-cd tenant_platform
-./start-backend.ps1
-```
-
-后端会：
-1. 读取 `.env` 中的配置
-2. 连接数据库
-3. 启动 HTTP 服务（127.0.0.1:8080）
-
-### 添加 LLM Provider（UI）
-
-1. 管理员登录
-2. 进入"LLM Provider"管理页面
-3. 点击"添加 Provider"
-4. 填写表单：
-   - **名称**：自定义名称（如 "my-gpt"）
-   - **类型**：下拉选择
-     - `OpenAI Compatible` (native_oai)
-     - `Anthropic Claude` (native_claude)
-   - **Base URL**：API 端点
-   - **Model**：模型名称
-   - **API Key**：密钥（会加密存储）
-   - **配置**：
-     - Thinking Type: adaptive / enabled / disabled
-     - Max Tokens: 8192
-     - Temperature: 1.0
-5. 保存
-
-### 添加 LLM Provider（API）
+### 添加 Provider（API）
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/admin/llm-providers \
@@ -152,132 +85,75 @@ curl -X POST http://127.0.0.1:8080/v1/admin/llm-providers \
     "name": "my-gpt",
     "provider_type": "native_oai",
     "base_url": "https://api.openai.com/v1",
-    "model": "gpt-4",
+    "model": "gpt-4o-mini",
     "api_key": "sk-...",
-    "config": {
+    "session_config": {
       "thinking_type": "adaptive",
       "max_tokens": 8192,
       "temperature": 1.0
+    },
+    "transport_config": {
+      "auth_mode": "auto"
     }
   }'
 ```
 
-### Worker 使用
+### 运行时路径（无需手工拉配置）
 
-Worker 启动时会：
-1. 从 Platform 拉取 mykey.py 配置
-2. 写入 `config/mykey.py`
-3. GA Core 读取并初始化 Session
-4. 使用配置处理任务
+1. 平台 Scheduler 在确保 Worker 时发 token 并写会话 `mykey.runtime.json` + loader
+2. Worker 启动 GA，请求经 Proxy
+3. Proxy 校验并注入真实 Key 后访问上游
 
-**环境变量**：
-```bash
-PLATFORM_URL=http://127.0.0.1:8080
-WORKER_TOKEN=<worker_token>
-```
+运维关注：`DATABASE_URL`、`BOT_TOKEN_KEY`、capability 签名密钥、Proxy 监听地址与 Platform 侧 `llm-proxy-addr` / 进程内 Proxy 配置一致。
 
----
+## 支持的类型
 
-## 🧪 测试
+| `provider_type` | 说明 |
+|-----------------|------|
+| `native_oai` | OpenAI 兼容（含兼容网关） |
+| `native_claude` | Anthropic Messages |
 
-### 运行端到端测试
+其他历史类型名已废弃，Admin 与领域校验只接受以上二者。
 
-```bash
-cd tenant_platform
-bash test-mykey-generation.sh
-```
+## 配置示例
 
-测试会：
-1. ✅ 创建测试 Provider
-2. ✅ 获取生成的 mykey.py
-3. ✅ 验证内容包含：
-   - mixin_config
-   - provider type
-   - config 字段
-   - API key
-4. ✅ 保存到 `config/mykey.py`
-
-### 手动测试
-
-```bash
-# 1. 获取管理员 token
-TOKEN=$(curl -s -X POST http://127.0.0.1:8080/v1/admin/login \
-  -H "Content-Type: application/json" \
-  -H "X-Platform-Dev-Token: f02adcb48a1eaa121a4e3b6edfdafdb30c860de02492d65de879ed0da9e74149" \
-  -d '{"username":"admin","password":"admin"}' \
-  | jq -r '.token')
-
-# 2. 获取 mykey.py
-curl -X GET http://127.0.0.1:8080/v1/config/mykey.py \
-  -H "Authorization: Bearer $TOKEN"
-```
-
----
-
-## 📚 支持的 Provider 类型
-
-### 1. OpenAI Compatible (`native_oai`)
-
-适用于：
-- OpenAI GPT-4 / GPT-3.5
-- Azure OpenAI
-- DeepSeek
-- 智谱 GLM
-- 其他 OpenAI 兼容接口
-
-### 2. Anthropic Claude (`native_claude`)
-
-适用于：
-- Claude Opus / Sonnet / Haiku
-- Claude API
-
-### 未来可扩展
-
-GA Core 支持的其他类型：
-- `kimi` - 月之暗面 Kimi
-- `minimax` - MiniMax
-
-只需在前端添加类型选项，无需修改后端代码。
-
----
-
-## 🔧 配置示例
-
-### OpenAI GPT-4
+### OpenAI 兼容
 
 ```json
 {
   "name": "openai-gpt4",
   "provider_type": "native_oai",
   "base_url": "https://api.openai.com/v1",
-  "model": "gpt-4",
+  "model": "gpt-4o-mini",
   "api_key": "sk-...",
-  "config": {
+  "session_config": {
     "thinking_type": "adaptive",
     "max_tokens": 8192,
     "temperature": 1.0
-  }
+  },
+  "transport_config": { "auth_mode": "auto" }
 }
 ```
 
-### Anthropic Claude
+### Claude
 
 ```json
 {
-  "name": "claude-opus",
+  "name": "claude-sonnet",
   "provider_type": "native_claude",
   "base_url": "https://api.anthropic.com",
-  "model": "claude-opus-5",
+  "model": "claude-sonnet-4-20250514",
   "api_key": "sk-ant-...",
-  "config": {
+  "session_config": {
     "thinking_type": "adaptive",
     "max_tokens": 8192,
     "temperature": 1.0
-  }
+  },
+  "transport_config": { "auth_mode": "x_api_key" }
 }
 ```
 
-### DeepSeek（OpenAI 兼容）
+### 兼容网关示例
 
 ```json
 {
@@ -286,87 +162,46 @@ GA Core 支持的其他类型：
   "base_url": "https://api.deepseek.com/v1",
   "model": "deepseek-chat",
   "api_key": "sk-...",
-  "config": {
+  "session_config": {
     "max_tokens": 4096,
     "temperature": 0.7
-  }
+  },
+  "transport_config": { "auth_mode": "auto" }
 }
 ```
 
----
+## 主要代码位置（参考）
 
-## 🚀 下一步
+### 后端
 
-### 立即测试
+- `backend-go/internal/domain/llm_provider.go` — 类型与嵌套配置
+- `backend-go/internal/api/llm_provider.go` — Admin handlers
+- `backend-go/internal/application/runtime_config.go` — token-only 会话文件
+- `backend-go/internal/application/scheduler*.go` / `worker_credential.go` — 签发、快照、吊销
+- `backend-go/internal/infrastructure/llmproxy/` — 透明代理
+- `backend-go/cmd/llm-proxy` / `cmd/platform` — 部署入口
 
-1. **启动后端**：`./start-backend.ps1`
-2. **运行测试**：`bash test-mykey-generation.sh`
-3. **检查 mykey.py**：`cat config/mykey.py`
+### 前端
 
-### 前端集成
+- `web/src/api/types.ts` / `web/src/api/providers.ts`
+- `web/src/features/admin/LLMProviderForm.tsx`（及管理页）
 
-1. 启动前端：`./start-web.ps1`
-2. 登录管理员账号
-3. 添加 LLM Provider
-4. 验证表单正常工作
+### 文档
 
-### Worker 集成
+- `docs/LLM_PROVIDER_ARCHITECTURE.md` — 边界与数据流
+- `docs/IMPLEMENTATION_SUMMARY.md` — 本文件
 
-1. 确保环境变量正确：
-   ```bash
-   PLATFORM_URL=http://127.0.0.1:8080
-   WORKER_TOKEN=<token>
-   ```
-2. 启动 Worker
-3. 检查日志，确认配置拉取成功
-4. 创建任务，验证 LLM 调用正常
+## 验证清单（概念）
 
----
+- [x] Admin CRUD 仅 `/v1/admin/llm-providers`
+- [x] 类型仅 `native_oai` / `native_claude`
+- [x] Key 加密存储且 API 不回显
+- [x] 会话配置仅 capability + Proxy URL
+- [x] Worker 走真实 GA
+- [x] Proxy 校验并注入；支持 chat/completions、responses、messages 与流式
+- [x] 密钥-only 轮换与默认变更语义分离
+- [x] 遗留手工 mykey 生成脚本已移除
 
-## 📝 文件清单
+## 总结
 
-### 后端 Go 代码
-- ✅ `backend-go/internal/domain/llm_provider.go`
-- ✅ `backend-go/internal/infrastructure/postgres/llm_provider_store.go`
-- ✅ `backend-go/internal/application/http/llm_provider_handlers.go`
-- ✅ `backend-go/internal/application/http/mykey_generator.go`
-- ✅ `backend-go/cmd/check-schema/main.go`
-
-### 前端 TypeScript 代码
-- ✅ `web/src/types/provider.ts`
-- ✅ `web/src/components/LLMProviderForm.tsx`
-
-### Worker Python 代码
-- ✅ `worker-python/src/ga_worker/config_loader.py`
-- ✅ `worker-python/src/ga_worker/session_lifecycle.py`
-
-### 测试和文档
-- ✅ `test-mykey-generation.sh`
-- ✅ `docs/LLM_PROVIDER_ARCHITECTURE.md`
-- ✅ `docs/IMPLEMENTATION_SUMMARY.md`（本文件）
-
----
-
-## ✅ 验证清单
-
-- [x] 数据库 schema 更新完成
-- [x] Backend API 实现完成
-- [x] Frontend 表单更新完成
-- [x] Worker 配置加载实现完成
-- [x] mykey.py 生成器实现完成
-- [x] 测试脚本创建完成
-- [x] 文档编写完成
-
----
-
-## 🎉 总结
-
-我们成功实现了一个**既不重复造轮子，又能实时生效**的 LLM Provider 系统：
-
-1. ✅ **复用 GA Core** - 所有 LLM 协议实现都在 GA Core 中
-2. ✅ **配置实时生效** - Worker 启动时拉取最新配置
-3. ✅ **易于扩展** - 新增 Provider 类型无需改代码
-4. ✅ **多租户友好** - 支持统一配置或独立配置
-5. ✅ **安全可靠** - API Key 加密存储，降级到本地缓存
-
-**现在可以开始测试了！** 🚀
+系统以 **Admin 配 Provider → Scheduler 发能力并写会话配置 → Worker/GA 执行 → Proxy 持钥转发** 为唯一主路径。配置与密钥生命周期由 revision、routing snapshot 与持久吊销约束，而不是共享明文 mykey 文件分发。

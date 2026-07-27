@@ -97,6 +97,26 @@ func (f *fakeUserStore) GetUserByID(_ context.Context, userID int64) (int64, str
 	return u.ID, u.Username, u.Status, nil
 }
 
+func (f *fakeUserStore) CountPendingUsers(_ context.Context) (int, error) {
+	n := 0
+	for _, u := range f.users {
+		if u.Status == domain.UserPending {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *fakeUserStore) CountApprovedUsers(_ context.Context) (int, error) {
+	n := 0
+	for _, u := range f.users {
+		if u.Status == domain.UserApproved {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func TestUserServiceCreateUserRejectsEmptyUsername(t *testing.T) {
 	svc, err := NewUserService(UserServiceConfig{Store: newFakeUserStore()})
 	if err != nil {

@@ -2,369 +2,219 @@
 
 ## 概述
 
-Tenant Platform 的 LLM Provider 系统设计目标：
-1. **复用 GA Core 的 LLM 协议实现** - 不重复造轮子
-2. **实时生效** - UI 配置修改后立即对新任务生效
-3. **多租户友好** - 支持统一配置或按用户独立配置
-4. **易于管理** - 管理员通过 UI 配置，用户直接使用
+Tenant Platform 的 LLM Provider 系统职责边界：
 
-## 架构设计
+1. **Admin** 通过 `/v1/admin/llm-providers` 管理上游 Provider
+2. **Scheduler** 为会话签发 capability JWT，并生成仅含 token + 代理地址的会话运行时配置
+3. **Worker** 加载该配置，把协议执行委托给真实 GA Core
+4. **Transparent LLM Proxy** 校验 capability / provider / model / revision / path，注入真实上游密钥后转发
 
-### 数据流
+真实上游 API Key 仅由 Proxy 持有（从加密存储解密）；Worker 与会话配置永不接触明文 Key。
+
+## 端到端数据流
 
 ```
-管理员在 UI 配置 Provider
+管理员在 UI / Admin API 配置 Provider
   ↓
-存储到数据库（provider_type + config 字段）
+DB 持久化：provider_type、session_config、transport_config、revision；
+api_key 以 ciphertext 存盘，API 响应永不回传明文
   ↓
-Worker 启动时从 Platform 拉取配置
+Scheduler 选路 → 为每个路由 Provider 签发 capability JWT
   ↓
-生成 mykey.py 文件
+写入会话目录：固定 mykey.py 加载器 + mykey.runtime.json
+（JSON 内 apikey = capability token，apibase = Proxy URL）
   ↓
-GA Core 读取 mykey.py 并初始化 Session
+Worker 委托 GA Core 按 native_oai / native_claude 建 Session 并执行
   ↓
-Worker 使用 GA Core 处理任务
+GA 请求打到 Transparent Proxy：
+校验 token、provider、model、revision、允许 path → 注入真实 Key → 上游
 ```
 
 ### 关键优势
 
-1. **不重复实现协议**
-   - OpenAI、Anthropic、国内大模型的协议都在 GA Core 中
-   - Platform 只负责配置管理和文件生成
-   - 新增 Provider 类型无需改 Platform 代码
+1. **密钥不进 Worker** — 会话配置只有 capability JWT 与 Proxy 地址
+2. **协议仍在 GA Core** — Platform 不重实现 chat / responses / messages
+3. **路由可修订** — `revision` 绑定 capability；密钥-only 轮换可保留 revision 与既有会话
+4. **撤销持久化** — Proxy 依赖 DB 级 capability 吊销，进程重启仍生效
 
-2. **配置实时生效**
-   - 新 Worker 启动时拉取最新配置
-   - 不需要重启整个 Platform
-   - 旧 Worker 完成任务后自然消亡
+## 所有权边界
 
-3. **完全兼容 GA Core**
-   - 字段格式对齐 `mykey.py`
-   - 支持所有 GA Core 的 Provider 类型
-   - 支持所有配置选项（thinking_type、max_tokens 等）
+| 组件 | 负责 | 不负责 |
+|------|------|--------|
+| Admin CRUD | Provider 元数据、嵌套 session/transport、加密入库、设默认 | 签发 token、转发上游 |
+| Scheduler | 路由快照、发 capability、写 `mykey.runtime.json` + 固定 loader、会话替换策略 | 持有明文上游 Key、执行 LLM 协议 |
+| Worker / GA Core | 读会话配置、真实 GA Session 执行 | 解密上游 Key、决定注入头 |
+| Transparent Proxy | 校验 capability/provider/model/revision/path；provider 作用域 transport；注入 Key；流式/SSE 透传 | 业务选路、生成会话配置 |
 
-## 数据库 Schema
+## 数据库要点
 
-```sql
-CREATE TABLE llm_providers (
-    id BIGSERIAL PRIMARY KEY,
-    name TEXT NOT NULL,                       -- Provider 名称
-    provider_type TEXT NOT NULL,              -- 'native_oai' | 'native_claude'
-    base_url TEXT NOT NULL,                   -- API 端点
-    model TEXT NOT NULL,                      -- 模型名称
-    api_key_ciphertext BYTEA NOT NULL,        -- 加密的 API Key
-    api_key_key_version TEXT NOT NULL,        -- 加密密钥版本
-    config JSONB NOT NULL DEFAULT '{}'::jsonb,-- 其他配置（thinking_type, max_tokens 等）
-    is_default BOOLEAN NOT NULL DEFAULT false,-- 是否为默认 Provider
-    state TEXT NOT NULL DEFAULT 'active',     -- 状态
-    created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
-);
-```
+Provider 记录（概念字段）：
 
-### config 字段示例
+- `provider_type`：仅 `native_oai` | `native_claude`
+- `base_url` / `model`
+- `api_key_ciphertext` / `api_key_key_version`（AES-GCM；列表/详情不返回明文）
+- `session_config` JSONB — GA Session 行为（thinking、tokens、temperature、api_mode 等，按类型校验）
+- `transport_config` JSONB — Proxy→上游传输（auth_mode、超时、可选 proxy_url 等）
+- `revision` — 路由/能力绑定版本；名称或密钥-only 更新保持不变，type/base/model/session/transport/state 变化递增
+- `is_default` / `state`
+
+## Admin API
+
+基路径：`/v1/admin/llm-providers`（需管理员认证）。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/v1/admin/llm-providers` | 创建（必填 `api_key`，加密入库） |
+| GET | `/v1/admin/llm-providers` | 列表（无明文 key） |
+| GET | `/v1/admin/llm-providers/{id}` | 详情 |
+| PUT | `/v1/admin/llm-providers/{id}` | 更新；省略/空 `api_key` 表示不轮换密钥 |
+| DELETE | `/v1/admin/llm-providers/{id}` | 删除 |
+| POST | `/v1/admin/llm-providers/{id}/default` | 设为默认 |
+| POST | `/v1/admin/llm-providers/{id}/disable` | 禁用非默认 Provider，并递增 revision |
+| POST | `/v1/admin/llm-providers/{id}/enable` | 重新启用 Provider，并递增 revision |
+
+创建/更新体形状：
 
 ```json
-{
-  "thinking_type": "adaptive",  // 思考模式：adaptive | enabled | disabled
-  "max_tokens": 8192,           // 最大 token 数
-  "temperature": 1.0,           // 温度参数
-  "top_p": 0.9,                 // Top-p 采样
-  "max_retries": 10             // 最大重试次数
-}
-```
-
-## API 接口
-
-### 1. 创建 Provider
-
-```http
-POST /v1/admin/llm-providers
-Authorization: Bearer <admin_token>
-Content-Type: application/json
-
 {
   "name": "my-gpt",
   "provider_type": "native_oai",
   "base_url": "https://api.openai.com/v1",
-  "model": "gpt-4",
+  "model": "gpt-4o-mini",
   "api_key": "sk-...",
-  "config": {
+  "session_config": {
     "thinking_type": "adaptive",
     "max_tokens": 8192,
     "temperature": 1.0
+  },
+  "transport_config": {
+    "auth_mode": "auto"
   }
 }
 ```
 
-### 2. 获取 mykey.py 配置
+响应含 `session_config`、`transport_config`、`revision` 等，**不含**明文 `api_key`。
 
-```http
-GET /v1/config/mykey.py
-Authorization: Bearer <token>
-```
+默认 Provider 不能直接禁用；先将另一个 active Provider 设为默认。重复 enable/disable 是幂等操作，不重复递增 revision。
 
-返回：
-```python
-# Auto-generated mykey.py from Tenant Platform
-# DO NOT EDIT - Changes will be overwritten
+不存在明文配置下发路由（例如旧的公开 mykey 拉取接口）；Worker 只消费 Scheduler 写入的会话目录文件。
 
-mixin_config = {
-    'llm_nos': ['my-gpt'],
-    'max_retries': 10,
-}
+## 会话运行时配置（Scheduler）
 
-native_oai_config_0 = {
-    'name': 'my-gpt',
-    'type': 'native_oai',
-    'apikey': 'sk-...',
-    'apibase': 'https://api.openai.com/v1',
-    'model': 'gpt-4',
-    'thinking_type': 'adaptive',
-    'max_tokens': 8192,
-    'temperature': 1.0,
-}
-```
+对每个绑定 Worker 的会话，Scheduler：
 
-## Worker 集成
+1. 按当前活动 Provider 与默认规则构建 **routing snapshot**
+2. 为快照内每个 Provider 签发 **capability JWT**（含 provider id、model、revision、路径策略等声明）
+3. 调用运行时配置构建，写出：
+   - **`mykey.runtime.json`**：GA 可消费的变量表；`apikey` 仅为 capability token，`apibase` 为 Proxy base URL；附带 routing / generation 元数据
+   - **`mykey.py`**：固定加载器（读同目录 JSON 并 `globals().update`），内容不随 Provider 变
 
-### 配置加载流程
+多 Provider 时生成 `mixin_config.llm_nos` 供 GA 故障转移。真实上游密钥从不进入这些文件。
 
-Worker 启动时：
+### 轮换与默认变更
 
-1. **从 Platform 拉取配置**
-   ```python
-   from ga_worker.config_loader import ensure_mykey
-   
-   ensure_mykey(
-       config_root=Path("/app/config"),
-       platform_url="http://platform:8080",
-       token=os.environ["WORKER_TOKEN"]
-   )
-   ```
+- **密钥-only 轮换**：可保留 `revision` 与既有会话绑定；新请求经 Proxy 用新密钥，不必因密钥本身替换 Worker
+- **session / model / type / transport / state / active 集合变更**：抬高 revision 或改变快照，在下一任务边界替换受影响 Worker 并吊销旧能力
+- **默认 Provider 变更**：影响之后新建的路由快照，不回溯改写已绑定会话的历史快照语义
 
-2. **写入 mykey.py 文件**
-   ```python
-   config_root/mykey.py  # GA Core 会读取这个文件
-   ```
+## Worker 与 GA Core
 
-3. **GA Core 初始化**
-   ```python
-   from ga_worker.legacy_import import import_legacy_runtime
-   
-   legacy_mods = import_legacy_runtime(
-       legacy_root=legacy_root,
-       config_root=config_root,
-       runtime_dir=runtime_dir
-   )
-   ```
+Worker 在创建 Agent/Session 前使用会话目录中的 loader + runtime JSON。GA Core 按 `native_oai` → NativeOAISession、`native_claude` → NativeClaudeSession 初始化。出站 HTTP 指向 Proxy，Authorization（或等价头）携带 capability token，而非上游 Key。
 
-4. **创建 Session**
-   ```python
-   # GA Core 自动根据 mykey.py 创建对应的 Session
-   # - native_oai → NativeOAISession
-   # - native_claude → NativeClaudeSession
-   session = legacy_mods.session_class(...)
-   ```
+## Transparent LLM Proxy
+
+职责：
+
+- 校验 capability JWT（签名、过期、**持久化吊销**）
+- Scheduler 周期删除已过 `expires_at` 的撤销记录，避免长期运行时表和索引无界增长
+- 校验声明与请求一致：provider、model、**revision**、允许的 path
+- 按 `provider_type` 映射上游路径：
+  - `native_oai`：`/v1/chat/completions`、`/v1/responses`（及兼容别名）
+  - `native_claude`：`/v1/messages`
+- 清洗入站头后 **注入** 解密后的上游凭证（`transport_config.auth_mode`：auto / bearer / x_api_key）
+- 支持流式与 SSE 透传；transport 超时与可选上游 HTTP proxy 按 Provider 作用域配置
+
+Proxy 是唯一解密并使用上游 Key 的运行时组件。
 
 ## 支持的 Provider 类型
 
-### native_oai (OpenAI 兼容)
+严格两种：
 
-适用于：
-- OpenAI GPT-4 / GPT-3.5
-- Azure OpenAI
-- 其他 OpenAI 兼容接口
+| 类型 | 用途 |
+|------|------|
+| `native_oai` | OpenAI 兼容（含 Azure / 兼容网关等） |
+| `native_claude` | Anthropic Messages API |
 
-配置字段：
-```python
-{
-    'name': 'my-provider',
-    'type': 'native_oai',
-    'apikey': 'sk-...',
-    'apibase': 'https://api.openai.com/v1',
-    'model': 'gpt-4',
-    'thinking_type': 'adaptive',  # adaptive | enabled | disabled
-    'max_tokens': 8192,
-    'temperature': 1.0,
-    'top_p': 0.9,
-}
-```
+`session_config` 字段按类型校验（例如 `api_mode` 仅 `native_oai`；Claude 专属字段仅 `native_claude`）。
 
-### native_claude (Anthropic Claude)
+## 前端集成要点
 
-适用于：
-- Claude Opus / Sonnet / Haiku
-- Claude API
-
-配置字段：
-```python
-{
-    'name': 'my-claude',
-    'type': 'native_claude',
-    'apikey': 'sk-ant-...',
-    'apibase': 'https://api.anthropic.com',
-    'model': 'claude-opus-5',
-    'thinking_type': 'adaptive',
-    'max_tokens': 8192,
-    'temperature': 1.0,
-}
-```
-
-## 前端集成
-
-### Provider 类型选择
-
-```typescript
-const PROVIDER_TYPES = [
-  { value: 'native_oai', label: 'OpenAI Compatible' },
-  { value: 'native_claude', label: 'Anthropic Claude' }
-];
-
-// 根据类型动态显示配置字段
-const configFields = {
-  native_oai: [
-    { name: 'thinking_type', type: 'select', options: ['adaptive', 'enabled', 'disabled'] },
-    { name: 'max_tokens', type: 'number', default: 8192 },
-    { name: 'temperature', type: 'number', min: 0, max: 2, step: 0.1, default: 1.0 },
-  ],
-  native_claude: [
-    { name: 'thinking_type', type: 'select', options: ['adaptive', 'enabled', 'disabled'] },
-    { name: 'max_tokens', type: 'number', default: 8192 },
-    { name: 'temperature', type: 'number', min: 0, max: 2, step: 0.1, default: 1.0 },
-  ]
-};
-```
+- 类型下拉仅 `native_oai` / `native_claude`
+- 表单编辑嵌套 `session_config` 与 `transport_config`
+- 创建必须提交 `api_key`；更新时留空表示不轮换
+- 展示 `revision`、默认标记、状态；永不期望 API 回显明文 Key
 
 ## 配置示例
 
-### 示例 1：OpenAI GPT-4
+### native_oai
 
 ```json
 {
   "name": "openai-gpt4",
   "provider_type": "native_oai",
   "base_url": "https://api.openai.com/v1",
-  "model": "gpt-4",
+  "model": "gpt-4o-mini",
   "api_key": "sk-...",
-  "config": {
+  "session_config": {
     "thinking_type": "adaptive",
     "max_tokens": 8192,
     "temperature": 1.0
+  },
+  "transport_config": {
+    "auth_mode": "auto"
   }
 }
 ```
 
-### 示例 2：Claude Opus
+### native_claude
 
 ```json
 {
-  "name": "claude-opus",
+  "name": "claude-sonnet",
   "provider_type": "native_claude",
   "base_url": "https://api.anthropic.com",
-  "model": "claude-opus-5",
+  "model": "claude-sonnet-4-20250514",
   "api_key": "sk-ant-...",
-  "config": {
+  "session_config": {
     "thinking_type": "adaptive",
     "max_tokens": 8192,
     "temperature": 1.0
+  },
+  "transport_config": {
+    "auth_mode": "x_api_key"
   }
 }
 ```
 
-### 示例 3：国内大模型（OpenAI 兼容）
+## 安全
 
-```json
-{
-  "name": "deepseek",
-  "provider_type": "native_oai",
-  "base_url": "https://api.deepseek.com/v1",
-  "model": "deepseek-chat",
-  "api_key": "sk-...",
-  "config": {
-    "max_tokens": 4096,
-    "temperature": 0.7
-  }
-}
-```
-
-## 测试
-
-运行测试脚本：
-
-```bash
-# 启动后端
-./start-backend.ps1
-
-# 在另一个终端运行测试
-bash test-mykey-generation.sh
-```
-
-测试会：
-1. 创建一个测试 Provider
-2. 获取生成的 mykey.py
-3. 验证内容正确性
-4. 保存到 config/mykey.py
-
-## 未来扩展
-
-### 1. 多租户配置
-
-每个用户独立的 Provider 配置：
-
-```http
-GET /v1/config/mykey.py?user_id=123
-```
-
-生成 `config/mykey_123.py`，Worker 根据用户 ID 加载对应配置。
-
-### 2. 配置热重载
-
-Worker 运行时检测配置变更：
-
-```python
-# Worker 收到通知后
-def on_config_changed(self):
-    if not self._is_busy:
-        self._reload_config()
-        self._recreate_session()
-```
-
-### 3. 更多 Provider 类型
-
-GA Core 支持的其他类型：
-- `kimi` - 月之暗面 Kimi
-- `glm` - 智谱 GLM
-- `minimax` - MiniMax
-
-只需在前端添加类型选项，无需修改后端代码。
+- 静态：API Key AES-GCM 加密；Admin 读路径不返回明文
+- 动态：Worker 仅持 capability JWT；Proxy 校验 + 吊销 + 注入
+- 传输：管理面与 Proxy 建议 HTTPS / 本机回环按部署约束
+- 审计：避免在日志与审计详情中记录 token、JTI 明文密钥材料
 
 ## 常见问题
 
-### Q: 为什么不直接用 LLM Proxy 转发？
+### 为什么还要 Proxy，而不是把 Key 写进 Worker？
 
-A: 
-1. 避免重复实现协议（OpenAI/Anthropic/国内大模型）
-2. GA Core 已经实现了所有细节（重试、错误处理、流式等）
-3. 减少维护成本
+避免真实密钥进入会话文件系统与 Worker 进程；吊销与 path/model 约束集中在 Proxy。
 
-### Q: 配置什么时候生效？
+### 配置何时生效？
 
-A:
-- **新 Worker**：启动时立即生效
-- **旧 Worker**：任务完成后消亡，下次创建新 Worker
+- 新路由快照 / 新 Worker：按当前默认与活动 Provider 立即生效
+- 密钥-only 轮换：可保留 revision 与现有会话，上游改用新密钥
+- 改变路由语义的更新：新会话用新快照；旧 capability 按吊销/替换策略失效
 
-### Q: 如何支持新的 LLM Provider？
+### 如何加新上游？
 
-A:
-1. 如果是 OpenAI 兼容接口：使用 `native_oai` 类型
-2. 如果是 GA Core 支持的类型：前端添加类型选项
-3. 如果是全新类型：需要先在 GA Core 中实现
-
-### Q: API Key 如何保护？
-
-A:
-- 存储时使用 AES-256-GCM 加密
-- 传输时使用 HTTPS
-- Worker 启动时解密并写入 mykey.py
-- mykey.py 文件仅在 Worker 容器内部可见
+在 Admin 创建 `native_oai` 或 `native_claude` Provider，填 base_url、model、密钥与嵌套配置，并按需设默认。无需也不应再维护手工明文 mykey 下发流程。

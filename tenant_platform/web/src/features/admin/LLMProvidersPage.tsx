@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
-import { Pencil, Star, Trash2 } from 'lucide-react';
+import { Pencil, Power, PowerOff, Star, Trash2 } from 'lucide-react';
 import { ApiClientError } from '../../api/client';
 import {
   createProvider,
   deleteProvider,
   listProviders,
   setDefaultProvider,
+  setProviderState,
   updateProvider,
   type UpdateProviderInput,
 } from '../../api/providers';
@@ -99,6 +100,23 @@ export function LLMProvidersPage() {
     }
   };
 
+  const handleStateChange = async (provider: LLMProvider) => {
+    const nextState = provider.state === 'active' ? 'disabled' : 'active';
+    if (
+      nextState === 'disabled'
+      && !window.confirm(`禁用 Provider “${provider.name}”？`)
+    ) {
+      return;
+    }
+    setError('');
+    try {
+      await setProviderState(provider.provider_id, nextState);
+      await loadProviders();
+    } catch (stateError) {
+      setError(errorMessage(stateError, nextState === 'active' ? '启用失败' : '禁用失败'));
+    }
+  };
+
   return (
     <div className="admin-page provider-page">
       <header className="admin-header animate-fade-in-up">
@@ -149,14 +167,17 @@ export function LLMProvidersPage() {
                     <tr key={provider.provider_id}>
                       <td>
                         <strong>{provider.name}</strong>
-                        <small>{provider.provider_type} · REV {provider.revision}</small>
+                        <small>
+                          {provider.provider_type} · REV {provider.revision} ·{' '}
+                          <span className={`provider-state ${provider.state}`}>{provider.state.toUpperCase()}</span>
+                        </small>
                         <small className="provider-model-mobile">{provider.model}</small>
                       </td>
                       <td>{provider.model}</td>
                       <td>
                         {provider.is_default ? (
                           <span className="provider-default"><Star size={13} fill="currentColor" /> DEFAULT</span>
-                        ) : (
+                        ) : provider.state === 'active' ? (
                           <button
                             className="icon-button"
                             type="button"
@@ -166,10 +187,22 @@ export function LLMProvidersPage() {
                           >
                             <Star size={16} />
                           </button>
+                        ) : (
+                          <span className="provider-not-available" aria-label="已禁用">—</span>
                         )}
                       </td>
                       <td>
                         <div className="admin-actions provider-row-actions">
+                          <button
+                            className="icon-button"
+                            type="button"
+                            title={provider.is_default ? '先设置其他默认 Provider' : provider.state === 'active' ? '禁用' : '启用'}
+                            aria-label={`${provider.state === 'active' ? '禁用' : '启用'} ${provider.name}`}
+                            disabled={provider.is_default}
+                            onClick={() => void handleStateChange(provider)}
+                          >
+                            {provider.state === 'active' ? <PowerOff size={16} /> : <Power size={16} />}
+                          </button>
                           <button
                             className="icon-button"
                             type="button"

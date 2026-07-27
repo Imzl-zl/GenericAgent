@@ -17,12 +17,18 @@ import grpc
 import pytest
 
 from genericagent.worker.v1 import worker_pb2, worker_pb2_grpc
-from ga_worker.checkpoint import SNAPSHOT_SCHEMA_VERSION, build_snapshot_bundle, result_digest_for
+from ga_worker.checkpoint import (
+    SNAPSHOT_SCHEMA_VERSION,
+    build_snapshot_bundle,
+    result_digest_for,
+)
 from ga_worker.limits import CapabilityRegistry
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 WORKER_ROOT = REPO_ROOT / "tenant_platform" / "worker-python"
-POLICY_PATH = REPO_ROOT / "tenant_platform" / "contracts" / "policy" / "foundation.v1.json"
+POLICY_PATH = (
+    REPO_ROOT / "tenant_platform" / "contracts" / "policy" / "foundation.v1.json"
+)
 PYTHON = Path(os.environ.get("GA_TEST_PYTHON") or sys.executable)
 TEST_TOKEN = "test-worker-token-not-a-real-key"
 FOUNDATION_DIGEST = "sha256:" + hashlib.sha256(POLICY_PATH.read_bytes()).hexdigest()
@@ -140,6 +146,7 @@ class FixtureServer(ThreadingHTTPServer):
     def release(self):
         self.release_response.set()
 
+
 @pytest.fixture(scope="module")
 def oai_fixture():
     srv = FixtureServer(("127.0.0.1", 0))
@@ -152,13 +159,34 @@ def oai_fixture():
     thread.join(timeout=2)
 
 
-def _write_mykey(config_root: Path, apibase: str, generation: int = 1) -> str:
+def _write_runtime_document(config_root: Path, document: dict) -> str:
     config_root.mkdir(parents=True, exist_ok=True)
     placeholder = "0" * 64
+    document["_platform_runtime"]["config_checksum"] = placeholder
+    canonical = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    )
+    checksum = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    (config_root / "mykey.runtime.json").write_bytes(
+        canonical.replace(placeholder, checksum, 1).encode("utf-8")
+    )
+    (config_root / "mykey.py").write_text(
+        "import json as _json\n"
+        "from pathlib import Path as _Path\n"
+        '_config = _json.loads(_Path(__file__).with_name("mykey.runtime.json").read_text(encoding="utf-8"))\n'
+        "globals().update(_config)\n"
+        "del _config\n",
+        encoding="utf-8",
+    )
+    return checksum
+
+
+def _write_mykey(config_root: Path, apibase: str, generation: int = 1) -> str:
     document = {
         "_platform_runtime": {
             "credential_generation": generation,
-            "config_checksum": placeholder,
+            "config_checksum": "",
             "routing_snapshot_id": f"integration-{generation}",
         },
         "platform_native_oai_provider_1_config": {
@@ -171,21 +199,12 @@ def _write_mykey(config_root: Path, apibase: str, generation: int = 1) -> str:
             "read_timeout": 30,
         },
     }
-    canonical = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-    checksum = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    (config_root / "mykey.runtime.json").write_bytes(canonical.replace(placeholder, checksum, 1).encode("utf-8"))
-    (config_root / "mykey.py").write_text(
-        "import json as _json\n"
-        "from pathlib import Path as _Path\n"
-        "_config = _json.loads(_Path(__file__).with_name(\"mykey.runtime.json\").read_text(encoding=\"utf-8\"))\n"
-        "globals().update(_config)\n"
-        "del _config\n",
-        encoding="utf-8",
-    )
-    return checksum
+    return _write_runtime_document(config_root, document)
 
 
-def _start_worker(config_root: Path, runtime_root: Path) -> tuple[subprocess.Popen, str]:
+def _start_worker(
+    config_root: Path, runtime_root: Path
+) -> tuple[subprocess.Popen, str]:
     env = os.environ.copy()
     env["GA_CONFIG_ROOT"] = str(config_root)
     env["GA_LEGACY_ROOT"] = str(REPO_ROOT)
@@ -194,11 +213,21 @@ def _start_worker(config_root: Path, runtime_root: Path) -> tuple[subprocess.Pop
     env["GA_WORKER_LISTEN"] = "127.0.0.1:0"
     # Integration pre-start cancel barrier directory (file protocol).
     env["GA_TEST_PRE_DISPATCH_BARRIER_DIR"] = str(runtime_root / "barriers")
-    env["PYTHONPATH"] = str(WORKER_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(WORKER_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    )
     env.pop("OPENAI_API_KEY", None)
     env.pop("ANTHROPIC_API_KEY", None)
     proc = subprocess.Popen(
-        [str(PYTHON), "-m", "ga_worker.entrypoint", "--listen", "127.0.0.1:0", "--grace-seconds", "3"],
+        [
+            str(PYTHON),
+            "-m",
+            "ga_worker.entrypoint",
+            "--listen",
+            "127.0.0.1:0",
+            "--grace-seconds",
+            "3",
+        ],
         cwd=str(WORKER_ROOT),
         env=env,
         stdout=subprocess.PIPE,
@@ -250,7 +279,13 @@ def _runtime_policy(**overrides):
     return worker_pb2.RuntimePolicy(**base)
 
 
-def _collect(stub, task_id: str, prompt: str, persona: list[str] | None = None, session_key: str = "personal:1"):
+def _collect(
+    stub,
+    task_id: str,
+    prompt: str,
+    persona: list[str] | None = None,
+    session_key: str = "personal:1",
+):
     events = list(
         stub.ExecuteTask(
             worker_pb2.ExecuteTaskRequest(
@@ -300,9 +335,9 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
         # Registry load sanity.
         reg = CapabilityRegistry.load(POLICY_PATH)
         assert reg.digest == FOUNDATION_DIGEST
-        assert reg.resolve("foundation.v1", "foundation.no-host-tools.v1").allowed_tools == frozenset(
-            {"update_working_checkpoint"}
-        )
+        assert reg.resolve(
+            "foundation.v1", "foundation.no-host-tools.v1"
+        ).allowed_tools == frozenset({"update_working_checkpoint"})
 
         proc, listen = _start_worker(config_root, runtime_root)
         try:
@@ -318,10 +353,15 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                     stub.StartSession(
                         worker_pb2.StartSessionRequest(
                             session_key="personal:1",
-                            runtime_policy=_runtime_policy(policy_digest="sha256:" + ("b" * 64)),
+                            runtime_policy=_runtime_policy(
+                                policy_digest="sha256:" + ("b" * 64)
+                            ),
                         )
                     )
-                assert "POLICY_DIGEST" in ei.value.details() or ei.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                assert (
+                    "POLICY_DIGEST" in ei.value.details()
+                    or ei.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                )
 
                 # Empty snapshot start.
                 s1 = stub.StartSession(
@@ -334,19 +374,56 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 assert s1.worker_instance_id
 
                 checksum2 = _write_mykey(config_root, apibase, generation=2)
-                reloaded = stub.ReloadCredentials(worker_pb2.ReloadCredentialsRequest(
-                    credential_generation=2,
-                    config_checksum=checksum2,
-                ))
+                reloaded = stub.ReloadCredentials(
+                    worker_pb2.ReloadCredentialsRequest(
+                        credential_generation=2,
+                        config_checksum=checksum2,
+                    )
+                )
                 assert reloaded.credential_generation == 2
                 assert reloaded.config_checksum == checksum2
 
-                repeated_reload = stub.ReloadCredentials(worker_pb2.ReloadCredentialsRequest(
-                    credential_generation=2,
-                    config_checksum=checksum2,
-                ))
+                repeated_reload = stub.ReloadCredentials(
+                    worker_pb2.ReloadCredentialsRequest(
+                        credential_generation=2,
+                        config_checksum=checksum2,
+                    )
+                )
                 assert repeated_reload.credential_generation == 2
                 assert repeated_reload.config_checksum == checksum2
+
+                broken = {
+                    "_platform_runtime": {
+                        "credential_generation": 3,
+                        "config_checksum": "",
+                        "routing_snapshot_id": "integration-broken-3",
+                    },
+                    "platform_native_oai_provider_1_config": {
+                        "name": "provider-1",
+                        "apibase": apibase,
+                        "model": "gpt-test",
+                    },
+                }
+                broken_checksum = _write_runtime_document(config_root, broken)
+                with pytest.raises(grpc.RpcError) as reload_error:
+                    stub.ReloadCredentials(
+                        worker_pb2.ReloadCredentialsRequest(
+                            credential_generation=3,
+                            config_checksum=broken_checksum,
+                        )
+                    )
+                assert "CREDENTIAL_CONFIG_EMPTY" in reload_error.value.details()
+
+                restored_checksum = _write_mykey(config_root, apibase, generation=2)
+                assert restored_checksum == checksum2
+                retained = stub.ReloadCredentials(
+                    worker_pb2.ReloadCredentialsRequest(
+                        credential_generation=2,
+                        config_checksum=checksum2,
+                    )
+                )
+                assert retained.credential_generation == 2
+                assert retained.config_checksum == checksum2
 
                 h1 = stub.Health(worker_pb2.HealthRequest())
                 assert h1.ready is True
@@ -363,10 +440,15 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
 
                 # Task with persona A.
                 srv.response_text = "reply-persona-A"
-                events_a = _collect(stub, "t-a", "Say hello A", persona=["You are persona A."])
+                events_a = _collect(
+                    stub, "t-a", "Say hello A", persona=["You are persona A."]
+                )
                 term_a = _assert_one_terminal(events_a)
                 assert term_a.status == worker_pb2.TASK_SUCCEEDED
-                assert "persona-A" in term_a.user_message or "reply-persona-A" in term_a.user_message
+                assert (
+                    "persona-A" in term_a.user_message
+                    or "reply-persona-A" in term_a.user_message
+                )
                 # Plan Task 3 Step 5: result_digest is sha256 over UTF-8 bytes of
                 # result.body. Verify both presence and exact byte-sequence match
                 # (previously a single `== ... or term_a.result_digest` assertion
@@ -393,11 +475,15 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 bundle = json.loads(raw.decode("utf-8"))
                 assert bundle["schema_version"] == SNAPSHOT_SCHEMA_VERSION
                 assert bundle["result_digest"] == ready.result_digest
-                assert result_digest_for(bundle["result"]["body"]) == ready.result_digest
+                assert (
+                    result_digest_for(bundle["result"]["body"]) == ready.result_digest
+                )
 
                 # Second persona task.
                 srv.response_text = "reply-persona-B"
-                events_b = _collect(stub, "t-b", "Say hello B", persona=["You are persona B."])
+                events_b = _collect(
+                    stub, "t-b", "Say hello B", persona=["You are persona B."]
+                )
                 term_b = _assert_one_terminal(events_b)
                 assert term_b.status == worker_pb2.TASK_SUCCEEDED
 
@@ -415,8 +501,12 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
 
                 th = threading.Thread(target=run_slow, daemon=True)
                 th.start()
-                assert srv.request_arrived.wait(10.0), "fixture never received LLM request"
-                cancel_mid = stub.CancelTask(worker_pb2.CancelTaskRequest(task_id="t-slow"))
+                assert srv.request_arrived.wait(10.0), (
+                    "fixture never received LLM request"
+                )
+                cancel_mid = stub.CancelTask(
+                    worker_pb2.CancelTaskRequest(task_id="t-slow")
+                )
                 assert cancel_mid.accepted is True
                 time.sleep(0.15)
                 srv.release()
@@ -443,7 +533,9 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
 
                 def run_pre():
                     try:
-                        pre_box.append(_collect(stub, "t-pre", "should-not-reach-model"))
+                        pre_box.append(
+                            _collect(stub, "t-pre", "should-not-reach-model")
+                        )
                     except Exception as exc:
                         pre_err.append(exc)
 
@@ -454,7 +546,9 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                     time.sleep(0.05)
                 assert reserved_flag.exists(), "worker never reserved pre-start task"
                 pre_req_count = len(srv.requests)
-                cancel_pre = stub.CancelTask(worker_pb2.CancelTaskRequest(task_id="t-pre"))
+                cancel_pre = stub.CancelTask(
+                    worker_pb2.CancelTaskRequest(task_id="t-pre")
+                )
                 assert cancel_pre.accepted is True
                 proceed_flag.write_text("1", encoding="utf-8")
                 th_pre.join(timeout=15)
@@ -463,7 +557,9 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 term_pre = _assert_one_terminal(pre_box[0])
                 assert term_pre.status == worker_pb2.TASK_CANCELLED
                 assert len(srv.requests) == pre_req_count
-                c_unknown = stub.CancelTask(worker_pb2.CancelTaskRequest(task_id="no-such"))
+                c_unknown = stub.CancelTask(
+                    worker_pb2.CancelTaskRequest(task_id="no-such")
+                )
                 assert c_unknown.accepted is False
 
                 shut = stub.Shutdown(worker_pb2.ShutdownRequest(reason="swap"))
@@ -501,9 +597,12 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                     max_working_bytes=64 * 1024,
                 )
                 snap_path = runtime_root / "snap-restore.json"
-                snap_raw = json.dumps(snap_bundle, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
-                    "utf-8"
-                )
+                snap_raw = json.dumps(
+                    snap_bundle,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
                 snap_path.write_bytes(snap_raw)
                 checksum = "sha256:" + hashlib.sha256(snap_raw).hexdigest()
 
@@ -532,7 +631,11 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
 
                 srv.response_text = "after-restore"
                 events_r = _collect(
-                    stub, "t-restore", "continue", persona=["restore-persona"], session_key="personal:2"
+                    stub,
+                    "t-restore",
+                    "continue",
+                    persona=["restore-persona"],
+                    session_key="personal:2",
                 )
                 term_r = _assert_one_terminal(events_r)
                 assert term_r.status == worker_pb2.TASK_SUCCEEDED

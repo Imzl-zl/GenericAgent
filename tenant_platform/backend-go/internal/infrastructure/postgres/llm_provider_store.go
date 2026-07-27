@@ -101,7 +101,6 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, input domain.LLMPr
 		session_config = $9::jsonb,
 		transport_config = $10::jsonb,
 		revision = revision + CASE WHEN
-			name IS DISTINCT FROM $2 OR
 			provider_type IS DISTINCT FROM $3 OR
 			base_url IS DISTINCT FROM $4 OR
 			model IS DISTINCT FROM $5 OR
@@ -121,19 +120,55 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, input domain.LLMPr
 	return provider, err
 }
 
+func (s *Store) SetProviderState(
+	ctx context.Context,
+	id int64,
+	state domain.LLMProviderState,
+) (domain.LLMProvider, error) {
+	if !state.Valid() {
+		return domain.LLMProvider{}, fmt.Errorf("invalid provider state %q", state)
+	}
+
+	var provider domain.LLMProvider
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		query := `SELECT ` + providerColumns + ` FROM llm_providers WHERE id = $1 FOR UPDATE`
+		var current domain.LLMProvider
+		if err := scanProvider(tx.QueryRow(ctx, query, id), &current); err != nil {
+			return fmt.Errorf("get provider %d: %w", id, err)
+		}
+		if current.State == state {
+			provider = current
+			return nil
+		}
+		if state == domain.ProviderDisabled && current.IsDefault {
+			return fmt.Errorf("default provider cannot be disabled; set another default first")
+		}
+		update := `UPDATE llm_providers SET
+			state = $2, revision = revision + 1, updated_at = NOW()
+			WHERE id = $1 RETURNING ` + providerColumns
+		return scanProvider(tx.QueryRow(ctx, update, id, string(state)), &provider)
+	})
+	return provider, err
+}
+
 func (s *Store) SetDefaultProvider(ctx context.Context, id int64) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
+		query := `SELECT ` + providerColumns + ` FROM llm_providers WHERE id = $1 FOR UPDATE`
+		var provider domain.LLMProvider
+		if err := scanProvider(tx.QueryRow(ctx, query, id), &provider); err != nil {
+			return fmt.Errorf("get provider %d: %w", id, err)
+		}
+		if !provider.IsActive() {
+			return fmt.Errorf("disabled provider cannot be default")
+		}
+		if provider.IsDefault {
+			return nil
+		}
 		if _, err := tx.Exec(ctx, `UPDATE llm_providers SET is_default = FALSE WHERE id != $1`, id); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `UPDATE llm_providers SET is_default = TRUE, updated_at = NOW() WHERE id = $1`, id)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("provider %d not found", id)
-		}
-		return nil
+		_, err := tx.Exec(ctx, `UPDATE llm_providers SET is_default = TRUE, updated_at = NOW() WHERE id = $1`, id)
+		return err
 	})
 }
 

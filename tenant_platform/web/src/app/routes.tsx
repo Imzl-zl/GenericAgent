@@ -17,21 +17,6 @@ import { PersonaReviewPage } from '../features/admin/PersonaReviewPage';
 import { LLMProvidersPage } from '../features/admin/LLMProvidersPage';
 import { SettingsPage } from '../features/admin/SettingsPage';
 
-function ProtectedAppLayout() {
-  return (
-    <RequireAuth>
-      <AppLayout />
-    </RequireAuth>
-  );
-}
-
-function ProtectedAdminLayout() {
-  return (
-    <RequireAuth adminOnly>
-      <AdminLayout />
-    </RequireAuth>
-  );
-}
 
 export const router = createBrowserRouter([
   {
@@ -52,7 +37,7 @@ export const router = createBrowserRouter([
   },
   {
     path: '/app',
-    element: <ProtectedAppLayout />,
+    element: <RequireAuth><AppLayout /></RequireAuth>,
     children: [
       { index: true, element: <DashboardPage /> },
       { path: 'binding', element: <BindingPage /> },
@@ -63,7 +48,7 @@ export const router = createBrowserRouter([
   },
   {
     path: '/admin',
-    element: <ProtectedAdminLayout />,
+    element: <RequireAuth adminOnly><AdminLayout /></RequireAuth>,
     children: [
       { index: true, element: <AdminDashboardPage /> },
       { path: 'users', element: <UsersPage /> },

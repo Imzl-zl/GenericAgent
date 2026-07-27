@@ -75,6 +75,8 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("PUT /v1/admin/llm-providers/{provider_id}", s.auth(s.handleAdminUpdateLLMProvider))
 		s.mux.HandleFunc("DELETE /v1/admin/llm-providers/{provider_id}", s.auth(s.handleAdminDeleteLLMProvider))
 		s.mux.HandleFunc("POST /v1/admin/llm-providers/{provider_id}/default", s.auth(s.handleAdminSetDefaultLLMProvider))
+		s.mux.HandleFunc("POST /v1/admin/llm-providers/{provider_id}/disable", s.auth(s.handleAdminDisableLLMProvider))
+		s.mux.HandleFunc("POST /v1/admin/llm-providers/{provider_id}/enable", s.auth(s.handleAdminEnableLLMProvider))
 
 	}
 	// Dashboard statistics endpoint

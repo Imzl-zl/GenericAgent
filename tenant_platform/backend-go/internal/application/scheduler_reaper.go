@@ -8,6 +8,22 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
+func (s *scheduler) cleanupExpiredCapabilityRevocations(ctx context.Context, now time.Time) error {
+	interval := s.cfg.RevocationCleanupInterval
+	if s.cfg.CapabilityStore == nil || interval <= 0 {
+		return nil
+	}
+	now = now.UTC()
+	if !s.lastRevocationCleanup.IsZero() && now.Before(s.lastRevocationCleanup.Add(interval)) {
+		return nil
+	}
+	if _, err := s.cfg.CapabilityStore.DeleteExpiredCapabilityRevocations(ctx, now); err != nil {
+		return err
+	}
+	s.lastRevocationCleanup = now
+	return nil
+}
+
 // reapIdleTasks finalizes running tasks whose last_activity_at is older than
 // now-idle. This is the "Worker alive but deadlocked" detector (Temporal
 // HeartbeatTimeout pattern). Legitimate long tasks keep last_activity_at fresh

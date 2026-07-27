@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
@@ -43,7 +44,6 @@ func (s *scheduler) resolveRoutingSnapshot(ctx context.Context) (routingSnapshot
 	}
 	defaultCount := 0
 	seen := make(map[int64]struct{}, len(providers))
-	routing := make([]routingProvider, 0, len(providers))
 	for index, provider := range providers {
 		if provider.IsDefault {
 			defaultCount++
@@ -61,14 +61,14 @@ func (s *scheduler) resolveRoutingSnapshot(ctx context.Context) (routingSnapshot
 		if err := provider.SessionConfig.Validate(provider.ProviderType); err != nil {
 			return routingSnapshot{}, fmt.Errorf("provider %d session config: %w", provider.ID, err)
 		}
-		routing = append(routing, routingProvider{
-			ID: provider.ID, Revision: provider.Revision, ProviderType: provider.ProviderType,
-			Model: provider.Model, RuntimeName: runtimeProviderName(provider.ID),
-			SessionConfig: provider.SessionConfig,
-		})
 	}
 	if defaultCount != 1 {
 		return routingSnapshot{}, fmt.Errorf("exactly one default LLM provider is required, got %d", defaultCount)
+	}
+
+	routing := make([]routingProvider, 0, len(providers))
+	for _, provider := range providers {
+		routing = append(routing, newRoutingProvider(provider))
 	}
 	encoded, err := json.Marshal(routing)
 	if err != nil {
@@ -78,12 +78,42 @@ func (s *scheduler) resolveRoutingSnapshot(ctx context.Context) (routingSnapshot
 	return routingSnapshot{ID: "sha256:" + hex.EncodeToString(digest[:]), Providers: routing}, nil
 }
 
-func (s *scheduler) routingSnapshotRequiresReplacement(ctx context.Context, snapshot routingSnapshot) (bool, error) {
-	current, err := s.resolveRoutingSnapshot(ctx)
-	if err != nil {
-		return false, err
+func newRoutingProvider(provider domain.LLMProvider) routingProvider {
+	return routingProvider{
+		ID: provider.ID, Revision: provider.Revision, ProviderType: provider.ProviderType,
+		Model: provider.Model, RuntimeName: runtimeProviderName(provider.ID),
+		SessionConfig: provider.SessionConfig,
 	}
-	return current.ID != snapshot.ID, nil
+}
+
+func routingProvidersEqual(left, right routingProvider) bool {
+	return left.ID == right.ID &&
+		left.Revision == right.Revision &&
+		left.ProviderType == right.ProviderType &&
+		left.Model == right.Model &&
+		left.RuntimeName == right.RuntimeName &&
+		reflect.DeepEqual(left.SessionConfig, right.SessionConfig)
+}
+
+func (s *scheduler) routingSnapshotRequiresReplacement(ctx context.Context, snapshot routingSnapshot) (bool, error) {
+	providers, err := s.cfg.LLMProvider.ListActiveProviders(ctx)
+	if err != nil {
+		return false, fmt.Errorf("list active LLM providers: %w", err)
+	}
+	if len(providers) != len(snapshot.Providers) {
+		return true, nil
+	}
+	currentByID := make(map[int64]domain.LLMProvider, len(providers))
+	for _, provider := range providers {
+		currentByID[provider.ID] = provider
+	}
+	for _, bound := range snapshot.Providers {
+		current, active := currentByID[bound.ID]
+		if !active || !routingProvidersEqual(newRoutingProvider(current), bound) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type routingAuditDetail struct {

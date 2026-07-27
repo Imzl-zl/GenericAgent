@@ -148,6 +148,17 @@ func (c ProviderTransportConfig) EffectiveAuthMode() ProviderAuthMode {
 	return c.AuthMode
 }
 
+type LLMProviderState string
+
+const (
+	ProviderActive   LLMProviderState = "active"
+	ProviderDisabled LLMProviderState = "disabled"
+)
+
+func (s LLMProviderState) Valid() bool {
+	return s == ProviderActive || s == ProviderDisabled
+}
+
 type LLMProviderCreate struct {
 	Name             string
 	ProviderType     LLMProviderType
@@ -179,12 +190,12 @@ type LLMProvider struct {
 	TransportConfig ProviderTransportConfig
 	Revision        int64
 	IsDefault       bool
-	State           string
+	State           LLMProviderState
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
 
-func (p LLMProvider) IsActive() bool { return p.State != "disabled" }
+func (p LLMProvider) IsActive() bool { return p.State == ProviderActive }
 
 func (p LLMProvider) SessionConfigJSON() ([]byte, error) {
 	return json.Marshal(p.SessionConfig)

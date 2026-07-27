@@ -48,11 +48,12 @@ type SchedulerConfig struct {
 	// the scheduler wraps it in a static runtime.
 	DialWorker func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(), error)
 	// LLM Proxy capability issuance. Required for real Worker paths.
-	TokenIssuer        *llmproxy.Issuer
-	CapabilityStore    CapabilityStore
-	Audit              AuditRecorder
-	LLMProxyAddr       string
-	ModelPolicyVersion string
+	TokenIssuer               *llmproxy.Issuer
+	CapabilityStore           CapabilityStore
+	RevocationCleanupInterval time.Duration
+	Audit                     AuditRecorder
+	LLMProxyAddr              string
+	ModelPolicyVersion        string
 	// LLMProvider resolves an immutable provider routing snapshot per Worker.
 	LLMProvider LLMProviderSource
 	// TokenTTL must cover a complete task plus the pre-dispatch refresh skew.
@@ -100,6 +101,7 @@ type LLMProviderSource interface {
 
 type CapabilityStore interface {
 	RevokeCapability(ctx context.Context, jti string, expiresAt time.Time) error
+	DeleteExpiredCapabilityRevocations(ctx context.Context, before time.Time) (int64, error)
 }
 
 const (
@@ -109,9 +111,10 @@ const (
 	defaultMaxOutputBytes     = 256 * 1024
 	defaultWorkerShutdownSecs = 5
 
-	DefaultTokenRefreshSkew = 5 * time.Minute
-	DefaultMaxTaskWallClock = 45 * time.Minute
-	workerShutdownTimeout   = defaultWorkerShutdownSecs * time.Second
+	DefaultTokenRefreshSkew          = 5 * time.Minute
+	DefaultMaxTaskWallClock          = 45 * time.Minute
+	defaultRevocationCleanupInterval = time.Minute
+	workerShutdownTimeout            = defaultWorkerShutdownSecs * time.Second
 )
 
 // ErrLeaseExpired is re-exported from domain for callers in the application
@@ -119,12 +122,13 @@ const (
 var ErrLeaseExpired = domain.ErrLeaseExpired
 
 type scheduler struct {
-	cfg          SchedulerConfig
-	mu           sync.Mutex
-	workerCallMu sync.Mutex
-	wake         chan struct{}
-	workers      map[string]*workerEntry // session_key -> dedicated worker
-	cancelOnce   sync.Map                // taskID -> *cancelCall
+	cfg                   SchedulerConfig
+	mu                    sync.Mutex
+	workerCallMu          sync.Mutex
+	wake                  chan struct{}
+	workers               map[string]*workerEntry // session_key -> dedicated worker
+	cancelOnce            sync.Map                // taskID -> *cancelCall
+	lastRevocationCleanup time.Time
 }
 
 // NewScheduler validates config and constructs the scheduler.
@@ -177,6 +181,12 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 	}
 	if err := validateSchedulerCredentialTiming(cfg); err != nil {
 		return nil, err
+	}
+	if cfg.RevocationCleanupInterval < 0 {
+		return nil, fmt.Errorf("SchedulerConfig.RevocationCleanupInterval must not be negative")
+	}
+	if cfg.RevocationCleanupInterval == 0 && cfg.CapabilityStore != nil {
+		cfg.RevocationCleanupInterval = defaultRevocationCleanupInterval
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = time.Second
@@ -246,6 +256,9 @@ func (s *scheduler) Run(ctx context.Context) error {
 }
 
 func (s *scheduler) tick(ctx context.Context) error {
+	if err := s.cleanupExpiredCapabilityRevocations(ctx, time.Now().UTC()); err != nil {
+		slog.ErrorContext(ctx, "scheduler: cleanup expired capability revocations failed", "error", err)
+	}
 	// Recover newly expired foreign-owner work opportunistically.
 	if _, err := s.cfg.Store.RecoverAfterRestart(ctx, s.cfg.PlatformInstanceID); err != nil {
 		return err

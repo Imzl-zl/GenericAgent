@@ -28,7 +28,20 @@ export function PersonaReviewPage() {
   };
 
   useEffect(() => {
-    loadPersonas();
+    let active = true;
+    void listPendingPersonas()
+      .then((list) => {
+        if (active) setPersonas(list);
+      })
+      .catch((err: unknown) => {
+        if (active) setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '加载失败');
+      })
+      .finally(() => {
+        if (active) setIsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const handleModerate = async (id: string, approve: boolean) => {
