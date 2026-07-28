@@ -2,14 +2,11 @@ package worker
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -91,14 +88,12 @@ func (r *LoopbackWorkerRuntime) Start(ctx context.Context, req StartRequest) (*I
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start python worker: %w", err)
 	}
-	listenAddr, err := waitWorkerListen(stdout, workerStartTimeout)
+	listenAddr, err := WaitWorkerListen(stdout, workerStartTimeout)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
-		rest, _ := io.ReadAll(stdout)
-		return nil, fmt.Errorf("%w\nworker output:\n%s", err, string(rest))
+		return nil, err
 	}
-	go func() { _, _ = io.Copy(io.Discard, stdout) }()
 	if !isLoopbackAddr(listenAddr) {
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("worker not loopback: %s", listenAddr)
@@ -154,8 +149,6 @@ func (s *StaticRuntime) Start(ctx context.Context, req StartRequest) (*Instance,
 
 const workerShutdownTimeout = 5 * time.Second
 
-var workerListenRE = regexp.MustCompile(`WORKER_LISTEN=(\S+)`)
-
 const workerStartTimeout = 30 * time.Second
 
 type processCleaner struct {
@@ -172,28 +165,6 @@ func (c processCleaner) run(timeout time.Duration) {
 	_ = c.closeConn()
 	_ = c.killProcess()
 	_ = c.waitProcess()
-}
-
-func waitWorkerListen(r io.Reader, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 512)
-	for time.Now().Before(deadline) {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if m := workerListenRE.FindSubmatch(buf); m != nil {
-				return string(m[1]), nil
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return "", fmt.Errorf("worker exited before WORKER_LISTEN; output:\n%s", string(buf))
-			}
-			return "", err
-		}
-	}
-	return "", fmt.Errorf("timeout waiting for WORKER_LISTEN; output:\n%s", string(buf))
 }
 
 func isLoopbackAddr(addr string) bool {

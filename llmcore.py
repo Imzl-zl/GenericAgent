@@ -5,6 +5,22 @@ _RESP_CACHE_KEY = str(uuid.uuid4()); _RESP_CODEX_KEY = str(uuid.uuid4())
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path: sys.path.append(_ROOT)
 
+_HTTP_POOL_CONNECTIONS = 8
+_HTTP_POOL_MAXSIZE = 32
+
+def _build_http_session():
+    sess = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=_HTTP_POOL_CONNECTIONS,
+        pool_maxsize=_HTTP_POOL_MAXSIZE,
+        max_retries=0,
+    )
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+_CONFIG_HTTP = _build_http_session()
+
 def _load_mykeys():
     global _mykey_path
     try:
@@ -19,7 +35,7 @@ def _load_mykeys():
     p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
     if not os.path.exists(p): raise Exception('[ERROR] mykey.py not found in sys.path and mykey.json not found. Run "python configure_mykey.py" or copy mykey_template.py to mykey.py and fill in your keys.')
     with open(_mykey_path := p, encoding='utf-8') as f: mk = json.load(f)
-    if isinstance(mk, dict) and 'remote_url' in mk: return requests.get(mk['remote_url'], timeout=10).json()
+    if isinstance(mk, dict) and 'remote_url' in mk: return _CONFIG_HTTP.get(mk['remote_url'], timeout=10).json()
     return mk
 
 _mykey_lock = threading.Lock()
@@ -387,8 +403,8 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
     for attempt in range(sess.max_retries + 1):
         streamed = False
         try:
-            with requests.post(url, headers=headers, json=payload, stream=sess.stream, 
-                               timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
+            with sess.http.post(url, headers=headers, json=payload, stream=sess.stream,
+                                timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
                 if r.status_code >= 400:
                     #pathlib.Path(__file__).parent.joinpath('temp','bad_requests.json').write_text(json.dumps({"url":url,"headers":headers,"payload":payload,"t":time.time()},ensure_ascii=False),encoding='utf-8')
                     if r.status_code in _RETRYABLE and attempt < sess.max_retries:
@@ -579,6 +595,7 @@ class BaseSession:
         self.max_tokens = cfg.get('max_tokens')
         self.default_ua = "claude-cli/2.1.152 (external, cli)"
         self.user_agent = cfg.get("user_agent", self.default_ua)
+        self.http = _build_http_session()
     def _apply_claude_thinking(self, payload):
         if self.thinking_type:
             thinking = {"type": self.thinking_type}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 )
@@ -40,7 +41,22 @@ func apiFixture(t *testing.T) (*Server, string) {
 		t.Fatal(err)
 	}
 	srv, err := NewServer(ServerConfig{
-		Service: svc, Registry: reg, DevToken: "test-dev-token", DevUserID: 9, SessionKey: dev.SessionKey,
+		Service:   svc,
+		Registry:  reg,
+		TaskStats: store,
+		RuntimeProfile: RuntimeProfile{
+			ClaimLeaseSeconds:       60,
+			TokenTTLSeconds:         3600,
+			TokenRefreshSkewSeconds: 300,
+			MaxTaskWallClockSeconds: 2700,
+			TaskTimeoutSeconds:      0,
+			TaskIdleTimeoutSeconds:  300,
+			WorkerIdleTTLSeconds:    600,
+			MaxRunningTasks:         16,
+			PerTenantRunningLimit:   4,
+			PerUserQueueLimit:       8,
+		},
+		DevToken: "test-dev-token", DevUserID: 9, SessionKey: dev.SessionKey,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -129,5 +145,108 @@ func TestResultRejectsPathLikeRef(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code == 200 {
 		t.Fatal("path-like ref must be rejected")
+	}
+}
+
+type dashboardFakeTaskService struct{}
+
+type dashboardFakeRegistry struct{}
+
+type dashboardFakeUserService struct {
+	pending  int
+	approved int
+}
+
+type dashboardFakeTaskStats struct{ running int }
+
+func (dashboardFakeTaskService) SubmitTask(context.Context, domain.SubmitTaskCommand) (domain.Task, error) {
+	return domain.Task{}, nil
+}
+func (dashboardFakeTaskService) GetTask(context.Context, string) (domain.Task, error) {
+	return domain.Task{}, nil
+}
+func (dashboardFakeTaskService) CancelTask(context.Context, string, int64) (domain.Task, error) {
+	return domain.Task{}, nil
+}
+func (dashboardFakeTaskService) ClaimNextTask(context.Context, string, string) (domain.Task, bool, error) {
+	return domain.Task{}, false, nil
+}
+func (dashboardFakeTaskService) RecoverAfterRestart(context.Context, string) error { return nil }
+func (dashboardFakeTaskService) ReadResult(context.Context, string) (domain.ResultPayload, error) {
+	return domain.ResultPayload{}, nil
+}
+
+func (dashboardFakeRegistry) Digest() string { return "sha256:test" }
+func (dashboardFakeRegistry) Resolve(string, string) (policy.ToolPolicy, error) {
+	return policy.ToolPolicy{Version: "foundation.no-host-tools.v1", AllowedTools: []string{"read"}}, nil
+}
+
+func (f dashboardFakeUserService) CreateUser(context.Context, string, string) (domain.User, error) {
+	return domain.User{}, nil
+}
+func (f dashboardFakeUserService) ApproveUser(context.Context, int64) (domain.User, error) {
+	return domain.User{}, nil
+}
+func (f dashboardFakeUserService) BlockUser(context.Context, int64) (domain.User, error) {
+	return domain.User{}, nil
+}
+func (f dashboardFakeUserService) ListPendingUsers(context.Context) ([]domain.User, error) {
+	return nil, nil
+}
+func (f dashboardFakeUserService) CountPendingUsers(context.Context) (int, error) {
+	return f.pending, nil
+}
+func (f dashboardFakeUserService) CountApprovedUsers(context.Context) (int, error) {
+	return f.approved, nil
+}
+
+func (f dashboardFakeTaskStats) CountRunningTasks(context.Context) (int, error) {
+	return f.running, nil
+}
+
+func TestAdminDashboardStatsExposeRuntimeProfileAndRunningTasks(t *testing.T) {
+	srv, err := NewServer(ServerConfig{
+		Service:   dashboardFakeTaskService{},
+		Users:     dashboardFakeUserService{pending: 2, approved: 5},
+		TaskStats: dashboardFakeTaskStats{running: 3},
+		Registry:  dashboardFakeRegistry{},
+		RuntimeProfile: RuntimeProfile{
+			ClaimLeaseSeconds:       60,
+			TokenTTLSeconds:         3600,
+			TokenRefreshSkewSeconds: 300,
+			MaxTaskWallClockSeconds: 2700,
+			TaskTimeoutSeconds:      0,
+			TaskIdleTimeoutSeconds:  300,
+			WorkerIdleTTLSeconds:    600,
+			MaxRunningTasks:         16,
+			PerTenantRunningLimit:   4,
+			PerUserQueueLimit:       8,
+		},
+		DevToken:  "test-dev-token",
+		DevUserID: 9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/dashboard/stats", nil)
+	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("dashboard status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var stats dashboardStatsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.PendingUsers != 2 || stats.ApprovedUsers != 5 || stats.RunningTasks != 3 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	if stats.RuntimeProfile.MaxTaskWallClockSeconds != 2700 || stats.RuntimeProfile.TaskIdleTimeoutSeconds != 300 {
+		t.Fatalf("runtime profile=%+v", stats.RuntimeProfile)
+	}
+	if stats.RuntimeProfile.TokenTTLSeconds != 3600 || stats.RuntimeProfile.PerUserQueueLimit != 8 {
+		t.Fatalf("runtime profile=%+v", stats.RuntimeProfile)
 	}
 }

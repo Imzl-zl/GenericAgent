@@ -510,6 +510,18 @@ def test_start_session_conflict_returns_session_already_started(roots, foundatio
     assert ei2.value.code == "SESSION_ALREADY_STARTED"
 
 
+def test_start_session_enables_incremental_output_for_worker_agent(roots, foundation_registry):
+    class IncrementalAgent(ScriptedAgent):
+        def __init__(self):
+            super().__init__()
+            self.inc_out = False
+
+    adapter = _make_adapter(roots, foundation_registry, IncrementalAgent)
+    adapter.start_session(_start_req())
+    assert adapter._session is not None
+    assert adapter._session.agent.inc_out is True
+
+
 def test_execute_task_maps_next_and_done(roots, foundation_registry):
     agent_holder: dict[str, ScriptedAgent] = {}
 

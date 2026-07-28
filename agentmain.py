@@ -53,6 +53,8 @@ class GenericAgent:
         self.inc_out = False; self.verbose = True
         self.peer_hint = True
         self.force_non_stream = False
+        self._shutdown = False
+        self._runner_thread = None
         logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
         self.log_path = os.path.join(script_dir, f'temp/model_responses/model_responses_{logid}.txt')
         self.llmclient = None
@@ -111,8 +113,22 @@ class GenericAgent:
         print('Abort current task...')
         self.stop_sig = True
         if self.handler is not None: self.handler.code_stop_signal.append(1)
-            
+
+    def shutdown(self, join_timeout=1.0):
+        with self.lock:
+            if self._shutdown:
+                runner = self._runner_thread
+            else:
+                self._shutdown = True
+                runner = self._runner_thread
+        self.abort()
+        try: self.task_queue.put("STOP")
+        except Exception: pass
+        if runner is not None and runner.is_alive() and runner is not threading.current_thread():
+            runner.join(timeout=join_timeout)
+
     def put_task(self, query, source="user", images=None):
+        if self._shutdown: raise RuntimeError('GenericAgent is shut down')
         display_queue = queue.Queue()
         self.task_queue.put({"query": query, "source": source, "images": images or [], "output": display_queue})
         return display_queue
@@ -134,9 +150,15 @@ class GenericAgent:
         return raw_query
 
     def run(self):
+        self._runner_thread = threading.current_thread()
         while True:
             task = self.task_queue.get()
             if isinstance(task, str): break
+            if self._shutdown:
+                try: task["output"].put({"done": "", "error": "GenericAgent is shutting down", "source": task.get("source", "system")})
+                except Exception: pass
+                self.task_queue.task_done()
+                continue
             raw_query, source, display_queue = task["query"], task["source"], task["output"]
             raw_query = self._handle_slash_cmd(raw_query, display_queue)
             if raw_query is None:

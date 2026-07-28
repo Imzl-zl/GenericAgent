@@ -162,6 +162,13 @@ class DiscordApp(AgentChatMixin):
             print(f"[Discord] deactivate abort failed for {chat_id}: {e}")
         return changed
 
+    def _shutdown_agent(self, chat_id, ga, reason):
+        try:
+            ga.shutdown()
+            print(f"[Discord] shutdown agent: {chat_id} ({reason})")
+        except Exception as e:
+            print(f"[Discord] shutdown failed for {chat_id} ({reason}): {e}")
+
     def _get_agent(self, chat_id):
         with self._agent_lock:
             ga = self._agents.get(chat_id)
@@ -171,7 +178,8 @@ class DiscordApp(AgentChatMixin):
                 self._agents[chat_id] = ga
                 threading.Thread(target=ga.run, daemon=True, name=f"discord-agent-{chat_id}").start()
                 if len(self._agents) > 200:
-                    old_chat_id, _old_agent = self._agents.popitem(last=False)
+                    old_chat_id, old_agent = self._agents.popitem(last=False)
+                    self._shutdown_agent(old_chat_id, old_agent, "lru-evict")
                     print(f"[Discord] dropped agent cache entry: {old_chat_id}")
             else:
                 self._agents.move_to_end(chat_id)

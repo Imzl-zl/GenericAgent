@@ -307,7 +307,7 @@ func (s *scheduler) tick(ctx context.Context) error {
 	//      path finalizes the task on the next tick.
 	//   3. Idle timeout — Worker alive but deadlocked (LLM HTTP call hung, GIL
 	//      deadlock, infinite loop). Reaper checks last_activity_at (updated by
-	//      RecordChunkEvent on every chunk and RecordHeartbeat on drain poll)
+	//      windowed RecordChunkEvent writes and RecordHeartbeat on drain poll)
 	//      against TASK_IDLE_TIMEOUT_SECONDS. Legitimate long tasks keep
 	//      producing chunks or heartbeats, so they are not reaped.
 	if s.cfg.IdleTimeout > 0 {

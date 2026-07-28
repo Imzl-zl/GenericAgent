@@ -23,22 +23,24 @@ const MaxRequestBodyBytes int64 = 1 << 20 // 1 MiB
 
 // Server is the loopback HTTP API.
 type Server struct {
-	svc           application.TaskService
-	users         application.UserService
-	wechatBinding application.WechatQRBindingService
-	botSvc        application.BotService
-	invite        application.InviteService
-	personas      application.PersonaService
-	router        application.Router
-	registry      policy.Registry
-	policies      PolicyStore
-	bots          BotStore
-	llmProviders  LLMProviderStore
-	botLifecycle  application.BotLifecycleService
-	cipher        secret.TokenCipher
-	devToken      string
-	devUserID     int64
-	sessionKey    string
+	svc            application.TaskService
+	users          application.UserService
+	wechatBinding  application.WechatQRBindingService
+	botSvc         application.BotService
+	invite         application.InviteService
+	personas       application.PersonaService
+	router         application.Router
+	registry       policy.Registry
+	policies       PolicyStore
+	bots           BotStore
+	llmProviders   LLMProviderStore
+	botLifecycle   application.BotLifecycleService
+	taskStats      TaskStoreStats
+	runtimeProfile RuntimeProfile
+	cipher         secret.TokenCipher
+	devToken       string
+	devUserID      int64
+	sessionKey     string
 	// webhookSecret is the HMAC-SHA256 key shared with the Bot Poller. When
 	// non-empty, /v1/im/webhook rejects requests whose X-Webhook-Signature
 	// header doesn't match. Empty = unauthenticated (dev/test only; logs once).
@@ -82,23 +84,38 @@ type Cipher interface {
 }
 
 // ServerConfig configures the foundation API.
+type RuntimeProfile struct {
+	ClaimLeaseSeconds       int `json:"claim_lease_seconds"`
+	TokenTTLSeconds         int `json:"token_ttl_seconds"`
+	TokenRefreshSkewSeconds int `json:"token_refresh_skew_seconds"`
+	MaxTaskWallClockSeconds int `json:"max_task_wall_clock_seconds"`
+	TaskTimeoutSeconds      int `json:"task_timeout_seconds"`
+	TaskIdleTimeoutSeconds  int `json:"task_idle_timeout_seconds"`
+	WorkerIdleTTLSeconds    int `json:"worker_idle_ttl_seconds"`
+	MaxRunningTasks         int `json:"max_running_tasks"`
+	PerTenantRunningLimit   int `json:"per_tenant_running_limit"`
+	PerUserQueueLimit       int `json:"per_user_queue_limit"`
+}
+
 type ServerConfig struct {
-	Service       application.TaskService
-	Users         application.UserService
-	WechatBinding application.WechatQRBindingService
-	BotService    application.BotService
-	Invite        application.InviteService
-	Personas      application.PersonaService
-	Router        application.Router
-	Registry      policy.Registry
-	Policies      PolicyStore
-	Bots          BotStore
-	LLMProviders  LLMProviderStore
-	BotLifecycle  application.BotLifecycleService
-	Cipher        secret.TokenCipher
-	DevToken      string
-	DevUserID     int64
-	SessionKey    string
+	Service        application.TaskService
+	Users          application.UserService
+	WechatBinding  application.WechatQRBindingService
+	BotService     application.BotService
+	Invite         application.InviteService
+	Personas       application.PersonaService
+	Router         application.Router
+	Registry       policy.Registry
+	Policies       PolicyStore
+	Bots           BotStore
+	LLMProviders   LLMProviderStore
+	BotLifecycle   application.BotLifecycleService
+	TaskStats      TaskStoreStats
+	RuntimeProfile RuntimeProfile
+	Cipher         secret.TokenCipher
+	DevToken       string
+	DevUserID      int64
+	SessionKey     string
 	// WebhookSecret, when set, requires Bot Poller requests to /v1/im/webhook
 	// to carry a valid X-Webhook-Signature header (HMAC-SHA256 over body).
 	WebhookSecret string
@@ -119,24 +136,26 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.SessionKey = fmt.Sprintf("personal:%d", cfg.DevUserID)
 	}
 	s := &Server{
-		svc:           cfg.Service,
-		users:         cfg.Users,
-		wechatBinding: cfg.WechatBinding,
-		botSvc:        cfg.BotService,
-		invite:        cfg.Invite,
-		personas:      cfg.Personas,
-		router:        cfg.Router,
-		registry:      cfg.Registry,
-		policies:      cfg.Policies,
-		bots:          cfg.Bots,
-		llmProviders:  cfg.LLMProviders,
-		botLifecycle:  cfg.BotLifecycle,
-		cipher:        cfg.Cipher,
-		devToken:      cfg.DevToken,
-		devUserID:     cfg.DevUserID,
-		sessionKey:    cfg.SessionKey,
-		webhookSecret: cfg.WebhookSecret,
-		mux:           http.NewServeMux(),
+		svc:            cfg.Service,
+		users:          cfg.Users,
+		wechatBinding:  cfg.WechatBinding,
+		botSvc:         cfg.BotService,
+		invite:         cfg.Invite,
+		personas:       cfg.Personas,
+		router:         cfg.Router,
+		registry:       cfg.Registry,
+		policies:       cfg.Policies,
+		bots:           cfg.Bots,
+		llmProviders:   cfg.LLMProviders,
+		botLifecycle:   cfg.BotLifecycle,
+		taskStats:      cfg.TaskStats,
+		runtimeProfile: cfg.RuntimeProfile,
+		cipher:         cfg.Cipher,
+		devToken:       cfg.DevToken,
+		devUserID:      cfg.DevUserID,
+		sessionKey:     cfg.SessionKey,
+		webhookSecret:  cfg.WebhookSecret,
+		mux:            http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.auth(s.handleCreateTask))

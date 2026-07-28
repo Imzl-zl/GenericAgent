@@ -27,8 +27,8 @@ func (s *scheduler) cleanupExpiredCapabilityRevocations(ctx context.Context, now
 // reapIdleTasks finalizes running tasks whose last_activity_at is older than
 // now-idle. This is the "Worker alive but deadlocked" detector (Temporal
 // HeartbeatTimeout pattern). Legitimate long tasks keep last_activity_at fresh
-// via RecordChunkEvent (each chunk) and RecordHeartbeat (drain poll), so they
-// are NOT reaped. Only called when SchedulerConfig.IdleTimeout > 0.
+// via windowed RecordChunkEvent writes and RecordHeartbeat (drain poll), so
+// they are NOT reaped. Only called when SchedulerConfig.IdleTimeout > 0.
 func (s *scheduler) reapIdleTasks(ctx context.Context, owned []domain.Task, idle time.Duration) error {
 	cutoff := time.Now().UTC().Add(-idle)
 	for _, t := range owned {

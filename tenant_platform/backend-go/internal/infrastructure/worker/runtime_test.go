@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,6 +58,54 @@ func TestProcessCleanerBoundsShutdownAndContinuesCleanup(t *testing.T) {
 	if !closeCalled.Load() || !killCalled.Load() || !waitCalled.Load() {
 		t.Fatalf("cleanup did not continue: close=%v kill=%v wait=%v", closeCalled.Load(), killCalled.Load(), waitCalled.Load())
 	}
+}
+
+type blockingReader struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingReader) Read(_ []byte) (int, error) {
+	select {
+	case <-r.started:
+	default:
+		close(r.started)
+	}
+	<-r.release
+	return 0, io.EOF
+}
+
+func TestWaitWorkerListenFindsAddressAcrossOutput(t *testing.T) {
+	addr, err := WaitWorkerListen(strings.NewReader("booting\nWORKER_LISTEN=127.0.0.1:43123\nmore logs\n"), 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitWorkerListen: %v", err)
+	}
+	if addr != "127.0.0.1:43123" {
+		t.Fatalf("addr=%q", addr)
+	}
+}
+
+func TestWaitWorkerListenTimesOutEvenWhenPipeReadBlocks(t *testing.T) {
+	reader := &blockingReader{started: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		_, err := WaitWorkerListen(reader, 50*time.Millisecond)
+		done <- err
+	}()
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not start")
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "timeout waiting for WORKER_LISTEN") {
+			t.Fatalf("err=%v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("WaitWorkerListen did not honor timeout")
+	}
+	close(reader.release)
 }
 
 func TestBuildWorkerEnvironmentExcludesInheritedPlatformSecrets(t *testing.T) {

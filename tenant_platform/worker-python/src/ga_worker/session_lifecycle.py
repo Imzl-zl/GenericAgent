@@ -143,6 +143,12 @@ class SessionLifecycleMixin:
             agent = agent_cls()
         else:
             agent = self.agent_factory()
+        # Formal Worker path streams deltas only. Legacy frontends opt into
+        # inc_out individually; forcing it here keeps gRPC payloads, in-memory
+        # display history, and chunk-event persistence linear instead of O(n²)
+        # cumulative-text replay.
+        if hasattr(agent, "inc_out"):
+            agent.inc_out = True
         if hasattr(agent, "handler"):
             agent.handler = None
         return agent

@@ -89,14 +89,15 @@ type TaskStoreStats interface {
 }
 
 type dashboardStatsResponse struct {
-	PendingUsers  int `json:"pending_users"`
-	ApprovedUsers int `json:"approved_users"`
-	RunningTasks  int `json:"running_tasks"`
-	ActiveWorkers int `json:"active_workers"`
+	PendingUsers   int            `json:"pending_users"`
+	ApprovedUsers  int            `json:"approved_users"`
+	RunningTasks   int            `json:"running_tasks"`
+	ActiveWorkers  int            `json:"active_workers"`
+	RuntimeProfile RuntimeProfile `json:"runtime_profile"`
 }
 
 func (s *Server) handleAdminDashboardStats(w http.ResponseWriter, r *http.Request) {
-	stats := dashboardStatsResponse{}
+	stats := dashboardStatsResponse{RuntimeProfile: s.runtimeProfile}
 
 	// 查询待审批用户数
 	if s.users != nil {
@@ -109,9 +110,11 @@ func (s *Server) handleAdminDashboardStats(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 查询运行中任务数
-	// TODO: 需要通过 TaskStoreStats 接口访问，或者让 TaskService 暴露此方法
-	// 当前暂时返回 0
-	stats.RunningTasks = 0
+	if s.taskStats != nil {
+		if running, err := s.taskStats.CountRunningTasks(r.Context()); err == nil {
+			stats.RunningTasks = running
+		}
+	}
 
 	// TODO: 活跃 Worker 数统计（需要实现 Worker 心跳机制）
 	// 目前暂时返回 0

@@ -152,6 +152,20 @@
   color: var(--text-muted);
 }
 
+.admin-chip-value {
+  flex: 0 0 auto;
+  min-width: 88px;
+  padding: 6px 10px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
 .provider-page {
   max-width: 1440px;
 }

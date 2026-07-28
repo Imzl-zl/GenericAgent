@@ -12,36 +12,33 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
+	workerruntime "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/worker"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
-	testToken            = "test-worker-token-not-a-real-key"
-	capabilityVersion    = "foundation.v1"
-	toolPolicyVersion    = "foundation.no-host-tools.v1"
-	defaultTaskID        = "loopback-task-1"
-	defaultSessionKey    = "personal:1"
-	workerStartTimeout   = 30 * time.Second
-	taskTimeout          = 90 * time.Second
-	healthPollInterval   = 200 * time.Millisecond
-	fixtureResponseText  = "loopback-fixture-reply"
+	testToken           = "test-worker-token-not-a-real-key"
+	capabilityVersion   = "foundation.v1"
+	toolPolicyVersion   = "foundation.no-host-tools.v1"
+	defaultTaskID       = "loopback-task-1"
+	defaultSessionKey   = "personal:1"
+	workerStartTimeout  = 30 * time.Second
+	taskTimeout         = 90 * time.Second
+	healthPollInterval  = 200 * time.Millisecond
+	fixtureResponseText = "loopback-fixture-reply"
 )
-
-var workerListenRE = regexp.MustCompile(`WORKER_LISTEN=(\S+)`)
 
 type summary struct {
 	TaskID           string `json:"task_id"`
@@ -469,43 +466,14 @@ func startPythonWorker(python, workerSrc, configRoot, legacyRoot, runtimeDir, po
 		return nil, "", fmt.Errorf("start python worker: %w", err)
 	}
 
-	listenAddr, err := waitWorkerListen(stdout, workerStartTimeout)
+	listenAddr, err := workerruntime.WaitWorkerListen(stdout, workerStartTimeout)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
-		// Drain remaining for diagnostics.
-		rest, _ := io.ReadAll(stdout)
-		return nil, "", fmt.Errorf("%w\nworker output:\n%s", err, string(rest))
+		return nil, "", err
 	}
-
-	// Continue draining stdout in background so the pipe does not block.
-	go func() { _, _ = io.Copy(io.Discard, stdout) }()
 
 	return cmd, listenAddr, nil
-}
-
-func waitWorkerListen(r io.Reader, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 512)
-	for time.Now().Before(deadline) {
-		// Non-blocking-ish read with short deadline via SetReadDeadline not available on pipe;
-		// read with small chunks; process may block until line arrives.
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if m := workerListenRE.FindSubmatch(buf); m != nil {
-				return string(m[1]), nil
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return "", fmt.Errorf("worker exited before publishing WORKER_LISTEN; output:\n%s", string(buf))
-			}
-			return "", err
-		}
-	}
-	return "", fmt.Errorf("timeout waiting for WORKER_LISTEN; output so far:\n%s", string(buf))
 }
 
 func waitHealth(ctx context.Context, client workerclient.WorkerClient, wantReady bool) (*workerv1.HealthResponse, error) {

@@ -2,8 +2,6 @@ package application
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -175,8 +173,30 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	defer cancelExecute()
 	events, errs := client.ExecuteTask(executeCtx, req)
 	releaseWorkerCall()
-	var terminal *workerv1.Terminal
-	var streamErr error
+	recordChunkWindow := func(byteCount int, digest string) error {
+		if byteCount == 0 {
+			return nil
+		}
+		if err := s.cfg.Store.RecordChunkEvent(ctx, task.ID, byteCount, digest); err != nil {
+			cancelExecute()
+			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+				"CHUNK_EVENT_FAILED", err.Error(), "")
+			_ = s.KickSession(ctx, task.SessionKey)
+			return fmt.Errorf("record chunk event: %w", err)
+		}
+		return nil
+	}
+	flushChunkWindow := func(batch *chunkEventBatcher) error {
+		if byteCount, digest, ok := batch.Flush(); ok {
+			return recordChunkWindow(byteCount, digest)
+		}
+		return nil
+	}
+	var (
+		terminal   *workerv1.Terminal
+		streamErr  error
+		chunkBatch chunkEventBatcher
+	)
 	eventsOpen, errsOpen := true, true
 	for eventsOpen || errsOpen {
 		select {
@@ -194,23 +214,22 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			if ev.IsChunk() && ev.Chunk != nil {
 				text := ev.Chunk.GetText()
 				// Empty-text Chunk is a Worker heartbeat (see task_drain.HEARTBEAT_INTERVAL_S).
-				// Refresh last_activity_at without writing a chunk event, so the
-				// reaper does not trip during slow LLM thinking / file processing.
+				// Flush any pending chunk metadata window, then refresh
+				// last_activity_at without writing a synthetic chunk event.
 				if text == "" {
+					if err := flushChunkWindow(&chunkBatch); err != nil {
+						return err
+					}
 					if err := s.cfg.Store.RecordHeartbeat(ctx, task.ID); err != nil {
 						slog.WarnContext(ctx, "scheduler: record heartbeat failed",
 							"task_id", task.ID, "error", err)
 					}
 					continue
 				}
-				sum := sha256.Sum256([]byte(text))
-				digest := "sha256:" + hex.EncodeToString(sum[:])
-				if err := s.cfg.Store.RecordChunkEvent(ctx, task.ID, len([]byte(text)), digest); err != nil {
-					cancelExecute()
-					_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-						"CHUNK_EVENT_FAILED", err.Error(), "")
-					_ = s.KickSession(ctx, task.SessionKey)
-					return fmt.Errorf("record chunk event: %w", err)
+				if byteCount, digest, ok := chunkBatch.Add(text, time.Now()); ok {
+					if err := recordChunkWindow(byteCount, digest); err != nil {
+						return err
+					}
 				}
 			}
 			if ev.IsTerminal() {
@@ -226,6 +245,9 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 				streamErr = err
 			}
 		}
+	}
+	if err := flushChunkWindow(&chunkBatch); err != nil {
+		return err
 	}
 	if !time.Now().Before(taskDeadline) {
 		return s.finalizeTaskDeadline(ctx, task)
