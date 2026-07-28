@@ -77,6 +77,62 @@ export async function listPendingPersonas(): Promise<Persona[]> {
   return res.personas;
 }
 
+export async function adminListPersonas(status?: string): Promise<Persona[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : '';
+  const res = await api.get<PersonaListResponse>(`/v1/admin/personas${query}`);
+  return res.personas;
+}
+
+// adminListMyPersonas returns only personas authored by the admin (dev user),
+// including private/pending/rejected ones — used by the "我的人设" view.
+export async function adminListMyPersonas(): Promise<Persona[]> {
+  const res = await api.get<PersonaListResponse>('/v1/admin/personas?mine=true');
+  return res.personas;
+}
+
+export async function adminCreatePersona(
+  name: string,
+  description: string,
+  systemPrompt: string,
+  isPublic: boolean
+): Promise<Persona> {
+  return api.post<Persona>('/v1/admin/personas', {
+    name,
+    description,
+    system_prompt: systemPrompt,
+    is_public: isPublic,
+  } as CreatePersonaRequest);
+}
+
+export async function adminUpdatePersona(
+  id: string,
+  name: string,
+  description: string,
+  systemPrompt: string
+): Promise<Persona> {
+  return api.put<Persona>(`/v1/admin/personas/${id}`, {
+    name,
+    description,
+    system_prompt: systemPrompt,
+  });
+}
+
+export async function adminDeletePersona(id: string): Promise<{ deleted: boolean }> {
+  return api.delete<{ deleted: boolean }>(`/v1/admin/personas/${id}`);
+}
+
+export async function adminSetDefaultPersona(id: string): Promise<{ default_persona_id: string }> {
+  return api.post<{ default_persona_id: string }>('/v1/admin/me/default-persona', {
+    persona_id: id,
+  } as SetDefaultPersonaRequest);
+}
+
+export async function adminClearDefaultPersona(): Promise<{ default_persona_id: string }> {
+  return api.post<{ default_persona_id: string }>('/v1/admin/me/default-persona', {
+    persona_id: '',
+  } as SetDefaultPersonaRequest);
+}
+
 export async function approvePersona(id: string, note: string): Promise<{ id: string; status: string }> {
   return api.post<{ id: string; status: string }>(`/v1/admin/personas/${id}/approve`, { note } as ModeratePersonaRequest);
 }

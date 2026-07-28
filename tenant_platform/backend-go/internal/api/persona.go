@@ -180,6 +180,120 @@ func (s *Server) handleAdminListPendingPersonas(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, map[string]any{"personas": personaListReply(personas)})
 }
 
+// handleAdminListPersonas lists every persona for pool management. An optional
+// ?status= query filters by lifecycle status (private/pending/approved/rejected).
+// ?mine=true restricts the list to personas authored by the admin (dev user id).
+func (s *Server) handleAdminListPersonas(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	if r.URL.Query().Get("mine") == "true" {
+		personas, err := s.personas.ListByAuthor(r.Context(), s.devUserID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "PERSONA_LIST_FAILED", err.Error(), tid)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"personas": personaListReply(personas)})
+		return
+	}
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	if status != "" && !domain.IsValidPersonaStatus(domain.PersonaStatus(status)) {
+		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", "invalid status filter", tid)
+		return
+	}
+	personas, err := s.personas.ListAll(r.Context(), status)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "PERSONA_LIST_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"personas": personaListReply(personas)})
+}
+
+// handleAdminCreatePersona lets the admin author a persona under the platform
+// dev user id. Public personas are published straight to the pool (approved)
+// since the admin is the moderation authority.
+func (s *Server) handleAdminCreatePersona(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	var body personaBody
+	if err := decodeStrict(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+		return
+	}
+	if err := validatePersonaBody(body); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
+		return
+	}
+	p, err := s.personas.AdminCreatePersona(r.Context(), s.devUserID, body.Name, body.Description, body.SystemPrompt, body.IsPublic)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "PERSONA_CREATE_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusCreated, personaReply(p))
+}
+
+// handleAdminUpdatePersona edits any persona in the pool regardless of author.
+func (s *Server) handleAdminUpdatePersona(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	id := r.PathValue("persona_id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "INVALID_ID", "persona_id is required", tid)
+		return
+	}
+	var body personaBody
+	if err := decodeStrict(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+		return
+	}
+	if err := validatePersonaBody(body); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
+		return
+	}
+	p, err := s.personas.AdminUpdatePersona(r.Context(), id, s.devUserID, body.Name, body.Description, body.SystemPrompt)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "PERSONA_UPDATE_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, personaReply(p))
+}
+
+// handleAdminDeletePersona removes any persona from the pool regardless of
+// author. Users who had it as their default are cleared via ON DELETE SET NULL.
+func (s *Server) handleAdminDeletePersona(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	id := r.PathValue("persona_id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "INVALID_ID", "persona_id is required", tid)
+		return
+	}
+	if err := s.personas.AdminDeletePersona(r.Context(), id); err != nil {
+		writeErr(w, http.StatusBadRequest, "PERSONA_DELETE_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+// handleAdminSetDefaultPersona sets or clears the admin's own default persona
+// (applied to the admin's bound bot), using the platform dev user id.
+func (s *Server) handleAdminSetDefaultPersona(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	var body struct {
+		PersonaID string `json:"persona_id"`
+	}
+	if err := decodeStrict(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+		return
+	}
+	var err error
+	if body.PersonaID == "" {
+		err = s.personas.ClearDefault(r.Context(), s.devUserID)
+	} else {
+		err = s.personas.SetDefault(r.Context(), s.devUserID, body.PersonaID)
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "DEFAULT_PERSONA_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"default_persona_id": body.PersonaID})
+}
+
 type moderatePersonaBody struct {
 	Note string `json:"note"`
 }

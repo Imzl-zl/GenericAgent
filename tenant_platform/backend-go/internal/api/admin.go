@@ -58,6 +58,12 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("GET /v1/admin/personas/pending", s.auth(s.handleAdminListPendingPersonas))
 		s.mux.HandleFunc("POST /v1/admin/personas/{persona_id}/approve", s.auth(s.handleAdminApprovePersona))
 		s.mux.HandleFunc("POST /v1/admin/personas/{persona_id}/reject", s.auth(s.handleAdminRejectPersona))
+		// 管理员公共池管理 + 管理员自建人设（使用开发者 user_id）
+		s.mux.HandleFunc("GET /v1/admin/personas", s.auth(s.handleAdminListPersonas))
+		s.mux.HandleFunc("POST /v1/admin/personas", s.auth(s.handleAdminCreatePersona))
+		s.mux.HandleFunc("PUT /v1/admin/personas/{persona_id}", s.auth(s.handleAdminUpdatePersona))
+		s.mux.HandleFunc("DELETE /v1/admin/personas/{persona_id}", s.auth(s.handleAdminDeletePersona))
+		s.mux.HandleFunc("POST /v1/admin/me/default-persona", s.auth(s.handleAdminSetDefaultPersona))
 	}
 	if s.router != nil {
 		s.mux.HandleFunc("POST /v1/router/messages", s.auth(s.handleRouterMessage))
