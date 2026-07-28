@@ -31,6 +31,43 @@ func TestNewClientTrimsTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestConfigureInboundCoalescing(t *testing.T) {
+	var received struct {
+		WindowMS int `json:"inbound_coalesce_window_ms"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/config" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &received)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"inbound_coalesce_window_ms":1800}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ConfigureInboundCoalescing(context.Background(), 1800); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	if received.WindowMS != 1800 {
+		t.Fatalf("window=%d", received.WindowMS)
+	}
+}
+
+func TestConfigureInboundCoalescingRejectsInvalidWindow(t *testing.T) {
+	client, err := NewClient("http://127.0.0.1:1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ConfigureInboundCoalescing(context.Background(), 5001); err == nil {
+		t.Fatal("expected invalid window error")
+	}
+}
+
 func TestStartBot(t *testing.T) {
 	var received StartBotRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

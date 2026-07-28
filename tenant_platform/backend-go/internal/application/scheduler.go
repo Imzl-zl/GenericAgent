@@ -76,6 +76,9 @@ type SchedulerConfig struct {
 	// detection relies on gRPC stream errors and heartbeat lease loss instead.
 	// Zero disables the Worker soft timer (dev/test).
 	TaskTimeoutSeconds int
+	// RuntimeSettings supplies administrator-managed Agent execution limits.
+	// Nil uses the production default.
+	RuntimeSettings AgentRuntimeSettings
 	// IdleTimeout enables Temporal-HeartbeatTimeout-style idle detection.
 	// When a running task's last_activity_at is older than now()-IdleTimeout,
 	// the reaper finalizes it as failed (WORKER_IDLE). This catches "Worker
@@ -104,8 +107,14 @@ type CapabilityStore interface {
 	DeleteExpiredCapabilityRevocations(ctx context.Context, before time.Time) (int64, error)
 }
 
+// AgentRuntimeSettings resolves the live turn budget used when starting a
+// Worker session. Admin updates apply to subsequent tasks.
+type AgentRuntimeSettings interface {
+	GetAgentMaxTurns(ctx context.Context) (int, error)
+}
+
 const (
-	defaultMaxTurns           = 6
+	defaultMaxTurns           = domain.DefaultAgentMaxTurns
 	defaultMaxHistoryBytes    = 256 * 1024
 	defaultMaxWorkingBytes    = 64 * 1024
 	defaultMaxOutputBytes     = 256 * 1024

@@ -28,6 +28,7 @@ type workerEntry struct {
 	startOnce          sync.Once
 	startErr           error
 	started            bool
+	runtimeMaxTurns    uint32
 	// lastUsedAt is updated every time a task is dispatched to this Worker.
 	// Used by the idle eviction reaper to reclaim memory from long-idle
 	// sessions (pattern: Kubernetes pod eviction, AWS Lambda container TTL).
@@ -44,6 +45,7 @@ func (e *workerEntry) startSession(ctx context.Context, req *workerv1.StartSessi
 			e.startErr = err
 			return
 		}
+		e.runtimeMaxTurns = req.GetRuntimePolicy().GetMaxTurns()
 		e.started = true
 	})
 	return e.startErr
@@ -116,6 +118,15 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 }
 
 func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) (bool, error) {
+	if entry.started && entry.runtimeMaxTurns > 0 {
+		maxTurns, err := s.agentMaxTurns(ctx)
+		if err != nil {
+			return false, err
+		}
+		if entry.runtimeMaxTurns != maxTurns {
+			return true, nil
+		}
+	}
 	if err := s.flushPendingCredentialRevocations(ctx, entry); err != nil {
 		return false, fmt.Errorf("flush pending credential revocations: %w", err)
 	}
@@ -218,10 +229,14 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	if !s.workerEntryIsCurrent(task.SessionKey, entry) {
 		return fmt.Errorf("worker replaced for session %s", task.SessionKey)
 	}
+	maxTurns, err := s.agentMaxTurns(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve agent max turns: %w", err)
+	}
 	startReq := &workerv1.StartSessionRequest{
 		SessionKey: task.SessionKey,
 		RuntimePolicy: &workerv1.RuntimePolicy{
-			MaxTurns: defaultMaxTurns, MaxHistoryBytes: defaultMaxHistoryBytes,
+			MaxTurns: maxTurns, MaxHistoryBytes: defaultMaxHistoryBytes,
 			MaxWorkingBytes: defaultMaxWorkingBytes, MaxOutputBytes: defaultMaxOutputBytes,
 			TaskTimeoutSeconds: uint32(s.cfg.TaskTimeoutSeconds),
 			CapabilityVersion:  CapabilityVersion, PolicyDigest: s.cfg.Registry.Digest(),
@@ -250,6 +265,21 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 		return err
 	}
 	return nil
+}
+
+func (s *scheduler) agentMaxTurns(ctx context.Context) (uint32, error) {
+	maxTurns := defaultMaxTurns
+	if s.cfg.RuntimeSettings != nil {
+		configured, err := s.cfg.RuntimeSettings.GetAgentMaxTurns(ctx)
+		if err != nil {
+			return 0, err
+		}
+		maxTurns = configured
+	}
+	if err := domain.ValidateAgentMaxTurns(maxTurns); err != nil {
+		return 0, err
+	}
+	return uint32(maxTurns), nil
 }
 
 // startWorkerProcess creates the Worker after its runtime JSON and fixed

@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
@@ -54,6 +55,8 @@ WEBHOOK_TIMEOUT = 10
 # consumer that refuses to commit an offset it failed to process).
 WEBHOOK_RETRY_BASE_SECONDS = 2.0
 WEBHOOK_RETRY_CAP_SECONDS = 60.0
+MAX_INBOUND_COALESCE_WINDOW_MS = 5000
+MAX_COALESCED_MESSAGES = 8
 
 # Map file extension to MIME content_type. Used to populate media_assets
 # metadata when the Poller forwards inbound media to the platform webhook.
@@ -102,6 +105,151 @@ MSG_TYPE_FILE = 'file'
 _VALID_MSG_TYPES = {MSG_TYPE_TEXT, MSG_TYPE_IMAGE, MSG_TYPE_VIDEO, MSG_TYPE_FILE}
 
 
+def _message_time_ms(msg, fallback_ms):
+    for key in ('create_time_ms', 'create_time', 'timestamp', 'message_time'):
+        value = msg.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            if key == 'create_time_ms':
+                return int(value)
+            return int(value if value >= 1_000_000_000_000 else value * 1000)
+    return fallback_ms
+
+
+def _is_command_body(body):
+    return str(body.get('text') or '').lstrip().startswith('/')
+
+
+def _can_coalesce(previous, current, window_ms):
+    if _is_command_body(previous) or _is_command_body(current):
+        return False
+    if previous.get('bot_uuid') != current.get('bot_uuid'):
+        return False
+    if previous.get('ilink_user_id') != current.get('ilink_user_id'):
+        return False
+    previous_at = int(previous.get('_received_at_ms') or 0)
+    current_at = int(current.get('_received_at_ms') or 0)
+    return current_at >= previous_at and current_at - previous_at <= window_ms
+
+
+def _finalize_coalesced_group(group):
+    source_ids = [str(item.get('message_id') or '') for item in group]
+    if len(group) == 1:
+        out = dict(group[0])
+    else:
+        digest = hashlib.sha256('|'.join(source_ids).encode('utf-8')).hexdigest()[:32]
+        out = dict(group[0])
+        out['message_id'] = f'coalesced:{digest}'
+        out['text'] = '\n'.join(
+            str(item.get('text') or '').strip()
+            for item in group
+            if str(item.get('text') or '').strip()
+        )
+        out['media_paths'] = list(dict.fromkeys(
+            path
+            for item in group
+            for path in (item.get('media_paths') or [])
+            if path
+        ))
+        seen_storage = set()
+        media_items = []
+        for item in group:
+            for media in item.get('media_items') or []:
+                storage_path = str(media.get('storage_path') or '')
+                key = storage_path or json.dumps(media, sort_keys=True, ensure_ascii=False)
+                if key in seen_storage:
+                    continue
+                seen_storage.add(key)
+                media_items.append(media)
+        out['media_items'] = media_items
+        out['updates_buf'] = group[-1].get('updates_buf', '')
+        out['context_token'] = group[-1].get('context_token', '')
+    out['source_message_ids'] = source_ids
+    out.pop('_received_at_ms', None)
+    return out
+
+
+def coalesce_webhook_bodies(bodies, window_ms):
+    """Merge adjacent ordinary messages supplied as one sequence.
+
+    Same-user messages inside the configured window may carry different
+    per-message context tokens. They still belong to the same user action;
+    the finalized webhook keeps the newest token for subsequent replies.
+    Commands always remain standalone. The hard part cap prevents one burst
+    from collapsing into an unbounded prompt.
+    """
+    if window_ms <= 0:
+        return [_finalize_coalesced_group([body]) for body in bodies]
+    groups = []
+    current = []
+    for body in bodies:
+        if current and (
+            len(current) >= MAX_COALESCED_MESSAGES
+            or not _can_coalesce(current[-1], body, window_ms)
+        ):
+            groups.append(current)
+            current = []
+        current.append(body)
+        if _is_command_body(body):
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return [_finalize_coalesced_group(group) for group in groups]
+
+
+class InboundCoalescingBuffer:
+    """Retains one user's adjacent messages across get_updates batches."""
+
+    def __init__(self, window_ms):
+        self._window_ms = max(0, int(window_ms))
+        self._pending = []
+        self._deadline_ms = None
+
+    def set_window(self, window_ms):
+        self._window_ms = max(0, int(window_ms))
+
+    def push(self, bodies, now_ms):
+        if self._window_ms <= 0:
+            ready = self.flush_all()
+            ready.extend(coalesce_webhook_bodies(bodies, 0))
+            return ready
+
+        ready = []
+        for body in bodies:
+            if _is_command_body(body):
+                ready.extend(self.flush_all())
+                ready.append(_finalize_coalesced_group([body]))
+                continue
+            if self._pending and (
+                len(self._pending) >= MAX_COALESCED_MESSAGES
+                or not _can_coalesce(self._pending[-1], body, self._window_ms)
+            ):
+                ready.extend(self.flush_all())
+            self._pending.append(body)
+            self._deadline_ms = int(now_ms) + self._window_ms
+        return ready
+
+    def flush_due(self, now_ms):
+        if not self._pending:
+            return []
+        if self._window_ms <= 0 or int(now_ms) >= self._deadline_ms:
+            return self.flush_all()
+        return []
+
+    def flush_all(self):
+        if not self._pending:
+            return []
+        group = self._pending
+        self._pending = []
+        self._deadline_ms = None
+        return [_finalize_coalesced_group(group)]
+
+    def timeout_seconds(self, now_ms):
+        if not self._pending or self._deadline_ms is None:
+            return None
+        return max(0.05, (self._deadline_ms - int(now_ms)) / 1000.0)
+
+
 class _DedupWindow:
     """Bounded FIFO dedup window: O(1) membership via set, FIFO eviction via deque.
 
@@ -127,28 +275,48 @@ class _DedupWindow:
 class BotEntry:
     """Per-bot runtime state held by the poller."""
 
-    def __init__(self, client, webhook_url, bot_uuid):
+    def __init__(self, client, webhook_url, bot_uuid, coalesce_window_ms=0):
         self.client = client
         self.webhook_url = webhook_url
         self.bot_uuid = bot_uuid
         self.stop_event = threading.Event()
         self.thread = None
         self.auth_expired = False
+        self.committed_updates_buf = getattr(client, 'updates_buf', '') or ''
+        self.webhook_idle = threading.Event()
+        self.webhook_idle.set()
+        self.coalescer = InboundCoalescingBuffer(coalesce_window_ms)
 
 
 class BotManager:
     """Manages long-poll threads for multiple bots."""
 
-    def __init__(self, media_root=None, webhook_secret=''):
+    def __init__(self, media_root=None, webhook_secret='', inbound_coalesce_window_ms=0):
         self._bots = {}
         self._lock = threading.Lock()
         self._media_root = media_root
+        self._inbound_coalesce_window_ms = 0
+        self.configure_inbound_coalescing(inbound_coalesce_window_ms)
         # HMAC-SHA256 secret shared with the Go platform. When set, every
         # webhook POST carries X-Webhook-Signature = hex(HMAC-SHA256(body)).
         # Empty = unauthenticated (dev/test only; Go side logs a warning).
         self._webhook_secret = webhook_secret or ''
         if media_root:
             os.makedirs(media_root, exist_ok=True)
+
+    def configure_inbound_coalescing(self, window_ms):
+        window_ms = int(window_ms)
+        if window_ms < 0 or window_ms > MAX_INBOUND_COALESCE_WINDOW_MS:
+            raise ValueError(
+                f'window_ms must be between 0 and {MAX_INBOUND_COALESCE_WINDOW_MS}'
+            )
+        with self._lock:
+            self._inbound_coalesce_window_ms = window_ms
+        return window_ms
+
+    def _coalesce_window_ms(self):
+        with self._lock:
+            return self._inbound_coalesce_window_ms
 
     def start(self, bot_uuid, bot_token, ilink_bot_id, base_url, updates_buf, webhook_url):
         with self._lock:
@@ -157,7 +325,12 @@ class BotManager:
             client = WxBotClient(token=bot_token, persist=False, base_url=base_url or None)
             client.bot_id = ilink_bot_id
             client.updates_buf = updates_buf or ''
-            entry = BotEntry(client=client, webhook_url=webhook_url, bot_uuid=bot_uuid)
+            entry = BotEntry(
+                client=client,
+                webhook_url=webhook_url,
+                bot_uuid=bot_uuid,
+                coalesce_window_ms=self._inbound_coalesce_window_ms,
+            )
             entry.media_dir = self._bot_media_dir(bot_uuid)
             entry.thread = threading.Thread(target=self._run, args=(entry,), daemon=True)
             entry.thread.start()
@@ -182,8 +355,15 @@ class BotManager:
         seen = _DedupWindow(maxlen=2000)
         while not entry.stop_event.is_set():
             try:
-                for msg in entry.client.get_updates(POLL_TIMEOUT):
-                    self._dispatch(entry, msg, seen)
+                now_ms = int(time.time() * 1000)
+                entry.coalescer.set_window(self._coalesce_window_ms())
+                for body in entry.coalescer.flush_due(now_ms):
+                    self._post_webhook_body(entry, body)
+                request_timeout = entry.coalescer.timeout_seconds(now_ms)
+                messages = entry.client.get_updates(
+                    POLL_TIMEOUT, request_timeout=request_timeout
+                )
+                self._dispatch_batch(entry, messages, seen)
             except AuthExpired:
                 entry.auth_expired = True
                 self._notify_expired(entry)
@@ -192,19 +372,30 @@ class BotManager:
                 print(f'[Poller] bot {entry.bot_uuid} err: {exc}', flush=True)
                 entry.stop_event.wait(5)
 
-    def _dispatch(self, entry, msg, seen):
-        """Forward one inbound message to the platform webhook.
+    def _dispatch_batch(self, entry, messages, seen):
+        received_at_ms = int(time.time() * 1000)
+        bodies = []
+        for msg in messages:
+            body = self._prepare_webhook_body(entry, msg, seen, received_at_ms)
+            if body is not None:
+                bodies.append(body)
+        entry.coalescer.set_window(self._coalesce_window_ms())
+        ready = entry.coalescer.push(bodies, received_at_ms)
+        ready.extend(entry.coalescer.flush_due(received_at_ms))
+        for body in ready:
+            self._post_webhook_body(entry, body)
 
-        Downloads any media items via wxbot_media.download_media and includes
-        the resulting local file paths in the webhook body as `media_paths`
-        (for the worker to read) plus `media_items` (metadata for the
-        platform to persist in media_assets). Text is still extracted so
-        text-only routing (commands, /stop, etc.) keeps working when a
-        message contains both text and media items.
-        """
+    def _dispatch(self, entry, msg, seen):
+        """Compatibility wrapper for a single inbound message."""
+        body = self._prepare_webhook_body(entry, msg, seen, int(time.time() * 1000))
+        if body is not None:
+            self._post_webhook_body(entry, _finalize_coalesced_group([body]))
+
+    def _prepare_webhook_body(self, entry, msg, seen, fallback_time_ms):
+        """Download media and build one platform webhook body."""
         mid = str(msg.get('message_id', 0))
         if not entry.client.is_user_msg(msg) or not seen.add(mid):
-            return
+            return None
         text = entry.client.extract_text(msg)
         uid = msg.get('from_user_id', '')
         ctx = msg.get('context_token', '')
@@ -216,7 +407,17 @@ class BotManager:
                 media_items = self._collect_media_items(media_paths)
             except Exception as exc:
                 print(f'[Poller] media dl err ({entry.bot_uuid}): {exc}', flush=True)
-        self._post_webhook(entry, uid, mid, text, ctx, media_paths, media_items)
+        return {
+            'bot_uuid': entry.bot_uuid,
+            'ilink_user_id': uid,
+            'message_id': mid,
+            'text': text,
+            'context_token': ctx,
+            'updates_buf': entry.client.updates_buf,
+            'media_paths': media_paths or [],
+            'media_items': media_items or [],
+            '_received_at_ms': _message_time_ms(msg, fallback_time_ms),
+        }
 
     def _collect_media_items(self, paths):
         """Build metadata for each downloaded media file.
@@ -270,6 +471,13 @@ class BotManager:
         self._post_webhook_body(entry, body, max_attempts=5)
 
     def _post_webhook_body(self, entry, body, max_attempts=None):
+        entry.webhook_idle.clear()
+        try:
+            return self._post_webhook_body_inner(entry, body, max_attempts=max_attempts)
+        finally:
+            entry.webhook_idle.set()
+
+    def _post_webhook_body_inner(self, entry, body, max_attempts=None):
         """POST webhook with deterministic JSON + HMAC-SHA256 signature.
 
         We serialize once and send as raw bytes so the signature matches the
@@ -307,6 +515,9 @@ class BotManager:
                 resp = requests.post(entry.webhook_url, data=body_bytes,
                                      headers=headers, timeout=WEBHOOK_TIMEOUT)
                 if 200 <= resp.status_code < 300:
+                    committed_cursor = body.get('updates_buf', '')
+                    if committed_cursor:
+                        entry.committed_updates_buf = committed_cursor
                     return True
                 if 400 <= resp.status_code < 500:
                     print(f'[Poller] webhook PERMANENTLY rejected ({entry.bot_uuid}) '
@@ -334,8 +545,9 @@ class BotManager:
         if not entry:
             return ''
         entry.stop_event.set()
+        entry.webhook_idle.wait(timeout=WEBHOOK_TIMEOUT + 1)
         entry.thread.join(timeout=5)
-        return entry.client.updates_buf
+        return entry.committed_updates_buf
 
     def send(self, bot_uuid, ilink_user_id, text, context_token='', msg_type=MSG_TYPE_TEXT, file_path=''):
         """Dispatch to send_text/send_image/send_video/send_file based on msg_type.
@@ -428,7 +640,12 @@ class PollerHandler(BaseHTTPRequestHandler):
 
             body = json.loads(body_bytes) if body_bytes != b'{}' else {}
 
-            if self.path == '/start':
+            if self.path == '/config':
+                window_ms = self.manager.configure_inbound_coalescing(
+                    body.get('inbound_coalesce_window_ms', 0)
+                )
+                self._reply(200, {'inbound_coalesce_window_ms': window_ms})
+            elif self.path == '/start':
                 self.manager.start(
                     body['bot_uuid'], body['bot_token'], body.get('ilink_bot_id', ''),
                     body.get('base_url', ''), body.get('updates_buf', ''),

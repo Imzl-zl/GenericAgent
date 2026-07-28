@@ -3,6 +3,9 @@ package application
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -76,7 +79,7 @@ func (f *fakeTaskService) SubmitTask(_ context.Context, cmd domain.SubmitTaskCom
 	if f.submitErr != nil {
 		return domain.Task{}, f.submitErr
 	}
-	f.submittedTask = domain.Task{ID: "task-fake", SessionKey: cmd.SessionKey, Prompt: cmd.Prompt, Source: cmd.Source, Status: domain.TaskQueued}
+	f.submittedTask = domain.Task{ID: "task-fake", SessionKey: cmd.SessionKey, Prompt: cmd.Prompt, Source: cmd.Source, ToolPolicyVersion: cmd.ToolPolicyVersion, Status: domain.TaskQueued}
 	return f.submittedTask, nil
 }
 
@@ -109,6 +112,25 @@ func newTestRouter(store *fakeRouterStore, tr *transport.LoopbackTransport) (Rou
 		SourceInstance: "test-router",
 	})
 	return r, tasks
+}
+
+func newTestRouterWithSessionFiles(t *testing.T, store *fakeRouterStore, tr *transport.LoopbackTransport) (Router, *fakeTaskService, SessionFiles) {
+	t.Helper()
+	tasks := &fakeTaskService{}
+	sessionFiles, err := NewSessionFiles(t.TempDir())
+	if err != nil {
+		t.Fatalf("new session files: %v", err)
+	}
+	r, _ := NewRouter(RouterConfig{
+		Store:          store,
+		Tasks:          tasks,
+		Transport:      tr,
+		Messages:       &fakeMessageStore{},
+		SessionFiles:   sessionFiles,
+		ToolPolicy:     "foundation.no-host-tools.v1",
+		SourceInstance: "test-router",
+	})
+	return r, tasks, sessionFiles
 }
 
 func TestRouterRejectsMissingFields(t *testing.T) {
@@ -271,6 +293,38 @@ func TestRouterMediaOnlyMessageUsesPlaceholder(t *testing.T) {
 	}
 }
 
+func TestRouterStagesMediaIntoSessionSandboxAndUpgradesPolicy(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	src := filepath.Join(t.TempDir(), "resume.txt")
+	if err := os.WriteFile(src, []byte("resume"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	tr := transport.NewLoopbackTransport()
+	r, tasks, sessionFiles := newTestRouterWithSessionFiles(t, store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "整理一下",
+		MediaPaths: []string{src},
+	})
+	if res.Action != ActionTaskCreated {
+		t.Fatalf("expected task_created, got %s", res.Action)
+	}
+	if tasks.submittedTask.ToolPolicyVersion != "foundation.session-files.v1" {
+		t.Fatalf("unexpected policy: %s", tasks.submittedTask.ToolPolicyVersion)
+	}
+	if !strings.Contains(tasks.submittedTask.Prompt, "attachments/F001_resume.txt") {
+		t.Fatalf("expected sandbox attachment path in prompt, got %q", tasks.submittedTask.Prompt)
+	}
+	refs, err := sessionFiles.Recent("personal:42", 8)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	if len(refs) != 1 || refs[0].RelativePath != "attachments/F001_resume.txt" {
+		t.Fatalf("unexpected session refs: %+v", refs)
+	}
+}
+
 func TestRouterStopCancelsRunningTask(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
@@ -330,8 +384,16 @@ func TestRouterHelpCommand(t *testing.T) {
 		t.Fatalf("expected help, got %s", res.Action)
 	}
 	last, ok := tr.LastSentMessage()
-	if !ok || !contains(last.Text, "平台命令") {
-		t.Fatalf("expected help text with '平台命令', got %q", last.Text)
+	if !ok || !contains(last.Text, "可用命令") {
+		t.Fatalf("expected help text with '可用命令', got %q", last.Text)
+	}
+	for _, hidden := range []string{"/llm", "/activate", "/session."} {
+		if contains(last.Text, hidden) {
+			t.Fatalf("help must not expose restricted command %q: %s", hidden, last.Text)
+		}
+	}
+	if !contains(last.Text, "/abort") {
+		t.Fatalf("help should expose /abort alias: %s", last.Text)
 	}
 }
 
@@ -372,25 +434,39 @@ func TestRouterStatusRunning(t *testing.T) {
 	}
 }
 
-func TestRouterLLMCommand(t *testing.T) {
+func TestRouterLLMCommandIsRestricted(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
-	r, _ := newTestRouter(store, tr)
+	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/llm",
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/llm 1",
 	})
-	if res.Action != ActionModelInfo {
-		t.Fatalf("expected model_info, got %s", res.Action)
+	if res.Action != ActionRejected {
+		t.Fatalf("expected restricted /llm to be rejected, got %s", res.Action)
 	}
-	last, _ := tr.LastSentMessage()
-	if !contains(last.Text, "LLM Proxy") {
-		t.Fatalf("expected LLM Proxy mention, got %q", last.Text)
+	if tasks.submittedTask.ID != "" {
+		t.Fatalf("restricted command must not create a task: %+v", tasks.submittedTask)
 	}
 }
 
-func TestRouterUnknownSlashCommandForwardedAsTask(t *testing.T) {
+func TestRouterAbortAliasStopsRunningTask(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	store.runningTask = &domain.Task{ID: "task-running", SessionKey: "personal:42", Status: domain.TaskRunning}
+	tr := transport.NewLoopbackTransport()
+	r, tasks := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/abort",
+	})
+	if res.Action != ActionStopped || tasks.cancelledID != "task-running" {
+		t.Fatalf("expected /abort to stop task, result=%+v cancelled=%q", res, tasks.cancelledID)
+	}
+}
+
+func TestRouterUnknownSlashCommandIsRejected(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
@@ -399,15 +475,33 @@ func TestRouterUnknownSlashCommandForwardedAsTask(t *testing.T) {
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/restore",
 	})
-	if res.Action != ActionTaskCreated {
-		t.Fatalf("expected task_created for unknown /xxx, got %s", res.Action)
+	if res.Action != ActionRejected {
+		t.Fatalf("expected unknown /xxx to be rejected, got %s", res.Action)
 	}
-	if tasks.submittedTask.Prompt != "/restore" {
-		t.Fatalf("expected prompt '/restore' forwarded verbatim, got %q", tasks.submittedTask.Prompt)
+	if tasks.submittedTask.ID != "" {
+		t.Fatalf("unknown slash command must not create task: %+v", tasks.submittedTask)
+	}
+	last, _ := tr.LastSentMessage()
+	if !contains(last.Text, "/help") {
+		t.Fatalf("expected /help guidance, got %q", last.Text)
 	}
 }
 
-func TestRouterSendsReplyViaTransport(t *testing.T) {
+func TestRouterSessionMutationCommandIsRejected(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, tasks := newTestRouter(store, tr)
+	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/session.temperature=2",
+	})
+	if res.Action != ActionRejected || tasks.submittedTask.ID != "" {
+		t.Fatalf("session mutation must be rejected before worker dispatch: result=%+v task=%+v", res, tasks.submittedTask)
+	}
+}
+
+func TestRouterNormalMessageDoesNotSendImmediateReply(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
@@ -416,12 +510,8 @@ func TestRouterSendsReplyViaTransport(t *testing.T) {
 	_, _ = r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
 	})
-	sent := tr.SentMessages()
-	if len(sent) == 0 {
-		t.Fatal("expected at least one reply sent via transport")
-	}
-	if sent[0].BotUUID != "b1" || sent[0].IlinkUserID != "u1" {
-		t.Fatalf("reply sent to wrong recipient: %+v", sent[0])
+	if sent := tr.SentMessages(); len(sent) != 0 {
+		t.Fatalf("expected no immediate transport reply for normal message, got %+v", sent)
 	}
 }
 

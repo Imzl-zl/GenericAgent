@@ -140,12 +140,13 @@ class WxBotClient:
                 raise RuntimeError('二维码过期')
 
     # ── receive ──
-    def get_updates(self, timeout=30):
+    def get_updates(self, timeout=30, request_timeout=None):
         try:
+            http_timeout = timeout + 5 if request_timeout is None else max(0.05, request_timeout)
             resp = self._post('ilink/bot/getupdates',
                               {'get_updates_buf': self._buf or '',
                                'base_info': {'channel_version': VER}},
-                              timeout=timeout + 5)
+                              timeout=http_timeout)
         except requests.exceptions.ReadTimeout:
             return []
         if resp.get('errcode'):
@@ -217,7 +218,6 @@ class WxBotClient:
             'filesize': ciphertext_size,
             'no_need_thumb': item_key not in ('image_item', 'video_item'),
             'aeskey': aes_key.hex(), 'base_info': {'channel_version': VER}}
-        body['filekey'] = fp.stem + '_' + uuid.uuid4().hex[:8]
         if thumb_raw:
             body.update({'thumb_rawsize': len(thumb_raw),
                          'thumb_rawfilemd5': hashlib.md5(thumb_raw).hexdigest(),

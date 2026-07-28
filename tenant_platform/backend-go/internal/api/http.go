@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -23,24 +24,27 @@ const MaxRequestBodyBytes int64 = 1 << 20 // 1 MiB
 
 // Server is the loopback HTTP API.
 type Server struct {
-	svc            application.TaskService
-	users          application.UserService
-	wechatBinding  application.WechatQRBindingService
-	botSvc         application.BotService
-	invite         application.InviteService
-	personas       application.PersonaService
-	router         application.Router
-	registry       policy.Registry
-	policies       PolicyStore
-	bots           BotStore
-	llmProviders   LLMProviderStore
-	botLifecycle   application.BotLifecycleService
-	taskStats      TaskStoreStats
-	runtimeProfile RuntimeProfile
-	cipher         secret.TokenCipher
-	devToken       string
-	devUserID      int64
-	sessionKey     string
+	svc                  application.TaskService
+	users                application.UserService
+	wechatBinding        application.WechatQRBindingService
+	botSvc               application.BotService
+	invite               application.InviteService
+	personas             application.PersonaService
+	router               application.Router
+	registry             policy.Registry
+	policies             PolicyStore
+	bots                 BotStore
+	llmProviders         LLMProviderStore
+	botLifecycle         application.BotLifecycleService
+	taskStats            TaskStoreStats
+	runtimeProfileMu     sync.RWMutex
+	runtimeProfile       RuntimeProfile
+	runtimeSettings      RuntimeSettingsStore
+	imAggregationRuntime IMAggregationRuntime
+	cipher               secret.TokenCipher
+	devToken             string
+	devUserID            int64
+	sessionKey           string
 	// webhookSecret is the HMAC-SHA256 key shared with the Bot Poller. When
 	// non-empty, /v1/im/webhook rejects requests whose X-Webhook-Signature
 	// header doesn't match. Empty = unauthenticated (dev/test only; logs once).
@@ -57,6 +61,21 @@ type PolicyStore interface {
 	CreateToolPolicy(ctx context.Context, version, description string,
 		allowedTools []string, createdBy int64) (domain.ToolPolicy, error)
 	UpdateUserToolPolicy(ctx context.Context, userID int64, version string, updatedBy int64) error
+}
+
+// RuntimeSettingsStore is the admin-facing port for small runtime-tunable
+// platform settings that must take effect without a rebuild.
+type RuntimeSettingsStore interface {
+	GetIMInboundCoalesceWindowMS(ctx context.Context) (int, error)
+	UpdateIMInboundCoalesceWindowMS(ctx context.Context, windowMS int, updatedBy int64) (int, error)
+	GetAgentMaxTurns(ctx context.Context) (int, error)
+	UpdateAgentMaxTurns(ctx context.Context, maxTurns int, updatedBy int64) (int, error)
+}
+
+// IMAggregationRuntime applies persisted aggregation settings to the live bot
+// transport. The Python Poller implements this port.
+type IMAggregationRuntime interface {
+	ConfigureInboundCoalescing(ctx context.Context, windowMS int) error
 }
 
 // BotStore creates and resolves bot records with encrypted tokens.
@@ -85,37 +104,41 @@ type Cipher interface {
 
 // ServerConfig configures the foundation API.
 type RuntimeProfile struct {
-	ClaimLeaseSeconds       int `json:"claim_lease_seconds"`
-	TokenTTLSeconds         int `json:"token_ttl_seconds"`
-	TokenRefreshSkewSeconds int `json:"token_refresh_skew_seconds"`
-	MaxTaskWallClockSeconds int `json:"max_task_wall_clock_seconds"`
-	TaskTimeoutSeconds      int `json:"task_timeout_seconds"`
-	TaskIdleTimeoutSeconds  int `json:"task_idle_timeout_seconds"`
-	WorkerIdleTTLSeconds    int `json:"worker_idle_ttl_seconds"`
-	MaxRunningTasks         int `json:"max_running_tasks"`
-	PerTenantRunningLimit   int `json:"per_tenant_running_limit"`
-	PerUserQueueLimit       int `json:"per_user_queue_limit"`
+	ClaimLeaseSeconds         int `json:"claim_lease_seconds"`
+	TokenTTLSeconds           int `json:"token_ttl_seconds"`
+	TokenRefreshSkewSeconds   int `json:"token_refresh_skew_seconds"`
+	MaxTaskWallClockSeconds   int `json:"max_task_wall_clock_seconds"`
+	TaskTimeoutSeconds        int `json:"task_timeout_seconds"`
+	TaskIdleTimeoutSeconds    int `json:"task_idle_timeout_seconds"`
+	WorkerIdleTTLSeconds      int `json:"worker_idle_ttl_seconds"`
+	MaxRunningTasks           int `json:"max_running_tasks"`
+	PerTenantRunningLimit     int `json:"per_tenant_running_limit"`
+	PerUserQueueLimit         int `json:"per_user_queue_limit"`
+	IMInboundCoalesceWindowMS int `json:"im_inbound_coalesce_window_ms"`
+	AgentMaxTurns             int `json:"agent_max_turns"`
 }
 
 type ServerConfig struct {
-	Service        application.TaskService
-	Users          application.UserService
-	WechatBinding  application.WechatQRBindingService
-	BotService     application.BotService
-	Invite         application.InviteService
-	Personas       application.PersonaService
-	Router         application.Router
-	Registry       policy.Registry
-	Policies       PolicyStore
-	Bots           BotStore
-	LLMProviders   LLMProviderStore
-	BotLifecycle   application.BotLifecycleService
-	TaskStats      TaskStoreStats
-	RuntimeProfile RuntimeProfile
-	Cipher         secret.TokenCipher
-	DevToken       string
-	DevUserID      int64
-	SessionKey     string
+	Service              application.TaskService
+	Users                application.UserService
+	WechatBinding        application.WechatQRBindingService
+	BotService           application.BotService
+	Invite               application.InviteService
+	Personas             application.PersonaService
+	Router               application.Router
+	Registry             policy.Registry
+	Policies             PolicyStore
+	RuntimeSettings      RuntimeSettingsStore
+	Bots                 BotStore
+	LLMProviders         LLMProviderStore
+	BotLifecycle         application.BotLifecycleService
+	TaskStats            TaskStoreStats
+	RuntimeProfile       RuntimeProfile
+	IMAggregationRuntime IMAggregationRuntime
+	Cipher               secret.TokenCipher
+	DevToken             string
+	DevUserID            int64
+	SessionKey           string
 	// WebhookSecret, when set, requires Bot Poller requests to /v1/im/webhook
 	// to carry a valid X-Webhook-Signature header (HMAC-SHA256 over body).
 	WebhookSecret string
@@ -136,26 +159,28 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.SessionKey = fmt.Sprintf("personal:%d", cfg.DevUserID)
 	}
 	s := &Server{
-		svc:            cfg.Service,
-		users:          cfg.Users,
-		wechatBinding:  cfg.WechatBinding,
-		botSvc:         cfg.BotService,
-		invite:         cfg.Invite,
-		personas:       cfg.Personas,
-		router:         cfg.Router,
-		registry:       cfg.Registry,
-		policies:       cfg.Policies,
-		bots:           cfg.Bots,
-		llmProviders:   cfg.LLMProviders,
-		botLifecycle:   cfg.BotLifecycle,
-		taskStats:      cfg.TaskStats,
-		runtimeProfile: cfg.RuntimeProfile,
-		cipher:         cfg.Cipher,
-		devToken:       cfg.DevToken,
-		devUserID:      cfg.DevUserID,
-		sessionKey:     cfg.SessionKey,
-		webhookSecret:  cfg.WebhookSecret,
-		mux:            http.NewServeMux(),
+		svc:                  cfg.Service,
+		users:                cfg.Users,
+		wechatBinding:        cfg.WechatBinding,
+		botSvc:               cfg.BotService,
+		invite:               cfg.Invite,
+		personas:             cfg.Personas,
+		router:               cfg.Router,
+		registry:             cfg.Registry,
+		policies:             cfg.Policies,
+		runtimeSettings:      cfg.RuntimeSettings,
+		bots:                 cfg.Bots,
+		llmProviders:         cfg.LLMProviders,
+		botLifecycle:         cfg.BotLifecycle,
+		taskStats:            cfg.TaskStats,
+		runtimeProfile:       cfg.RuntimeProfile,
+		imAggregationRuntime: cfg.IMAggregationRuntime,
+		cipher:               cfg.Cipher,
+		devToken:             cfg.DevToken,
+		devUserID:            cfg.DevUserID,
+		sessionKey:           cfg.SessionKey,
+		webhookSecret:        cfg.WebhookSecret,
+		mux:                  http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.auth(s.handleCreateTask))
@@ -164,6 +189,18 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	s.mux.HandleFunc("POST /v1/tasks/{task_id}/cancel", s.auth(s.handleCancel))
 	s.registerLifecycleRoutes()
 	return s, nil
+}
+
+func (s *Server) runtimeProfileSnapshot() RuntimeProfile {
+	s.runtimeProfileMu.RLock()
+	defer s.runtimeProfileMu.RUnlock()
+	return s.runtimeProfile
+}
+
+func (s *Server) updateRuntimeProfile(update func(*RuntimeProfile)) {
+	s.runtimeProfileMu.Lock()
+	defer s.runtimeProfileMu.Unlock()
+	update(&s.runtimeProfile)
 }
 
 // SessionKey returns the default bootstrapped session (used by smoke tooling).

@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"regexp"
+	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/sync/errgroup"
 
@@ -77,6 +81,7 @@ type DeliveryServiceConfig struct {
 	Transport    transport.BotTransportAdapter
 	Results      ResultReader
 	Messages     MessageStore
+	SessionFiles SessionFiles
 	PollInterval time.Duration
 	ClaimLease   time.Duration
 	RetryWindow  time.Duration
@@ -105,6 +110,9 @@ func (cfg DeliveryServiceConfig) withDefaults() DeliveryServiceConfig {
 
 type deliveryService struct {
 	cfg DeliveryServiceConfig
+
+	unjournaledMu    sync.Mutex
+	unjournaledParts map[string]struct{}
 }
 
 // NewDeliveryService validates config and returns a runnable delivery service.
@@ -128,7 +136,10 @@ func NewDeliveryService(cfg DeliveryServiceConfig) (DeliveryService, error) {
 	if cfg.Messages == nil {
 		return nil, errors.New("MessageStore is required")
 	}
-	return &deliveryService{cfg: cfg}, nil
+	return &deliveryService{
+		cfg:              cfg,
+		unjournaledParts: make(map[string]struct{}),
+	}, nil
 }
 
 // Recover returns stuck sending rows to pending and dead-letters expired rows.
@@ -207,60 +218,220 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 	if !bot.IsBound() {
 		return s.deadLetter(ctx, d, "BOT_NOT_BOUND", "bot has no bound ilink user", now)
 	}
-	text, err := s.buildText(ctx, d, task)
+	payload, err := s.buildPayload(ctx, d, task)
 	if err != nil {
 		return s.deadLetter(ctx, d, "PAYLOAD_BUILD_FAILED", err.Error(), now)
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, deliverySendTimeout)
 	defer cancel()
-	if err := s.cfg.Transport.SendMessage(sendCtx, bot.BotUUID, bot.IlinkUserID, text); err != nil {
-		return s.retryOrDeadLetter(ctx, d, task, "SEND_FAILED", err.Error(), now)
+	if payload.Text != "" {
+		partKey := d.DeliveryID + ":text"
+		_, _, partErr := s.sendAndJournalPart(ctx, deliveryPart{
+			key: partKey,
+			message: domain.Message{
+				UserID:      bot.OwnerID,
+				BotID:       bot.ID,
+				SessionKey:  personalSessionKey(bot.OwnerID),
+				MessageType: domain.MessageTypeText,
+				Content:     payload.Text,
+				TaskID:      task.ID,
+			},
+			send: func() error {
+				return s.cfg.Transport.SendMessage(sendCtx, bot.BotUUID, bot.IlinkUserID, payload.Text)
+			},
+			sendErrorCode: "SEND_FAILED",
+		})
+		if partErr != nil {
+			return s.handleDeliveryPartError(ctx, d, task, partKey, partErr, now)
+		}
 	}
-	// Audit the outbound reply. Failure is non-fatal: the message has been
-	// sent, so we still ack the delivery. The alternative (not acking) would
-	// cause a duplicate send on the next tick, which is worse than a missing
-	// audit row. The log surfaces DB issues without blocking the user.
-	if _, err := s.cfg.Messages.InsertOutboundMessage(ctx, domain.Message{
-		UserID:      bot.OwnerID,
-		BotID:       bot.ID,
-		SessionKey:  personalSessionKey(bot.OwnerID),
-		MessageType: domain.MessageTypeText,
-		Content:     text,
-		TaskID:      task.ID,
-	}); err != nil {
-		slog.ErrorContext(ctx, "delivery: audit outbound failed",
-			"delivery_id", d.DeliveryID,
-			"task_id", task.ID,
-			"user_id", bot.OwnerID,
-			"bot_id", bot.ID,
-			"error", err)
+	for _, file := range payload.Files {
+		partKey := d.DeliveryID + ":file:" + file.relPath
+		msgRow, alreadySent, partErr := s.sendAndJournalPart(ctx, deliveryPart{
+			key: partKey,
+			message: domain.Message{
+				UserID:      bot.OwnerID,
+				BotID:       bot.ID,
+				SessionKey:  personalSessionKey(bot.OwnerID),
+				MessageType: domain.MessageTypeFile,
+				Content:     file.displayName,
+				MediaPath:   file.relPath,
+				TaskID:      task.ID,
+			},
+			send: func() error {
+				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, file.absPath)
+			},
+			sendErrorCode: "SEND_FILE_FAILED",
+		})
+		if partErr != nil {
+			return s.handleDeliveryPartError(ctx, d, task, partKey, partErr, now)
+		}
+		if alreadySent {
+			continue
+		}
+		if _, err := s.cfg.Messages.InsertMediaAsset(ctx, domain.MediaAsset{
+			UserID:      bot.OwnerID,
+			BotID:       bot.ID,
+			MessageID:   msgRow.ID,
+			FileName:    file.displayName,
+			StoragePath: file.relPath,
+			ContentType: "application/octet-stream",
+			Direction:   domain.MessageOutbound,
+		}); err != nil && !errors.Is(err, domain.ErrDuplicateMediaAsset) {
+			slog.ErrorContext(ctx, "delivery: audit outbound media asset failed",
+				"delivery_id", d.DeliveryID,
+				"task_id", task.ID,
+				"user_id", bot.OwnerID,
+				"bot_id", bot.ID,
+				"file", file.relPath,
+				"error", err)
+		}
 	}
 	return s.cfg.Store.MarkDeliveryAcked(ctx, d.DeliveryID, now)
 }
 
-func (s *deliveryService) buildText(ctx context.Context, d domain.Delivery, task domain.Task) (string, error) {
+type deliveryPart struct {
+	key           string
+	message       domain.Message
+	send          func() error
+	sendErrorCode string
+}
+
+type deliveryPartError struct {
+	code string
+	err  error
+}
+
+func (s *deliveryService) sendAndJournalPart(ctx context.Context, part deliveryPart) (domain.Message, bool, *deliveryPartError) {
+	alreadyJournaled, err := s.cfg.Messages.HasOutboundMessage(
+		ctx,
+		part.message.TaskID,
+		part.message.MessageType,
+		part.message.Content,
+		part.message.MediaPath,
+	)
+	if err != nil {
+		return domain.Message{}, false, &deliveryPartError{code: "DELIVERY_PROGRESS_LOOKUP_FAILED", err: err}
+	}
+	if alreadyJournaled {
+		s.clearUnjournaledPart(part.key)
+		return domain.Message{}, true, nil
+	}
+
+	if !s.hasUnjournaledPart(part.key) {
+		if err := part.send(); err != nil {
+			return domain.Message{}, false, &deliveryPartError{code: part.sendErrorCode, err: err}
+		}
+		s.markUnjournaledPart(part.key)
+	}
+
+	msgRow, err := s.cfg.Messages.InsertOutboundMessage(ctx, part.message)
+	if err != nil {
+		return domain.Message{}, false, &deliveryPartError{code: "DELIVERY_PROGRESS_WRITE_FAILED", err: err}
+	}
+	s.clearUnjournaledPart(part.key)
+	return msgRow, false, nil
+}
+
+func (s *deliveryService) handleDeliveryPartError(
+	ctx context.Context,
+	d domain.Delivery,
+	task domain.Task,
+	partKey string,
+	partErr *deliveryPartError,
+	now time.Time,
+) error {
+	if partErr.code == "DELIVERY_PROGRESS_WRITE_FAILED" {
+		err := s.deadLetter(ctx, d, partErr.code, partErr.err.Error(), now)
+		if err == nil {
+			s.clearUnjournaledPart(partKey)
+		}
+		return err
+	}
+	return s.retryOrDeadLetter(ctx, d, task, partErr.code, partErr.err.Error(), now)
+}
+
+func (s *deliveryService) hasUnjournaledPart(key string) bool {
+	s.unjournaledMu.Lock()
+	defer s.unjournaledMu.Unlock()
+	_, ok := s.unjournaledParts[key]
+	return ok
+}
+
+func (s *deliveryService) markUnjournaledPart(key string) {
+	s.unjournaledMu.Lock()
+	defer s.unjournaledMu.Unlock()
+	s.unjournaledParts[key] = struct{}{}
+}
+
+func (s *deliveryService) clearUnjournaledPart(key string) {
+	s.unjournaledMu.Lock()
+	defer s.unjournaledMu.Unlock()
+	delete(s.unjournaledParts, key)
+}
+
+type deliveryFile struct {
+	absPath     string
+	relPath     string
+	displayName string
+}
+
+type deliveryPayload struct {
+	Text  string
+	Files []deliveryFile
+}
+
+func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, task domain.Task) (deliveryPayload, error) {
 	switch d.DeliveryType {
 	case domain.DeliveryTaskStarted:
-		// Initial notification: let user know processing has begun
-		return "🤖 正在处理您的任务...", nil
+		return deliveryPayload{Text: "✓ 收到，正在处理您的任务..."}, nil
 	case domain.DeliveryTaskComplete:
 		if d.PayloadRef == "" {
-			return "", errors.New("task_complete missing payload_ref")
+			return deliveryPayload{}, errors.New("task_complete missing payload_ref")
 		}
 		payload, err := s.cfg.Results.ReadResult(ctx, d.PayloadRef, d.PayloadDigest)
 		if err != nil {
-			return "", err
+			return deliveryPayload{}, err
 		}
-		body := truncateBytes(string(payload.Body), maxDeliveryTextBytes)
-		return fmt.Sprintf("任务完成：\n%s", body), nil
+		body := userVisibleTaskResult(string(payload.Body))
+		markers := extractFileMarkers(body)
+		cleaned := stripFileMarkers(body)
+		cleaned = truncateBytes(cleaned, maxDeliveryTextBytes)
+		out := deliveryPayload{}
+		if cleaned != "" {
+			out.Text = fmt.Sprintf("任务完成：\n%s", cleaned)
+		} else if len(markers) > 0 {
+			out.Text = "任务完成，请查收文件。"
+		} else {
+			out.Text = "任务完成。"
+		}
+		if len(markers) == 0 {
+			return out, nil
+		}
+		if s.cfg.SessionFiles == nil {
+			return deliveryPayload{}, errors.New("session files manager is required for [FILE:] markers")
+		}
+		out.Files = make([]deliveryFile, 0, len(markers))
+		for _, marker := range markers {
+			absPath, relPath, err := s.cfg.SessionFiles.ResolveMarker(task.SessionKey, marker)
+			if err != nil {
+				return deliveryPayload{}, err
+			}
+			ref, err := s.cfg.SessionFiles.RecordOutbound(task.SessionKey, marker)
+			if err != nil {
+				return deliveryPayload{}, err
+			}
+			out.Files = append(out.Files, deliveryFile{absPath: absPath, relPath: relPath, displayName: ref.OriginalName})
+		}
+		return out, nil
 	case domain.DeliveryTaskFailed:
-		return fmt.Sprintf("任务失败：%s\n%s", d.ErrorCode, truncateBytes(d.ErrorMessage, maxDeliveryTextBytes)), nil
+		return deliveryPayload{Text: fmt.Sprintf("任务失败：%s\n%s", d.ErrorCode, truncateBytes(d.ErrorMessage, maxDeliveryTextBytes))}, nil
 	case domain.DeliveryTaskCancelled:
-		return fmt.Sprintf("任务已取消：%s", truncateBytes(d.ErrorMessage, maxDeliveryTextBytes)), nil
+		return deliveryPayload{Text: fmt.Sprintf("任务已取消：%s", truncateBytes(d.ErrorMessage, maxDeliveryTextBytes))}, nil
 	case domain.DeliveryTaskInterrupted:
-		return fmt.Sprintf("任务中断：%s", truncateBytes(d.ErrorMessage, maxDeliveryTextBytes)), nil
+		return deliveryPayload{Text: fmt.Sprintf("任务中断：%s", truncateBytes(d.ErrorMessage, maxDeliveryTextBytes))}, nil
 	default:
-		return "", fmt.Errorf("unknown delivery type %s", d.DeliveryType)
+		return deliveryPayload{}, fmt.Errorf("unknown delivery type %s", d.DeliveryType)
 	}
 }
 
@@ -305,4 +476,123 @@ func truncateBytes(s string, limit int) string {
 		return s
 	}
 	return s[:limit]
+}
+
+var (
+	turnMarkerLineRE           = regexp.MustCompile(`(?m)^\s*\*{0,2}LLM Running \(Turn \d+\) \.\.\.\*{0,2}\s*$`)
+	hiddenTranscriptTagRE      = regexp.MustCompile(`(?is)<(?:thinking|summary|tool_use|file_content)>.*?</(?:thinking|summary|tool_use|file_content)>`)
+	compactToolLineRE          = regexp.MustCompile(`^\s*🛠️\s+[A-Za-z_][A-Za-z0-9_]*\(.*$`)
+	internalReasoningEnglishRE = regexp.MustCompile(`(?i)(the user is asking|let me\b|i should\b|actually\b|since there(?:'s| is)\b|i'?m just waiting for instructions)`)
+)
+
+func userVisibleTaskResult(raw string) string {
+	turns := splitTranscriptTurns(raw)
+	if len(turns) == 0 {
+		turns = []string{raw}
+	}
+	for i := len(turns) - 1; i >= 0; i-- {
+		cleaned := cleanTranscriptTurn(turns[i])
+		if cleaned != "" {
+			return cleaned
+		}
+	}
+	fallback := strings.TrimSpace(raw)
+	if fallback == "" {
+		return "任务已完成"
+	}
+	return fallback
+}
+
+func splitTranscriptTurns(raw string) []string {
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	if !turnMarkerLineRE.MatchString(normalized) {
+		return nil
+	}
+	lines := strings.Split(normalized, "\n")
+	turns := make([]string, 0, 4)
+	buf := make([]string, 0, len(lines))
+	flush := func() {
+		joined := strings.TrimSpace(strings.Join(buf, "\n"))
+		if joined != "" {
+			turns = append(turns, joined)
+		}
+		buf = buf[:0]
+	}
+	for _, line := range lines {
+		if turnMarkerLineRE.MatchString(line) {
+			flush()
+			continue
+		}
+		buf = append(buf, line)
+	}
+	flush()
+	return turns
+}
+
+func cleanTranscriptTurn(turn string) string {
+	normalized := hiddenTranscriptTagRE.ReplaceAllString(strings.ReplaceAll(turn, "\r\n", "\n"), "")
+	lines := strings.Split(normalized, "\n")
+	out := make([]string, 0, len(lines))
+	skipVerboseTool := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "":
+			if !skipVerboseTool {
+				out = append(out, "")
+			}
+			skipVerboseTool = false
+		case strings.HasPrefix(trimmed, "🛠️ Tool:"):
+			skipVerboseTool = true
+		case skipVerboseTool:
+			continue
+		case compactToolLineRE.MatchString(trimmed):
+			continue
+		case strings.HasPrefix(trimmed, "[Info]") || strings.HasPrefix(trimmed, "[Warn]") || strings.HasPrefix(trimmed, "[Error]"):
+			continue
+		default:
+			out = append(out, line)
+		}
+	}
+	cleaned := collapseBlankLines(strings.Join(out, "\n"))
+	cleaned = trimLikelyInternalReasoningPrefix(cleaned)
+	return strings.TrimSpace(cleaned)
+}
+
+func collapseBlankLines(s string) string {
+	parts := strings.Split(s, "\n")
+	out := make([]string, 0, len(parts))
+	lastBlank := false
+	for _, part := range parts {
+		blank := strings.TrimSpace(part) == ""
+		if blank {
+			if lastBlank {
+				continue
+			}
+			lastBlank = true
+			out = append(out, "")
+			continue
+		}
+		lastBlank = false
+		out = append(out, part)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func trimLikelyInternalReasoningPrefix(s string) string {
+	firstCJK := -1
+	for i, r := range s {
+		if unicode.Is(unicode.Han, r) {
+			firstCJK = i
+			break
+		}
+	}
+	if firstCJK <= 0 {
+		return s
+	}
+	prefix := strings.TrimSpace(s[:firstCJK])
+	if len(prefix) < 20 || !internalReasoningEnglishRE.MatchString(prefix) {
+		return s
+	}
+	return strings.TrimSpace(s[firstCJK:])
 }

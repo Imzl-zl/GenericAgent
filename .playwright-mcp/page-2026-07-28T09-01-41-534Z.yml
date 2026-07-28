@@ -1,0 +1,49 @@
+- generic [ref=f1e3]:
+  - complementary [ref=f1e4]:
+    - generic [ref=f1e5]:
+      - generic [ref=f1e6]: ADM
+      - generic [ref=f1e7]: Control
+    - navigation [ref=f1e8]:
+      - link "控制台" [ref=f1e9] [cursor=pointer]:
+        - /url: /admin
+      - link "用户审批" [ref=f1e13] [cursor=pointer]:
+        - /url: /admin/users
+      - link "邀请码" [ref=f1e20] [cursor=pointer]:
+        - /url: /admin/invite-codes
+      - link "人设审核" [ref=f1e24] [cursor=pointer]:
+        - /url: /admin/personas
+      - link "LLM 供应" [ref=f1e38] [cursor=pointer]:
+        - /url: /admin/providers
+      - link "微信绑定" [ref=f1e43] [cursor=pointer]:
+        - /url: /admin/binding
+      - link "策略设置" [ref=f1e47] [cursor=pointer]:
+        - /url: /admin/settings
+    - button "退出" [ref=f1e53] [cursor=pointer]
+  - main [ref=f1e58]:
+    - generic [ref=f1e59]:
+      - generic [ref=f1e60]:
+        - generic [ref=f1e61]:
+          - heading "邀请码" [level=1] [ref=f1e62]
+          - paragraph [ref=f1e63]: 生成、撤销与清理一次性邀请码
+        - generic [ref=f1e64]:
+          - button "刷新" [ref=f1e65] [cursor=pointer]
+          - button "生成邀请码" [ref=f1e66] [cursor=pointer]
+      - status [ref=f1e68]: 已永久删除 2 个邀请码
+      - generic [ref=f1e69]:
+        - generic [ref=f1e70]:
+          - generic [ref=f1e71]: 已选 0 项
+          - button "删除选中" [disabled] [ref=f1e72]
+        - table [ref=f1e77]:
+          - rowgroup [ref=f1e78]:
+            - row [ref=f1e79]:
+              - columnheader [ref=f1e80]:
+                - checkbox "选择全部邀请码" [disabled] [ref=f1e81]
+              - columnheader "邀请码" [ref=f1e82]
+              - columnheader "状态" [ref=f1e83]
+              - columnheader "使用者" [ref=f1e84]
+              - columnheader "过期时间" [ref=f1e85]
+              - columnheader "创建时间" [ref=f1e86]
+              - columnheader "操作" [ref=f1e87]
+          - rowgroup [ref=f1e88]:
+            - row [ref=f1e89]:
+              - cell "暂无邀请码" [ref=f1e90]

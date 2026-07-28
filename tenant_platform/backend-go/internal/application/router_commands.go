@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -69,24 +70,24 @@ func (r *router) loadCommands(ctx context.Context) map[string]domain.PlatformCom
 }
 
 // defaultCommands is the built-in fallback when no CommandRegistry is wired
-// (e.g. unit tests). Matches the seed data in migrations 0004 + 0016.
+// (e.g. unit tests). It contains only user-safe platform commands.
 func defaultCommands() map[string]domain.PlatformCommand {
 	defaults := []domain.PlatformCommand{
-		{Command: "/help", Action: domain.CommandIntercept, Handler: "help"},
-		{Command: "/status", Action: domain.CommandIntercept, Handler: "status"},
-		{Command: "/stop", Action: domain.CommandIntercept, Handler: "stop"},
-		{Command: "/new", Action: domain.CommandIntercept, Handler: "new"},
-		{Command: "/llm", Action: domain.CommandIntercept, Handler: "llm"},
-		{Command: "/我的身份", Action: domain.CommandIntercept, Handler: "identity"},
-		{Command: "/个人", Action: domain.CommandIntercept, Handler: "personal"},
-		{Command: "/团队", Action: domain.CommandIntercept, Handler: "team"},
-		{Command: "/邀请码", Action: domain.CommandIntercept, Handler: "invite_code"},
-		{Command: "/同意", Action: domain.CommandIntercept, Handler: "accept"},
-		{Command: "/批准", Action: domain.CommandIntercept, Handler: "approve"},
-		{Command: "/拒绝", Action: domain.CommandIntercept, Handler: "reject"},
-		{Command: "/移除", Action: domain.CommandIntercept, Handler: "remove"},
-		{Command: "/relay_off", Action: domain.CommandIntercept, Handler: "relay_off"},
-		{Command: "/relay_on", Action: domain.CommandIntercept, Handler: "relay_on"},
+		{Command: "/help", Action: domain.CommandIntercept, Handler: "help", HelpText: "显示帮助", SortOrder: 1},
+		{Command: "/status", Action: domain.CommandIntercept, Handler: "status", HelpText: "查看任务状态", SortOrder: 2},
+		{Command: "/stop", Action: domain.CommandIntercept, Handler: "stop", HelpText: "停止当前任务", SortOrder: 3},
+		{Command: "/abort", Action: domain.CommandIntercept, Handler: "stop", HelpText: "停止当前任务（/stop 别名）", SortOrder: 4},
+		{Command: "/new", Action: domain.CommandIntercept, Handler: "new", HelpText: "开启新对话", SortOrder: 5},
+		{Command: "/我的身份", Action: domain.CommandIntercept, Handler: "identity", HelpText: "查看当前身份和上下文", SortOrder: 10},
+		{Command: "/个人", Action: domain.CommandIntercept, Handler: "personal", HelpText: "切换到个人助手上下文", SortOrder: 11},
+		{Command: "/团队", Action: domain.CommandIntercept, Handler: "team", HelpText: "进入团队上下文或列出团队", SortOrder: 12},
+		{Command: "/邀请码", Action: domain.CommandIntercept, Handler: "invite_code", HelpText: "提交团队邀请码", SortOrder: 13},
+		{Command: "/同意", Action: domain.CommandIntercept, Handler: "accept", HelpText: "同意团队邀请", SortOrder: 14},
+		{Command: "/批准", Action: domain.CommandIntercept, Handler: "approve", HelpText: "批准成员加入", SortOrder: 15},
+		{Command: "/拒绝", Action: domain.CommandIntercept, Handler: "reject", HelpText: "拒绝团队邀请", SortOrder: 16},
+		{Command: "/移除", Action: domain.CommandIntercept, Handler: "remove", HelpText: "移除团队成员", SortOrder: 17},
+		{Command: "/relay_off", Action: domain.CommandIntercept, Handler: "relay_off", HelpText: "关闭消息转发", SortOrder: 20},
+		{Command: "/relay_on", Action: domain.CommandIntercept, Handler: "relay_on", HelpText: "开启消息转发", SortOrder: 21},
 	}
 	m := make(map[string]domain.PlatformCommand, len(defaults))
 	for _, c := range defaults {
@@ -175,28 +176,30 @@ func (r *router) handleHelp(ctx context.Context, msg IncomingMessage, bot domain
 
 // buildHelpText formats the command list from the registry into a help message.
 func buildHelpText(commands map[string]domain.PlatformCommand) string {
-	var sb strings.Builder
-	sb.WriteString("📖 平台命令:\n")
+	visible := make([]domain.PlatformCommand, 0, len(commands))
 	for _, cmd := range commands {
-		if cmd.Action == domain.CommandIntercept {
-			help := cmd.HelpText
-			if help == "" {
-				help = cmd.Handler
-			}
-			sb.WriteString(fmt.Sprintf("%s - %s\n", cmd.Command, help))
+		if cmd.Action == domain.CommandIntercept && !isRestrictedUserCommand(cmd.Command) {
+			visible = append(visible, cmd)
 		}
 	}
-	sb.WriteString("\n其他消息或 /xxx 命令将作为任务发送给 Agent")
-	return sb.String()
-}
+	sort.Slice(visible, func(i, j int) bool {
+		if visible[i].SortOrder == visible[j].SortOrder {
+			return visible[i].Command < visible[j].Command
+		}
+		return visible[i].SortOrder < visible[j].SortOrder
+	})
 
-// handleLLM reports model policy info. Model selection is controlled by the
-// platform's LLM Proxy (spec §44: real Key only in control plane); the Worker
-// cannot self-select models. The actual model list comes from LLM Proxy policy.
-func (r *router) handleLLM(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
-	reply := fmt.Sprintf("模型由平台 LLM Proxy 管控（当前策略版本: %s）\nWorker 不可自选模型", r.toolPolicy)
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
-	return RouterResult{Action: ActionModelInfo, Reply: reply, UserID: bot.OwnerID}, nil
+	var sb strings.Builder
+	sb.WriteString("📖 可用命令:\n")
+	for _, cmd := range visible {
+		help := cmd.HelpText
+		if help == "" {
+			help = cmd.Handler
+		}
+		sb.WriteString(fmt.Sprintf("%s - %s\n", cmd.Command, help))
+	}
+	sb.WriteString("\n未列出的 /xxx 命令不可用")
+	return sb.String()
 }
 
 // handleNormalMessage forwards a non-command text/media payload as a task to
@@ -207,15 +210,9 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	// Surface inbound media paths in the prompt so GA's file tools can read them.
-	// This keeps the SubmitTaskCommand proto stable while making media reachable
-	// to the worker. If text is empty (pure media message), use a placeholder.
 	prompt := text
-	if len(msg.MediaPaths) > 0 {
-		if prompt == "" {
-			prompt = "[media message]"
-		}
-		prompt = prompt + "\n\n[Attached files: " + strings.Join(msg.MediaPaths, ", ") + "]"
+	if prompt == "" && len(msg.MediaPaths) > 0 {
+		prompt = "[media message]"
 	}
 	// Per-user tool policy (migration 0005): resolve the user's assigned policy
 	// version, not a global default. Admins can grant different capabilities
@@ -230,6 +227,30 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
+	}
+	if r.sessionFiles != nil {
+		currentRefs, err := r.sessionFiles.ImportInbound(sessionKey, msg.MediaPaths)
+		if err != nil {
+			return RouterResult{}, fmt.Errorf("stage session files: %w", err)
+		}
+		recentRefs, err := r.sessionFiles.Recent(sessionKey, 8)
+		if err != nil {
+			return RouterResult{}, fmt.Errorf("list session files: %w", err)
+		}
+		if hint := sessionFilesPrompt(currentRefs, recentRefs); hint != "" {
+			if prompt != "" {
+				prompt += "\n\n"
+			}
+			prompt += hint
+		}
+		if userPolicy == "foundation.no-host-tools.v1" {
+			userPolicy = "foundation.session-files.v1"
+		}
+	} else if len(msg.MediaPaths) > 0 {
+		if prompt != "" {
+			prompt += "\n\n"
+		}
+		prompt += "[Attached files: " + strings.Join(msg.MediaPaths, ", ") + "]"
 	}
 	_, err = r.tasks.SubmitTask(ctx, domain.SubmitTaskCommand{
 		SessionKey:        sessionKey,
@@ -246,10 +267,9 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	// Send immediate ack so user knows message was received (synchronous fast path).
-	// The delivery_service will also send "🤖 正在处理..." notification via task_started
-	// delivery (asynchronous reliable path, survives restarts).
-	reply := "✓ 收到"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	// Normal message acceptance is delivered through the durable task_started
+	// outbox path so users get exactly one acknowledgment instead of a sync
+	// "收到" plus an async "正在处理" duplicate.
+	reply := "✓ 收到，正在处理您的任务..."
 	return RouterResult{Action: ActionTaskCreated, Reply: reply, UserID: bot.OwnerID}, nil
 }

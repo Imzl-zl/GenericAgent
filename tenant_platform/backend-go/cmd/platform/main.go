@@ -309,6 +309,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	imInboundCoalesceWindowMS, err := store.GetIMInboundCoalesceWindowMS(ctx)
+	if err != nil {
+		return fmt.Errorf("load im inbound coalesce window: %w", err)
+	}
+	agentMaxTurns, err := store.GetAgentMaxTurns(ctx)
+	if err != nil {
+		return fmt.Errorf("load agent max turns: %w", err)
+	}
 	// Resource quotas: enforced by scheduler (global running cap) and store
 	// (per-user queued cap). Zero disables (dev/test).
 	store.SetPerUserQueueLimit(*perUserQueueLimit)
@@ -470,6 +478,7 @@ func run() error {
 		MaxRunningTasks:       *maxRunningTasks,
 		PerTenantRunningLimit: *perTenantRunningLimit,
 		TaskTimeoutSeconds:    *taskTimeoutSeconds,
+		RuntimeSettings:       store,
 		IdleTimeout:           time.Duration(*taskIdleTimeoutSec) * time.Second,
 		WorkerIdleTTL:         time.Duration(*workerIdleTTLSec) * time.Second,
 	})
@@ -556,6 +565,7 @@ func run() error {
 	// loopback transport is used for dev/test.
 	var botTransport transport.BotTransportAdapter
 	var botLifecycle application.BotLifecycleService
+	var botPollerClient *poller.Client
 	if pollerURL := strings.TrimSpace(*botPollerURL); pollerURL != "" {
 		if cipher == nil {
 			return fmt.Errorf("--bot-poller-url requires --bot-token-key/BOT_TOKEN_KEY")
@@ -564,12 +574,15 @@ func run() error {
 		if webhookURL == "" {
 			webhookURL = fmt.Sprintf("http://%s/v1/im/webhook", *listen)
 		}
-		pollerClient, err := poller.NewClient(pollerURL, strings.TrimSpace(*botPollerAPISecret))
+		botPollerClient, err = poller.NewClient(pollerURL, strings.TrimSpace(*botPollerAPISecret))
 		if err != nil {
 			return fmt.Errorf("poller client: %w", err)
 		}
+		if err := botPollerClient.ConfigureInboundCoalescing(ctx, imInboundCoalesceWindowMS); err != nil {
+			return fmt.Errorf("configure poller inbound coalescing: %w", err)
+		}
 		ilinkAdapter, err := transport.NewILinkAdapter(transport.ILinkAdapterConfig{
-			Poller: pollerClient,
+			Poller: botPollerClient,
 		})
 		if err != nil {
 			return fmt.Errorf("ilink adapter: %w", err)
@@ -578,7 +591,7 @@ func run() error {
 		botLifecycle, err = application.NewBotLifecycleService(application.BotLifecycleConfig{
 			Store:              store,
 			Cipher:             cipher,
-			Poller:             pollerClient,
+			Poller:             botPollerClient,
 			WebhookURL:         webhookURL,
 			RestoreConcurrency: 4,
 		})
@@ -604,12 +617,21 @@ func run() error {
 		return fmt.Errorf("relay service: %w", err)
 	}
 
+	var sessionFiles application.SessionFiles
+	if strings.TrimSpace(boot.RuntimeRoot) != "" {
+		sessionFiles, err = application.NewSessionFiles(boot.RuntimeRoot)
+		if err != nil {
+			return fmt.Errorf("session files: %w", err)
+		}
+	}
+
 	routerSvc, err := application.NewRouter(application.RouterConfig{
 		Store:          store,
 		Tasks:          svc,
 		Transport:      botTransport,
 		Commands:       store, // DB-driven command registry (migration 0004)
 		Messages:       store, // messages table (migration 0013)
+		SessionFiles:   sessionFiles,
 		ToolPolicy:     strings.TrimSpace(*modelPolicyVersion),
 		SourceInstance: instanceID,
 		Teams:          teamSvc,  // P1 team lifecycle (migration 0016)
@@ -620,36 +642,40 @@ func run() error {
 	}
 
 	server, err := api.NewServer(api.ServerConfig{
-		Service:       svc,
-		Users:         userSvc,
-		WechatBinding: wechatBindingSvc,
-		BotService:    botSvc,
-		Invite:        inviteSvc,
-		Personas:      personaSvc,
-		Router:        routerSvc,
-		Registry:      reg,
-		Policies:      store, // admin command/policy management (migration 0004)
-		Bots:          store,
-		LLMProviders:  store, // admin LLM provider management (migration 0007)
-		BotLifecycle:  botLifecycle,
-		TaskStats:     store,
+		Service:         svc,
+		Users:           userSvc,
+		WechatBinding:   wechatBindingSvc,
+		BotService:      botSvc,
+		Invite:          inviteSvc,
+		Personas:        personaSvc,
+		Router:          routerSvc,
+		Registry:        reg,
+		Policies:        store, // admin command/policy management (migration 0004)
+		RuntimeSettings: store,
+		Bots:            store,
+		LLMProviders:    store, // admin LLM provider management (migration 0007)
+		BotLifecycle:    botLifecycle,
+		TaskStats:       store,
 		RuntimeProfile: api.RuntimeProfile{
-			ClaimLeaseSeconds:       int((*claimLease) / time.Second),
-			TokenTTLSeconds:         int(llmproxy.DefaultTokenTTL / time.Second),
-			TokenRefreshSkewSeconds: int(application.DefaultTokenRefreshSkew / time.Second),
-			MaxTaskWallClockSeconds: *maxTaskWallClockSec,
-			TaskTimeoutSeconds:      *taskTimeoutSeconds,
-			TaskIdleTimeoutSeconds:  *taskIdleTimeoutSec,
-			WorkerIdleTTLSeconds:    *workerIdleTTLSec,
-			MaxRunningTasks:         *maxRunningTasks,
-			PerTenantRunningLimit:   *perTenantRunningLimit,
-			PerUserQueueLimit:       *perUserQueueLimit,
+			ClaimLeaseSeconds:         int((*claimLease) / time.Second),
+			TokenTTLSeconds:           int(llmproxy.DefaultTokenTTL / time.Second),
+			TokenRefreshSkewSeconds:   int(application.DefaultTokenRefreshSkew / time.Second),
+			MaxTaskWallClockSeconds:   *maxTaskWallClockSec,
+			TaskTimeoutSeconds:        *taskTimeoutSeconds,
+			TaskIdleTimeoutSeconds:    *taskIdleTimeoutSec,
+			WorkerIdleTTLSeconds:      *workerIdleTTLSec,
+			MaxRunningTasks:           *maxRunningTasks,
+			PerTenantRunningLimit:     *perTenantRunningLimit,
+			PerUserQueueLimit:         *perUserQueueLimit,
+			IMInboundCoalesceWindowMS: imInboundCoalesceWindowMS,
+			AgentMaxTurns:             agentMaxTurns,
 		},
-		Cipher:        cipher,
-		DevToken:      boot.DevToken,
-		DevUserID:     devCtx.UserID,
-		SessionKey:    devCtx.SessionKey,
-		WebhookSecret: strings.TrimSpace(*webhookSecret),
+		IMAggregationRuntime: botPollerClient,
+		Cipher:               cipher,
+		DevToken:             boot.DevToken,
+		DevUserID:            devCtx.UserID,
+		SessionKey:           devCtx.SessionKey,
+		WebhookSecret:        strings.TrimSpace(*webhookSecret),
 	})
 	if err != nil {
 		return err
@@ -667,6 +693,7 @@ func run() error {
 			Transport:    botTransport,
 			Results:      coord,
 			Messages:     store, // audit outbound replies (migration 0013)
+			SessionFiles: sessionFiles,
 			PollInterval: 2 * time.Second,
 			ClaimLease:   30 * time.Second,
 			RetryWindow:  5 * time.Minute,

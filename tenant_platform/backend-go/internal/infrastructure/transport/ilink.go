@@ -50,6 +50,18 @@ func (a *ILinkAdapter) SendMessage(ctx context.Context, botUUID, ilinkUserID, te
 	})
 }
 
+func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, ilinkUserID, filePath string) error {
+	if botUUID == "" || ilinkUserID == "" || filePath == "" {
+		return errors.New("bot uuid, ilink user id, and file path are required")
+	}
+	return a.poller.SendMessage(ctx, poller.SendMessageRequest{
+		BotUUID:     botUUID,
+		ILinkUserID: ilinkUserID,
+		MsgType:     poller.MsgTypeFile,
+		FilePath:    filePath,
+	})
+}
+
 // RecordMessageIdempotency returns true the first time a message is seen
 // within the TTL window. Sharded by key hash so concurrent bots don't contend
 // on a single mutex.

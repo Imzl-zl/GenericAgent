@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -21,13 +22,17 @@ const InviteCodeTTL = 7 * 24 * time.Hour
 // SessionTTL is the default validity window for a user bearer session.
 const SessionTTL = 30 * 24 * time.Hour
 
+// ErrInviteCodesRequired reports an empty permanent-delete request.
+var ErrInviteCodesRequired = errors.New("at least one invite code is required")
+
 // InviteStore is the persistence port for invite codes and user sessions.
 type InviteStore interface {
 	CreateInviteCode(ctx context.Context, code string, createdByUserID int64, expiresAt time.Time) (domain.InviteCode, error)
-	GetInviteCode(ctx context.Context, code string) (domain.InviteCode, error)
-	ConsumeInviteCode(ctx context.Context, code string, usedByUserID int64, now time.Time) error
+	CheckInviteCode(ctx context.Context, code string, now time.Time) error
 	RevokeInviteCode(ctx context.Context, code string) error
+	DeleteInviteCodes(ctx context.Context, codes []string) (int64, error)
 	ListInviteCodes(ctx context.Context) ([]domain.InviteCode, error)
+	CreateUserWithInvite(ctx context.Context, username, passwordHash, code, tokenHash string, now, sessionExpiresAt time.Time) (domain.User, error)
 	CreateUserSession(ctx context.Context, tokenHash string, userID int64, expiresAt time.Time) (domain.UserSession, error)
 	GetUserSession(ctx context.Context, tokenHash string) (domain.UserSession, error)
 }
@@ -36,6 +41,7 @@ type InviteStore interface {
 type InviteService interface {
 	GenerateInviteCode(ctx context.Context, createdByUserID int64) (string, domain.InviteCode, error)
 	RevokeInviteCode(ctx context.Context, code string) error
+	DeleteInviteCodes(ctx context.Context, codes []string) (int64, error)
 	ListInviteCodes(ctx context.Context) ([]domain.InviteCode, error)
 	RegisterWithInvite(ctx context.Context, username, password, code string) (domain.User, string, error)
 	Login(ctx context.Context, username, password string) (domain.User, string, error)
@@ -43,9 +49,9 @@ type InviteService interface {
 }
 
 type inviteService struct {
-	store     InviteStore
-	users     UserStore
-	codeTTL   time.Duration
+	store      InviteStore
+	users      UserStore
+	codeTTL    time.Duration
 	sessionTTL time.Duration
 }
 
@@ -99,6 +105,26 @@ func (s *inviteService) RevokeInviteCode(ctx context.Context, code string) error
 	return s.store.RevokeInviteCode(ctx, code)
 }
 
+func (s *inviteService) DeleteInviteCodes(ctx context.Context, codes []string) (int64, error) {
+	unique := make([]string, 0, len(codes))
+	seen := make(map[string]struct{}, len(codes))
+	for _, code := range codes {
+		trimmed := strings.TrimSpace(code)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		unique = append(unique, trimmed)
+	}
+	if len(unique) == 0 {
+		return 0, ErrInviteCodesRequired
+	}
+	return s.store.DeleteInviteCodes(ctx, unique)
+}
+
 func (s *inviteService) ListInviteCodes(ctx context.Context) ([]domain.InviteCode, error) {
 	return s.store.ListInviteCodes(ctx)
 }
@@ -117,33 +143,29 @@ func (s *inviteService) RegisterWithInvite(ctx context.Context, username, passwo
 	if code == "" {
 		return domain.User{}, "", fmt.Errorf("invite code is required")
 	}
-	ic, err := s.store.GetInviteCode(ctx, code)
-	if err != nil {
+	now := time.Now().UTC()
+	if err := s.store.CheckInviteCode(ctx, code, now); err != nil {
 		return domain.User{}, "", fmt.Errorf("invalid invite code")
 	}
-	now := time.Now().UTC()
-	if !ic.IsConsumable(now) {
-		return domain.User{}, "", fmt.Errorf("invite code is used, expired, or revoked")
-	}
-
 	passwordHash, err := HashPassword(password)
 	if err != nil {
 		return domain.User{}, "", fmt.Errorf("hash password: %w", err)
 	}
-	user, err := s.users.CreateUser(ctx, trimmed, passwordHash)
-	if err != nil {
-		return domain.User{}, "", err
-	}
-
-	if err := s.store.ConsumeInviteCode(ctx, code, user.ID, now); err != nil {
-		return domain.User{}, "", err
-	}
-
 	token, err := createSessionToken()
 	if err != nil {
 		return domain.User{}, "", err
 	}
-	if _, err := s.store.CreateUserSession(ctx, hashToken(token), user.ID, now.Add(s.sessionTTL)); err != nil {
+	now = time.Now().UTC()
+	user, err := s.store.CreateUserWithInvite(
+		ctx,
+		trimmed,
+		passwordHash,
+		code,
+		hashToken(token),
+		now,
+		now.Add(s.sessionTTL),
+	)
+	if err != nil {
 		return domain.User{}, "", err
 	}
 	return user, token, nil

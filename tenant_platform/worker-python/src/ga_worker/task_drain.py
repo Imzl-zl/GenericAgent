@@ -153,8 +153,9 @@ def _handle_done_item(
     state.final_body = item.get("done") or ""
     state.final_turn = int(item.get("turn") or 0)
     error_msg = item.get("error")
+    error_code = item.get("error_code")
     if error_msg:
-        yield from emit_error_terminal(adapter, task, state, error_msg)
+        yield from emit_error_terminal(adapter, task, state, error_msg, error_code)
         return
     if state.output_exceeded["v"]:
         yield from emit_output_exceeded_terminal(adapter, task, state)

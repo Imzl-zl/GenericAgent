@@ -3,8 +3,11 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 )
 
 type registerBody struct {
@@ -28,7 +31,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"user_id": user.ID,
+		"user_id":  user.ID,
 		"username": user.Username,
 		"status":   string(user.Status),
 		"token":    token,
@@ -68,8 +71,8 @@ func (s *Server) handleAdminCreateInviteCode(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"code":      plaintext,
-		"state":     string(ic.State),
+		"code":       plaintext,
+		"state":      string(ic.State),
 		"expires_at": ic.ExpiresAt.UTC().Format(time.RFC3339),
 		"created_at": ic.CreatedAt.UTC().Format(time.RFC3339),
 	})
@@ -100,6 +103,29 @@ func (s *Server) handleAdminListInviteCodes(w http.ResponseWriter, r *http.Reque
 		out = append(out, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"invite_codes": out})
+}
+
+type deleteInviteCodesBody struct {
+	Codes []string `json:"codes"`
+}
+
+func (s *Server) handleAdminDeleteInviteCodes(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	var body deleteInviteCodesBody
+	if err := decodeStrict(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+		return
+	}
+	deleted, err := s.invite.DeleteInviteCodes(r.Context(), body.Codes)
+	if errors.Is(err, application.ErrInviteCodesRequired) {
+		writeErr(w, http.StatusBadRequest, "INVITE_DELETE_FAILED", err.Error(), tid)
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "INVITE_DELETE_FAILED", "failed to delete invite codes", tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
 }
 
 func (s *Server) handleAdminRevokeInviteCode(w http.ResponseWriter, r *http.Request) {

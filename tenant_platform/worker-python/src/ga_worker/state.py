@@ -66,6 +66,7 @@ class SessionState:
     seed_agent_history: list[Any] = field(default_factory=list)
     seed_display_history: list[Any] = field(default_factory=list)
     display_history: list[Any] = field(default_factory=list)
+    generated_output_files: list[str] = field(default_factory=list)
     completed: CompletedTask | None = None
     active_task_id: str | None = None
     shutting_down: bool = False

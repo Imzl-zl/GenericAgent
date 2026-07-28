@@ -5,6 +5,15 @@
       "tool_policies": {
         "foundation.no-host-tools.v1": {
           "allowed_tools": ["update_working_checkpoint"]
+        },
+        "foundation.session-files.v1": {
+          "allowed_tools": [
+            "update_working_checkpoint",
+            "file_read",
+            "file_write",
+            "file_patch",
+            "export_docx"
+          ]
         }
       }
     }

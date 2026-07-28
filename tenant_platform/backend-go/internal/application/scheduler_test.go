@@ -11,6 +11,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
@@ -68,6 +69,14 @@ func TestCredentialReloadDoesNotHoldGlobalWorkersLock(t *testing.T) {
 	if err := <-reloadDone; err != nil {
 		t.Fatal(err)
 	}
+}
+
+type fakeAgentRuntimeSettings struct {
+	maxTurns int
+}
+
+func (f *fakeAgentRuntimeSettings) GetAgentMaxTurns(context.Context) (int, error) {
+	return f.maxTurns, nil
 }
 
 type controlledWorker struct {
@@ -201,6 +210,21 @@ func (w *controlledWorker) interrupt() {
 		close(w.streamDone)
 	})
 }
+func (w *controlledWorker) fail(code, message string) {
+	w.events <- workerclient.WorkerEvent{
+		Kind: workerclient.KindTerminal,
+		Terminal: &workerv1.Terminal{
+			Status:      workerv1.TerminalStatus_TASK_FAILED,
+			UserMessage: message,
+			Error:       &workerv1.ErrorEnvelope{Code: code, UserMessage: message},
+		},
+	}
+	w.closeOnce.Do(func() {
+		close(w.events)
+		close(w.errs)
+		close(w.streamDone)
+	})
+}
 func (w *controlledWorker) failStream(err error) {
 	w.errs <- err
 	w.closeOnce.Do(func() {
@@ -277,8 +301,17 @@ func (c *readFailCoordinator) ReadResult(context.Context, string, string) (domai
 	return domain.ResultPayload{}, errors.New("digest-checked result read failed")
 }
 
+func testPolicyRegistry(t *testing.T) policy.Registry {
+	t.Helper()
+	registry, err := policy.LoadRegistry(foundationPolicy(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry
+}
+
 func TestStartSessionOnWorkerPassesCurrentRestorePoint(t *testing.T) {
-	_, _, registry, _ := serviceFixture(t)
+	registry := testPolicyRegistry(t)
 	worker := newControlledWorker()
 	coordinator := &successfulCoordinator{
 		restorePoint: checkpoint.RestorePoint{
@@ -302,6 +335,43 @@ func TestStartSessionOnWorkerPassesCurrentRestorePoint(t *testing.T) {
 		request.GetSnapshotRef() != coordinator.restorePoint.SnapshotRef ||
 		request.GetSnapshotChecksum() != coordinator.restorePoint.Checksum {
 		t.Fatalf("start request=%+v restore=%+v", request, coordinator.restorePoint)
+	}
+	if request.GetRuntimePolicy().GetMaxTurns() != 80 {
+		t.Fatalf("max turns=%d want 80", request.GetRuntimePolicy().GetMaxTurns())
+	}
+}
+
+func TestStartSessionOnWorkerUsesConfiguredAgentMaxTurns(t *testing.T) {
+	registry := testPolicyRegistry(t)
+	worker := newControlledWorker()
+	entry := &workerEntry{client: worker, sessionKey: "personal:configured"}
+	s := &scheduler{
+		cfg: SchedulerConfig{
+			Registry:        registry,
+			RuntimeSettings: &fakeAgentRuntimeSettings{maxTurns: 120},
+		},
+		workers: map[string]*workerEntry{"personal:configured": entry},
+	}
+
+	if err := s.startSessionOnWorker(context.Background(), domain.Task{SessionKey: "personal:configured"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := worker.startSessionRequest.GetRuntimePolicy().GetMaxTurns(); got != 120 {
+		t.Fatalf("max turns=%d want 120", got)
+	}
+}
+
+func TestPrepareWorkerEntryReplacesWorkerAfterAgentMaxTurnsChanges(t *testing.T) {
+	settings := &fakeAgentRuntimeSettings{maxTurns: 120}
+	entry := &workerEntry{started: true, runtimeMaxTurns: 80}
+	s := &scheduler{cfg: SchedulerConfig{RuntimeSettings: settings}}
+
+	replace, err := s.prepareWorkerEntry(context.Background(), entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replace {
+		t.Fatal("expected worker with stale max turns to be replaced")
 	}
 }
 
@@ -953,6 +1023,55 @@ WHERE id=$1
 	}
 	if final.Status == domain.TaskSucceeded {
 		t.Fatal("heartbeat loss published success")
+	}
+	if _, err := store.GetDelivery(ctx, task.ID, domain.DeliveryTaskComplete); err == nil {
+		t.Fatal("unexpected task_complete delivery")
+	}
+}
+
+func TestScheduler_MaxTurnsExceededCommitsFailedAndCreatesFailedDelivery(t *testing.T) {
+	_, store, reg, dev := serviceFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
+		Source: "web", SourceInstanceID: "max-turns", MessageID: "max-turns",
+		Prompt: "long task", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "max-turns-owner", time.Second)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	worker := newControlledWorker()
+	schedulerAPI, err := NewScheduler(SchedulerConfig{
+		PlatformInstanceID: "max-turns-owner", ClaimLease: time.Second, Store: store, Registry: reg,
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+			return worker, func() {}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatchDone := make(chan error, 1)
+	go func() { dispatchDone <- schedulerAPI.(*scheduler).dispatch(ctx, claimed) }()
+	<-worker.executeStarted
+	worker.fail("MAX_TURNS_EXCEEDED", "agent reached configured turn limit (80) before completing the task")
+	if err := <-dispatchDone; err != nil {
+		t.Fatal(err)
+	}
+
+	final, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != domain.TaskFailed || final.TerminalErrorCode != "MAX_TURNS_EXCEEDED" {
+		t.Fatalf("status=%s code=%s", final.Status, final.TerminalErrorCode)
+	}
+	if _, err := store.GetDelivery(ctx, task.ID, domain.DeliveryTaskFailed); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := store.GetDelivery(ctx, task.ID, domain.DeliveryTaskComplete); err == nil {
 		t.Fatal("unexpected task_complete delivery")

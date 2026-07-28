@@ -13,14 +13,21 @@ type SentMessage struct {
 	Text        string
 }
 
+type SentFile struct {
+	BotUUID     string
+	IlinkUserID string
+	FilePath    string
+}
+
 // LoopbackTransport is an in-memory BotTransportAdapter for tests and dev
 // loopback. It records sent messages and tracks message idempotency without
 // any real IM SDK. Safe for concurrent use.
 type LoopbackTransport struct {
-	mu       sync.Mutex
-	sent     []SentMessage
-	seen     map[string]bool // key = botUUID + "|" + messageID
-	sendErr  error
+	mu        sync.Mutex
+	sent      []SentMessage
+	sentFiles []SentFile
+	seen      map[string]bool // key = botUUID + "|" + messageID
+	sendErr   error
 }
 
 // NewLoopbackTransport constructs an empty loopback transport.
@@ -43,6 +50,16 @@ func (t *LoopbackTransport) SendMessage(_ context.Context, botUUID, ilinkUserID,
 		return t.sendErr
 	}
 	t.sent = append(t.sent, SentMessage{BotUUID: botUUID, IlinkUserID: ilinkUserID, Text: text})
+	return nil
+}
+
+func (t *LoopbackTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sendErr != nil {
+		return t.sendErr
+	}
+	t.sentFiles = append(t.sentFiles, SentFile{BotUUID: botUUID, IlinkUserID: ilinkUserID, FilePath: filePath})
 	return nil
 }
 
@@ -81,11 +98,20 @@ func (t *LoopbackTransport) LastSentMessage() (SentMessage, bool) {
 	return t.sent[len(t.sent)-1], true
 }
 
+func (t *LoopbackTransport) SentFiles() []SentFile {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]SentFile, len(t.sentFiles))
+	copy(out, t.sentFiles)
+	return out
+}
+
 // Reset clears all state (test helper).
 func (t *LoopbackTransport) Reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.sent = nil
+	t.sentFiles = nil
 	t.seen = make(map[string]bool)
 	t.sendErr = nil
 }

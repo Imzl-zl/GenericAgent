@@ -24,7 +24,6 @@ const (
 	ActionNoRunning   RouterAction = "no_running_task"
 	ActionHelp        RouterAction = "help"
 	ActionStatus      RouterAction = "status"
-	ActionModelInfo   RouterAction = "model_info"
 	// ActionReplied covers team/context commands whose outcome is a user-facing
 	// reply (identity, switch, invite submit, member approve/reject/remove).
 	// Keeping a single action avoids action-type sprawl for one-shot commands.
@@ -78,6 +77,7 @@ type RouterStore interface {
 type MessageStore interface {
 	InsertInboundMessage(ctx context.Context, m domain.Message) (domain.Message, error)
 	InsertOutboundMessage(ctx context.Context, m domain.Message) (domain.Message, error)
+	HasOutboundMessage(ctx context.Context, taskID, messageType, content, mediaPath string) (bool, error)
 	InsertMediaAsset(ctx context.Context, m domain.MediaAsset) (domain.MediaAsset, error)
 }
 
@@ -98,6 +98,7 @@ type RouterConfig struct {
 	Transport      transport.BotTransportAdapter
 	Commands       CommandRegistry
 	Messages       MessageStore
+	SessionFiles   SessionFiles
 	ToolPolicy     string
 	SourceInstance string
 	// Teams is the team lifecycle service. Optional in P0; when nil, team
@@ -124,6 +125,7 @@ type router struct {
 	transport      transport.BotTransportAdapter
 	commands       CommandRegistry
 	messages       MessageStore
+	sessionFiles   SessionFiles
 	teams          TeamService
 	relay          RelayService
 	toolPolicy     string
@@ -155,6 +157,7 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 		transport:      cfg.Transport,
 		commands:       cfg.Commands,
 		messages:       cfg.Messages,
+		sessionFiles:   cfg.SessionFiles,
 		teams:          cfg.Teams,
 		relay:          cfg.Relay,
 		toolPolicy:     cfg.ToolPolicy,
@@ -238,11 +241,10 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 // routeBoundMessage parses platform-level commands and routes everything else
 // as a task to the Worker (spec §6.2).
 //
-// Design principle: the control plane intercepts ONLY commands that affect
-// platform-owned state (tasks, bindings, model policy). Unknown /xxx commands
-// and normal text are forwarded as tasks — the Worker/GA decides whether they
-// are valid agent commands. This keeps the platform decoupled from GA's
-// command surface.
+// Design principle: slash commands are an explicit control-plane allowlist.
+// Only enabled intercept commands reach handlers; restricted, passthrough, and
+// unknown /xxx inputs are rejected before the Worker so GA's local-only slash
+// commands cannot bypass tenant policy. Non-command text is forwarded as a task.
 //
 // The command set is admin-configurable via the platform_commands table
 // (migration 0004). If CommandRegistry is nil (tests), falls back to defaults.
@@ -258,10 +260,13 @@ func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot
 		return r.handleRelay(ctx, msg, bot, text)
 	}
 	cmd, found := r.resolveCommand(ctx, text)
-	if !found || cmd.Action == domain.CommandPassthrough {
-		return r.handleNormalMessage(ctx, msg, bot, text)
+	if strings.HasPrefix(text, "/") {
+		if isRestrictedUserCommand(text) || !found || cmd.Action != domain.CommandIntercept {
+			return r.rejectUnavailableCommand(ctx, msg, bot)
+		}
+		return r.dispatchHandler(ctx, msg, bot, cmd.Handler, text)
 	}
-	return r.dispatchHandler(ctx, msg, bot, cmd.Handler, text)
+	return r.handleNormalMessage(ctx, msg, bot, text)
 }
 
 // dispatchHandler routes to the Go handler func by handler key.
@@ -277,8 +282,6 @@ func (r *router) dispatchHandler(ctx context.Context, msg IncomingMessage, bot d
 		return r.handleStatus(ctx, msg, bot)
 	case "help":
 		return r.handleHelp(ctx, msg, bot)
-	case "llm":
-		return r.handleLLM(ctx, msg, bot)
 	case "identity":
 		return r.handleIdentity(ctx, msg, bot)
 	case "personal":
@@ -300,7 +303,29 @@ func (r *router) dispatchHandler(ctx context.Context, msg IncomingMessage, bot d
 	case "relay_on":
 		return r.handleRelayOn(ctx, msg, bot)
 	default:
-		// Unknown handler key in DB → treat as passthrough (safe default).
-		return r.handleNormalMessage(ctx, msg, bot, text)
+		return r.rejectUnavailableCommand(ctx, msg, bot)
 	}
+}
+
+func isRestrictedUserCommand(text string) bool {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) == 0 {
+		return false
+	}
+	command := strings.ToLower(fields[0])
+	if strings.HasPrefix(command, "/session.") {
+		return true
+	}
+	switch command {
+	case "/llm", "/activate", "/resume":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *router) rejectUnavailableCommand(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+	reply := "该命令不可用。发送 /help 查看可用命令。"
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 }

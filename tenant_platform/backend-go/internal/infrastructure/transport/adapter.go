@@ -13,6 +13,8 @@ import "context"
 type BotTransportAdapter interface {
 	// SendMessage delivers a text reply to the bound user via the bot.
 	SendMessage(ctx context.Context, botUUID, ilinkUserID, text string) error
+	// SendFile delivers a file reply to the bound user via the bot.
+	SendFile(ctx context.Context, botUUID, ilinkUserID, filePath string) error
 
 	// RecordMessageIdempotency records (botUUID, messageID) and returns true
 	// if this is the first time the message has been seen. Returns false for

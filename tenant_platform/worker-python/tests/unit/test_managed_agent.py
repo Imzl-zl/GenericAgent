@@ -522,6 +522,18 @@ def test_start_session_enables_incremental_output_for_worker_agent(roots, founda
     assert adapter._session.agent.inc_out is True
 
 
+def test_start_session_forces_non_verbose_agent(roots, foundation_registry):
+    class VerboseAgent(ScriptedAgent):
+        def __init__(self):
+            super().__init__()
+            self.verbose = True
+
+    adapter = _make_adapter(roots, foundation_registry, VerboseAgent)
+    adapter.start_session(_start_req())
+    assert adapter._session is not None
+    assert adapter._session.agent.verbose is False
+
+
 def test_execute_task_maps_next_and_done(roots, foundation_registry):
     agent_holder: dict[str, ScriptedAgent] = {}
 
@@ -873,6 +885,35 @@ def test_legacy_backend_exception_maps_to_task_failed(roots, foundation_registry
     assert term.error.code == "TASK_EXCEPTION"
     assert "simulated backend crash" in term.user_message
     # Partial body is preserved for checkpoint digest.
+    assert term.result_digest == result_digest_for("partial-body")
+
+
+def test_max_turns_exceeded_preserves_structured_failure_code(roots, foundation_registry):
+    class MaxTurnsAgent(ScriptedAgent):
+        def run(self):
+            while True:
+                task = self.task_queue.get()
+                if isinstance(task, str):
+                    break
+                self.is_running = True
+                task["output"].put({
+                    "done": "partial-body",
+                    "error": "agent reached configured turn limit (80) before completing the task",
+                    "error_code": "MAX_TURNS_EXCEEDED",
+                    "source": "test",
+                    "turn": 80,
+                    "outputs": [],
+                })
+                self.is_running = False
+                self.task_queue.task_done()
+
+    adapter = _make_adapter(roots, foundation_registry, MaxTurnsAgent)
+    adapter.start_session(_start_req(runtime_policy=_runtime_policy(max_turns=80)))
+    term = _terminal(_events(adapter, _task("max-turns", "long task")))
+
+    assert term.status == worker_pb2.TASK_FAILED
+    assert term.error.code == "MAX_TURNS_EXCEEDED"
+    assert "turn limit" in term.user_message
     assert term.result_digest == result_digest_for("partial-body")
 
 

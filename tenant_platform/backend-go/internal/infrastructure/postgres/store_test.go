@@ -25,6 +25,25 @@ func seedDev(t *testing.T, store *Store) DevelopmentContext {
 	return dev
 }
 
+func TestAgentMaxTurnsSettingPersistsAndValidates(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if got, err := store.GetAgentMaxTurns(ctx); err != nil || got != domain.DefaultAgentMaxTurns {
+		t.Fatalf("default max turns=%d err=%v", got, err)
+	}
+	if got, err := store.UpdateAgentMaxTurns(ctx, 120, 1); err != nil || got != 120 {
+		t.Fatalf("updated max turns=%d err=%v", got, err)
+	}
+	if _, err := store.UpdateAgentMaxTurns(ctx, domain.MaxAgentMaxTurns+1, 1); err == nil {
+		t.Fatal("expected max-turn validation error")
+	}
+}
+
 func TestSubmitDedupeAndCrossInstance(t *testing.T) {
 	pool := requireDB(t)
 	store, err := NewStore(pool)

@@ -70,16 +70,21 @@ const adminSteps = [
 ];
 
 const commands = [
-  { cmd: '/help', desc: '查看当前可用的平台级命令列表。' },
+  { cmd: '/help', desc: '查看当前账号可用的平台命令。' },
   { cmd: '/status', desc: '查询当前会话是否有正在运行的任务。' },
   { cmd: '/stop', desc: '取消当前会话中正在运行的任务。' },
+  { cmd: '/abort', desc: '取消当前任务，作用与 /stop 相同。' },
   { cmd: '/new', desc: '清空当前会话的 history 和 working，开启全新上下文。' },
-  { cmd: '/llm', desc: '查看当前模型策略版本，模型由平台 LLM Proxy 统一管控。' },
-  { cmd: '/我的身份', desc: '查看当前绑定的平台身份信息。' },
+  { cmd: '/我的身份', desc: '查看当前绑定的平台身份和会话上下文。' },
   { cmd: '/个人', desc: '切换回个人会话上下文。' },
-  { cmd: '/团队', desc: '切换到团队会话上下文（需先加入团队）。' },
-  { cmd: '/relay_on', desc: '开启 Relay 模式，@username 消息将直接转发给对应用户。' },
-  { cmd: '/relay_off', desc: '关闭 Relay 模式，@username 按普通消息处理。' },
+  { cmd: '/团队 [名称]', desc: '列出可用团队，或按名称切换到团队上下文。' },
+  { cmd: '/邀请码 <邀请码>', desc: '提交团队邀请码，申请加入对应团队。' },
+  { cmd: '/同意 <邀请ID>', desc: '同意团队负责人发来的直接邀请。' },
+  { cmd: '/批准 <申请ID>', desc: '团队负责人批准成员加入申请。' },
+  { cmd: '/拒绝 <申请ID>', desc: '拒绝待处理的团队邀请或加入申请。' },
+  { cmd: '/移除 @用户名', desc: '团队负责人移除指定成员。' },
+  { cmd: '/relay_on', desc: '允许接收其他用户通过 @用户名 转发的消息。' },
+  { cmd: '/relay_off', desc: '关闭接收其他用户的 @用户名 转发消息。' },
 ];
 
 const bindingStatuses = [

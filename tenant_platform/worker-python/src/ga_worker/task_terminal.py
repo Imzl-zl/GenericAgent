@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 from genericagent.worker.v1 import worker_pb2
 
+from ga_worker.session_files import append_missing_file_markers
 from ga_worker.state import TaskRunState
 
 # P-M8: named constant (no magic numbers).
@@ -54,15 +55,17 @@ def map_exception_code(exc: BaseException) -> str:
 
 
 def emit_error_terminal(
-    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState, error_msg: Any,
+    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
+    error_msg: Any, error_code: Any = None,
 ) -> Iterator[worker_pb2.WorkerEvent]:
-    """B1: legacy exception → TASK_FAILED with partial body as result_body."""
+    """Legacy failure → TASK_FAILED while preserving a structured error code."""
     if state.terminal_emitted:
         return
+    code = str(error_code or "TASK_EXCEPTION")[:ERROR_MSG_MAX_LEN]
     term = adapter._terminal(
         task.task_id, worker_pb2.TASK_FAILED,
         user_message=str(error_msg)[:ERROR_MSG_MAX_LEN],
-        error_code="TASK_EXCEPTION", result_body=state.final_body,
+        error_code=code, result_body=state.final_body,
     )
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
@@ -102,6 +105,8 @@ def emit_cancel_or_timeout_terminal(
 def emit_final_terminal(
     adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
 ) -> Iterator[worker_pb2.WorkerEvent]:
+    session = getattr(adapter, "_session", None)
+    generated = list(getattr(session, "generated_output_files", []) or [])
     if state.pending.cancel_requested or state.timed_out["v"]:
         is_timeout = state.timed_out["v"]
         status = worker_pb2.TASK_INTERRUPTED if is_timeout else worker_pb2.TASK_CANCELLED
@@ -112,6 +117,8 @@ def emit_final_terminal(
             error_code=code, result_body=state.final_body,
         )
     else:
+        if generated:
+            state.final_body = append_missing_file_markers(state.final_body, generated)
         term = adapter._terminal(
             task.task_id, worker_pb2.TASK_SUCCEEDED,
             user_message=state.final_body, result_body=state.final_body,

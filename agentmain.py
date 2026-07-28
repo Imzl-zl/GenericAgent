@@ -188,7 +188,13 @@ class GenericAgent:
                                     max_turns=180, verbose=self.verbose, yield_info=True)
             try:
                 full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = []
-                for chunk in gen:
+                runner_result = {}
+                while True:
+                    try:
+                        chunk = next(gen)
+                    except StopIteration as stop:
+                        runner_result = stop.value or {}
+                        break
                     if consume_file(self.task_dir, '_stop'): self.abort() 
                     if self.stop_sig: break
                     if isinstance(chunk, dict) and 'turn' in chunk: 
@@ -201,7 +207,13 @@ class GenericAgent:
                 if self.inc_out and last_pos < len(full_resp):
                     display_queue.put({'next': full_resp[last_pos:], 'source': source,
                                     'turn': curr_turn, 'outputs': turn_resps[-2:]})
-                display_queue.put({'done': full_resp, 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
+                done_item = {'done': full_resp, 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()}
+                if runner_result.get('result') == 'MAX_TURNS_EXCEEDED':
+                    done_item.update({
+                        'error': f'agent reached configured turn limit ({curr_turn}) before completing the task',
+                        'error_code': 'MAX_TURNS_EXCEEDED',
+                    })
+                display_queue.put(done_item)
                 self.history = handler.history_info
             except Exception as e:
                 # B1: surface backend exceptions distinctly via 'error' key so the

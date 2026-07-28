@@ -20,15 +20,16 @@ import (
 //     media_items (metadata for media_assets persistence)
 //   - auth-expired signal: bot_uuid, auth_expired=true
 type imWebhookBody struct {
-	BotUUID      string         `json:"bot_uuid"`
-	IlinkUserID  string         `json:"ilink_user_id"`
-	MessageID    string         `json:"message_id"`
-	Text         string         `json:"text"`
-	UpdatesBuf   string         `json:"updates_buf"`
-	ContextToken string         `json:"context_token"`
-	AuthExpired  bool           `json:"auth_expired"`
-	MediaPaths   []string       `json:"media_paths"`
-	MediaItems   []webhookMedia `json:"media_items"`
+	BotUUID          string         `json:"bot_uuid"`
+	IlinkUserID      string         `json:"ilink_user_id"`
+	MessageID        string         `json:"message_id"`
+	Text             string         `json:"text"`
+	UpdatesBuf       string         `json:"updates_buf"`
+	ContextToken     string         `json:"context_token"`
+	SourceMessageIDs []string       `json:"source_message_ids"`
+	AuthExpired      bool           `json:"auth_expired"`
+	MediaPaths       []string       `json:"media_paths"`
+	MediaItems       []webhookMedia `json:"media_items"`
 }
 
 // webhookMedia is one media item's metadata forwarded by the Bot Poller.

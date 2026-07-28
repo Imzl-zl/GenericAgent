@@ -11,6 +11,8 @@ export interface RuntimeProfile {
   max_running_tasks: number;
   per_tenant_running_limit: number;
   per_user_queue_limit: number;
+  im_inbound_coalesce_window_ms: number;
+  agent_max_turns: number;
 }
 
 export interface DashboardStats {

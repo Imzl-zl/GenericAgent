@@ -149,6 +149,12 @@ class SessionLifecycleMixin:
         # cumulative-text replay.
         if hasattr(agent, "inc_out"):
             agent.inc_out = True
+        # Tenant deliveries should match GA chat frontends: user-facing output
+        # comes from cleaned reply text, not the verbose raw transcript that
+        # includes internal turn markers / tool traces / provider-specific
+        # streaming detail.
+        if hasattr(agent, "verbose"):
+            agent.verbose = False
         if hasattr(agent, "handler"):
             agent.handler = None
         return agent

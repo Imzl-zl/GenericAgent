@@ -211,16 +211,17 @@ func TestAdminDashboardStatsExposeRuntimeProfileAndRunningTasks(t *testing.T) {
 		TaskStats: dashboardFakeTaskStats{running: 3},
 		Registry:  dashboardFakeRegistry{},
 		RuntimeProfile: RuntimeProfile{
-			ClaimLeaseSeconds:       60,
-			TokenTTLSeconds:         3600,
-			TokenRefreshSkewSeconds: 300,
-			MaxTaskWallClockSeconds: 2700,
-			TaskTimeoutSeconds:      0,
-			TaskIdleTimeoutSeconds:  300,
-			WorkerIdleTTLSeconds:    600,
-			MaxRunningTasks:         16,
-			PerTenantRunningLimit:   4,
-			PerUserQueueLimit:       8,
+			ClaimLeaseSeconds:         60,
+			TokenTTLSeconds:           3600,
+			TokenRefreshSkewSeconds:   300,
+			MaxTaskWallClockSeconds:   2700,
+			TaskTimeoutSeconds:        0,
+			TaskIdleTimeoutSeconds:    300,
+			WorkerIdleTTLSeconds:      600,
+			MaxRunningTasks:           16,
+			PerTenantRunningLimit:     4,
+			PerUserQueueLimit:         8,
+			IMInboundCoalesceWindowMS: 2500,
 		},
 		DevToken:  "test-dev-token",
 		DevUserID: 9,
@@ -247,6 +248,9 @@ func TestAdminDashboardStatsExposeRuntimeProfileAndRunningTasks(t *testing.T) {
 		t.Fatalf("runtime profile=%+v", stats.RuntimeProfile)
 	}
 	if stats.RuntimeProfile.TokenTTLSeconds != 3600 || stats.RuntimeProfile.PerUserQueueLimit != 8 {
+		t.Fatalf("runtime profile=%+v", stats.RuntimeProfile)
+	}
+	if stats.RuntimeProfile.IMInboundCoalesceWindowMS != 2500 {
 		t.Fatalf("runtime profile=%+v", stats.RuntimeProfile)
 	}
 }

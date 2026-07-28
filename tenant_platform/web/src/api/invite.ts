@@ -36,3 +36,7 @@ export async function listInviteCodes(): Promise<InviteCode[]> {
 export async function revokeInviteCode(code: string): Promise<{ revoked: boolean }> {
   return api.delete<{ revoked: boolean }>(`/v1/admin/invite-codes/${encodeURIComponent(code)}`);
 }
+
+export async function deleteInviteCodes(codes: string[]): Promise<{ deleted: number }> {
+  return api.delete<{ deleted: number }>('/v1/admin/invite-codes', { codes });
+}

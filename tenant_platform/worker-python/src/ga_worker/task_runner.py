@@ -137,7 +137,7 @@ def _setup_runtime(
 ) -> TaskRunState:
     from ga_worker.legacy_instrument import (
         apply_tool_policy, install_dispatch_guard, install_handler_print_counter,
-        install_max_turns, prepare_handler_seed,
+        install_max_turns, install_session_file_sandbox, prepare_handler_seed,
     )
     agent = adapter._session.agent
     state = TaskRunState(
@@ -148,6 +148,9 @@ def _setup_runtime(
         previous_persona=list(getattr(agent, "extra_sys_prompts", []) or []),
     )
     agent.extra_sys_prompts = list(task.persona_snapshot)
+    if adapter._session is not None:
+        adapter._session.generated_output_files = []
+    state.sandbox_unwrap = install_session_file_sandbox(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
     state.previous_schema = apply_tool_policy(tool_policy, adapter._legacy_mods)
     state.dispatch_unwrap = install_dispatch_guard(tool_policy, adapter._legacy_mods)
     state.seed_unwrap = prepare_handler_seed(
@@ -235,7 +238,8 @@ def _cleanup_task(adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunSta
         # (state.py is out of scope for this change). Placed before seed_unwrap
         # so handler.print is restored before the handler class is restored.
         print_counter_unwrap = getattr(state, "print_counter_unwrap", None)
-        for unwrap in (state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap, state.seed_unwrap):
+        sandbox_unwrap = getattr(state, "sandbox_unwrap", None)
+        for unwrap in (state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap, state.seed_unwrap, sandbox_unwrap):
             if unwrap is not None:
                 try:
                     unwrap()

@@ -81,6 +81,31 @@ RETURNING id, user_id, bot_id, session_key, direction, COALESCE(message_id, ''),
 	return out, nil
 }
 
+// HasOutboundMessage reports whether a delivery part was already accepted by
+// iLink and journaled. Delivery retries use this as their durable per-part
+// progress marker so a later file failure cannot resend an earlier text part.
+func (s *Store) HasOutboundMessage(ctx context.Context, taskID, messageType, content, mediaPath string) (bool, error) {
+	if taskID == "" || messageType == "" {
+		return false, fmt.Errorf("task id and message type are required")
+	}
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM messages
+    WHERE direction = 'outbound'
+      AND task_id = $1
+      AND message_type = $2
+      AND COALESCE(content, '') = $3
+      AND COALESCE(media_path, '') = $4
+)
+`, taskID, messageType, content, mediaPath).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check outbound message: %w", err)
+	}
+	return exists, nil
+}
+
 // ListMessagesByUser returns the most recent messages for a user, newest first.
 // limit is capped at 200 to bound query cost; callers wanting more should paginate.
 func (s *Store) ListMessagesByUser(ctx context.Context, userID int64, limit, offset int) ([]domain.Message, error) {

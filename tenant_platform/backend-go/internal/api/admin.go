@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -31,6 +32,7 @@ func (s *Server) registerLifecycleRoutes() {
 	if s.invite != nil {
 		s.mux.HandleFunc("POST /v1/admin/invite-codes", s.auth(s.handleAdminCreateInviteCode))
 		s.mux.HandleFunc("GET /v1/admin/invite-codes", s.auth(s.handleAdminListInviteCodes))
+		s.mux.HandleFunc("DELETE /v1/admin/invite-codes", s.auth(s.handleAdminDeleteInviteCodes))
 		s.mux.HandleFunc("DELETE /v1/admin/invite-codes/{code}", s.auth(s.handleAdminRevokeInviteCode))
 	}
 	if s.botSvc != nil {
@@ -68,6 +70,12 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("POST /v1/admin/tool-policies", s.auth(s.handleCreateToolPolicy))
 		s.mux.HandleFunc("PUT /v1/admin/users/{user_id}/tool-policy", s.auth(s.handleUpdateUserToolPolicy))
 	}
+	if s.runtimeSettings != nil {
+		s.mux.HandleFunc("GET /v1/admin/settings/im-aggregation", s.auth(s.handleGetIMAggregationSettings))
+		s.mux.HandleFunc("PUT /v1/admin/settings/im-aggregation", s.auth(s.handleUpdateIMAggregationSettings))
+		s.mux.HandleFunc("GET /v1/admin/settings/agent-runtime", s.auth(s.handleGetAgentRuntimeSettings))
+		s.mux.HandleFunc("PUT /v1/admin/settings/agent-runtime", s.auth(s.handleUpdateAgentRuntimeSettings))
+	}
 	if s.llmProviders != nil && s.cipher != nil {
 		s.mux.HandleFunc("POST /v1/admin/llm-providers", s.auth(s.handleAdminCreateLLMProvider))
 		s.mux.HandleFunc("GET /v1/admin/llm-providers", s.auth(s.handleAdminListLLMProviders))
@@ -97,7 +105,7 @@ type dashboardStatsResponse struct {
 }
 
 func (s *Server) handleAdminDashboardStats(w http.ResponseWriter, r *http.Request) {
-	stats := dashboardStatsResponse{RuntimeProfile: s.runtimeProfile}
+	stats := dashboardStatsResponse{RuntimeProfile: s.runtimeProfileSnapshot()}
 
 	// 查询待审批用户数
 	if s.users != nil {
@@ -223,7 +231,17 @@ func decodeStrict(r *http.Request, v any) error {
 func decodeStrictBytes(body []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 // readBody fully drains r.Body and replaces it so downstream handlers can

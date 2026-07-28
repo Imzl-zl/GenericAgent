@@ -98,6 +98,101 @@
   padding: 32px;
 }
 
+.admin-error,
+.admin-success {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid;
+  border-radius: var(--radius-sm);
+}
+
+.admin-error {
+  color: var(--danger);
+  background: var(--danger-dim);
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+}
+
+.admin-success {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.invite-bulk-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 42px;
+}
+
+.invite-selection-count {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.invite-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.invite-table {
+  min-width: 960px;
+}
+
+.invite-table tr.is-selected td {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.invite-select-cell {
+  width: 44px;
+  text-align: center !important;
+}
+
+.invite-select-cell input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.invite-select-cell input:disabled {
+  cursor: not-allowed;
+}
+
+.invite-code-cell {
+  white-space: nowrap;
+}
+
+.invite-row-actions {
+  flex-wrap: nowrap;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.invite-row-actions .icon-button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .invite-codes-page .admin-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .invite-codes-page .admin-header .admin-actions .btn {
+    flex: 1 1 0;
+  }
+
+  .invite-bulk-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
 .provider-form {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -211,6 +306,15 @@
   border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
   border-radius: var(--radius-sm);
   overflow-wrap: anywhere;
+}
+
+.provider-success {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: var(--radius-sm);
 }
 
 .provider-type-switch {

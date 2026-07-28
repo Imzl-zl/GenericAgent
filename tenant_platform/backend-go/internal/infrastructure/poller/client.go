@@ -29,6 +29,7 @@ const (
 	defaultMaxIdleConns        = 64
 	defaultMaxIdleConnsPerHost = 32
 	defaultIdleConnTimeout     = 90 * time.Second
+	maxInboundCoalesceWindowMS = 5000
 )
 
 // Client calls the Python Bot Poller HTTP API.
@@ -59,6 +60,18 @@ func NewClient(baseURL, apiSecret string) (*Client, error) {
 		http:      &http.Client{Timeout: defaultTimeout, Transport: transport},
 		apiSecret: apiSecret,
 	}, nil
+}
+
+// ConfigureInboundCoalescing updates the Poller's global cross-batch IM
+// coalescing window. It applies to every active bot.
+func (c *Client) ConfigureInboundCoalescing(ctx context.Context, windowMS int) error {
+	if windowMS < 0 || windowMS > maxInboundCoalesceWindowMS {
+		return fmt.Errorf("window_ms must be between 0 and %d", maxInboundCoalesceWindowMS)
+	}
+	_, err := c.post(ctx, "/config", map[string]int{
+		"inbound_coalesce_window_ms": windowMS,
+	})
+	return err
 }
 
 // StartBotRequest is the body for POST /start.
