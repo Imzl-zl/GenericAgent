@@ -24,7 +24,7 @@ class RuntimeCredentialMetadata:
     routing_snapshot_id: str
 
 
-def load_runtime_metadata(config_root: Path) -> RuntimeCredentialMetadata:
+def load_runtime_document(config_root: Path) -> tuple[RuntimeCredentialMetadata, dict[str, Any]]:
     path = Path(config_root) / RUNTIME_CONFIG_FILENAME
     try:
         encoded = path.read_bytes()
@@ -55,7 +55,12 @@ def load_runtime_metadata(config_root: Path) -> RuntimeCredentialMetadata:
     expected = hashlib.sha256(encoded.replace(checksum_bytes, CHECKSUM_PLACEHOLDER.encode("ascii"), 1)).hexdigest()
     if not hmac.compare_digest(expected, checksum):
         raise CredentialConfigError("CONFIG_CHECKSUM_MISMATCH")
-    return RuntimeCredentialMetadata(generation, checksum, snapshot_id)
+    return RuntimeCredentialMetadata(generation, checksum, snapshot_id), document
+
+
+def load_runtime_metadata(config_root: Path) -> RuntimeCredentialMetadata:
+    metadata, _ = load_runtime_document(config_root)
+    return metadata
 
 
 def validate_reload_request(

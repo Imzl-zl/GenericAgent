@@ -38,6 +38,18 @@ const statusBadge = (status: string) => {
   return <Badge variant="default">私有</Badge>;
 };
 
+const errText = (err: unknown, fallback: string) =>
+  err instanceof ApiClientError ? `${err.code}: ${err.message}` : fallback;
+
+async function fetchPersonaCollections() {
+  const [pending, pool, mine] = await Promise.all([
+    listPendingPersonas(),
+    adminListPersonas(),
+    adminListMyPersonas(),
+  ]);
+  return { pending, pool, mine };
+}
+
 export function PersonaReviewPage() {
   const [tab, setTab] = useState<Tab>('pending');
   const [pending, setPending] = useState<Persona[]>([]);
@@ -59,21 +71,14 @@ export function PersonaReviewPage() {
   const [isPublic, setIsPublic] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
-  const errText = (err: unknown, fallback: string) =>
-    err instanceof ApiClientError ? `${err.code}: ${err.message}` : fallback;
-
   const loadAll = async () => {
     setIsLoading(true);
     setError('');
     try {
-      const [pend, all, own] = await Promise.all([
-        listPendingPersonas(),
-        adminListPersonas(),
-        adminListMyPersonas(),
-      ]);
-      setPending(pend);
-      setPool(all);
-      setMine(own);
+      const collections = await fetchPersonaCollections();
+      setPending(collections.pending);
+      setPool(collections.pool);
+      setMine(collections.mine);
     } catch (err) {
       setError(errText(err, '加载失败'));
     } finally {
@@ -82,8 +87,23 @@ export function PersonaReviewPage() {
   };
 
   useEffect(() => {
-    void loadAll();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let active = true;
+    void fetchPersonaCollections()
+      .then((collections) => {
+        if (!active) return;
+        setPending(collections.pending);
+        setPool(collections.pool);
+        setMine(collections.mine);
+      })
+      .catch((err: unknown) => {
+        if (active) setError(errText(err, '加载失败'));
+      })
+      .finally(() => {
+        if (active) setIsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const handleModerate = async (id: string, approve: boolean) => {

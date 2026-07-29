@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { Shield, Users, Ticket, UserCog, Cpu, Settings, LogOut, MessageCircle } from 'lucide-react';
+import { Shield, Users, Ticket, UserCog, Cpu, Settings, LogOut, MessageCircle, Plug } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import './Layout.css';
 
@@ -9,6 +9,7 @@ const navItems = [
   { to: '/admin/invite-codes', label: '邀请码', icon: Ticket },
   { to: '/admin/personas', label: '人设审核', icon: UserCog },
   { to: '/admin/providers', label: 'LLM 供应', icon: Cpu },
+  { to: '/admin/mcp-servers', label: 'MCP 工具', icon: Plug },
   { to: '/admin/binding', label: '微信绑定', icon: MessageCircle },
   { to: '/admin/settings', label: '策略设置', icon: Settings },
 ];

@@ -472,6 +472,7 @@ func run() error {
 		Audit:                 store,
 		ModelPolicyVersion:    strings.TrimSpace(*modelPolicyVersion),
 		LLMProvider:           store,
+		MCPServer:             store,
 		TokenTTL:              llmproxy.DefaultTokenTTL,
 		TokenRefreshSkew:      application.DefaultTokenRefreshSkew,
 		MaxTaskWallClock:      time.Duration(*maxTaskWallClockSec) * time.Second,
@@ -654,6 +655,7 @@ func run() error {
 		RuntimeSettings: store,
 		Bots:            store,
 		LLMProviders:    store, // admin LLM provider management (migration 0007)
+		MCPServers:      store, // global MCP server management (migration 0029)
 		BotLifecycle:    botLifecycle,
 		TaskStats:       store,
 		RuntimeProfile: api.RuntimeProfile{

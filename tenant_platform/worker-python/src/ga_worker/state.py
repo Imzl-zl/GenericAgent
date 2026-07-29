@@ -67,6 +67,9 @@ class SessionState:
     seed_display_history: list[Any] = field(default_factory=list)
     display_history: list[Any] = field(default_factory=list)
     generated_output_files: list[str] = field(default_factory=list)
+    mcp_snapshot_id: str = "disabled"
+    mcp_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    mcp_clients: list[Any] = field(default_factory=list)
     completed: CompletedTask | None = None
     active_task_id: str | None = None
     shutting_down: bool = False
@@ -89,6 +92,7 @@ class TaskRunState:
     deadline_timer: threading.Timer | None = None
     loop_unwrap: Callable[[], None] | None = None
     dispatch_unwrap: Callable[[], None] | None = None
+    mcp_unwrap: Callable[[], None] | None = None
     seed_unwrap: Callable[[], None] | None = None
     previous_persona: list[str] = field(default_factory=list)
     previous_schema: Any = None

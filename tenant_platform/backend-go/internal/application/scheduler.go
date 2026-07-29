@@ -56,6 +56,8 @@ type SchedulerConfig struct {
 	ModelPolicyVersion        string
 	// LLMProvider resolves an immutable provider routing snapshot per Worker.
 	LLMProvider LLMProviderSource
+	// MCPServer resolves the administrator-enabled global MCP catalog.
+	MCPServer MCPServerSource
 	// TokenTTL must cover a complete task plus the pre-dispatch refresh skew.
 	TokenTTL         time.Duration
 	TokenRefreshSkew time.Duration
@@ -100,6 +102,10 @@ type SchedulerConfig struct {
 type LLMProviderSource interface {
 	ListActiveProviders(ctx context.Context) ([]domain.LLMProvider, error)
 	GetProvider(ctx context.Context, id int64) (domain.LLMProvider, error)
+}
+
+type MCPServerSource interface {
+	ListEnabledMCPServers(ctx context.Context) ([]domain.MCPServer, error)
 }
 
 type CapabilityStore interface {

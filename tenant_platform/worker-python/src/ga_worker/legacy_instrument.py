@@ -80,6 +80,7 @@ def apply_tool_policy(tool_policy: ToolPolicy, legacy_mods: dict[str, Any] | Non
         return None
     previous = agentmain.TOOLS_SCHEMA
     allowed = tool_policy.allowed_tools
+    global_mcp_tools = frozenset(getattr(agentmain, "_tenant_global_mcp_tool_names", ()) or ())
     augmented = list(previous)
     for extra in getattr(agentmain, "_tenant_custom_tools_schema", []) or []:
         if not isinstance(extra, dict):
@@ -94,7 +95,7 @@ def apply_tool_policy(tool_policy: ToolPolicy, legacy_mods: dict[str, Any] | Non
         t
         for t in augmented
         if isinstance(t, dict)
-        and t.get("function", {}).get("name") in allowed
+        and t.get("function", {}).get("name") in allowed.union(global_mcp_tools)
     ]
     agentmain.TOOLS_SCHEMA = filtered
     return previous
@@ -198,7 +199,13 @@ def install_session_file_sandbox(session: Any, legacy_mods: dict[str, Any] | Non
     handler_cls.do_export_docx = do_export_docx  # type: ignore[assignment]
     _set_cwd(getattr(session.agent, "handler", None))
     if agentmain is not None:
-        agentmain._tenant_custom_tools_schema = [_EXPORT_DOCX_TOOL]
+        custom = list(previous_custom_schema or [])
+        if not any(
+            isinstance(tool, dict) and tool.get("function", {}).get("name") == "export_docx"
+            for tool in custom
+        ):
+            custom.append(_EXPORT_DOCX_TOOL)
+        agentmain._tenant_custom_tools_schema = custom
 
     def unwrap() -> None:
         if callable(original_init) and getattr(handler_cls, "__init__", None) is sandboxed_init:
@@ -216,6 +223,114 @@ def install_session_file_sandbox(session: Any, legacy_mods: dict[str, Any] | Non
                     delattr(agentmain, "_tenant_custom_tools_schema")
             else:
                 agentmain._tenant_custom_tools_schema = previous_custom_schema
+
+    return unwrap
+
+
+def install_global_mcp_tools(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
+    """Expose the session's administrator-enabled MCP catalog to every tenant task."""
+    if legacy_mods is None or session is None:
+        return lambda: None
+    ga_mod = legacy_mods.get("ga")
+    agentmain = legacy_mods.get("agentmain")
+    if ga_mod is None or agentmain is None:
+        return lambda: None
+    handler_cls = getattr(ga_mod, "GenericAgentHandler", None)
+    if handler_cls is None:
+        return lambda: None
+
+    catalog = getattr(session, "mcp_tools", None) or {}
+    if not isinstance(catalog, dict):
+        raise ValueError("session mcp_tools must be a mapping")
+
+    previous_custom_schema = getattr(agentmain, "_tenant_custom_tools_schema", None)
+    previous_tool_names = getattr(agentmain, "_tenant_global_mcp_tool_names", None)
+    original_methods: dict[str, Any] = {}
+    installed_methods: dict[str, Any] = {}
+    custom = list(previous_custom_schema or [])
+    existing_names = {
+        tool.get("function", {}).get("name")
+        for tool in custom
+        if isinstance(tool, dict)
+    }
+    prepared: list[tuple[str, dict[str, Any], Any, str]] = []
+
+    # Validate the complete catalog before mutating the global legacy handler.
+    for ga_name, binding in catalog.items():
+        if not isinstance(ga_name, str) or not isinstance(binding, dict):
+            raise ValueError("invalid MCP tool binding")
+        schema = binding.get("schema")
+        client = binding.get("client")
+        remote_name = binding.get("tool_name")
+        if (
+            not isinstance(schema, dict)
+            or schema.get("function", {}).get("name") != ga_name
+            or not isinstance(remote_name, str)
+            or client is None
+        ):
+            raise ValueError(f"invalid MCP tool binding for {ga_name}")
+        method_name = f"do_{ga_name}"
+        if hasattr(handler_cls, method_name):
+            raise ValueError(f"MCP tool conflicts with existing handler method: {ga_name}")
+        if ga_name in existing_names:
+            raise ValueError(f"duplicate custom tool name: {ga_name}")
+        prepared.append((method_name, schema, client, remote_name))
+        existing_names.add(ga_name)
+
+    def make_mcp_handler(client: Any, remote_name: str) -> Callable[..., Any]:
+        def do_mcp_tool(self, args, response):
+            try:
+                public_args = {
+                    key: value for key, value in dict(args).items()
+                    if key not in ("_index", "_tool_num")
+                }
+                result = client.call_tool(remote_name, public_args)
+            except Exception as exc:
+                yield f"[Status] ❌ MCP 工具调用失败: {exc}\n"
+                step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
+                if step_outcome_cls is None:
+                    raise
+                return step_outcome_cls(
+                    {"status": "error", "message": str(exc)},
+                    next_prompt="MCP tool failed; report the explicit error instead of assuming success.\n",
+                    should_exit=False,
+                )
+            yield f"[MCP Result]\n{result}\n"
+            step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
+            if step_outcome_cls is None:
+                return result
+            return step_outcome_cls(result, next_prompt="\n")
+        return do_mcp_tool
+
+    for method_name, schema, client, remote_name in prepared:
+        do_mcp_tool = make_mcp_handler(client, remote_name)
+        original_methods[method_name] = getattr(handler_cls, method_name, None)
+        installed_methods[method_name] = do_mcp_tool
+        setattr(handler_cls, method_name, do_mcp_tool)
+        custom.append(schema)
+
+    agentmain._tenant_custom_tools_schema = custom
+    agentmain._tenant_global_mcp_tool_names = frozenset(catalog)
+
+    def unwrap() -> None:
+        for method_name, installed in installed_methods.items():
+            if getattr(handler_cls, method_name, None) is not installed:
+                continue
+            original = original_methods[method_name]
+            if original is None:
+                delattr(handler_cls, method_name)
+            else:
+                setattr(handler_cls, method_name, original)
+        if previous_custom_schema is None:
+            if hasattr(agentmain, "_tenant_custom_tools_schema"):
+                delattr(agentmain, "_tenant_custom_tools_schema")
+        else:
+            agentmain._tenant_custom_tools_schema = previous_custom_schema
+        if previous_tool_names is None:
+            if hasattr(agentmain, "_tenant_global_mcp_tool_names"):
+                delattr(agentmain, "_tenant_global_mcp_tool_names")
+        else:
+            agentmain._tenant_global_mcp_tool_names = previous_tool_names
 
     return unwrap
 
@@ -240,6 +355,10 @@ def install_dispatch_guard(
         return lambda: None
 
     allowed = tool_policy.allowed_tools
+    agentmain = legacy_mods.get("agentmain")
+    global_mcp_tools = frozenset(
+        getattr(agentmain, "_tenant_global_mcp_tool_names", ()) or ()
+    ) if agentmain is not None else frozenset()
 
     # Restore original before (re)installing to avoid double-wrapping.
     original_dispatch = getattr(handler_cls, "_adapter_original_dispatch", None)
@@ -249,7 +368,7 @@ def install_dispatch_guard(
         handler_cls.dispatch = original_dispatch
 
     def guarded(self, tool_name, args, response, index=0, tool_num=1):
-        if tool_name not in allowed and tool_name not in ("no_tool", "bad_json"):
+        if tool_name not in allowed and tool_name not in global_mcp_tools and tool_name not in ("no_tool", "bad_json"):
             yield f"tool denied by policy: {tool_name}\n"
             step_outcome_cls = getattr(agent_loop, "StepOutcome", None) if agent_loop is not None else None
             if step_outcome_cls is None:

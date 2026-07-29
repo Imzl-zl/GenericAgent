@@ -16,11 +16,12 @@ import (
 )
 
 type workerCredentialSet struct {
-	Generation uint64
-	Checksum   string
-	ExpiresAt  time.Time
-	JTIs       []string
-	Snapshot   routingSnapshot
+	Generation  uint64
+	Checksum    string
+	ExpiresAt   time.Time
+	JTIs        []string
+	Snapshot    routingSnapshot
+	MCPSnapshot RuntimeMCPSnapshot
 }
 
 const credentialRevokeTimeout = 5 * time.Second
@@ -38,11 +39,25 @@ func (s *scheduler) issueProviderCapabilities(
 	snapshot routingSnapshot,
 	generation uint64,
 ) (workerCredentialSet, RuntimeConfigFiles, error) {
+	mcpSnapshot, err := s.resolveMCPSnapshot(ctx)
+	if err != nil {
+		return workerCredentialSet{}, RuntimeConfigFiles{}, err
+	}
+	return s.issueProviderCapabilitiesWithMCP(ctx, sessionKey, snapshot, mcpSnapshot, generation)
+}
+
+func (s *scheduler) issueProviderCapabilitiesWithMCP(
+	ctx context.Context,
+	sessionKey string,
+	snapshot routingSnapshot,
+	mcpSnapshot RuntimeMCPSnapshot,
+	generation uint64,
+) (workerCredentialSet, RuntimeConfigFiles, error) {
 	if s.cfg.TokenIssuer == nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, nil
 	}
 	bindings := make([]RuntimeProviderBinding, 0, len(snapshot.Providers))
-	set := workerCredentialSet{Generation: generation, Snapshot: snapshot}
+	set := workerCredentialSet{Generation: generation, Snapshot: snapshot, MCPSnapshot: mcpSnapshot}
 	for _, routed := range snapshot.Providers {
 		token, claims, err := s.cfg.TokenIssuer.Issue(llmproxy.CapabilitySpec{
 			SessionKey: sessionKey, ProviderID: routed.ID, ProviderRevision: routed.Revision,
@@ -73,7 +88,7 @@ func (s *scheduler) issueProviderCapabilities(
 	}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
 		Generation: generation, ProxyBaseURL: s.cfg.LLMProxyAddr,
-		RoutingSnapshotID: snapshot.ID, Providers: bindings,
+		RoutingSnapshotID: snapshot.ID, Providers: bindings, MCP: mcpSnapshot,
 	})
 	if err != nil {
 		s.revokeCredentialSetBestEffort(ctx, set)
@@ -123,8 +138,12 @@ func (s *scheduler) refreshWorkerCredentials(ctx context.Context, entry *workerE
 		if err != nil {
 			return fmt.Errorf("read previous runtime config: %w", err)
 		}
-		newSet, files, err := s.issueProviderCapabilities(
-			ctx, entry.sessionKey, entry.credentials.Snapshot, generation,
+		// Credential reload intentionally preserves the worker's immutable MCP
+		// catalog. MCP changes are detected in prepareWorkerEntry and applied by
+		// replacing the worker at a task boundary, never by hot-reloading tools.
+		newSet, files, err := s.issueProviderCapabilitiesWithMCP(
+			ctx, entry.sessionKey, entry.credentials.Snapshot,
+			entry.credentials.MCPSnapshot, generation,
 		)
 		if err != nil {
 			return err

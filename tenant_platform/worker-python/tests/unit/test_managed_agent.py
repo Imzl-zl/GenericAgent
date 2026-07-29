@@ -328,6 +328,11 @@ def test_reload_credentials_reloads_ga_sessions_and_advances_generation(roots, f
     assert adapter._session is not None
     assert adapter._session.credential_generation == 1
     assert adapter._session.credential_checksum == checksum1
+    mcp_client = object()
+    mcp_tools = {"exa__search": {"client": mcp_client}}
+    adapter._session.mcp_snapshot_id = "sha256:mcp"
+    adapter._session.mcp_clients = [mcp_client]
+    adapter._session.mcp_tools = mcp_tools
 
     checksum2 = _write_runtime_config(roots["config_root"], 2)
     response = adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
@@ -338,6 +343,9 @@ def test_reload_credentials_reloads_ga_sessions_and_advances_generation(roots, f
     assert response.config_checksum == checksum2
     assert reloads == [1]
     assert adapter._session.credential_generation == 2
+    assert adapter._session.mcp_snapshot_id == "sha256:mcp"
+    assert adapter._session.mcp_clients == [mcp_client]
+    assert adapter._session.mcp_tools is mcp_tools
 
     repeated = adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
         credential_generation=2,
@@ -1019,6 +1027,37 @@ def test_health_and_shutdown(roots, foundation_registry):
     assert h1.session_key == "personal:1"
     shut = adapter.shutdown("test-done")
     assert shut.accepted is True
+
+
+def test_shutdown_timeout_closes_mcp_clients(roots, foundation_registry, monkeypatch):
+    import ga_worker.managed_agent as managed_agent_module
+
+    release = threading.Event()
+
+    class StuckAgent(ScriptedAgent):
+        def run(self):
+            release.wait()
+
+    class CloseTrackingClient:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    adapter = _make_adapter(roots, foundation_registry, StuckAgent)
+    adapter.start_session(_start_req())
+    assert adapter._session is not None
+    client = CloseTrackingClient()
+    adapter._session.mcp_clients = [client]
+    monkeypatch.setattr(managed_agent_module, "SHUTDOWN_JOIN_TIMEOUT_S", 0.01)
+
+    try:
+        shut = adapter.shutdown("test-timeout")
+        assert shut.accepted is False
+        assert client.closed is True
+    finally:
+        release.set()
+        adapter._session.runner_thread.join(timeout=1)
 
 
 def test_max_history_bytes_on_restore(roots, foundation_registry):

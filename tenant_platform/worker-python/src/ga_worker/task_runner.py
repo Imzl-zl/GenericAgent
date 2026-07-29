@@ -136,8 +136,9 @@ def _setup_runtime(
     adapter: Any, task: worker_pb2.TaskEnvelope, pending: PendingTask, tool_policy: Any,
 ) -> TaskRunState:
     from ga_worker.legacy_instrument import (
-        apply_tool_policy, install_dispatch_guard, install_handler_print_counter,
-        install_max_turns, install_session_file_sandbox, prepare_handler_seed,
+        apply_tool_policy, install_dispatch_guard, install_global_mcp_tools,
+        install_handler_print_counter, install_max_turns, install_session_file_sandbox,
+        prepare_handler_seed,
     )
     agent = adapter._session.agent
     state = TaskRunState(
@@ -150,23 +151,47 @@ def _setup_runtime(
     agent.extra_sys_prompts = list(task.persona_snapshot)
     if adapter._session is not None:
         adapter._session.generated_output_files = []
-    state.sandbox_unwrap = install_session_file_sandbox(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
-    state.previous_schema = apply_tool_policy(tool_policy, adapter._legacy_mods)
-    state.dispatch_unwrap = install_dispatch_guard(tool_policy, adapter._legacy_mods)
-    state.seed_unwrap = prepare_handler_seed(
-        agent, adapter._session.seed_working, adapter.agent_factory, adapter._legacy_mods,
-    )
-    state.count_fn = _make_count_fn(state, adapter)
-    # Store on state dynamically (state.py cannot be modified per task scope);
-    # _cleanup_task reads it back via getattr and calls it to restore the
-    # agent class / handler class so counters do not leak across tasks.
-    state.print_counter_unwrap = install_handler_print_counter(  # type: ignore[attr-defined]
-        agent, state.count_fn, adapter._legacy_mods,
-    )
-    if state.max_turns > 0:
-        state.loop_unwrap = install_max_turns(agent, state.max_turns, adapter._legacy_mods)
-    _arm_deadline_timer(adapter, task, state)
-    return state
+    try:
+        state.sandbox_unwrap = install_session_file_sandbox(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
+        state.mcp_unwrap = install_global_mcp_tools(adapter._session, adapter._legacy_mods)
+        state.previous_schema = apply_tool_policy(tool_policy, adapter._legacy_mods)
+        state.dispatch_unwrap = install_dispatch_guard(tool_policy, adapter._legacy_mods)
+        state.seed_unwrap = prepare_handler_seed(
+            agent, adapter._session.seed_working, adapter.agent_factory, adapter._legacy_mods,
+        )
+        state.count_fn = _make_count_fn(state, adapter)
+        state.print_counter_unwrap = install_handler_print_counter(  # type: ignore[attr-defined]
+            agent, state.count_fn, adapter._legacy_mods,
+        )
+        if state.max_turns > 0:
+            state.loop_unwrap = install_max_turns(agent, state.max_turns, adapter._legacy_mods)
+        _arm_deadline_timer(adapter, task, state)
+        return state
+    except Exception:
+        _rollback_runtime_setup(adapter, state)
+        raise
+
+
+def _rollback_runtime_setup(adapter: Any, state: TaskRunState) -> None:
+    if state.deadline_timer is not None:
+        state.deadline_timer.cancel()
+    print_counter_unwrap = getattr(state, "print_counter_unwrap", None)
+    sandbox_unwrap = getattr(state, "sandbox_unwrap", None)
+    for unwrap in (
+        state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap,
+        state.seed_unwrap, state.mcp_unwrap, sandbox_unwrap,
+    ):
+        if unwrap is not None:
+            try:
+                unwrap()
+            except Exception:
+                pass
+    from ga_worker.legacy_instrument import restore_tool_schema
+    restore_tool_schema(state.previous_schema, adapter._legacy_mods)
+    try:
+        state.agent.extra_sys_prompts = state.previous_persona
+    except Exception:
+        state.agent.extra_sys_prompts = []
 
 
 def _make_count_fn(state: TaskRunState, adapter: Any) -> Callable[[str], bool]:
@@ -232,25 +257,7 @@ def _emit_exception_terminal(
 
 def _cleanup_task(adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState | None) -> None:
     if state is not None:
-        if state.deadline_timer is not None:
-            state.deadline_timer.cancel()
-        # print_counter_unwrap is attached dynamically in _setup_runtime
-        # (state.py is out of scope for this change). Placed before seed_unwrap
-        # so handler.print is restored before the handler class is restored.
-        print_counter_unwrap = getattr(state, "print_counter_unwrap", None)
-        sandbox_unwrap = getattr(state, "sandbox_unwrap", None)
-        for unwrap in (state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap, state.seed_unwrap, sandbox_unwrap):
-            if unwrap is not None:
-                try:
-                    unwrap()
-                except Exception:
-                    pass
-        try:
-            state.agent.extra_sys_prompts = state.previous_persona
-        except Exception:
-            state.agent.extra_sys_prompts = []
-        from ga_worker.legacy_instrument import restore_tool_schema
-        restore_tool_schema(state.previous_schema, adapter._legacy_mods)
+        _rollback_runtime_setup(adapter, state)
     with adapter._lock:
         if adapter._pending and adapter._pending.task_id == task.task_id:
             adapter._pending = None

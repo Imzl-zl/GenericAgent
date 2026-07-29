@@ -135,6 +135,10 @@ func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) 
 			return false, err
 		}
 	}
+	mcpReplace, err := s.mcpSnapshotRequiresReplacement(ctx, entry.credentials.MCPSnapshot.ID)
+	if err != nil || mcpReplace {
+		return mcpReplace, err
+	}
 	if s.cfg.TokenIssuer == nil {
 		return false, nil
 	}

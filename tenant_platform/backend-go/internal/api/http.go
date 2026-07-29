@@ -35,6 +35,7 @@ type Server struct {
 	policies             PolicyStore
 	bots                 BotStore
 	llmProviders         LLMProviderStore
+	mcpServers           MCPServerStore
 	botLifecycle         application.BotLifecycleService
 	taskStats            TaskStoreStats
 	runtimeProfileMu     sync.RWMutex
@@ -96,6 +97,15 @@ type LLMProviderStore interface {
 	DeleteProvider(ctx context.Context, id int64) error
 }
 
+// MCPServerStore is the admin-facing port for globally shared MCP servers.
+type MCPServerStore interface {
+	CreateMCPServer(ctx context.Context, input domain.MCPServerCreate) (domain.MCPServer, error)
+	ListMCPServers(ctx context.Context) ([]domain.MCPServer, error)
+	UpdateMCPServer(ctx context.Context, id int64, input domain.MCPServerUpdate) (domain.MCPServer, error)
+	SetMCPServerEnabled(ctx context.Context, id int64, enabled bool) (domain.MCPServer, error)
+	DeleteMCPServer(ctx context.Context, id int64) error
+}
+
 // Cipher is the interface for encrypting/decrypting sensitive data.
 type Cipher interface {
 	Encrypt(plaintext []byte) (ciphertext []byte, version int, err error)
@@ -131,6 +141,7 @@ type ServerConfig struct {
 	RuntimeSettings      RuntimeSettingsStore
 	Bots                 BotStore
 	LLMProviders         LLMProviderStore
+	MCPServers           MCPServerStore
 	BotLifecycle         application.BotLifecycleService
 	TaskStats            TaskStoreStats
 	RuntimeProfile       RuntimeProfile
@@ -171,6 +182,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		runtimeSettings:      cfg.RuntimeSettings,
 		bots:                 cfg.Bots,
 		llmProviders:         cfg.LLMProviders,
+		mcpServers:           cfg.MCPServers,
 		botLifecycle:         cfg.BotLifecycle,
 		taskStats:            cfg.TaskStats,
 		runtimeProfile:       cfg.RuntimeProfile,

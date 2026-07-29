@@ -59,6 +59,8 @@ func migrationFiles() []string {
 		"0026_safe_user_commands.sql",
 		"0027_outbound_delivery_progress.sql",
 		"0028_agent_max_turns_setting.sql",
+		"0029_mcp_servers.sql",
+		"0030_remove_mcp_headers.sql",
 	}
 }
 
@@ -96,6 +98,8 @@ var pendingMigrations = []struct {
 	{"0026_safe_user_commands.sql", "migration_0026_safe_user_commands_marker"},
 	{"0027_outbound_delivery_progress.sql", "migration_0027_outbound_delivery_progress_marker"},
 	{"0028_agent_max_turns_setting.sql", "migration_0028_agent_max_turns_setting_marker"},
+	{"0029_mcp_servers.sql", "migration_0029_mcp_servers_marker"},
+	{"0030_remove_mcp_headers.sql", "migration_0030_remove_mcp_headers_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -103,6 +107,7 @@ var foundationTableNames = []string{
 	"llm_capability_revocations",
 	"media_assets",
 	"messages",
+	"mcp_servers",
 	"llm_providers",
 	"audit_events",
 	"context_tokens",
@@ -135,6 +140,8 @@ var foundationTableNames = []string{
 	"migration_0026_safe_user_commands_marker",
 	"migration_0027_outbound_delivery_progress_marker",
 	"migration_0028_agent_max_turns_setting_marker",
+	"migration_0029_mcp_servers_marker",
+	"migration_0030_remove_mcp_headers_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",

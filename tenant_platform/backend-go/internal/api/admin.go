@@ -93,6 +93,14 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("POST /v1/admin/llm-providers/{provider_id}/enable", s.auth(s.handleAdminEnableLLMProvider))
 
 	}
+	if s.mcpServers != nil {
+		s.mux.HandleFunc("POST /v1/admin/mcp-servers", s.auth(s.handleAdminCreateMCPServer))
+		s.mux.HandleFunc("GET /v1/admin/mcp-servers", s.auth(s.handleAdminListMCPServers))
+		s.mux.HandleFunc("PUT /v1/admin/mcp-servers/{mcp_server_id}", s.auth(s.handleAdminUpdateMCPServer))
+		s.mux.HandleFunc("DELETE /v1/admin/mcp-servers/{mcp_server_id}", s.auth(s.handleAdminDeleteMCPServer))
+		s.mux.HandleFunc("POST /v1/admin/mcp-servers/{mcp_server_id}/enable", s.auth(s.handleAdminEnableMCPServer))
+		s.mux.HandleFunc("POST /v1/admin/mcp-servers/{mcp_server_id}/disable", s.auth(s.handleAdminDisableMCPServer))
+	}
 	// Dashboard statistics endpoint
 	s.mux.HandleFunc("GET /v1/admin/dashboard/stats", s.auth(s.handleAdminDashboardStats))
 }

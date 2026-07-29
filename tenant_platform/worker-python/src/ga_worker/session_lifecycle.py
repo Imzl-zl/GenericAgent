@@ -24,6 +24,8 @@ from ga_worker.checkpoint import (
 )
 from ga_worker.credential_config import CredentialConfigError, load_runtime_metadata
 from ga_worker.legacy_import import LegacyImportError, import_legacy_runtime
+from ga_worker.mcp_config import MCPConfigError, load_runtime_mcp_snapshot
+from ga_worker.mcp_runtime import MCPRuntimeError, close_mcp_clients, initialize_mcp_catalog
 from ga_worker.runtime_overlay import (
     OverlayError,
     encode_session_id,
@@ -97,6 +99,11 @@ class SessionLifecycleMixin:
             raise WorkerAdapterError("CREDENTIAL_CONFIG_ERROR", str(exc)) from exc
         agent = self._create_agent(overlay_dir, manifest)
         self._restore_histories(agent, seed_agent, seed_backend)
+        try:
+            mcp_snapshot = load_runtime_mcp_snapshot(self.config_root)
+            mcp_tools, mcp_clients = initialize_mcp_catalog(mcp_snapshot)
+        except (MCPConfigError, MCPRuntimeError, ValueError) as exc:
+            raise WorkerAdapterError("MCP_INITIALIZATION_ERROR", str(exc)) from exc
 
         runner = threading.Thread(target=self._safe_run, args=(agent,), name="ga-runner", daemon=True)
         runner.start()
@@ -121,6 +128,9 @@ class SessionLifecycleMixin:
             seed_agent_history=seed_agent,
             seed_display_history=seed_display,
             display_history=[],
+            mcp_snapshot_id=mcp_snapshot.snapshot_id,
+            mcp_tools=mcp_tools,
+            mcp_clients=mcp_clients,
         )
         return worker_pb2.StartSessionResponse(
             session_key=self._session.session_key,
@@ -276,6 +286,13 @@ class SessionLifecycleMixin:
             checksum=checksum,
             result_digest=result_digest,
         )
+
+    def _close_session_mcp(self) -> None:
+        if self._session is None:
+            return
+        close_mcp_clients(self._session.mcp_clients)
+        self._session.mcp_clients = []
+        self._session.mcp_tools = {}
 
     def _safe_run(self, agent: Any) -> None:
         try:

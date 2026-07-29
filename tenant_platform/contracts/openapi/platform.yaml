@@ -487,6 +487,123 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/admin/mcp-servers:
+    get:
+      operationId: adminListMCPServers
+      summary: List globally shared MCP servers (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      responses:
+        "200":
+          description: MCP server list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [servers]
+                properties:
+                  servers:
+                    type: array
+                    items: {$ref: "#/components/schemas/MCPServer"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    post:
+      operationId: adminCreateMCPServer
+      summary: Create a disabled global MCP server (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateMCPServerRequest"}
+      responses:
+        "201":
+          description: Disabled MCP server created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MCPServer"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /v1/admin/mcp-servers/{mcp_server_id}:
+    parameters:
+      - name: mcp_server_id
+        in: path
+        required: true
+        schema: {type: integer, format: int64, minimum: 1}
+    put:
+      operationId: adminUpdateMCPServer
+      summary: Update a global MCP server (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateMCPServerRequest"}
+      responses:
+        "200":
+          description: MCP server updated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MCPServer"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    delete:
+      operationId: adminDeleteMCPServer
+      summary: Delete a global MCP server (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      responses:
+        "204": {description: MCP server deleted}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /v1/admin/mcp-servers/{mcp_server_id}/enable:
+    post:
+      operationId: adminEnableMCPServer
+      summary: Enable an MCP server for every tenant (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: mcp_server_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64, minimum: 1}
+      responses:
+        "200":
+          description: MCP server enabled
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MCPServer"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /v1/admin/mcp-servers/{mcp_server_id}/disable:
+    post:
+      operationId: adminDisableMCPServer
+      summary: Disable an MCP server for every tenant (admin-only)
+      tags: [admin]
+      security: [{PlatformDevToken: []}]
+      parameters:
+        - name: mcp_server_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64, minimum: 1}
+      responses:
+        "200":
+          description: MCP server disabled
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MCPServer"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500": {$ref: "#/components/responses/InternalError"}
   /v1/bindings:
     post:
       operationId: createBinding
@@ -1185,6 +1302,38 @@ components:
         updated_at:
           type: string
           format: date-time
+    MCPServer:
+      type: object
+      additionalProperties: false
+      required: [mcp_server_id, server_key, name, url, timeout_seconds, enabled, revision, created_at, updated_at]
+      properties:
+        mcp_server_id: {type: integer, format: int64, minimum: 1}
+        server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
+        name: {type: string, minLength: 1}
+        url: {type: string, format: uri}
+        timeout_seconds: {type: integer, minimum: 1, maximum: 300}
+        enabled: {type: boolean}
+        revision: {type: integer, format: int64, minimum: 1}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    CreateMCPServerRequest:
+      type: object
+      additionalProperties: false
+      required: [server_key, name, url, timeout_seconds]
+      properties:
+        server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
+        name: {type: string, minLength: 1}
+        url: {type: string, format: uri}
+        timeout_seconds: {type: integer, minimum: 1, maximum: 300}
+    UpdateMCPServerRequest:
+      type: object
+      additionalProperties: false
+      required: [server_key, name, url, timeout_seconds]
+      properties:
+        server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
+        name: {type: string, minLength: 1}
+        url: {type: string, format: uri}
+        timeout_seconds: {type: integer, minimum: 1, maximum: 300}
     CreateLLMProviderRequest:
       type: object
       additionalProperties: false

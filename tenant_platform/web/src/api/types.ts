@@ -103,6 +103,18 @@ export interface ProviderTransportConfig {
   response_header_timeout_seconds?: number;
 }
 
+export interface MCPServer {
+  mcp_server_id: number;
+  server_key: string;
+  name: string;
+  url: string;
+  timeout_seconds: number;
+  enabled: boolean;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface LLMProvider {
   provider_id: number;
   name: string;

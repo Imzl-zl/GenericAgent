@@ -15,6 +15,7 @@ import { UsersPage } from '../features/admin/UsersPage';
 import { InviteCodesPage } from '../features/admin/InviteCodesPage';
 import { PersonaReviewPage } from '../features/admin/PersonaReviewPage';
 import { LLMProvidersPage } from '../features/admin/LLMProvidersPage';
+import { MCPServersPage } from '../features/admin/MCPServersPage';
 import { SettingsPage } from '../features/admin/SettingsPage';
 
 
@@ -55,6 +56,7 @@ export const router = createBrowserRouter([
       { path: 'invite-codes', element: <InviteCodesPage /> },
       { path: 'personas', element: <PersonaReviewPage /> },
       { path: 'providers', element: <LLMProvidersPage /> },
+      { path: 'mcp-servers', element: <MCPServersPage /> },
       { path: 'binding', element: <BindingPage /> },
       { path: 'settings', element: <SettingsPage /> },
     ],

@@ -34,11 +34,24 @@ type RuntimeProviderBinding struct {
 	Token    string
 }
 
+type RuntimeMCPServer struct {
+	ServerID       string `json:"server_id"`
+	Name           string `json:"name"`
+	URL            string `json:"url"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+type RuntimeMCPSnapshot struct {
+	ID      string             `json:"snapshot_id"`
+	Servers []RuntimeMCPServer `json:"servers"`
+}
+
 type RuntimeConfigInput struct {
 	Generation        uint64
 	ProxyBaseURL      string
 	RoutingSnapshotID string
 	Providers         []RuntimeProviderBinding
+	MCP               RuntimeMCPSnapshot
 }
 
 type RuntimeConfigMetadata struct {
@@ -77,6 +90,12 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 		RoutingSnapshotID:    input.RoutingSnapshotID,
 	}
 	document["_platform_runtime"] = metadata
+	if strings.TrimSpace(input.MCP.ID) != "" {
+		if err := validateRuntimeMCPSnapshot(input.MCP); err != nil {
+			return RuntimeConfigFiles{}, err
+		}
+		document["_platform_mcp"] = input.MCP
+	}
 	seen := make(map[int64]struct{}, len(input.Providers))
 	mixinNames := make([]string, 0, len(input.Providers))
 	for _, binding := range input.Providers {
@@ -174,6 +193,26 @@ func validateRuntimeBinding(binding RuntimeProviderBinding) error {
 		return fmt.Errorf("provider %d model is required", provider.ID)
 	}
 	return provider.SessionConfig.Validate(provider.ProviderType)
+}
+
+func validateRuntimeMCPSnapshot(snapshot RuntimeMCPSnapshot) error {
+	if strings.TrimSpace(snapshot.ID) == "" {
+		return fmt.Errorf("MCP snapshot id is required")
+	}
+	seen := make(map[string]struct{}, len(snapshot.Servers))
+	for _, server := range snapshot.Servers {
+		if _, duplicate := seen[server.ServerID]; duplicate {
+			return fmt.Errorf("duplicate MCP server id %q", server.ServerID)
+		}
+		seen[server.ServerID] = struct{}{}
+		if err := domain.ValidateMCPServerInput(domain.MCPServerCreate{
+			ServerKey: server.ServerID, Name: server.Name, URL: server.URL,
+			TimeoutSeconds: server.TimeoutSeconds,
+		}); err != nil {
+			return fmt.Errorf("MCP server %q: %w", server.ServerID, err)
+		}
+	}
+	return nil
 }
 
 func parseProxyBase(raw string) (*url.URL, error) {

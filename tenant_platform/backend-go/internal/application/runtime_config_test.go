@@ -90,6 +90,39 @@ func TestBuildRuntimeConfigCreatesStableMixin(t *testing.T) {
 	}
 }
 
+func TestBuildRuntimeConfigIncludesGlobalMCPSnapshot(t *testing.T) {
+	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
+		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
+		MCP: RuntimeMCPSnapshot{ID: "sha256:mcp", Servers: []RuntimeMCPServer{{
+			ServerID: "exa", Name: "Exa", URL: "https://mcp.exa.ai/mcp", TimeoutSeconds: 30,
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(files.JSON, &document); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot struct {
+		SnapshotID string `json:"snapshot_id"`
+		Servers    []struct {
+			ServerID string `json:"server_id"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal(document["_platform_mcp"], &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.SnapshotID != "sha256:mcp" || len(snapshot.Servers) != 1 || snapshot.Servers[0].ServerID != "exa" {
+		t.Fatalf("MCP snapshot = %+v", snapshot)
+	}
+	if bytes.Contains(document["_platform_mcp"], []byte(`"headers"`)) {
+		t.Fatalf("runtime MCP snapshot exposed unsupported headers: %s", document["_platform_mcp"])
+	}
+}
+
 func TestBuildRuntimeConfigRejectsDuplicateProviderAndMissingToken(t *testing.T) {
 	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
 	for name, providers := range map[string][]RuntimeProviderBinding{
