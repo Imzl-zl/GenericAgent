@@ -138,7 +138,6 @@ func TestAdminPersonaLifecycle(t *testing.T) {
 		"name":          "Admin Persona v2",
 		"description":   "edited",
 		"system_prompt": "you are very helpful",
-		"is_public":     true,
 	})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%v", rr.Code, body)

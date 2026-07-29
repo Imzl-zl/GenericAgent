@@ -17,6 +17,15 @@ type personaBody struct {
 	IsPublic     bool   `json:"is_public"`
 }
 
+// updatePersonaBody is the request body for edit operations. Unlike
+// personaBody it omits is_public: visibility is controlled by the moderation
+// lifecycle (create/submit/approve/reject), not by editing.
+type updatePersonaBody struct {
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	SystemPrompt string `json:"system_prompt"`
+}
+
 func (s *Server) handleListPersonas(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	userID, ok := userIDFromContext(r.Context())
@@ -44,7 +53,7 @@ func (s *Server) handleCreatePersona(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
 		return
 	}
-	if err := validatePersonaBody(body); err != nil {
+	if err := validatePersonaBody(body.Name, body.SystemPrompt); err != nil {
 		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
 		return
 	}
@@ -93,7 +102,7 @@ func (s *Server) handleUpdatePersona(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
 		return
 	}
-	if err := validatePersonaBody(body); err != nil {
+	if err := validatePersonaBody(body.Name, body.SystemPrompt); err != nil {
 		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
 		return
 	}
@@ -217,7 +226,7 @@ func (s *Server) handleAdminCreatePersona(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
 		return
 	}
-	if err := validatePersonaBody(body); err != nil {
+	if err := validatePersonaBody(body.Name, body.SystemPrompt); err != nil {
 		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
 		return
 	}
@@ -237,12 +246,12 @@ func (s *Server) handleAdminUpdatePersona(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, "INVALID_ID", "persona_id is required", tid)
 		return
 	}
-	var body personaBody
+	var body updatePersonaBody
 	if err := decodeStrict(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
 		return
 	}
-	if err := validatePersonaBody(body); err != nil {
+	if err := validatePersonaBody(body.Name, body.SystemPrompt); err != nil {
 		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
 		return
 	}
@@ -325,11 +334,11 @@ func (s *Server) handleModeratePersona(w http.ResponseWriter, r *http.Request, s
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": string(status)})
 }
 
-func validatePersonaBody(b personaBody) error {
-	if strings.TrimSpace(b.Name) == "" {
+func validatePersonaBody(name, systemPrompt string) error {
+	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("name is required")
 	}
-	if strings.TrimSpace(b.SystemPrompt) == "" {
+	if strings.TrimSpace(systemPrompt) == "" {
 		return fmt.Errorf("system_prompt is required")
 	}
 	return nil

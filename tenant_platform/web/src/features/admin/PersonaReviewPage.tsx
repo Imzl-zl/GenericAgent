@@ -95,6 +95,11 @@ export function PersonaReviewPage() {
       } else {
         await rejectPersona(id, notes[id] || '');
       }
+      // 下架后服务端会清理 default_persona_id，前端同步清理
+      if (!approve && defaultId === id) {
+        setDefaultId('');
+        localStorage.removeItem('ga_admin_default_persona_id');
+      }
       setSuccess(approve ? '已通过' : '已拒绝/下架');
       await loadAll();
     } catch (err) {
