@@ -7,6 +7,8 @@ __pycache__/
 .venv/
 venv/
 env/
+!tenant_platform/infra/compose/env/
+!tenant_platform/infra/compose/env/*.env.example
 build/
 dist/
 *.egg-info/
