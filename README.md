@@ -172,6 +172,7 @@ GLOBAL=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/lsdefine/Generi
 GenericAgent Local remains cross-platform for Windows, Linux, and macOS. The multi-tenant document platform is a separate security-hardened deployment profile and currently requires Linux with systemd, cgroup v2, and a dedicated rootless Docker runtime.
 
 - Self-service single-host profile: [`tenant_platform/infra/compose/README.zh-CN.md`](tenant_platform/infra/compose/README.zh-CN.md)
+- Build and publish all four Linux images: `python tenant_platform/infra/compose/release_images.py --registry registry.example/namespace`
 - All-systemd profile: [`tenant_platform/infra/deploy/README.md`](tenant_platform/infra/deploy/README.md)
 
 ---
@@ -572,6 +573,7 @@ python launch.pyw
 本地 GA 仍支持 Windows、Linux 和 macOS。多租户文档平台是独立的安全加固部署 profile，当前要求 Linux、systemd、cgroup v2 和独立 rootless Docker runtime。
 
 - 单机 Compose 部署与打包：[`tenant_platform/infra/compose/README.zh-CN.md`](tenant_platform/infra/compose/README.zh-CN.md)
+- 一次构建并推送四张 Linux 镜像：`python tenant_platform/infra/compose/release_images.py --registry registry.example/namespace`
 - 全 systemd 部署：[`tenant_platform/infra/deploy/README.md`](tenant_platform/infra/deploy/README.md)
 
 ---

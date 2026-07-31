@@ -125,7 +125,40 @@ sudoedit /opt/genericagent/source/tenant_platform/infra/compose/secrets/bot-poll
 
 ## 7. 构建应用镜像
 
-首次在目标机本地构建：
+### 正式 registry release（推荐）
+
+在干净的 reviewed checkout 上运行一个命令，构建、推送并解析四张 Linux 镜像的 manifest digest。该脚本可在 Windows Docker Desktop、Linux 或 CI 中执行；目标平台固定为 Linux，最终运行仍在 Linux staging/production 主机：
+
+```bash
+cd /opt/genericagent/source
+python3 tenant_platform/infra/compose/release_images.py \
+  --registry registry.example/genericagent
+```
+
+Windows PowerShell（先完成 `docker login`）使用仓库本地路径：
+
+```powershell
+Set-Location C:\src\GenericAgent
+py -3 .\tenant_platform\infra\compose\release_images.py `
+  --registry registry.example/genericagent
+```
+
+默认 tag 是当前 Git revision 的前 12 位。先检查命令而不调用 Docker：
+
+```bash
+python3 tenant_platform/infra/compose/release_images.py \
+  --registry registry.example/genericagent \
+  --tag "$(git rev-parse --short=12 HEAD)" \
+  --dry-run
+```
+
+正式运行会发布 `genericagent-platform`、`genericagent-bot-poller`、`genericagent-web` 和 `genericagent-document-tool`，再输出三条 Compose `.env` 值和一条 `DOCUMENT_MANAGER_IMAGE` 值。把前三条写进 `.env`，最后一条写进 `/etc/ga/document-manager.env`；它们都必须是 `repository@sha256:<digest>`，不能保留 tag。
+
+PostgreSQL 镜像也应固定 digest；本 profile 固定官方 Alpine image 的 `70:70` 身份，升级 PostgreSQL digest 前必须确认镜像内 `postgres` 仍是 UID/GID 70，并重新做空卷初始化和恢复演练。
+
+### 本地 Compose staging
+
+首次在目标机本地构建三个 Compose 应用镜像：
 
 ```bash
 cd /opt/genericagent/source/tenant_platform/infra/compose
@@ -135,8 +168,6 @@ sudo docker image inspect \
   genericagent-bot-poller:local \
   genericagent-web:local >/dev/null
 ```
-
-正式生产建议把三个应用镜像推入私有 registry，拉取后把 `.env` 中的镜像值改成 `repository@sha256:<digest>`。PostgreSQL 镜像也应固定 digest；本 profile 固定官方 Alpine image 的 `70:70` 身份，升级 PostgreSQL digest 前必须确认镜像内 `postgres` 仍是 UID/GID 70，并重新做空卷初始化和恢复演练。
 
 本地 staging 尚未推 registry 时，preflight 需要显式允许本地 tag：
 
@@ -212,28 +243,20 @@ sudo -u ga-document -H env \
 
 输出必须包含 `rootless`、受限 seccomp 和 cgroup v2。
 
-### 构建并固定文档镜像
+### 拉取已固定文档镜像
 
-文档镜像必须进入 registry，因为 Document Manager 拒绝 tag 和本地 image ID：
+第 7 节的 `release_images.py` 已构建并推送文档镜像。将脚本输出的 `DOCUMENT_MANAGER_IMAGE=repository@sha256:<digest>` 写入第 10 节的 `/etc/ga/document-manager.env` 后，以 `ga-document` 的 rootless daemon 拉取该精确 digest：
 
 ```bash
-cd /opt/genericagent/source
 DOCUMENT_UID="$(id -u ga-document)"
-REVISION="$(git rev-parse --short=12 HEAD)"
+DOCUMENT_IMAGE='registry.example/genericagent/genericagent-document-tool@sha256:<REGISTRY_DIGEST>'
 sudo -u ga-document -H env \
   XDG_RUNTIME_DIR="/run/user/$DOCUMENT_UID" \
   DOCKER_HOST="unix:///run/user/$DOCUMENT_UID/docker.sock" \
-  docker build -f tenant_platform/document-image/Dockerfile \
-  -t registry.example/genericagent/document-tool:"$REVISION" .
-sudo -u ga-document -H env \
-  XDG_RUNTIME_DIR="/run/user/$DOCUMENT_UID" \
-  DOCKER_HOST="unix:///run/user/$DOCUMENT_UID/docker.sock" \
-  docker push registry.example/genericagent/document-tool:"$REVISION"
-sudo -u ga-document -H env \
-  XDG_RUNTIME_DIR="/run/user/$DOCUMENT_UID" \
-  DOCKER_HOST="unix:///run/user/$DOCUMENT_UID/docker.sock" \
-  docker pull registry.example/genericagent/document-tool@sha256:<REGISTRY_DIGEST>
+  docker pull "$DOCUMENT_IMAGE"
 ```
+
+Document Manager 拒绝 tag 和本地 image ID；不要绕过该限制。
 
 ## 10. 配置 Document Manager
 
@@ -251,7 +274,7 @@ sudoedit /etc/ga/document-manager.env
 DATABASE_URL=postgres://genericagent:<DB_PASSWORD>@127.0.0.1:55432/genericagent?sslmode=disable
 GA_MIGRATIONS_DIR=/opt/ga/migrations
 DOCUMENT_MANAGER_RUNTIME_BINARY=docker
-DOCUMENT_MANAGER_IMAGE=registry.example/genericagent/document-tool@sha256:<REGISTRY_DIGEST>
+DOCUMENT_MANAGER_IMAGE=registry.example/genericagent/genericagent-document-tool@sha256:<REGISTRY_DIGEST>
 DOCUMENT_MANAGER_WORK_ROOT=/var/lib/ga/documents
 XDG_RUNTIME_DIR=/run/user/<GA_DOCUMENT_UID>
 DOCKER_HOST=unix:///run/user/<GA_DOCUMENT_UID>/docker.sock
@@ -337,7 +360,7 @@ sudo -u ga-document -H env \
   DOCKER_HOST="unix:///run/user/$DOCUMENT_UID/docker.sock" \
   GA_DOCUMENT_DOCKER_SMOKE=1 \
   GA_DOCUMENT_RUNTIME_BINARY=docker \
-  GA_DOCUMENT_SMOKE_IMAGE='registry.example/genericagent/document-tool@sha256:<REGISTRY_DIGEST>' \
+  GA_DOCUMENT_SMOKE_IMAGE='registry.example/genericagent/genericagent-document-tool@sha256:<REGISTRY_DIGEST>' \
   GA_DOCUMENT_SECCOMP_PROFILE=builtin \
   /opt/genericagent/source/tenant_platform/tests/smoke/document_pool_docker.sh
 ```
