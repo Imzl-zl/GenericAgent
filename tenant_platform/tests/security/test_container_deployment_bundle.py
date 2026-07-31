@@ -17,6 +17,7 @@ def _compose() -> dict:
 def test_container_bundle_has_required_operator_files() -> None:
     required = {
         ".env.example",
+        ".env.production.example",
         ".gitignore",
         "README.zh-CN.md",
         "bot-poller.Dockerfile",
@@ -36,7 +37,20 @@ def test_container_bundle_has_required_operator_files() -> None:
     assert not missing, f"missing container deployment files: {missing}"
 
 
-def test_compose_preserves_runtime_and_host_namespace_boundaries() -> None:
+
+def test_production_env_template_separates_digest_images_from_secrets() -> None:
+    template = (COMPOSE_DIR / ".env.production.example").read_text(encoding="utf-8")
+    for key in (
+        "COMPOSE_PROJECT_NAME=genericagent",
+        "GA_HTTP_BIND=127.0.0.1",
+        "GA_POSTGRES_BIND=127.0.0.1",
+        "GA_PLATFORM_IMAGE=REPLACE_WITH_PLATFORM_IMAGE_AT_SHA256",
+        "GA_BOT_POLLER_IMAGE=REPLACE_WITH_BOT_POLLER_IMAGE_AT_SHA256",
+        "GA_WEB_IMAGE=REPLACE_WITH_WEB_IMAGE_AT_SHA256",
+        "GA_POSTGRES_IMAGE=postgres@sha256:",
+    ):
+        assert key in template
+
     services = _compose()["services"]
     assert "document-manager" not in services
     assert set(services) == {"postgres", "bot-poller", "platform", "web"}

@@ -82,7 +82,7 @@ sudo chmod -R go-w /opt/genericagent/source
 
 ```bash
 cd /opt/genericagent/source/tenant_platform/infra/compose
-sudo cp .env.example .env
+sudo cp .env.production.example .env
 sudo install -d -o root -g root -m 0700 secrets
 sudo install -o root -g root -m 0600 env/platform.env.example secrets/platform.env
 sudo install -o root -g root -m 0600 env/bot-poller.env.example secrets/bot-poller.env
@@ -90,6 +90,8 @@ sudo install -o root -g root -m 0600 env/postgres.env.example secrets/postgres.e
 sudo chown root:root .env
 sudo chmod 600 .env
 ```
+
+`.env` 仅保存 Compose 插值和镜像 digest，不保存密码或 Token。将 `release_images.py` 输出的 `GA_PLATFORM_IMAGE`、`GA_BOT_POLLER_IMAGE`、`GA_WEB_IMAGE` 三行填入 `.env`；`DOCUMENT_MANAGER_IMAGE` 留给第 10 节的 `/etc/ga/document-manager.env`。`.env.example` 仅用于本地 mutable-tag staging，正式 Linux 部署必须从 `.env.production.example` 创建 `.env`。
 
 ## 6. 生成和填写密钥
 
