@@ -145,6 +145,11 @@ frontends/conductor_im_plugins/*
 **/__pycache__/
 
 .claude/
+.worktrees/
+.pi-subagents/artifacts/
+.playwright-mcp/
+.serena/memories/
+.tmp-*
 
 # Project Mode SOP
 !memory/project_mode_sop.md
