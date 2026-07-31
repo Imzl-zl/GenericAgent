@@ -98,9 +98,9 @@ def test_1panel_profile_is_self_contained_and_excludes_document_manager() -> Non
 def test_1panel_environment_template_contains_all_required_runtime_values() -> None:
     template = (COMPOSE_DIR / "env" / "1panel.env.example").read_text(encoding="utf-8")
     for key in (
-        "GA_PLATFORM_IMAGE=example.invalid/genericagent-platform@sha256:",
-        "GA_BOT_POLLER_IMAGE=example.invalid/genericagent-bot-poller@sha256:",
-        "GA_WEB_IMAGE=example.invalid/genericagent-web@sha256:",
+        "GA_PLATFORM_IMAGE=docker.io/zhangl580/genericagent-platform@sha256:5ec7f4ac9793133238b7710757ff91afb0593512d5dfdeb6d051bc10842f421d",
+        "GA_BOT_POLLER_IMAGE=docker.io/zhangl580/genericagent-bot-poller@sha256:b61fa498a10318292c53e60cabfdd2495e7b4628b15bce19f7b8ea08313cf9ff",
+        "GA_WEB_IMAGE=docker.io/zhangl580/genericagent-web@sha256:d7748b63f015bb216384dba4c515ca5fe6067e6dd2f8659aa984c3fbd331595d",
         "POSTGRES_PASSWORD=CHANGE_ME",
         "DATABASE_URL=postgres://genericagent:CHANGE_ME",
         "BOT_POLLER_API_SECRET=CHANGE_ME",
