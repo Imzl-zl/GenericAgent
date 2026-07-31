@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import yaml
 
@@ -8,6 +9,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 COMPOSE_DIR = ROOT / "tenant_platform" / "infra" / "compose"
 COMPOSE_FILE = COMPOSE_DIR / "compose.yaml"
+ONEPANEL_COMPOSE_FILE = COMPOSE_DIR / "compose.1panel.yaml"
 
 
 def _compose() -> dict:
@@ -18,6 +20,7 @@ def test_container_bundle_has_required_operator_files() -> None:
     required = {
         ".env.example",
         ".env.production.example",
+        "compose.1panel.yaml",
         ".gitignore",
         "README.zh-CN.md",
         "bot-poller.Dockerfile",
@@ -25,6 +28,7 @@ def test_container_bundle_has_required_operator_files() -> None:
         "compose.yaml",
         "document-runtime-preflight.sh",
         "env/bot-poller.env.example",
+        "env/1panel.env.example",
         "env/platform.env.example",
         "env/postgres.env.example",
         "ga-document-manager.service",
@@ -51,6 +55,8 @@ def test_production_env_template_separates_digest_images_from_secrets() -> None:
     ):
         assert key in template
 
+
+def test_compose_preserves_runtime_and_host_namespace_boundaries() -> None:
     services = _compose()["services"]
     assert "document-manager" not in services
     assert set(services) == {"postgres", "bot-poller", "platform", "web"}
@@ -63,6 +69,48 @@ def test_production_env_template_separates_digest_images_from_secrets() -> None:
         for mount in service.get("volumes", []):
             assert "docker.sock" not in str(mount).lower(), (name, mount)
             assert "podman.sock" not in str(mount).lower(), (name, mount)
+
+
+def test_1panel_profile_is_self_contained_and_excludes_document_manager() -> None:
+    profile = yaml.safe_load(ONEPANEL_COMPOSE_FILE.read_text(encoding="utf-8"))
+    services = profile["services"]
+    assert set(services) == {"postgres", "bot-poller", "platform", "web"}
+    assert "document-manager" not in services
+    for name, service in services.items():
+        assert "build" not in service
+        assert "env_file" not in service
+        assert service.get("restart") == "unless-stopped"
+        assert service.get("privileged") is not True, name
+        assert service.get("network_mode") != "host", name
+        assert service.get("pid") != "host", name
+        assert service.get("ipc") != "host", name
+        assert service.get("user") not in (None, "", "0", "0:0", "root"), name
+        assert service.get("read_only") is True, name
+        assert "ALL" in service.get("cap_drop", []), name
+        assert "no-new-privileges:true" in {str(value).lower() for value in service.get("security_opt", [])}
+        for mount in service.get("volumes", []):
+            assert isinstance(mount, str), (name, mount)
+            source = mount.split(":", 1)[0]
+            assert source in {"postgres_data", "platform_runtime", "platform_config", "session_files", "bot_media"}, (name, mount)
+    assert services["web"]["network_mode"] == "service:platform"
+
+
+def test_1panel_environment_template_contains_all_required_runtime_values() -> None:
+    template = (COMPOSE_DIR / "env" / "1panel.env.example").read_text(encoding="utf-8")
+    for key in (
+        "GA_PLATFORM_IMAGE=example.invalid/genericagent-platform@sha256:",
+        "GA_BOT_POLLER_IMAGE=example.invalid/genericagent-bot-poller@sha256:",
+        "GA_WEB_IMAGE=example.invalid/genericagent-web@sha256:",
+        "POSTGRES_PASSWORD=CHANGE_ME",
+        "DATABASE_URL=postgres://genericagent:CHANGE_ME",
+        "BOT_POLLER_API_SECRET=CHANGE_ME",
+        "PLATFORM_WEBHOOK_SECRET=CHANGE_ME",
+        "LLM_PROXY_CAPABILITY_SIGNING_KEY=CHANGE_ME",
+    ):
+        assert key in template
+    values = dict(line.split("=", 1) for line in template.splitlines() if "=" in line and not line.startswith("#"))
+    for key in ("GA_PLATFORM_IMAGE", "GA_BOT_POLLER_IMAGE", "GA_WEB_IMAGE", "GA_POSTGRES_IMAGE"):
+        assert re.fullmatch(r"[a-z0-9][a-z0-9._/:-]*@sha256:[a-f0-9]{64}", values[key])
 
 
 def test_application_containers_are_hardened_and_non_root() -> None:

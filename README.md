@@ -572,6 +572,7 @@ python launch.pyw
 
 本地 GA 仍支持 Windows、Linux 和 macOS。多租户文档平台是独立的安全加固部署 profile，当前要求 Linux、systemd、cgroup v2 和独立 rootless Docker runtime。
 
+- 1Panel 快速启动（暂不含 DOCX）：[`tenant_platform/infra/compose/README.1panel.zh-CN.md`](tenant_platform/infra/compose/README.1panel.zh-CN.md)
 - 单机 Compose 部署与打包：[`tenant_platform/infra/compose/README.zh-CN.md`](tenant_platform/infra/compose/README.zh-CN.md)
 - 一次构建并推送四张 Linux 镜像：`python tenant_platform/infra/compose/release_images.py --registry registry.example/namespace`
 - 全 systemd 部署：[`tenant_platform/infra/deploy/README.md`](tenant_platform/infra/deploy/README.md)
