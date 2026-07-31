@@ -35,8 +35,22 @@ done
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DOCUMENT_USER="${GA_DOCUMENT_USER:-ga-document}"
 MANAGER_ENV="${GA_DOCUMENT_MANAGER_ENV:-/etc/ga/document-manager.env}"
-MANAGER_UNIT="/etc/systemd/system/ga-document-manager.service"
-EXPECTED_UNIT="$SCRIPT_DIR/ga-document-manager.service"
+STACK_MODE="${GA_DOCUMENT_STACK_MODE:-systemd}"
+case "$STACK_MODE" in
+  systemd)
+    MANAGER_UNIT="/etc/systemd/system/ga-document-manager.service"
+    EXPECTED_UNIT="$SCRIPT_DIR/ga-document-manager.service"
+    ;;
+  1panel)
+    require_command curl
+    MANAGER_UNIT="/etc/systemd/system/ga-document-manager-1panel.service"
+    EXPECTED_UNIT="$SCRIPT_DIR/ga-document-manager-1panel.service"
+    PLATFORM_HEALTH_URL="${GA_1PANEL_PLATFORM_HEALTH_URL:-http://127.0.0.1:8088/healthz}"
+    ;;
+  *)
+    fail "unsupported GA_DOCUMENT_STACK_MODE: $STACK_MODE"
+    ;;
+esac
 WORK_ROOT="/var/lib/ga/documents"
 MIGRATIONS_ROOT="/opt/ga/migrations"
 MANAGER_BINARY="/opt/ga/bin/document-manager"
@@ -82,9 +96,16 @@ runuser -u "$DOCUMENT_USER" -- env "${runtime_env[@]}" docker image inspect "$im
 
 [[ -f "$MANAGER_UNIT" && -f "$EXPECTED_UNIT" ]] || fail "manager unit is missing"
 cmp -s "$EXPECTED_UNIT" "$MANAGER_UNIT" || fail "installed manager unit differs from reviewed Compose profile unit"
-systemd-analyze verify "$MANAGER_UNIT" /etc/systemd/system/genericagent-compose.service >/dev/null || fail "systemd unit verification failed"
-[[ "$(systemctl show ga-document-manager.service -p FragmentPath --value)" == "$MANAGER_UNIT" ]] || fail "unexpected manager unit fragment"
-[[ -z "$(systemctl show ga-document-manager.service -p DropInPaths --value)" ]] || fail "manager unit has unreviewed drop-ins"
-systemctl is-active --quiet genericagent-compose.service || fail "Compose application stack is not active"
+if [[ "$STACK_MODE" == "systemd" ]]; then
+  systemd-analyze verify "$MANAGER_UNIT" /etc/systemd/system/genericagent-compose.service >/dev/null || fail "systemd unit verification failed"
+  [[ "$(systemctl show ga-document-manager.service -p FragmentPath --value)" == "$MANAGER_UNIT" ]] || fail "unexpected manager unit fragment"
+  [[ -z "$(systemctl show ga-document-manager.service -p DropInPaths --value)" ]] || fail "manager unit has unreviewed drop-ins"
+  systemctl is-active --quiet genericagent-compose.service || fail "Compose application stack is not active"
+else
+  systemd-analyze verify "$MANAGER_UNIT" >/dev/null || fail "systemd unit verification failed"
+  [[ "$(systemctl show ga-document-manager-1panel.service -p FragmentPath --value)" == "$MANAGER_UNIT" ]] || fail "unexpected manager unit fragment"
+  [[ -z "$(systemctl show ga-document-manager-1panel.service -p DropInPaths --value)" ]] || fail "manager unit has unreviewed drop-ins"
+  curl --fail --silent --show-error "$PLATFORM_HEALTH_URL" >/dev/null || fail "1Panel Platform is not healthy: $PLATFORM_HEALTH_URL"
+fi
 
 pass "dedicated UID/groups, private config, rootless Docker, cgroup v2, seccomp, pinned image, paths and effective units"

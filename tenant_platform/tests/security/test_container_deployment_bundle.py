@@ -27,10 +27,12 @@ def test_container_bundle_has_required_operator_files() -> None:
         "compose-preflight.sh",
         "compose.yaml",
         "document-runtime-preflight.sh",
+        "document-manager.1panel.env.example",
         "env/bot-poller.env.example",
         "env/1panel.env.example",
         "env/platform.env.example",
         "env/postgres.env.example",
+        "ga-document-manager-1panel.service",
         "ga-document-manager.service",
         "genericagent-compose.service",
         "nginx.conf",
@@ -111,6 +113,29 @@ def test_1panel_environment_template_contains_all_required_runtime_values() -> N
     values = dict(line.split("=", 1) for line in template.splitlines() if "=" in line and not line.startswith("#"))
     for key in ("GA_PLATFORM_IMAGE", "GA_BOT_POLLER_IMAGE", "GA_WEB_IMAGE", "GA_POSTGRES_IMAGE"):
         assert re.fullmatch(r"[a-z0-9][a-z0-9._/:-]*@sha256:[a-f0-9]{64}", values[key])
+    assert "DOCUMENT_MANAGER_IMAGE" not in values
+
+
+def test_1panel_document_manager_bundle_targets_the_host_stack() -> None:
+    manager_env = (COMPOSE_DIR / "document-manager.1panel.env.example").read_text(encoding="utf-8")
+    manager_unit = (COMPOSE_DIR / "ga-document-manager-1panel.service").read_text(encoding="utf-8")
+    runtime_preflight = (COMPOSE_DIR / "document-runtime-preflight.sh").read_text(encoding="utf-8")
+    assert "DATABASE_URL=postgres://genericagent:CHANGE_ME@127.0.0.1:55432/genericagent?sslmode=disable" in manager_env
+    assert "must match GA_POSTGRES_PORT" in manager_env
+    assert "DOCUMENT_MANAGER_IMAGE=docker.io/zhangl580/genericagent-document-tool@sha256:a67a176bc046e28d38ef24dc300b51b0066a1275ffa980b9d5d2b846669e7f61" in manager_env
+    assert "Requires=genericagent-compose.service" not in manager_unit
+    assert "After=network-online.target docker.service" in manager_unit
+    assert "User=ga-document" in manager_unit
+    assert "NoNewPrivileges=true" in manager_unit
+    assert "BindReadOnlyPaths=-/run/user/%U/docker.sock -/run/user/%U/podman/podman.sock" in manager_unit
+    assert "/run/docker.sock" in manager_unit
+    assert "GA_DOCUMENT_STACK_MODE=1panel" in manager_unit
+    assert "GA_1PANEL_PLATFORM_HEALTH_URL=http://127.0.0.1:8088/healthz" in manager_unit
+    assert "1panel)" in runtime_preflight
+    assert 'curl --fail --silent --show-error "$PLATFORM_HEALTH_URL"' in runtime_preflight
+    guide = (COMPOSE_DIR / "README.1panel.zh-CN.md").read_text(encoding="utf-8")
+    assert "GA_POSTGRES_PORT" in guide
+    assert "Document Manager 镜像" in guide
 
 
 def test_application_containers_are_hardened_and_non_root() -> None:
