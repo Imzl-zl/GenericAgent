@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Link2, UserCog, Activity, BookOpen, LogOut } from 'lucide-react';
+import { LayoutDashboard, Link2, UserCog, Activity, BookOpen, LogOut, ScrollText } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import './Layout.css';
 
@@ -8,6 +8,7 @@ const navItems = [
   { to: '/app/binding', label: '微信绑定', icon: Link2 },
   { to: '/app/persona', label: '人设', icon: UserCog },
   { to: '/app/status', label: '运行状态', icon: Activity },
+  { to: '/app/sops', label: '已加载 SOP', icon: ScrollText },
   { to: '/app/docs', label: '使用文档', icon: BookOpen },
 ];
 

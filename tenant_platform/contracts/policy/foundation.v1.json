@@ -12,7 +12,9 @@
             "file_read",
             "file_write",
             "file_patch",
-            "export_docx"
+            "export_docx",
+            "document_job_submit",
+            "document_job_close"
           ]
         }
       }

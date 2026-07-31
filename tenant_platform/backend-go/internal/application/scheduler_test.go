@@ -16,6 +16,30 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
 
+func TestWorkerTaskEnvelopeCarriesSOPSnapshots(t *testing.T) {
+	task := domain.Task{
+		ID: "task-sop", SessionKey: "personal:1", RequesterID: 1,
+		Source: domain.SourceWechat, SourceInstanceID: "bot", MessageID: "message",
+		Prompt: "make report", PersonaSnapshot: []string{"persona"}, ToolPolicyVersion: "foundation.session-files.v1",
+		CreatedAt: time.Unix(100, 0).UTC(),
+		SOPSnapshots: []domain.TaskSOPSnapshot{{
+			SOPVersionID: "version-1", Title: "Report", Description: "Use for reports",
+			Content: "# Report\n", ContentDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		}},
+	}
+	envelope := workerTaskEnvelope(task)
+	if len(envelope.GetSopSnapshots()) != 1 {
+		t.Fatalf("snapshots=%+v", envelope.GetSopSnapshots())
+	}
+	snapshot := envelope.GetSopSnapshots()[0]
+	if snapshot.GetVersionId() != "version-1" || snapshot.GetContent() != "# Report\n" || snapshot.GetContentDigest() != task.SOPSnapshots[0].ContentDigest {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	if envelope.GetPrompt() != task.Prompt || len(envelope.GetPersonaSnapshot()) != 1 {
+		t.Fatalf("envelope=%+v", envelope)
+	}
+}
+
 func TestSchedulerConfigValidation(t *testing.T) {
 	// Covered primarily in task_service_test; keep explicit package-local case.
 	if _, err := NewScheduler(SchedulerConfig{}); err == nil {

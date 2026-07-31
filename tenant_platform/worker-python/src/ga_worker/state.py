@@ -70,6 +70,8 @@ class SessionState:
     mcp_snapshot_id: str = "disabled"
     mcp_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     mcp_clients: list[Any] = field(default_factory=list)
+    document_client: Any | None = None
+    document_open_task_id: str | None = None
     completed: CompletedTask | None = None
     active_task_id: str | None = None
     shutting_down: bool = False
@@ -93,6 +95,7 @@ class TaskRunState:
     loop_unwrap: Callable[[], None] | None = None
     dispatch_unwrap: Callable[[], None] | None = None
     mcp_unwrap: Callable[[], None] | None = None
+    document_unwrap: Callable[[], None] | None = None
     seed_unwrap: Callable[[], None] | None = None
     previous_persona: list[str] = field(default_factory=list)
     previous_schema: Any = None

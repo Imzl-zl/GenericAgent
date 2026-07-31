@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).parents[2]
 
 
@@ -17,6 +19,9 @@ def test_worker_contract_declares_versioned_service_and_terminal_states():
     assert "rpc ReloadCredentials" in text
     assert "credential_generation" in text
     assert "config_checksum" in text
+    assert "message SOPSnapshot" in text
+    assert "repeated SOPSnapshot sop_snapshots" in text
+    assert "string content_digest" in text
     assert "api_key" not in text.lower()
     assert "string delivery_id" not in text
     assert "string result_ref" not in text
@@ -101,6 +106,74 @@ def test_platform_openapi_exposes_foundation_task_paths():
         "tool_policy_version",
     ):
         assert f"- {field}" in task_required
+
+
+def test_document_pool_status_route_matches_backend_web_and_openapi():
+    openapi = yaml.safe_load(
+        (ROOT / "contracts/openapi/platform.yaml").read_text(encoding="utf-8")
+    )
+    path = "/v1/admin/document-pool/status"
+    assert "get" in openapi["paths"][path]
+    backend = (ROOT / "backend-go/internal/api/admin.go").read_text(encoding="utf-8")
+    assert f"GET {path}" in backend
+    web = (ROOT / "web/src/api/settings.ts").read_text(encoding="utf-8")
+    assert f"api.get<DocumentPoolStatus>('{path}')" in web
+
+
+def test_document_routes_match_backend_and_openapi_security_contract():
+    openapi = yaml.safe_load(
+        (ROOT / "contracts/openapi/platform.yaml").read_text(encoding="utf-8")
+    )
+    backend = (ROOT / "backend-go/internal/api/document_tools_http.go").read_text(encoding="utf-8")
+    admin = (ROOT / "backend-go/internal/api/admin.go").read_text(encoding="utf-8")
+    routes = (
+        ("GET", "/v1/admin/settings/document-pool"),
+        ("PUT", "/v1/admin/settings/document-pool"),
+        ("POST", "/v1/document/commands"),
+        ("POST", "/v1/document/close"),
+        ("GET", "/v1/document/status"),
+        ("GET", "/v1/document/artifact"),
+    )
+    for method, path in routes:
+        assert method.lower() in openapi["paths"][path], f"OpenAPI missing {method} {path}"
+        source = admin if path.startswith("/v1/admin/") else backend
+        assert f"{method} {path}" in source, f"backend missing {method} {path}"
+    schemes = openapi["components"]["securitySchemes"]
+    assert schemes["DocumentCapability"] == {
+        "type": "http", "scheme": "bearer", "bearerFormat": "document-capability"
+    }
+    for path in ("/v1/document/commands", "/v1/document/close", "/v1/document/status", "/v1/document/artifact"):
+        for operation in openapi["paths"][path].values():
+            assert operation["security"] == [{"DocumentCapability": []}]
+
+
+def test_document_gateway_error_envelope_matches_go_and_worker_client():
+    go_http = (ROOT / "backend-go/internal/api/http.go").read_text(encoding="utf-8")
+    worker_client = (ROOT / "worker-python/src/ga_worker/document_client.py").read_text(encoding="utf-8")
+    assert "standard error envelope: {code, message, trace_id}" in go_http
+    assert 'payload.get("code")' in worker_client
+    assert 'payload.get("message")' in worker_client
+    assert 'payload.get("error")' not in worker_client
+
+
+def test_sop_admin_routes_match_backend_web_and_openapi():
+    openapi = yaml.safe_load(
+        (ROOT / "contracts/openapi/platform.yaml").read_text(encoding="utf-8")
+    )
+    backend = (
+        ROOT / "backend-go/internal/api/admin.go"
+    ).read_text(encoding="utf-8")
+    web = (ROOT / "web/src/api/sops.ts").read_text(encoding="utf-8")
+    routes = (
+        ("GET", "/v1/admin/sophub/search", "api.get<SophubSearchResult>(`/v1/admin/sophub/search?"),
+        ("POST", "/v1/admin/sophub/candidates/import", "api.post<SOPCandidate>('/v1/admin/sophub/candidates/import'"),
+        ("POST", "/v1/admin/sop-versions/{version_id}/load", "api.post(`/v1/admin/sop-versions/${versionId}/load`)"),
+        ("POST", "/v1/admin/sops/{entry_id}/unload", "api.post(`/v1/admin/sops/${entryId}/unload`)"),
+    )
+    for method, path, web_call in routes:
+        assert method.lower() in openapi["paths"][path], f"OpenAPI missing {method} {path}"
+        assert f'{method} {path}' in backend, f"backend missing {method} {path}"
+        assert web_call in web, f"Web client missing {method} {path}"
 
 
 def test_platform_openapi_declares_error_response_schema_and_status_enum():

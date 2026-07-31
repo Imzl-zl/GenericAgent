@@ -232,31 +232,15 @@ docker-compose down
 
 ## 生产部署
 
-生产环境建议使用 systemd 管理服务：
+安全文档平台的生产部署不使用本节早期的通用启动命令。单机自助部署优先使用 [`infra/compose/README.zh-CN.md`](infra/compose/README.zh-CN.md)：Web、Platform+Python 子 Worker、Bot Poller 和 PostgreSQL 由 hardened Compose 启动，Document Manager 仍由宿主 systemd 管理独立 rootless runtime。全 systemd 方案见 [`infra/deploy/README.md`](infra/deploy/README.md)。两种方案都包含：
 
-```bash
-# 复制 systemd 服务文件
-sudo cp infra/systemd/*.service /etc/systemd/system/
+- rootless Docker/Podman 与 cgroup v2 的 fail-closed preflight；
+- digest-pinned document image、私有环境文件和明确启动顺序；
+- 只有 `ga-document-manager` 持有文档 runtime 权限，Compose 应用不挂任何 runtime socket；
+- 真实容器、管理员控制面、浏览器/微信交付和 secret journal 检查；
+- 明确的停池、应用/二进制回滚和数据库恢复边界。
 
-# 重新加载 systemd
-sudo systemctl daemon-reload
-
-# 启动服务
-sudo systemctl start ga-platform
-sudo systemctl start ga-bot-poller
-
-# 设置开机自启
-sudo systemctl enable ga-platform
-sudo systemctl enable ga-bot-poller
-
-# 查看状态
-sudo systemctl status ga-platform
-sudo systemctl status ga-bot-poller
-
-# 查看日志
-sudo journalctl -u ga-platform -f
-sudo journalctl -u ga-bot-poller -f
-```
+目标主机未通过所选 profile 的全部门禁前，不得启用文档池。
 
 ## 开发技巧
 

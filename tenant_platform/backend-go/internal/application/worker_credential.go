@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 	"google.golang.org/grpc/codes"
@@ -22,6 +24,7 @@ type workerCredentialSet struct {
 	JTIs        []string
 	Snapshot    routingSnapshot
 	MCPSnapshot RuntimeMCPSnapshot
+	Document    RuntimeDocumentGateway
 }
 
 const credentialRevokeTimeout = 5 * time.Second
@@ -43,7 +46,7 @@ func (s *scheduler) issueProviderCapabilities(
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
 	}
-	return s.issueProviderCapabilitiesWithMCP(ctx, sessionKey, snapshot, mcpSnapshot, generation)
+	return s.issueProviderCapabilitiesWithRuntime(ctx, sessionKey, snapshot, mcpSnapshot, RuntimeDocumentGateway{}, generation)
 }
 
 func (s *scheduler) issueProviderCapabilitiesWithMCP(
@@ -53,11 +56,22 @@ func (s *scheduler) issueProviderCapabilitiesWithMCP(
 	mcpSnapshot RuntimeMCPSnapshot,
 	generation uint64,
 ) (workerCredentialSet, RuntimeConfigFiles, error) {
+	return s.issueProviderCapabilitiesWithRuntime(ctx, sessionKey, snapshot, mcpSnapshot, RuntimeDocumentGateway{}, generation)
+}
+
+func (s *scheduler) issueProviderCapabilitiesWithRuntime(
+	ctx context.Context,
+	sessionKey string,
+	snapshot routingSnapshot,
+	mcpSnapshot RuntimeMCPSnapshot,
+	documentGateway RuntimeDocumentGateway,
+	generation uint64,
+) (workerCredentialSet, RuntimeConfigFiles, error) {
 	if s.cfg.TokenIssuer == nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, nil
 	}
 	bindings := make([]RuntimeProviderBinding, 0, len(snapshot.Providers))
-	set := workerCredentialSet{Generation: generation, Snapshot: snapshot, MCPSnapshot: mcpSnapshot}
+	set := workerCredentialSet{Generation: generation, Snapshot: snapshot, MCPSnapshot: mcpSnapshot, Document: documentGateway}
 	for _, routed := range snapshot.Providers {
 		token, claims, err := s.cfg.TokenIssuer.Issue(llmproxy.CapabilitySpec{
 			SessionKey: sessionKey, ProviderID: routed.ID, ProviderRevision: routed.Revision,
@@ -89,6 +103,7 @@ func (s *scheduler) issueProviderCapabilitiesWithMCP(
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
 		Generation: generation, ProxyBaseURL: s.cfg.LLMProxyAddr,
 		RoutingSnapshotID: snapshot.ID, Providers: bindings, MCP: mcpSnapshot,
+		Document: documentGateway,
 	})
 	if err != nil {
 		s.revokeCredentialSetBestEffort(ctx, set)
@@ -99,7 +114,7 @@ func (s *scheduler) issueProviderCapabilitiesWithMCP(
 }
 
 func (s *scheduler) issueInitialWorkerCredentials(
-	ctx context.Context, sessionKey string,
+	ctx context.Context, task domain.Task,
 ) (workerCredentialSet, error) {
 	if s.cfg.TokenIssuer == nil {
 		return workerCredentialSet{}, nil
@@ -108,15 +123,58 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	if err != nil {
 		return workerCredentialSet{}, err
 	}
-	set, files, err := s.issueProviderCapabilities(ctx, sessionKey, snapshot, 1)
+	mcpSnapshot, err := s.resolveMCPSnapshot(ctx)
 	if err != nil {
 		return workerCredentialSet{}, err
 	}
-	if err := WriteRuntimeConfigAtomic(s.configDirFor(sessionKey), files); err != nil {
+	documentGateway, err := s.resolveRuntimeDocumentGateway(ctx, task)
+	if err != nil {
+		return workerCredentialSet{}, err
+	}
+	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, documentGateway, 1)
+	if err != nil {
+		return workerCredentialSet{}, err
+	}
+	if err := WriteRuntimeConfigAtomic(s.configDirFor(task.SessionKey), files); err != nil {
 		s.revokeCredentialSetBestEffort(ctx, set)
 		return workerCredentialSet{}, fmt.Errorf("write token-only runtime config: %w", err)
 	}
 	return set, nil
+}
+
+func (s *scheduler) resolveRuntimeDocumentGateway(ctx context.Context, task domain.Task) (RuntimeDocumentGateway, error) {
+	if strings.TrimSpace(s.cfg.DocumentGatewayBaseURL) == "" {
+		return RuntimeDocumentGateway{}, nil
+	}
+	if s.cfg.DocumentGatewayTokenIssuer == nil {
+		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway token issuer is required")
+	}
+	if strings.TrimSpace(task.SessionKey) == "" || strings.TrimSpace(task.WorkspaceID) == "" {
+		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway requires task session_key and workspace_id")
+	}
+	token, err := s.cfg.DocumentGatewayTokenIssuer.IssueDocumentGatewayToken(ctx, task.SessionKey, task.WorkspaceID)
+	if err != nil {
+		return RuntimeDocumentGateway{}, fmt.Errorf("issue document gateway token: %w", err)
+	}
+	gateway, err := validateRuntimeDocumentGateway(RuntimeDocumentGateway{
+		BaseURL: strings.TrimSpace(s.cfg.DocumentGatewayBaseURL), CapabilityToken: token,
+		SessionKey: task.SessionKey, WorkspaceID: task.WorkspaceID,
+	})
+	if err != nil {
+		return RuntimeDocumentGateway{}, err
+	}
+	return gateway, nil
+}
+
+func (s *scheduler) refreshRuntimeDocumentGateway(
+	ctx context.Context, current RuntimeDocumentGateway,
+) (RuntimeDocumentGateway, error) {
+	if !runtimeDocumentGatewayConfigured(current) {
+		return RuntimeDocumentGateway{}, nil
+	}
+	return s.resolveRuntimeDocumentGateway(ctx, domain.Task{
+		SessionKey: current.SessionKey, WorkspaceID: current.WorkspaceID,
+	})
 }
 
 func (s *scheduler) credentialsNeedRefresh(set workerCredentialSet) bool {
@@ -141,9 +199,13 @@ func (s *scheduler) refreshWorkerCredentials(ctx context.Context, entry *workerE
 		// Credential reload intentionally preserves the worker's immutable MCP
 		// catalog. MCP changes are detected in prepareWorkerEntry and applied by
 		// replacing the worker at a task boundary, never by hot-reloading tools.
-		newSet, files, err := s.issueProviderCapabilitiesWithMCP(
+		documentGateway, err := s.refreshRuntimeDocumentGateway(ctx, entry.credentials.Document)
+		if err != nil {
+			return err
+		}
+		newSet, files, err := s.issueProviderCapabilitiesWithRuntime(
 			ctx, entry.sessionKey, entry.credentials.Snapshot,
-			entry.credentials.MCPSnapshot, generation,
+			entry.credentials.MCPSnapshot, documentGateway, generation,
 		)
 		if err != nil {
 			return err

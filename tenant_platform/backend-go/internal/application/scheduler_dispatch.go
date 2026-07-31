@@ -42,6 +42,32 @@ func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) 
 	return context.DeadlineExceeded
 }
 
+func workerTaskEnvelope(task domain.Task) *workerv1.TaskEnvelope {
+	snapshots := make([]*workerv1.SOPSnapshot, 0, len(task.SOPSnapshots))
+	for _, snapshot := range task.SOPSnapshots {
+		snapshots = append(snapshots, &workerv1.SOPSnapshot{
+			VersionId:     snapshot.SOPVersionID,
+			Title:         snapshot.Title,
+			Description:   snapshot.Description,
+			Content:       snapshot.Content,
+			ContentDigest: snapshot.ContentDigest,
+		})
+	}
+	return &workerv1.TaskEnvelope{
+		TaskId:            task.ID,
+		SessionKey:        task.SessionKey,
+		RequesterUserId:   task.RequesterID,
+		Source:            task.Source,
+		SourceInstanceId:  task.SourceInstanceID,
+		MessageId:         task.MessageID,
+		Prompt:            task.Prompt,
+		PersonaSnapshot:   append([]string(nil), task.PersonaSnapshot...),
+		ToolPolicyVersion: task.ToolPolicyVersion,
+		CreatedAt:         timestamppb.New(task.CreatedAt),
+		SopSnapshots:      snapshots,
+	}
+}
+
 func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -153,20 +179,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
-	req := &workerv1.ExecuteTaskRequest{
-		Task: &workerv1.TaskEnvelope{
-			TaskId:            taskRow.ID,
-			SessionKey:        taskRow.SessionKey,
-			RequesterUserId:   taskRow.RequesterID,
-			Source:            taskRow.Source,
-			SourceInstanceId:  taskRow.SourceInstanceID,
-			MessageId:         taskRow.MessageID,
-			Prompt:            taskRow.Prompt,
-			PersonaSnapshot:   append([]string(nil), taskRow.PersonaSnapshot...),
-			ToolPolicyVersion: taskRow.ToolPolicyVersion,
-			CreatedAt:         timestamppb.New(taskRow.CreatedAt),
-		},
-	}
+	req := &workerv1.ExecuteTaskRequest{Task: workerTaskEnvelope(taskRow)}
 
 	taskDeadline := time.Now().Add(s.cfg.MaxTaskWallClock)
 	executeCtx, cancelExecute := context.WithTimeout(ctx, s.cfg.MaxTaskWallClock)

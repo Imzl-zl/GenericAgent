@@ -54,6 +54,15 @@ def map_exception_code(exc: BaseException) -> str:
     return "TASK_EXCEPTION"
 
 
+def _close_document_job(session: Any, task_id: str) -> Exception | None:
+    try:
+        from ga_worker.document_instrument import close_open_document_job
+        close_open_document_job(session, task_id)
+        return None
+    except Exception as exc:
+        return exc
+
+
 def emit_error_terminal(
     adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
     error_msg: Any, error_code: Any = None,
@@ -62,9 +71,13 @@ def emit_error_terminal(
     if state.terminal_emitted:
         return
     code = str(error_code or "TASK_EXCEPTION")[:ERROR_MSG_MAX_LEN]
+    close_error = _close_document_job(getattr(adapter, "_session", None), task.task_id)
+    message = str(error_msg)
+    if close_error is not None:
+        message += f"; document job close also failed: {close_error}"
     term = adapter._terminal(
         task.task_id, worker_pb2.TASK_FAILED,
-        user_message=str(error_msg)[:ERROR_MSG_MAX_LEN],
+        user_message=message[:ERROR_MSG_MAX_LEN],
         error_code=code, result_body=state.final_body,
     )
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
@@ -77,9 +90,13 @@ def emit_output_exceeded_terminal(
 ) -> Iterator[worker_pb2.WorkerEvent]:
     if state.terminal_emitted:
         return
+    close_error = _close_document_job(getattr(adapter, "_session", None), task.task_id)
+    message = "max_output_bytes exceeded"
+    if close_error is not None:
+        message += f"; document job close also failed: {close_error}"
     term = adapter._terminal(
         task.task_id, worker_pb2.TASK_FAILED,
-        user_message="max_output_bytes exceeded", error_code="MAX_OUTPUT_BYTES",
+        user_message=message[:ERROR_MSG_MAX_LEN], error_code="MAX_OUTPUT_BYTES",
     )
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
@@ -92,9 +109,13 @@ def emit_cancel_or_timeout_terminal(
     is_timeout = state.timed_out["v"]
     status = worker_pb2.TASK_INTERRUPTED if is_timeout else worker_pb2.TASK_CANCELLED
     code = "TASK_TIMEOUT" if is_timeout else "TASK_CANCELLED"
+    message = "task timeout" if is_timeout else "cancelled"
+    close_error = _close_document_job(getattr(adapter, "_session", None), task.task_id)
+    if close_error is not None:
+        message += f"; document job close also failed: {close_error}"
     term = adapter._terminal(
         task.task_id, status,
-        user_message="task timeout" if is_timeout else "cancelled",
+        user_message=message[:ERROR_MSG_MAX_LEN],
         error_code=code,
     )
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
@@ -106,14 +127,31 @@ def emit_final_terminal(
     adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
 ) -> Iterator[worker_pb2.WorkerEvent]:
     session = getattr(adapter, "_session", None)
+    if not (state.pending.cancel_requested or state.timed_out["v"]):
+        close_error = _close_document_job(session, task.task_id)
+        if close_error is not None:
+            term = adapter._terminal(
+                task.task_id, worker_pb2.TASK_FAILED,
+                user_message=f"document job close failed: {close_error}"[:ERROR_MSG_MAX_LEN],
+                error_code="DOCUMENT_JOB_CLOSE_FAILED",
+                result_body=state.final_body,
+            )
+            adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
+            yield worker_pb2.WorkerEvent(terminal=term)
+            state.terminal_emitted = True
+            return
     generated = list(getattr(session, "generated_output_files", []) or [])
     if state.pending.cancel_requested or state.timed_out["v"]:
         is_timeout = state.timed_out["v"]
         status = worker_pb2.TASK_INTERRUPTED if is_timeout else worker_pb2.TASK_CANCELLED
         code = "TASK_TIMEOUT" if is_timeout else "TASK_CANCELLED"
+        close_error = _close_document_job(session, task.task_id)
+        message = state.final_body or ("timeout" if is_timeout else "cancelled")
+        if close_error is not None:
+            message += f"; document job close also failed: {close_error}"
         term = adapter._terminal(
             task.task_id, status,
-            user_message=state.final_body or ("timeout" if is_timeout else "cancelled"),
+            user_message=message[:ERROR_MSG_MAX_LEN],
             error_code=code, result_body=state.final_body,
         )
     else:
@@ -133,15 +171,19 @@ def emit_missing_terminal_if_needed(
 ) -> Iterator[worker_pb2.WorkerEvent]:
     if state.terminal_emitted:
         return
+    close_error = _close_document_job(getattr(adapter, "_session", None), task.task_id)
+    message = "max_output_bytes exceeded" if state.output_exceeded["v"] else "task ended without terminal payload"
+    if close_error is not None:
+        message += f"; document job close also failed: {close_error}"
     if state.output_exceeded["v"]:
         term = adapter._terminal(
             task.task_id, worker_pb2.TASK_FAILED,
-            user_message="max_output_bytes exceeded", error_code="MAX_OUTPUT_BYTES",
+            user_message=message[:ERROR_MSG_MAX_LEN], error_code="MAX_OUTPUT_BYTES",
         )
     else:
         term = adapter._terminal(
             task.task_id, worker_pb2.TASK_FAILED,
-            user_message="task ended without terminal payload", error_code="MISSING_TERMINAL",
+            user_message=message[:ERROR_MSG_MAX_LEN], error_code="MISSING_TERMINAL",
         )
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
@@ -152,9 +194,13 @@ def emit_exception_terminal(
     adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState | None, exc: Exception,
 ) -> Iterator[worker_pb2.WorkerEvent]:
     code = map_exception_code(exc)
+    close_error = _close_document_job(getattr(adapter, "_session", None), task.task_id)
+    message = f"{code}: {exc}"
+    if close_error is not None:
+        message += f"; document job close also failed: {close_error}"
     term = adapter._terminal(
         task.task_id, worker_pb2.TASK_FAILED,
-        user_message=f"{code}: {exc}"[:ERROR_MSG_MAX_LEN], error_code=code,
+        user_message=message[:ERROR_MSG_MAX_LEN], error_code=code,
     )
     agent = state.agent if state is not None else None
     try:

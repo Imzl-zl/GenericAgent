@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import types
 from pathlib import Path
-import zipfile
 
 from genericagent.worker.v1 import worker_pb2
 from ga_worker.legacy_instrument import (
@@ -13,12 +12,12 @@ from ga_worker.legacy_instrument import (
     restore_tool_schema,
 )
 from ga_worker.limits import ToolPolicy
-from ga_worker.session_files import append_missing_file_markers, ensure_session_sandbox, normalize_output_name, resolve_under_root, write_simple_docx
+from ga_worker.session_files import append_missing_file_markers, ensure_session_sandbox, normalize_output_name, resolve_under_root
 from ga_worker.state import PendingTask, TaskRunState
-from ga_worker.task_terminal import emit_final_terminal
+from ga_worker.task_terminal import emit_cancel_or_timeout_terminal, emit_final_terminal
 
 
-def test_resolve_under_root_and_write_docx(tmp_path: Path):
+def test_resolve_under_root_rejects_escape(tmp_path: Path):
     root = ensure_session_sandbox(tmp_path, "personal:1")
     resolved = resolve_under_root(root, "outputs/resume.docx")
     assert resolved == root / "outputs" / "resume.docx"
@@ -29,13 +28,6 @@ def test_resolve_under_root_and_write_docx(tmp_path: Path):
         assert "escapes session sandbox" in str(exc)
     else:
         raise AssertionError("expected sandbox escape rejection")
-
-    write_simple_docx(resolved, "第一段\n\n第二段", title="简历")
-    assert resolved.is_file()
-    with zipfile.ZipFile(resolved) as zf:
-        names = set(zf.namelist())
-        assert "word/document.xml" in names
-        assert "[Content_Types].xml" in names
 
 
 def test_normalize_output_name_preserves_outputs_prefix():
@@ -81,7 +73,84 @@ def test_emit_final_terminal_appends_generated_output_markers():
 
 
 
-def test_session_sandbox_injects_export_docx_tool(tmp_path: Path):
+def test_cancel_terminal_closes_open_document_job():
+    closed: list[str] = []
+
+    class FakeClient:
+        def close(self, task_id: str) -> None:
+            closed.append(task_id)
+
+    session = types.SimpleNamespace(document_client=FakeClient(), document_open_task_id="t1")
+
+    class FakeAdapter:
+        def __init__(self):
+            self._session = session
+
+        def _terminal(self, task_id, status, *, user_message="", error_code=None, result_body=None):
+            return worker_pb2.Terminal(task_id=task_id, status=status, user_message=user_message)
+
+        def _record_completed(self, *args):
+            return None
+
+    task = worker_pb2.TaskEnvelope(task_id="t1", session_key="personal:1")
+    state = TaskRunState(
+        pending=PendingTask(task_id="t1", request=worker_pb2.ExecuteTaskRequest(), cancel_requested=True),
+        agent=object(),
+    )
+    events = list(emit_cancel_or_timeout_terminal(FakeAdapter(), task, state))
+
+    assert len(events) == 1
+    assert events[0].terminal.status == worker_pb2.TASK_CANCELLED
+    assert closed == ["t1"]
+    assert session.document_open_task_id is None
+
+
+def test_failed_document_close_is_retried_by_next_task_without_document_operation():
+    attempts: list[str] = []
+
+    class FlakyClient:
+        def close(self, task_id: str) -> None:
+            attempts.append(task_id)
+            if len(attempts) == 1:
+                raise RuntimeError("temporary close failure")
+
+    session = types.SimpleNamespace(
+        document_client=FlakyClient(), document_open_task_id="t1", generated_output_files=[]
+    )
+
+    class FakeAdapter:
+        def __init__(self):
+            self._session = session
+
+        def _terminal(self, task_id, status, *, user_message="", error_code=None, result_body=None):
+            return worker_pb2.Terminal(
+                task_id=task_id, status=status, user_message=user_message
+            )
+
+        def _record_completed(self, *args):
+            return None
+
+    first_task = worker_pb2.TaskEnvelope(task_id="t1", session_key="personal:1")
+    first_state = TaskRunState(
+        pending=PendingTask(task_id="t1", request=worker_pb2.ExecuteTaskRequest()),
+        agent=object(),
+    )
+    first = list(emit_final_terminal(FakeAdapter(), first_task, first_state))
+    assert first[0].terminal.status == worker_pb2.TASK_FAILED
+    assert session.document_open_task_id == "t1"
+
+    second_task = worker_pb2.TaskEnvelope(task_id="t2", session_key="personal:1")
+    second_state = TaskRunState(
+        pending=PendingTask(task_id="t2", request=worker_pb2.ExecuteTaskRequest()),
+        agent=object(),
+    )
+    second = list(emit_final_terminal(FakeAdapter(), second_task, second_state))
+    assert second[0].terminal.status == worker_pb2.TASK_SUCCEEDED
+    assert attempts == ["t1", "t1"]
+    assert session.document_open_task_id is None
+
+
+def test_session_sandbox_does_not_inject_local_export_docx(tmp_path: Path):
     class FakeHandler:
         def __init__(self, *args, **kwargs):
             self.cwd = "./temp"
@@ -106,23 +175,101 @@ def test_session_sandbox_injects_export_docx_tool(tmp_path: Path):
     )
     try:
         names = [t["function"]["name"] for t in agentmain_mod.TOOLS_SCHEMA]
-        assert names == ["file_read", "export_docx"]
+        assert names == ["file_read"]
 
         handler = ga_mod.GenericAgentHandler(None)
         assert "session_files" in Path(handler.cwd).as_posix()
         resolved = Path(handler._get_abs_path("outputs/demo.docx"))
         assert resolved.parts[-2:] == ("outputs", "demo.docx")
         assert "session_files" in resolved.as_posix()
-        assert hasattr(ga_mod.GenericAgentHandler, "do_export_docx")
-
-        gen = handler.do_export_docx({"path": "outputs/demo.docx", "content": "hello"}, types.SimpleNamespace(content=""))
-        out = list(gen)
-        assert any("已生成 Word 文件" in chunk for chunk in out)
-        assert resolved.is_file()
-        assert session.generated_output_files == ["outputs/demo.docx"]
+        assert not hasattr(ga_mod.GenericAgentHandler, "do_export_docx")
+        assert not resolved.exists()
+        assert session.generated_output_files == []
     finally:
         restore_tool_schema(previous, {"ga": ga_mod, "agentmain": agentmain_mod})
         unwrap()
+
+
+def test_global_mcp_tool_runs_when_tenant_policy_allows_it(tmp_path: Path, monkeypatch):
+    import sys
+
+    class StepOutcome:
+        def __init__(self, data, next_prompt=None, should_exit=False):
+            self.data = data
+            self.next_prompt = next_prompt
+            self.should_exit = should_exit
+
+    monkeypatch.setitem(sys.modules, "agent_loop", types.SimpleNamespace(StepOutcome=StepOutcome))
+
+    class FakeHandler:
+        def __init__(self, *args, **kwargs):
+            self.cwd = "./temp"
+
+        def dispatch(self, tool_name, args, response, index=0, tool_num=1):
+            method = getattr(self, f"do_{tool_name}", None)
+            if method is None:
+                yield f"unknown:{tool_name}\n"
+                return StepOutcome(None)
+            return (yield from method(args, response))
+
+    class FakeClient:
+        def call_tool(self, name, arguments):
+            assert name == "web_search"
+            assert arguments == {"query": "GA"}
+            return "search result"
+
+    ga_mod = types.SimpleNamespace(GenericAgentHandler=FakeHandler)
+    agentmain_mod = types.SimpleNamespace(TOOLS_SCHEMA=[
+        {"type": "function", "function": {"name": "file_read"}},
+    ])
+    session = types.SimpleNamespace(
+        overlay_dir=tmp_path / "runtime" / "s-1" / "legacy-overlay",
+        session_key="personal:1",
+        agent=types.SimpleNamespace(handler=None),
+        generated_output_files=[],
+        mcp_tools={
+            "exa__web_search": {
+                "client": FakeClient(),
+                "tool_name": "web_search",
+                "schema": {
+                    "type": "function",
+                    "function": {
+                        "name": "exa__web_search",
+                        "description": "Search",
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                    },
+                },
+            },
+        },
+    )
+    session.overlay_dir.mkdir(parents=True, exist_ok=True)
+    mods = {"ga": ga_mod, "agentmain": agentmain_mod, "agent_loop": sys.modules["agent_loop"]}
+
+    sandbox_unwrap = install_session_file_sandbox(session, mods)
+    mcp_unwrap = install_global_mcp_tools(session, mods)
+    policy = ToolPolicy(
+        version="foundation.session-files.v1",
+        allowed_tools=frozenset({"file_read", "export_docx", "exa__web_search"}),
+    )
+    previous = apply_tool_policy(policy, mods)
+    guard_unwrap = install_dispatch_guard(policy, mods)
+    try:
+        names = [tool["function"]["name"] for tool in agentmain_mod.TOOLS_SCHEMA]
+        assert names == ["file_read", "exa__web_search"]
+
+        call = ga_mod.GenericAgentHandler().dispatch("exa__web_search", {"query": "GA"}, None)
+        chunks = []
+        try:
+            while True:
+                chunks.append(next(call))
+        except StopIteration as stop:
+            assert stop.value.data == "search result"
+        assert any("search result" in chunk for chunk in chunks)
+    finally:
+        guard_unwrap()
+        restore_tool_schema(previous, mods)
+        mcp_unwrap()
+        sandbox_unwrap()
 
 
 def test_global_mcp_install_is_transactional_when_catalog_contains_conflict():
@@ -163,7 +310,7 @@ def test_global_mcp_install_is_transactional_when_catalog_contains_conflict():
     assert not hasattr(agentmain_mod, "_tenant_global_mcp_tool_names")
 
 
-def test_global_mcp_tools_coexist_with_export_and_bypass_only_tenant_policy(tmp_path: Path, monkeypatch):
+def test_global_mcp_tools_must_intersect_with_tenant_policy(tmp_path: Path, monkeypatch):
     import sys
 
     class StepOutcome:
@@ -233,31 +380,22 @@ def test_global_mcp_tools_coexist_with_export_and_bypass_only_tenant_policy(tmp_
     guard_unwrap = install_dispatch_guard(policy, mods)
     try:
         names = [tool["function"]["name"] for tool in agentmain_mod.TOOLS_SCHEMA]
-        assert names == ["file_read", "export_docx", "exa__web_search"]
+        assert names == ["file_read"]
 
         handler = ga_mod.GenericAgentHandler()
-        call = handler.dispatch(
+        denied = handler.dispatch(
             "exa__web_search",
             {"query": "GA", "_index": 0, "_tool_num": 1},
             None,
         )
-        chunks = []
+        denied_chunks = []
         try:
             while True:
-                chunks.append(next(call))
-        except StopIteration as stop:
-            assert stop.value.data == "search result"
-        assert any("search result" in chunk for chunk in chunks)
-
-        forged = handler.dispatch("evil__shell", {}, None)
-        forged_chunks = []
-        try:
-            while True:
-                forged_chunks.append(next(forged))
+                denied_chunks.append(next(denied))
         except StopIteration:
             pass
-        assert any("denied" in chunk for chunk in forged_chunks)
-        assert "evil__shell" not in dispatched
+        assert any("denied" in chunk for chunk in denied_chunks)
+        assert dispatched == []
     finally:
         guard_unwrap()
         restore_tool_schema(previous, mods)

@@ -13,14 +13,13 @@ Fixes applied during extraction:
 from __future__ import annotations
 
 import copy
-import re
 import sys
 import threading
 from pathlib import Path
 from typing import Any, Callable
 
 from ga_worker.limits import ToolPolicy
-from ga_worker.session_files import ensure_session_sandbox, normalize_output_name, read_text_file, resolve_under_root, write_simple_docx
+from ga_worker.session_files import ensure_session_sandbox, resolve_under_root
 
 
 def prepare_handler_seed(
@@ -80,7 +79,6 @@ def apply_tool_policy(tool_policy: ToolPolicy, legacy_mods: dict[str, Any] | Non
         return None
     previous = agentmain.TOOLS_SCHEMA
     allowed = tool_policy.allowed_tools
-    global_mcp_tools = frozenset(getattr(agentmain, "_tenant_global_mcp_tool_names", ()) or ())
     augmented = list(previous)
     for extra in getattr(agentmain, "_tenant_custom_tools_schema", []) or []:
         if not isinstance(extra, dict):
@@ -95,7 +93,7 @@ def apply_tool_policy(tool_policy: ToolPolicy, legacy_mods: dict[str, Any] | Non
         t
         for t in augmented
         if isinstance(t, dict)
-        and t.get("function", {}).get("name") in allowed.union(global_mcp_tools)
+        and t.get("function", {}).get("name") in allowed
     ]
     agentmain.TOOLS_SCHEMA = filtered
     return previous
@@ -131,7 +129,6 @@ def install_session_file_sandbox(session: Any, legacy_mods: dict[str, Any] | Non
     if legacy_mods is None or session is None:
         return lambda: None
     ga_mod = legacy_mods.get("ga")
-    agentmain = legacy_mods.get("agentmain")
     if ga_mod is None:
         return lambda: None
     handler_cls = getattr(ga_mod, "GenericAgentHandler", None)
@@ -141,8 +138,6 @@ def install_session_file_sandbox(session: Any, legacy_mods: dict[str, Any] | Non
     sandbox_root = ensure_session_sandbox(Path(session.overlay_dir).parents[1], session.session_key)
     original_init = getattr(handler_cls, "__init__", None)
     original_get_abs_path = getattr(handler_cls, "_get_abs_path", None)
-    original_export_docx = getattr(handler_cls, "do_export_docx", None)
-    previous_custom_schema = getattr(agentmain, "_tenant_custom_tools_schema", None) if agentmain is not None else None
 
     def _set_cwd(handler: Any) -> None:
         if handler is not None:
@@ -160,69 +155,14 @@ def install_session_file_sandbox(session: Any, legacy_mods: dict[str, Any] | Non
             return ""
         return str(resolve_under_root(sandbox_root, raw))
 
-    def do_export_docx(self, args, response):
-        path = normalize_output_name(args.get("path", "outputs/document.docx"))
-        abs_path = resolve_under_root(sandbox_root, path)
-        title = str(args.get("title") or "").strip()
-        content = args.get("content")
-        if not content:
-            source_path = str(args.get("source_path") or "").strip()
-            if source_path:
-                content = read_text_file(resolve_under_root(sandbox_root, source_path))
-            else:
-                body = getattr(response, "content", "") or ""
-                tags = re.findall(r"<file_content[^>]*>(.*?)</file_content>", body, re.DOTALL)
-                if tags:
-                    content = tags[-1].strip()
-                else:
-                    blocks = re.findall(r"```[^\n]*\n([\s\S]*?)```", body)
-                    if blocks:
-                        content = blocks[-1].strip()
-        if content is None or str(content).strip() == "":
-            step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
-            if step_outcome_cls is None:
-                raise ValueError("export_docx requires content or source_path")
-            yield "[Status] ❌ 导出异常: 缺少内容\n"
-            return step_outcome_cls({"status": "error", "msg": "export_docx requires content or source_path"}, next_prompt="\n")
-        write_simple_docx(abs_path, str(content), title=title)
-        rel_path = abs_path.relative_to(sandbox_root).as_posix()
-        generated = getattr(session, "generated_output_files", None)
-        if isinstance(generated, list) and rel_path not in generated:
-            generated.append(rel_path)
-        yield f"[Status] ✅ 已生成 Word 文件: {abs_path.name}\n"
-        step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
-        if step_outcome_cls is None:
-            return {"status": "success", "path": rel_path}
-        return step_outcome_cls({"status": "success", "path": rel_path}, next_prompt="\n")
-
     handler_cls._get_abs_path = sandboxed_get_abs_path  # type: ignore[assignment]
-    handler_cls.do_export_docx = do_export_docx  # type: ignore[assignment]
     _set_cwd(getattr(session.agent, "handler", None))
-    if agentmain is not None:
-        custom = list(previous_custom_schema or [])
-        if not any(
-            isinstance(tool, dict) and tool.get("function", {}).get("name") == "export_docx"
-            for tool in custom
-        ):
-            custom.append(_EXPORT_DOCX_TOOL)
-        agentmain._tenant_custom_tools_schema = custom
 
     def unwrap() -> None:
         if callable(original_init) and getattr(handler_cls, "__init__", None) is sandboxed_init:
             handler_cls.__init__ = original_init  # type: ignore[assignment]
         if original_get_abs_path is not None and getattr(handler_cls, "_get_abs_path", None) is sandboxed_get_abs_path:
             handler_cls._get_abs_path = original_get_abs_path  # type: ignore[assignment]
-        if getattr(handler_cls, "do_export_docx", None) is do_export_docx:
-            if original_export_docx is not None:
-                handler_cls.do_export_docx = original_export_docx  # type: ignore[assignment]
-            else:
-                delattr(handler_cls, "do_export_docx")
-        if agentmain is not None:
-            if previous_custom_schema is None:
-                if hasattr(agentmain, "_tenant_custom_tools_schema"):
-                    delattr(agentmain, "_tenant_custom_tools_schema")
-            else:
-                agentmain._tenant_custom_tools_schema = previous_custom_schema
 
     return unwrap
 
@@ -355,10 +295,6 @@ def install_dispatch_guard(
         return lambda: None
 
     allowed = tool_policy.allowed_tools
-    agentmain = legacy_mods.get("agentmain")
-    global_mcp_tools = frozenset(
-        getattr(agentmain, "_tenant_global_mcp_tool_names", ()) or ()
-    ) if agentmain is not None else frozenset()
 
     # Restore original before (re)installing to avoid double-wrapping.
     original_dispatch = getattr(handler_cls, "_adapter_original_dispatch", None)
@@ -368,7 +304,7 @@ def install_dispatch_guard(
         handler_cls.dispatch = original_dispatch
 
     def guarded(self, tool_name, args, response, index=0, tool_num=1):
-        if tool_name not in allowed and tool_name not in global_mcp_tools and tool_name not in ("no_tool", "bad_json"):
+        if tool_name not in allowed and tool_name not in ("no_tool", "bad_json"):
             yield f"tool denied by policy: {tool_name}\n"
             step_outcome_cls = getattr(agent_loop, "StepOutcome", None) if agent_loop is not None else None
             if step_outcome_cls is None:

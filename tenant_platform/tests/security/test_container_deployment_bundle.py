@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[3]
+COMPOSE_DIR = ROOT / "tenant_platform" / "infra" / "compose"
+COMPOSE_FILE = COMPOSE_DIR / "compose.yaml"
+
+
+def _compose() -> dict:
+    return yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+
+
+def test_container_bundle_has_required_operator_files() -> None:
+    required = {
+        ".env.example",
+        ".gitignore",
+        "README.zh-CN.md",
+        "bot-poller.Dockerfile",
+        "compose-preflight.sh",
+        "compose.yaml",
+        "document-runtime-preflight.sh",
+        "env/bot-poller.env.example",
+        "env/platform.env.example",
+        "env/postgres.env.example",
+        "ga-document-manager.service",
+        "genericagent-compose.service",
+        "nginx.conf",
+        "platform.Dockerfile",
+        "web.Dockerfile",
+    }
+    missing = sorted(path for path in required if not (COMPOSE_DIR / path).is_file())
+    assert not missing, f"missing container deployment files: {missing}"
+
+
+def test_compose_preserves_runtime_and_host_namespace_boundaries() -> None:
+    services = _compose()["services"]
+    assert "document-manager" not in services
+    assert set(services) == {"postgres", "bot-poller", "platform", "web"}
+
+    for name, service in services.items():
+        assert service.get("privileged") is not True, name
+        assert service.get("network_mode") != "host", name
+        assert service.get("pid") != "host", name
+        assert service.get("ipc") != "host", name
+        for mount in service.get("volumes", []):
+            assert "docker.sock" not in str(mount).lower(), (name, mount)
+            assert "podman.sock" not in str(mount).lower(), (name, mount)
+
+
+def test_application_containers_are_hardened_and_non_root() -> None:
+    services = _compose()["services"]
+    for name, service in services.items():
+        assert service.get("restart") == "no", f"{name} must only restart through the systemd preflight owner"
+        assert service.get("read_only") is True, name
+        assert service.get("user") not in (None, "", "0", "0:0", "root"), name
+        assert "ALL" in service.get("cap_drop", []), name
+        options = {str(value).lower() for value in service.get("security_opt", [])}
+        assert "no-new-privileges:true" in options, name
+
+
+def test_postgres_and_shared_delivery_volumes_have_explicit_runtime_constraints() -> None:
+    services = _compose()["services"]
+    postgres = services["postgres"]
+    assert postgres.get("user") == "70:70"
+    assert postgres.get("pids_limit")
+    assert postgres.get("mem_limit")
+    assert postgres.get("cpus")
+    assert postgres.get("ulimits", {}).get("nofile")
+
+    platform = services["platform"]
+    bot = services["bot-poller"]
+    assert "10003" in [str(group) for group in platform.get("group_add", [])]
+    assert "10003" in [str(group) for group in bot.get("group_add", [])]
+    platform_image = (COMPOSE_DIR / "platform.Dockerfile").read_text(encoding="utf-8")
+    bot_image = (COMPOSE_DIR / "bot-poller.Dockerfile").read_text(encoding="utf-8")
+    for dockerfile in (platform_image, bot_image):
+        assert "10003" in dockerfile
+        assert "ga-delivery" in dockerfile
+        assert "umask 0027" in dockerfile
+
+
+def test_compose_preflight_checks_root_owned_trusted_configuration() -> None:
+    script = (COMPOSE_DIR / "compose-preflight.sh").read_text(encoding="utf-8")
+    assert "root:root" in script
+    assert "require_trusted_parent_chain" in script
+    assert "docker compose --env-file .env -f compose.yaml config --format json" in script
+    assert "import json" in script
+    assert "import yaml" not in script
+
+
+def test_only_loopback_ports_are_published_by_default() -> None:
+    services = _compose()["services"]
+    assert services["platform"]["ports"] == [
+        "${GA_HTTP_BIND:-127.0.0.1}:${GA_HTTP_PORT:-8088}:8088"
+    ]
+    assert services["postgres"]["ports"] == [
+        "${GA_POSTGRES_BIND:-127.0.0.1}:${GA_POSTGRES_PORT:-55432}:5432"
+    ]
+    assert "ports" not in services["bot-poller"]
+    assert services["web"]["network_mode"] == "service:platform"
+
+
+def test_platform_image_contains_worker_policy_and_explicit_migrations() -> None:
+    dockerfile = (COMPOSE_DIR / "platform.Dockerfile").read_text(encoding="utf-8")
+    assert "tenant_platform/worker-python/pyproject.toml" in dockerfile
+    assert "tenant_platform/worker-python/src" in dockerfile
+    assert "tenant_platform/contracts/policy/foundation.v1.json" in dockerfile
+    assert "tenant_platform/infra/postgres/migrations" in dockerfile
+    assert "GA_MIGRATIONS_DIR=/opt/ga/migrations" in dockerfile
+    assert "USER 10001:10001" in dockerfile
+
+
+def test_host_document_manager_keeps_the_dedicated_rootless_boundary() -> None:
+    manager_unit = (COMPOSE_DIR / "ga-document-manager.service").read_text(encoding="utf-8")
+    compose_unit = (COMPOSE_DIR / "genericagent-compose.service").read_text(encoding="utf-8")
+    assert "Requires=genericagent-compose.service" in manager_unit
+    assert "User=ga-document" in manager_unit
+    assert "BindReadOnlyPaths=-/run/user/%U/docker.sock -/run/user/%U/podman/podman.sock" in manager_unit
+    assert "ExecStartPre=+/usr/bin/env GA_DOCUMENT_RUNTIME_PREFLIGHT=1 /usr/bin/bash /opt/genericagent/source/tenant_platform/infra/compose/document-runtime-preflight.sh" in manager_unit
+    assert "/run/docker.sock" in manager_unit
+    assert "WorkingDirectory=/opt/genericagent/source/tenant_platform/infra/compose" in compose_unit
+    assert "PartOf=docker.service" in compose_unit
+    assert "ExecStartPre=/usr/bin/env GA_COMPOSE_DEPLOY_PREFLIGHT=1 /usr/bin/bash /opt/genericagent/source/tenant_platform/infra/compose/compose-preflight.sh" in compose_unit
+    assert "docker compose" in compose_unit
+
+
+def test_operator_guide_explains_file_and_command_semantics() -> None:
+    guide = (COMPOSE_DIR / "README.zh-CN.md").read_text(encoding="utf-8")
+    for required in (
+        "为什么不能做成一个镜像",
+        "容器里能不能执行命令和操作文件",
+        "首次部署",
+        "升级",
+        "回滚",
+        "Document Manager",
+        "rootless",
+    ):
+        assert required in guide

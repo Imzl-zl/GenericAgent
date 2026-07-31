@@ -1,0 +1,21 @@
+[Unit]
+Description=GenericAgent Compose application stack
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/genericagent/source/tenant_platform/infra/compose
+ExecStartPre=/usr/bin/env GA_COMPOSE_DEPLOY_PREFLIGHT=1 /usr/bin/bash /opt/genericagent/source/tenant_platform/infra/compose/compose-preflight.sh
+ExecStart=/usr/bin/docker compose --env-file .env -f compose.yaml up -d --no-build --remove-orphans --wait
+ExecReload=/usr/bin/env GA_COMPOSE_DEPLOY_PREFLIGHT=1 /usr/bin/bash /opt/genericagent/source/tenant_platform/infra/compose/compose-preflight.sh
+ExecReload=/usr/bin/docker compose --env-file .env -f compose.yaml up -d --no-build --remove-orphans --wait
+ExecStop=/usr/bin/docker compose --env-file .env -f compose.yaml stop --timeout 45
+TimeoutStartSec=180
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

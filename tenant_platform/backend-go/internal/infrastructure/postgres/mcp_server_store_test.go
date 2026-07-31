@@ -3,8 +3,6 @@ package postgres
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -29,43 +27,15 @@ func TestClassifyMCPServerStoreError(t *testing.T) {
 func TestMCPHeaderCleanupMigrationRemovesLegacyColumns(t *testing.T) {
 	pool := requireDB(t)
 	ctx := context.Background()
-	if err := ResetSchema(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range migrationFiles() {
-		if name == "0029_mcp_servers.sql" {
-			break
-		}
-		raw, err := os.ReadFile(filepath.Join(migrationsDir(), name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := pool.Exec(ctx, string(raw)); err != nil {
-			t.Fatalf("apply %s: %v", name, err)
-		}
-	}
 	if _, err := pool.Exec(ctx, `
-		CREATE TABLE mcp_servers (
-			id BIGSERIAL PRIMARY KEY,
-			server_key TEXT NOT NULL UNIQUE,
-			name TEXT NOT NULL,
-			url TEXT NOT NULL,
-			headers_ciphertext BYTEA NOT NULL,
-			headers_key_version TEXT NOT NULL,
-			timeout_seconds INTEGER NOT NULL,
-			enabled BOOLEAN NOT NULL DEFAULT FALSE,
-			revision BIGINT NOT NULL DEFAULT 1,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-		INSERT INTO mcp_servers (
-			server_key, name, url, headers_ciphertext, headers_key_version, timeout_seconds
-		) VALUES ('legacy', 'Legacy', 'https://example.com/mcp', 'secret', '1', 30);
-		CREATE TABLE migration_0029_mcp_servers_marker (
-			id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id)
-		);
-		INSERT INTO migration_0029_mcp_servers_marker(id) VALUES (TRUE);
-	`); err != nil {
+ALTER TABLE mcp_servers
+    ADD COLUMN headers_ciphertext BYTEA,
+    ADD COLUMN headers_key_version TEXT;
+DROP TABLE migration_0030_remove_mcp_headers_marker;
+INSERT INTO mcp_servers (
+    server_key, name, url, headers_ciphertext, headers_key_version, timeout_seconds
+) VALUES ('legacy', 'Legacy', 'https://example.com/mcp', 'secret', '1', 30)
+`); err != nil {
 		t.Fatal(err)
 	}
 

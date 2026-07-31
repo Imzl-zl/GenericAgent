@@ -184,24 +184,31 @@ func TestLLMProviderStoreListsActiveDefaultFirst(t *testing.T) {
 func TestTransparentProxyMigrationPreservesSupportedConfig(t *testing.T) {
 	pool := requireDB(t)
 	ctx := context.Background()
-	if err := ResetSchema(ctx, pool); err != nil {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range migrationFiles() {
-		if name == "0024_transparent_llm_proxy.sql" {
-			break
-		}
-		sqlBytes, err := os.ReadFile(filepath.Join(migrationsDir(), name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := pool.Exec(ctx, string(sqlBytes)); err != nil {
-			t.Fatalf("apply %s: %v", name, err)
-		}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+CREATE SCHEMA ga_test_llm_migration;
+SET LOCAL search_path TO ga_test_llm_migration;
+CREATE TABLE llm_providers (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    provider_type TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    model TEXT NOT NULL,
+    api_key_ciphertext BYTEA NOT NULL,
+    api_key_key_version TEXT NOT NULL,
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_default BOOLEAN NOT NULL DEFAULT FALSE
+)
+`); err != nil {
+		t.Fatal(err)
 	}
 
 	legacyConfig := `{"temperature":0,"max_retries":0,"stream":true,"proxy":"http://proxy.example:8080","verify":false,"connect_timeout":9}`
-	if _, err := pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO llm_providers (
 			name, provider_type, base_url, model, api_key_ciphertext,
 			api_key_key_version, config, is_default
@@ -209,13 +216,17 @@ func TestTransparentProxyMigrationPreservesSupportedConfig(t *testing.T) {
 	`, []byte("cipher"), legacyConfig); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureSchema(ctx, pool, ""); err != nil {
+	raw, err := os.ReadFile(filepath.Join(migrationsDir(), "0024_transparent_llm_proxy.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(raw)); err != nil {
 		t.Fatal(err)
 	}
 
 	var sessionJSON, transportJSON []byte
 	var revision int64
-	if err := pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		SELECT session_config, transport_config, revision
 		FROM llm_providers WHERE name = 'legacy'
 	`).Scan(&sessionJSON, &transportJSON, &revision); err != nil {

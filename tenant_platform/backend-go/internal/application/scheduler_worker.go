@@ -90,7 +90,7 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 			entry.lifecycleMu.Lock()
 			s.workers[task.SessionKey] = entry
 			s.mu.Unlock()
-			return s.initializeWorkerEntry(ctx, task.SessionKey, entry)
+			return s.initializeWorkerEntry(ctx, task, entry)
 		}
 		s.mu.Unlock()
 
@@ -155,17 +155,17 @@ func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) 
 }
 
 func (s *scheduler) initializeWorkerEntry(
-	ctx context.Context, sessionKey string, entry *workerEntry,
+	ctx context.Context, task domain.Task, entry *workerEntry,
 ) (workerclient.WorkerClient, *workerEntry, error) {
-	credentials, err := s.issueInitialWorkerCredentials(ctx, sessionKey)
+	credentials, err := s.issueInitialWorkerCredentials(ctx, task)
 	if err != nil {
-		s.removeWorkerEntry(sessionKey, entry)
+		s.removeWorkerEntry(task.SessionKey, entry)
 		entry.lifecycleMu.Unlock()
 		return nil, nil, err
 	}
-	client, instID, cleanup, err := s.startWorkerProcess(ctx, sessionKey)
+	client, instID, cleanup, err := s.startWorkerProcess(ctx, task.SessionKey)
 	if err != nil {
-		s.removeWorkerEntry(sessionKey, entry)
+		s.removeWorkerEntry(task.SessionKey, entry)
 		s.revokeCredentialSetBestEffort(context.Background(), credentials)
 		entry.lifecycleMu.Unlock()
 		return nil, nil, err

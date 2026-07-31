@@ -762,6 +762,341 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /v1/admin/settings/document-pool:
+    get:
+      operationId: adminGetDocumentPoolSettings
+      summary: Read the complete versioned document pool settings snapshot
+      tags: [admin, document]
+      security: [{PlatformDevToken: []}]
+      responses:
+        "200":
+          description: Persisted settings and deployment hard ceiling
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DocumentPoolSettings"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    put:
+      operationId: adminUpdateDocumentPoolSettings
+      summary: Compare-and-swap the complete document pool settings snapshot
+      tags: [admin, document]
+      security: [{PlatformDevToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateDocumentPoolSettingsRequest"}
+      responses:
+        "200":
+          description: Persisted and applied settings
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DocumentPoolSettings"}
+        "202":
+          description: Persisted settings pending runtime reconciliation
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DocumentPoolSettings"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/document-pool/status:
+    get:
+      operationId: adminGetDocumentPoolStatus
+      summary: Read aggregate live document pool state from PostgreSQL
+      tags: [admin, document]
+      responses:
+        "200":
+          description: Aggregate status without tenant, job, payload, path or runtime identifiers
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DocumentPoolStatus"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/document/commands:
+    post:
+      operationId: submitDocumentCommand
+      summary: Submit one typed document operation for the capability task
+      tags: [document]
+      security: [{DocumentCapability: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/DocumentCommandRequest"}
+      responses:
+        "202":
+          description: Command accepted into the task's single-use document job
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DocumentCommandEnvelope"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "429": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/InternalError"}
+
+  /v1/document/close:
+    post:
+      operationId: closeDocumentJob
+      summary: Close further commands and finalize the capability task's document job
+      tags: [document]
+      security: [{DocumentCapability: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/DocumentTaskRequest"}
+      responses:
+        "200":
+          description: Closed document job
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DocumentJobEnvelope"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /v1/document/status:
+    get:
+      operationId: getDocumentCommandStatus
+      summary: Read the authorized task's document job or command status
+      tags: [document]
+      security: [{DocumentCapability: []}]
+      parameters:
+        - {name: task_id, in: query, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+        - {name: tool_name, in: query, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+        - {name: request_id, in: query, required: false, schema: {type: string, maxLength: 256}}
+      responses:
+        "200":
+          description: Authorized status without database, tenant or runtime identifiers
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DocumentCommandEnvelope"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /v1/document/artifact:
+    get:
+      operationId: downloadDocumentArtifact
+      summary: Download the authorized task's immutable document artifact
+      tags: [document]
+      security: [{DocumentCapability: []}]
+      parameters:
+        - {name: task_id, in: query, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+        - {name: tool_name, in: query, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+        - {name: request_id, in: query, required: true, schema: {type: string, minLength: 1, maxLength: 256}}
+      responses:
+        "200":
+          description: DOCX bytes with Content-Length and X-Content-SHA256 headers
+          headers:
+            X-Content-SHA256:
+              required: true
+              schema: {type: string, pattern: "^[a-f0-9]{64}$"}
+          content:
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema: {type: string, format: binary}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /v1/admin/sophub/binding:
+    get:
+      operationId: adminGetSophubBinding
+      summary: Read write-only Sophub binding status
+      tags: [admin, sop]
+      responses:
+        "200":
+          description: Binding status without the API key
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SophubBindingStatus"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    put:
+      operationId: adminBindSophub
+      summary: Verify and replace the encrypted Sophub API key
+      tags: [admin, sop]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_key]
+              properties:
+                api_key: {type: string, writeOnly: true, minLength: 1}
+      responses:
+        "200":
+          description: Verified binding status; the key is never returned
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SophubBindingStatus"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/admin/sophub/search:
+    get:
+      operationId: adminSearchSophubSOPs
+      summary: Search approved SOP metadata at the fixed Sophub origin
+      tags: [admin, sop]
+      parameters:
+        - {name: q, in: query, required: false, schema: {type: string}}
+        - {name: page, in: query, required: false, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: page_size, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 24}}
+      responses:
+        "200":
+          description: Sophub search result
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SophubSearchResult"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/admin/sophub/candidates/import:
+    post:
+      operationId: adminImportSophubCandidate
+      summary: Import one approved single-file Markdown SOP for review
+      tags: [admin, sop]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [remote_sop_id]
+              properties:
+                remote_sop_id: {type: string, minLength: 1}
+      responses:
+        "201":
+          description: Imported or refreshed mutable candidate
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SOPCandidate"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/admin/sop-candidates:
+    get:
+      operationId: adminListSOPCandidates
+      summary: List locally imported SOP candidates
+      tags: [admin, sop]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: {type: string, enum: [pending, approved, rejected]}
+      responses:
+        "200":
+          description: Candidate list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [candidates]
+                properties:
+                  candidates: {type: array, items: {$ref: "#/components/schemas/SOPCandidate"}}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/admin/sop-candidates/{candidate_id}/approve:
+    post:
+      operationId: adminApproveSOPCandidate
+      summary: Install a candidate as a new append-only local SOP version
+      tags: [admin, sop]
+      parameters:
+        - {$ref: "#/components/parameters/CandidateId"}
+      responses:
+        "201":
+          description: Installed immutable version
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SOPVersion"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/admin/sop-candidates/{candidate_id}/reject:
+    post:
+      operationId: adminRejectSOPCandidate
+      summary: Reject a pending SOP candidate
+      tags: [admin, sop]
+      parameters:
+        - {$ref: "#/components/parameters/CandidateId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [note]
+              properties:
+                note: {type: string}
+      responses:
+        "200": {description: Candidate rejected}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/admin/sops:
+    get:
+      operationId: adminListSOPRegistry
+      summary: List installed immutable SOP versions and loaded state
+      tags: [admin, sop]
+      responses:
+        "200":
+          description: Local SOP registry
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sops]
+                properties:
+                  sops: {type: array, items: {$ref: "#/components/schemas/SOPRegistryItem"}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /v1/admin/sop-versions/{version_id}/load:
+    post:
+      operationId: adminLoadSOPVersion
+      summary: Load an installed version for subsequent new tasks
+      tags: [admin, sop]
+      parameters:
+        - {$ref: "#/components/parameters/SOPVersionId"}
+      responses:
+        "200": {description: Version loaded}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/admin/sops/{entry_id}/unload:
+    post:
+      operationId: adminUnloadSOP
+      summary: Stop loading an entry in subsequent new tasks
+      tags: [admin, sop]
+      parameters:
+        - {$ref: "#/components/parameters/SOPEntryId"}
+      responses:
+        "200": {description: Entry unloaded}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/sops:
+    get:
+      operationId: listLoadedSOPs
+      summary: Read administrator-loaded SOP versions
+      tags: [sop]
+      security: [{BearerToken: []}]
+      responses:
+        "200":
+          description: Loaded SOP content visible to an approved tenant user
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sops]
+                properties:
+                  sops: {type: array, items: {$ref: "#/components/schemas/LoadedSOP"}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
 components:
   securitySchemes:
     PlatformDevToken:
@@ -769,6 +1104,14 @@ components:
       in: header
       name: X-Platform-Dev-Token
       description: Required foundation-only loopback development token
+    DocumentCapability:
+      type: http
+      scheme: bearer
+      bearerFormat: document-capability
+    BearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: platform-user-token
   parameters:
     SessionKey:
       name: session_key
@@ -790,6 +1133,21 @@ components:
         type: integer
         format: int64
         minimum: 1
+    CandidateId:
+      name: candidate_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    SOPVersionId:
+      name: version_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    SOPEntryId:
+      name: entry_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
   responses:
     ValidationError:
       description: Client-side validation failure (e.g. prompt too long, unknown source)
@@ -822,6 +1180,198 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
   schemas:
+    DocumentPoolSettings:
+      type: object
+      additionalProperties: false
+      required: [enabled, max_active, min_ready, job_idle_ttl_seconds, ready_idle_ttl_seconds, global_queue_limit, per_tenant_queue_limit, per_tenant_active_limit, job_timeout_seconds, command_timeout_seconds, version, updated_by, updated_at, reason, deployment_max_active]
+      properties:
+        enabled: {type: boolean}
+        max_active: {type: integer, minimum: 0}
+        min_ready: {type: integer, minimum: 0}
+        job_idle_ttl_seconds: {type: integer, minimum: 1}
+        ready_idle_ttl_seconds: {type: integer, minimum: 1}
+        global_queue_limit: {type: integer, minimum: 1}
+        per_tenant_queue_limit: {type: integer, minimum: 1}
+        per_tenant_active_limit: {type: integer, minimum: 0}
+        job_timeout_seconds: {type: integer, minimum: 1}
+        command_timeout_seconds: {type: integer, minimum: 1}
+        version: {type: integer, format: int64, minimum: 1}
+        updated_by: {type: integer, format: int64, minimum: 1}
+        updated_at: {type: string, format: date-time}
+        reason: {type: string, maxLength: 500}
+        deployment_max_active: {type: integer, minimum: 1}
+        apply_status: {type: string, enum: [applied, pending_retry]}
+    UpdateDocumentPoolSettingsRequest:
+      type: object
+      additionalProperties: false
+      required: [enabled, max_active, min_ready, job_idle_ttl_seconds, ready_idle_ttl_seconds, global_queue_limit, per_tenant_queue_limit, per_tenant_active_limit, job_timeout_seconds, command_timeout_seconds, expected_version, reason]
+      properties:
+        enabled: {type: boolean}
+        max_active: {type: integer, minimum: 0}
+        min_ready: {type: integer, minimum: 0}
+        job_idle_ttl_seconds: {type: integer, minimum: 1}
+        ready_idle_ttl_seconds: {type: integer, minimum: 1}
+        global_queue_limit: {type: integer, minimum: 1}
+        per_tenant_queue_limit: {type: integer, minimum: 1}
+        per_tenant_active_limit: {type: integer, minimum: 0}
+        job_timeout_seconds: {type: integer, minimum: 1}
+        command_timeout_seconds: {type: integer, minimum: 1}
+        expected_version: {type: integer, format: int64, minimum: 1}
+        reason: {type: string, minLength: 1, maxLength: 500}
+    DocumentOperation:
+      type: object
+      additionalProperties: false
+      required: [schema_version, operation, parameters]
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        operation: {type: string, enum: [export_docx]}
+        parameters:
+          type: object
+          additionalProperties: false
+          required: [content]
+          properties:
+            output_name: {type: string, maxLength: 255, default: document.docx}
+            title: {type: string, maxLength: 4096}
+            content: {type: string, minLength: 1, maxLength: 1048576}
+    DocumentCommandRequest:
+      type: object
+      additionalProperties: false
+      required: [task_id, tool_name, request_id, operation]
+      properties:
+        task_id: {type: string, minLength: 1, maxLength: 128}
+        tool_name: {type: string, minLength: 1, maxLength: 128}
+        request_id: {type: string, minLength: 1, maxLength: 256}
+        operation: {$ref: "#/components/schemas/DocumentOperation"}
+    DocumentTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [task_id, tool_name]
+      properties:
+        task_id: {type: string, minLength: 1, maxLength: 128}
+        tool_name: {type: string, minLength: 1, maxLength: 128}
+    DocumentJobState:
+      type: object
+      additionalProperties: false
+      required: [status, commands_closed]
+      properties:
+        status: {type: string, enum: [queued, starting, running, succeeded, failed, cancelled, expired, absent]}
+        commands_closed: {type: boolean}
+        terminal_error:
+          type: object
+          additionalProperties: false
+          required: [code]
+          properties:
+            code: {type: string}
+    DocumentCommandState:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: {type: string, enum: [pending, executing, succeeded, failed, expired]}
+    DocumentJobEnvelope:
+      type: object
+      additionalProperties: false
+      required: [job]
+      properties:
+        job: {$ref: "#/components/schemas/DocumentJobState"}
+    DocumentCommandEnvelope:
+      type: object
+      additionalProperties: false
+      required: [job]
+      properties:
+        job: {$ref: "#/components/schemas/DocumentJobState"}
+        command: {$ref: "#/components/schemas/DocumentCommandState"}
+    DocumentPoolStatus:
+      type: object
+      required: [jobs_queued, jobs_starting, jobs_running, instances_creating, instances_ready, instances_allocated, instances_running, instances_destroying, instances_lost, commands_pending, commands_executing, observed_at]
+      properties:
+        jobs_queued: {type: integer, minimum: 0}
+        jobs_starting: {type: integer, minimum: 0}
+        jobs_running: {type: integer, minimum: 0}
+        instances_creating: {type: integer, minimum: 0}
+        instances_ready: {type: integer, minimum: 0}
+        instances_allocated: {type: integer, minimum: 0}
+        instances_running: {type: integer, minimum: 0}
+        instances_destroying: {type: integer, minimum: 0}
+        instances_lost: {type: integer, minimum: 0}
+        commands_pending: {type: integer, minimum: 0}
+        commands_executing: {type: integer, minimum: 0}
+        oldest_queued_at: {type: string, format: date-time}
+        observed_at: {type: string, format: date-time}
+    SophubBindingStatus:
+      type: object
+      required: [configured, author_type, agent_uid, display_name]
+      properties:
+        configured: {type: boolean}
+        author_type: {type: string}
+        agent_uid: {type: string}
+        display_name: {type: string}
+        verified_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    SophubSearchItem:
+      type: object
+      required: [id, title, preview, file_type, package_type, status]
+      properties:
+        id: {type: string}
+        title: {type: string}
+        preview: {type: string}
+        file_type: {type: string}
+        package_type: {type: string}
+        status: {type: string}
+        content: {type: string}
+    SophubSearchResult:
+      type: object
+      required: [items, total, page, page_size, total_pages, has_more]
+      properties:
+        items: {type: array, items: {$ref: "#/components/schemas/SophubSearchItem"}}
+        total: {type: integer, minimum: 0}
+        page: {type: integer, minimum: 1}
+        page_size: {type: integer, minimum: 1}
+        total_pages: {type: integer, minimum: 0}
+        has_more: {type: boolean}
+    SOPCandidate:
+      type: object
+      required: [candidate_id, remote_sop_id, title, description, file_type, content, source_digest, status, review_note]
+      properties:
+        candidate_id: {type: string, format: uuid}
+        remote_sop_id: {type: string}
+        title: {type: string}
+        description: {type: string}
+        file_type: {type: string, enum: [markdown]}
+        content: {type: string}
+        source_digest: {type: string, pattern: "^[a-f0-9]{64}$"}
+        status: {type: string, enum: [pending, approved, rejected]}
+        review_note: {type: string}
+        reviewed_at: {type: string, format: date-time}
+    SOPVersion:
+      type: object
+      required: [version_id, entry_id, candidate_id, version, title, description, content, digest, approved_at]
+      properties:
+        version_id: {type: string, format: uuid}
+        entry_id: {type: string, format: uuid}
+        candidate_id: {type: string, format: uuid}
+        version: {type: integer, minimum: 1}
+        title: {type: string}
+        description: {type: string}
+        content: {type: string}
+        digest: {type: string, pattern: "^[a-f0-9]{64}$"}
+        approved_at: {type: string, format: date-time}
+    SOPRegistryItem:
+      allOf:
+        - {$ref: "#/components/schemas/SOPVersion"}
+        - type: object
+          required: [loaded]
+          properties:
+            loaded: {type: boolean}
+    LoadedSOP:
+      type: object
+      required: [title, description, content, digest, version]
+      properties:
+        title: {type: string}
+        description: {type: string}
+        content: {type: string}
+        digest: {type: string, pattern: "^[a-f0-9]{64}$"}
+        version: {type: integer, minimum: 1}
     ErrorResponse:
       type: object
       required:

@@ -166,3 +166,95 @@
   text-align: center;
   padding: 32px;
 }
+
+.sop-library-page {
+  max-width: 1040px;
+}
+
+.sop-library-page .page-header .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.sop-library-error {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  color: var(--danger);
+  background: var(--danger-dim);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: var(--radius-sm);
+}
+
+.sop-library-empty {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  min-height: 180px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.sop-library-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.sop-library-item {
+  min-width: 0;
+}
+
+.sop-library-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.sop-library-heading h3 {
+  font-size: 16px;
+}
+
+.sop-library-heading p {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.sop-library-item > code {
+  display: block;
+  margin-top: 14px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.sop-library-item details {
+  margin-top: 16px;
+}
+
+.sop-library-item summary {
+  color: var(--cyan);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.sop-library-item pre {
+  max-height: 360px;
+  margin-top: 10px;
+  padding: 14px;
+  overflow: auto;
+  color: var(--text-secondary);
+  background: var(--bg-overlay);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .sop-library-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
