@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/documentgateway"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 )
 
@@ -41,6 +42,37 @@ func TestBuildWorkerRuntimeLoopbackDefault(t *testing.T) {
 	}
 	if rt == nil {
 		t.Fatal("expected runtime")
+	}
+}
+
+func TestBuildDocumentGatewayIssuer(t *testing.T) {
+	if issuer, err := buildDocumentGatewayIssuer("", "short"); err != nil || issuer != nil {
+		t.Fatalf("disabled issuer=%v err=%v", issuer, err)
+	}
+	key := "test-document-gateway-signing-key-32-bytes"
+	issuer, err := buildDocumentGatewayIssuer("http://127.0.0.1:8080/v1/document", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := issuer.IssueDocumentGatewayToken(
+		context.Background(), "team:docs", "11111111-1111-1111-1111-111111111111",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator, err := documentgateway.NewValidator([]byte(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := validator.Validate(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.Subject != "team:docs" || claims.WorkspaceID != "11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("claims=%+v", claims)
+	}
+	if _, err := buildDocumentGatewayIssuer("http://127.0.0.1:8080/v1/document", "short"); err == nil {
+		t.Fatal("expected short signing key error")
 	}
 }
 

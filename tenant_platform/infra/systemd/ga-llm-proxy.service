@@ -22,8 +22,8 @@ LimitNOFILE=4096
 
 EnvironmentFile=-/etc/ga/llm-proxy.env
 
-User=ga
-Group=ga
+User=ga-llm
+Group=ga-llm
 WorkingDirectory=/opt/ga
 
 # ExecStart — binds loopback only. The platform's Worker calls this address
@@ -44,7 +44,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ga
+ProtectProc=invisible
+ProcSubset=pid
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/podman/podman.sock -/var/run/podman/podman.sock -/run/user /etc/ga/llm-proxy.env /etc/ga/platform.env /etc/ga/document-manager.env /etc/ga/bot-poller.env /var/lib/ga/documents /var/lib/ga/runtime /etc/ga/config /opt/ga/legacy /opt/ga/worker-python
+UnsetEnvironment=DOCKER_HOST CONTAINER_HOST
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

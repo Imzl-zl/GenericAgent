@@ -14,6 +14,7 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/documentgateway"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
 )
@@ -24,28 +25,34 @@ const MaxRequestBodyBytes int64 = 1 << 20 // 1 MiB
 
 // Server is the loopback HTTP API.
 type Server struct {
-	svc                  application.TaskService
-	users                application.UserService
-	wechatBinding        application.WechatQRBindingService
-	botSvc               application.BotService
-	invite               application.InviteService
-	personas             application.PersonaService
-	router               application.Router
-	registry             policy.Registry
-	policies             PolicyStore
-	bots                 BotStore
-	llmProviders         LLMProviderStore
-	mcpServers           MCPServerStore
-	botLifecycle         application.BotLifecycleService
-	taskStats            TaskStoreStats
-	runtimeProfileMu     sync.RWMutex
-	runtimeProfile       RuntimeProfile
-	runtimeSettings      RuntimeSettingsStore
-	imAggregationRuntime IMAggregationRuntime
-	cipher               secret.TokenCipher
-	devToken             string
-	devUserID            int64
-	sessionKey           string
+	svc                             application.TaskService
+	users                           application.UserService
+	wechatBinding                   application.WechatQRBindingService
+	botSvc                          application.BotService
+	invite                          application.InviteService
+	personas                        application.PersonaService
+	router                          application.Router
+	registry                        policy.Registry
+	policies                        PolicyStore
+	bots                            BotStore
+	llmProviders                    LLMProviderStore
+	mcpServers                      MCPServerStore
+	botLifecycle                    application.BotLifecycleService
+	taskStats                       TaskStoreStats
+	runtimeProfileMu                sync.RWMutex
+	runtimeProfile                  RuntimeProfile
+	runtimeSettings                 RuntimeSettingsStore
+	imAggregationRuntime            IMAggregationRuntime
+	documentPoolSettingsRuntime     DocumentPoolSettingsRuntime
+	documentPoolStatus              DocumentPoolStatusStore
+	documentPoolDeploymentMaxActive int
+	documentTools                   application.DocumentToolService
+	documentCapabilityValidator     *documentgateway.Validator
+	sophub                          application.SophubService
+	cipher                          secret.TokenCipher
+	devToken                        string
+	devUserID                       int64
+	sessionKey                      string
 	// webhookSecret is the HMAC-SHA256 key shared with the Bot Poller. When
 	// non-empty, /v1/im/webhook rejects requests whose X-Webhook-Signature
 	// header doesn't match. Empty = unauthenticated (dev/test only; logs once).
@@ -71,6 +78,18 @@ type RuntimeSettingsStore interface {
 	UpdateIMInboundCoalesceWindowMS(ctx context.Context, windowMS int, updatedBy int64) (int, error)
 	GetAgentMaxTurns(ctx context.Context) (int, error)
 	UpdateAgentMaxTurns(ctx context.Context, maxTurns int, updatedBy int64) (int, error)
+	GetDocumentPoolSettings(ctx context.Context) (domain.DocumentPoolSettings, error)
+	UpdateDocumentPoolSettings(ctx context.Context, settings domain.DocumentPoolSettings, expectedVersion, updatedBy int64, reason string) (domain.DocumentPoolSettings, error)
+}
+
+// DocumentPoolSettingsRuntime applies a persisted complete settings snapshot
+// to the live document manager. Existing jobs retain their start-time limits.
+type DocumentPoolSettingsRuntime interface {
+	ApplyDocumentPoolSettings(ctx context.Context, settings domain.DocumentPoolSettings) error
+}
+
+type DocumentPoolStatusStore interface {
+	GetDocumentPoolStatus(ctx context.Context) (domain.DocumentPoolStatus, error)
 }
 
 // IMAggregationRuntime applies persisted aggregation settings to the live bot
@@ -129,27 +148,33 @@ type RuntimeProfile struct {
 }
 
 type ServerConfig struct {
-	Service              application.TaskService
-	Users                application.UserService
-	WechatBinding        application.WechatQRBindingService
-	BotService           application.BotService
-	Invite               application.InviteService
-	Personas             application.PersonaService
-	Router               application.Router
-	Registry             policy.Registry
-	Policies             PolicyStore
-	RuntimeSettings      RuntimeSettingsStore
-	Bots                 BotStore
-	LLMProviders         LLMProviderStore
-	MCPServers           MCPServerStore
-	BotLifecycle         application.BotLifecycleService
-	TaskStats            TaskStoreStats
-	RuntimeProfile       RuntimeProfile
-	IMAggregationRuntime IMAggregationRuntime
-	Cipher               secret.TokenCipher
-	DevToken             string
-	DevUserID            int64
-	SessionKey           string
+	Service                         application.TaskService
+	Users                           application.UserService
+	WechatBinding                   application.WechatQRBindingService
+	BotService                      application.BotService
+	Invite                          application.InviteService
+	Personas                        application.PersonaService
+	Router                          application.Router
+	Registry                        policy.Registry
+	Policies                        PolicyStore
+	RuntimeSettings                 RuntimeSettingsStore
+	Bots                            BotStore
+	LLMProviders                    LLMProviderStore
+	MCPServers                      MCPServerStore
+	BotLifecycle                    application.BotLifecycleService
+	TaskStats                       TaskStoreStats
+	RuntimeProfile                  RuntimeProfile
+	IMAggregationRuntime            IMAggregationRuntime
+	DocumentPoolSettingsRuntime     DocumentPoolSettingsRuntime
+	DocumentPoolStatus              DocumentPoolStatusStore
+	DocumentPoolDeploymentMaxActive int
+	DocumentTools                   application.DocumentToolService
+	DocumentCapabilityValidator     *documentgateway.Validator
+	Sophub                          application.SophubService
+	Cipher                          secret.TokenCipher
+	DevToken                        string
+	DevUserID                       int64
+	SessionKey                      string
 	// WebhookSecret, when set, requires Bot Poller requests to /v1/im/webhook
 	// to carry a valid X-Webhook-Signature header (HMAC-SHA256 over body).
 	WebhookSecret string
@@ -166,39 +191,65 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.DevUserID <= 0 {
 		return nil, fmt.Errorf("dev user id required")
 	}
+	documentPoolConfigured := cfg.DocumentPoolDeploymentMaxActive != 0 || cfg.DocumentPoolSettingsRuntime != nil
+	if documentPoolConfigured && cfg.DocumentPoolDeploymentMaxActive <= 0 {
+		return nil, fmt.Errorf("document pool deployment max_active must be positive")
+	}
+	if documentPoolConfigured && cfg.DocumentPoolSettingsRuntime == nil {
+		return nil, fmt.Errorf("document pool settings runtime required")
+	}
+	if documentPoolConfigured && cfg.RuntimeSettings == nil {
+		return nil, fmt.Errorf("document pool settings store required")
+	}
+	documentGatewayConfigured := cfg.DocumentTools != nil || cfg.DocumentCapabilityValidator != nil
+	if documentGatewayConfigured && cfg.DocumentTools == nil {
+		return nil, fmt.Errorf("document tool service required when document gateway is configured")
+	}
+	if documentGatewayConfigured && cfg.DocumentCapabilityValidator == nil {
+		return nil, fmt.Errorf("document capability validator required when document gateway is configured")
+	}
 	if strings.TrimSpace(cfg.SessionKey) == "" {
 		cfg.SessionKey = fmt.Sprintf("personal:%d", cfg.DevUserID)
 	}
 	s := &Server{
-		svc:                  cfg.Service,
-		users:                cfg.Users,
-		wechatBinding:        cfg.WechatBinding,
-		botSvc:               cfg.BotService,
-		invite:               cfg.Invite,
-		personas:             cfg.Personas,
-		router:               cfg.Router,
-		registry:             cfg.Registry,
-		policies:             cfg.Policies,
-		runtimeSettings:      cfg.RuntimeSettings,
-		bots:                 cfg.Bots,
-		llmProviders:         cfg.LLMProviders,
-		mcpServers:           cfg.MCPServers,
-		botLifecycle:         cfg.BotLifecycle,
-		taskStats:            cfg.TaskStats,
-		runtimeProfile:       cfg.RuntimeProfile,
-		imAggregationRuntime: cfg.IMAggregationRuntime,
-		cipher:               cfg.Cipher,
-		devToken:             cfg.DevToken,
-		devUserID:            cfg.DevUserID,
-		sessionKey:           cfg.SessionKey,
-		webhookSecret:        cfg.WebhookSecret,
-		mux:                  http.NewServeMux(),
+		svc:                             cfg.Service,
+		users:                           cfg.Users,
+		wechatBinding:                   cfg.WechatBinding,
+		botSvc:                          cfg.BotService,
+		invite:                          cfg.Invite,
+		personas:                        cfg.Personas,
+		router:                          cfg.Router,
+		registry:                        cfg.Registry,
+		policies:                        cfg.Policies,
+		runtimeSettings:                 cfg.RuntimeSettings,
+		bots:                            cfg.Bots,
+		llmProviders:                    cfg.LLMProviders,
+		mcpServers:                      cfg.MCPServers,
+		botLifecycle:                    cfg.BotLifecycle,
+		taskStats:                       cfg.TaskStats,
+		runtimeProfile:                  cfg.RuntimeProfile,
+		imAggregationRuntime:            cfg.IMAggregationRuntime,
+		documentPoolSettingsRuntime:     cfg.DocumentPoolSettingsRuntime,
+		documentPoolStatus:              cfg.DocumentPoolStatus,
+		documentPoolDeploymentMaxActive: cfg.DocumentPoolDeploymentMaxActive,
+		documentTools:                   cfg.DocumentTools,
+		documentCapabilityValidator:     cfg.DocumentCapabilityValidator,
+		sophub:                          cfg.Sophub,
+		cipher:                          cfg.Cipher,
+		devToken:                        cfg.DevToken,
+		devUserID:                       cfg.DevUserID,
+		sessionKey:                      cfg.SessionKey,
+		webhookSecret:                   cfg.WebhookSecret,
+		mux:                             http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.auth(s.handleCreateTask))
 	s.mux.HandleFunc("GET /v1/tasks/{task_id}", s.auth(s.handleGetTask))
 	s.mux.HandleFunc("GET /v1/tasks/{task_id}/result", s.auth(s.handleGetResult))
 	s.mux.HandleFunc("POST /v1/tasks/{task_id}/cancel", s.auth(s.handleCancel))
+	if documentGatewayConfigured {
+		s.registerDocumentToolRoutes()
+	}
 	s.registerLifecycleRoutes()
 	return s, nil
 }

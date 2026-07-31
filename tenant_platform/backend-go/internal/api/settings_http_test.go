@@ -4,16 +4,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 type fakeRuntimeSettingsStore struct {
-	mu       sync.Mutex
-	windowMS int
-	maxTurns int
+	mu           sync.Mutex
+	windowMS     int
+	maxTurns     int
+	documentPool domain.DocumentPoolSettings
+	updateErr    error
+	afterUpdate  func()
 }
 
 func (f *fakeRuntimeSettingsStore) GetIMInboundCoalesceWindowMS(context.Context) (int, error) {
@@ -40,6 +47,45 @@ func (f *fakeRuntimeSettingsStore) UpdateAgentMaxTurns(_ context.Context, maxTur
 	defer f.mu.Unlock()
 	f.maxTurns = maxTurns
 	return f.maxTurns, nil
+}
+
+func (f *fakeRuntimeSettingsStore) GetDocumentPoolSettings(context.Context) (domain.DocumentPoolSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.documentPool, nil
+}
+
+func (f *fakeRuntimeSettingsStore) UpdateDocumentPoolSettings(_ context.Context, settings domain.DocumentPoolSettings, expectedVersion, updatedBy int64, reason string) (domain.DocumentPoolSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateErr != nil {
+		return domain.DocumentPoolSettings{}, f.updateErr
+	}
+	if expectedVersion != f.documentPool.Version {
+		return domain.DocumentPoolSettings{}, domain.ErrDocumentPoolSettingsConflict
+	}
+	settings.Version = expectedVersion + 1
+	settings.UpdatedBy = updatedBy
+	settings.Reason = reason
+	settings.UpdatedAt = time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	f.documentPool = settings
+	if f.afterUpdate != nil {
+		f.afterUpdate()
+	}
+	return settings, nil
+}
+
+type fakeDocumentPoolRuntime struct {
+	store   *fakeRuntimeSettingsStore
+	applied domain.DocumentPoolSettings
+}
+
+func (f *fakeDocumentPoolRuntime) ApplyDocumentPoolSettings(_ context.Context, settings domain.DocumentPoolSettings) error {
+	if f.store.documentPool.Version != settings.Version {
+		return errors.New("runtime invoked before persistence")
+	}
+	f.applied = settings
+	return nil
 }
 
 type fakeIMAggregationRuntime struct{ windowMS int }

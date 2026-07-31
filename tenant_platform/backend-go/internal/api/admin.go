@@ -82,6 +82,13 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("GET /v1/admin/settings/agent-runtime", s.auth(s.handleGetAgentRuntimeSettings))
 		s.mux.HandleFunc("PUT /v1/admin/settings/agent-runtime", s.auth(s.handleUpdateAgentRuntimeSettings))
 	}
+	if s.runtimeSettings != nil && s.documentPoolSettingsRuntime != nil {
+		s.mux.HandleFunc("GET /v1/admin/settings/document-pool", s.auth(s.handleGetDocumentPoolSettings))
+		s.mux.HandleFunc("PUT /v1/admin/settings/document-pool", s.auth(s.handleUpdateDocumentPoolSettings))
+	}
+	if s.documentPoolStatus != nil {
+		s.mux.HandleFunc("GET /v1/admin/document-pool/status", s.auth(s.handleGetDocumentPoolStatus))
+	}
 	if s.llmProviders != nil && s.cipher != nil {
 		s.mux.HandleFunc("POST /v1/admin/llm-providers", s.auth(s.handleAdminCreateLLMProvider))
 		s.mux.HandleFunc("GET /v1/admin/llm-providers", s.auth(s.handleAdminListLLMProviders))
@@ -100,6 +107,19 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("DELETE /v1/admin/mcp-servers/{mcp_server_id}", s.auth(s.handleAdminDeleteMCPServer))
 		s.mux.HandleFunc("POST /v1/admin/mcp-servers/{mcp_server_id}/enable", s.auth(s.handleAdminEnableMCPServer))
 		s.mux.HandleFunc("POST /v1/admin/mcp-servers/{mcp_server_id}/disable", s.auth(s.handleAdminDisableMCPServer))
+	}
+	if s.sophub != nil {
+		s.mux.HandleFunc("GET /v1/admin/sophub/binding", s.auth(s.handleAdminGetSophubBinding))
+		s.mux.HandleFunc("PUT /v1/admin/sophub/binding", s.auth(s.handleAdminBindSophub))
+		s.mux.HandleFunc("GET /v1/admin/sophub/search", s.auth(s.handleAdminSearchSophub))
+		s.mux.HandleFunc("POST /v1/admin/sophub/candidates/import", s.auth(s.handleAdminImportSOPCandidate))
+		s.mux.HandleFunc("GET /v1/admin/sop-candidates", s.auth(s.handleAdminListSOPCandidates))
+		s.mux.HandleFunc("POST /v1/admin/sop-candidates/{candidate_id}/approve", s.auth(s.handleAdminApproveSOPCandidate))
+		s.mux.HandleFunc("POST /v1/admin/sop-candidates/{candidate_id}/reject", s.auth(s.handleAdminRejectSOPCandidate))
+		s.mux.HandleFunc("GET /v1/admin/sops", s.auth(s.handleAdminListSOPRegistry))
+		s.mux.HandleFunc("POST /v1/admin/sop-versions/{version_id}/load", s.auth(s.handleAdminLoadSOPVersion))
+		s.mux.HandleFunc("POST /v1/admin/sops/{entry_id}/unload", s.auth(s.handleAdminUnloadSOP))
+		s.mux.HandleFunc("GET /v1/sops", s.userAuth(s.handleListLoadedSOPs))
 	}
 	// Dashboard statistics endpoint
 	s.mux.HandleFunc("GET /v1/admin/dashboard/stats", s.auth(s.handleAdminDashboardStats))

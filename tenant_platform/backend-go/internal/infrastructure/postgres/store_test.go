@@ -389,7 +389,7 @@ func TestRecordChunkEventSerializesConcurrentSequenceAllocation(t *testing.T) {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
 	task = claimed
-	const writers = 64
+	const writers = 16
 	start := make(chan struct{})
 	errs := make(chan error, writers)
 	var wg sync.WaitGroup

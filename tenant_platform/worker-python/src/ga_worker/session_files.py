@@ -1,20 +1,21 @@
-"""Per-session file sandbox helpers and minimal DOCX export."""
+"""Per-session file sandbox and artifact persistence helpers."""
 
 from __future__ import annotations
 
 import hashlib
 import os
 import re
-import zipfile
-from datetime import datetime, timezone
+import secrets
+import stat
 from pathlib import Path
-from xml.sax.saxutils import escape
 
 FILE_MARKER_RE = re.compile(r"\[FILE:([^\]]+)\]")
 
 SESSION_FILES_DIR = "session_files"
 ATTACHMENTS_DIR = "attachments"
 OUTPUTS_DIR = "outputs"
+MAX_DOCUMENT_ARTIFACT_BYTES = 8 * 1024 * 1024
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
 def session_key_digest(session_key: str) -> str:
@@ -70,140 +71,218 @@ def normalize_output_name(name: str, default: str = "document.docx") -> str:
     return "/".join(safe_parts)
 
 
-def _paragraphs_from_text(text: str) -> list[list[str]]:
-    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not normalized:
-        return [[""]]
-    blocks = re.split(r"\n{2,}", normalized)
-    paragraphs: list[list[str]] = []
-    for block in blocks:
-        lines = block.split("\n")
-        paragraphs.append(lines)
-    return paragraphs
+def persist_document_artifact(root: Path, file_name: str, content: bytes, sha256: str) -> str:
+    root = Path(root).resolve()
+    if not isinstance(content, bytes) or not 0 < len(content) <= MAX_DOCUMENT_ARTIFACT_BYTES:
+        raise ValueError("document artifact size is invalid")
+    if not isinstance(sha256, str) or not _SHA256_RE.fullmatch(sha256) or hashlib.sha256(content).hexdigest() != sha256:
+        raise ValueError("document artifact digest is invalid")
+    _validate_document_artifact_name(file_name)
+    outputs = root / OUTPUTS_DIR
+    if os.name != "nt":
+        return _persist_document_artifact_posix(root, file_name, content, sha256)
+    try:
+        info = outputs.lstat()
+    except OSError as exc:
+        raise ValueError("session outputs directory is unavailable") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or outputs.resolve() != outputs:
+        raise ValueError("session outputs directory is invalid")
+
+    stem = Path(file_name).stem
+    suffix = Path(file_name).suffix
+    candidates = [file_name, f"{stem}-{sha256[:12]}{suffix}"]
+    for candidate_name in candidates:
+        candidate = outputs / candidate_name
+        if candidate.exists() or candidate.is_symlink():
+            if _existing_artifact_matches(candidate, content, sha256):
+                return f"{OUTPUTS_DIR}/{candidate_name}"
+            continue
+        if _write_artifact_no_replace(outputs, candidate_name, content):
+            return f"{OUTPUTS_DIR}/{candidate_name}"
+        if _existing_artifact_matches(candidate, content, sha256):
+            return f"{OUTPUTS_DIR}/{candidate_name}"
+    raise ValueError("document artifact output name conflicts with an existing file")
 
 
-def _xml_run(text: str) -> str:
-    if text == "":
-        return '<w:r><w:t xml:space="preserve"></w:t></w:r>'
-    return f'<w:r><w:t xml:space="preserve">{escape(text)}</w:t></w:r>'
+def _persist_document_artifact_posix(root: Path, file_name: str, content: bytes, sha256: str) -> str:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        root_fd = os.open(root, directory_flags)
+    except OSError as exc:
+        raise ValueError("session output root is unavailable") from exc
+    try:
+        root_info = os.fstat(root_fd)
+        path_info = root.lstat()
+        if not _same_directory(root_info, path_info):
+            raise ValueError("session output root changed during artifact write")
+        try:
+            outputs_fd = os.open(OUTPUTS_DIR, directory_flags, dir_fd=root_fd)
+        except OSError as exc:
+            raise ValueError("session outputs directory is unavailable") from exc
+        try:
+            outputs_info = os.fstat(outputs_fd)
+            relative_info = os.stat(OUTPUTS_DIR, dir_fd=root_fd, follow_symlinks=False)
+            if not _same_directory(outputs_info, relative_info):
+                raise ValueError("session outputs directory is invalid")
+            stem = Path(file_name).stem
+            suffix = Path(file_name).suffix
+            for candidate_name in (file_name, f"{stem}-{sha256[:12]}{suffix}"):
+                if _existing_artifact_matches_at(outputs_fd, candidate_name, content, sha256):
+                    result = f"{OUTPUTS_DIR}/{candidate_name}"
+                elif _write_artifact_no_replace_at(outputs_fd, candidate_name, content):
+                    result = f"{OUTPUTS_DIR}/{candidate_name}"
+                elif _existing_artifact_matches_at(outputs_fd, candidate_name, content, sha256):
+                    result = f"{OUTPUTS_DIR}/{candidate_name}"
+                else:
+                    continue
+                if not _directory_handle_still_reachable(root, root_fd, OUTPUTS_DIR, outputs_fd):
+                    raise ValueError("session outputs directory changed during artifact write")
+                return result
+        finally:
+            os.close(outputs_fd)
+    finally:
+        os.close(root_fd)
+    raise ValueError("document artifact output name conflicts with an existing file")
 
 
-def _xml_paragraph(lines: list[str]) -> str:
-    runs: list[str] = []
-    for idx, line in enumerate(lines):
-        if idx > 0:
-            runs.append('<w:r><w:br/></w:r>')
-        runs.append(_xml_run(line))
-    if not runs:
-        runs.append(_xml_run(""))
-    return '<w:p>' + ''.join(runs) + '</w:p>'
-
-
-def build_docx_bytes(text: str, *, title: str = "") -> bytes:
-    paragraphs = ''.join(_xml_paragraph(lines) for lines in _paragraphs_from_text(text))
-    created = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
-    document_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" '
-        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
-        'xmlns:o="urn:schemas-microsoft-com:office:office" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
-        'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" '
-        'xmlns:v="urn:schemas-microsoft-com:vml" '
-        'xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" '
-        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
-        'xmlns:w10="urn:schemas-microsoft-com:office:word" '
-        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
-        'xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" '
-        'xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk" '
-        'xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml" '
-        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
-        'mc:Ignorable="w14 wp14">'
-        '<w:body>' + paragraphs + '<w:sectPr>'
-        '<w:pgSz w:w="11906" w:h="16838"/>'
-        '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>'
-        '<w:cols w:space="708"/>'
-        '<w:docGrid w:linePitch="360"/>'
-        '</w:sectPr></w:body></w:document>'
+def _same_directory(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(left.st_mode)
+        and stat.S_ISDIR(right.st_mode)
+        and left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
     )
-    core_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
-        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
-        'xmlns:dcterms="http://purl.org/dc/terms/" '
-        'xmlns:dcmitype="http://purl.org/dc/dcmitype/" '
-        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
-        f'<dc:title>{escape(title or "GenericAgent Export")}</dc:title>'
-        '<dc:creator>GenericAgent</dc:creator>'
-        '<cp:lastModifiedBy>GenericAgent</cp:lastModifiedBy>'
-        f'<dcterms:created xsi:type="dcterms:W3CDTF">{created}</dcterms:created>'
-        f'<dcterms:modified xsi:type="dcterms:W3CDTF">{created}</dcterms:modified>'
-        '</cp:coreProperties>'
-    )
-    app_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
-        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
-        '<Application>GenericAgent</Application>'
-        '</Properties>'
-    )
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-        '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
-        '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
-        '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
-        '</Types>'
-    )
-    rels_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
-        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
-        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
-        '</Relationships>'
-    )
-    word_rels_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
-        '</Relationships>'
-    )
-    styles_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal">'
-        '<w:name w:val="Normal"/>'
-        '<w:qFormat/>'
-        '</w:style>'
-        '</w:styles>'
-    )
-    from io import BytesIO
-
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr('[Content_Types].xml', content_types)
-        zf.writestr('_rels/.rels', rels_xml)
-        zf.writestr('docProps/core.xml', core_xml)
-        zf.writestr('docProps/app.xml', app_xml)
-        zf.writestr('word/document.xml', document_xml)
-        zf.writestr('word/_rels/document.xml.rels', word_rels_xml)
-        zf.writestr('word/styles.xml', styles_xml)
-    return buf.getvalue()
 
 
-def write_simple_docx(path: Path, text: str, *, title: str = "") -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(build_docx_bytes(text, title=title))
+def _directory_handle_still_reachable(root: Path, root_fd: int, name: str, directory_fd: int) -> bool:
+    try:
+        return _same_directory(os.fstat(root_fd), root.lstat()) and _same_directory(
+            os.fstat(directory_fd),
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False),
+        )
+    except OSError:
+        return False
 
 
-def read_text_file(path: Path) -> str:
-    raw = Path(path).read_bytes()
+def _existing_artifact_matches_at(directory_fd: int, file_name: str, content: bytes, sha256: str) -> bool:
+    try:
+        fd = os.open(file_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != len(content):
+            return False
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 64 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest() == sha256
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _write_artifact_no_replace_at(directory_fd: int, file_name: str, content: bytes) -> bool:
+    temp_name = f".ga-document-{secrets.token_hex(16)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    fd = os.open(temp_name, flags, 0o640, dir_fd=directory_fd)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("document artifact write made no progress")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        try:
+            os.link(
+                temp_name,
+                file_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            return False
+        os.fsync(directory_fd)
+        return True
+    finally:
+        try:
+            os.unlink(temp_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _validate_document_artifact_name(file_name: str) -> None:
+    if (
+        not isinstance(file_name, str)
+        or not file_name.strip()
+        or file_name != file_name.strip()
+        or len(file_name.encode("utf-8")) > 255
+        or file_name in {".", ".."}
+        or "/" in file_name
+        or "\\" in file_name
+        or any(ord(char) < 32 or ord(char) == 127 for char in file_name)
+        or not file_name.lower().endswith(".docx")
+    ):
+        raise ValueError("document artifact file name is invalid")
+
+
+def _existing_artifact_matches(path: Path, content: bytes, sha256: str) -> bool:
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size != len(content):
+            return False
+        return hashlib.sha256(path.read_bytes()).hexdigest() == sha256
+    except OSError:
+        return False
+
+
+def _write_artifact_no_replace(outputs: Path, file_name: str, content: bytes) -> bool:
+    temp_name = f".ga-document-{secrets.token_hex(16)}.tmp"
+    temp_path = outputs / temp_name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temp_path, flags, 0o640)
+    linked = False
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_path, outputs / file_name)
+            linked = True
+        except FileExistsError:
+            return False
+        if os.name != "nt":
+            directory_fd = os.open(outputs, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        return True
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        if not linked and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def read_text_file(path: Path, *, max_bytes: int = 1024 * 1024) -> str:
+    if max_bytes <= 0:
+        raise ValueError("text file byte limit must be positive")
+    with Path(path).open("rb") as handle:
+        raw = handle.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"text file exceeds {max_bytes} bytes")
     for enc in ('utf-8', 'utf-8-sig', 'utf-16'):
         try:
             return raw.decode(enc)

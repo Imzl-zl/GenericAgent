@@ -109,6 +109,11 @@ RETURNING `+taskSelectColumns, taskID, workspaceID, cmd.SessionKey, nextSeq, req
 		t, scanErr := scanTask(row)
 		if scanErr == nil {
 			task = t
+			snapshots, err := insertLoadedSOPSnapshots(ctx, tx, t.ID)
+			if err != nil {
+				return err
+			}
+			task.SOPSnapshots = snapshots
 			if err := insertEvent(ctx, tx, t.ID, "status_transition", 0, nil, nil, "", "queued", "", ""); err != nil {
 				return err
 			}
@@ -133,6 +138,11 @@ FOR UPDATE
 			return err
 		}
 		task = t
+		snapshots, err := loadTaskSOPSnapshots(ctx, tx, t.ID)
+		if err != nil {
+			return err
+		}
+		task.SOPSnapshots = snapshots
 		return nil
 	})
 	return task, err
@@ -145,7 +155,15 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (domain.Task, error)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Task{}, fmt.Errorf("task not found: %s", taskID)
 	}
-	return t, err
+	if err != nil {
+		return domain.Task{}, err
+	}
+	snapshots, err := loadTaskSOPSnapshots(ctx, s.pool, taskID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	t.SOPSnapshots = snapshots
+	return t, nil
 }
 
 // ResetWorkspace marks the session for fresh start: the next submitted task

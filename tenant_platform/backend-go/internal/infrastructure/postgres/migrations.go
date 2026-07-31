@@ -14,6 +14,9 @@ import (
 
 // migrationsDir returns the checked-in migrations directory relative to this module.
 func migrationsDir() string {
+	if configured := strings.TrimSpace(os.Getenv("GA_MIGRATIONS_DIR")); configured != "" {
+		return filepath.Clean(configured)
+	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		return ""
@@ -61,6 +64,11 @@ func migrationFiles() []string {
 		"0028_agent_max_turns_setting.sql",
 		"0029_mcp_servers.sql",
 		"0030_remove_mcp_headers.sql",
+		"0031_document_pool_settings.sql",
+		"0032_document_job_pool.sql",
+		"0033_document_job_finish.sql",
+		"0034_document_artifacts.sql",
+		"0035_sophub_sop_registry.sql",
 	}
 }
 
@@ -100,10 +108,24 @@ var pendingMigrations = []struct {
 	{"0028_agent_max_turns_setting.sql", "migration_0028_agent_max_turns_setting_marker"},
 	{"0029_mcp_servers.sql", "migration_0029_mcp_servers_marker"},
 	{"0030_remove_mcp_headers.sql", "migration_0030_remove_mcp_headers_marker"},
+	{"0031_document_pool_settings.sql", "migration_0031_document_pool_settings_marker"},
+	{"0032_document_job_pool.sql", "migration_0032_document_job_pool_marker"},
+	{"0033_document_job_finish.sql", "migration_0033_document_job_finish_marker"},
+	{"0034_document_artifacts.sql", "migration_0034_document_artifacts_marker"},
+	{"0035_sophub_sop_registry.sql", "migration_0035_sophub_sop_registry_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
 var foundationTableNames = []string{
+	"task_sop_snapshots",
+	"sop_versions",
+	"sop_entries",
+	"sop_candidates",
+	"sophub_bindings",
+	"document_artifacts",
+	"document_commands",
+	"document_instances",
+	"document_jobs",
 	"llm_capability_revocations",
 	"media_assets",
 	"messages",
@@ -130,6 +152,7 @@ var foundationTableNames = []string{
 	"tool_policies",
 	"relay_preferences",
 	"platform_runtime_settings",
+	"document_pool_settings",
 	"migration_0008_user_id_serial_marker",
 	"migration_0009_marker",
 	"migration_0010_user_password_hash_marker",
@@ -142,6 +165,11 @@ var foundationTableNames = []string{
 	"migration_0028_agent_max_turns_setting_marker",
 	"migration_0029_mcp_servers_marker",
 	"migration_0030_remove_mcp_headers_marker",
+	"migration_0031_document_pool_settings_marker",
+	"migration_0032_document_job_pool_marker",
+	"migration_0033_document_job_finish_marker",
+	"migration_0034_document_artifacts_marker",
+	"migration_0035_sophub_sop_registry_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",
@@ -154,23 +182,38 @@ var foundationTableNames = []string{
 	"active_contexts",
 }
 
+func readMigrationBatch(files []string) (string, error) {
+	dir := migrationsDir()
+	var batch strings.Builder
+	for _, name := range files {
+		path := name
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(dir, name)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read migration %s: %w", path, err)
+		}
+		fmt.Fprintf(&batch, "\n-- migration: %s\n", name)
+		batch.Write(raw)
+		batch.WriteByte('\n')
+	}
+	return batch.String(), nil
+}
+
 // DropFoundationSchema removes foundation tables and leftover composite types.
 // Safe to call when objects are missing. Uses CASCADE.
 func DropFoundationSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	if pool == nil {
 		return fmt.Errorf("pool is nil")
 	}
-	for _, name := range foundationTableNames {
-		if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, name)); err != nil {
-			return fmt.Errorf("drop table %s: %w", name, err)
-		}
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS `+strings.Join(foundationTableNames, ",")+` CASCADE`); err != nil {
+		return fmt.Errorf("drop foundation tables: %w", err)
 	}
 	// PostgreSQL creates a composite type per table; orphan types after partial
 	// failed CREATE produce pg_type_typname_nsp_index 23505 on retry.
-	for _, name := range foundationTableNames {
-		if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TYPE IF EXISTS %s CASCADE`, name)); err != nil {
-			return fmt.Errorf("drop type %s: %w", name, err)
-		}
+	if _, err := pool.Exec(ctx, `DROP TYPE IF EXISTS `+strings.Join(foundationTableNames, ",")+` CASCADE`); err != nil {
+		return fmt.Errorf("drop foundation types: %w", err)
 	}
 	if _, err := pool.Exec(ctx, `DROP SEQUENCE IF EXISTS task_events_id_seq CASCADE`); err != nil {
 		return fmt.Errorf("drop sequence: %w", err)
@@ -258,30 +301,21 @@ WHERE table_schema='public' AND table_name='tasks'
 		return applyPendingMigrations(ctx, tx)
 	}
 
-	dir := migrationsDir()
-	// Clean orphans inside the same locked transaction, then create.
-	for _, name := range foundationTableNames {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, name)); err != nil {
-			return err
-		}
+	if _, err := tx.Exec(ctx, `DROP TABLE IF EXISTS `+strings.Join(foundationTableNames, ",")+` CASCADE`); err != nil {
+		return err
 	}
-	for _, name := range foundationTableNames {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TYPE IF EXISTS %s CASCADE`, name)); err != nil {
-			return err
-		}
+	if _, err := tx.Exec(ctx, `DROP TYPE IF EXISTS `+strings.Join(foundationTableNames, ",")+` CASCADE`); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `DROP SEQUENCE IF EXISTS task_events_id_seq CASCADE`); err != nil {
 		return err
 	}
-	for _, name := range migrationFiles() {
-		path := filepath.Join(dir, name)
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("read migration %s: %w", path, err)
-		}
-		if _, err := tx.Exec(ctx, string(raw)); err != nil {
-			return fmt.Errorf("apply migration %s: %w", name, err)
-		}
+	batch, err := readMigrationBatch(migrationFiles())
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, batch); err != nil {
+		return fmt.Errorf("apply fresh schema migrations: %w", err)
 	}
 	return tx.Commit(ctx)
 }
@@ -291,25 +325,46 @@ WHERE table_schema='public' AND table_name='tasks'
 // platform processes do not race. Each migration file is responsible for being
 // idempotent-safe (guarded by the caller's marker table check).
 func applyPendingMigrations(ctx context.Context, tx pgx.Tx) error {
-	dir := migrationsDir()
-	for _, pm := range pendingMigrations {
-		var count int
-		if err := tx.QueryRow(ctx, `
-SELECT COUNT(*) FROM information_schema.tables
-WHERE table_schema='public' AND table_name=$1
-`, pm.markerTable).Scan(&count); err != nil {
+	markers := make([]string, 0, len(pendingMigrations))
+	for _, migration := range pendingMigrations {
+		markers = append(markers, migration.markerTable)
+	}
+	rows, err := tx.Query(ctx, `
+SELECT marker
+FROM unnest($1::text[]) AS marker
+WHERE to_regclass(format('%I.%I', 'public', marker)) IS NULL
+`, markers)
+	if err != nil {
+		return fmt.Errorf("find pending migrations: %w", err)
+	}
+	missingMarkers := make(map[string]struct{}, len(pendingMigrations))
+	for rows.Next() {
+		var marker string
+		if err := rows.Scan(&marker); err != nil {
+			rows.Close()
 			return err
 		}
-		if count > 0 {
-			continue
+		missingMarkers[marker] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	files := make([]string, 0, len(missingMarkers))
+	for _, migration := range pendingMigrations {
+		if _, missing := missingMarkers[migration.markerTable]; missing {
+			files = append(files, migration.file)
 		}
-		path := filepath.Join(dir, pm.file)
-		raw, err := os.ReadFile(path)
+	}
+	if len(files) > 0 {
+		batch, err := readMigrationBatch(files)
 		if err != nil {
-			return fmt.Errorf("read migration %s: %w", pm.file, err)
+			return err
 		}
-		if _, err := tx.Exec(ctx, string(raw)); err != nil {
-			return fmt.Errorf("apply migration %s: %w", pm.file, err)
+		if _, err := tx.Exec(ctx, batch); err != nil {
+			return fmt.Errorf("apply pending migrations %s: %w", strings.Join(files, ", "), err)
 		}
 	}
 	return tx.Commit(ctx)

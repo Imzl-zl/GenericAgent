@@ -22,13 +22,16 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/api"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/documentgateway"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/logging"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/poller"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/processguard"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/sophub"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/systemd"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/transport"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/worker"
@@ -85,6 +88,17 @@ func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRunti
 		return nil, fmt.Errorf("loopback runtime: %w", err)
 	}
 	return runtime, nil
+}
+
+func buildDocumentGatewayIssuer(baseURL, signingKey string) (*documentgateway.Issuer, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, nil
+	}
+	issuer, err := documentgateway.NewIssuer([]byte(signingKey), llmproxy.DefaultTokenTTL)
+	if err != nil {
+		return nil, fmt.Errorf("document gateway capability token issuer: %w", err)
+	}
+	return issuer, nil
 }
 
 // llmProxyConfig carries LLM Proxy startup parameters. The real upstream key
@@ -216,42 +230,47 @@ func finishPlatform(serveErr error, schedulerDone <-chan error, timeout time.Dur
 }
 
 func run() error {
-	// Initialize structured logging before anything else so even early
+	if err := processguard.DisablePeerInspection(); err != nil {
+		return fmt.Errorf("harden platform process: %w", err)
+	}
+	// Initialize structured logging before configuration parsing so early
 	// failures produce JSON. LOG_LEVEL controls verbosity.
 	logging.Init()
 
 	var (
-		policyFile            = flag.String("policy-file", "", "path to capability policy manifest (required)")
-		claimLease            = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
-		devLoopback           = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
-		listen                = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
-		databaseURL           = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
-		migration             = flag.String("migration", "", "path to 0001_foundation.sql")
-		runtimeRoot           = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
-		configRoot            = flag.String("config-root", "", "GA_CONFIG_ROOT for session-scoped token-only runtime configuration")
-		legacyRoot            = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
-		workerPython          = flag.String("worker-python", "", "python interpreter for worker")
-		workerSrc             = flag.String("worker-src", "", "path to worker-python/src")
-		llmProxyAddr          = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
-		capabilitySigningKey  = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=32 bytes")
-		modelPolicyVersion    = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
-		devExtraUsers         = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
-		devTeam               = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
-		botTokenKey           = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
-		ilinkBaseURL          = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
-		ilinkAppID            = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
-		ilinkClientVersion    = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
-		botPollerURL          = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
-		botPollerAPISecret    = flag.String("bot-poller-api-secret", os.Getenv("BOT_POLLER_API_SECRET"), "HMAC-SHA256 secret for authenticating requests to Bot Poller /start /send /stop (or BOT_POLLER_API_SECRET); empty = unauthenticated (INSECURE - dev/test only)")
-		platformWebhookURL    = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
-		webhookSecret         = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
-		maxRunningTasks       = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
-		perTenantRunningLimit = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
-		perUserQueueLimit     = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
-		taskTimeoutSeconds    = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
-		maxTaskWallClockSec   = flag.Int("max-task-wall-clock-seconds", envInt("MAX_TASK_WALL_CLOCK_SECONDS", 2700), "hard task wall-clock limit; capability TTL must cover this plus refresh skew")
-		taskIdleTimeoutSec    = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
-		workerIdleTTLSec      = flag.Int("worker-idle-ttl-seconds", envInt("WORKER_IDLE_TTL_SECONDS", 600), "Worker eviction threshold (or WORKER_IDLE_TTL_SECONDS). Default 600s (10min). Idle Worker processes (no active task) older than this are torn down to reclaim memory (pattern: Kubernetes pod eviction + AWS Lambda container reuse window). Next task cold-starts from last snapshot. 0 = keep Workers resident indefinitely (dev/test or tiny fleets).")
+		policyFile                = flag.String("policy-file", "", "path to capability policy manifest (required)")
+		claimLease                = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
+		devLoopback               = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
+		listen                    = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
+		databaseURL               = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
+		migration                 = flag.String("migration", "", "path to 0001_foundation.sql")
+		runtimeRoot               = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
+		configRoot                = flag.String("config-root", "", "GA_CONFIG_ROOT for session-scoped token-only runtime configuration")
+		legacyRoot                = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
+		workerPython              = flag.String("worker-python", "", "python interpreter for worker")
+		workerSrc                 = flag.String("worker-src", "", "path to worker-python/src")
+		llmProxyAddr              = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
+		capabilitySigningKey      = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=32 bytes")
+		documentGatewayBaseURL    = flag.String("document-gateway-base-url", os.Getenv("DOCUMENT_GATEWAY_BASE_URL"), "loopback document gateway base URL (or DOCUMENT_GATEWAY_BASE_URL); empty disables Worker document capability")
+		modelPolicyVersion        = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
+		devExtraUsers             = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
+		devTeam                   = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
+		botTokenKey               = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
+		ilinkBaseURL              = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
+		ilinkAppID                = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
+		ilinkClientVersion        = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
+		botPollerURL              = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
+		botPollerAPISecret        = flag.String("bot-poller-api-secret", os.Getenv("BOT_POLLER_API_SECRET"), "HMAC-SHA256 secret for authenticating requests to Bot Poller /start /send /stop (or BOT_POLLER_API_SECRET); empty = unauthenticated (INSECURE - dev/test only)")
+		platformWebhookURL        = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
+		webhookSecret             = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
+		maxRunningTasks           = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
+		perTenantRunningLimit     = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
+		perUserQueueLimit         = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
+		taskTimeoutSeconds        = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
+		maxTaskWallClockSec       = flag.Int("max-task-wall-clock-seconds", envInt("MAX_TASK_WALL_CLOCK_SECONDS", 2700), "hard task wall-clock limit; capability TTL must cover this plus refresh skew")
+		taskIdleTimeoutSec        = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
+		workerIdleTTLSec          = flag.Int("worker-idle-ttl-seconds", envInt("WORKER_IDLE_TTL_SECONDS", 600), "Worker eviction threshold (or WORKER_IDLE_TTL_SECONDS). Default 600s (10min). Idle Worker processes (no active task) older than this are torn down to reclaim memory (pattern: Kubernetes pod eviction + AWS Lambda container reuse window). Next task cold-starts from last snapshot. 0 = keep Workers resident indefinitely (dev/test or tiny fleets).")
+		documentPoolMaxActiveHard = flag.Int("document-pool-max-active-hard", envInt("DOCUMENT_POOL_MAX_ACTIVE_HARD", 1), "deployment hard ceiling for administrator-managed document pool max_active")
 	)
 	flag.Parse()
 
@@ -260,6 +279,9 @@ func run() error {
 	}
 	if *claimLease <= 0 {
 		return fmt.Errorf("--claim-lease must be a positive duration")
+	}
+	if *documentPoolMaxActiveHard <= 0 {
+		return fmt.Errorf("--document-pool-max-active-hard must be positive")
 	}
 	resolvedPolicyFile, err := resolvePolicyPath(*policyFile)
 	if err != nil {
@@ -305,7 +327,7 @@ func run() error {
 		return err
 	}
 
-	store, err := postgres.NewStore(pool)
+	store, err := postgres.NewStore(pool, postgres.WithDocumentPoolDeploymentMaxActive(*documentPoolMaxActiveHard))
 	if err != nil {
 		return err
 	}
@@ -316,6 +338,22 @@ func run() error {
 	agentMaxTurns, err := store.GetAgentMaxTurns(ctx)
 	if err != nil {
 		return fmt.Errorf("load agent max turns: %w", err)
+	}
+	documentPoolSettings, err := store.GetDocumentPoolSettings(ctx)
+	if err != nil {
+		return fmt.Errorf("load document pool settings: %w", err)
+	}
+	documentPoolSettingsRuntime, err := application.NewDocumentPoolSettingsRuntime(documentPoolSettings, *documentPoolMaxActiveHard)
+	if err != nil {
+		return fmt.Errorf("initialize document pool settings runtime: %w", err)
+	}
+	documentPoolSettingsReconciler, err := application.NewDocumentPoolSettingsReconciler(
+		store,
+		documentPoolSettingsRuntime,
+		application.DefaultDocumentPoolSettingsReconcileInterval,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize document pool settings reconciler: %w", err)
 	}
 	// Resource quotas: enforced by scheduler (global running cap) and store
 	// (per-user queued cap). Zero disables (dev/test).
@@ -449,6 +487,25 @@ func run() error {
 		return fmt.Errorf("capability token issuer: %w", err)
 	}
 
+	documentIssuer, err := buildDocumentGatewayIssuer(*documentGatewayBaseURL, signingKey)
+	if err != nil {
+		return err
+	}
+	var documentValidator *documentgateway.Validator
+	var documentTools application.DocumentToolService
+	if documentIssuer != nil {
+		documentValidator, err = documentgateway.NewValidator([]byte(signingKey))
+		if err != nil {
+			return fmt.Errorf("document gateway capability validator: %w", err)
+		}
+		documentTools, err = application.NewDocumentToolService(application.DocumentToolServiceConfig{
+			Store: store, Registry: reg,
+		})
+		if err != nil {
+			return fmt.Errorf("document tool service: %w", err)
+		}
+	}
+
 	runtime, err := buildWorkerRuntime(boot)
 	if err != nil {
 		return err
@@ -456,32 +513,34 @@ func run() error {
 	sessionScopedConfig := true
 
 	sched, err := application.NewScheduler(application.SchedulerConfig{
-		PlatformInstanceID:    instanceID,
-		ClaimLease:            *claimLease,
-		PollInterval:          500 * time.Millisecond,
-		Store:                 store,
-		Registry:              reg,
-		Coordinator:           coord,
-		Runtime:               runtime,
-		ConfigRoot:            boot.ConfigRoot,
-		SessionScopedConfig:   sessionScopedConfig,
-		RuntimeRoot:           boot.RuntimeRoot,
-		LLMProxyAddr:          proxyAddr,
-		TokenIssuer:           issuer,
-		CapabilityStore:       store,
-		Audit:                 store,
-		ModelPolicyVersion:    strings.TrimSpace(*modelPolicyVersion),
-		LLMProvider:           store,
-		MCPServer:             store,
-		TokenTTL:              llmproxy.DefaultTokenTTL,
-		TokenRefreshSkew:      application.DefaultTokenRefreshSkew,
-		MaxTaskWallClock:      time.Duration(*maxTaskWallClockSec) * time.Second,
-		MaxRunningTasks:       *maxRunningTasks,
-		PerTenantRunningLimit: *perTenantRunningLimit,
-		TaskTimeoutSeconds:    *taskTimeoutSeconds,
-		RuntimeSettings:       store,
-		IdleTimeout:           time.Duration(*taskIdleTimeoutSec) * time.Second,
-		WorkerIdleTTL:         time.Duration(*workerIdleTTLSec) * time.Second,
+		PlatformInstanceID:         instanceID,
+		ClaimLease:                 *claimLease,
+		PollInterval:               500 * time.Millisecond,
+		Store:                      store,
+		Registry:                   reg,
+		Coordinator:                coord,
+		Runtime:                    runtime,
+		ConfigRoot:                 boot.ConfigRoot,
+		SessionScopedConfig:        sessionScopedConfig,
+		RuntimeRoot:                boot.RuntimeRoot,
+		LLMProxyAddr:               proxyAddr,
+		TokenIssuer:                issuer,
+		CapabilityStore:            store,
+		Audit:                      store,
+		ModelPolicyVersion:         strings.TrimSpace(*modelPolicyVersion),
+		LLMProvider:                store,
+		MCPServer:                  store,
+		DocumentGatewayBaseURL:     strings.TrimSpace(*documentGatewayBaseURL),
+		DocumentGatewayTokenIssuer: documentIssuer,
+		TokenTTL:                   llmproxy.DefaultTokenTTL,
+		TokenRefreshSkew:           application.DefaultTokenRefreshSkew,
+		MaxTaskWallClock:           time.Duration(*maxTaskWallClockSec) * time.Second,
+		MaxRunningTasks:            *maxRunningTasks,
+		PerTenantRunningLimit:      *perTenantRunningLimit,
+		TaskTimeoutSeconds:         *taskTimeoutSeconds,
+		RuntimeSettings:            store,
+		IdleTimeout:                time.Duration(*taskIdleTimeoutSec) * time.Second,
+		WorkerIdleTTL:              time.Duration(*workerIdleTTLSec) * time.Second,
 	})
 	if err != nil {
 		return err
@@ -557,6 +616,16 @@ func run() error {
 	personaSvc, err := application.NewPersonaService(store)
 	if err != nil {
 		return err
+	}
+
+	var sophubSvc application.SophubService
+	if cipher != nil {
+		sophubSvc, err = application.NewSophubService(application.SophubServiceConfig{
+			Store: store, Client: sophub.NewClient(), Cipher: cipher,
+		})
+		if err != nil {
+			return fmt.Errorf("Sophub service: %w", err)
+		}
 	}
 
 	// Bot transport + lifecycle: when iLink is configured, the Go platform
@@ -643,21 +712,27 @@ func run() error {
 	}
 
 	server, err := api.NewServer(api.ServerConfig{
-		Service:         svc,
-		Users:           userSvc,
-		WechatBinding:   wechatBindingSvc,
-		BotService:      botSvc,
-		Invite:          inviteSvc,
-		Personas:        personaSvc,
-		Router:          routerSvc,
-		Registry:        reg,
-		Policies:        store, // admin command/policy management (migration 0004)
-		RuntimeSettings: store,
-		Bots:            store,
-		LLMProviders:    store, // admin LLM provider management (migration 0007)
-		MCPServers:      store, // global MCP server management (migration 0029)
-		BotLifecycle:    botLifecycle,
-		TaskStats:       store,
+		Service:                         svc,
+		Users:                           userSvc,
+		WechatBinding:                   wechatBindingSvc,
+		BotService:                      botSvc,
+		Invite:                          inviteSvc,
+		Personas:                        personaSvc,
+		Router:                          routerSvc,
+		Registry:                        reg,
+		Policies:                        store, // admin command/policy management (migration 0004)
+		RuntimeSettings:                 store,
+		DocumentPoolSettingsRuntime:     documentPoolSettingsRuntime,
+		DocumentPoolStatus:              store,
+		DocumentPoolDeploymentMaxActive: *documentPoolMaxActiveHard,
+		DocumentTools:                   documentTools,
+		DocumentCapabilityValidator:     documentValidator,
+		Sophub:                          sophubSvc,
+		Bots:                            store,
+		LLMProviders:                    store, // admin LLM provider management (migration 0007)
+		MCPServers:                      store, // global MCP server management (migration 0029)
+		BotLifecycle:                    botLifecycle,
+		TaskStats:                       store,
 		RuntimeProfile: api.RuntimeProfile{
 			ClaimLeaseSeconds:         int((*claimLease) / time.Second),
 			TokenTTLSeconds:           int(llmproxy.DefaultTokenTTL / time.Second),
@@ -709,6 +784,11 @@ func run() error {
 	schedulerDone := make(chan error, 1)
 	go func() {
 		schedulerDone <- sched.Run(ctx)
+	}()
+	go func() {
+		if err := documentPoolSettingsReconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.ErrorContext(ctx, "document pool settings reconciler stopped", "error", err)
+		}
 	}()
 
 	if deliverySvc != nil {

@@ -14,7 +14,7 @@ from typing import Any, Iterator
 from genericagent.worker.v1 import worker_pb2
 
 from ga_worker.state import PendingTask, TaskRunState
-from ga_worker.task_terminal import emit_cancel_or_timeout_terminal
+from ga_worker.task_terminal import emit_cancel_or_timeout_terminal, emit_output_exceeded_terminal
 
 # P-M8: named constants (no magic numbers).
 QUEUE_POLL_TIMEOUT_S = 0.1
@@ -123,15 +123,8 @@ def _handle_next_item(
     turn = int(item.get("turn") or 0)
     if state.count_fn is not None and state.count_fn(text):
         if not state.terminal_emitted:
-            term = adapter._terminal(
-                task.task_id, worker_pb2.TASK_FAILED,
-                user_message="max_output_bytes exceeded", error_code="MAX_OUTPUT_BYTES",
-            )
-            adapter._record_completed(
-                task, term, text[:max(0, state.max_output)], state.display_history, state.agent,
-            )
-            yield worker_pb2.WorkerEvent(terminal=term)
-            state.terminal_emitted = True
+            state.final_body = text[:max(0, state.max_output)]
+            yield from emit_output_exceeded_terminal(adapter, task, state)
         return True
     state.display_history.append({"text": text, "turn": turn})
     with adapter._lock:

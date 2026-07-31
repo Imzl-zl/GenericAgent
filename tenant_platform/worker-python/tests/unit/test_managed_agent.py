@@ -97,6 +97,7 @@ def _task(
     *,
     session_key: str = "personal:1",
     persona: list[str] | None = None,
+    sop_snapshots: list[worker_pb2.SOPSnapshot] | None = None,
     tool_policy_version: str = "foundation.no-host-tools.v1",
 ) -> worker_pb2.ExecuteTaskRequest:
     return worker_pb2.ExecuteTaskRequest(
@@ -110,6 +111,7 @@ def _task(
             prompt=prompt,
             persona_snapshot=list(persona or []),
             tool_policy_version=tool_policy_version,
+            sop_snapshots=list(sop_snapshots or []),
         )
     )
 
@@ -295,7 +297,7 @@ def _make_adapter(roots, registry, factory=None) -> ManagedAgentAdapter:
         agent_factory=factory,
     )
 
-def _write_runtime_config(config_root: Path, generation: int, checksum: str = "") -> str:
+def _write_runtime_config(config_root: Path, generation: int, checksum: str = "", *, document_gateway: dict[str, Any] | None = None) -> str:
     placeholder = "0" * 64
     document: dict[str, Any] = {
         "_platform_runtime": {
@@ -310,12 +312,68 @@ def _write_runtime_config(config_root: Path, generation: int, checksum: str = ""
             "model": "test",
         },
     }
+    if document_gateway is not None:
+        document["_platform_document"] = document_gateway
     canonical = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
     calculated = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     active_checksum = checksum or calculated
     encoded = canonical.replace(placeholder, active_checksum, 1)
     (config_root / "mykey.runtime.json").write_bytes(encoded.encode("utf-8"))
     return active_checksum
+
+
+def test_session_document_client_loads_and_rotates_with_signed_credentials(roots, foundation_registry, monkeypatch):
+    import ga_worker.managed_agent as managed_agent_module
+    import ga_worker.session_lifecycle as session_lifecycle_module
+
+    created = []
+
+    class FakeDocumentClient:
+        def __init__(self, gateway):
+            self.gateway = gateway
+            self.closed = False
+            created.append(self)
+
+        def close_transport(self):
+            self.closed = True
+
+    monkeypatch.setattr(session_lifecycle_module, "DocumentGatewayClient", FakeDocumentClient)
+    monkeypatch.setattr(managed_agent_module, "DocumentGatewayClient", FakeDocumentClient)
+    base = {
+        "base_url": "http://127.0.0.1:8080/v1/document",
+        "capability_token": "token-1",
+        "session_key": "personal:1",
+        "workspace_id": "11111111-1111-1111-1111-111111111111",
+    }
+    checksum1 = _write_runtime_config(roots["config_root"], 1, document_gateway=base)
+    agent = ScriptedAgent()
+    agent.load_llm_sessions = lambda: None
+    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
+    adapter.start_session(_start_req())
+    assert adapter._session is not None
+    assert adapter._session.document_client.gateway.capability_token == "token-1"
+
+    rotated = {**base, "capability_token": "token-2"}
+    checksum2 = _write_runtime_config(roots["config_root"], 2, document_gateway=rotated)
+    adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        credential_generation=2, config_checksum=checksum2,
+    ))
+    assert adapter._session.document_client.gateway.capability_token == "token-2"
+    assert created[0].closed is True
+    assert checksum1 != checksum2
+
+
+def test_session_document_gateway_rejects_session_mismatch(roots, foundation_registry):
+    _write_runtime_config(roots["config_root"], 1, document_gateway={
+        "base_url": "http://127.0.0.1:8080/v1/document",
+        "capability_token": "token",
+        "session_key": "personal:other",
+        "workspace_id": "11111111-1111-1111-1111-111111111111",
+    })
+    adapter = _make_adapter(roots, foundation_registry, factory=ScriptedAgent)
+    with pytest.raises(WorkerAdapterError) as error:
+        adapter.start_session(_start_req())
+    assert error.value.code == "DOCUMENT_CONFIG_ERROR"
 
 
 def test_reload_credentials_reloads_ga_sessions_and_advances_generation(roots, foundation_registry):
@@ -716,6 +774,49 @@ def test_persona_is_task_scoped(roots, foundation_registry):
     assert ScriptedAgent.instances[0].extra_sys_prompts == []
 
 
+def test_sop_snapshots_are_task_scoped_and_digest_verified(roots, foundation_registry):
+    seen: list[list[str]] = []
+
+    class SOPAgent(ScriptedAgent):
+        def put_task(self, query, source="user", images=None):
+            seen.append(list(self.extra_sys_prompts))
+            return super().put_task(query, source=source, images=images)
+
+    content = "# Approved report SOP\n\nUse the available document tool.\n"
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    snapshot = worker_pb2.SOPSnapshot(
+        version_id="00000000-0000-4000-8000-000000000001",
+        title="Approved report",
+        description="Use for report generation",
+        content=content,
+        content_digest=digest,
+    )
+    adapter = _make_adapter(roots, foundation_registry, SOPAgent)
+    adapter.start_session(_start_req())
+    first = _events(adapter, _task("sop-1", "one", persona=["persona-A"], sop_snapshots=[snapshot]))
+    second = _events(adapter, _task("sop-2", "two", persona=["persona-B"]))
+    assert _terminal(first).status == worker_pb2.TASK_SUCCEEDED
+    assert _terminal(second).status == worker_pb2.TASK_SUCCEEDED
+    assert seen[0][0] == "persona-A"
+    assert len(seen[0]) == 2
+    assert "[PLATFORM APPROVED SOP]" in seen[0][1]
+    assert "Approved report" in seen[0][1]
+    assert content in seen[0][1]
+    assert digest in seen[0][1]
+    assert seen[1] == ["persona-B"]
+    assert ScriptedAgent.instances[0].extra_sys_prompts == []
+
+    invalid = worker_pb2.SOPSnapshot(
+        version_id=snapshot.version_id,
+        title=snapshot.title,
+        content=content + "tampered",
+        content_digest=digest,
+    )
+    with pytest.raises(WorkerAdapterError) as exc:
+        _events(adapter, _task("sop-invalid", "bad", sop_snapshots=[invalid]))
+    assert exc.value.code == "SOP_DIGEST_MISMATCH"
+
+
 def test_checkpoint_not_in_display_stream_and_valid_bundle(roots, foundation_registry, tmp_path):
     class WorkingAgent(ScriptedAgent):
         def run(self):
@@ -931,12 +1032,22 @@ def test_output_byte_cap_emits_failed(roots, foundation_registry):
             big = "x" * 200
             super().__init__({"loud": [{"next": big, "turn": 1}, {"done": big, "turn": 1}]})
 
+    closed: list[str] = []
+
+    class DocumentClient:
+        def close(self, task_id: str) -> None:
+            closed.append(task_id)
+
     adapter = _make_adapter(roots, foundation_registry, LoudAgent)
     adapter.start_session(_start_req(runtime_policy=_runtime_policy(max_output_bytes=50)))
+    adapter._session.document_client = DocumentClient()
+    adapter._session.document_open_task_id = "out-cap"
     events = _events(adapter, _task("out-cap", "loud"))
     term = _terminal(events)
     assert term.status == worker_pb2.TASK_FAILED
     assert term.error.code in {"MAX_OUTPUT_BYTES", "OUTPUT_LIMIT_EXCEEDED", "POLICY_LIMIT"}
+    assert closed == ["out-cap"]
+    assert adapter._session.document_open_task_id is None
 
 
 def test_overlay_manifest_and_legacy_root_untouched(roots, foundation_registry):
@@ -972,6 +1083,27 @@ def test_overlay_manifest_and_legacy_root_untouched(roots, foundation_registry):
         )
     )
     assert roots["sentinel"].read_bytes() == roots["sentinel_bytes"]
+
+
+def test_overlay_copies_when_hard_links_are_unavailable(roots, monkeypatch):
+    source = roots["legacy_root"] / "agentmain.py"
+    source.chmod(0o600)
+    original = source.read_bytes()
+
+    def reject_hard_link(*_args, **_kwargs):
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr("ga_worker.runtime_overlay.os.link", reject_hard_link)
+    overlay, manifest = materialize_runtime_overlay(
+        legacy_root=roots["legacy_root"],
+        runtime_root=roots["runtime_root"],
+        session_id="container-volume",
+    )
+
+    assert set(manifest["entries"]) == set(OVERLAY_MANIFEST_ENTRIES)
+    assert (overlay / "agentmain.py").read_bytes() == original
+    assert source.read_bytes() == original
+    assert source.stat().st_mode & 0o200
 
 
 def test_import_ga_exercises_simphtml_and_leaves_legacy_root(roots, foundation_registry):
@@ -1241,14 +1373,24 @@ def test_max_output_bytes_counts_handler_print(roots, foundation_registry):
                 self.is_running = False
                 self.task_queue.task_done()
 
+    closed: list[str] = []
+
+    class DocumentClient:
+        def close(self, task_id: str) -> None:
+            closed.append(task_id)
+
     adapter = _make_adapter(roots, foundation_registry, PrintyAgent)
     adapter.start_session(
         _start_req(runtime_policy=_runtime_policy(max_output_bytes=40, task_timeout_seconds=10))
     )
+    adapter._session.document_client = DocumentClient()
+    adapter._session.document_open_task_id = "print-cap"
     events = _events(adapter, _task("print-cap", "go"))
     term = _terminal(events)
     assert term.status == worker_pb2.TASK_FAILED
     assert term.error.code == "MAX_OUTPUT_BYTES"
+    assert closed == ["print-cap"]
+    assert adapter._session.document_open_task_id is None
 
 
 def test_tool_schema_filter_and_dispatch_deny(roots, foundation_registry, monkeypatch):

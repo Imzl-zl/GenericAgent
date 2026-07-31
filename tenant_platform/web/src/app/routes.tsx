@@ -9,6 +9,7 @@ import { DashboardPage } from '../features/user/DashboardPage';
 import { BindingPage } from '../features/user/BindingPage';
 import { PersonaPage } from '../features/user/PersonaPage';
 import { StatusPage } from '../features/user/StatusPage';
+import { SOPLibraryPage } from '../features/user/SOPLibraryPage';
 import { DocsPage } from '../features/docs/DocsPage';
 import { AdminDashboardPage } from '../features/admin/AdminDashboardPage';
 import { UsersPage } from '../features/admin/UsersPage';
@@ -16,6 +17,7 @@ import { InviteCodesPage } from '../features/admin/InviteCodesPage';
 import { PersonaReviewPage } from '../features/admin/PersonaReviewPage';
 import { LLMProvidersPage } from '../features/admin/LLMProvidersPage';
 import { MCPServersPage } from '../features/admin/MCPServersPage';
+import { SOPAdminPage } from '../features/admin/SOPAdminPage';
 import { SettingsPage } from '../features/admin/SettingsPage';
 
 
@@ -44,6 +46,7 @@ export const router = createBrowserRouter([
       { path: 'binding', element: <BindingPage /> },
       { path: 'persona', element: <PersonaPage /> },
       { path: 'status', element: <StatusPage /> },
+      { path: 'sops', element: <SOPLibraryPage /> },
       { path: 'docs', element: <DocsPage /> },
     ],
   },
@@ -57,6 +60,7 @@ export const router = createBrowserRouter([
       { path: 'personas', element: <PersonaReviewPage /> },
       { path: 'providers', element: <LLMProvidersPage /> },
       { path: 'mcp-servers', element: <MCPServersPage /> },
+      { path: 'sops', element: <SOPAdminPage /> },
       { path: 'binding', element: <BindingPage /> },
       { path: 'settings', element: <SettingsPage /> },
     ],

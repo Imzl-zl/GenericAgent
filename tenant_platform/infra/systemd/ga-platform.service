@@ -1,8 +1,9 @@
 [Unit]
 Description=GenericAgent Platform (control plane)
 Documentation=https://github.com/Imzl-zl/GenericAgent/tree/main/docs/superpowers/specs/2026-07-21-multi-tenant-architecture.md
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service ga-bot-poller.service
 Wants=network-online.target postgresql.service
+Requires=ga-bot-poller.service
 
 [Service]
 Type=notify
@@ -24,19 +25,25 @@ LimitNOFILE=4096
 # must define DATABASE_URL, BOT_TOKEN_KEY, PLATFORM_WEBHOOK_SECRET,
 # LLM_PROXY_CAPABILITY_SIGNING_KEY, and any optional quota tunables.
 EnvironmentFile=-/etc/ga/platform.env
+# Worker document capability points back to this loopback-only process. The
+# signed runtime config never exposes PostgreSQL or container runtime access.
+Environment=DOCUMENT_GATEWAY_BASE_URL=http://127.0.0.1:8080/v1/document
 
-# User isolation — never run as root.
-User=ga
-Group=ga
+# User isolation — never run as root. Runtime socket denial below remains
+# effective even if this account is accidentally added to docker/podman groups.
+User=ga-platform
+Group=ga-platform
+SupplementaryGroups=ga-delivery
+UMask=0027
 
 # Working directory — needed so relative paths in flags resolve.
 WorkingDirectory=/opt/ga
 
-# ExecStart — dev-loopback is the only currently-supported mode; the
-# production path will replace this with the three-process split
-# (platform / worker-manager / llm-proxy) once Slice 2b Podman is validated.
+# ExecStart — platform stays loopback-only and uses the Python worker loopback
+# path. Container access for secure document jobs belongs only to
+# cmd/document-manager; do not add Docker/Podman flags or sockets here.
 ExecStart=/opt/ga/bin/platform \
-  --policy-file=/opt/ga/policy/foundation.yaml \
+  --policy-file=/opt/ga/policy/foundation.v1.json \
   --claim-lease=30s \
   --dev-loopback \
   --listen=127.0.0.1:8080 \
@@ -44,16 +51,21 @@ ExecStart=/opt/ga/bin/platform \
   --config-root=/etc/ga/config \
   --legacy-root=/opt/ga/legacy \
   --worker-python=/usr/bin/python3 \
-  --worker-src=/opt/ga/worker-python/src \
-  --worker-runtime=loopback
+  --worker-src=/opt/ga/worker-python/src
 
-# Sandboxing — defense in depth. The service still works if any of these
-# are too restrictive for a given deployment; relax in /etc/systemd/system.
+# Sandboxing is part of the deployment boundary. Preflight rejects unit
+# drop-ins, so changes require a reviewed unit revision rather than overrides.
 NoNewPrivileges=true
 PrivateTmp=true
+# Hide standard rootful/rootless runtime sockets inside this service's mount
+# namespace, including every per-user Podman socket under /run/user.
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/podman/podman.sock -/var/run/podman/podman.sock -/run/user /etc/ga/platform.env /etc/ga/document-manager.env /etc/ga/bot-poller.env /var/lib/ga/documents
+UnsetEnvironment=DOCKER_HOST CONTAINER_HOST
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ga /etc/ga/config
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/ga/runtime /etc/ga/config
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

@@ -30,16 +30,38 @@ type DevelopmentContext struct {
 
 // Store is the PostgreSQL-backed task store.
 type Store struct {
-	pool              *pgxpool.Pool
-	perUserQueueLimit int // 0 = disabled (dev/test); enforced inside SubmitTask tx
+	pool                            *pgxpool.Pool
+	perUserQueueLimit               int // 0 = disabled (dev/test); enforced inside SubmitTask tx
+	documentPoolDeploymentMaxActive int
+}
+
+type StoreOption func(*Store) error
+
+func WithDocumentPoolDeploymentMaxActive(limit int) StoreOption {
+	return func(store *Store) error {
+		if limit <= 0 {
+			return fmt.Errorf("document pool deployment max_active must be positive")
+		}
+		store.documentPoolDeploymentMaxActive = limit
+		return nil
+	}
 }
 
 // NewStore wraps a pgx pool.
-func NewStore(pool *pgxpool.Pool) (*Store, error) {
+func NewStore(pool *pgxpool.Pool, options ...StoreOption) (*Store, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("pool is nil")
 	}
-	return &Store{pool: pool}, nil
+	store := &Store{pool: pool, documentPoolDeploymentMaxActive: 1}
+	for _, option := range options {
+		if option == nil {
+			return nil, fmt.Errorf("store option is nil")
+		}
+		if err := option(store); err != nil {
+			return nil, err
+		}
+	}
+	return store, nil
 }
 
 // SetPerUserQueueLimit sets the per-requester queued-task cap. Must be called

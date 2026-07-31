@@ -1,0 +1,16 @@
+.git
+.pi-subagents
+.tasks
+**/.pytest_cache
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.mypy_cache
+**/.ruff_cache
+tenant_platform/web/node_modules
+tenant_platform/web/dist
+tenant_platform/infra/compose/.env
+tenant_platform/infra/compose/secrets
+*.exe
+*.test
+.tmp-*
