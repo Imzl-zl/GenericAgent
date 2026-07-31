@@ -46,6 +46,7 @@ Every time GenericAgent solves a new task, it automatically crystallizes the exe
 - [Key Features](#-key-features)
 - [Demo Showcase](#-demo-showcase)
 - [Quick Start](#-quick-start)
+- [Secure Platform Deployment](#-secure-platform-deployment)
 - [Usage](#-usage)
 - [Unlocking Advanced Capabilities](#-unlocking-advanced-capabilities)
 - [Architecture](#-architecture)
@@ -163,6 +164,15 @@ GLOBAL=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/lsdefine/Generi
 ```
 
 > 💡 GenericAgent grows its environment **through the Agent itself** — don't pre-install everything. See [Unlocking Advanced Capabilities](#-unlocking-advanced-capabilities) below.
+
+---
+
+## 🛡️ Secure Platform Deployment
+
+GenericAgent Local remains cross-platform for Windows, Linux, and macOS. The multi-tenant document platform is a separate security-hardened deployment profile and currently requires Linux with systemd, cgroup v2, and a dedicated rootless Docker runtime.
+
+- Self-service single-host profile: [`tenant_platform/infra/compose/README.zh-CN.md`](tenant_platform/infra/compose/README.zh-CN.md)
+- All-systemd profile: [`tenant_platform/infra/deploy/README.md`](tenant_platform/infra/deploy/README.md)
 
 ---
 
@@ -437,6 +447,7 @@ Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for full text.
 - [核心特性](#-核心特性)
 - [实例展示](#-实例展示)
 - [快速开始](#-快速开始)
+- [安全平台部署](#-安全平台部署)
 - [使用方式](#-使用方式)
 - [架构设计](#-架构设计)
 - [自我进化机制](#-自我进化机制)
@@ -553,6 +564,15 @@ python launch.pyw
 📖 完整引导流程见 [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)
 📖 新手图文版：[飞书文档](https://my.feishu.cn/wiki/CGrDw0T76iNFuskmwxdcWrpinPb)
 📘 完整入门教程（Datawhale 出品）：[Hello GenericAgent](https://datawhalechina.github.io/hello-generic-agent/) · [GitHub](https://github.com/datawhalechina/hello-generic-agent)
+
+---
+
+## 🛡️ 安全平台部署
+
+本地 GA 仍支持 Windows、Linux 和 macOS。多租户文档平台是独立的安全加固部署 profile，当前要求 Linux、systemd、cgroup v2 和独立 rootless Docker runtime。
+
+- 单机 Compose 部署与打包：[`tenant_platform/infra/compose/README.zh-CN.md`](tenant_platform/infra/compose/README.zh-CN.md)
+- 全 systemd 部署：[`tenant_platform/infra/deploy/README.md`](tenant_platform/infra/deploy/README.md)
 
 ---
 
