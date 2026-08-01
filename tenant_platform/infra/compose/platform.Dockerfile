@@ -4,11 +4,7 @@ WORKDIR /src
 COPY tenant_platform/backend-go/go.mod tenant_platform/backend-go/go.sum ./
 RUN go mod download
 COPY tenant_platform/backend-go/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w -buildid=' -o /out/ga-platform ./cmd/platform \
-    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w -buildid=' -o /out/ga-document-manager ./cmd/document-manager
-
-FROM scratch AS document-manager-export
-COPY --from=go-build /out/ga-document-manager /ga-document-manager
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w -buildid=' -o /out/ga-platform ./cmd/platform
 
 FROM python:3.11-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
 ENV PYTHONUNBUFFERED=1 \

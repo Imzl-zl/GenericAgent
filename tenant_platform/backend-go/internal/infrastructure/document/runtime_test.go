@@ -175,6 +175,32 @@ func TestDockerCLIVerifyHostFailsClosed(t *testing.T) {
 	}
 }
 
+func TestDockerCLIRequiresExplicitOptInForRootfulAndMutableComposeImage(t *testing.T) {
+	cfg := validDockerConfig(t.TempDir())
+	cfg.Image = "genericagent-document-tool:local"
+	if _, err := newDockerCLI(cfg, &scriptedRunner{}); err == nil {
+		t.Fatal("mutable local image must require explicit opt-in")
+	}
+
+	cfg.AllowMutableImage = true
+	runtime, err := newDockerCLI(cfg, &scriptedRunner{replies: []runnerReply{{result: commandResult{stdout: dockerHostInfo(false, "builtin", "2", true)}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.VerifyHost(context.Background()); err == nil || !strings.Contains(strings.ToLower(err.Error()), "rootless") {
+		t.Fatalf("err=%v want rootless rejection", err)
+	}
+
+	cfg.AllowRootfulRuntime = true
+	runtime, err = newDockerCLI(cfg, &scriptedRunner{replies: []runnerReply{{result: commandResult{stdout: dockerHostInfo(false, "builtin", "2", true)}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.VerifyHost(context.Background()); err != nil {
+		t.Fatalf("explicit rootful runtime should be accepted: %v", err)
+	}
+}
+
 func TestPodmanVerifyHostUsesHostSecurity(t *testing.T) {
 	cfg := validDockerConfig(t.TempDir())
 	cfg.Binary = "podman"

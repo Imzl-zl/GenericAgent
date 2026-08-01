@@ -67,6 +67,23 @@ func TestBuildDocumentManagerConfigRequiresImmutableRuntimePolicy(t *testing.T) 
 	}
 }
 
+func TestParseDocumentManagerArgsReadsComposeRuntimeFlags(t *testing.T) {
+	t.Setenv("DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME", "true")
+	t.Setenv("DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE", "true")
+	t.Setenv("DOCUMENT_MANAGER_SHUTDOWN_TIMEOUT", "30s")
+
+	opts, err := parseDocumentManagerArgs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.allowRootfulRuntime || !opts.allowMutableImage {
+		t.Fatalf("compose opt-ins not parsed: %+v", opts)
+	}
+	if opts.shutdownTimeout != 30*time.Second {
+		t.Fatalf("shutdown timeout=%s want 30s", opts.shutdownTimeout)
+	}
+}
+
 func TestParseDocumentManagerArgsUsesEnvDatabaseURL(t *testing.T) {
 	root := canonicalTestDir(t)
 	t.Setenv("DATABASE_URL", "postgres://from-env")

@@ -33,24 +33,27 @@ const (
 
 var (
 	fixedImagePattern                = regexp.MustCompile(`^[a-z0-9][a-z0-9._/:\-]*@sha256:[a-f0-9]{64}$`)
+	mutableLocalImagePattern         = regexp.MustCompile(`^genericagent-document-tool:[a-z0-9][a-z0-9._-]{0,127}$`)
 	containerNamePattern             = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 	containerIDPattern               = regexp.MustCompile(`^[a-f0-9]{12,64}$`)
 	errDocumentCommandOutputTooLarge = errors.New("document command stdout exceeded limit")
 )
 
 type DockerConfig struct {
-	Binary         string
-	Image          string
-	WorkRoot       string
-	SeccompProfile string
-	UID            int
-	GID            int
-	MemoryBytes    int64
-	CPUPeriod      int64
-	CPUQuota       int64
-	PIDsLimit      int64
-	TmpfsBytes     int64
-	Command        []string
+	Binary              string
+	Image               string
+	WorkRoot            string
+	SeccompProfile      string
+	UID                 int
+	GID                 int
+	MemoryBytes         int64
+	CPUPeriod           int64
+	CPUQuota            int64
+	PIDsLimit           int64
+	TmpfsBytes          int64
+	Command             []string
+	AllowRootfulRuntime bool
+	AllowMutableImage   bool
 }
 
 type commandResult struct {
@@ -84,8 +87,9 @@ func newDockerCLI(cfg DockerConfig, runner commandRunner) (*DockerCLI, error) {
 	if binaryName != "docker" && binaryName != "docker.exe" && binaryName != "podman" && binaryName != "podman.exe" {
 		return nil, fmt.Errorf("runtime binary must be docker or podman")
 	}
-	if !fixedImagePattern.MatchString(cfg.Image) || imageReferenceHasTag(cfg.Image) {
-		return nil, fmt.Errorf("image must be pinned as untagged repository@sha256:<64 lowercase hex>")
+	if (!fixedImagePattern.MatchString(cfg.Image) || imageReferenceHasTag(cfg.Image)) &&
+		(!cfg.AllowMutableImage || !mutableLocalImagePattern.MatchString(cfg.Image)) {
+		return nil, fmt.Errorf("image must be pinned as untagged repository@sha256:<64 lowercase hex>; the only mutable opt-in is genericagent-document-tool:<tag>")
 	}
 	if err := validateSeccompProfile(cfg.SeccompProfile); err != nil {
 		return nil, err
@@ -157,7 +161,7 @@ func (d *DockerCLI) verifyDockerHost(ctx context.Context) error {
 			confinedSeccomp = true
 		}
 	}
-	if !rootless {
+	if !rootless && !d.cfg.AllowRootfulRuntime {
 		return fmt.Errorf("container runtime is not rootless")
 	}
 	if !confinedSeccomp {

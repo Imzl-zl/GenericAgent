@@ -9,10 +9,12 @@ x-logging: &default-logging
 services:
   postgres:
     image: ${GA_POSTGRES_IMAGE:-postgres:16-alpine}
-    restart: "no"
+    restart: unless-stopped
     user: "70:70"
-    env_file:
-      - ./secrets/postgres.env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     read_only: true
     cap_drop:
       - ALL
@@ -48,12 +50,15 @@ services:
     build:
       context: ../../..
       dockerfile: tenant_platform/infra/compose/bot-poller.Dockerfile
-    restart: "no"
+    restart: unless-stopped
     user: "10002:10002"
     group_add:
       - "10003"
-    env_file:
-      - ./secrets/bot-poller.env
+    environment:
+      BOT_POLLER_LISTEN: ${BOT_POLLER_LISTEN}
+      BOT_POLLER_MEDIA_DIR: ${BOT_POLLER_MEDIA_DIR}
+      BOT_POLLER_API_SECRET: ${BOT_POLLER_API_SECRET}
+      PLATFORM_WEBHOOK_SECRET: ${PLATFORM_WEBHOOK_SECRET}
     read_only: true
     cap_drop:
       - ALL
@@ -87,13 +92,35 @@ services:
     build:
       context: ../../..
       dockerfile: tenant_platform/infra/compose/platform.Dockerfile
-    restart: "no"
+    restart: unless-stopped
     init: true
     user: "10001:10001"
     group_add:
       - "10003"
-    env_file:
-      - ./secrets/platform.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      BOT_TOKEN_KEY: ${BOT_TOKEN_KEY}
+      BOT_POLLER_URL: ${BOT_POLLER_URL}
+      BOT_POLLER_API_SECRET: ${BOT_POLLER_API_SECRET}
+      PLATFORM_WEBHOOK_URL: ${PLATFORM_WEBHOOK_URL}
+      PLATFORM_WEBHOOK_SECRET: ${PLATFORM_WEBHOOK_SECRET}
+      PLATFORM_DEV_TOKEN: ${PLATFORM_DEV_TOKEN}
+      PLATFORM_DEV_USER_ID: ${PLATFORM_DEV_USER_ID}
+      PLATFORM_DEV_USERNAME: ${PLATFORM_DEV_USERNAME}
+      LLM_PROXY_CAPABILITY_SIGNING_KEY: ${LLM_PROXY_CAPABILITY_SIGNING_KEY}
+      GA_RUNTIME_DIR: ${GA_RUNTIME_DIR}
+      GA_CONFIG_ROOT: ${GA_CONFIG_ROOT}
+      GA_LEGACY_ROOT: ${GA_LEGACY_ROOT}
+      GA_WORKER_PYTHON: ${GA_WORKER_PYTHON}
+      GA_WORKER_SRC: ${GA_WORKER_SRC}
+      GA_MIGRATIONS_DIR: ${GA_MIGRATIONS_DIR}
+      DOCUMENT_GATEWAY_BASE_URL: ${DOCUMENT_GATEWAY_BASE_URL}
+      DOCUMENT_POOL_MAX_ACTIVE_HARD: ${DOCUMENT_POOL_MAX_ACTIVE_HARD}
+      MAX_RUNNING_TASKS: ${MAX_RUNNING_TASKS}
+      PER_TENANT_RUNNING_LIMIT: ${PER_TENANT_RUNNING_LIMIT}
+      PER_USER_QUEUE_LIMIT: ${PER_USER_QUEUE_LIMIT}
+      TASK_IDLE_TIMEOUT_SECONDS: ${TASK_IDLE_TIMEOUT_SECONDS}
+      WORKER_IDLE_TTL_SECONDS: ${WORKER_IDLE_TTL_SECONDS}
     read_only: true
     cap_drop:
       - ALL
@@ -132,12 +159,68 @@ services:
     stop_grace_period: 45s
     logging: *default-logging
 
+  document-manager:
+    image: ${GA_DOCUMENT_MANAGER_IMAGE:-genericagent-document-manager:local}
+    build:
+      context: ../../..
+      dockerfile: tenant_platform/infra/compose/document-manager.Dockerfile
+    restart: unless-stopped
+    init: true
+    user: "0:0"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      GA_MIGRATIONS_DIR: ${GA_MIGRATIONS_DIR}
+      DOCUMENT_MANAGER_OWNER: ${DOCUMENT_MANAGER_OWNER}
+      DOCUMENT_MANAGER_WORK_ROOT: ${DOCUMENT_MANAGER_WORK_ROOT}
+      DOCUMENT_MANAGER_RUNTIME_BINARY: ${DOCUMENT_MANAGER_RUNTIME_BINARY}
+      DOCUMENT_MANAGER_IMAGE: ${DOCUMENT_MANAGER_IMAGE}
+      DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME: ${DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME}
+      DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE: ${DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE}
+      DOCUMENT_MANAGER_SECCOMP_PROFILE: ${DOCUMENT_MANAGER_SECCOMP_PROFILE}
+      DOCUMENT_MANAGER_UID: ${DOCUMENT_MANAGER_UID}
+      DOCUMENT_MANAGER_GID: ${DOCUMENT_MANAGER_GID}
+      DOCUMENT_MANAGER_MEMORY_BYTES: ${DOCUMENT_MANAGER_MEMORY_BYTES}
+      DOCUMENT_MANAGER_CPU_PERIOD: ${DOCUMENT_MANAGER_CPU_PERIOD}
+      DOCUMENT_MANAGER_CPU_QUOTA: ${DOCUMENT_MANAGER_CPU_QUOTA}
+      DOCUMENT_MANAGER_PIDS_LIMIT: ${DOCUMENT_MANAGER_PIDS_LIMIT}
+      DOCUMENT_MANAGER_TMPFS_BYTES: ${DOCUMENT_MANAGER_TMPFS_BYTES}
+      DOCUMENT_POOL_MAX_ACTIVE_HARD: ${DOCUMENT_POOL_MAX_ACTIVE_HARD}
+      DOCUMENT_MANAGER_CLAIM_LEASE: ${DOCUMENT_MANAGER_CLAIM_LEASE}
+      DOCUMENT_MANAGER_HEARTBEAT_INTERVAL: ${DOCUMENT_MANAGER_HEARTBEAT_INTERVAL}
+      DOCUMENT_MANAGER_POLL_INTERVAL: ${DOCUMENT_MANAGER_POLL_INTERVAL}
+      DOCUMENT_MANAGER_COMMAND_POLL_INTERVAL: ${DOCUMENT_MANAGER_COMMAND_POLL_INTERVAL}
+      DOCUMENT_MANAGER_SHUTDOWN_TIMEOUT: ${DOCUMENT_MANAGER_SHUTDOWN_TIMEOUT}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    volumes:
+      - document_work:/var/lib/ga/documents
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    stop_grace_period: 30s
+    logging: *default-logging
+
   web:
     image: ${GA_WEB_IMAGE:-genericagent-web:local}
     build:
       context: ../../..
       dockerfile: tenant_platform/infra/compose/web.Dockerfile
-    restart: "no"
+    restart: unless-stopped
     user: "101:101"
     network_mode: service:platform
     depends_on:
@@ -172,6 +255,7 @@ volumes:
   platform_config:
   session_files:
   bot_media:
+  document_work:
 
 networks:
   application:

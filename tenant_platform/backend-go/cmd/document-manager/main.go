@@ -42,6 +42,8 @@ type documentManagerOptions struct {
 	pollInterval        time.Duration
 	commandPollInterval time.Duration
 	shutdownTimeout     time.Duration
+	allowRootfulRuntime bool
+	allowMutableImage   bool
 }
 
 func main() {
@@ -102,6 +104,16 @@ func run(args []string) error {
 
 func parseDocumentManagerArgs(args []string) (documentManagerOptions, error) {
 	var opts documentManagerOptions
+	allowRootfulRuntime, err := envBool("DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME", false)
+	if err != nil {
+		return opts, err
+	}
+	allowMutableImage, err := envBool("DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE", false)
+	if err != nil {
+		return opts, err
+	}
+	opts.allowRootfulRuntime = allowRootfulRuntime
+	opts.allowMutableImage = allowMutableImage
 	fs := flag.NewFlagSet("document-manager", flag.ContinueOnError)
 	fs.StringVar(&opts.databaseURL, "database-url", firstNonEmpty(os.Getenv("DATABASE_URL"), ""), "PostgreSQL URL (or DATABASE_URL)")
 	fs.StringVar(&opts.owner, "owner", firstNonEmpty(os.Getenv("DOCUMENT_MANAGER_OWNER"), "document-manager"), "document manager owner/fencing identity")
@@ -122,6 +134,8 @@ func parseDocumentManagerArgs(args []string) (documentManagerOptions, error) {
 	fs.DurationVar(&opts.pollInterval, "poll-interval", envDuration("DOCUMENT_MANAGER_POLL_INTERVAL", time.Second), "manager reconciliation poll interval")
 	fs.DurationVar(&opts.commandPollInterval, "command-poll-interval", envDuration("DOCUMENT_MANAGER_COMMAND_POLL_INTERVAL", 250*time.Millisecond), "per-job command poll interval")
 	fs.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", envDuration("DOCUMENT_MANAGER_SHUTDOWN_TIMEOUT", 15*time.Second), "bounded shutdown timeout")
+	fs.BoolVar(&opts.allowRootfulRuntime, "allow-rootful-runtime", opts.allowRootfulRuntime, "allow a rootful Docker daemon; intended only for the Compose test profile")
+	fs.BoolVar(&opts.allowMutableImage, "allow-mutable-image", opts.allowMutableImage, "allow genericagent-document-tool:<tag>; intended only for the Compose test profile")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -149,18 +163,20 @@ func buildDocumentManagerConfig(opts documentManagerOptions) (application.Manage
 	}
 
 	runtimeCfg := document.DockerConfig{
-		Binary:         opts.runtimeBinary,
-		Image:          opts.image,
-		WorkRoot:       opts.workRoot,
-		SeccompProfile: opts.seccompProfile,
-		UID:            opts.uid,
-		GID:            opts.gid,
-		MemoryBytes:    opts.memoryBytes,
-		CPUPeriod:      opts.cpuPeriod,
-		CPUQuota:       opts.cpuQuota,
-		PIDsLimit:      opts.pidsLimit,
-		TmpfsBytes:     opts.tmpfsBytes,
-		Command:        []string{"/usr/local/bin/ga-document-tool", "idle"},
+		Binary:              opts.runtimeBinary,
+		Image:               opts.image,
+		WorkRoot:            opts.workRoot,
+		SeccompProfile:      opts.seccompProfile,
+		UID:                 opts.uid,
+		GID:                 opts.gid,
+		MemoryBytes:         opts.memoryBytes,
+		CPUPeriod:           opts.cpuPeriod,
+		CPUQuota:            opts.cpuQuota,
+		PIDsLimit:           opts.pidsLimit,
+		TmpfsBytes:          opts.tmpfsBytes,
+		Command:             []string{"/usr/local/bin/ga-document-tool", "idle"},
+		AllowRootfulRuntime: opts.allowRootfulRuntime,
+		AllowMutableImage:   opts.allowMutableImage,
 	}
 	if _, err := document.NewDockerCLI(runtimeCfg); err != nil {
 		return application.ManagerConfig{}, document.DockerConfig{}, err
@@ -211,6 +227,18 @@ func parseEnvInt64(name string) (int64, bool) {
 		return 0, false
 	}
 	return value, true
+}
+
+func envBool(name string, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false: %w", name, err)
+	}
+	return value, nil
 }
 
 func envDuration(name string, fallback time.Duration) time.Duration {

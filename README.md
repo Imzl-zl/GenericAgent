@@ -167,13 +167,9 @@ GLOBAL=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/lsdefine/Generi
 
 ---
 
-## 🛡️ Secure Platform Deployment
+## 🛡️ Platform Deployment
 
-GenericAgent Local remains cross-platform for Windows, Linux, and macOS. The multi-tenant document platform is a separate security-hardened deployment profile and currently requires Linux with systemd, cgroup v2, and a dedicated rootless Docker runtime.
-
-- Self-service single-host profile: [`tenant_platform/infra/compose/README.zh-CN.md`](tenant_platform/infra/compose/README.zh-CN.md)
-- Build and publish all four Linux images: `python tenant_platform/infra/compose/release_images.py --registry registry.example/namespace`
-- All-systemd profile: [`tenant_platform/infra/deploy/README.md`](tenant_platform/infra/deploy/README.md)
+The multi-tenant platform has one supported deployment entry: [Docker Compose](tenant_platform/infra/compose/README.zh-CN.md). It requires a Linux host with Docker Engine and Docker Compose v2.
 
 ---
 
@@ -568,14 +564,9 @@ python launch.pyw
 
 ---
 
-## 🛡️ 安全平台部署
+## 🛡️ 平台部署
 
-本地 GA 仍支持 Windows、Linux 和 macOS。多租户文档平台是独立的安全加固部署 profile，当前要求 Linux、systemd、cgroup v2 和独立 rootless Docker runtime。
-
-- 1Panel 快速启动（暂不含 DOCX）：[`tenant_platform/infra/compose/README.1panel.zh-CN.md`](tenant_platform/infra/compose/README.1panel.zh-CN.md)
-- 单机 Compose 部署与打包：[`tenant_platform/infra/compose/README.zh-CN.md`](tenant_platform/infra/compose/README.zh-CN.md)
-- 一次构建并推送四张 Linux 镜像：`python tenant_platform/infra/compose/release_images.py --registry registry.example/namespace`
-- 全 systemd 部署：[`tenant_platform/infra/deploy/README.md`](tenant_platform/infra/deploy/README.md)
+多租户平台只保留一条部署入口：[Docker Compose](tenant_platform/infra/compose/README.zh-CN.md)。目标主机需要 Linux、Docker Engine 和 Docker Compose v2。
 
 ---
 
