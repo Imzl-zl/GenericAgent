@@ -167,7 +167,7 @@ GLOBAL=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/lsdefine/Generi
 
 ---
 
-## 🛡️ Platform Deployment
+## 🛡️ Secure Platform Deployment
 
 The multi-tenant platform has one supported deployment entry: [Docker Compose](tenant_platform/infra/compose/README.zh-CN.md). It requires a Linux host with Docker Engine and Docker Compose v2.
 
@@ -564,7 +564,7 @@ python launch.pyw
 
 ---
 
-## 🛡️ 平台部署
+## 🛡️ 安全平台部署
 
 多租户平台只保留一条部署入口：[Docker Compose](tenant_platform/infra/compose/README.zh-CN.md)。目标主机需要 Linux、Docker Engine 和 Docker Compose v2。
 

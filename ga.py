@@ -466,6 +466,8 @@ class GenericAgentHandler(BaseHandler):
         self.working['passed_sessions'] = 0
         yield f"[Info] Updated key_info and related_sop.\n"
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
+        if self.current_turn <= 1:
+            next_prompt += "\n[TIPS] Working checkpoint updated. Do not call update_working_checkpoint again unless new, non-obvious facts appear. Skip for short tasks.\n"
         #next_prompt += '\n[SYSTEM TIPS] 此函数一般在任务开始或中间时调用，如果任务已成功完成应该是start_long_term_update用于结算长期记忆。\n'
         return StepOutcome({"result": "working key_info updated"}, next_prompt=next_prompt)
 
@@ -539,7 +541,7 @@ class GenericAgentHandler(BaseHandler):
         path = './memory/memory_management_sop.md'
         if os.path.exists(path): result = 'This is L0:\n' + file_read(path, show_linenos=False)
         else: result = "Memory Management SOP not found. Do not update memory."
-        if self.current_turn < 10: result, prompt = 'start_long_term_update is only used after completing a long turn task!', '.\n'
+        if self.current_turn < 10: result, prompt = 'start_long_term_update is only used after completing a long turn task!', '\n'
         return StepOutcome(result, next_prompt=prompt)
 
     def _fold_earlier(self, lines):

@@ -165,4 +165,3 @@ plugins/subscription_portal.py
 # Tenant platform runtime data (checkpoints, overlays, staging, results).
 # runtime/config/mykey.py is already covered by the global mykey.py rule above.
 tenant_platform/runtime/runtime_data/
-
