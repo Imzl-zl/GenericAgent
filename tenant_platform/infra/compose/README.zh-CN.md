@@ -2,6 +2,8 @@
 
 这是平台唯一保留的部署方式：一个 `compose.yaml` 编排全部服务，一个 `.env` 放全部配置。`docker compose up -d --build` 会启动 Web、Platform、Bot Poller、PostgreSQL 和 `document-manager`，DOCX 文档功能包含在内。
 
+> 本文描述当前可运行的部署实现。后续“每个用户工作区一个 GA Runner”重构仍处于方案阶段，详见 [GA Sandbox Runner 重构方案](../../docs/GA_SANDBOX_RUNNER_REFACTOR.zh-CN.md)，不要依据该方案替换本文的现有启动步骤。
+
 ## 需要什么
 
 - Linux 服务器，建议 4 vCPU、8 GiB RAM、40 GiB 可用磁盘；

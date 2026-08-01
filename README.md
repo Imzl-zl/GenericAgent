@@ -171,6 +171,8 @@ GLOBAL=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/lsdefine/Generi
 
 The multi-tenant platform has one supported deployment entry: [Docker Compose](tenant_platform/infra/compose/README.zh-CN.md). It requires a Linux host with Docker Engine and Docker Compose v2.
 
+The current deployment includes the Document Manager and full DOCX workflow. The planned refactor to one GA Sandbox Runner per user workspace is documented separately in [GA Sandbox Runner Refactor Plan](tenant_platform/docs/GA_SANDBOX_RUNNER_REFACTOR.zh-CN.md); it is not part of the current deployment contract.
+
 ---
 
 ## 💻 Usage
