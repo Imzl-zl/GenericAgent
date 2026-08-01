@@ -1,7 +1,9 @@
 # GA Sandbox Runner 重构方案（原生租户工作区）
 
-> 状态：方案草案，尚未实施。
-> 当前可运行部署仍以 [Compose 部署说明](../infra/compose/README.zh-CN.md) 为准；本文不改变现有运行方式。
+> 状态：已实施（2025-08，仓库 main 分支）。
+> 部署形态见 [Compose 部署说明](../infra/compose/README.zh-CN.md)：六常驻服务
+> postgres/platform/bot-poller/web/llm-proxy/sandbox-manager，ga-runner 按工作区
+> 活跃状态动态创建。方案第 10 节验证门中需真实 Linux 主机/runsc 的项仍待部署验证。
 >
 > **核心决定：** 渠道只是消息入口。个人用户或团队租户拥有一份完整、持久、可编辑的 GA 原生工作区；其中包含 `memory/`、`temp/`、项目、文件、会话历史和用户 SOP。一个活跃工作区独占一个隔离 Runner，Runner 从不在不同工作区间复用。
 

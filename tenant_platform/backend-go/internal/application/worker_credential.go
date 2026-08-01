@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -24,7 +23,6 @@ type workerCredentialSet struct {
 	JTIs        []string
 	Snapshot    routingSnapshot
 	MCPSnapshot RuntimeMCPSnapshot
-	Document    RuntimeDocumentGateway
 }
 
 const credentialRevokeTimeout = 5 * time.Second
@@ -46,7 +44,7 @@ func (s *scheduler) issueProviderCapabilities(
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
 	}
-	return s.issueProviderCapabilitiesWithRuntime(ctx, sessionKey, snapshot, mcpSnapshot, RuntimeDocumentGateway{}, generation)
+	return s.issueProviderCapabilitiesWithRuntime(ctx, sessionKey, snapshot, mcpSnapshot, generation, "")
 }
 
 func (s *scheduler) issueProviderCapabilitiesWithMCP(
@@ -56,7 +54,7 @@ func (s *scheduler) issueProviderCapabilitiesWithMCP(
 	mcpSnapshot RuntimeMCPSnapshot,
 	generation uint64,
 ) (workerCredentialSet, RuntimeConfigFiles, error) {
-	return s.issueProviderCapabilitiesWithRuntime(ctx, sessionKey, snapshot, mcpSnapshot, RuntimeDocumentGateway{}, generation)
+	return s.issueProviderCapabilitiesWithRuntime(ctx, sessionKey, snapshot, mcpSnapshot, generation, "")
 }
 
 func (s *scheduler) issueProviderCapabilitiesWithRuntime(
@@ -64,19 +62,20 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 	sessionKey string,
 	snapshot routingSnapshot,
 	mcpSnapshot RuntimeMCPSnapshot,
-	documentGateway RuntimeDocumentGateway,
 	generation uint64,
+	taskID string,
 ) (workerCredentialSet, RuntimeConfigFiles, error) {
 	if s.cfg.TokenIssuer == nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, nil
 	}
 	bindings := make([]RuntimeProviderBinding, 0, len(snapshot.Providers))
-	set := workerCredentialSet{Generation: generation, Snapshot: snapshot, MCPSnapshot: mcpSnapshot, Document: documentGateway}
+	set := workerCredentialSet{Generation: generation, Snapshot: snapshot, MCPSnapshot: mcpSnapshot}
 	for _, routed := range snapshot.Providers {
 		token, claims, err := s.cfg.TokenIssuer.Issue(llmproxy.CapabilitySpec{
 			SessionKey: sessionKey, ProviderID: routed.ID, ProviderRevision: routed.Revision,
 			ProviderType: routed.ProviderType, Model: routed.Model,
 			PolicyVersion: s.cfg.ModelPolicyVersion,
+			TaskID: taskID, RunnerGeneration: generation,
 		})
 		if err != nil {
 			s.revokeCredentialSetBestEffort(ctx, set)
@@ -100,10 +99,20 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 		set.JTIs = append(set.JTIs, claims.ID)
 		bindings = append(bindings, RuntimeProviderBinding{Provider: routed.runtimeProvider(), Token: token})
 	}
+	// Sophub proxy capability(方案 §5.2): 经同一签发体系, audience=ga-sophub-proxy。
+	var sophub *RuntimeSophubProxy
+	if s.cfg.TokenIssuer != nil && s.cfg.SophubProxyBaseURL != "" {
+		sophubToken, _, err := s.cfg.TokenIssuer.IssueSophubToken(sessionKey, llmproxy.DefaultTokenTTL)
+		if err != nil {
+			s.revokeCredentialSetBestEffort(ctx, set)
+			return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("issue sophub capability: %w", err)
+		}
+		sophub = &RuntimeSophubProxy{BaseURL: s.cfg.SophubProxyBaseURL, CapabilityToken: sophubToken}
+	}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
 		Generation: generation, ProxyBaseURL: s.cfg.LLMProxyAddr,
 		RoutingSnapshotID: snapshot.ID, Providers: bindings, MCP: mcpSnapshot,
-		Document: documentGateway,
+		Sophub: sophub,
 	})
 	if err != nil {
 		s.revokeCredentialSetBestEffort(ctx, set)
@@ -127,11 +136,7 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	if err != nil {
 		return workerCredentialSet{}, err
 	}
-	documentGateway, err := s.resolveRuntimeDocumentGateway(ctx, task)
-	if err != nil {
-		return workerCredentialSet{}, err
-	}
-	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, documentGateway, 1)
+	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, 1, task.ID)
 	if err != nil {
 		return workerCredentialSet{}, err
 	}
@@ -140,41 +145,6 @@ func (s *scheduler) issueInitialWorkerCredentials(
 		return workerCredentialSet{}, fmt.Errorf("write token-only runtime config: %w", err)
 	}
 	return set, nil
-}
-
-func (s *scheduler) resolveRuntimeDocumentGateway(ctx context.Context, task domain.Task) (RuntimeDocumentGateway, error) {
-	if strings.TrimSpace(s.cfg.DocumentGatewayBaseURL) == "" {
-		return RuntimeDocumentGateway{}, nil
-	}
-	if s.cfg.DocumentGatewayTokenIssuer == nil {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway token issuer is required")
-	}
-	if strings.TrimSpace(task.SessionKey) == "" || strings.TrimSpace(task.WorkspaceID) == "" {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway requires task session_key and workspace_id")
-	}
-	token, err := s.cfg.DocumentGatewayTokenIssuer.IssueDocumentGatewayToken(ctx, task.SessionKey, task.WorkspaceID)
-	if err != nil {
-		return RuntimeDocumentGateway{}, fmt.Errorf("issue document gateway token: %w", err)
-	}
-	gateway, err := validateRuntimeDocumentGateway(RuntimeDocumentGateway{
-		BaseURL: strings.TrimSpace(s.cfg.DocumentGatewayBaseURL), CapabilityToken: token,
-		SessionKey: task.SessionKey, WorkspaceID: task.WorkspaceID,
-	})
-	if err != nil {
-		return RuntimeDocumentGateway{}, err
-	}
-	return gateway, nil
-}
-
-func (s *scheduler) refreshRuntimeDocumentGateway(
-	ctx context.Context, current RuntimeDocumentGateway,
-) (RuntimeDocumentGateway, error) {
-	if !runtimeDocumentGatewayConfigured(current) {
-		return RuntimeDocumentGateway{}, nil
-	}
-	return s.resolveRuntimeDocumentGateway(ctx, domain.Task{
-		SessionKey: current.SessionKey, WorkspaceID: current.WorkspaceID,
-	})
 }
 
 func (s *scheduler) credentialsNeedRefresh(set workerCredentialSet) bool {
@@ -199,13 +169,9 @@ func (s *scheduler) refreshWorkerCredentials(ctx context.Context, entry *workerE
 		// Credential reload intentionally preserves the worker's immutable MCP
 		// catalog. MCP changes are detected in prepareWorkerEntry and applied by
 		// replacing the worker at a task boundary, never by hot-reloading tools.
-		documentGateway, err := s.refreshRuntimeDocumentGateway(ctx, entry.credentials.Document)
-		if err != nil {
-			return err
-		}
 		newSet, files, err := s.issueProviderCapabilitiesWithRuntime(
 			ctx, entry.sessionKey, entry.credentials.Snapshot,
-			entry.credentials.MCPSnapshot, documentGateway, generation,
+			entry.credentials.MCPSnapshot, generation, entry.taskID,
 		)
 		if err != nil {
 			return err

@@ -6,15 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/google/uuid"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
@@ -49,20 +46,21 @@ type RuntimeMCPSnapshot struct {
 	Servers []RuntimeMCPServer `json:"servers"`
 }
 
-type RuntimeDocumentGateway struct {
-	BaseURL         string `json:"base_url"`
-	CapabilityToken string `json:"capability_token"`
-	SessionKey      string `json:"session_key"`
-	WorkspaceID     string `json:"workspace_id"`
-}
-
 type RuntimeConfigInput struct {
 	Generation        uint64
 	ProxyBaseURL      string
 	RoutingSnapshotID string
 	Providers         []RuntimeProviderBinding
 	MCP               RuntimeMCPSnapshot
-	Document          RuntimeDocumentGateway
+	// Sophub proxy capability(方案 §5.2): 非空时写入 _platform_sophub,
+	// Worker 经 Platform 受控 proxy 搜索/安装 SOP, 不持有 Sophub API Key。
+	Sophub *RuntimeSophubProxy
+}
+
+// RuntimeSophubProxy 是 Worker 可用的 Sophub proxy 端点(带短期 capability)。
+type RuntimeSophubProxy struct {
+	BaseURL         string `json:"base_url"`
+	CapabilityToken string `json:"capability_token"`
 }
 
 type RuntimeConfigMetadata struct {
@@ -107,12 +105,14 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 		}
 		document["_platform_mcp"] = input.MCP
 	}
-	if runtimeDocumentGatewayConfigured(input.Document) {
-		gateway, err := validateRuntimeDocumentGateway(input.Document)
-		if err != nil {
-			return RuntimeConfigFiles{}, err
+	if input.Sophub != nil {
+		if strings.TrimSpace(input.Sophub.BaseURL) == "" || strings.TrimSpace(input.Sophub.CapabilityToken) == "" {
+			return RuntimeConfigFiles{}, fmt.Errorf("sophub proxy base_url and capability_token are required")
 		}
-		document["_platform_document"] = gateway
+		document["_platform_sophub"] = map[string]any{
+			"base_url":         strings.TrimRight(strings.TrimSpace(input.Sophub.BaseURL), "/"),
+			"capability_token": strings.TrimSpace(input.Sophub.CapabilityToken),
+		}
 	}
 	seen := make(map[int64]struct{}, len(input.Providers))
 	mixinNames := make([]string, 0, len(input.Providers))
@@ -231,57 +231,6 @@ func validateRuntimeMCPSnapshot(snapshot RuntimeMCPSnapshot) error {
 		}
 	}
 	return nil
-}
-
-func runtimeDocumentGatewayConfigured(gateway RuntimeDocumentGateway) bool {
-	return strings.TrimSpace(gateway.BaseURL) != "" ||
-		strings.TrimSpace(gateway.CapabilityToken) != "" ||
-		strings.TrimSpace(gateway.SessionKey) != "" ||
-		strings.TrimSpace(gateway.WorkspaceID) != ""
-}
-
-func validateRuntimeDocumentGateway(gateway RuntimeDocumentGateway) (RuntimeDocumentGateway, error) {
-	gateway.BaseURL = strings.TrimRight(strings.TrimSpace(gateway.BaseURL), "/")
-	gateway.CapabilityToken = strings.TrimSpace(gateway.CapabilityToken)
-	gateway.SessionKey = strings.TrimSpace(gateway.SessionKey)
-	gateway.WorkspaceID = strings.TrimSpace(gateway.WorkspaceID)
-	if gateway.BaseURL == "" || gateway.CapabilityToken == "" || gateway.SessionKey == "" || gateway.WorkspaceID == "" {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway base_url, capability_token, session_key, and workspace_id are required")
-	}
-	if strings.ContainsRune(gateway.SessionKey, '\x00') || len(gateway.SessionKey) > 256 {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway session_key is invalid")
-	}
-	if len(gateway.CapabilityToken) > 4096 {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway capability_token is too large")
-	}
-	if _, err := uuid.Parse(gateway.WorkspaceID); err != nil {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway workspace_id must be a UUID: %w", err)
-	}
-	parsed, err := url.Parse(gateway.BaseURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway base_url must be absolute")
-	}
-	if parsed.Scheme != "http" {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway base_url must use http loopback")
-	}
-	if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway base_url must not contain userinfo, query, or fragment")
-	}
-	if strings.HasSuffix(parsed.Host, ":") {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway base_url port is invalid")
-	}
-	if port := parsed.Port(); port != "" {
-		value, err := strconv.Atoi(port)
-		if err != nil || value < 1 || value > 65535 {
-			return RuntimeDocumentGateway{}, fmt.Errorf("document gateway base_url port is invalid")
-		}
-	}
-	host := parsed.Hostname()
-	ip := net.ParseIP(host)
-	if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-		return RuntimeDocumentGateway{}, fmt.Errorf("document gateway base_url must be loopback")
-	}
-	return gateway, nil
 }
 
 func parseProxyBase(raw string) (*url.URL, error) {

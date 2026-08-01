@@ -120,6 +120,9 @@ def web_scan(tabs_only=False, switch_tab_id=None, text_only=False, maxlen=35000)
     tabs_only: 仅返回标签页列表，不获取HTML内容（节省token）。
     switch_tab_id: 可选参数，如果提供，则在扫描前切换到该标签页。
     应当多用execute_js，少全量观察html"""
+    # 多租户 Runner 中宿主浏览器能力禁用(方案 §7: V1 禁用宿主浏览器入口)。
+    if os.environ.get("GA_DISABLE_HOST_BROWSER", "") == "1":
+        return {"error": "host browser access is disabled in this environment"}
     global driver
     try:
         if driver is None: first_init_driver()
@@ -167,6 +170,9 @@ def log_memory_access(path):
 
 def web_execute_js(script, switch_tab_id=None, no_monitor=False):
     """执行 JS 脚本来控制浏览器，并捕获结果和页面变化"""
+    # 多租户 Runner 中宿主浏览器能力禁用(方案 §7: V1 禁用宿主浏览器入口)。
+    if os.environ.get("GA_DISABLE_HOST_BROWSER", "") == "1":
+        return {"status": "error", "msg": "host browser access is disabled in this environment"}
     global driver
     try:
         if driver is None: first_init_driver()

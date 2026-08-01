@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -17,8 +18,11 @@ import (
 const (
 	CapabilityIssuer   = "ga-platform"
 	CapabilityAudience = "ga-llm-proxy"
-	CapabilityType     = "ga-llm-cap+jwt"
-	validationLeeway   = 30 * time.Second
+	// SophubAudience 是 Runner → Platform Sophub proxy 的 capability audience。
+	// 与 LLM capability 同签发体系但独立用途(方案 §5.2: Runner 不持有 Sophub Key)。
+	SophubAudience = "ga-sophub-proxy"
+	CapabilityType = "ga-llm-cap+jwt"
+	validationLeeway = 30 * time.Second
 )
 
 var (
@@ -29,12 +33,18 @@ var (
 )
 
 type CapabilitySpec struct {
+	// Audience 目标 audience; 空表示默认 LLM Proxy audience。
+	Audience         string
 	SessionKey       string
 	ProviderID       int64
 	ProviderRevision int64
 	ProviderType     domain.LLMProviderType
 	Model            string
 	PolicyVersion    string
+	// TaskID 与 RunnerGeneration 将 capability 绑定到单个 task 与 Runner
+	// generation(方案 §7): 终态后的 token 不能被下一条 task 继续使用。
+	TaskID           string
+	RunnerGeneration uint64
 }
 
 type CapabilityClaims struct {
@@ -43,6 +53,8 @@ type CapabilityClaims struct {
 	ProviderType     domain.LLMProviderType `json:"provider_type"`
 	Model            string                 `json:"model"`
 	PolicyVersion    string                 `json:"policy_version"`
+	TaskID           string                 `json:"task_id,omitempty"`
+	RunnerGeneration uint64                 `json:"runner_generation,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -97,10 +109,12 @@ func (i *Issuer) Issue(spec CapabilitySpec) (string, CapabilityClaims, error) {
 		ProviderType:     spec.ProviderType,
 		Model:            spec.Model,
 		PolicyVersion:    spec.PolicyVersion,
+		TaskID:           spec.TaskID,
+		RunnerGeneration: spec.RunnerGeneration,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    CapabilityIssuer,
 			Subject:   spec.SessionKey,
-			Audience:  jwt.ClaimStrings{CapabilityAudience},
+			Audience:  jwt.ClaimStrings{effectiveAudience(spec.Audience)},
 			ExpiresAt: jwt.NewNumericDate(now.Add(i.ttl)),
 			NotBefore: jwt.NewNumericDate(now),
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -183,6 +197,48 @@ func (v *Validator) Validate(ctx context.Context, tokenString string) (Capabilit
 
 func HashJTI(jti string) [32]byte {
 	return sha256.Sum256([]byte(jti))
+}
+
+// effectiveAudience 返回 audience(空 = LLM Proxy 默认)。
+func effectiveAudience(audience string) string {
+	if strings.TrimSpace(audience) == "" {
+		return CapabilityAudience
+	}
+	return audience
+}
+
+// IssueSophubToken 签发 Runner → Platform Sophub proxy 的短期 capability
+// (方案 §5.2: Runner 不持有 Sophub API Key)。
+func (i *Issuer) IssueSophubToken(sessionKey string, ttl time.Duration) (string, CapabilityClaims, error) {
+	if strings.TrimSpace(sessionKey) == "" {
+		return "", CapabilityClaims{}, fmt.Errorf("session key is required")
+	}
+	if ttl <= 0 {
+		ttl = i.ttl
+	}
+	jti, err := newJTI()
+	if err != nil {
+		return "", CapabilityClaims{}, err
+	}
+	now := i.clock().UTC()
+	claims := CapabilityClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    CapabilityIssuer,
+			Subject:   sessionKey,
+			Audience:  jwt.ClaimStrings{SophubAudience},
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			NotBefore: jwt.NewNumericDate(now),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        jti,
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["typ"] = CapabilityType
+	signed, err := token.SignedString(i.signingKey)
+	if err != nil {
+		return "", CapabilityClaims{}, fmt.Errorf("sign sophub capability token: %w", err)
+	}
+	return signed, claims, nil
 }
 
 func validateCapabilitySpec(spec CapabilitySpec) error {

@@ -56,7 +56,6 @@ type Task struct {
 	MessageIdempotencyKey string
 	Prompt                string
 	PersonaSnapshot       []string
-	SOPSnapshots          []TaskSOPSnapshot
 	ToolPolicyVersion     string
 	ClaimOwner            string
 	ClaimLeaseUntil       time.Time

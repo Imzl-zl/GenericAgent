@@ -113,23 +113,6 @@ func (r *routingAuditRecorder) AppendAuditEvent(_ context.Context, event domain.
 	return nil
 }
 
-type fakeDocumentGatewayTokenIssuer struct {
-	token      string
-	sessionKey string
-	workspace  string
-	calls      int
-	err        error
-}
-
-func (f *fakeDocumentGatewayTokenIssuer) IssueDocumentGatewayToken(_ context.Context, sessionKey, workspaceID string) (string, error) {
-	f.sessionKey = sessionKey
-	f.workspace = workspaceID
-	f.calls++
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.token, nil
-}
 
 func testProvider(id, revision int64, providerType domain.LLMProviderType, isDefault bool) domain.LLMProvider {
 	return domain.LLMProvider{
@@ -254,79 +237,6 @@ func TestRoutingSnapshotIgnoresDefaultSwitchAndDetectsBoundProviderChange(t *tes
 	}
 	if !replace {
 		t.Fatal("bound provider revision change must replace the Worker")
-	}
-}
-
-func TestIssueInitialWorkerCredentialsWritesDocumentGatewayConfig(t *testing.T) {
-	dir := t.TempDir()
-	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
-	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	documentIssuer := &fakeDocumentGatewayTokenIssuer{token: "document-token"}
-	s := &scheduler{cfg: SchedulerConfig{
-		TokenIssuer: issuer, LLMProvider: source, LLMProxyAddr: "http://127.0.0.1:9999",
-		ConfigRoot: dir, ModelPolicyVersion: "test.v1",
-		MaxTaskWallClock: 45 * time.Minute, TokenRefreshSkew: 5 * time.Minute,
-		DocumentGatewayBaseURL:     "http://127.0.0.1:8080/document-gateway",
-		DocumentGatewayTokenIssuer: documentIssuer,
-	}}
-	task := domain.Task{SessionKey: "team:docs", WorkspaceID: "11111111-1111-1111-1111-111111111111", RequesterID: 42}
-
-	set, err := s.issueInitialWorkerCredentials(context.Background(), task)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if set.Document.WorkspaceID != task.WorkspaceID || set.Document.SessionKey != task.SessionKey {
-		t.Fatalf("credential document config = %+v", set.Document)
-	}
-	if documentIssuer.sessionKey != task.SessionKey || documentIssuer.workspace != task.WorkspaceID {
-		t.Fatalf("document issuer saw session=%q workspace=%q", documentIssuer.sessionKey, documentIssuer.workspace)
-	}
-	runtimeJSON, err := os.ReadFile(filepath.Join(dir, runtimeConfigFilename))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var document map[string]json.RawMessage
-	if err := json.Unmarshal(runtimeJSON, &document); err != nil {
-		t.Fatal(err)
-	}
-	var gateway RuntimeDocumentGateway
-	if err := json.Unmarshal(document["_platform_document"], &gateway); err != nil {
-		t.Fatal(err)
-	}
-	if gateway.BaseURL != "http://127.0.0.1:8080/document-gateway" || gateway.CapabilityToken != "document-token" || gateway.SessionKey != task.SessionKey || gateway.WorkspaceID != task.WorkspaceID {
-		t.Fatalf("document gateway = %+v", gateway)
-	}
-	for _, forbidden := range []string{"requester_user_id", "DATABASE_URL", "docker", "podman"} {
-		if strings.Contains(string(document["_platform_document"]), forbidden) {
-			t.Fatalf("document gateway leaked %q: %s", forbidden, document["_platform_document"])
-		}
-	}
-}
-
-func TestRefreshRuntimeDocumentGatewayReissuesBoundCapability(t *testing.T) {
-	issuer := &fakeDocumentGatewayTokenIssuer{token: "refreshed-document-token"}
-	s := &scheduler{cfg: SchedulerConfig{
-		DocumentGatewayBaseURL:     "http://127.0.0.1:8080/document-gateway",
-		DocumentGatewayTokenIssuer: issuer,
-	}}
-	current := RuntimeDocumentGateway{
-		BaseURL: "http://127.0.0.1:8080/document-gateway", CapabilityToken: "old-token",
-		SessionKey: "team:docs", WorkspaceID: "11111111-1111-1111-1111-111111111111",
-	}
-
-	refreshed, err := s.refreshRuntimeDocumentGateway(context.Background(), current)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if issuer.calls != 1 || issuer.sessionKey != current.SessionKey || issuer.workspace != current.WorkspaceID {
-		t.Fatalf("issuer calls=%d session=%q workspace=%q", issuer.calls, issuer.sessionKey, issuer.workspace)
-	}
-	if refreshed.CapabilityToken != "refreshed-document-token" || refreshed.SessionKey != current.SessionKey || refreshed.WorkspaceID != current.WorkspaceID {
-		t.Fatalf("refreshed gateway = %+v", refreshed)
 	}
 }
 

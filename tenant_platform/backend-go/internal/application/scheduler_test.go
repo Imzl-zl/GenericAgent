@@ -16,30 +16,6 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
 
-func TestWorkerTaskEnvelopeCarriesSOPSnapshots(t *testing.T) {
-	task := domain.Task{
-		ID: "task-sop", SessionKey: "personal:1", RequesterID: 1,
-		Source: domain.SourceWechat, SourceInstanceID: "bot", MessageID: "message",
-		Prompt: "make report", PersonaSnapshot: []string{"persona"}, ToolPolicyVersion: "foundation.session-files.v1",
-		CreatedAt: time.Unix(100, 0).UTC(),
-		SOPSnapshots: []domain.TaskSOPSnapshot{{
-			SOPVersionID: "version-1", Title: "Report", Description: "Use for reports",
-			Content: "# Report\n", ContentDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		}},
-	}
-	envelope := workerTaskEnvelope(task)
-	if len(envelope.GetSopSnapshots()) != 1 {
-		t.Fatalf("snapshots=%+v", envelope.GetSopSnapshots())
-	}
-	snapshot := envelope.GetSopSnapshots()[0]
-	if snapshot.GetVersionId() != "version-1" || snapshot.GetContent() != "# Report\n" || snapshot.GetContentDigest() != task.SOPSnapshots[0].ContentDigest {
-		t.Fatalf("snapshot=%+v", snapshot)
-	}
-	if envelope.GetPrompt() != task.Prompt || len(envelope.GetPersonaSnapshot()) != 1 {
-		t.Fatalf("envelope=%+v", envelope)
-	}
-}
-
 func TestSchedulerConfigValidation(t *testing.T) {
 	// Covered primarily in task_service_test; keep explicit package-local case.
 	if _, err := NewScheduler(SchedulerConfig{}); err == nil {
@@ -1337,4 +1313,158 @@ func (w *blockedShutdownWorker) Shutdown(ctx context.Context, _ string) error {
 	<-ctx.Done()
 	close(w.deadlineObserved)
 	return ctx.Err()
+}
+
+// TestSchedulerGlobalCapacityKeepsTasksQueued verifies the GA_RUNNER_MAX_ACTIVE
+// contract: when the global running cap is reached, claimable tasks stay queued
+// (never finalized as failed) and are claimed once capacity frees up.
+func TestSchedulerGlobalCapacityKeepsTasksQueued(t *testing.T) {
+	_, store, reg, dev := serviceFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Two sessions, one task each, so per-tenant limits don't interfere.
+	dev2, err := store.EnsureDevelopmentContext(ctx, 2, "dev2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "cap-hold", MessageID: "cap-hold-1",
+		Prompt: "hold", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev2.SessionKey, RequesterUserID: 2,
+		Source: "web", SourceInstanceID: "cap-hold", MessageID: "cap-hold-2",
+		Prompt: "hold", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim the first task and hold it (simulating an in-flight Runner).
+	claimedFirst, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "cap-owner", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim first: ok=%v err=%v", ok, err)
+	}
+	_ = claimedFirst
+
+	// Second task must remain queued (not claimed) while the first task occupies
+	// the only capacity slot. ClaimNextTask would move it to starting, so we
+	// must NOT claim it manually — the tick loop's capacity gate decides.
+	second, err = store.GetTask(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Status != domain.TaskQueued {
+		t.Fatalf("second task status = %s, want queued before capacity tick", second.Status)
+	}
+
+	// The tick loop with MaxRunningTasks=1 must not claim the second task
+	// (CountRunningTasks >= cap), and must not finalize it as failed.
+	sched, err := NewScheduler(SchedulerConfig{
+		PlatformInstanceID: "cap-owner", ClaimLease: time.Minute,
+		Store: store, Registry: reg,
+		MaxRunningTasks: 1,
+		DialWorker: func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+			return newControlledWorker(), func() {}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mark first as running so CountRunningTasks sees 1 (claim alone leaves it starting).
+	if _, err := store.MarkDispatchStarted(ctx, first.ID, "cap-owner", "cap-worker"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.(*scheduler).tick(ctx); err != nil {
+		t.Fatalf("tick at capacity: %v", err)
+	}
+	after, err := store.GetTask(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != domain.TaskQueued {
+		t.Fatalf("second task status = %s after capacity tick, want queued (not failed)", after.Status)
+	}
+
+	// Release the running slot via cancellation; the queued task is claimable again.
+	if _, _, err := store.CancelTask(ctx, first.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev2.SessionKey, "cap-owner", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim after release: ok=%v err=%v", ok, err)
+	}
+	if claimed.ID != second.ID {
+		t.Fatalf("claimed %s, want %s", claimed.ID, second.ID)
+	}
+}
+
+// TestSchedulerRunnerKeySerialExecution verifies the runner_key contract: two
+// tasks under the same runner_key (personal:<uid>) are serial — the second
+// stays queued while the first is starting/running, and becomes claimable only
+// after the first terminal. The scheduler never creates a second Worker for
+// the same runner_key (workerEntry cache is keyed by SessionKey == runner_key).
+func TestSchedulerRunnerKeySerialExecution(t *testing.T) {
+	_, store, _, dev := serviceFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	first, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
+		Source: "web", SourceInstanceID: "serial", MessageID: "serial-1",
+		Prompt: "one", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: dev.UserID,
+		Source: "web", SourceInstanceID: "serial", MessageID: "serial-2",
+		Prompt: "two", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim first; second must not be claimable (serial gate).
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "serial-owner", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim first: ok=%v err=%v", ok, err)
+	}
+	if claimed.ID != first.ID {
+		t.Fatalf("claimed %s, want %s", claimed.ID, first.ID)
+	}
+	keys, err := store.ListClaimableSessionKeys(ctx, 16, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
+		if k == dev.SessionKey {
+			t.Fatalf("session %s still claimable while first task starting", dev.SessionKey)
+		}
+	}
+	secondAfter, err := store.GetTask(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondAfter.Status != domain.TaskQueued {
+		t.Fatalf("second status = %s, want queued", secondAfter.Status)
+	}
+
+	// Terminal first; second becomes claimable.
+	if _, _, err := store.CancelTask(ctx, first.ID, dev.UserID); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "serial-owner", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim second: ok=%v err=%v", ok, err)
+	}
+	if next.ID != second.ID {
+		t.Fatalf("claimed %s, want %s", next.ID, second.ID)
+	}
 }

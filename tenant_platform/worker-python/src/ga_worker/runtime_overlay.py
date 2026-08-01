@@ -53,6 +53,23 @@ def encode_session_id(session_key: str) -> str:
     return f"s-{digest}"
 
 
+def _link_dir(link: Path, target: Path) -> None:
+    """创建目录链接: 优先 symlink; Windows 无特权时回退 junction。"""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        if os.name == "nt":
+            import subprocess
+
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            raise
+
+
 def _validate_session_id(session_id: str) -> str:
     if not session_id or not isinstance(session_id, str):
         raise OverlayError("session_id must be a non-empty string")
@@ -165,20 +182,39 @@ def materialize_runtime_overlay(
         digests[rel] = _copy_manifest_entry(legacy_root, overlay_dir, rel)
 
     # Writable per-session memory/temp (not in immutable manifest).
+    # 方案 §4/§5: 容器 Runner 中 memory/temp 由 Manager 以工作区 subpath 挂载到
+    # 固定位置(/ga/legacy/memory、/ga/legacy/temp), overlay 通过符号链接指向
+    # 挂载点, GA 保持原生 ./temp 与 ../memory 相对路径约定且直接读写工作区。
+    # 非容器(loopback 开发)环境仍创建本地目录。
+    workspace_mem_raw = os.environ.get("GA_WORKSPACE_MEMORY", "").strip()
+    workspace_temp_raw = os.environ.get("GA_WORKSPACE_TEMP", "").strip()
+    workspace_mem = Path(workspace_mem_raw) if workspace_mem_raw else None
+    workspace_temp = Path(workspace_temp_raw) if workspace_temp_raw else None
+
     mem_dir = overlay_dir / "memory"
-    mem_dir.mkdir(parents=True, exist_ok=True)
-    lang_suffix = "_en" if lang == "en" else ""
-    mem_txt = mem_dir / "global_mem.txt"
-    if not mem_txt.exists():
-        mem_txt.write_text("# [Global Memory - L2]\n", encoding="utf-8")
-    mem_insight = mem_dir / "global_mem_insight.txt"
-    if not mem_insight.exists():
-        template = overlay_dir / f"assets/global_mem_insight_template{lang_suffix}.txt"
-        text = template.read_text(encoding="utf-8") if template.is_file() else ""
-        mem_insight.write_text(text, encoding="utf-8")
+    if workspace_mem is not None and workspace_mem.is_dir():
+        if mem_dir.exists():
+            shutil.rmtree(mem_dir)
+        _link_dir(mem_dir, workspace_mem)
+    else:
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        lang_suffix = "_en" if lang == "en" else ""
+        mem_txt = mem_dir / "global_mem.txt"
+        if not mem_txt.exists():
+            mem_txt.write_text("# [Global Memory - L2]\n", encoding="utf-8")
+        mem_insight = mem_dir / "global_mem_insight.txt"
+        if not mem_insight.exists():
+            template = overlay_dir / f"assets/global_mem_insight_template{lang_suffix}.txt"
+            text = template.read_text(encoding="utf-8") if template.is_file() else ""
+            mem_insight.write_text(text, encoding="utf-8")
     temp_dir = overlay_dir / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    (temp_dir / "model_responses").mkdir(parents=True, exist_ok=True)
+    if workspace_temp is not None and workspace_temp.is_dir():
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        _link_dir(temp_dir, workspace_temp)
+    else:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        (temp_dir / "model_responses").mkdir(parents=True, exist_ok=True)
 
     manifest: dict[str, Any] = {
         "schema_version": "genericagent.overlay-manifest.v1",

@@ -27,6 +27,10 @@ type DevBootstrapConfig struct {
 	WorkerPython string
 	WorkerSrc    string
 	ListenAddr   string
+	// Sandbox Runner(方案 §7): 工作区根、镜像内只读 memory 模板、Runner 镜像。
+	WorkspacesRoot string
+	MemoryTemplate string
+	RunnerImage    string
 }
 
 // DevTeamConfig bootstraps a minimal team workspace for multi-session testing.

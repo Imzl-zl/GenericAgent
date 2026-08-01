@@ -23,8 +23,6 @@ from ga_worker.checkpoint import (
     write_checkpoint_atomic,
 )
 from ga_worker.credential_config import CredentialConfigError, load_runtime_metadata
-from ga_worker.document_client import DocumentGatewayClient
-from ga_worker.document_config import DocumentConfigError, load_runtime_document_gateway
 from ga_worker.legacy_import import LegacyImportError, import_legacy_runtime
 from ga_worker.mcp_config import MCPConfigError, load_runtime_mcp_snapshot
 from ga_worker.mcp_runtime import MCPRuntimeError, close_mcp_clients, initialize_mcp_catalog
@@ -51,6 +49,13 @@ class SessionLifecycleMixin:
     def _validate_start_session_request(self, request: worker_pb2.StartSessionRequest) -> None:
         if not request.session_key:
             raise WorkerAdapterError("INVALID_SESSION_KEY", "session_key required")
+        # generation fencing(方案 §7): Runner 只接受绑定的 workspace_key 与 generation。
+        if not request.workspace_key:
+            raise WorkerAdapterError("INVALID_WORKSPACE_KEY", "workspace_key required")
+        if request.workspace_key != request.session_key:
+            raise WorkerAdapterError("WORKSPACE_KEY_MISMATCH", "workspace_key must match session_key")
+        if request.runner_generation == 0:
+            raise WorkerAdapterError("INVALID_RUNNER_GENERATION", "runner_generation required")
         policy = request.runtime_policy
         if not policy.capability_version:
             raise WorkerAdapterError("INVALID_RUNTIME_POLICY", "capability_version required")
@@ -97,12 +102,8 @@ class SessionLifecycleMixin:
         seed_working, seed_backend, seed_agent, seed_display = self._load_snapshot_if_any(request)
         try:
             credential_metadata = load_runtime_metadata(self.config_root)
-            document_gateway = load_runtime_document_gateway(self.config_root)
-        except (CredentialConfigError, DocumentConfigError) as exc:
+        except CredentialConfigError as exc:
             raise WorkerAdapterError("CREDENTIAL_CONFIG_ERROR", str(exc)) from exc
-        if document_gateway is not None and document_gateway.session_key != request.session_key:
-            raise WorkerAdapterError("DOCUMENT_CONFIG_ERROR", "document gateway session_key mismatch")
-        document_client = DocumentGatewayClient(document_gateway) if document_gateway is not None else None
         agent = self._create_agent(overlay_dir, manifest)
         self._restore_histories(agent, seed_agent, seed_backend)
         try:
@@ -119,6 +120,8 @@ class SessionLifecycleMixin:
             session_id=session_id,
             worker_instance_id=self.worker_instance_id,
             runtime_policy=copy.deepcopy(request.runtime_policy),
+            workspace_key=request.workspace_key,
+            runner_generation=request.runner_generation,
             snapshot_id=request.snapshot_id or "",
             snapshot_checksum=request.snapshot_checksum or "",
             snapshot_ref=request.snapshot_ref or "",
@@ -137,7 +140,6 @@ class SessionLifecycleMixin:
             mcp_snapshot_id=mcp_snapshot.snapshot_id,
             mcp_tools=mcp_tools,
             mcp_clients=mcp_clients,
-            document_client=document_client,
         )
         return worker_pb2.StartSessionResponse(
             session_key=self._session.session_key,
@@ -197,6 +199,8 @@ class SessionLifecycleMixin:
         sp = s.runtime_policy
         return (
             request.session_key == s.session_key
+            and (request.workspace_key or "") == s.workspace_key
+            and request.runner_generation == s.runner_generation
             and (request.snapshot_ref or "") == s.snapshot_ref
             and (request.snapshot_id or "") == s.snapshot_id
             and (request.snapshot_checksum or "") == s.snapshot_checksum
@@ -300,12 +304,6 @@ class SessionLifecycleMixin:
         close_mcp_clients(self._session.mcp_clients)
         self._session.mcp_clients = []
         self._session.mcp_tools = {}
-
-    def _close_session_document(self) -> None:
-        if self._session is None or self._session.document_client is None:
-            return
-        self._session.document_client.close_transport()
-        self._session.document_client = None
 
     def _safe_run(self, agent: Any) -> None:
         try:

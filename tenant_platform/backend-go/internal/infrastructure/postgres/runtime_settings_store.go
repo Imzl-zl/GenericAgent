@@ -2,83 +2,10 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"strings"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
-
-const documentPoolSettingsColumns = `
-enabled, max_active, min_ready, job_idle_ttl_seconds, ready_idle_ttl_seconds,
-global_queue_limit, per_tenant_queue_limit, per_tenant_active_limit,
-job_timeout_seconds, command_timeout_seconds, version, updated_by, updated_at, reason`
-
-func scanDocumentPoolSettings(row pgx.Row) (domain.DocumentPoolSettings, error) {
-	var settings domain.DocumentPoolSettings
-	err := row.Scan(
-		&settings.Enabled, &settings.MaxActive, &settings.MinReady,
-		&settings.JobIdleTTLSeconds, &settings.ReadyIdleTTLSeconds,
-		&settings.GlobalQueueLimit, &settings.PerTenantQueueLimit,
-		&settings.PerTenantActiveLimit, &settings.JobTimeoutSeconds,
-		&settings.CommandTimeoutSeconds, &settings.Version,
-		&settings.UpdatedBy, &settings.UpdatedAt, &settings.Reason,
-	)
-	return settings, err
-}
-
-func (s *Store) GetDocumentPoolSettings(ctx context.Context) (domain.DocumentPoolSettings, error) {
-	settings, err := scanDocumentPoolSettings(s.pool.QueryRow(ctx,
-		"SELECT "+documentPoolSettingsColumns+" FROM document_pool_settings WHERE singleton = TRUE"))
-	if err != nil {
-		return domain.DocumentPoolSettings{}, fmt.Errorf("get document pool settings: %w", err)
-	}
-	if err := domain.ValidateDocumentPoolSettings(settings, s.documentPoolDeploymentMaxActive); err != nil {
-		return domain.DocumentPoolSettings{}, fmt.Errorf("persisted document pool settings violate deployment policy: %w", err)
-	}
-	if err := domain.ValidateDocumentPoolSettingsReason(settings.Reason); err != nil {
-		return domain.DocumentPoolSettings{}, fmt.Errorf("persisted document pool settings have invalid reason: %w", err)
-	}
-	return settings, nil
-}
-
-func (s *Store) UpdateDocumentPoolSettings(ctx context.Context, settings domain.DocumentPoolSettings, expectedVersion, updatedBy int64, reason string) (domain.DocumentPoolSettings, error) {
-	if err := domain.ValidateDocumentPoolSettings(settings, s.documentPoolDeploymentMaxActive); err != nil {
-		return domain.DocumentPoolSettings{}, err
-	}
-	reason = strings.TrimSpace(reason)
-	if err := domain.ValidateDocumentPoolSettingsReason(reason); err != nil {
-		return domain.DocumentPoolSettings{}, err
-	}
-	if expectedVersion <= 0 || updatedBy <= 0 {
-		return domain.DocumentPoolSettings{}, fmt.Errorf("expected_version and updated_by must be positive")
-	}
-	row := s.pool.QueryRow(ctx, `
-UPDATE document_pool_settings
-SET enabled = $1, max_active = $2, min_ready = $3,
-    job_idle_ttl_seconds = $4, ready_idle_ttl_seconds = $5,
-    global_queue_limit = $6, per_tenant_queue_limit = $7,
-    per_tenant_active_limit = $8, job_timeout_seconds = $9,
-    command_timeout_seconds = $10, version = version + 1,
-    updated_by = $11, updated_at = now(), reason = $12
-WHERE singleton = TRUE AND version = $13
-RETURNING `+documentPoolSettingsColumns,
-		settings.Enabled, settings.MaxActive, settings.MinReady,
-		settings.JobIdleTTLSeconds, settings.ReadyIdleTTLSeconds,
-		settings.GlobalQueueLimit, settings.PerTenantQueueLimit,
-		settings.PerTenantActiveLimit, settings.JobTimeoutSeconds,
-		settings.CommandTimeoutSeconds, updatedBy, reason, expectedVersion)
-	stored, err := scanDocumentPoolSettings(row)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.DocumentPoolSettings{}, domain.ErrDocumentPoolSettingsConflict
-	}
-	if err != nil {
-		return domain.DocumentPoolSettings{}, fmt.Errorf("update document pool settings: %w", err)
-	}
-	return stored, nil
-}
 
 func (s *Store) GetIMInboundCoalesceWindowMS(ctx context.Context) (int, error) {
 	var windowMS int

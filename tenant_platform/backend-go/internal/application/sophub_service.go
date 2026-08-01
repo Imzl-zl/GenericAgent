@@ -22,28 +22,14 @@ type SophubClient interface {
 type SophubStore interface {
 	UpsertSophubBinding(ctx context.Context, binding domain.SophubBinding) (domain.SophubBinding, error)
 	GetSophubBinding(ctx context.Context) (domain.SophubBinding, error)
-	UpsertSOPCandidate(ctx context.Context, input domain.ImportSOPCandidateCommand) (domain.SOPCandidate, error)
-	ListSOPCandidates(ctx context.Context, status domain.SOPCandidateStatus) ([]domain.SOPCandidate, error)
-	ApproveSOPCandidate(ctx context.Context, candidateID string, adminUserID int64) (domain.SOPVersion, error)
-	RejectSOPCandidate(ctx context.Context, candidateID string, adminUserID int64, note string) error
-	ListSOPRegistry(ctx context.Context) ([]domain.SOPRegistryItem, error)
-	LoadSOPVersion(ctx context.Context, versionID string, adminUserID int64) (domain.SOPEntry, error)
-	UnloadSOP(ctx context.Context, entryID string, adminUserID int64) (domain.SOPEntry, error)
-	ListLoadedSOPVersions(ctx context.Context) ([]domain.SOPVersion, error)
 }
 
 type SophubService interface {
 	Bind(ctx context.Context, apiKey string, adminUserID int64) (domain.SophubBindingStatus, error)
 	GetBindingStatus(ctx context.Context) (domain.SophubBindingStatus, error)
 	Search(ctx context.Context, query string, page, pageSize int) (domain.SophubSearchResult, error)
-	ImportCandidate(ctx context.Context, remoteSOPID string) (domain.SOPCandidate, error)
-	ListCandidates(ctx context.Context, status domain.SOPCandidateStatus) ([]domain.SOPCandidate, error)
-	ApproveCandidate(ctx context.Context, candidateID string, adminUserID int64) (domain.SOPVersion, error)
-	RejectCandidate(ctx context.Context, candidateID string, adminUserID int64, note string) error
-	ListRegistry(ctx context.Context) ([]domain.SOPRegistryItem, error)
-	LoadVersion(ctx context.Context, versionID string, adminUserID int64) (domain.SOPEntry, error)
-	Unload(ctx context.Context, entryID string, adminUserID int64) (domain.SOPEntry, error)
-	ListLoaded(ctx context.Context) ([]domain.SOPVersion, error)
+	// FetchRemoteSOP 供 Worker proxy 使用: 返回远程 SOP 内容(不落任何注册表)。
+	FetchRemoteSOP(ctx context.Context, remoteSOPID string) (domain.SophubRemoteSOP, error)
 }
 
 type SophubServiceConfig struct {
@@ -103,7 +89,7 @@ func (service *sophubService) GetBindingStatus(ctx context.Context) (domain.Soph
 
 func (service *sophubService) Search(ctx context.Context, query string, page, pageSize int) (domain.SophubSearchResult, error) {
 	query = strings.TrimSpace(query)
-	if !utf8.ValidString(query) || len([]byte(query)) > domain.MaxSOPTitleBytes {
+	if !utf8.ValidString(query) || len([]byte(query)) > 200 {
 		return domain.SophubSearchResult{}, fmt.Errorf("Sophub search query is invalid")
 	}
 	apiKey, err := service.bindingKey(ctx)
@@ -117,63 +103,24 @@ func (service *sophubService) Search(ctx context.Context, query string, page, pa
 	return result, nil
 }
 
-func (service *sophubService) ImportCandidate(ctx context.Context, remoteSOPID string) (domain.SOPCandidate, error) {
+// FetchRemoteSOP 返回远程 SOP(供 Worker proxy; 不写入任何注册表/候选)。
+func (service *sophubService) FetchRemoteSOP(ctx context.Context, remoteSOPID string) (domain.SophubRemoteSOP, error) {
+	remoteSOPID = strings.TrimSpace(remoteSOPID)
+	if !utf8.ValidString(remoteSOPID) || len([]byte(remoteSOPID)) > domain.MaxSOPRemoteIDBytes {
+		return domain.SophubRemoteSOP{}, fmt.Errorf("remote SOP id is invalid")
+	}
 	apiKey, err := service.bindingKey(ctx)
 	if err != nil {
-		return domain.SOPCandidate{}, err
+		return domain.SophubRemoteSOP{}, err
 	}
 	remote, err := service.client.GetSOP(ctx, apiKey, remoteSOPID)
 	if err != nil {
-		return domain.SOPCandidate{}, fmt.Errorf("Sophub SOP fetch failed")
+		return domain.SophubRemoteSOP{}, fmt.Errorf("Sophub SOP fetch failed")
 	}
-	if remote.ID != strings.TrimSpace(remoteSOPID) {
-		return domain.SOPCandidate{}, fmt.Errorf("Sophub SOP identity mismatch")
+	if remote.ID != remoteSOPID {
+		return domain.SophubRemoteSOP{}, fmt.Errorf("Sophub SOP identity mismatch")
 	}
-	if remote.Status != "approved" || remote.PackageType != "single_file" {
-		return domain.SOPCandidate{}, fmt.Errorf("Sophub SOP must be approved single-file content")
-	}
-	input := domain.ImportSOPCandidateCommand{
-		RemoteSOPID: remote.ID,
-		Title:       remote.Title,
-		Description: remote.Preview,
-		FileType:    remote.FileType,
-		Content:     remote.Content,
-	}
-	if err := domain.ValidateImportSOPCandidate(input); err != nil {
-		return domain.SOPCandidate{}, err
-	}
-	return service.store.UpsertSOPCandidate(ctx, input)
-}
-
-func (service *sophubService) ListCandidates(ctx context.Context, status domain.SOPCandidateStatus) ([]domain.SOPCandidate, error) {
-	if status != "" && !status.IsValid() {
-		return nil, fmt.Errorf("invalid SOP candidate status")
-	}
-	return service.store.ListSOPCandidates(ctx, status)
-}
-
-func (service *sophubService) ApproveCandidate(ctx context.Context, candidateID string, adminUserID int64) (domain.SOPVersion, error) {
-	return service.store.ApproveSOPCandidate(ctx, candidateID, adminUserID)
-}
-
-func (service *sophubService) RejectCandidate(ctx context.Context, candidateID string, adminUserID int64, note string) error {
-	return service.store.RejectSOPCandidate(ctx, candidateID, adminUserID, note)
-}
-
-func (service *sophubService) ListRegistry(ctx context.Context) ([]domain.SOPRegistryItem, error) {
-	return service.store.ListSOPRegistry(ctx)
-}
-
-func (service *sophubService) LoadVersion(ctx context.Context, versionID string, adminUserID int64) (domain.SOPEntry, error) {
-	return service.store.LoadSOPVersion(ctx, versionID, adminUserID)
-}
-
-func (service *sophubService) Unload(ctx context.Context, entryID string, adminUserID int64) (domain.SOPEntry, error) {
-	return service.store.UnloadSOP(ctx, entryID, adminUserID)
-}
-
-func (service *sophubService) ListLoaded(ctx context.Context) ([]domain.SOPVersion, error) {
-	return service.store.ListLoadedSOPVersions(ctx)
+	return remote, nil
 }
 
 func (service *sophubService) bindingKey(ctx context.Context) (string, error) {

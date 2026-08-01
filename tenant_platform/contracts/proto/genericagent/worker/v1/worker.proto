@@ -29,6 +29,10 @@ message StartSessionRequest {
   RuntimePolicy runtime_policy = 3;
   string snapshot_id = 4;
   string snapshot_checksum = 5;
+  // workspace_key (personal:<uid> / team:<tid>) 与 runner_generation 由
+  // Platform 在 mTLS 握手后校验; Runner 侧拒绝不匹配的控制请求(方案 §7)。
+  string workspace_key = 6;
+  uint64 runner_generation = 7;
 }
 
 message StartSessionResponse {
@@ -46,14 +50,6 @@ message ReloadCredentialsResponse {
   string config_checksum = 2;
 }
 
-message SOPSnapshot {
-  string version_id = 1;
-  string title = 2;
-  string description = 3;
-  string content = 4;
-  string content_digest = 5;
-}
-
 message TaskEnvelope {
   string task_id = 1;
   string session_key = 2;
@@ -65,7 +61,9 @@ message TaskEnvelope {
   repeated string persona_snapshot = 8;
   string tool_policy_version = 9;
   google.protobuf.Timestamp created_at = 10;
-  repeated SOPSnapshot sop_snapshots = 11;
+  // 每 task capability 的 generation 墙(方案 §7): 终态后不可用于下一 task。
+  uint64 runner_generation = 12;
+  string capability_jti = 13;
 }
 
 message ExecuteTaskRequest { TaskEnvelope task = 1; }

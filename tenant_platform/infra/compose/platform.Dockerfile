@@ -16,7 +16,7 @@ ENV PYTHONUNBUFFERED=1 \
     GA_WORKER_PYTHON=/usr/local/bin/python3 \
     GA_WORKER_SRC=/opt/ga/worker-python/src \
     GA_MIGRATIONS_DIR=/opt/ga/migrations \
-    DOCUMENT_GATEWAY_BASE_URL=http://127.0.0.1:8080/v1/document
+    GA_WORKSPACE_TEMP=/var/lib/ga/runtime/workspace-temp
 
 RUN groupadd --system --gid 10003 ga-delivery \
     && groupadd --system --gid 10001 ga-platform \

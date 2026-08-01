@@ -26,7 +26,6 @@ var testSeedTables = []string{
 	"platform_commands",
 	"tool_policies",
 	"platform_runtime_settings",
-	"document_pool_settings",
 }
 
 // OpenTestPool returns a pool with exclusive, transactionally reset state.
@@ -90,16 +89,13 @@ func testSchemaHealthy(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 	var healthy bool
 	err := pool.QueryRow(ctx, `
 SELECT to_regclass('public.tasks') IS NOT NULL
-   AND to_regclass('public.migration_0033_document_job_finish_marker') IS NOT NULL
-   AND EXISTS (
-       SELECT 1 FROM information_schema.columns
-       WHERE table_schema='public' AND table_name='document_jobs' AND column_name='commands_closed_at'
-   )
-   AND EXISTS (
-       SELECT 1 FROM pg_trigger
-       WHERE tgrelid='public.task_sop_snapshots'::regclass
-         AND tgname='task_sop_snapshots_sealed' AND NOT tgisinternal
-   )
+   AND to_regclass('public.migration_0036_channel_bindings_marker') IS NOT NULL
+   AND to_regclass('public.migration_0037_runner_leases_marker') IS NOT NULL
+   AND to_regclass('public.migration_0039_drop_sophub_registry_marker') IS NOT NULL
+   AND to_regclass('public.sophub_bindings') IS NOT NULL
+   AND to_regclass('public.sop_candidates') IS NULL
+   AND to_regclass('public.task_sop_snapshots') IS NULL
+   AND to_regclass('public.document_jobs') IS NULL
 `).Scan(&healthy)
 	return healthy, err
 }

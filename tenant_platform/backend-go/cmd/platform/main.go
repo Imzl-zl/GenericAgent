@@ -22,9 +22,9 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/api"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/documentgateway"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/sandbox"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/logging"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/poller"
@@ -74,32 +74,106 @@ func envInt(name string, fallback int) int {
 	return n
 }
 
-// buildWorkerRuntime constructs the loopback Worker runtime. Podman/container
-// mode was abandoned (single-instance multi-tenant deployment); loopback is
-// the only supported runtime.
-func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRuntime, error) {
-	runtime, err := worker.NewLoopback(worker.LoopbackConfig{
-		Python:     boot.WorkerPython,
-		WorkerSrc:  boot.WorkerSrc,
-		LegacyRoot: boot.LegacyRoot,
-		PolicyFile: boot.PolicyFile,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("loopback runtime: %w", err)
+// envIntEither reads the first non-empty of two environment variables;
+// GA_RUNNER_MAX_ACTIVE is the new deployment name, MAX_RUNNING_TASKS the
+// legacy one. The first set variable wins.
+func envIntEither(primary, legacy string, fallback int) int {
+	for _, name := range []string{primary, legacy} {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			continue
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			continue
+		}
+		return n
 	}
-	return runtime, nil
+	return fallback
 }
 
-func buildDocumentGatewayIssuer(baseURL, signingKey string) (*documentgateway.Issuer, error) {
-	if strings.TrimSpace(baseURL) == "" {
-		return nil, nil
+// buildWorkerRuntime constructs the production Worker runtime.
+// GA_WORKER_EXECUTION_MODE=user_workspace_runner(默认)使用 Sandbox 工作区
+// Runner; loopback 仅显式用于开发降级(方案 §7: 不作静默回退)。
+func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRuntime, error) {
+	mode := strings.TrimSpace(os.Getenv("GA_WORKER_EXECUTION_MODE"))
+	if mode == "" {
+		mode = "user_workspace_runner"
 	}
-	issuer, err := documentgateway.NewIssuer([]byte(signingKey), llmproxy.DefaultTokenTTL)
+	if mode == "loopback" {
+		runtime, err := worker.NewLoopback(worker.LoopbackConfig{
+			Python:     boot.WorkerPython,
+			WorkerSrc:  boot.WorkerSrc,
+			LegacyRoot: boot.LegacyRoot,
+			PolicyFile: boot.PolicyFile,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("loopback runtime: %w", err)
+		}
+		return runtime, nil
+	}
+	if mode != "user_workspace_runner" {
+		return nil, fmt.Errorf("unknown GA_WORKER_EXECUTION_MODE %q (user_workspace_runner|loopback)", mode)
+	}
+
+	ca, err := worker.NewPlatformCA()
 	if err != nil {
-		return nil, fmt.Errorf("document gateway capability token issuer: %w", err)
+		return nil, fmt.Errorf("runner control CA: %w", err)
 	}
-	return issuer, nil
+	cli, err := sandboxCLI()
+	if err != nil {
+		return nil, err
+	}
+	manager := sandbox.NewManager(sandbox.ManagerConfig{
+		CLI:                 cli,
+		WorkspaceRoot:       boot.WorkspacesRoot,
+		MemoryTemplate:      boot.MemoryTemplate,
+		ContainerNamePrefix: "ga-runner",
+		Image:               boot.RunnerImage,
+	})
+	return worker.NewSandbox(worker.SandboxConfig{
+		Manager:        manager,
+		CA:             ca,
+		WorkspaceRoot:  boot.WorkspacesRoot,
+		MemoryTemplate: boot.MemoryTemplate,
+		Image:          boot.RunnerImage,
+	})
 }
+
+// sandboxCLI 构建固定 profile 的 Docker CLI(仅 Manager 使用)。
+// sophubProxyBaseURL 返回 Platform 的 Worker Sophub proxy 地址(方案 §5.2)。
+// 默认走 Platform 自身的 /v1/worker/sophub 端点(与 API 同地址)。
+func sophubProxyBaseURL() string {
+	if v := strings.TrimSpace(os.Getenv("GA_SOPHUB_PROXY_ADDR")); v != "" {
+		return v
+	}
+	return ""
+}
+
+func sandboxCLI() (*sandbox.DockerCLI, error) {
+	profile := sandbox.ValidProfile()
+	profile.Image = strings.TrimSpace(os.Getenv("GA_RUNNER_IMAGE"))
+	if profile.Image == "" {
+		profile.Image = "ga-runner:local"
+	}
+	profile.Runtime = strings.TrimSpace(os.Getenv("GA_RUNNER_SECURITY_PROFILE"))
+	workspacesRoot := strings.TrimSpace(os.Getenv("GA_WORKSPACES_ROOT"))
+	if workspacesRoot == "" {
+		return nil, fmt.Errorf("GA_WORKSPACES_ROOT is required for user_workspace_runner mode")
+	}
+	cli, err := sandbox.NewDockerCLI(sandbox.DockerConfig{
+		Binary:             "docker",
+		Profile:            profile,
+		WorkspacesRoot:     workspacesRoot,
+		ContainerNamePrefix: "ga-runner",
+	})
+	if err != nil {
+		// 配置错误由启动日志暴露, 不静默降级到 loopback(方案 §7)。
+		return nil, fmt.Errorf("sandbox docker cli: %w", err)
+	}
+	return cli, nil
+}
+
 
 // llmProxyConfig carries LLM Proxy startup parameters. The real upstream key
 // is fetched from the admin-configured provider store and decrypted with the
@@ -114,9 +188,6 @@ type llmProxyConfig struct {
 	allowedHTTPHosts     []string
 }
 
-// startLLMProxy starts the in-process LLM Proxy when externalAddr is empty,
-// or validates the external addr. Returns the Proxy base URL the Worker will
-// call (e.g. "http://127.0.0.1:port") and a shutdown function.
 func startLLMProxy(ctx context.Context, cfg llmProxyConfig) (string, func(), error) {
 	if cfg.externalAddr != "" {
 		return strings.TrimRight(cfg.externalAddr, "/"), func() {}, nil
@@ -251,7 +322,6 @@ func run() error {
 		workerSrc                 = flag.String("worker-src", "", "path to worker-python/src")
 		llmProxyAddr              = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
 		capabilitySigningKey      = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=32 bytes")
-		documentGatewayBaseURL    = flag.String("document-gateway-base-url", os.Getenv("DOCUMENT_GATEWAY_BASE_URL"), "loopback document gateway base URL (or DOCUMENT_GATEWAY_BASE_URL); empty disables Worker document capability")
 		modelPolicyVersion        = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
 		devExtraUsers             = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
 		devTeam                   = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
@@ -263,14 +333,13 @@ func run() error {
 		botPollerAPISecret        = flag.String("bot-poller-api-secret", os.Getenv("BOT_POLLER_API_SECRET"), "HMAC-SHA256 secret for authenticating requests to Bot Poller /start /send /stop (or BOT_POLLER_API_SECRET); empty = unauthenticated (INSECURE - dev/test only)")
 		platformWebhookURL        = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
 		webhookSecret             = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
-		maxRunningTasks           = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
+		maxRunningTasks           = flag.Int("max-running-tasks", envIntEither("GA_RUNNER_MAX_ACTIVE", "MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or GA_RUNNER_MAX_ACTIVE/MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
 		perTenantRunningLimit     = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
 		perUserQueueLimit         = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
 		taskTimeoutSeconds        = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
 		maxTaskWallClockSec       = flag.Int("max-task-wall-clock-seconds", envInt("MAX_TASK_WALL_CLOCK_SECONDS", 2700), "hard task wall-clock limit; capability TTL must cover this plus refresh skew")
 		taskIdleTimeoutSec        = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
 		workerIdleTTLSec          = flag.Int("worker-idle-ttl-seconds", envInt("WORKER_IDLE_TTL_SECONDS", 600), "Worker eviction threshold (or WORKER_IDLE_TTL_SECONDS). Default 600s (10min). Idle Worker processes (no active task) older than this are torn down to reclaim memory (pattern: Kubernetes pod eviction + AWS Lambda container reuse window). Next task cold-starts from last snapshot. 0 = keep Workers resident indefinitely (dev/test or tiny fleets).")
-		documentPoolMaxActiveHard = flag.Int("document-pool-max-active-hard", envInt("DOCUMENT_POOL_MAX_ACTIVE_HARD", 1), "deployment hard ceiling for administrator-managed document pool max_active")
 	)
 	flag.Parse()
 
@@ -279,9 +348,6 @@ func run() error {
 	}
 	if *claimLease <= 0 {
 		return fmt.Errorf("--claim-lease must be a positive duration")
-	}
-	if *documentPoolMaxActiveHard <= 0 {
-		return fmt.Errorf("--document-pool-max-active-hard must be positive")
 	}
 	resolvedPolicyFile, err := resolvePolicyPath(*policyFile)
 	if err != nil {
@@ -327,7 +393,7 @@ func run() error {
 		return err
 	}
 
-	store, err := postgres.NewStore(pool, postgres.WithDocumentPoolDeploymentMaxActive(*documentPoolMaxActiveHard))
+	store, err := postgres.NewStore(pool)
 	if err != nil {
 		return err
 	}
@@ -338,22 +404,6 @@ func run() error {
 	agentMaxTurns, err := store.GetAgentMaxTurns(ctx)
 	if err != nil {
 		return fmt.Errorf("load agent max turns: %w", err)
-	}
-	documentPoolSettings, err := store.GetDocumentPoolSettings(ctx)
-	if err != nil {
-		return fmt.Errorf("load document pool settings: %w", err)
-	}
-	documentPoolSettingsRuntime, err := application.NewDocumentPoolSettingsRuntime(documentPoolSettings, *documentPoolMaxActiveHard)
-	if err != nil {
-		return fmt.Errorf("initialize document pool settings runtime: %w", err)
-	}
-	documentPoolSettingsReconciler, err := application.NewDocumentPoolSettingsReconciler(
-		store,
-		documentPoolSettingsRuntime,
-		application.DefaultDocumentPoolSettingsReconcileInterval,
-	)
-	if err != nil {
-		return fmt.Errorf("initialize document pool settings reconciler: %w", err)
 	}
 	// Resource quotas: enforced by scheduler (global running cap) and store
 	// (per-user queued cap). Zero disables (dev/test).
@@ -395,6 +445,12 @@ func run() error {
 	}
 	if boot.LegacyRoot == "" {
 		boot.LegacyRoot = strings.TrimSpace(os.Getenv("GA_LEGACY_ROOT"))
+	}
+	boot.WorkspacesRoot = strings.TrimSpace(os.Getenv("GA_WORKSPACES_ROOT"))
+	boot.MemoryTemplate = strings.TrimSpace(os.Getenv("GA_MEMORY_TEMPLATE"))
+	boot.RunnerImage = strings.TrimSpace(os.Getenv("GA_RUNNER_IMAGE"))
+	if boot.RunnerImage == "" {
+		boot.RunnerImage = "ga-runner:local"
 	}
 
 	var devCtx postgres.DevelopmentContext
@@ -487,25 +543,6 @@ func run() error {
 		return fmt.Errorf("capability token issuer: %w", err)
 	}
 
-	documentIssuer, err := buildDocumentGatewayIssuer(*documentGatewayBaseURL, signingKey)
-	if err != nil {
-		return err
-	}
-	var documentValidator *documentgateway.Validator
-	var documentTools application.DocumentToolService
-	if documentIssuer != nil {
-		documentValidator, err = documentgateway.NewValidator([]byte(signingKey))
-		if err != nil {
-			return fmt.Errorf("document gateway capability validator: %w", err)
-		}
-		documentTools, err = application.NewDocumentToolService(application.DocumentToolServiceConfig{
-			Store: store, Registry: reg,
-		})
-		if err != nil {
-			return fmt.Errorf("document tool service: %w", err)
-		}
-	}
-
 	runtime, err := buildWorkerRuntime(boot)
 	if err != nil {
 		return err
@@ -530,8 +567,6 @@ func run() error {
 		ModelPolicyVersion:         strings.TrimSpace(*modelPolicyVersion),
 		LLMProvider:                store,
 		MCPServer:                  store,
-		DocumentGatewayBaseURL:     strings.TrimSpace(*documentGatewayBaseURL),
-		DocumentGatewayTokenIssuer: documentIssuer,
 		TokenTTL:                   llmproxy.DefaultTokenTTL,
 		TokenRefreshSkew:           application.DefaultTokenRefreshSkew,
 		MaxTaskWallClock:           time.Duration(*maxTaskWallClockSec) * time.Second,
@@ -722,11 +757,6 @@ func run() error {
 		Registry:                        reg,
 		Policies:                        store, // admin command/policy management (migration 0004)
 		RuntimeSettings:                 store,
-		DocumentPoolSettingsRuntime:     documentPoolSettingsRuntime,
-		DocumentPoolStatus:              store,
-		DocumentPoolDeploymentMaxActive: *documentPoolMaxActiveHard,
-		DocumentTools:                   documentTools,
-		DocumentCapabilityValidator:     documentValidator,
 		Sophub:                          sophubSvc,
 		Bots:                            store,
 		LLMProviders:                    store, // admin LLM provider management (migration 0007)
@@ -785,12 +815,6 @@ func run() error {
 	go func() {
 		schedulerDone <- sched.Run(ctx)
 	}()
-	go func() {
-		if err := documentPoolSettingsReconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			slog.ErrorContext(ctx, "document pool settings reconciler stopped", "error", err)
-		}
-	}()
-
 	if deliverySvc != nil {
 		go func() {
 			if err := deliverySvc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

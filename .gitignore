@@ -32,6 +32,8 @@ model_responses.txt
 mykey.py
 
 tasks/
+!tasks/.zhanggui-root
+!.tasks/sandbox-runner-refactor/tasks/
 
 *.zip
 *.exe
@@ -165,3 +167,6 @@ plugins/subscription_portal.py
 # Tenant platform runtime data (checkpoints, overlays, staging, results).
 # runtime/config/mykey.py is already covered by the global mykey.py rule above.
 tenant_platform/runtime/runtime_data/
+
+# ga-runner 镜像构建产物(由 scripts/build-memory-template.sh 生成)
+tenant_platform/infra/compose/memory-template/

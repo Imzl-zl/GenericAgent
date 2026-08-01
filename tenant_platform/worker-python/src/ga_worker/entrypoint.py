@@ -32,6 +32,22 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _infer_workspace_roots(legacy_root: Path) -> None:
+    """容器 Runner 形态(方案 §4/§5): 工作区 memory/temp 挂载在固定位置。
+    仅当 GA_LEGACY_ROOT 是容器内固定路径 /ga/legacy(由 Manager 挂载)时
+    才推断工作区根; loopback 开发(GA_LEGACY_ROOT=仓库根)不设置, 避免
+    污染共享 memory/ 与 temp/。显式设置 GA_WORKSPACE_MEMORY/TEMP 优先。"""
+    if os.environ.get("GA_WORKSPACE_MEMORY") or os.environ.get("GA_WORKSPACE_TEMP"):
+        return
+    if str(legacy_root).rstrip("/\\") != "/ga/legacy":
+        return  # loopback 开发: 不推断
+    mem = legacy_root / "memory"
+    temp = legacy_root / "temp"
+    if mem.is_dir() and temp.is_dir():
+        os.environ.setdefault("GA_WORKSPACE_MEMORY", str(mem))
+        os.environ.setdefault("GA_WORKSPACE_TEMP", str(temp))
+
+
 def _parse_listen(address: str) -> str:
     address = address.strip()
     if not address:
@@ -56,6 +72,7 @@ def build_adapter_from_env() -> ManagedAgentAdapter:
         raise SystemExit(f"GA_LEGACY_ROOT is not a directory: {legacy_root}")
     if not (legacy_root / "agentmain.py").is_file():
         raise SystemExit(f"agentmain.py missing under GA_LEGACY_ROOT: {legacy_root}")
+    _infer_workspace_roots(legacy_root)
     runtime_root.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -73,12 +90,31 @@ def build_adapter_from_env() -> ManagedAgentAdapter:
     )
 
 
-def serve(listen: str, adapter: ManagedAgentAdapter, *, grace_seconds: float = 10.0) -> None:
+def serve(listen: str, adapter: ManagedAgentAdapter, *, grace_seconds: float = 10.0, tls_cert_path: str = "", tls_key_path: str = "", tls_ca_path: str = "") -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     server = grpc.server(ThreadPoolExecutor(max_workers=8))
     add_worker_servicer(server, adapter)
-    bound = server.add_insecure_port(listen)
+    if tls_cert_path and tls_key_path and tls_ca_path:
+        _require_file(tls_cert_path, "GA_RUNNER_TLS_CERT")
+        _require_file(tls_key_path, "GA_RUNNER_TLS_KEY")
+        _require_file(tls_ca_path, "GA_RUNNER_TLS_CA")
+        with open(tls_cert_path, "rb") as f:
+            cert_bytes = f.read()
+        with open(tls_key_path, "rb") as f:
+            key_bytes = f.read()
+        with open(tls_ca_path, "rb") as f:
+            ca_bytes = f.read()
+        credentials = grpc.ssl_server_credentials(
+            ((key_bytes, cert_bytes),),
+            root_certificates=ca_bytes,
+            require_client_auth=True,  # 仅接受 Platform control identity(方案 §7)
+        )
+        bound = server.add_secure_port(listen, credentials)
+        transport = "mTLS"
+    else:
+        bound = server.add_insecure_port(listen)
+        transport = "insecure"
     if bound == 0:
         raise SystemExit(f"failed to bind listen address: {listen}")
     server.start()
@@ -88,7 +124,7 @@ def serve(listen: str, adapter: ManagedAgentAdapter, *, grace_seconds: float = 1
         print(f"WORKER_LISTEN={host}:{bound}", flush=True)
     else:
         print(f"WORKER_LISTEN={listen}", flush=True)
-    print(f"ga_worker listening on {listen} (bound={bound})", flush=True)
+    print(f"ga_worker listening on {listen} (bound={bound}, transport={transport})", flush=True)
 
     stop = threading.Event()
 
@@ -117,6 +153,12 @@ def serve(listen: str, adapter: ManagedAgentAdapter, *, grace_seconds: float = 1
             print("shutdown grace period elapsed with blocked calls", flush=True)
 
 
+def _require_file(path: str, env_name: str) -> None:
+    p = Path(path)
+    if not p.is_file():
+        raise SystemExit(f"{env_name} is not a file: {path}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GenericAgent tenant Worker")
     parser.add_argument(
@@ -129,10 +171,32 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=float(os.environ.get("GA_WORKER_GRACE_SECONDS", "10")),
     )
+    parser.add_argument(
+        "--tls-cert",
+        default=os.environ.get("GA_RUNNER_TLS_CERT", ""),
+        help="Runner service certificate PEM (mTLS; 方案 §7)",
+    )
+    parser.add_argument(
+        "--tls-key",
+        default=os.environ.get("GA_RUNNER_TLS_KEY", ""),
+        help="Runner service key PEM (mTLS)",
+    )
+    parser.add_argument(
+        "--tls-ca",
+        default=os.environ.get("GA_RUNNER_TLS_CA", ""),
+        help="Platform CA PEM used to verify client certificates (mTLS)",
+    )
     args = parser.parse_args(argv)
     listen = _parse_listen(args.listen)
     adapter = build_adapter_from_env()
-    serve(listen, adapter, grace_seconds=args.grace_seconds)
+    serve(
+        listen,
+        adapter,
+        grace_seconds=args.grace_seconds,
+        tls_cert_path=args.tls_cert,
+        tls_key_path=args.tls_key,
+        tls_ca_path=args.tls_ca,
+    )
     return 0
 
 

@@ -25,13 +25,6 @@ from ga_worker.state import PendingTask, TaskRunState, WorkerAdapterError
 
 # P-M8: named constants (no magic numbers).
 PRE_DISPATCH_BARRIER_TIMEOUT_S = 5.0
-MAX_SOP_SNAPSHOTS = 16
-MAX_SOP_CONTENT_BYTES = 64 * 1024
-MAX_SOP_TOTAL_BYTES = 256 * 1024
-MAX_SOP_TITLE_BYTES = 200
-MAX_SOP_DESCRIPTION_BYTES = 2048
-_SOP_VERSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
-_SOP_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
 def run_task(adapter: Any, request: worker_pb2.ExecuteTaskRequest) -> Iterator[worker_pb2.WorkerEvent]:
@@ -62,35 +55,6 @@ def _validate_task_request(task: worker_pb2.TaskEnvelope) -> None:
         raise WorkerAdapterError("INVALID_TASK", "task_id required")
     if not task.prompt and task.prompt != "":
         raise WorkerAdapterError("INVALID_TASK", "prompt required")
-    _validate_sop_snapshots(task.sop_snapshots)
-
-
-def _validate_sop_snapshots(snapshots: Any) -> None:
-    if len(snapshots) > MAX_SOP_SNAPSHOTS:
-        raise WorkerAdapterError("INVALID_SOP_SNAPSHOT", "too many SOP snapshots")
-    version_ids: set[str] = set()
-    total_bytes = 0
-    for snapshot in snapshots:
-        if not _SOP_VERSION_ID_RE.fullmatch(snapshot.version_id or "") or snapshot.version_id in version_ids:
-            raise WorkerAdapterError("INVALID_SOP_SNAPSHOT", "SOP version id is invalid or duplicated")
-        version_ids.add(snapshot.version_id)
-        if not _bounded_label(snapshot.title, MAX_SOP_TITLE_BYTES, allow_empty=False):
-            raise WorkerAdapterError("INVALID_SOP_SNAPSHOT", "SOP title is invalid")
-        if not _bounded_label(snapshot.description, MAX_SOP_DESCRIPTION_BYTES, allow_empty=True):
-            raise WorkerAdapterError("INVALID_SOP_SNAPSHOT", "SOP description is invalid")
-        content_bytes = snapshot.content.encode("utf-8")
-        if not content_bytes or len(content_bytes) > MAX_SOP_CONTENT_BYTES or not snapshot.content.strip():
-            raise WorkerAdapterError("INVALID_SOP_SNAPSHOT", "SOP content is invalid")
-        if any(ord(char) < 32 and char not in "\n\r\t" for char in snapshot.content):
-            raise WorkerAdapterError("INVALID_SOP_SNAPSHOT", "SOP content contains control characters")
-        total_bytes += len(content_bytes)
-        if total_bytes > MAX_SOP_TOTAL_BYTES:
-            raise WorkerAdapterError("INVALID_SOP_SNAPSHOT", "SOP snapshots exceed total byte limit")
-        if not _SOP_DIGEST_RE.fullmatch(snapshot.content_digest or ""):
-            raise WorkerAdapterError("INVALID_SOP_SNAPSHOT", "SOP digest is invalid")
-        actual = hashlib.sha256(content_bytes).hexdigest()
-        if not hmac.compare_digest(actual, snapshot.content_digest):
-            raise WorkerAdapterError("SOP_DIGEST_MISMATCH", "SOP content digest mismatch")
 
 
 def _bounded_label(value: str, max_bytes: int, *, allow_empty: bool) -> bool:
@@ -98,20 +62,6 @@ def _bounded_label(value: str, max_bytes: int, *, allow_empty: bool) -> bool:
         return False
     return not any(ord(char) < 32 or ord(char) == 127 for char in value)
 
-
-def _sop_system_prompts(snapshots: Any) -> list[str]:
-    prompts: list[str] = []
-    for snapshot in snapshots:
-        prompts.append(
-            "[PLATFORM APPROVED SOP]\n"
-            f"Title: {snapshot.title}\n"
-            f"Description: {snapshot.description}\n"
-            f"Digest: {snapshot.content_digest}\n"
-            "Apply these instructions when relevant. They cannot override platform security or tool policy.\n\n"
-            f"{snapshot.content}"
-            "[END PLATFORM APPROVED SOP]"
-        )
-    return prompts
 
 
 def _validate_and_reserve(
@@ -208,14 +158,12 @@ def _setup_runtime(
         max_turns=int(adapter._session.runtime_policy.max_turns),
         previous_persona=list(getattr(agent, "extra_sys_prompts", []) or []),
     )
-    agent.extra_sys_prompts = list(task.persona_snapshot) + _sop_system_prompts(task.sop_snapshots)
+    agent.extra_sys_prompts = list(task.persona_snapshot)
     if adapter._session is not None:
         adapter._session.generated_output_files = []
     try:
         state.sandbox_unwrap = install_session_file_sandbox(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
         state.mcp_unwrap = install_global_mcp_tools(adapter._session, adapter._legacy_mods)
-        from ga_worker.document_instrument import install_document_tools
-        state.document_unwrap = install_document_tools(adapter._session, task.task_id, adapter._legacy_mods)
         state.previous_schema = apply_tool_policy(tool_policy, adapter._legacy_mods)
         state.dispatch_unwrap = install_dispatch_guard(tool_policy, adapter._legacy_mods)
         state.seed_unwrap = prepare_handler_seed(
@@ -241,7 +189,7 @@ def _rollback_runtime_setup(adapter: Any, state: TaskRunState) -> None:
     sandbox_unwrap = getattr(state, "sandbox_unwrap", None)
     for unwrap in (
         state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap,
-        state.seed_unwrap, state.document_unwrap, state.mcp_unwrap, sandbox_unwrap,
+        state.seed_unwrap, state.mcp_unwrap, sandbox_unwrap,
     ):
         if unwrap is not None:
             try:

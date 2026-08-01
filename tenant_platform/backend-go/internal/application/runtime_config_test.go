@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -124,71 +123,6 @@ func TestBuildRuntimeConfigIncludesGlobalMCPSnapshot(t *testing.T) {
 	}
 }
 
-func TestBuildRuntimeConfigIncludesDocumentGatewayCapability(t *testing.T) {
-	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
-	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
-		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
-		Document: RuntimeDocumentGateway{
-			BaseURL: "http://127.0.0.1:8080/document-gateway/", CapabilityToken: "document-capability-token",
-			SessionKey: "personal:42", WorkspaceID: "11111111-1111-1111-1111-111111111111",
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var document map[string]json.RawMessage
-	if err := json.Unmarshal(files.JSON, &document); err != nil {
-		t.Fatal(err)
-	}
-	var gateway RuntimeDocumentGateway
-	if err := json.Unmarshal(document["_platform_document"], &gateway); err != nil {
-		t.Fatal(err)
-	}
-	if gateway.BaseURL != "http://127.0.0.1:8080/document-gateway" || gateway.CapabilityToken != "document-capability-token" {
-		t.Fatalf("document gateway = %+v", gateway)
-	}
-	for _, forbidden := range [][]byte{[]byte("DATABASE_URL"), []byte("docker"), []byte("podman"), []byte("C:\\"), []byte("/var/run/docker.sock")} {
-		if bytes.Contains(document["_platform_document"], forbidden) {
-			t.Fatalf("document gateway leaked forbidden deployment detail %q: %s", forbidden, document["_platform_document"])
-		}
-	}
-}
-
-func TestBuildRuntimeConfigRejectsUnsafeDocumentGateway(t *testing.T) {
-	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
-	valid := RuntimeDocumentGateway{
-		BaseURL: "http://127.0.0.1:8080", CapabilityToken: "document-capability-token",
-		SessionKey: "personal:42", WorkspaceID: "11111111-1111-1111-1111-111111111111",
-	}
-	tests := []struct {
-		name string
-		edit func(*RuntimeDocumentGateway)
-		want string
-	}{
-		{"external URL", func(g *RuntimeDocumentGateway) { g.BaseURL = "https://example.com" }, "loopback"},
-		{"query URL", func(g *RuntimeDocumentGateway) { g.BaseURL = "http://127.0.0.1:8080?x=1" }, "query"},
-		{"out of range port", func(g *RuntimeDocumentGateway) { g.BaseURL = "http://127.0.0.1:99999" }, "port"},
-		{"empty port", func(g *RuntimeDocumentGateway) { g.BaseURL = "http://127.0.0.1:" }, "port"},
-		{"missing token", func(g *RuntimeDocumentGateway) { g.CapabilityToken = "" }, "capability_token"},
-		{"bad workspace", func(g *RuntimeDocumentGateway) { g.WorkspaceID = "not-a-uuid" }, "workspace_id"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gateway := valid
-			tt.edit(&gateway)
-			_, err := BuildRuntimeConfig(RuntimeConfigInput{
-				Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
-				RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
-				Document: gateway,
-			})
-			if err == nil || !strings.Contains(strings.ToLower(err.Error()), tt.want) {
-				t.Fatalf("err=%v want %q", err, tt.want)
-			}
-		})
-	}
-}
-
 func TestBuildRuntimeConfigRejectsDuplicateProviderAndMissingToken(t *testing.T) {
 	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
 	for name, providers := range map[string][]RuntimeProviderBinding{
@@ -251,4 +185,43 @@ print(json.dumps({
 		t.Fatalf("decode GA probe %q: %v", output, err)
 	}
 	return result
+}
+
+func TestBuildRuntimeConfigIncludesSophubProxyCapability(t *testing.T) {
+	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
+		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
+		Sophub: &RuntimeSophubProxy{BaseURL: "http://127.0.0.1:8080", CapabilityToken: "sophub-cap"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(files.JSON, &document); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := document["_platform_sophub"]
+	if !ok {
+		t.Fatal("missing _platform_sophub")
+	}
+	var proxy RuntimeSophubProxy
+	if err := json.Unmarshal(raw, &proxy); err != nil {
+		t.Fatal(err)
+	}
+	if proxy.BaseURL != "http://127.0.0.1:8080" || proxy.CapabilityToken != "sophub-cap" {
+		t.Fatalf("proxy=%+v", proxy)
+	}
+}
+
+func TestBuildRuntimeConfigRejectsEmptySophubProxy(t *testing.T) {
+	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
+	_, err := BuildRuntimeConfig(RuntimeConfigInput{
+		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
+		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
+		Sophub: &RuntimeSophubProxy{BaseURL: "", CapabilityToken: "x"},
+	})
+	if err == nil {
+		t.Fatal("empty sophub base_url must fail")
+	}
 }

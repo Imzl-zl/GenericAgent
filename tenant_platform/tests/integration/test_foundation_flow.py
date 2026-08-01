@@ -430,6 +430,8 @@ def _start_platform(
     env["GA_WORKER_PYTHON"] = str(PYTHON)
     env["GA_WORKER_SRC"] = str(WORKER_SRC)
     env["GA_POLICY_FILE"] = str(POLICY_PATH)
+    # 集成测试使用 loopback 开发降级路径(方案 §7: 显式声明, 非静默回退)。
+    env["GA_WORKER_EXECUTION_MODE"] = "loopback"
     # The Platform receives only Proxy capability signing material and the DB
     # encryption key. The fixture upstream key enters through the Admin API.
     env["LLM_PROXY_CAPABILITY_SIGNING_KEY"] = CAPABILITY_SIGNING_KEY

@@ -32,27 +32,16 @@ type DevelopmentContext struct {
 type Store struct {
 	pool                            *pgxpool.Pool
 	perUserQueueLimit               int // 0 = disabled (dev/test); enforced inside SubmitTask tx
-	documentPoolDeploymentMaxActive int
 }
 
 type StoreOption func(*Store) error
-
-func WithDocumentPoolDeploymentMaxActive(limit int) StoreOption {
-	return func(store *Store) error {
-		if limit <= 0 {
-			return fmt.Errorf("document pool deployment max_active must be positive")
-		}
-		store.documentPoolDeploymentMaxActive = limit
-		return nil
-	}
-}
 
 // NewStore wraps a pgx pool.
 func NewStore(pool *pgxpool.Pool, options ...StoreOption) (*Store, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("pool is nil")
 	}
-	store := &Store{pool: pool, documentPoolDeploymentMaxActive: 1}
+	store := &Store{pool: pool}
 	for _, option := range options {
 		if option == nil {
 			return nil, fmt.Errorf("store option is nil")

@@ -3,6 +3,7 @@
 package domain
 
 import (
+	"errors"
 	"time"
 )
 
@@ -29,6 +30,21 @@ type User struct {
 	BootstrapMarker string
 	CreatedAt       time.Time
 	ApprovedAt      *time.Time
+}
+
+// ErrChannelBindingNotFound is returned when no channel account is bound to a canonical user.
+var ErrChannelBindingNotFound = errors.New("channel binding not found")
+
+// ChannelBinding maps a channel account to a canonical_user_id (spec §3: 用户身份).
+// A channel account can belong to at most one canonical user; a user may hold
+// bindings on multiple channels. Team routing uses team:<team_id> and is not
+// stored here.
+type ChannelBinding struct {
+	ChannelType      string
+	ChannelAccountID string
+	CanonicalUserID  int64
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // BotState is the bot lifecycle (spec §5: bots).

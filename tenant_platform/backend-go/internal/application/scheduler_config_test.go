@@ -52,34 +52,6 @@ func TestSchedulerConfigDirFor(t *testing.T) {
 	}
 }
 
-func TestValidateSchedulerDocumentGatewayConfig(t *testing.T) {
-	issuer := &fakeDocumentGatewayTokenIssuer{token: "token"}
-	valid := SchedulerConfig{
-		DocumentGatewayBaseURL:     "http://127.0.0.1:8080/document-gateway/",
-		DocumentGatewayTokenIssuer: issuer,
-	}
-	if err := validateSchedulerDocumentGatewayConfig(&valid); err != nil {
-		t.Fatal(err)
-	}
-	if valid.DocumentGatewayBaseURL != "http://127.0.0.1:8080/document-gateway" {
-		t.Fatalf("base URL = %q", valid.DocumentGatewayBaseURL)
-	}
-
-	for name, cfg := range map[string]SchedulerConfig{
-		"issuer without URL": {DocumentGatewayTokenIssuer: issuer},
-		"URL without issuer": {DocumentGatewayBaseURL: "http://127.0.0.1:8080"},
-		"external URL": {
-			DocumentGatewayBaseURL: "https://example.com", DocumentGatewayTokenIssuer: issuer,
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if err := validateSchedulerDocumentGatewayConfig(&cfg); err == nil {
-				t.Fatal("expected validation error")
-			}
-		})
-	}
-}
-
 func TestValidateSchedulerCredentialTiming(t *testing.T) {
 	const wallClock = 45 * time.Minute
 	const skew = 5 * time.Minute

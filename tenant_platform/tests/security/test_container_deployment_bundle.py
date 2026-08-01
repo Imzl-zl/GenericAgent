@@ -30,10 +30,12 @@ def test_compose_bundle_has_one_complete_operator_entrypoint() -> None:
         "README.zh-CN.md",
         "bot-poller.Dockerfile",
         "compose.yaml",
-        "document-manager.Dockerfile",
-        "document-manager-entrypoint.sh",
+        "ga-runner.Dockerfile",
+        "llm-proxy.Dockerfile",
+        "sandbox-manager.Dockerfile",
         "nginx.conf",
         "platform.Dockerfile",
+        "reset-dev.sh",
         "web.Dockerfile",
     }
     missing = sorted(path for path in required if not (COMPOSE_DIR / path).is_file())
@@ -42,6 +44,9 @@ def test_compose_bundle_has_one_complete_operator_entrypoint() -> None:
     assert not (COMPOSE_DIR / "secrets").exists()
     assert not (ROOT / "tenant_platform" / "infra" / "deploy").exists()
     assert not (ROOT / "tenant_platform" / "infra" / "systemd").exists()
+    # document 系统已整体删除(方案 §8)。
+    assert not (COMPOSE_DIR / "document-manager.Dockerfile").exists()
+    assert not (COMPOSE_DIR / "document-manager-entrypoint.sh").exists()
 
 
 def test_one_env_template_contains_every_compose_value() -> None:
@@ -55,7 +60,6 @@ def test_one_env_template_contains_every_compose_value() -> None:
         "GA_PLATFORM_IMAGE",
         "GA_BOT_POLLER_IMAGE",
         "GA_WEB_IMAGE",
-        "GA_DOCUMENT_MANAGER_IMAGE",
         "GA_POSTGRES_IMAGE",
         "POSTGRES_USER",
         "POSTGRES_PASSWORD",
@@ -66,22 +70,25 @@ def test_one_env_template_contains_every_compose_value() -> None:
         "PLATFORM_WEBHOOK_SECRET",
         "PLATFORM_DEV_TOKEN",
         "LLM_PROXY_CAPABILITY_SIGNING_KEY",
-        "DOCUMENT_MANAGER_IMAGE",
-        "DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME",
-        "DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE",
+        "GA_WORKER_EXECUTION_MODE",
+        "GA_RUNNER_IMAGE",
+        "GA_RUNNER_MAX_ACTIVE",
+        "GA_RUNNER_IDLE_TTL",
+        "GA_RUNNER_TASK_TIMEOUT",
+        "GA_RUNNER_MEMORY_BYTES",
+        "GA_RUNNER_CPU_QUOTA",
+        "GA_RUNNER_PIDS_LIMIT",
+        "GA_LLM_PROXY_ADDR",
     ):
-        assert key in values
+        assert key in values, f"missing {key}"
     assert values["GA_HTTP_BIND"] == "127.0.0.1"
     assert values["GA_POSTGRES_BIND"] == "127.0.0.1"
-    assert values["DOCUMENT_GATEWAY_BASE_URL"] == "http://127.0.0.1:8080/v1/document"
-    assert values["DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME"] == "true"
-    assert values["DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE"] == "true"
     assert values["POSTGRES_PASSWORD"] in values["DATABASE_URL"]
 
 
-def test_compose_starts_document_manager_but_only_it_receives_docker_socket() -> None:
+def test_compose_starts_six_services_and_only_sandbox_manager_receives_docker_socket() -> None:
     services = _compose()["services"]
-    assert set(services) == {"postgres", "bot-poller", "platform", "web", "document-manager"}
+    assert set(services) == {"postgres", "bot-poller", "platform", "web", "llm-proxy", "sandbox-manager"}
 
     for name, service in services.items():
         assert "env_file" not in service, name
@@ -96,16 +103,12 @@ def test_compose_starts_document_manager_but_only_it_receives_docker_socket() ->
         assert "no-new-privileges:true" in options, name
         mounts = [str(mount).lower() for mount in service.get("volumes", [])]
         has_runtime_socket = any("docker.sock" in mount or "podman.sock" in mount for mount in mounts)
-        assert has_runtime_socket is (name == "document-manager"), name
+        assert has_runtime_socket is (name == "sandbox-manager"), name
 
-    manager = services["document-manager"]
-    assert manager["build"]["dockerfile"] == "tenant_platform/infra/compose/document-manager.Dockerfile"
-    assert manager["user"] == "0:0"
-    assert "document_work:/var/lib/ga/documents" in manager["volumes"]
+    manager = services["sandbox-manager"]
+    assert manager["build"]["dockerfile"] == "tenant_platform/infra/compose/sandbox-manager.Dockerfile"
     assert "/var/run/docker.sock:/var/run/docker.sock" in manager["volumes"]
-    assert manager["environment"]["DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME"] == "${DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME}"
-    assert manager["environment"]["DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE"] == "${DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE}"
-    assert manager["environment"]["GA_MIGRATIONS_DIR"] == "${GA_MIGRATIONS_DIR}"
+    assert manager["environment"]["GA_RUNNER_IMAGE"] == "${GA_RUNNER_IMAGE:-ga-runner:local}"
     assert manager["depends_on"]["postgres"]["condition"] == "service_healthy"
 
     assert services["postgres"]["environment"] == {
@@ -115,10 +118,19 @@ def test_compose_starts_document_manager_but_only_it_receives_docker_socket() ->
     }
     assert services["web"]["network_mode"] == "service:platform"
 
+    # llm-proxy 仅内部网络, 不映射宿主端口(方案 §7)。
+    llm_proxy = services["llm-proxy"]
+    assert "ports" not in llm_proxy
+    networks = set(llm_proxy.get("networks", []))
+    assert networks == {"database", "runner-control"}
+
 
 def test_application_configuration_uses_named_volumes() -> None:
     volumes = _compose()["volumes"]
-    assert set(volumes) == {"postgres_data", "platform_runtime", "platform_config", "session_files", "bot_media", "document_work"}
+    assert set(volumes) == {
+        "postgres_data", "platform_runtime", "platform_config",
+        "session_files", "bot_media", "runner_workspaces",
+    }
     assert all(not value for value in volumes.values())
 
 
@@ -127,7 +139,8 @@ def test_only_loopback_application_ports_are_published() -> None:
     assert services["platform"]["ports"] == ["${GA_HTTP_BIND:-127.0.0.1}:${GA_HTTP_PORT:-8088}:8088"]
     assert services["postgres"]["ports"] == ["${GA_POSTGRES_BIND:-127.0.0.1}:${GA_POSTGRES_PORT:-55432}:5432"]
     assert "ports" not in services["bot-poller"]
-    assert "ports" not in services["document-manager"]
+    assert "ports" not in services["llm-proxy"]
+    assert "ports" not in services["sandbox-manager"]
 
 
 def test_platform_image_contains_worker_policy_and_explicit_migrations() -> None:
@@ -141,27 +154,19 @@ def test_platform_image_contains_worker_policy_and_explicit_migrations() -> None
         "USER 10001:10001",
     ):
         assert required in dockerfile
+    assert "DOCUMENT_GATEWAY_BASE_URL" not in dockerfile
 
 
-def test_document_manager_image_builds_the_document_tool_and_runs_the_manager() -> None:
-    dockerfile = (COMPOSE_DIR / "document-manager.Dockerfile").read_text(encoding="utf-8")
-    entrypoint = (COMPOSE_DIR / "document-manager-entrypoint.sh").read_text(encoding="utf-8")
+def test_runner_image_is_readonly_nonroot_with_memory_template() -> None:
+    dockerfile = (COMPOSE_DIR / "ga-runner.Dockerfile").read_text(encoding="utf-8")
     for required in (
-        "./cmd/document-manager",
-        "tenant_platform/document-image/Dockerfile",
-        "tenant_platform/infra/postgres/migrations",
-        "golang:1.22-bookworm@sha256:",
-        "docker@sha256:",
-        "/opt/ga/bin/document-manager",
+        "GA_DISABLE_HOST_BROWSER=1",
+        "USER 10002:10002",
+        "memory-template",
+        "/ga/legacy/memory",
+        "/ga/runner-state",
     ):
         assert required in dockerfile
-    for required in (
-        "docker image inspect",
-        "docker build",
-        "DOCUMENT_MANAGER_IMAGE",
-        "exec /opt/ga/bin/document-manager",
-    ):
-        assert required in entrypoint
 
 
 def test_operator_guide_explains_the_complete_two_file_workflow() -> None:
@@ -171,10 +176,11 @@ def test_operator_guide_explains_the_complete_two_file_workflow() -> None:
         ".env",
         "配置并启动",
         "docker compose up -d --build",
-        "document-manager",
+        "sandbox-manager",
         "/var/run/docker.sock",
         "命名卷",
-        "DOCUMENT_GATEWAY_BASE_URL",
+        "GA_RUNNER_MAX_ACTIVE",
         "docker compose down -v",
     ):
         assert required in guide
+    assert "document-manager" not in guide

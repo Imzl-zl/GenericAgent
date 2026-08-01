@@ -114,9 +114,10 @@ services:
       GA_WORKER_PYTHON: ${GA_WORKER_PYTHON}
       GA_WORKER_SRC: ${GA_WORKER_SRC}
       GA_MIGRATIONS_DIR: ${GA_MIGRATIONS_DIR}
-      DOCUMENT_GATEWAY_BASE_URL: ${DOCUMENT_GATEWAY_BASE_URL}
-      DOCUMENT_POOL_MAX_ACTIVE_HARD: ${DOCUMENT_POOL_MAX_ACTIVE_HARD}
-      MAX_RUNNING_TASKS: ${MAX_RUNNING_TASKS}
+      GA_WORKER_EXECUTION_MODE: ${GA_WORKER_EXECUTION_MODE:-user_workspace_runner}
+      GA_RUNNER_MAX_ACTIVE: ${GA_RUNNER_MAX_ACTIVE:-4}
+      GA_LLM_PROXY_ADDR: ${GA_LLM_PROXY_ADDR:-http://llm-proxy:8081}
+      MAX_RUNNING_TASKS: ${GA_RUNNER_MAX_ACTIVE:-4}
       PER_TENANT_RUNNING_LIMIT: ${PER_TENANT_RUNNING_LIMIT}
       PER_USER_QUEUE_LIMIT: ${PER_USER_QUEUE_LIMIT}
       TASK_IDLE_TIMEOUT_SECONDS: ${TASK_IDLE_TIMEOUT_SECONDS}
@@ -159,49 +160,78 @@ services:
     stop_grace_period: 45s
     logging: *default-logging
 
-  document-manager:
-    image: ${GA_DOCUMENT_MANAGER_IMAGE:-genericagent-document-manager:local}
+  llm-proxy:
+    image: ${GA_LLM_PROXY_IMAGE:-genericagent-llm-proxy:local}
     build:
       context: ../../..
-      dockerfile: tenant_platform/infra/compose/document-manager.Dockerfile
+      dockerfile: tenant_platform/infra/compose/llm-proxy.Dockerfile
     restart: unless-stopped
     init: true
-    user: "0:0"
+    user: "10001:10001"
     environment:
       DATABASE_URL: ${DATABASE_URL}
-      GA_MIGRATIONS_DIR: ${GA_MIGRATIONS_DIR}
-      DOCUMENT_MANAGER_OWNER: ${DOCUMENT_MANAGER_OWNER}
-      DOCUMENT_MANAGER_WORK_ROOT: ${DOCUMENT_MANAGER_WORK_ROOT}
-      DOCUMENT_MANAGER_RUNTIME_BINARY: ${DOCUMENT_MANAGER_RUNTIME_BINARY}
-      DOCUMENT_MANAGER_IMAGE: ${DOCUMENT_MANAGER_IMAGE}
-      DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME: ${DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME}
-      DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE: ${DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE}
-      DOCUMENT_MANAGER_SECCOMP_PROFILE: ${DOCUMENT_MANAGER_SECCOMP_PROFILE}
-      DOCUMENT_MANAGER_UID: ${DOCUMENT_MANAGER_UID}
-      DOCUMENT_MANAGER_GID: ${DOCUMENT_MANAGER_GID}
-      DOCUMENT_MANAGER_MEMORY_BYTES: ${DOCUMENT_MANAGER_MEMORY_BYTES}
-      DOCUMENT_MANAGER_CPU_PERIOD: ${DOCUMENT_MANAGER_CPU_PERIOD}
-      DOCUMENT_MANAGER_CPU_QUOTA: ${DOCUMENT_MANAGER_CPU_QUOTA}
-      DOCUMENT_MANAGER_PIDS_LIMIT: ${DOCUMENT_MANAGER_PIDS_LIMIT}
-      DOCUMENT_MANAGER_TMPFS_BYTES: ${DOCUMENT_MANAGER_TMPFS_BYTES}
-      DOCUMENT_POOL_MAX_ACTIVE_HARD: ${DOCUMENT_POOL_MAX_ACTIVE_HARD}
-      DOCUMENT_MANAGER_CLAIM_LEASE: ${DOCUMENT_MANAGER_CLAIM_LEASE}
-      DOCUMENT_MANAGER_HEARTBEAT_INTERVAL: ${DOCUMENT_MANAGER_HEARTBEAT_INTERVAL}
-      DOCUMENT_MANAGER_POLL_INTERVAL: ${DOCUMENT_MANAGER_POLL_INTERVAL}
-      DOCUMENT_MANAGER_COMMAND_POLL_INTERVAL: ${DOCUMENT_MANAGER_COMMAND_POLL_INTERVAL}
-      DOCUMENT_MANAGER_SHUTDOWN_TIMEOUT: ${DOCUMENT_MANAGER_SHUTDOWN_TIMEOUT}
+      LLM_PROXY_CAPABILITY_SIGNING_KEY: ${LLM_PROXY_CAPABILITY_SIGNING_KEY}
+      LLM_PROXY_LISTEN: ${LLM_PROXY_LISTEN:-0.0.0.0:8081}
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=64m
-    volumes:
-      - document_work:/var/lib/ga/documents
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700
     networks:
       - database
+      - runner-control
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # 内部服务: 不映射宿主机端口; 仅 runner-control + database 网络(方案 §7)。
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    stop_grace_period: 30s
+    logging: *default-logging
+
+  # Sandbox Manager: 唯一可访问 Docker socket 的组件(方案 §7)。
+  # ga-runner 不是常驻服务, 由 Manager 按工作区活跃状态动态创建。
+  sandbox-manager:
+    image: ${GA_SANDBOX_MANAGER_IMAGE:-genericagent-sandbox-manager:local}
+    build:
+      context: ../../..
+      dockerfile: tenant_platform/infra/compose/sandbox-manager.Dockerfile
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
+      GA_RUNNER_SECURITY_PROFILE: ${GA_RUNNER_SECURITY_PROFILE:-}
+      GA_RUNNER_IDLE_TTL: ${GA_RUNNER_IDLE_TTL:-30m}
+      GA_RUNNER_MEMORY_BYTES: ${GA_RUNNER_MEMORY_BYTES:-1073741824}
+      GA_RUNNER_CPU_QUOTA: ${GA_RUNNER_CPU_QUOTA:-100000}
+      GA_RUNNER_PIDS_LIMIT: ${GA_RUNNER_PIDS_LIMIT:-128}
+      GA_RUNNER_TASK_TIMEOUT: ${GA_RUNNER_TASK_TIMEOUT:-300s}
+      GA_WORKSPACES_ROOT: ${GA_WORKSPACES_ROOT:-/var/lib/ga/workspaces}
+      GA_LLM_PROXY_ADDR: ${GA_LLM_PROXY_ADDR:-http://llm-proxy:8081}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner_workspaces:/var/lib/ga/workspaces
+      - platform_runtime:/var/lib/ga/runtime
+    networks:
+      - application
+      - database
+      - runner-control
     depends_on:
       postgres:
         condition: service_healthy
@@ -255,9 +285,12 @@ volumes:
   platform_config:
   session_files:
   bot_media:
-  document_work:
+  runner_workspaces:
 
 networks:
   application:
   database:
     internal: true
+  runner-control:
+    internal: true
+    name: runner-control

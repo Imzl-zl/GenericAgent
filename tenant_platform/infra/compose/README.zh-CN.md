@@ -1,17 +1,18 @@
 # GenericAgent 完整 Docker Compose 部署
 
-这是平台唯一保留的部署方式：一个 `compose.yaml` 编排全部服务，一个 `.env` 放全部配置。`docker compose up -d --build` 会启动 Web、Platform、Bot Poller、PostgreSQL 和 `document-manager`，DOCX 文档功能包含在内。
+这是平台唯一保留的部署方式：一个 `compose.yaml` 编排全部服务，一个 `.env` 放全部配置。`docker compose up -d --build` 会启动六个常驻服务：Web、Platform、Bot Poller、PostgreSQL、Sandbox Manager 与内部 LLM Proxy。GA Runner 不是常驻服务，由 Sandbox Manager 按工作区活跃状态动态创建。
 
-> 本文描述当前可运行的部署实现。后续“每个用户工作区一个 GA Runner”重构仍处于方案阶段，详见 [GA Sandbox Runner 重构方案](../../docs/GA_SANDBOX_RUNNER_REFACTOR.zh-CN.md)，不要依据该方案替换本文的现有启动步骤。
+> 本部署对应 [GA Sandbox Runner 重构方案](../../docs/GA_SANDBOX_RUNNER_REFACTOR.zh-CN.md) 的最终形态：渠道身份绑定 → 个人/团队工作区 → 每工作区唯一隔离 Runner。
 
 ## 需要什么
 
 - Linux 服务器，建议 4 vCPU、8 GiB RAM、40 GiB 可用磁盘；
 - Docker Engine；
 - Docker Compose v2；
-- `git` 和 `openssl`。
+- `git` 和 `openssl`；
+- 生产环境建议安装 `gVisor/runsc` 作为 Runner 运行时（`GA_RUNNER_SECURITY_PROFILE=runsc`）；本机开发可用 Docker 加固（默认）。
 
-完整文档功能需要 Linux Docker socket `/var/run/docker.sock`。不需要安装 GenericAgent 的 systemd 服务，不需要 1Panel，也不需要手工创建 `config`、`runtime`、数据库或数据目录。
+Runner 容器由 Sandbox Manager 动态创建，需要 Docker socket 仅挂载给 `sandbox-manager` 服务。不需要安装 GenericAgent 的 systemd 服务，不需要 1Panel，也不需要手工创建 `config`、`runtime`、数据库或数据目录。
 
 ## 只有两个文件
 
@@ -56,22 +57,23 @@ docker compose config >/dev/null
 docker compose up -d --build
 docker compose ps
 curl --fail http://127.0.0.1:8088/healthz
-docker compose logs --tail=200 document-manager
+docker compose logs --tail=200 sandbox-manager
 ```
-
-`document-manager` 首次启动会通过 `/var/run/docker.sock` 自动构建 `genericagent-document-tool:local`，然后管理实际的 DOCX 文档容器。因此不需要先构建第五张镜像，也不需要手工创建文档目录。
 
 默认 Web 只监听服务器本机的 `127.0.0.1:8088`。远程浏览器请通过 SSH 隧道或 HTTPS 反向代理访问，不要把 8088、55432 或数据库端口直接暴露到公网。
 
-首次登录管理页面后，在“LLM Providers”配置模型供应商、Base URL、模型和 API Key。供应商 API Key 会加密保存到 PostgreSQL，不再写入 `.env`。
+首次登录管理页面后，在“LLM Providers”配置模型供应商、Base URL、模型和 API Key。供应商 API Key 会加密保存到 PostgreSQL，不再写入 `.env`。LLM 调用经内部 `llm-proxy` 转发，Runner 只持有短期 capability，不接触真实 Key。
 
-## 文档功能与权限
+## Runner 工作区与动态容器
 
-`DOCUMENT_GATEWAY_BASE_URL=http://127.0.0.1:8080/v1/document` 已启用 Platform 的文档工具。管理员在页面启用文档池后，Worker 可以提交 DOCX 任务；`document-manager` 从 PostgreSQL 领取任务并创建受限文档容器。
+- 用户首次发消息时，Platform 将渠道身份解析为 `personal:<user_id>`（或授权团队的 `team:<team_id>`），Sandbox Manager 创建该工作区的 Runner 容器并挂载其 `memory/`、`temp/`、`state/`。
+- 同一工作区的后续消息复用该 Runner；空闲超过 `GA_RUNNER_IDLE_TTL` 后回收，下次消息重建干净 Runner。工作区数据始终保留。
+- `GA_RUNNER_MAX_ACTIVE` 是全局并发 Runner 上限；满载时新任务保持排队，不失败。
+- Runner 只加入内部 `runner-control` 网络，只能访问 Platform 控制端点与内部 LLM Proxy；不挂载 Docker socket、不暴露任何宿主机路径。
 
-为实现“一条 Compose 命令完成全部测试”，只有 `document-manager` 挂载了 `/var/run/docker.sock`。这使它能够构建和启动文档容器，因此它是高权限服务；Platform、Web、Bot Poller 和 PostgreSQL 均不挂载 Docker socket。动态文档容器仍强制使用非 root 用户、只读根文件系统、无网络、无宿主目录挂载、最小 capability、seccomp 和 CPU/内存/PID 限制。
+## 权限边界
 
-`.env` 中的 `DOCUMENT_MANAGER_ALLOW_ROOTFUL_RUNTIME=true` 与 `DOCUMENT_MANAGER_ALLOW_MUTABLE_IMAGE=true` 是这个 Compose 测试配置的显式开关。代码默认拒绝 rootful Docker 和浮动标签，只有 `document-manager` 读取这两个开关。
+只有 `sandbox-manager` 挂载了 `/var/run/docker.sock`，它是唯一能创建/销毁 Runner 的组件；Platform、Web、Bot Poller、PostgreSQL 与 Runner 均不持有 Docker socket。Runner 容器强制使用非 root 用户、只读根文件系统、仅 `runner-control` 网络、最小 capability、no-new-privileges 与 CPU/内存/PID 限制。宿主浏览器工具（`web_scan`/`web_execute_js`）在 Runner 中禁用。
 
 ## 日常命令
 
@@ -79,7 +81,7 @@ docker compose logs --tail=200 document-manager
 # 状态和日志
 docker compose ps
 docker compose logs -f platform
-docker compose logs -f document-manager
+docker compose logs -f sandbox-manager
 
 # 更新代码后重建并启动
 git pull
@@ -92,10 +94,22 @@ docker compose down
 docker compose up -d
 ```
 
-不要执行 `docker compose down -v`。`-v` 会删除数据库、任务、会话文件、Bot 媒体和文档工作数据。
+不要执行 `docker compose down -v`。`-v` 会删除数据库、任务、会话文件、Bot 媒体、Runner 工作区等所有数据。
+
+### 开发期清库切换
+
+重构采用清库式切换（方案 D12）：启用新部署前删除旧 PostgreSQL 数据卷及 Document 相关运行卷，再按新 schema 启动。仓库处于开发阶段，不保留生产历史数据，不提供旧数据兼容或回滚。
+
+```bash
+# 删除旧 PG 数据卷与 document_work 卷，然后按新 schema 重建启动
+./infra/compose/reset-dev.sh
+
+# 完整重置（额外删除 platform_runtime / platform_config / session_files / bot_media）
+./infra/compose/reset-dev.sh --all
+```
 
 ## 原理
 
-Compose 一次创建并管理五个服务：`postgres` 存平台数据，`platform` 提供 API、调度和 Worker，`bot-poller` 负责 IM，`web` 提供网页入口，`document-manager` 负责 DOCX 任务。Platform 会等待 PostgreSQL 与 Bot Poller 健康后启动；Document Manager 会等待 PostgreSQL 健康后启动。两者都会自动执行数据库 migration。
+Compose 一次创建并管理六个服务：`postgres` 存平台数据，`platform` 提供 API、调度、渠道绑定与 Runner lease 控制，`bot-poller` 负责 IM，`web` 提供网页入口，`llm-proxy` 是内部透明模型代理（仅 `database` + `runner-control` 网络，不映射宿主端口），`sandbox-manager` 负责 Runner 容器的创建/检查/销毁与空闲回收。Platform 会等待 PostgreSQL 与 Bot Poller 健康后启动，并自动执行数据库 migration。
 
-Compose 还会自动创建六个命名卷：数据库、平台运行数据、平台配置、会话文件、Bot 媒体和文档工作目录。它们由 Docker 管理，不出现在项目目录中；容器重建或 `docker compose down` 都不会删除数据。
+Compose 还会自动创建六个命名卷：数据库、平台运行数据、平台配置、会话文件、Bot 媒体和 Runner 工作区。它们由 Docker 管理，不出现在项目目录中；容器重建或 `docker compose down` 都不会删除数据。

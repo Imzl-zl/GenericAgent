@@ -19,8 +19,6 @@ from typing import Any, Iterator
 from genericagent.worker.v1 import worker_pb2
 
 from ga_worker.credential_config import CredentialConfigError, load_runtime_metadata, validate_reload_request
-from ga_worker.document_client import DocumentGatewayClient
-from ga_worker.document_config import DocumentConfigError, load_runtime_document_gateway
 from ga_worker.limits import CapabilityRegistry
 from ga_worker.session_lifecycle import SessionLifecycleMixin
 from ga_worker.state import (
@@ -131,22 +129,9 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
                 if had_clients:
                     agent.llmclients = previous_clients
                 raise WorkerAdapterError("CREDENTIAL_CONFIG_EMPTY", "no GA sessions loaded")
-            try:
-                document_gateway = load_runtime_document_gateway(self.config_root)
-                if document_gateway is not None and document_gateway.session_key != self._session.session_key:
-                    raise DocumentConfigError("document gateway session_key mismatch")
-                document_client = DocumentGatewayClient(document_gateway) if document_gateway is not None else None
-            except (DocumentConfigError, ValueError) as exc:
-                if had_clients:
-                    agent.llmclients = previous_clients
-                raise WorkerAdapterError("DOCUMENT_CONFIG_ERROR", str(exc)) from exc
-            previous_document_client = self._session.document_client
             self._session.credential_generation = metadata.generation
             self._session.credential_checksum = metadata.checksum
             self._session.routing_snapshot_id = metadata.routing_snapshot_id
-            self._session.document_client = document_client
-            if previous_document_client is not None:
-                previous_document_client.close_transport()
             return worker_pb2.ReloadCredentialsResponse(
                 credential_generation=metadata.generation,
                 config_checksum=metadata.checksum,
@@ -214,5 +199,4 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
                 # escalates to a hard kill after this best-effort teardown.
                 accepted = False
         self._close_session_mcp()
-        self._close_session_document()
         return worker_pb2.ShutdownResponse(accepted=accepted)

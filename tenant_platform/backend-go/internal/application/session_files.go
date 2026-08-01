@@ -56,6 +56,10 @@ func NewSessionFiles(root string) (SessionFiles, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("session files root is required")
 	}
+	// 方案 §6: 附件/输出统一到工作区 temp; GA_WORKSPACE_TEMP 时以工作区为准。
+	if ws := strings.TrimSpace(os.Getenv("GA_WORKSPACE_TEMP")); ws != "" {
+		root = ws
+	}
 	base := filepath.Join(root, sessionFilesDirName)
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return nil, fmt.Errorf("create session files root: %w", err)
@@ -155,10 +159,16 @@ func (m *sessionFilesManager) ResolveMarker(sessionKey, marker string) (string, 
 	if err != nil {
 		return "", "", err
 	}
-	if st, err := os.Stat(resolved); err != nil {
+	// 安全交付: Lstat 不跟随符号链接, 拒绝非普通文件(方案 §4/§6)。
+	info, err := os.Lstat(resolved)
+	if err != nil {
 		return "", "", fmt.Errorf("resolve file marker %q: %w", marker, err)
-	} else if st.IsDir() {
+	}
+	if info.IsDir() {
 		return "", "", fmt.Errorf("file marker %q points to a directory", marker)
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("file marker %q is not a regular file (mode %s)", marker, info.Mode())
 	}
 	return resolved, rel, nil
 }
@@ -185,10 +195,15 @@ func (m *sessionFilesManager) RecordOutbound(sessionKey, marker string) (Session
 	if !strings.HasPrefix(rel, sessionOutputsDir+"/") {
 		return SessionFileRef{}, fmt.Errorf("outbound file must live under %s", sessionOutputsDir)
 	}
-	if st, err := os.Stat(resolved); err != nil {
+	info, err := os.Lstat(resolved)
+	if err != nil {
 		return SessionFileRef{}, fmt.Errorf("stat outbound file %q: %w", resolved, err)
-	} else if st.IsDir() {
+	}
+	if info.IsDir() {
 		return SessionFileRef{}, fmt.Errorf("outbound path %q is a directory", resolved)
+	}
+	if !info.Mode().IsRegular() {
+		return SessionFileRef{}, fmt.Errorf("outbound path %q is not a regular file (mode %s)", resolved, info.Mode())
 	}
 	manifest.NextSeq++
 	ref := SessionFileRef{
@@ -319,6 +334,20 @@ func resolveUnderRoot(root, marker string) (string, string, error) {
 	rel = filepath.Clean(rel)
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", "", fmt.Errorf("path escapes session sandbox: %s", marker)
+	}
+	// 中间组件符号链接也可能逃出沙箱(Lstat 只检查最后组件): EvalSymlinks
+	// 解析全部组件后必须仍落在 base 内(方案 §4: 不跟随链接)。
+	evaluated, err := filepath.EvalSymlinks(resolved)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve symlinks for %q: %w", marker, err)
+	}
+	evalRel, err := filepath.Rel(base, evaluated)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve evaluated path: %w", err)
+	}
+	evalRel = filepath.Clean(evalRel)
+	if evalRel == ".." || strings.HasPrefix(evalRel, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("path escapes session sandbox via symlink: %s", marker)
 	}
 	return resolved, filepath.ToSlash(rel), nil
 }

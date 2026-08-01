@@ -21,6 +21,7 @@ type workerEntry struct {
 	cleanup            func()
 	instID             string
 	sessionKey         string
+	taskID             string // 当前已下发 capability 的 task(方案 §7 per-task capability)
 	credentials        workerCredentialSet
 	pendingRefresh     *pendingCredentialRefresh
 	pendingRevocations []workerCredentialSet
@@ -33,6 +34,13 @@ type workerEntry struct {
 	// Used by the idle eviction reaper to reclaim memory from long-idle
 	// sessions (pattern: Kubernetes pod eviction, AWS Lambda container TTL).
 	lastUsedAt time.Time
+}
+
+// runnerGeneration 返回该 Worker 的 Runner generation(方案 §7 fencing)。
+// V1: loopback/static 路径恒为 1; SandboxWorkerRuntime 在任务 4/5 接线后
+// 由持久 lease 提供。此处保证 StartSession 的 generation 校验总是通过。
+func (e *workerEntry) runnerGeneration() uint64 {
+	return 1
 }
 
 // startSession invokes StartSession on the worker exactly once. Subsequent
@@ -106,6 +114,7 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 		}
 		if !replace {
 			entry.lastUsedAt = time.Now().UTC()
+			entry.taskID = task.ID
 			client := entry.client
 			entry.lifecycleMu.Unlock()
 			return client, entry, nil
@@ -174,6 +183,7 @@ func (s *scheduler) initializeWorkerEntry(
 	entry.cleanup = cleanup
 	entry.instID = instID
 	entry.credentials = credentials
+	entry.taskID = task.ID
 	entry.lastUsedAt = time.Now().UTC()
 	entry.lifecycleMu.Unlock()
 	return client, entry, nil
@@ -239,6 +249,9 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	}
 	startReq := &workerv1.StartSessionRequest{
 		SessionKey: task.SessionKey,
+		// 方案 §7: workspace_key + runner_generation 由 Platform 写入, Runner 校验。
+		WorkspaceKey:      task.SessionKey,
+		RunnerGeneration:  entry.runnerGeneration(),
 		RuntimePolicy: &workerv1.RuntimePolicy{
 			MaxTurns: maxTurns, MaxHistoryBytes: defaultMaxHistoryBytes,
 			MaxWorkingBytes: defaultMaxWorkingBytes, MaxOutputBytes: defaultMaxOutputBytes,

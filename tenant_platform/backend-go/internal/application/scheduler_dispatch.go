@@ -43,16 +43,6 @@ func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) 
 }
 
 func workerTaskEnvelope(task domain.Task) *workerv1.TaskEnvelope {
-	snapshots := make([]*workerv1.SOPSnapshot, 0, len(task.SOPSnapshots))
-	for _, snapshot := range task.SOPSnapshots {
-		snapshots = append(snapshots, &workerv1.SOPSnapshot{
-			VersionId:     snapshot.SOPVersionID,
-			Title:         snapshot.Title,
-			Description:   snapshot.Description,
-			Content:       snapshot.Content,
-			ContentDigest: snapshot.ContentDigest,
-		})
-	}
 	return &workerv1.TaskEnvelope{
 		TaskId:            task.ID,
 		SessionKey:        task.SessionKey,
@@ -64,7 +54,6 @@ func workerTaskEnvelope(task domain.Task) *workerv1.TaskEnvelope {
 		PersonaSnapshot:   append([]string(nil), task.PersonaSnapshot...),
 		ToolPolicyVersion: task.ToolPolicyVersion,
 		CreatedAt:         timestamppb.New(task.CreatedAt),
-		SopSnapshots:      snapshots,
 	}
 }
 

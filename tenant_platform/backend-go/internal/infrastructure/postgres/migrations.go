@@ -64,11 +64,10 @@ func migrationFiles() []string {
 		"0028_agent_max_turns_setting.sql",
 		"0029_mcp_servers.sql",
 		"0030_remove_mcp_headers.sql",
-		"0031_document_pool_settings.sql",
-		"0032_document_job_pool.sql",
-		"0033_document_job_finish.sql",
-		"0034_document_artifacts.sql",
 		"0035_sophub_sop_registry.sql",
+		"0036_channel_bindings.sql",
+		"0037_runner_leases.sql",
+		"0039_drop_sophub_registry.sql",
 	}
 }
 
@@ -108,11 +107,10 @@ var pendingMigrations = []struct {
 	{"0028_agent_max_turns_setting.sql", "migration_0028_agent_max_turns_setting_marker"},
 	{"0029_mcp_servers.sql", "migration_0029_mcp_servers_marker"},
 	{"0030_remove_mcp_headers.sql", "migration_0030_remove_mcp_headers_marker"},
-	{"0031_document_pool_settings.sql", "migration_0031_document_pool_settings_marker"},
-	{"0032_document_job_pool.sql", "migration_0032_document_job_pool_marker"},
-	{"0033_document_job_finish.sql", "migration_0033_document_job_finish_marker"},
-	{"0034_document_artifacts.sql", "migration_0034_document_artifacts_marker"},
 	{"0035_sophub_sop_registry.sql", "migration_0035_sophub_sop_registry_marker"},
+	{"0036_channel_bindings.sql", "migration_0036_channel_bindings_marker"},
+	{"0037_runner_leases.sql", "migration_0037_runner_leases_marker"},
+	{"0039_drop_sophub_registry.sql", "migration_0039_drop_sophub_registry_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -122,10 +120,6 @@ var foundationTableNames = []string{
 	"sop_entries",
 	"sop_candidates",
 	"sophub_bindings",
-	"document_artifacts",
-	"document_commands",
-	"document_instances",
-	"document_jobs",
 	"llm_capability_revocations",
 	"media_assets",
 	"messages",
@@ -152,7 +146,6 @@ var foundationTableNames = []string{
 	"tool_policies",
 	"relay_preferences",
 	"platform_runtime_settings",
-	"document_pool_settings",
 	"migration_0008_user_id_serial_marker",
 	"migration_0009_marker",
 	"migration_0010_user_password_hash_marker",

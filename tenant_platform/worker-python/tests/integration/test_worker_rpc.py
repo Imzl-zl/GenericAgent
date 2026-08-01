@@ -353,6 +353,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                     stub.StartSession(
                         worker_pb2.StartSessionRequest(
                             session_key="personal:1",
+                            workspace_key="personal:1",
+                            runner_generation=1,
                             runtime_policy=_runtime_policy(
                                 policy_digest="sha256:" + ("b" * 64)
                             ),
@@ -367,6 +369,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 s1 = stub.StartSession(
                     worker_pb2.StartSessionRequest(
                         session_key="personal:1",
+                        workspace_key="personal:1",
+                        runner_generation=1,
                         runtime_policy=_runtime_policy(),
                     )
                 )
@@ -433,6 +437,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 s2 = stub.StartSession(
                     worker_pb2.StartSessionRequest(
                         session_key="personal:1",
+                        workspace_key="personal:1",
+                        runner_generation=1,
                         runtime_policy=_runtime_policy(),
                     )
                 )
@@ -621,6 +627,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 s_ok = stub.StartSession(
                     worker_pb2.StartSessionRequest(
                         session_key="personal:2",
+                        workspace_key="personal:2",
+                        runner_generation=1,
                         snapshot_ref=str(snap_path),
                         snapshot_id="snap-1",
                         snapshot_checksum=checksum,

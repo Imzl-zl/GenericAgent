@@ -228,3 +228,22 @@ func TestCapabilityJWTRejectsShortSigningKey(t *testing.T) {
 		t.Fatal("expected validator key length error")
 	}
 }
+
+func TestCapabilityValidatorReturnsTaskBinding(t *testing.T) {
+	issuer, validator := newJWTTestPair(t, time.Hour, &fakeRevocationSource{revoked: make(map[[32]byte]bool)})
+	tokenString, _, err := issuer.Issue(CapabilitySpec{
+		SessionKey: "personal:1", ProviderID: 3, ProviderRevision: 5,
+		ProviderType: "native_oai", Model: "gpt-4o", PolicyVersion: "v1",
+		TaskID: "task-xyz", RunnerGeneration: 9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := validator.Validate(context.Background(), tokenString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.TaskID != "task-xyz" || claims.RunnerGeneration != 9 {
+		t.Fatalf("validator claims task binding = %s/%d", claims.TaskID, claims.RunnerGeneration)
+	}
+}

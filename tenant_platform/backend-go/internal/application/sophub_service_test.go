@@ -30,9 +30,7 @@ func (client *fakeSophubClient) GetSOP(_ context.Context, key, _ string) (domain
 }
 
 type fakeSophubStore struct {
-	binding   domain.SophubBinding
-	candidate domain.SOPCandidate
-	input     domain.ImportSOPCandidateCommand
+	binding domain.SophubBinding
 }
 
 func (store *fakeSophubStore) UpsertSophubBinding(_ context.Context, binding domain.SophubBinding) (domain.SophubBinding, error) {
@@ -45,34 +43,6 @@ func (store *fakeSophubStore) GetSophubBinding(context.Context) (domain.SophubBi
 	}
 	return store.binding, nil
 }
-func (store *fakeSophubStore) UpsertSOPCandidate(_ context.Context, input domain.ImportSOPCandidateCommand) (domain.SOPCandidate, error) {
-	store.input = input
-	store.candidate = domain.SOPCandidate{ID: "candidate-1", RemoteSOPID: input.RemoteSOPID, Content: input.Content}
-	return store.candidate, nil
-}
-
-func (store *fakeSophubStore) ListSOPCandidates(context.Context, domain.SOPCandidateStatus) ([]domain.SOPCandidate, error) {
-	return []domain.SOPCandidate{store.candidate}, nil
-}
-func (store *fakeSophubStore) ApproveSOPCandidate(context.Context, string, int64) (domain.SOPVersion, error) {
-	return domain.SOPVersion{}, nil
-}
-func (store *fakeSophubStore) RejectSOPCandidate(context.Context, string, int64, string) error {
-	return nil
-}
-func (store *fakeSophubStore) ListSOPRegistry(context.Context) ([]domain.SOPRegistryItem, error) {
-	return []domain.SOPRegistryItem{}, nil
-}
-func (store *fakeSophubStore) LoadSOPVersion(context.Context, string, int64) (domain.SOPEntry, error) {
-	return domain.SOPEntry{}, nil
-}
-func (store *fakeSophubStore) UnloadSOP(context.Context, string, int64) (domain.SOPEntry, error) {
-	return domain.SOPEntry{}, nil
-}
-func (store *fakeSophubStore) ListLoadedSOPVersions(context.Context) ([]domain.SOPVersion, error) {
-	return []domain.SOPVersion{}, nil
-}
-
 type fakeSophubCipher struct {
 	plain []byte
 }
@@ -125,27 +95,34 @@ func TestSophubServiceDoesNotPersistFailedOrLeakKey(t *testing.T) {
 	}
 }
 
-func TestSophubServiceImportsApprovedMarkdownCandidate(t *testing.T) {
+
+func TestSophubServiceFetchRemoteSOPForWorkerProxy(t *testing.T) {
+	store := &fakeSophubStore{}
+	cipher := &fakeSophubCipher{}
 	client := &fakeSophubClient{remote: domain.SophubRemoteSOP{
-		ID: "remote-1", Title: "Report", Preview: "Use for reports", FileType: domain.SOPFileTypeMarkdown,
-		PackageType: "single_file", Status: "approved", Content: "# Report\n",
+		ID: "sop-remote", FileType: "markdown", Status: "approved", Content: "# SOP",
 	}}
-	store := &fakeSophubStore{binding: domain.SophubBinding{APIKeyCiphertext: []byte("ciphertext-only"), APIKeyVersion: 7}}
-	cipher := &fakeSophubCipher{plain: []byte("key")}
 	service, err := NewSophubService(SophubServiceConfig{Store: store, Client: client, Cipher: cipher})
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidate, err := service.ImportCandidate(context.Background(), "remote-1")
+	if _, err := service.Bind(context.Background(), "admin-key", 1); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := service.FetchRemoteSOP(context.Background(), "sop-remote")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if candidate.ID != "candidate-1" || store.input.Content != "# Report\n" || store.input.FileType != domain.SOPFileTypeMarkdown {
-		t.Fatalf("candidate=%+v input=%+v", candidate, store.input)
+	if remote.ID != "sop-remote" || remote.Content != "# SOP" {
+		t.Fatalf("remote=%+v", remote)
 	}
-
-	client.remote.FileType = "python"
-	if _, err := service.ImportCandidate(context.Background(), "remote-1"); err == nil {
-		t.Fatal("expected executable candidate rejection")
+	// 未绑定: 拒绝。
+	store2 := &fakeSophubStore{}
+	service2, err := NewSophubService(SophubServiceConfig{Store: store2, Client: client, Cipher: cipher})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service2.FetchRemoteSOP(context.Background(), "sop-remote"); err == nil {
+		t.Fatal("fetch without binding must fail")
 	}
 }

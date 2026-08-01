@@ -53,16 +53,14 @@ type SchedulerConfig struct {
 	RevocationCleanupInterval time.Duration
 	Audit                     AuditRecorder
 	LLMProxyAddr              string
+	// SophubProxyBaseURL 是 Platform 的 Worker Sophub proxy 地址(方案 §5.2);
+	// 非空时向 Worker 下发 _platform_sophub capability。
+	SophubProxyBaseURL string
 	ModelPolicyVersion        string
 	// LLMProvider resolves an immutable provider routing snapshot per Worker.
 	LLMProvider LLMProviderSource
 	// MCPServer resolves the administrator-enabled global MCP catalog.
 	MCPServer MCPServerSource
-	// DocumentGatewayBaseURL, when set, exposes a loopback-only document tool
-	// gateway to the Worker through signed runtime config. The Worker receives
-	// no PostgreSQL or container runtime credentials.
-	DocumentGatewayBaseURL     string
-	DocumentGatewayTokenIssuer DocumentGatewayTokenIssuer
 	// TokenTTL must cover a complete task plus the pre-dispatch refresh skew.
 	TokenTTL         time.Duration
 	TokenRefreshSkew time.Duration
@@ -116,10 +114,6 @@ type MCPServerSource interface {
 type CapabilityStore interface {
 	RevokeCapability(ctx context.Context, jti string, expiresAt time.Time) error
 	DeleteExpiredCapabilityRevocations(ctx context.Context, before time.Time) (int64, error)
-}
-
-type DocumentGatewayTokenIssuer interface {
-	IssueDocumentGatewayToken(ctx context.Context, sessionKey, workspaceID string) (string, error)
 }
 
 // AgentRuntimeSettings resolves the live turn budget used when starting a
@@ -194,9 +188,6 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 			return nil, fmt.Errorf("SchedulerConfig.LLMProvider is required for real Worker path")
 		}
 	}
-	if err := validateSchedulerDocumentGatewayConfig(&cfg); err != nil {
-		return nil, err
-	}
 	if cfg.MaxTaskWallClock == 0 && cfg.DialWorker != nil {
 		cfg.MaxTaskWallClock = DefaultMaxTaskWallClock
 	}
@@ -228,27 +219,6 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 	}, nil
 }
 
-func validateSchedulerDocumentGatewayConfig(cfg *SchedulerConfig) error {
-	baseURL := strings.TrimSpace(cfg.DocumentGatewayBaseURL)
-	if baseURL == "" {
-		if cfg.DocumentGatewayTokenIssuer != nil {
-			return fmt.Errorf("SchedulerConfig.DocumentGatewayBaseURL is required when DocumentGatewayTokenIssuer is set")
-		}
-		return nil
-	}
-	if cfg.DocumentGatewayTokenIssuer == nil {
-		return fmt.Errorf("SchedulerConfig.DocumentGatewayTokenIssuer is required when DocumentGatewayBaseURL is set")
-	}
-	gateway, err := validateRuntimeDocumentGateway(RuntimeDocumentGateway{
-		BaseURL: baseURL, CapabilityToken: "startup-validation",
-		SessionKey: "startup-validation", WorkspaceID: "00000000-0000-0000-0000-000000000001",
-	})
-	if err != nil {
-		return fmt.Errorf("SchedulerConfig.DocumentGatewayBaseURL: %w", err)
-	}
-	cfg.DocumentGatewayBaseURL = gateway.BaseURL
-	return nil
-}
 
 func validateSchedulerCredentialTiming(cfg SchedulerConfig) error {
 	if cfg.MaxTaskWallClock <= 0 {

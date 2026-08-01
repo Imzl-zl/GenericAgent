@@ -15,3 +15,10 @@
 - Completed task 4: admin-only fixed-origin Sophub binding/search/import; encrypted write-only key; mutable candidates and append-only local Markdown versions; explicit global load/unload; atomic task snapshots preserving dedupe identity; typed scheduler/Worker transfer with digest and size validation; GA-native task-scoped `extra_sys_prompts` loading and cleanup; tenant read-only Web with no WeChat selection; tool policy remains the sole authorization boundary.
 - Task 5 local scope complete: admin-only truthful PostgreSQL pool status and responsive Web panel; distinct-UID Linux rootless/cgroup-v2/digest/systemd preflight; exact NSS groups, proc/env/filesystem isolation and fixed effective config paths; exact-socket Document Manager access; real-image smoke executes two commands in one container; mandatory admin+tenant smoke; deployment/start/evidence/rollback runbook; hardened self-service Compose images with host-only Document Manager, forced preflight lifecycle, fixed delivery GID, fresh-volume PostgreSQL and complete backup/restore; independent final reviews report no Critical/Important.
 - Blocked now: provide the actual target Linux host/SSH execution path with approved secret provisioning and execute `tasks/security-verification` item 6, including daemon reboot recovery. Only after target evidence exists may task 5 and the Epic become DONE.
+
+## Superseded Notice (2025-08-01)
+
+- Status: superseded by GA Sandbox Runner 重构 (`.tasks/sandbox-runner-refactor`)
+- User decision D17 (confirmed): document 系统 + 全局 SOP Registry 将整体删除;
+  document-processing-platform epic 成果不再维护、不合并、不回滚保留
+- Blocked gate(真实 Linux 主机验证)不再需要执行;epic 永久封存

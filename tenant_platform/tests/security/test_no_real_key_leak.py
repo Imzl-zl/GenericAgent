@@ -103,15 +103,20 @@ def test_ga_and_worker_python_do_not_read_platform_real_keys() -> None:
 
 
 def test_worker_contract_and_runtime_do_not_receive_sophub_credentials() -> None:
+    # 方案 §5.2: Runner 只能经 Platform 受控 proxy(/v1/worker/sophub/*)访问 Sophub,
+    # 不持有 Sophub API Key, 不直接访问 Sophub 站点。
     runtime_paths = [
         REPO_ROOT / "tenant_platform" / "contracts" / "proto" / "genericagent" / "worker" / "v1" / "worker.proto",
         *WORKER_SRC.rglob("*.py"),
     ]
-    forbidden = ("sophub_api_key", "sophub endpoint", "fudankw.cn", "/sophub")
+    forbidden = ("sophub_api_key", "fudankw.cn")
     for path in runtime_paths:
         body = path.read_text(encoding="utf-8").lower()
         matches = [token for token in forbidden if token in body]
         assert not matches, f"{path} exposes Sophub control-plane data to Worker: {matches}"
+    # proxy 端点必须存在于 Platform, 且 Runner 侧只出现 capability 令牌字段。
+    proxy = (REPO_ROOT / "tenant_platform/backend-go/internal/api/worker_sophub_proxy.go").read_text(encoding="utf-8")
+    assert "/v1/worker/sophub" in proxy or "worker/sophub" in proxy
 
 
 def test_platform_keeps_linux_process_inspection_hardening() -> None:
@@ -119,16 +124,6 @@ def test_platform_keeps_linux_process_inspection_hardening() -> None:
     guard = (REPO_ROOT / "tenant_platform/backend-go/internal/infrastructure/processguard/dumpable_linux.go").read_text(encoding="utf-8")
     assert "processguard.DisablePeerInspection()" in platform_main
     assert "unix.PR_SET_DUMPABLE, 0" in guard
-
-
-def test_document_image_has_single_fixed_non_root_entry_process() -> None:
-    dockerfile = (REPO_ROOT / "tenant_platform" / "document-image" / "Dockerfile").read_text(encoding="utf-8")
-    final_stage = dockerfile.rsplit("FROM scratch", 1)[-1]
-    assert "FROM scratch" in dockerfile
-    assert "USER 1000:1000" in final_stage
-    assert "ENTRYPOINT" not in final_stage
-    assert 'CMD ["/usr/local/bin/ga-document-tool", "idle"]' in final_stage
-    assert "/bin/sh" not in final_stage
 
 
 def test_go_worker_environment_and_runtime_config_are_token_only() -> None:
