@@ -4,7 +4,9 @@
     "foundation.v1": {
       "tool_policies": {
         "foundation.no-host-tools.v1": {
-          "allowed_tools": ["update_working_checkpoint"]
+          "allowed_tools": [
+            "update_working_checkpoint"
+          ]
         },
         "foundation.session-files.v1": {
           "allowed_tools": [
@@ -12,9 +14,7 @@
             "file_read",
             "file_write",
             "file_patch",
-            "export_docx",
-            "document_job_submit",
-            "document_job_close"
+            "export_docx"
           ]
         }
       }

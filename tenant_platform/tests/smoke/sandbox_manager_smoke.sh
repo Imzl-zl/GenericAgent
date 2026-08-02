@@ -35,7 +35,7 @@ fi
 HASH_A="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 HASH_B="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 for H in "$HASH_A" "$HASH_B"; do
-  mkdir -p "$WS_ROOT/$H"/{memory,temp,state}
+  mkdir -p "$WS_ROOT/$H"/{memory,temp,state,config,attachments}
 done
 
 NAME_A="ga-runner-smoke-a-g1"
@@ -74,7 +74,7 @@ start_runner() {
   docker start "$name" >/dev/null
   # 等待 Worker 就绪(最多 15s)
   for _ in $(seq 1 15); do
-    if docker exec "$name" sh -c '[ -S /ga/runner-state/worker.sock ]' >/dev/null 2>&1; then
+    if docker exec "$name" sh -c 'cat /proc/net/tcp 2>/dev/null | grep -q ":24E0"' >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -87,11 +87,11 @@ start_runner() {
 start_runner "$NAME_A" "$HASH_A"
 start_runner "$NAME_B" "$HASH_B"
 
-echo "==> 2. inspect 校验: 挂载必须恰好是三个工作区 subpath"
+echo "==> 2. inspect 校验: 挂载必须恰好是五个工作区 subpath(config/attachments 只读)"
 for name in "$NAME_A" "$NAME_B"; do
   mounts="$(docker inspect --format '{{range .Mounts}}{{.Destination}} {{end}}' "$name")"
   echo "    $name mounts: $mounts"
-  for want in /ga/legacy/memory /ga/legacy/temp /ga/runner-state; do
+  for want in /ga/legacy/memory /ga/legacy/temp /ga/runner-state /ga/runner-config /ga/runner-attachments; do
     case " $mounts " in
       *" $want "*) ;;
       *) echo "错误: $name 缺少挂载 $want" >&2; exit 1;;

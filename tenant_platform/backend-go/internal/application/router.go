@@ -91,6 +91,11 @@ type CommandRegistry interface {
 	CommandRegistryVersion(ctx context.Context) (string, error)
 }
 
+// ChannelBindingResolver 解析渠道账号(如 iLink user id)对应的 canonical user。
+type ChannelBindingResolver interface {
+	ResolveCanonicalUserID(ctx context.Context, channelType, channelAccountID string) (int64, error)
+}
+
 // RouterConfig wires the router's dependencies.
 type RouterConfig struct {
 	Store          RouterStore
@@ -104,6 +109,9 @@ type RouterConfig struct {
 	// Teams is the team lifecycle service. Optional in P0; when nil, team
 	// commands reply with "功能未启用" and messages always route to personal.
 	Teams TeamService
+	// ChannelBindings 解析渠道账号 → canonical user(方案 §5.1)。nil 时回退
+	// bot 属主(未启用渠道绑定)。
+	ChannelBindings ChannelBindingResolver
 	// Relay is the @username forwarding service. Optional; when nil,
 	// @-mentions fall through to normal task routing.
 	Relay RelayService
@@ -128,6 +136,7 @@ type router struct {
 	sessionFiles   SessionFiles
 	teams          TeamService
 	relay          RelayService
+	channelBindings ChannelBindingResolver
 	toolPolicy     string
 	sourceInstance string
 	// Trigger-invalidated cache for command registry. Admin update handlers
@@ -160,9 +169,27 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 		sessionFiles:   cfg.SessionFiles,
 		teams:          cfg.Teams,
 		relay:          cfg.Relay,
+		channelBindings: cfg.ChannelBindings,
 		toolPolicy:     cfg.ToolPolicy,
 		sourceInstance: cfg.SourceInstance,
 	}, nil
+}
+
+// resolveOwnerID 解析消息发送者的 canonical user: 渠道绑定存在时用绑定用户
+// (跨渠道统一身份, 方案 §5.1), 否则回退 bot 属主(未启用绑定)。
+func (r *router) resolveOwnerID(ctx context.Context, msg IncomingMessage, botOwnerID int64) int64 {
+	if r.channelBindings == nil || msg.IlinkUserID == "" {
+		return botOwnerID
+	}
+	canonical, err := r.channelBindings.ResolveCanonicalUserID(ctx, "ilink", msg.IlinkUserID)
+	if err != nil {
+		if !errors.Is(err, domain.ErrChannelBindingNotFound) {
+			slog.WarnContext(ctx, "router: resolve canonical user failed; falling back to bot owner",
+				"ilink_user_id", msg.IlinkUserID, "error", err)
+		}
+		return botOwnerID
+	}
+	return canonical
 }
 
 // HandleMessage processes one incoming message per spec §6.1.
@@ -188,10 +215,13 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	// Resolve active context early so persistInbound records the correct
 	// session_key (personal:{user_id} vs team:{team_id}). Falls back to
 	// personal session when teams are disabled or context lookup fails.
-	inboundSessionKey := personalSessionKey(bot.OwnerID)
+	ownerID := r.resolveOwnerID(ctx, msg, bot.OwnerID)
+	// canonical identity(方案 §5.1): 后续 status/任务提交全部以绑定用户为准。
+	bot.OwnerID = ownerID
+	inboundSessionKey := personalSessionKey(ownerID)
 	if r.teams != nil {
-		if ac, err := r.teams.GetActiveContext(ctx, bot.OwnerID); err == nil {
-			inboundSessionKey = ac.SessionKey(bot.OwnerID)
+		if ac, err := r.teams.GetActiveContext(ctx, ownerID); err == nil {
+			inboundSessionKey = ac.SessionKey(ownerID)
 		}
 	}
 	// Persist inbound message for history/audit and as the cross-instance

@@ -7,10 +7,12 @@
 # 先运行 tenant_platform/scripts/build-memory-template.sh 生成 memory-template/。
 #
 # 镜像层固定 digest;GA 代码、assets、memory-template、worker-python 全部只读。
-# 运行时仅挂载当前工作区三个 subpath:
-#   /ga/legacy/memory  <- workspaces/<hash>/memory
-#   /ga/legacy/temp    <- workspaces/<hash>/temp
-#   /ga/runner-state   <- workspaces/<hash>/state
+# 运行时由 Manager 挂载当前工作区五个 subpath(方案 §4/§7):
+#   /ga/legacy/memory      <- workspaces/<hash>/memory(读写)
+#   /ga/legacy/temp        <- workspaces/<hash>/temp(读写;附件/输出经此互通)
+#   /ga/runner-state       <- workspaces/<hash>/state(读写;checkpoint staging/committed)
+#   /ga/runner-config      <- workspaces/<hash>/config(只读;mTLS 证书/策略)
+#   /ga/runner-attachments <- workspaces/<hash>/attachments(只读;输入附件)
 
 FROM python:3.11-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
 

@@ -11,6 +11,9 @@ COPY tenant_platform/backend-go/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w -buildid=' -o /out/ga-sandbox-manager ./cmd/sandbox-manager
 
 FROM docker:27-cli@sha256:29016a9dbbd937a172a1c0a016df8c4586f6f1b5e63eb26d3c94a281ffe50f12
-COPY --from=build --chown=10001:10001 /out/ga-sandbox-manager /usr/local/bin/ga-sandbox-manager
-USER 10001:10001
+COPY --from=build /out/ga-sandbox-manager /usr/local/bin/ga-sandbox-manager
+# 以 root 运行: 需要 chown 工作区目录(固定 Runner UID/GID)与访问 Docker socket。
+# 容器仍受 read_only + cap_drop ALL 约束; compose 仅追加 CHOWN/DAC 能力。
+# 若存在 memory-template 构建产物则一并拷贝(与 ga-runner 镜像同源模板)。
+COPY tenant_platform/infra/compose/memory-template/ /ga/memory-template/
 ENTRYPOINT ["/usr/local/bin/ga-sandbox-manager"]

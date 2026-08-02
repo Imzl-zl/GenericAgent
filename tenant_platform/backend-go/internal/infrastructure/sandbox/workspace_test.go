@@ -12,11 +12,11 @@ func TestPrepareWorkspaceDirsCreatesSubdirs(t *testing.T) {
 	root := t.TempDir()
 	hash := WorkspaceDirHash("personal:1")
 
-	dirs, err := prepareWorkspaceDirs(root, hash, "")
+	dirs, err := prepareWorkspaceDirs(root, hash, "", 10002, 10002)
 	if err != nil {
 		t.Fatalf("prepareWorkspaceDirs: %v", err)
 	}
-	for _, sub := range []string{"memory", "temp", "state"} {
+	for _, sub := range []string{"memory", "temp", "state", "config", "attachments"} {
 		info, err := os.Stat(filepath.Join(dirs.Workspace, sub))
 		if err != nil {
 			t.Fatalf("missing %s: %v", sub, err)
@@ -43,7 +43,7 @@ func TestPrepareWorkspaceDirsSeedsMemoryFromTemplate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dirs, err := prepareWorkspaceDirs(root, hash, tmpl)
+	dirs, err := prepareWorkspaceDirs(root, hash, tmpl, 10002, 10002)
 	if err != nil {
 		t.Fatalf("prepareWorkspaceDirs: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestPrepareWorkspaceDirsDoesNotOverwriteExistingMemory(t *testing.T) {
 	hash := WorkspaceDirHash("personal:3")
 
 	// 预先创建带用户内容的 memory。
-	dirs, err := prepareWorkspaceDirs(root, hash, "")
+	dirs, err := prepareWorkspaceDirs(root, hash, "", 10002, 10002)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestPrepareWorkspaceDirsDoesNotOverwriteExistingMemory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpl, "global_mem.txt"), []byte("template"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := prepareWorkspaceDirs(root, hash, tmpl); err != nil {
+	if _, err := prepareWorkspaceDirs(root, hash, tmpl, 10002, 10002); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(userMem)
@@ -97,7 +97,7 @@ func TestPrepareWorkspaceDirsDoesNotOverwriteExistingMemory(t *testing.T) {
 
 func TestPrepareWorkspaceDirsRejectsTraversalHash(t *testing.T) {
 	root := t.TempDir()
-	if _, err := prepareWorkspaceDirs(root, "../../etc", ""); err == nil {
+	if _, err := prepareWorkspaceDirs(root, "../../etc", "", 10002, 10002); err == nil {
 		t.Fatal("path traversal hash must fail")
 	}
 }

@@ -24,12 +24,12 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/sandbox"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/logging"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/poller"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/processguard"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/sandbox"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/sophub"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/systemd"
@@ -95,7 +95,11 @@ func envIntEither(primary, legacy string, fallback int) int {
 // buildWorkerRuntime constructs the production Worker runtime.
 // GA_WORKER_EXECUTION_MODE=user_workspace_runner(默认)使用 Sandbox 工作区
 // Runner; loopback 仅显式用于开发降级(方案 §7: 不作静默回退)。
-func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRuntime, error) {
+func buildWorkerRuntime(
+	boot application.DevBootstrapConfig,
+	store *postgres.Store,
+	instanceID, policyFile, llmProxyAddr, sophubProxyAddr string,
+) (worker.WorkerRuntime, error) {
 	mode := strings.TrimSpace(os.Getenv("GA_WORKER_EXECUTION_MODE"))
 	if mode == "" {
 		mode = "user_workspace_runner"
@@ -115,28 +119,42 @@ func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRunti
 	if mode != "user_workspace_runner" {
 		return nil, fmt.Errorf("unknown GA_WORKER_EXECUTION_MODE %q (user_workspace_runner|loopback)", mode)
 	}
-
+	if strings.TrimSpace(boot.WorkspacesRoot) == "" {
+		return nil, fmt.Errorf("GA_WORKSPACES_ROOT is required for user_workspace_runner mode")
+	}
+	// Platform 不持有 Docker socket: 所有容器操作经认证的 Manager 控制面
+	// (方案 §7)。GA_MANAGER_ADDR/GA_MANAGER_SECRET 为必填。
+	managerAddr := strings.TrimSpace(os.Getenv("GA_MANAGER_ADDR"))
+	managerSecret := strings.TrimSpace(os.Getenv("GA_MANAGER_SECRET"))
+	if managerAddr == "" || managerSecret == "" {
+		return nil, fmt.Errorf("GA_MANAGER_ADDR and GA_MANAGER_SECRET are required for user_workspace_runner mode")
+	}
+	manager, err := sandbox.NewManagerClient(managerAddr, managerSecret, "ga-runner")
+	if err != nil {
+		return nil, fmt.Errorf("sandbox manager client: %w", err)
+	}
 	ca, err := worker.NewPlatformCA()
 	if err != nil {
 		return nil, fmt.Errorf("runner control CA: %w", err)
 	}
-	cli, err := sandboxCLI()
-	if err != nil {
-		return nil, err
+	var env []string
+	if strings.TrimSpace(llmProxyAddr) != "" {
+		env = append(env, "GA_LLM_PROXY_ADDR="+strings.TrimSpace(llmProxyAddr))
 	}
-	manager := sandbox.NewManager(sandbox.ManagerConfig{
-		CLI:                 cli,
-		WorkspaceRoot:       boot.WorkspacesRoot,
-		MemoryTemplate:      boot.MemoryTemplate,
-		ContainerNamePrefix: "ga-runner",
-		Image:               boot.RunnerImage,
-	})
+	if strings.TrimSpace(sophubProxyAddr) != "" {
+		env = append(env, "GA_SOPHUB_PROXY_ADDR="+strings.TrimSpace(sophubProxyAddr))
+	}
 	return worker.NewSandbox(worker.SandboxConfig{
-		Manager:        manager,
-		CA:             ca,
-		WorkspaceRoot:  boot.WorkspacesRoot,
-		MemoryTemplate: boot.MemoryTemplate,
-		Image:          boot.RunnerImage,
+		Manager:            manager,
+		CA:                 ca,
+		LeaseStore:         store,
+		PlatformInstanceID: instanceID,
+		WorkspaceRoot:      boot.WorkspacesRoot,
+		MemoryTemplate:     boot.MemoryTemplate,
+		Image:              boot.RunnerImage,
+		ContainerPrefix:    "ga-runner",
+		PolicyFile:         policyFile,
+		Env:                env,
 	})
 }
 
@@ -144,36 +162,50 @@ func buildWorkerRuntime(boot application.DevBootstrapConfig) (worker.WorkerRunti
 // sophubProxyBaseURL 返回 Platform 的 Worker Sophub proxy 地址(方案 §5.2)。
 // 默认走 Platform 自身的 /v1/worker/sophub 端点(与 API 同地址)。
 func sophubProxyBaseURL() string {
-	if v := strings.TrimSpace(os.Getenv("GA_SOPHUB_PROXY_ADDR")); v != "" {
-		return v
-	}
-	return ""
+	return strings.TrimSpace(os.Getenv("GA_SOPHUB_PROXY_ADDR"))
 }
 
-func sandboxCLI() (*sandbox.DockerCLI, error) {
-	profile := sandbox.ValidProfile()
-	profile.Image = strings.TrimSpace(os.Getenv("GA_RUNNER_IMAGE"))
-	if profile.Image == "" {
-		profile.Image = "ga-runner:local"
+// runnerLeaseReaper 周期清理本实例已过期的 Runner lease: 销毁 lease 记录的
+// 容器并释放 lease(方案 §7: 持久 lease 驱动的重启恢复/孤儿回收)。
+// Worker idle eviction 的正常路径由 scheduler cleanup 直接销毁容器。
+func runRunnerLeaseReaper(
+	ctx context.Context,
+	store *postgres.Store,
+	manager sandbox.RunnerCLI,
+	instanceID string,
+	interval time.Duration,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			leases, err := store.ListExpiredRunnerLeases(ctx, time.Now().UTC())
+			if err != nil {
+				slog.ErrorContext(ctx, "platform: list expired runner leases failed", "error", err)
+				continue
+			}
+			for _, lease := range leases {
+				if lease.Owner != instanceID {
+					continue // 其他实例的过期 lease 由对应实例接管
+				}
+				if lease.ContainerID != "" {
+					if err := manager.Destroy(ctx, lease.ContainerID); err != nil {
+						slog.WarnContext(ctx, "platform: destroy expired runner failed",
+							"runner_key", lease.RunnerKey, "container", lease.ContainerID, "error", err)
+						continue
+					}
+				}
+				if err := store.ReleaseRunnerLease(ctx, lease.RunnerKey, instanceID); err != nil {
+					slog.WarnContext(ctx, "platform: release expired runner lease failed",
+						"runner_key", lease.RunnerKey, "error", err)
+				}
+			}
+		}
 	}
-	profile.Runtime = strings.TrimSpace(os.Getenv("GA_RUNNER_SECURITY_PROFILE"))
-	workspacesRoot := strings.TrimSpace(os.Getenv("GA_WORKSPACES_ROOT"))
-	if workspacesRoot == "" {
-		return nil, fmt.Errorf("GA_WORKSPACES_ROOT is required for user_workspace_runner mode")
-	}
-	cli, err := sandbox.NewDockerCLI(sandbox.DockerConfig{
-		Binary:             "docker",
-		Profile:            profile,
-		WorkspacesRoot:     workspacesRoot,
-		ContainerNamePrefix: "ga-runner",
-	})
-	if err != nil {
-		// 配置错误由启动日志暴露, 不静默降级到 loopback(方案 §7)。
-		return nil, fmt.Errorf("sandbox docker cli: %w", err)
-	}
-	return cli, nil
 }
-
 
 // llmProxyConfig carries LLM Proxy startup parameters. The real upstream key
 // is fetched from the admin-configured provider store and decrypted with the
@@ -309,37 +341,37 @@ func run() error {
 	logging.Init()
 
 	var (
-		policyFile                = flag.String("policy-file", "", "path to capability policy manifest (required)")
-		claimLease                = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
-		devLoopback               = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
-		listen                    = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
-		databaseURL               = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
-		migration                 = flag.String("migration", "", "path to 0001_foundation.sql")
-		runtimeRoot               = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
-		configRoot                = flag.String("config-root", "", "GA_CONFIG_ROOT for session-scoped token-only runtime configuration")
-		legacyRoot                = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
-		workerPython              = flag.String("worker-python", "", "python interpreter for worker")
-		workerSrc                 = flag.String("worker-src", "", "path to worker-python/src")
-		llmProxyAddr              = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
-		capabilitySigningKey      = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=32 bytes")
-		modelPolicyVersion        = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
-		devExtraUsers             = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
-		devTeam                   = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
-		botTokenKey               = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
-		ilinkBaseURL              = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
-		ilinkAppID                = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
-		ilinkClientVersion        = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
-		botPollerURL              = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
-		botPollerAPISecret        = flag.String("bot-poller-api-secret", os.Getenv("BOT_POLLER_API_SECRET"), "HMAC-SHA256 secret for authenticating requests to Bot Poller /start /send /stop (or BOT_POLLER_API_SECRET); empty = unauthenticated (INSECURE - dev/test only)")
-		platformWebhookURL        = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
-		webhookSecret             = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
-		maxRunningTasks           = flag.Int("max-running-tasks", envIntEither("GA_RUNNER_MAX_ACTIVE", "MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or GA_RUNNER_MAX_ACTIVE/MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
-		perTenantRunningLimit     = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
-		perUserQueueLimit         = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
-		taskTimeoutSeconds        = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
-		maxTaskWallClockSec       = flag.Int("max-task-wall-clock-seconds", envInt("MAX_TASK_WALL_CLOCK_SECONDS", 2700), "hard task wall-clock limit; capability TTL must cover this plus refresh skew")
-		taskIdleTimeoutSec        = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
-		workerIdleTTLSec          = flag.Int("worker-idle-ttl-seconds", envInt("WORKER_IDLE_TTL_SECONDS", 600), "Worker eviction threshold (or WORKER_IDLE_TTL_SECONDS). Default 600s (10min). Idle Worker processes (no active task) older than this are torn down to reclaim memory (pattern: Kubernetes pod eviction + AWS Lambda container reuse window). Next task cold-starts from last snapshot. 0 = keep Workers resident indefinitely (dev/test or tiny fleets).")
+		policyFile            = flag.String("policy-file", "", "path to capability policy manifest (required)")
+		claimLease            = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
+		devLoopback           = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
+		listen                = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
+		databaseURL           = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
+		migration             = flag.String("migration", "", "path to 0001_foundation.sql")
+		runtimeRoot           = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
+		configRoot            = flag.String("config-root", "", "GA_CONFIG_ROOT for session-scoped token-only runtime configuration")
+		legacyRoot            = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
+		workerPython          = flag.String("worker-python", "", "python interpreter for worker")
+		workerSrc             = flag.String("worker-src", "", "path to worker-python/src")
+		llmProxyAddr          = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
+		capabilitySigningKey  = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=32 bytes")
+		modelPolicyVersion    = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
+		devExtraUsers         = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
+		devTeam               = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
+		botTokenKey           = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
+		ilinkBaseURL          = flag.String("ilink-base-url", os.Getenv("ILINK_BASE_URL"), "iLink API base URL (or ILINK_BASE_URL); empty = loopback transport")
+		ilinkAppID            = flag.String("ilink-app-id", firstNonEmpty(os.Getenv("ILINK_APP_ID"), "bot"), "iLink App-Id header")
+		ilinkClientVersion    = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
+		botPollerURL          = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
+		botPollerAPISecret    = flag.String("bot-poller-api-secret", os.Getenv("BOT_POLLER_API_SECRET"), "HMAC-SHA256 secret for authenticating requests to Bot Poller /start /send /stop (or BOT_POLLER_API_SECRET); empty = unauthenticated (INSECURE - dev/test only)")
+		platformWebhookURL    = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
+		webhookSecret         = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
+		maxRunningTasks       = flag.Int("max-running-tasks", envIntEither("GA_RUNNER_MAX_ACTIVE", "MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or GA_RUNNER_MAX_ACTIVE/MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
+		perTenantRunningLimit = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
+		perUserQueueLimit     = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
+		taskTimeoutSeconds    = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
+		maxTaskWallClockSec   = flag.Int("max-task-wall-clock-seconds", envInt("MAX_TASK_WALL_CLOCK_SECONDS", 2700), "hard task wall-clock limit; capability TTL must cover this plus refresh skew")
+		taskIdleTimeoutSec    = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
+		workerIdleTTLSec      = flag.Int("worker-idle-ttl-seconds", envInt("WORKER_IDLE_TTL_SECONDS", 600), "Worker eviction threshold (or WORKER_IDLE_TTL_SECONDS). Default 600s (10min). Idle Worker processes (no active task) older than this are torn down to reclaim memory (pattern: Kubernetes pod eviction + AWS Lambda container reuse window). Next task cold-starts from last snapshot. 0 = keep Workers resident indefinitely (dev/test or tiny fleets).")
 	)
 	flag.Parse()
 
@@ -500,11 +532,33 @@ func run() error {
 		}
 		coord = local
 	} else {
-		// Normal startup rejects local coordinator and bootstrap.
-		if boot.UserID != 0 && os.Getenv("PLATFORM_DEV_FORCE") == "" {
-			// Still refuse EnsureDevelopmentContext path by not calling it.
+		// 生产路径(方案 §5/§7): staging/committed 落在共享工作区卷的 state/ 内,
+		// 由 Sandbox Runner 读写; 要求 GA_WORKSPACES_ROOT 提供共享卷根。
+		if strings.TrimSpace(boot.WorkspacesRoot) == "" {
+			return fmt.Errorf("GA_WORKSPACES_ROOT is required for production checkpoint coordinator")
 		}
-		return fmt.Errorf("foundation platform currently requires --dev-loopback (local coordinator); production path is out of scope for this slice")
+		if boot.UserID <= 0 {
+			return fmt.Errorf("PLATFORM_DEV_USER_ID is required as the platform admin user id in production")
+		}
+		if strings.TrimSpace(boot.DevToken) == "" {
+			return fmt.Errorf("PLATFORM_DEV_TOKEN is required as the admin API token in production")
+		}
+		// 平台管理员身份(管理端 persona/policy/invite 的 actor)。
+		adminCtx, err := store.EnsurePlatformAdminUser(ctx, boot.UserID, boot.Username)
+		if err != nil {
+			return fmt.Errorf("ensure platform admin user: %w", err)
+		}
+		devCtx = adminCtx
+		workspaceCoord, err := checkpoint.NewWorkspaceCoordinator(checkpoint.WorkspaceConfig{
+			WorkspacesRoot:     boot.WorkspacesRoot,
+			PlatformInstanceID: instanceID,
+			Store:              store,
+			RunnerStateMount:   "/ga/runner-state",
+		})
+		if err != nil {
+			return fmt.Errorf("workspace checkpoint coordinator: %w", err)
+		}
+		coord = workspaceCoord
 	}
 
 	// Bot token cipher: required for bot registration, iLink transport, and
@@ -543,39 +597,40 @@ func run() error {
 		return fmt.Errorf("capability token issuer: %w", err)
 	}
 
-	runtime, err := buildWorkerRuntime(boot)
+	runtime, err := buildWorkerRuntime(boot, store, instanceID, resolvedPolicyFile, proxyAddr, sophubProxyBaseURL())
 	if err != nil {
 		return err
 	}
 	sessionScopedConfig := true
 
 	sched, err := application.NewScheduler(application.SchedulerConfig{
-		PlatformInstanceID:         instanceID,
-		ClaimLease:                 *claimLease,
-		PollInterval:               500 * time.Millisecond,
-		Store:                      store,
-		Registry:                   reg,
-		Coordinator:                coord,
-		Runtime:                    runtime,
-		ConfigRoot:                 boot.ConfigRoot,
-		SessionScopedConfig:        sessionScopedConfig,
-		RuntimeRoot:                boot.RuntimeRoot,
-		LLMProxyAddr:               proxyAddr,
-		TokenIssuer:                issuer,
-		CapabilityStore:            store,
-		Audit:                      store,
-		ModelPolicyVersion:         strings.TrimSpace(*modelPolicyVersion),
-		LLMProvider:                store,
-		MCPServer:                  store,
-		TokenTTL:                   llmproxy.DefaultTokenTTL,
-		TokenRefreshSkew:           application.DefaultTokenRefreshSkew,
-		MaxTaskWallClock:           time.Duration(*maxTaskWallClockSec) * time.Second,
-		MaxRunningTasks:            *maxRunningTasks,
-		PerTenantRunningLimit:      *perTenantRunningLimit,
-		TaskTimeoutSeconds:         *taskTimeoutSeconds,
-		RuntimeSettings:            store,
-		IdleTimeout:                time.Duration(*taskIdleTimeoutSec) * time.Second,
-		WorkerIdleTTL:              time.Duration(*workerIdleTTLSec) * time.Second,
+		PlatformInstanceID:    instanceID,
+		ClaimLease:            *claimLease,
+		PollInterval:          500 * time.Millisecond,
+		Store:                 store,
+		Registry:              reg,
+		Coordinator:           coord,
+		Runtime:               runtime,
+		ConfigRoot:            boot.ConfigRoot,
+		SessionScopedConfig:   sessionScopedConfig,
+		RuntimeRoot:           boot.RuntimeRoot,
+		LLMProxyAddr:          proxyAddr,
+		SophubProxyBaseURL:    sophubProxyBaseURL(),
+		TokenIssuer:           issuer,
+		CapabilityStore:       store,
+		Audit:                 store,
+		ModelPolicyVersion:    strings.TrimSpace(*modelPolicyVersion),
+		LLMProvider:           store,
+		MCPServer:             store,
+		TokenTTL:              llmproxy.DefaultTokenTTL,
+		TokenRefreshSkew:      application.DefaultTokenRefreshSkew,
+		MaxTaskWallClock:      time.Duration(*maxTaskWallClockSec) * time.Second,
+		MaxRunningTasks:       *maxRunningTasks,
+		PerTenantRunningLimit: *perTenantRunningLimit,
+		TaskTimeoutSeconds:    *taskTimeoutSeconds,
+		RuntimeSettings:       store,
+		IdleTimeout:           time.Duration(*taskIdleTimeoutSec) * time.Second,
+		WorkerIdleTTL:         time.Duration(*workerIdleTTLSec) * time.Second,
 	})
 	if err != nil {
 		return err
@@ -723,46 +778,62 @@ func run() error {
 	}
 
 	var sessionFiles application.SessionFiles
-	if strings.TrimSpace(boot.RuntimeRoot) != "" {
-		sessionFiles, err = application.NewSessionFiles(boot.RuntimeRoot)
+	if *devLoopback {
+		if strings.TrimSpace(boot.RuntimeRoot) != "" {
+			sessionFiles, err = application.NewSessionFiles(boot.RuntimeRoot)
+			if err != nil {
+				return fmt.Errorf("session files: %w", err)
+			}
+		}
+	} else {
+		// 生产: 附件/输出经共享工作区卷 temp/ 与 Runner 互通(方案 §6)。
+		sessionFiles, err = application.NewWorkspaceSessionFiles(boot.WorkspacesRoot)
 		if err != nil {
-			return fmt.Errorf("session files: %w", err)
+			return fmt.Errorf("workspace session files: %w", err)
 		}
 	}
 
 	routerSvc, err := application.NewRouter(application.RouterConfig{
-		Store:          store,
-		Tasks:          svc,
-		Transport:      botTransport,
-		Commands:       store, // DB-driven command registry (migration 0004)
-		Messages:       store, // messages table (migration 0013)
-		SessionFiles:   sessionFiles,
-		ToolPolicy:     strings.TrimSpace(*modelPolicyVersion),
-		SourceInstance: instanceID,
-		Teams:          teamSvc,  // P1 team lifecycle (migration 0016)
-		Relay:          relaySvc, // P1 @username relay (migration 0017)
+		Store:           store,
+		Tasks:           svc,
+		Transport:       botTransport,
+		Commands:        store, // DB-driven command registry (migration 0004)
+		Messages:        store, // messages table (migration 0013)
+		SessionFiles:    sessionFiles,
+		ToolPolicy:      strings.TrimSpace(*modelPolicyVersion),
+		SourceInstance:  instanceID,
+		Teams:           teamSvc,  // P1 team lifecycle (migration 0016)
+		Relay:           relaySvc, // P1 @username relay (migration 0017)
+		ChannelBindings: store,    // channel_bindings canonical identity (migration 0037)
 	})
 	if err != nil {
 		return err
 	}
 
 	server, err := api.NewServer(api.ServerConfig{
-		Service:                         svc,
-		Users:                           userSvc,
-		WechatBinding:                   wechatBindingSvc,
-		BotService:                      botSvc,
-		Invite:                          inviteSvc,
-		Personas:                        personaSvc,
-		Router:                          routerSvc,
-		Registry:                        reg,
-		Policies:                        store, // admin command/policy management (migration 0004)
-		RuntimeSettings:                 store,
-		Sophub:                          sophubSvc,
-		Bots:                            store,
-		LLMProviders:                    store, // admin LLM provider management (migration 0007)
-		MCPServers:                      store, // global MCP server management (migration 0029)
-		BotLifecycle:                    botLifecycle,
-		TaskStats:                       store,
+		Service:         svc,
+		Users:           userSvc,
+		WechatBinding:   wechatBindingSvc,
+		BotService:      botSvc,
+		Invite:          inviteSvc,
+		Personas:        personaSvc,
+		Router:          routerSvc,
+		Registry:        reg,
+		Policies:        store, // admin command/policy management (migration 0004)
+		RuntimeSettings: store,
+		Sophub:          sophubSvc,
+		SophubValidator: func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+			sv, err := llmproxy.NewSophubValidator([]byte(signingKey), store)
+			if err != nil {
+				return llmproxy.CapabilityClaims{}, err
+			}
+			return sv.Validate(ctx, token)
+		},
+		Bots:         store,
+		LLMProviders: store, // admin LLM provider management (migration 0007)
+		MCPServers:   store, // global MCP server management (migration 0029)
+		BotLifecycle: botLifecycle,
+		TaskStats:    store,
 		RuntimeProfile: api.RuntimeProfile{
 			ClaimLeaseSeconds:         int((*claimLease) / time.Second),
 			TokenTTLSeconds:           int(llmproxy.DefaultTokenTTL / time.Second),
@@ -815,6 +886,17 @@ func run() error {
 	go func() {
 		schedulerDone <- sched.Run(ctx)
 	}()
+	if !*devLoopback {
+		managerClient, clientErr := sandbox.NewManagerClient(
+			strings.TrimSpace(os.Getenv("GA_MANAGER_ADDR")),
+			strings.TrimSpace(os.Getenv("GA_MANAGER_SECRET")),
+			"ga-runner",
+		)
+		if clientErr != nil {
+			return fmt.Errorf("runner lease reaper manager client: %w", clientErr)
+		}
+		go runRunnerLeaseReaper(ctx, store, managerClient, instanceID, time.Minute)
+	}
 	if deliverySvc != nil {
 		go func() {
 			if err := deliverySvc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

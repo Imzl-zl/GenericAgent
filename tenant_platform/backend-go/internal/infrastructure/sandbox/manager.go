@@ -15,10 +15,21 @@ type ContainerCLI interface {
 	Inspect(ctx context.Context, name string) error
 }
 
+// EnsureRunnerRequest 是受控的 Runner 创建请求。字段只来自认证的 Platform
+// 控制面(workspace_key、generation、控制面环境与 mTLS 材料), 永不来自业务输入。
+type EnsureRunnerRequest struct {
+	WorkspaceKey string
+	Generation   uint64
+	// Env 是控制面透传环境(如 GA_LLM_PROXY_ADDR); 安全参数由 Manager 固定。
+	Env []string
+	// ConfigFiles 写入 workspace config/ 的文件(短期证书、策略清单)。
+	ConfigFiles map[string][]byte
+}
+
 // RunnerCLI 是 SandboxWorkerRuntime(生产 Worker 创建路径)使用的完整生命周期面。
 type RunnerCLI interface {
 	ContainerCLI
-	EnsureRunner(ctx context.Context, workspaceKey string, generation uint64) (Runner, bool, error)
+	EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Runner, bool, error)
 }
 
 // ManagerConfig wires the Manager to its dependencies.
@@ -51,11 +62,14 @@ func NewManager(cfg ManagerConfig) *Manager {
 
 // EnsureRunner returns the active Runner for a workspace generation, creating
 // it on first use and replacing (destroying) the previous generation.
-func (m *Manager) EnsureRunner(ctx context.Context, workspaceKey string, generation uint64) (Runner, bool, error) {
-	if generation == 0 {
+func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Runner, bool, error) {
+	if req.Generation == 0 {
 		return Runner{}, false, fmt.Errorf("runner generation must be positive")
 	}
-	hash := WorkspaceDirHash(workspaceKey)
+	if strings.TrimSpace(req.WorkspaceKey) == "" {
+		return Runner{}, false, fmt.Errorf("workspace key is required")
+	}
+	hash := WorkspaceDirHash(req.WorkspaceKey)
 
 	// per-workspace 锁: 防止并发 EnsureRunner 为同一工作区创建两个容器。
 	m.mu.Lock()
@@ -72,7 +86,7 @@ func (m *Manager) EnsureRunner(ctx context.Context, workspaceKey string, generat
 	existing, hasExisting := m.runners[hash]
 	m.mu.Unlock()
 
-	if hasExisting && strings.HasSuffix(existing, "-g"+strconv.FormatUint(generation, 10)) {
+	if hasExisting && strings.HasSuffix(existing, "-g"+strconv.FormatUint(req.Generation, 10)) {
 		// 同 generation 复用:校验后直接返回。
 		if err := m.cfg.CLI.Inspect(ctx, existing); err != nil {
 			return Runner{}, false, fmt.Errorf("inspect existing runner %s: %w", existing, err)
@@ -88,10 +102,12 @@ func (m *Manager) EnsureRunner(ctx context.Context, workspaceKey string, generat
 	}
 
 	spec := RunnerSpec{
-		WorkspaceHash: hash,
-		Generation:    generation,
-		Image:         m.cfg.Image,
+		WorkspaceHash:  hash,
+		Generation:     req.Generation,
+		Image:          m.cfg.Image,
 		MemoryTemplate: m.cfg.MemoryTemplate,
+		Env:            req.Env,
+		ConfigFiles:    req.ConfigFiles,
 	}
 	runner, err := m.cfg.CLI.CreateAndStart(ctx, spec)
 	if err != nil {
@@ -106,6 +122,21 @@ func (m *Manager) EnsureRunner(ctx context.Context, workspaceKey string, generat
 	m.runners[hash] = runner.Name
 	m.mu.Unlock()
 	return runner, true, nil
+}
+
+// ListRunners 返回当前管理的 Runner 容器名(用于孤儿回收与状态巡检)。
+func (m *Manager) ListRunners(ctx context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := make([]string, 0, len(m.runners))
+	seen := map[string]bool{}
+	for _, n := range m.runners {
+		if !seen[n] {
+			names = append(names, n)
+			seen[n] = true
+		}
+	}
+	return names, nil
 }
 
 // CreateAndStart 委托 CLI(实现 RunnerCLI 接口, 供 WorkerRuntime 使用)。

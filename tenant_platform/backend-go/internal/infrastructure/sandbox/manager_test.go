@@ -23,8 +23,11 @@ func (f *fakeCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner, 
 }
 
 // EnsureRunner 模拟 Manager 的同 generation 复用/跨 generation 替换。
-func (f *fakeCLI) EnsureRunner(ctx context.Context, workspaceKey string, generation uint64) (Runner, bool, error) {
-	r, err := f.CreateAndStart(ctx, RunnerSpec{WorkspaceHash: WorkspaceDirHash(workspaceKey), Generation: generation})
+func (f *fakeCLI) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Runner, bool, error) {
+	r, err := f.CreateAndStart(ctx, RunnerSpec{
+		WorkspaceHash: WorkspaceDirHash(req.WorkspaceKey), Generation: req.Generation,
+		Env: req.Env, ConfigFiles: req.ConfigFiles,
+	})
 	return r, true, err
 }
 
@@ -43,14 +46,14 @@ func TestManagerEnsureRunnerReusesSameGeneration(t *testing.T) {
 	cli := &fakeCLI{}
 	m := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: t.TempDir(), ContainerNamePrefix: "ga-runner"})
 
-	first, created, err := m.EnsureRunner(ctx, "personal:1", 1)
+	first, created, err := m.EnsureRunner(ctx, EnsureRunnerRequest{WorkspaceKey: "personal:1", Generation: 1})
 	if err != nil {
 		t.Fatalf("EnsureRunner: %v", err)
 	}
 	if !created {
 		t.Fatal("first ensure must create")
 	}
-	again, created, err := m.EnsureRunner(ctx, "personal:1", 1)
+	again, created, err := m.EnsureRunner(ctx, EnsureRunnerRequest{WorkspaceKey: "personal:1", Generation: 1})
 	if err != nil {
 		t.Fatalf("EnsureRunner reuse: %v", err)
 	}
@@ -70,11 +73,11 @@ func TestManagerEnsureRunnerReplacesOnGenerationBump(t *testing.T) {
 	cli := &fakeCLI{}
 	m := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: t.TempDir(), ContainerNamePrefix: "ga-runner"})
 
-	first, _, err := m.EnsureRunner(ctx, "personal:1", 1)
+	first, _, err := m.EnsureRunner(ctx, EnsureRunnerRequest{WorkspaceKey: "personal:1", Generation: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, created, err := m.EnsureRunner(ctx, "personal:1", 2)
+	next, created, err := m.EnsureRunner(ctx, EnsureRunnerRequest{WorkspaceKey: "personal:1", Generation: 2})
 	if err != nil {
 		t.Fatalf("EnsureRunner regen: %v", err)
 	}

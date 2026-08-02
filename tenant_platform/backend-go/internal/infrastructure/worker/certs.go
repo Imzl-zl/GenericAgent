@@ -66,14 +66,17 @@ func NewPlatformCA() (*PlatformCA, error) {
 	}, nil
 }
 
+
+
 // IssueRunnerCert 为 (workspace_key, generation) 签发短期服务证书。
-// CN 编码 runner_key hash + generation, 供服务端与客户端双重 fencing。
-func (ca *PlatformCA) IssueRunnerCert(workspaceKey string, generation uint64, ttl time.Duration) (CertMaterial, error) {
+// CN 编码 runner_key hash + generation; DNS SAN 包含容器名(runner-control
+// 网络内的拨号地址), 供服务端与客户端双重 fencing(方案 §7)。
+func (ca *PlatformCA) IssueRunnerCert(workspaceKey string, generation uint64, ttl time.Duration, dnsNames ...string) (CertMaterial, error) {
 	if workspaceKey == "" || generation == 0 {
 		return CertMaterial{}, fmt.Errorf("workspace key and generation are required")
 	}
 	cn := fmt.Sprintf(runnerCertCNTmpl, workspaceKey, generation)
-	return ca.issue(cn, ttl, x509.ExtKeyUsageServerAuth)
+	return ca.issue(cn, ttl, x509.ExtKeyUsageServerAuth, dnsNames...)
 }
 
 // IssuePlatformClientCert 签发 Platform 控制面的客户端身份证书。
@@ -81,7 +84,7 @@ func (ca *PlatformCA) IssuePlatformClientCert(ttl time.Duration) (CertMaterial, 
 	return ca.issue(platformClientCN, ttl, x509.ExtKeyUsageClientAuth)
 }
 
-func (ca *PlatformCA) issue(cn string, ttl time.Duration, extKeyUsage x509.ExtKeyUsage) (CertMaterial, error) {
+func (ca *PlatformCA) issue(cn string, ttl time.Duration, extKeyUsage x509.ExtKeyUsage, dnsNames ...string) (CertMaterial, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return CertMaterial{}, fmt.Errorf("generate key: %w", err)
@@ -97,6 +100,7 @@ func (ca *PlatformCA) issue(cn string, ttl time.Duration, extKeyUsage x509.ExtKe
 		NotAfter:     time.Now().Add(ttl),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{extKeyUsage},
+		DNSNames:     append([]string(nil), dnsNames...),
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
 	if err != nil {

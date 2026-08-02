@@ -120,6 +120,12 @@ func (service *sophubService) FetchRemoteSOP(ctx context.Context, remoteSOPID st
 	if remote.ID != remoteSOPID {
 		return domain.SophubRemoteSOP{}, fmt.Errorf("Sophub SOP identity mismatch")
 	}
+	// 仅公开 approved single-file markdown 可被 Worker 安装(方案 §5.2)。
+	if !remote.IsPublic || !strings.EqualFold(remote.Status, domain.SOPStatusApproved) ||
+		!strings.EqualFold(remote.PackageType, domain.SOPPackageTypeSingle) ||
+		!strings.EqualFold(remote.FileType, domain.SOPFileTypeMarkdown) {
+		return domain.SophubRemoteSOP{}, fmt.Errorf("Sophub SOP is not a public approved single-file markdown")
+	}
 	return remote, nil
 }
 

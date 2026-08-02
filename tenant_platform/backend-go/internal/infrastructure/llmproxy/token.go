@@ -151,21 +151,85 @@ func NewValidator(signingKey []byte, revocations CapabilityRevocationSource) (*V
 }
 
 func (v *Validator) Validate(ctx context.Context, tokenString string) (CapabilityClaims, error) {
+	claims, err := v.validateWithAudience(ctx, tokenString, CapabilityAudience)
+	if err != nil {
+		return CapabilityClaims{}, err
+	}
+	if err := validateCapabilityClaims(claims); err != nil {
+		return CapabilityClaims{}, err
+	}
+	return claims, nil
+}
+
+// ValidateTaskScoped 在 Validate 基础上强制 task 绑定(方案 §7): LLM capability
+// 必须绑定 task_id 与 runner_generation, 终态撤销 + 绑定校验后旧 token 无法
+// 被下一条 task 复用。
+func (v *Validator) ValidateTaskScoped(ctx context.Context, tokenString string) (CapabilityClaims, error) {
+	claims, err := v.validateWithAudience(ctx, tokenString, CapabilityAudience)
+	if err != nil {
+		return CapabilityClaims{}, err
+	}
+	if err := validateCapabilityClaims(claims); err != nil {
+		return CapabilityClaims{}, err
+	}
+	if claims.TaskID == "" {
+		return CapabilityClaims{}, fmt.Errorf("%w: task_id binding required", ErrCapabilityInvalid)
+	}
+	if claims.RunnerGeneration == 0 {
+		return CapabilityClaims{}, fmt.Errorf("%w: runner_generation binding required", ErrCapabilityInvalid)
+	}
+	return claims, nil
+}
+
+// SophubValidator 校验 Runner → Platform Sophub proxy 的 capability
+// (audience=ga-sophub-proxy, 方案 §5.2): 不要求 provider/task 字段,
+// 但要求 session subject + jti 且未撤销。
+type SophubValidator struct {
+	signingKey  []byte
+	revocations CapabilityRevocationSource
+	clock       func() time.Time
+}
+
+// NewSophubValidator 构建 Sophub audience 专用校验器。
+func NewSophubValidator(signingKey []byte, revocations CapabilityRevocationSource) (*SophubValidator, error) {
+	if len(signingKey) < MinSigningKeyLen {
+		return nil, fmt.Errorf("signing key must be at least %d bytes", MinSigningKeyLen)
+	}
+	if revocations == nil {
+		return nil, fmt.Errorf("capability revocation source is required")
+	}
+	return &SophubValidator{signingKey: append([]byte(nil), signingKey...), revocations: revocations, clock: time.Now}, nil
+}
+
+func (v *SophubValidator) Validate(ctx context.Context, tokenString string) (CapabilityClaims, error) {
+	claims, err := validateWithAudience(v.signingKey, v.revocations, v.clock, ctx, tokenString, SophubAudience)
+	if err != nil {
+		return CapabilityClaims{}, err
+	}
+	return claims, nil
+}
+
+// validateWithAudience 解析并校验 audience/签名/撤销(不含 provider/task 语义)。
+func (v *Validator) validateWithAudience(ctx context.Context, tokenString, audience string) (CapabilityClaims, error) {
+	return validateWithAudience(v.signingKey, v.revocations, v.clock, ctx, tokenString, audience)
+}
+
+func validateWithAudience(signingKey []byte, revocations CapabilityRevocationSource, clock func() time.Time, ctx context.Context, tokenString, audience string) (CapabilityClaims, error) {
 	claims := CapabilityClaims{}
 	parser := jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 		jwt.WithIssuer(CapabilityIssuer),
-		jwt.WithAudience(CapabilityAudience),
+		jwt.WithAudience(audience),
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(),
 		jwt.WithLeeway(validationLeeway),
-		jwt.WithTimeFunc(v.clock),
+		jwt.WithTimeFunc(clock),
 	)
 	token, err := parser.ParseWithClaims(tokenString, &claims, func(token *jwt.Token) (any, error) {
 		if token.Method != jwt.SigningMethodHS256 {
 			return nil, fmt.Errorf("%w: unsupported signing method %q", ErrCapabilityInvalid, token.Method.Alg())
 		}
-		return v.signingKey, nil
+		return signingKey, nil
 	})
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
@@ -182,10 +246,10 @@ func (v *Validator) Validate(ctx context.Context, tokenString string) (Capabilit
 	if token.Header["typ"] != CapabilityType {
 		return CapabilityClaims{}, fmt.Errorf("%w: token type must be %q", ErrCapabilityInvalid, CapabilityType)
 	}
-	if err := validateCapabilityClaims(claims); err != nil {
-		return CapabilityClaims{}, err
+	if claims.Subject == "" || claims.ID == "" {
+		return CapabilityClaims{}, fmt.Errorf("%w: subject and jti are required", ErrCapabilityInvalid)
 	}
-	revoked, err := v.revocations.IsCapabilityRevoked(ctx, HashJTI(claims.ID))
+	revoked, err := revocations.IsCapabilityRevoked(ctx, HashJTI(claims.ID))
 	if err != nil {
 		return CapabilityClaims{}, fmt.Errorf("check capability revocation: %w", err)
 	}

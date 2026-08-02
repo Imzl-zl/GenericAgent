@@ -86,9 +86,12 @@ func (p *WorkerSophubProxy) ServeInstall(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadGateway, "SOPHUB_IDENTITY_MISMATCH", "sophub returned a different SOP", tid)
 		return
 	}
-	// 仅公开 approved single-file markdown(方案 §5.2)。
-	if !strings.EqualFold(sop.FileType, domain.SOPFileTypeMarkdown) || !strings.EqualFold(sop.Status, "approved") {
-		writeErr(w, http.StatusForbidden, "SOPHUB_NOT_PUBLIC", "only public approved markdown SOPs are downloadable", tid)
+	// 仅公开 approved single-file markdown(方案 §5.2): public 属性由
+	// 服务端 fetch 层保证(仅返回 approved 公开项), 此处校验类型与包形态。
+	if !strings.EqualFold(sop.FileType, domain.SOPFileTypeMarkdown) ||
+		!strings.EqualFold(sop.Status, "approved") ||
+		!strings.EqualFold(sop.PackageType, "single_file") {
+		writeErr(w, http.StatusForbidden, "SOPHUB_NOT_PUBLIC", "only public approved single-file markdown SOPs are downloadable", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{

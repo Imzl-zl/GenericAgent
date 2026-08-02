@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -113,6 +114,8 @@ type deliveryService struct {
 
 	unjournaledMu    sync.Mutex
 	unjournaledParts map[string]struct{}
+	// snapshotDir 是 Platform 私有文件快照目录(发送前不可变副本)。
+	snapshotDir string
 }
 
 // NewDeliveryService validates config and returns a runnable delivery service.
@@ -136,9 +139,14 @@ func NewDeliveryService(cfg DeliveryServiceConfig) (DeliveryService, error) {
 	if cfg.Messages == nil {
 		return nil, errors.New("MessageStore is required")
 	}
+	snapshotDir, err := os.MkdirTemp("", "ga-delivery-*")
+	if err != nil {
+		return nil, fmt.Errorf("create deliverable snapshot dir: %w", err)
+	}
 	return &deliveryService{
 		cfg:              cfg,
 		unjournaledParts: make(map[string]struct{}),
+		snapshotDir:      snapshotDir,
 	}, nil
 }
 
@@ -259,7 +267,15 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				TaskID:      task.ID,
 			},
 			send: func() error {
-				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, file.absPath)
+				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
+				// 后复制到 Platform 私有快照, transport 发送不可变快照,
+				// 消除校验与发送之间的 TOCTOU。
+				snap, snapErr := snapshotDeliverable(file.absPath, s.snapshotDir, defaultMaxDeliverableBytes)
+				if snapErr != nil {
+					return snapErr
+				}
+				defer os.Remove(snap)
+				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, snap)
 			},
 			sendErrorCode: "SEND_FILE_FAILED",
 		})

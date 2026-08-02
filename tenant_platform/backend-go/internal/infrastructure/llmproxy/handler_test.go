@@ -38,6 +38,7 @@ func handlerCapabilitySpec(sessionKey string) CapabilitySpec {
 	return CapabilitySpec{
 		SessionKey: sessionKey, ProviderID: 1, ProviderRevision: 1,
 		ProviderType: domain.ProviderNativeOAI, Model: "gpt-test", PolicyVersion: "p",
+		TaskID: "task-1", RunnerGeneration: 1,
 	}
 }
 

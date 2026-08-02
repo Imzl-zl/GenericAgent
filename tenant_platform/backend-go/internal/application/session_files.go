@@ -44,7 +44,11 @@ type SessionFiles interface {
 
 type sessionFilesManager struct {
 	root string
-	mu   sync.Map // session hash -> *sync.Mutex
+	// workspaceLayout 为 true 时(root = GA_WORKSPACES_ROOT)按
+	// <root>/<workspace-hash>/temp/session_files/<digest> 布局落盘:
+	// 附件/输出经共享卷 temp 对 Runner 可见(方案 §4/§6)。
+	workspaceLayout bool
+	mu               sync.Map // session hash -> *sync.Mutex
 }
 
 type sessionManifest struct {
@@ -67,7 +71,21 @@ func NewSessionFiles(root string) (SessionFiles, error) {
 	return &sessionFilesManager{root: base}, nil
 }
 
+// NewWorkspaceSessionFiles 构建共享卷布局的 SessionFiles(生产 Runner 模式):
+// 附件/输出落在 workspaces/<hash>/temp/session_files/..., 与 Runner 内
+// GA_WORKSPACE_TEMP(/ga/legacy/temp) 的 worker 侧布局完全一致。
+func NewWorkspaceSessionFiles(workspacesRoot string) (SessionFiles, error) {
+	if strings.TrimSpace(workspacesRoot) == "" {
+		return nil, fmt.Errorf("workspaces root is required")
+	}
+	return &sessionFilesManager{root: filepath.Clean(workspacesRoot), workspaceLayout: true}, nil
+}
+
 func (m *sessionFilesManager) SandboxRoot(sessionKey string) string {
+	if m.workspaceLayout {
+		hash := sessionKeyDigest(sessionKey)
+		return filepath.Join(m.root, hash, "temp", sessionFilesDirName, hash)
+	}
 	return filepath.Join(m.root, sessionKeyDigest(sessionKey))
 }
 

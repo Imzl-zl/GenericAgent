@@ -6,7 +6,9 @@ import (
 )
 
 const (
-	SOPFileTypeMarkdown = "markdown"
+	SOPFileTypeMarkdown    = "markdown"
+	SOPPackageTypeSingle   = "single_file"
+	SOPStatusApproved      = "approved"
 	MaxSOPRemoteIDBytes = 256
 	MaxSOPContentBytes  = 64 * 1024
 )
@@ -28,6 +30,7 @@ type SophubRemoteSOP struct {
 	FileType    string `json:"file_type"`
 	PackageType string `json:"package_type"`
 	Status      string `json:"status"`
+	IsPublic    bool   `json:"is_public"`
 	Content     string `json:"content"`
 }
 

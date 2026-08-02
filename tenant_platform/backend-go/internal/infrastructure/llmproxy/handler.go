@@ -91,7 +91,7 @@ func (s *Server) validateCapability(w http.ResponseWriter, r *http.Request) (Cap
 		writeError(w, http.StatusUnauthorized, "CAPABILITY_INVALID", "Authorization Bearer required")
 		return CapabilityClaims{}, false
 	}
-	claims, err := s.validator.Validate(r.Context(), token)
+	claims, err := s.validator.ValidateTaskScoped(r.Context(), token)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, capabilityErrorCode(err), "capability token rejected")
 		return CapabilityClaims{}, false

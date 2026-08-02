@@ -131,7 +131,13 @@ def test_application_configuration_uses_named_volumes() -> None:
         "postgres_data", "platform_runtime", "platform_config",
         "session_files", "bot_media", "runner_workspaces",
     }
-    assert all(not value for value in volumes.values())
+    # runner_workspaces 显式 name: sandbox-manager 需以 daemon 可解析的卷名
+    # 做 volume-subpath 挂载(方案 §7); 其余卷保持默认声明。
+    for name, value in volumes.items():
+        if name == "runner_workspaces":
+            assert value == {"name": "runner_workspaces"}
+        else:
+            assert not value
 
 
 def test_only_loopback_application_ports_are_published() -> None:

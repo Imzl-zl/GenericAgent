@@ -339,50 +339,48 @@ func (s *scheduler) tick(ctx context.Context) error {
 	// tasks are never touched; the next task cold-starts from the last
 	// committed snapshot.
 	s.evictIdleWorkers(owned)
-	// If we already own a non-terminal starting/running task, continue dispatch if needed.
+	// 已 owned 的 starting 任务: 异步派发(允许多 Runner 并发, 方案 §7
+	// GA_RUNNER_MAX_ACTIVE); running 任务由各自的 dispatch goroutine 持有,
+	// tick 不再阻塞等待单个任务完成。
 	for _, t := range owned {
 		if t.Status == domain.TaskStarting && t.WorkerDispatchStartedAt == nil {
-			if err := s.dispatch(ctx, t); err != nil {
+			go s.dispatch(ctx, t)
+		}
+	}
+	// 容量内的新任务 claim + 异步派发, 直到达到全局 running 上限。
+	// 同 session key 的串行由 store 的活跃任务约束保证。
+	for {
+		if s.cfg.MaxRunningTasks > 0 {
+			running, err := s.cfg.Store.CountRunningTasks(ctx)
+			if err != nil {
 				return err
 			}
-			return nil
+			if running >= s.cfg.MaxRunningTasks {
+				return nil
+			}
 		}
-		if t.Status == domain.TaskStarting && t.WorkerDispatchStartedAt != nil {
-			// In-flight; wait for completion path (dispatch holds the stream).
-			return nil
-		}
-		if t.Status == domain.TaskRunning {
-			return nil
-		}
-	}
-	keys, err := s.cfg.Store.ListClaimableSessionKeys(ctx, 16, s.cfg.PerTenantRunningLimit)
-	if err != nil {
-		return err
-	}
-	if len(keys) == 0 {
-		return nil
-	}
-	// Global running cap: don't claim new tasks when at capacity. The check
-	// happens after ListClaimableSessionKeys so the cap doesn't mask session
-	// discovery errors. Zero means disabled (dev/test).
-	if s.cfg.MaxRunningTasks > 0 {
-		running, err := s.cfg.Store.CountRunningTasks(ctx)
+		keys, err := s.cfg.Store.ListClaimableSessionKeys(ctx, 16, s.cfg.PerTenantRunningLimit)
 		if err != nil {
 			return err
 		}
-		if running >= s.cfg.MaxRunningTasks {
+		if len(keys) == 0 {
+			return nil
+		}
+		claimed := false
+		for _, sk := range keys {
+			task, ok, err := s.cfg.Store.ClaimNextTask(ctx, sk, s.cfg.PlatformInstanceID, s.cfg.ClaimLease)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			go s.dispatch(ctx, task)
+			claimed = true
+			break // 重新检查容量与可 claim 会话
+		}
+		if !claimed {
 			return nil
 		}
 	}
-	for _, sk := range keys {
-		task, ok, err := s.cfg.Store.ClaimNextTask(ctx, sk, s.cfg.PlatformInstanceID, s.cfg.ClaimLease)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		return s.dispatch(ctx, task)
-	}
-	return nil
 }

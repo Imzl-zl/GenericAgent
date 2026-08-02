@@ -22,6 +22,9 @@ type Instance struct {
 	Client  workerclient.WorkerClient
 	InstID  string
 	Cleanup func()
+	// RunnerGeneration 是 Runner lease generation(方案 §7 fencing)。
+	// loopback 路径恒为 1; Sandbox 路径来自持久 lease。
+	RunnerGeneration uint64
 }
 
 // StartRequest carries the session-scoped resources needed to start a Worker.

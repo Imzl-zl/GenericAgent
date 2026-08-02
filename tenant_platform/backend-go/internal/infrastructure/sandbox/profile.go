@@ -21,10 +21,15 @@ const RunnerNetwork = "runner-control"
 
 // workspace subpaths mounted into the Runner (spec §4).
 const (
-	LegacyMemoryMount = "/ga/legacy/memory"
-	LegacyTempMount   = "/ga/legacy/temp"
-	RunnerStateMount  = "/ga/runner-state"
+	LegacyMemoryMount      = "/ga/legacy/memory"
+	LegacyTempMount        = "/ga/legacy/temp"
+	RunnerStateMount       = "/ga/runner-state"
+	RunnerConfigMount      = "/ga/runner-config" // 控制面材料(证书/策略), 只读
+	RunnerAttachmentsMount = "/ga/runner-attachments" // 输入附件, 只读
 )
+
+// RunnerControlPort 是 Runner 控制面 mTLS 监听端口(方案 §7)。
+const RunnerControlPort = 9443
 
 // WorkspaceMount is one deterministic mount derived from the workspace key.
 type WorkspaceMount struct {

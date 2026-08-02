@@ -31,6 +31,18 @@ if [[ "${1:-}" == "--all" ]]; then
   echo "==> --all 模式: 同时删除运行时/会话/媒体卷"
 fi
 
+# 旧 Document 系统的遗留卷(重构前部署)也一并清理, 避免残留。
+for legacy in document_work document_artifacts; do
+  if docker volume inspect "${project_name}_${legacy}" >/dev/null 2>&1; then
+    docker volume rm "${project_name}_${legacy}"
+    echo "    removed legacy ${project_name}_${legacy}"
+  fi
+  if docker volume inspect "${legacy}" >/dev/null 2>&1; then
+    docker volume rm "${legacy}"
+    echo "    removed legacy ${legacy}"
+  fi
+done
+
 echo "==> 删除卷: ${volumes[*]}"
 for v in "${volumes[@]}"; do
   full="${project_name}_${v}"

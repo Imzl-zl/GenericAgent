@@ -81,6 +81,8 @@ func (h *reverseProxyHarness) defaultToken(t *testing.T) string {
 		ProviderType:     provider.ProviderType,
 		Model:            provider.Model,
 		PolicyVersion:    "p1",
+		TaskID:           "task-1",
+		RunnerGeneration: 1,
 	})
 }
 
@@ -459,6 +461,7 @@ func TestCapabilityBindingRejectsStaleOrMismatchedProvider(t *testing.T) {
 			spec := CapabilitySpec{
 				SessionKey: "personal:42", ProviderID: provider.ID, ProviderRevision: provider.Revision,
 				ProviderType: provider.ProviderType, Model: provider.Model, PolicyVersion: "p1",
+				TaskID: "task-1", RunnerGeneration: 1,
 			}
 			test.mutate(provider, &spec)
 			token := harness.issueToken(t, spec)
@@ -505,6 +508,7 @@ func TestCapabilityBindingAcceptsGAClaudeOneMillionContextModel(t *testing.T) {
 			token := harness.issueToken(t, CapabilitySpec{
 				SessionKey: "personal:42", ProviderID: provider.ID, ProviderRevision: provider.Revision,
 				ProviderType: provider.ProviderType, Model: provider.Model, PolicyVersion: "p1",
+				TaskID: "task-1", RunnerGeneration: 1,
 			})
 			response := proxyRequest(
 				t, context.Background(), harness.proxy.Client(), http.MethodPost,

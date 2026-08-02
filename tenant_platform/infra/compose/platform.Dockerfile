@@ -42,10 +42,14 @@ RUN install -d -o 10001 -g 10001 -m 0750 \
     && install -d -o 10001 -g 10003 -m 2770 \
         /var/lib/ga/runtime/session_files \
         /var/lib/ga/bot-media \
+    && install -d -o 10001 -g 10002 -m 2770 \
+        /var/lib/ga/workspaces \
     && chmod -R a-w /opt/ga/bin /opt/ga/legacy /opt/ga/worker-python /opt/ga/policy /opt/ga/migrations
 
 USER 10001:10001
 WORKDIR /opt/ga
 EXPOSE 8080
 ENTRYPOINT ["/bin/sh", "-c", "umask 0027; exec /opt/ga/bin/platform \"$@\"", "--"]
-CMD ["--policy-file=/opt/ga/policy/foundation.v1.json", "--claim-lease=30s", "--dev-loopback", "--listen=127.0.0.1:8080", "--runtime-root=/var/lib/ga/runtime", "--config-root=/etc/ga/config", "--legacy-root=/opt/ga/legacy", "--worker-python=/usr/local/bin/python3", "--worker-src=/opt/ga/worker-python/src"]
+# 生产 Runner 模式(方案 §7): 不启用 dev-loopback。GA_MANAGER_ADDR/GA_MANAGER_SECRET
+# 等环境由 compose 注入; --listen=0.0.0.0 供同一 application 网络内的容器访问。
+CMD ["--policy-file=/opt/ga/policy/foundation.v1.json", "--claim-lease=30s", "--listen=0.0.0.0:8080"]

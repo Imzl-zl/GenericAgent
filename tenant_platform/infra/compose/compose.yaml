@@ -122,6 +122,13 @@ services:
       PER_USER_QUEUE_LIMIT: ${PER_USER_QUEUE_LIMIT}
       TASK_IDLE_TIMEOUT_SECONDS: ${TASK_IDLE_TIMEOUT_SECONDS}
       WORKER_IDLE_TTL_SECONDS: ${WORKER_IDLE_TTL_SECONDS}
+      # 生产 Runner 控制面(方案 §7): Platform 经认证 Manager API 操作容器。
+      GA_WORKSPACES_ROOT: /var/lib/ga/workspaces
+      GA_MANAGER_ADDR: ${GA_MANAGER_ADDR:-http://sandbox-manager:8091}
+      GA_MANAGER_SECRET: ${GA_MANAGER_SECRET}
+      GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
+      GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
+      GA_SOPHUB_PROXY_ADDR: ${GA_SOPHUB_PROXY_ADDR:-}
     read_only: true
     cap_drop:
       - ALL
@@ -134,11 +141,14 @@ services:
       - session_files:/var/lib/ga/runtime/session_files
       - platform_config:/etc/ga/config
       - bot_media:/var/lib/ga/bot-media:ro
+      # 共享工作区卷: 附件/输出经 temp/ 与 Runner 互通(方案 §6)。
+      - runner_workspaces:/var/lib/ga/workspaces
     ports:
       - "${GA_HTTP_BIND:-127.0.0.1}:${GA_HTTP_PORT:-8088}:8088"
     networks:
       - application
       - database
+      - runner-control
     depends_on:
       postgres:
         condition: service_healthy
@@ -205,7 +215,16 @@ services:
       dockerfile: tenant_platform/infra/compose/sandbox-manager.Dockerfile
     restart: unless-stopped
     init: true
-    user: "10001:10001"
+    # root 运行: 需要 chown 工作区目录(固定 Runner UID/GID)与访问 Docker socket;
+    # 仍受 read_only + cap_drop ALL + no-new-privileges 约束, 仅追加最小能力。
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
     environment:
       DATABASE_URL: ${DATABASE_URL}
       GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
@@ -216,14 +235,14 @@ services:
       GA_RUNNER_PIDS_LIMIT: ${GA_RUNNER_PIDS_LIMIT:-128}
       GA_RUNNER_TASK_TIMEOUT: ${GA_RUNNER_TASK_TIMEOUT:-300s}
       GA_WORKSPACES_ROOT: ${GA_WORKSPACES_ROOT:-/var/lib/ga/workspaces}
+      GA_WORKSPACES_VOLUME: ${GA_WORKSPACES_VOLUME:-runner_workspaces}
       GA_LLM_PROXY_ADDR: ${GA_LLM_PROXY_ADDR:-http://llm-proxy:8081}
+      GA_MANAGER_SECRET: ${GA_MANAGER_SECRET}
+      GA_MANAGER_ID: ${GA_MANAGER_ID:-sandbox-manager-1}
+      GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
     read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=0700
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner_workspaces:/var/lib/ga/workspaces
@@ -285,7 +304,9 @@ volumes:
   platform_config:
   session_files:
   bot_media:
+  # 显式卷名: sandbox-manager 用 volume-subpath 挂载子目录到 Runner(daemon 可解析)。
   runner_workspaces:
+    name: runner_workspaces
 
 networks:
   application:

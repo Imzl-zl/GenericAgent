@@ -42,7 +42,7 @@ func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) 
 	return context.DeadlineExceeded
 }
 
-func workerTaskEnvelope(task domain.Task) *workerv1.TaskEnvelope {
+func workerTaskEnvelope(task domain.Task, runnerGeneration uint64, capabilityJTI string) *workerv1.TaskEnvelope {
 	return &workerv1.TaskEnvelope{
 		TaskId:            task.ID,
 		SessionKey:        task.SessionKey,
@@ -54,6 +54,8 @@ func workerTaskEnvelope(task domain.Task) *workerv1.TaskEnvelope {
 		PersonaSnapshot:   append([]string(nil), task.PersonaSnapshot...),
 		ToolPolicyVersion: task.ToolPolicyVersion,
 		CreatedAt:         timestamppb.New(task.CreatedAt),
+		RunnerGeneration:  runnerGeneration,
+		CapabilityJti:     capabilityJTI,
 	}
 }
 
@@ -168,7 +170,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
-	req := &workerv1.ExecuteTaskRequest{Task: workerTaskEnvelope(taskRow)}
+	req := &workerv1.ExecuteTaskRequest{Task: workerTaskEnvelope(taskRow, entry.runnerGeneration, firstJTI(entry.credentials))}
 
 	taskDeadline := time.Now().Add(s.cfg.MaxTaskWallClock)
 	executeCtx, cancelExecute := context.WithTimeout(ctx, s.cfg.MaxTaskWallClock)
@@ -304,4 +306,13 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}
 	_ = s.KickSession(ctx, task.SessionKey)
 	return nil
+}
+
+// firstJTI 返回凭证集首个 JTI(空集返回空串), 用于 TaskEnvelope 的
+// capability_jti 绑定(方案 §7; Worker 侧 generation 校验为主)。
+func firstJTI(set workerCredentialSet) string {
+	if len(set.JTIs) == 0 {
+		return ""
+	}
+	return set.JTIs[0]
 }

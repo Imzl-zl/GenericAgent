@@ -34,13 +34,9 @@ type workerEntry struct {
 	// Used by the idle eviction reaper to reclaim memory from long-idle
 	// sessions (pattern: Kubernetes pod eviction, AWS Lambda container TTL).
 	lastUsedAt time.Time
-}
-
-// runnerGeneration 返回该 Worker 的 Runner generation(方案 §7 fencing)。
-// V1: loopback/static 路径恒为 1; SandboxWorkerRuntime 在任务 4/5 接线后
-// 由持久 lease 提供。此处保证 StartSession 的 generation 校验总是通过。
-func (e *workerEntry) runnerGeneration() uint64 {
-	return 1
+	// runnerGeneration 是该 Worker 的 Runner lease generation(方案 §7 fencing)。
+	// loopback 路径恒为 1; Sandbox 路径由持久 lease 提供。
+	runnerGeneration uint64
 }
 
 // startSession invokes StartSession on the worker exactly once. Subsequent
@@ -114,7 +110,16 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 		}
 		if !replace {
 			entry.lastUsedAt = time.Now().UTC()
+			// per-task capability(方案 §7): 复用 Worker 时也必须为每个新任务
+			// 签发新 token(绑定 task_id/generation), 旧 token 在 ack 后撤销。
+			taskChanged := entry.taskID != task.ID
 			entry.taskID = task.ID
+			if taskChanged && s.cfg.TokenIssuer != nil {
+				if err := s.refreshWorkerCredentials(ctx, entry); err != nil {
+					entry.lifecycleMu.Unlock()
+					return nil, entry, err
+				}
+			}
 			client := entry.client
 			entry.lifecycleMu.Unlock()
 			return client, entry, nil
@@ -172,7 +177,7 @@ func (s *scheduler) initializeWorkerEntry(
 		entry.lifecycleMu.Unlock()
 		return nil, nil, err
 	}
-	client, instID, cleanup, err := s.startWorkerProcess(ctx, task.SessionKey)
+	client, instID, cleanup, generation, err := s.startWorkerProcess(ctx, task.SessionKey)
 	if err != nil {
 		s.removeWorkerEntry(task.SessionKey, entry)
 		s.revokeCredentialSetBestEffort(context.Background(), credentials)
@@ -182,6 +187,7 @@ func (s *scheduler) initializeWorkerEntry(
 	entry.client = client
 	entry.cleanup = cleanup
 	entry.instID = instID
+	entry.runnerGeneration = generation
 	entry.credentials = credentials
 	entry.taskID = task.ID
 	entry.lastUsedAt = time.Now().UTC()
@@ -251,7 +257,7 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 		SessionKey: task.SessionKey,
 		// 方案 §7: workspace_key + runner_generation 由 Platform 写入, Runner 校验。
 		WorkspaceKey:      task.SessionKey,
-		RunnerGeneration:  entry.runnerGeneration(),
+		RunnerGeneration:  entry.runnerGeneration,
 		RuntimePolicy: &workerv1.RuntimePolicy{
 			MaxTurns: maxTurns, MaxHistoryBytes: defaultMaxHistoryBytes,
 			MaxWorkingBytes: defaultMaxWorkingBytes, MaxOutputBytes: defaultMaxOutputBytes,
@@ -301,16 +307,16 @@ func (s *scheduler) agentMaxTurns(ctx context.Context) (uint32, error) {
 
 // startWorkerProcess creates the Worker after its runtime JSON and fixed
 // mykey.py loader have been written.
-func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string) (workerclient.WorkerClient, string, func(), error) {
+func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string) (workerclient.WorkerClient, string, func(), uint64, error) {
 	inst, err := s.cfg.Runtime.Start(ctx, worker.StartRequest{
 		SessionKey: sessionKey,
 		ConfigDir:  s.configDirFor(sessionKey),
 		RuntimeDir: s.cfg.RuntimeRoot,
 	})
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", nil, 0, err
 	}
-	return inst.Client, inst.InstID, inst.Cleanup, nil
+	return inst.Client, inst.InstID, inst.Cleanup, inst.RunnerGeneration, nil
 }
 
 // shutdownAllWorkers revokes active capability sets and tears down every
