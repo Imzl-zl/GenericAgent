@@ -57,6 +57,7 @@ def build_snapshot_bundle(
     result_body: str,
     max_history_bytes: int,
     max_working_bytes: int,
+    runner_generation: int = 0,
 ) -> dict[str, Any]:
     if not isinstance(result_body, str):
         raise CheckpointError("INVALID_RESULT", "result body must be str")
@@ -64,7 +65,7 @@ def build_snapshot_bundle(
     _check_working_budget(working, max_working_bytes)
     body = result_body
     digest = result_digest_for(body)
-    return {
+    bundle = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "task_id": task_id,
         "session_key": session_key,
@@ -78,6 +79,9 @@ def build_snapshot_bundle(
         },
         "result_digest": digest,
     }
+    if runner_generation:
+        bundle["runner_generation"] = runner_generation
+    return bundle
 
 
 def bundle_checksum_bytes(raw: bytes) -> str:
@@ -94,10 +98,25 @@ def load_snapshot_bundle(
     expected_checksum: str,
     max_history_bytes: int,
     max_working_bytes: int,
+    max_bundle_bytes: int = 0,
 ) -> dict[str, Any]:
     path = Path(path)
     if not path.is_file():
         raise CheckpointError("SNAPSHOT_NOT_FOUND", f"snapshot not found: {path}")
+    # 审查 R4-I6: committed/ 位于 Runner 可写的 state 挂载内, 可能被替换为
+    # 超大文件。必须先按 max_bundle_bytes stat 拒绝超限, 再读入内存, 防止
+    # read_bytes 无界读取耗尽 Runner 内存(checksum 校验在读完之后, 不能
+    # 先读后查限)。
+    if max_bundle_bytes > 0:
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise CheckpointError("SNAPSHOT_NOT_FOUND", f"snapshot stat failed: {path}") from exc
+        if size > max_bundle_bytes:
+            raise CheckpointError(
+                "SNAPSHOT_TOO_LARGE",
+                f"snapshot size {size} exceeds max_bundle_bytes {max_bundle_bytes}",
+            )
     raw = path.read_bytes()
     actual = bundle_checksum_bytes(raw)
     if actual != expected_checksum:
@@ -172,20 +191,32 @@ def write_checkpoint_atomic(
     )
     tmp_path = Path(tmp_name)
     try:
+        # mkstemp 默认 0600, Platform(共享组)必须能读 staging bundle
+        # (审查: 共享卷权限协议; 0640 = 属主读写 + 共享组读)。
+        os.fchmod(fd, 0o640)
         with os.fdopen(fd, "wb") as f:
             f.write(raw)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, staging_ref)
-        # fsync directory best-effort (Windows may not support dir fd the same way).
+        # fsync directory to persist the rename (crash durability, 审查 I8).
+        # Windows may not support opening a directory for fsync; only swallow
+        # the specific "not supported" cases there, never on POSIX.
         try:
             dir_fd = os.open(str(staging_ref.parent), os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            if os.name == "nt":
+                # Windows: 目录 fsync 不受支持/无 POSIX 语义, 容忍。
+                pass
+            else:
+                raise CheckpointError(
+                    "STAGING_DIR_FSYNC_FAILED",
+                    f"fsync staging dir failed: {exc}",
+                ) from exc
     except Exception:
         if tmp_path.exists():
             try:

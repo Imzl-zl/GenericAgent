@@ -51,7 +51,9 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
 
     def CancelTask(self, request, context):
         try:
-            return self._adapter.cancel_task(request.task_id)
+            return self._adapter.cancel_task(
+                request.task_id, request.workspace_key, request.runner_generation
+            )
         except WorkerAdapterError as exc:
             _abort(context, exc)
             return worker_pb2.CancelTaskResponse(accepted=False)
@@ -65,7 +67,9 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
 
     def Shutdown(self, request, context):
         try:
-            return self._adapter.shutdown(request.reason or "")
+            return self._adapter.shutdown(
+                request.reason or "", request.workspace_key, request.runner_generation
+            )
         except WorkerAdapterError as exc:
             _abort(context, exc)
             return worker_pb2.ShutdownResponse(accepted=False)

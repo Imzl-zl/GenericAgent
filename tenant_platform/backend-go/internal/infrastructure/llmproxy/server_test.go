@@ -29,11 +29,19 @@ func TestNewServerRejectsEmptyConfig(t *testing.T) {
 	}
 }
 
-func TestNewServerRejectsNonLoopbackListen(t *testing.T) {
+// TestNewServerAllowsExplicitContainerListen 验证容器内部服务可显式配置
+// 非 loopback 监听(审查 C2: llm-proxy 在 runner-control 网络内被 Runner
+// 访问, 必须监听 0.0.0.0 或具体地址)。
+func TestNewServerAllowsExplicitContainerListen(t *testing.T) {
 	cfg := testConfig()
 	cfg.Listen = "0.0.0.0:8081"
+	if _, err := NewServer(cfg); err != nil {
+		t.Fatalf("explicit container listen must be allowed: %v", err)
+	}
+	// 非法地址仍拒绝。
+	cfg.Listen = "no-port"
 	if _, err := NewServer(cfg); err == nil {
-		t.Fatal("expected loopback validation error")
+		t.Fatal("expected invalid listen validation error")
 	}
 }
 

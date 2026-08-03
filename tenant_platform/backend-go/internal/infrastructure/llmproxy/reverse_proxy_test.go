@@ -43,6 +43,7 @@ func newReverseProxyHarness(
 		ProviderSource:       providerSource,
 		Cipher:               &fakeCipher{wantVersion: 1},
 		Revocations:          &fakeRevocationSource{revoked: make(map[[32]byte]bool)},
+		UsageCounter:         &fakeUsageCounter{maxCalls: 1000},
 		AllowedUpstreamCIDRs: []string{"127.0.0.0/8", "::1/128"},
 		AllowedHTTPHosts:     []string{upstream.Listener.Addr().String()},
 	})
@@ -83,6 +84,8 @@ func (h *reverseProxyHarness) defaultToken(t *testing.T) string {
 		PolicyVersion:    "p1",
 		TaskID:           "task-1",
 		RunnerGeneration: 1,
+		Operation:        "llm.chat",
+		Budget:           `{"max_turns":8}`,
 	})
 }
 
@@ -462,6 +465,8 @@ func TestCapabilityBindingRejectsStaleOrMismatchedProvider(t *testing.T) {
 				SessionKey: "personal:42", ProviderID: provider.ID, ProviderRevision: provider.Revision,
 				ProviderType: provider.ProviderType, Model: provider.Model, PolicyVersion: "p1",
 				TaskID: "task-1", RunnerGeneration: 1,
+				Operation: "llm.chat",
+				Budget:   `{"max_turns":8}`,
 			}
 			test.mutate(provider, &spec)
 			token := harness.issueToken(t, spec)
@@ -509,6 +514,8 @@ func TestCapabilityBindingAcceptsGAClaudeOneMillionContextModel(t *testing.T) {
 				SessionKey: "personal:42", ProviderID: provider.ID, ProviderRevision: provider.Revision,
 				ProviderType: provider.ProviderType, Model: provider.Model, PolicyVersion: "p1",
 				TaskID: "task-1", RunnerGeneration: 1,
+				Operation: "llm.chat",
+				Budget:   `{"max_turns":8}`,
 			})
 			response := proxyRequest(
 				t, context.Background(), harness.proxy.Client(), http.MethodPost,

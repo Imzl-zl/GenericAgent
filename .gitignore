@@ -168,5 +168,6 @@ plugins/subscription_portal.py
 # runtime/config/mykey.py is already covered by the global mykey.py rule above.
 tenant_platform/runtime/runtime_data/
 
-# ga-runner 镜像构建产物(由 scripts/build-memory-template.sh 生成)
-tenant_platform/infra/compose/memory-template/
+# ga-runner memory 模板基线已入库(由 scripts/build-memory-template.sh 生成,
+# 与上游 9355c22d7 对齐; 重新生成后必须与 git 基线 diff 校验)
+tenant_platform/infra/compose/memory-template/*.tmp

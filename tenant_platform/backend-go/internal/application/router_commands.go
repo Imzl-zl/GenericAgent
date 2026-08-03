@@ -137,7 +137,7 @@ func (r *router) handleNew(ctx context.Context, msg IncomingMessage, bot domain.
 				"task_id", task.ID, "error", err)
 		}
 	}
-	if err := r.store.ResetWorkspace(ctx, sessionKey); err != nil {
+	if _, err := r.store.ResetWorkspaceForNewSession(ctx, sessionKey); err != nil {
 		return RouterResult{}, fmt.Errorf("reset workspace: %w", err)
 	}
 	reply := "已开启新会话，history 和 working 已清空"

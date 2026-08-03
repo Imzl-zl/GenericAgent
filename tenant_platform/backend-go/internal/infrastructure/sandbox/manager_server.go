@@ -11,23 +11,31 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // ManagerServer 是 sandbox-manager 暴露给 Platform 控制面的 HTTP API
 // (方案 §7: Platform 不持有 Docker socket)。所有请求都必须携带
-// HMAC-SHA256 签名(共享 secret + 时间戳 + nonce), 防重放窗口 ±5 分钟。
+// HMAC-SHA256 签名(共享 secret + 时间戳 + nonce), 防重放窗口 ±5 分钟;
+// nonce 一次性消费(进程内去重 + TTL), 同一签名请求不能重放两次。
 //
 // 端点:
 //
 //	POST /v1/runners/ensure  创建/复用 Runner(携带 mTLS 材料与控制面环境)
-//	DELETE /v1/runners/{name} 销毁 Runner
+//	DELETE /v1/runners/{name} 销毁 Runner(仅限本 Manager 的 Runner 命名)
 //	GET   /v1/runners/{name}  校验 Runner 固定 profile
 //	GET   /v1/runners         列出本 Manager 的 Runner
 type ManagerServer struct {
 	manager *Manager
 	secret  []byte
 	now     func() time.Time
+
+	// seenNonces 是已消费 nonce 的一次性集合(nonce -> 过期时间)。
+	// 进程内实现: Manager 单实例持有全部容器生命周期, 重启后窗口内
+	// 旧 nonce 因进程丢失而不再存在, 但 HMAC secret 轮换可覆盖重启场景。
+	seenNoncesMu sync.Mutex
+	seenNonces   map[string]time.Time
 }
 
 const managerAuthWindow = 5 * time.Minute
@@ -40,13 +48,19 @@ func NewManagerServer(manager *Manager, secret string) (*ManagerServer, error) {
 	if len(secret) < 16 {
 		return nil, fmt.Errorf("manager control secret must be at least 16 bytes")
 	}
-	return &ManagerServer{manager: manager, secret: []byte(secret), now: time.Now}, nil
+	return &ManagerServer{
+		manager:    manager,
+		secret:     []byte(secret),
+		now:        time.Now,
+		seenNonces: make(map[string]time.Time),
+	}, nil
 }
 
 // Handler 返回带认证中间件的路由。
 func (s *ManagerServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/runners/ensure", s.handleEnsure)
+	mux.HandleFunc("POST /v1/workspaces/ensure", s.handleEnsureWorkspace)
 	mux.HandleFunc("DELETE /v1/runners/{name}", s.handleDestroy)
 	mux.HandleFunc("GET /v1/runners/{name}", s.handleInspect)
 	mux.HandleFunc("GET /v1/runners", s.handleList)
@@ -92,11 +106,45 @@ func (s *ManagerServer) handleEnsure(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *ManagerServer) handleEnsureWorkspace(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeManagerError(w, http.StatusBadRequest, "BODY_READ_FAILED", "request body could not be read")
+		return
+	}
+	var req struct {
+		WorkspaceKey string `json:"workspace_key"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeManagerError(w, http.StatusBadRequest, "INVALID_JSON", "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.WorkspaceKey) == "" {
+		writeManagerError(w, http.StatusBadRequest, "WORKSPACE_KEY_REQUIRED", "workspace_key is required")
+		return
+	}
+	if err := s.manager.EnsureWorkspace(r.Context(), req.WorkspaceKey); err != nil {
+		writeManagerError(w, http.StatusConflict, "WORKSPACE_ENSURE_FAILED", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *ManagerServer) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
 		writeManagerError(w, http.StatusBadRequest, "NAME_REQUIRED", "runner name is required")
 		return
+	}
+	// 仅允许销毁本 Manager 的 Runner(命名模式或容器 ID + label 校验),
+	// 防止控制面凭据泄露后任意 docker rm -f 宿主任意容器(方案 §7)。
+	// 接管清理(stale_container_id)以容器 ID 调用本接口, 必须走 label 归属校验。
+	if !s.manager.IsRunnerName(name) {
+		ok, err := s.manager.IsRunnerContainer(r.Context(), name)
+		if err != nil || !ok {
+			writeManagerError(w, http.StatusBadRequest, "NAME_REJECTED", "not a managed runner")
+			return
+		}
 	}
 	if err := s.manager.DestroyRunner(r.Context(), name); err != nil {
 		writeManagerError(w, http.StatusConflict, "RUNNER_DESTROY_FAILED", err.Error())
@@ -160,9 +208,31 @@ func (s *ManagerServer) authenticate(next http.Handler) http.Handler {
 			writeManagerError(w, http.StatusUnauthorized, "AUTH_MISMATCH", "invalid manager control signature")
 			return
 		}
+		// nonce 一次性消费: 同一 nonce 在窗口内只能使用一次(防重放)。
+		if !s.consumeNonce(nonce) {
+			writeManagerError(w, http.StatusUnauthorized, "AUTH_REPLAY", "nonce already used")
+			return
+		}
 		r.Body = io.NopCloser(strings.NewReader(string(body)))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// consumeNonce 记录并消费 nonce; 重复使用返回 false。顺带惰性清理过期项。
+func (s *ManagerServer) consumeNonce(nonce string) bool {
+	s.seenNoncesMu.Lock()
+	defer s.seenNoncesMu.Unlock()
+	now := s.now()
+	for n, expires := range s.seenNonces {
+		if now.After(expires) {
+			delete(s.seenNonces, n)
+		}
+	}
+	if _, seen := s.seenNonces[nonce]; seen {
+		return false
+	}
+	s.seenNonces[nonce] = now.Add(managerAuthWindow + time.Minute)
+	return true
 }
 
 func writeManagerJSON(w http.ResponseWriter, status int, v any) {

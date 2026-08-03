@@ -11,6 +11,7 @@ Public API only; internals split into:
 from __future__ import annotations
 
 import hmac
+import os
 import threading
 import uuid
 from pathlib import Path
@@ -70,7 +71,7 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
             return worker_pb2.HealthResponse(
                 worker_instance_id=self._session.worker_instance_id,
                 session_key=self._session.session_key,
-                ready=not self._session.shutting_down,
+                ready=not (self._session.shutting_down or self._session.agent_failed),
             )
 
     def start_session(self, request: worker_pb2.StartSessionRequest) -> worker_pb2.StartSessionResponse:
@@ -94,6 +95,9 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
         with self._lock:
             if self._session is None:
                 raise WorkerAdapterError("SESSION_NOT_STARTED", "session not started")
+            # 控制面身份 fencing(方案 §7, 审查): 迟到的 reload 请求必须绑定
+            # 当前 workspace 与 Runner generation。
+            self._assert_control_identity(request.workspace_key, request.runner_generation)
             if self._pending is not None or self._session.active_task_id:
                 raise WorkerAdapterError("TASK_ACTIVE", "cannot reload credentials during a task")
             if request.credential_generation == self._session.credential_generation:
@@ -132,6 +136,21 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
             self._session.credential_generation = metadata.generation
             self._session.credential_checksum = metadata.checksum
             self._session.routing_snapshot_id = metadata.routing_snapshot_id
+            self._session.capability_jtis = metadata.jtis
+            # 审查: reload 必须同步刷新 SOPHub proxy——复用 Runner 的第二个
+            # task 不能继续使用首个 task 已撤销的 capability token。配置被
+            # 移除时 proxy 清空(下一任务不再安装 sophub 工具); 配置损坏时
+            # 与 StartSession 一致地显式失败。
+            from ga_worker.sop_tool import SopToolError, load_runtime_sophub_proxy
+            try:
+                self._session.sophub_proxy = load_runtime_sophub_proxy(self.config_root)
+            except SopToolError as exc:
+                raise WorkerAdapterError("SOPHUB_CONFIG_ERROR", str(exc)) from exc
+            if self._session.sophub_proxy is not None:
+                mem_env = os.environ.get("GA_WORKSPACE_MEMORY", "").strip()
+                self._session.workspace_memory = (
+                    Path(mem_env) if mem_env else Path(self.legacy_root) / "memory"
+                )
             return worker_pb2.ReloadCredentialsResponse(
                 credential_generation=metadata.generation,
                 config_checksum=metadata.checksum,
@@ -141,9 +160,30 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
         from ga_worker.task_runner import run_task
         yield from run_task(self, request)
 
-    def cancel_task(self, task_id: str) -> worker_pb2.CancelTaskResponse:
+    def _assert_control_identity(self, workspace_key: str, runner_generation: int) -> None:
+        """控制 RPC(Reload/Cancel/Shutdown)的身份 fencing(方案 §7, 审查):
+        请求必须携带并与当前会话的 workspace/generation 精确匹配, 拒绝迟到
+        或跨工作区的控制请求。"""
+        if self._session is None:
+            return
+        if workspace_key != self._session.workspace_key:
+            raise WorkerAdapterError(
+                "WORKSPACE_KEY_MISMATCH",
+                f"control workspace_key {workspace_key!r} != active {self._session.workspace_key!r}",
+            )
+        if runner_generation != self._session.runner_generation:
+            raise WorkerAdapterError(
+                "RUNNER_GENERATION_MISMATCH",
+                f"control runner_generation {runner_generation} != active {self._session.runner_generation}",
+            )
+
+    def cancel_task(self, task_id: str, workspace_key: str = "", runner_generation: int = 0) -> worker_pb2.CancelTaskResponse:
         with self._lock:
             if self._session is None:
+                return worker_pb2.CancelTaskResponse(accepted=False)
+            try:
+                self._assert_control_identity(workspace_key, runner_generation)
+            except WorkerAdapterError:
                 return worker_pb2.CancelTaskResponse(accepted=False)
             agent = self._session.agent
             pending = self._pending
@@ -162,6 +202,13 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
         with self._lock:
             if self._session is None:
                 raise WorkerAdapterError("SESSION_NOT_STARTED", "no active session")
+            # Runner generation fencing(审查 I7): 只有当前 generation 的 Runner
+            # 可以提交 checkpoint; 旧 generation 的迟到请求必须拒绝。
+            if request.runner_generation != self._session.runner_generation:
+                raise WorkerAdapterError(
+                    "CHECKPOINT_GENERATION_MISMATCH",
+                    f"checkpoint runner_generation {request.runner_generation} != active {self._session.runner_generation}",
+                )
             completed = self._session.completed
             if completed is None or completed.task_id != request.task_id:
                 raise WorkerAdapterError(
@@ -171,10 +218,14 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
         self._validate_checkpoint_request(request)
         return self._write_checkpoint(request)
 
-    def shutdown(self, reason: str) -> worker_pb2.ShutdownResponse:
+    def shutdown(self, reason: str, workspace_key: str = "", runner_generation: int = 0) -> worker_pb2.ShutdownResponse:
         with self._lock:
             if self._session is None:
                 return worker_pb2.ShutdownResponse(accepted=True)
+            try:
+                self._assert_control_identity(workspace_key, runner_generation)
+            except WorkerAdapterError:
+                return worker_pb2.ShutdownResponse(accepted=False)
             self._session.shutting_down = True
             agent = self._session.agent
             pending = self._pending

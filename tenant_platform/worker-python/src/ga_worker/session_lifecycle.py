@@ -9,11 +9,15 @@ history accessors.
 from __future__ import annotations
 
 import copy
+import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
 
 from genericagent.worker.v1 import worker_pb2
+
+logger = logging.getLogger(__name__)
 
 from ga_worker.checkpoint import (
     CheckpointError,
@@ -31,6 +35,7 @@ from ga_worker.runtime_overlay import (
     encode_session_id,
     materialize_runtime_overlay,
 )
+from ga_worker.sop_tool import SopToolError, load_runtime_sophub_proxy
 from ga_worker.state import (
     CompletedTask,
     SessionState,
@@ -56,6 +61,27 @@ class SessionLifecycleMixin:
             raise WorkerAdapterError("WORKSPACE_KEY_MISMATCH", "workspace_key must match session_key")
         if request.runner_generation == 0:
             raise WorkerAdapterError("INVALID_RUNNER_GENERATION", "runner_generation required")
+        # 容器不可变身份(方案 §7, 审查): Manager 创建容器时固定注入
+        # GA_WORKSPACE_KEY / GA_RUNNER_GENERATION, Worker 自身无法修改。
+        # 容器模式(env 存在)强制校验, 防止误路由/迟到的控制面请求在错误
+        # 工作区挂载中初始化; loopback 开发(env 缺失)跳过。
+        container_ws = os.environ.get("GA_WORKSPACE_KEY", "").strip()
+        container_gen = os.environ.get("GA_RUNNER_GENERATION", "").strip()
+        if container_ws and request.workspace_key != container_ws:
+            raise WorkerAdapterError(
+                "WORKSPACE_KEY_MISMATCH",
+                f"workspace_key {request.workspace_key!r} != container identity {container_ws!r}",
+            )
+        if container_gen:
+            try:
+                container_generation = int(container_gen)
+            except ValueError:
+                raise WorkerAdapterError("RUNNER_IDENTITY_INVALID", "container runner generation env is invalid")
+            if request.runner_generation != container_generation:
+                raise WorkerAdapterError(
+                    "RUNNER_GENERATION_MISMATCH",
+                    f"runner_generation {request.runner_generation} != container generation {container_generation}",
+                )
         policy = request.runtime_policy
         if not policy.capability_version:
             raise WorkerAdapterError("INVALID_RUNTIME_POLICY", "capability_version required")
@@ -91,10 +117,15 @@ class SessionLifecycleMixin:
     def _create_session(self, request: worker_pb2.StartSessionRequest) -> worker_pb2.StartSessionResponse:
         try:
             session_id = encode_session_id(request.session_key)
+            # 审查 R4-I13: 容器 Runner 的 GA_OVERLAY_ROOT 指向 tmpfs, overlay
+            # 不落持久 state; loopback 未设置时回退 runtime_root。
+            overlay_root_env = os.environ.get("GA_OVERLAY_ROOT", "").strip()
+            overlay_root = Path(overlay_root_env) if overlay_root_env else None
             overlay_dir, manifest = materialize_runtime_overlay(
                 legacy_root=self.legacy_root,
                 runtime_root=self.runtime_root,
                 session_id=session_id,
+                overlay_root=overlay_root,
             )
         except OverlayError as exc:
             raise WorkerAdapterError("OVERLAY_ERROR", str(exc)) from exc
@@ -104,6 +135,16 @@ class SessionLifecycleMixin:
             credential_metadata = load_runtime_metadata(self.config_root)
         except CredentialConfigError as exc:
             raise WorkerAdapterError("CREDENTIAL_CONFIG_ERROR", str(exc)) from exc
+        # SOPHub proxy capability(方案 §5.2): 配置存在时 Worker 才能搜索/安装
+        # SOP; 安装目标为当前工作区 memory/sops/。
+        try:
+            sophub_proxy = load_runtime_sophub_proxy(self.config_root)
+        except SopToolError as exc:
+            raise WorkerAdapterError("SOPHUB_CONFIG_ERROR", str(exc)) from exc
+        workspace_memory = None
+        if sophub_proxy is not None:
+            mem_env = os.environ.get("GA_WORKSPACE_MEMORY", "").strip()
+            workspace_memory = Path(mem_env) if mem_env else Path(self.legacy_root) / "memory"
         agent = self._create_agent(overlay_dir, manifest)
         self._restore_histories(agent, seed_agent, seed_backend)
         try:
@@ -113,8 +154,9 @@ class SessionLifecycleMixin:
             raise WorkerAdapterError("MCP_INITIALIZATION_ERROR", str(exc)) from exc
 
         runner = threading.Thread(target=self._safe_run, args=(agent,), name="ga-runner", daemon=True)
-        runner.start()
-
+        # 审查: 必须先赋值 self._session 再启动 runner 线程, 否则线程在
+        # SessionState 创建前崩溃时 agent_failed 无处标记, 失败静默丢失且
+        # health 继续报 ready(审查 R4-I11 启动竞态)。
         self._session = SessionState(
             session_key=request.session_key,
             session_id=session_id,
@@ -132,6 +174,9 @@ class SessionLifecycleMixin:
             credential_generation=credential_metadata.generation,
             credential_checksum=credential_metadata.checksum,
             routing_snapshot_id=credential_metadata.routing_snapshot_id,
+            capability_jtis=credential_metadata.jtis,
+            sophub_proxy=sophub_proxy,
+            workspace_memory=workspace_memory,
             seed_working=seed_working,
             seed_backend_history=seed_backend,
             seed_agent_history=seed_agent,
@@ -141,6 +186,7 @@ class SessionLifecycleMixin:
             mcp_tools=mcp_tools,
             mcp_clients=mcp_clients,
         )
+        runner.start()
         return worker_pb2.StartSessionResponse(
             session_key=self._session.session_key,
             worker_instance_id=self._session.worker_instance_id,
@@ -233,6 +279,14 @@ class SessionLifecycleMixin:
                 expected_checksum=request.snapshot_checksum,
                 max_history_bytes=int(policy.max_history_bytes),
                 max_working_bytes=int(policy.max_working_bytes),
+                # 审查 R4-I6: Platform 签发快照时按 Prepare 的 max_bundle_bytes
+                # 校验, 恢复时下发该上限供限长读取; 未下发时按策略上限推导
+                # 保守界, 保证任何路径都不会无界读入。
+                max_bundle_bytes=int(request.max_bundle_bytes)
+                or int(policy.max_history_bytes)
+                + int(policy.max_working_bytes)
+                + int(policy.max_output_bytes)
+                + (1 << 20),
             )
         except CheckpointError as exc:
             raise WorkerAdapterError(exc.code, exc.message) from exc
@@ -278,6 +332,7 @@ class SessionLifecycleMixin:
                 result_body=completed.result_body,
                 max_history_bytes=int(policy.max_history_bytes),
                 max_working_bytes=int(policy.max_working_bytes),
+                runner_generation=request.runner_generation,
             )
             checksum, result_digest = write_checkpoint_atomic(
                 staging_ref=staging,
@@ -296,6 +351,7 @@ class SessionLifecycleMixin:
             staging_ref=str(staging),
             checksum=checksum,
             result_digest=result_digest,
+            runner_generation=request.runner_generation,
         )
 
     def _close_session_mcp(self) -> None:
@@ -306,10 +362,16 @@ class SessionLifecycleMixin:
         self._session.mcp_tools = {}
 
     def _safe_run(self, agent: Any) -> None:
+        # 审查: agent 主线程异常必须显式记录并标记会话失败, 不能静默吞掉——
+        # 否则 health/heartbeat 继续 ready, 后续任务会对死亡线程的空队列挂起,
+        # 关闭 task timeout 时永久占用 Runner。
         try:
             agent.run()
         except Exception:
-            pass
+            logger.exception("ga-runner thread crashed")
+            with self._lock:
+                if self._session is not None:
+                    self._session.agent_failed = True
 
     def _set_backend_history(self, agent: Any, history: list[Any]) -> None:
         try:

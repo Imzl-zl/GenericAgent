@@ -68,6 +68,10 @@ func migrationFiles() []string {
 		"0036_channel_bindings.sql",
 		"0037_runner_leases.sql",
 		"0039_drop_sophub_registry.sql",
+		"0040_checkpoint_runner_generation.sql",
+		"0041_runner_lease_stale_container.sql",
+		"0042_task_capability_jtis.sql",
+		"0043_capability_usage.sql",
 	}
 }
 
@@ -111,6 +115,10 @@ var pendingMigrations = []struct {
 	{"0036_channel_bindings.sql", "migration_0036_channel_bindings_marker"},
 	{"0037_runner_leases.sql", "migration_0037_runner_leases_marker"},
 	{"0039_drop_sophub_registry.sql", "migration_0039_drop_sophub_registry_marker"},
+	{"0040_checkpoint_runner_generation.sql", "migration_0040_checkpoint_runner_generation_marker"},
+	{"0041_runner_lease_stale_container.sql", "migration_0041_runner_lease_stale_container_marker"},
+	{"0042_task_capability_jtis.sql", "migration_0042_task_capability_jtis_marker"},
+	{"0043_capability_usage.sql", "migration_0043_capability_usage_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -121,6 +129,8 @@ var foundationTableNames = []string{
 	"sop_candidates",
 	"sophub_bindings",
 	"llm_capability_revocations",
+	"channel_bindings",
+	"runner_leases",
 	"media_assets",
 	"messages",
 	"mcp_servers",
@@ -163,6 +173,12 @@ var foundationTableNames = []string{
 	"migration_0033_document_job_finish_marker",
 	"migration_0034_document_artifacts_marker",
 	"migration_0035_sophub_sop_registry_marker",
+	"migration_0036_channel_bindings_marker",
+	"migration_0037_runner_leases_marker",
+	"migration_0039_drop_sophub_registry_marker",
+	"migration_0040_checkpoint_runner_generation_marker",
+	"migration_0041_runner_lease_stale_container_marker",
+	"migration_0042_task_capability_jtis_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",

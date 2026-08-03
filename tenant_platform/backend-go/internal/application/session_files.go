@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/safefs"
 )
 
 const (
@@ -20,6 +22,11 @@ const (
 	sessionManifestName   = "manifest.json"
 	sessionAttachmentsDir = "attachments"
 	sessionOutputsDir     = "outputs"
+	// sessionManifestMaxBytes 限制 manifest.json 大小: 文件位于 Runner 可写的
+	// 工作区 temp/ 内, 无界读取会让单个租户耗尽 Platform 内存(审查 R4-C4)。
+	sessionManifestMaxBytes = 1 << 20 // 1 MiB
+	// sessionManifestMaxFiles 限制 manifest 条目数, 防止解析后处理爆炸。
+	sessionManifestMaxFiles = 4096
 )
 
 var fileMarkerRE = regexp.MustCompile(`\[FILE:([^\]]+)\]`)
@@ -48,6 +55,8 @@ type sessionFilesManager struct {
 	// <root>/<workspace-hash>/temp/session_files/<digest> 布局落盘:
 	// 附件/输出经共享卷 temp 对 Runner 可见(方案 §4/§6)。
 	workspaceLayout bool
+	// ensureWorkspace 在 ImportInbound 前调用(生产: Manager 控制面预置目录)。
+	ensureWorkspace func(sessionKey string) error
 	mu               sync.Map // session hash -> *sync.Mutex
 }
 
@@ -74,17 +83,25 @@ func NewSessionFiles(root string) (SessionFiles, error) {
 // NewWorkspaceSessionFiles 构建共享卷布局的 SessionFiles(生产 Runner 模式):
 // 附件/输出落在 workspaces/<hash>/temp/session_files/..., 与 Runner 内
 // GA_WORKSPACE_TEMP(/ga/legacy/temp) 的 worker 侧布局完全一致。
-func NewWorkspaceSessionFiles(workspacesRoot string) (SessionFiles, error) {
+// ensureWorkspace 非 nil 时在每次附件导入前调用(方案 §6: fresh workspace
+// 首条带附件消息必须先由 Manager 预置目录布局与共享组权限)。
+func NewWorkspaceSessionFiles(workspacesRoot string, ensureWorkspace func(sessionKey string) error) (SessionFiles, error) {
 	if strings.TrimSpace(workspacesRoot) == "" {
 		return nil, fmt.Errorf("workspaces root is required")
 	}
-	return &sessionFilesManager{root: filepath.Clean(workspacesRoot), workspaceLayout: true}, nil
+	return &sessionFilesManager{
+		root:            filepath.Clean(workspacesRoot),
+		workspaceLayout: true,
+		ensureWorkspace: ensureWorkspace,
+	}, nil
 }
 
 func (m *sessionFilesManager) SandboxRoot(sessionKey string) string {
 	if m.workspaceLayout {
 		hash := sessionKeyDigest(sessionKey)
-		return filepath.Join(m.root, hash, "temp", sessionFilesDirName, hash)
+		// 审查: 附件/输出统一到工作区 temp/ 根(方案 §6), 与 GA 原生 cwd
+		// 语义一致; 不再使用 session_files/<digest> 中间层。
+		return filepath.Join(m.root, hash, "temp")
 	}
 	return filepath.Join(m.root, sessionKeyDigest(sessionKey))
 }
@@ -97,11 +114,19 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 	lock.Lock()
 	defer lock.Unlock()
 
+	// fresh workspace 首条带附件消息: 先由 Manager 预置目录布局(方案 §6)。
+	if m.ensureWorkspace != nil {
+		if err := m.ensureWorkspace(sessionKey); err != nil {
+			return nil, fmt.Errorf("ensure workspace layout: %w", err)
+		}
+	}
+
 	root := m.SandboxRoot(sessionKey)
-	if err := os.MkdirAll(filepath.Join(root, sessionAttachmentsDir), 0o755); err != nil {
+	dirMode := m.dirMode()
+	if err := safefs.MkdirAllBeneath(root, sessionAttachmentsDir, dirMode); err != nil {
 		return nil, fmt.Errorf("create attachments dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(root, sessionOutputsDir), 0o755); err != nil {
+	if err := safefs.MkdirAllBeneath(root, sessionOutputsDir, dirMode); err != nil {
 		return nil, fmt.Errorf("create outputs dir: %w", err)
 	}
 	manifest, err := m.loadManifest(root)
@@ -127,8 +152,7 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 			safeName = "file"
 		}
 		rel := filepath.ToSlash(filepath.Join(sessionAttachmentsDir, alias+"_"+safeName))
-		dst := filepath.Join(root, filepath.FromSlash(rel))
-		if err := copyFile(src, dst); err != nil {
+		if err := safefs.CopyFileBeneath(root, filepath.FromSlash(rel), src, m.fileMode()); err != nil {
 			return nil, fmt.Errorf("copy attachment %q: %w", src, err)
 		}
 		ref := SessionFileRef{
@@ -197,11 +221,17 @@ func (m *sessionFilesManager) RecordOutbound(sessionKey, marker string) (Session
 	defer lock.Unlock()
 
 	root := m.SandboxRoot(sessionKey)
-	manifest, err := m.loadManifest(root)
+	resolved, rel, err := resolveUnderRoot(root, marker)
 	if err != nil {
 		return SessionFileRef{}, err
 	}
-	resolved, rel, err := resolveUnderRoot(root, marker)
+	// 安全交付: 只有 outputs/ 下的文件才能登记为出站交付物。目录校验必须先于
+	// manifest 查询, 否则 Runner 可伪造 manifest 条目绕过 outputs/ 限制
+	// (审查 R4-I7: 直接返回附件或 temp/ 下任意文件)。
+	if !strings.HasPrefix(rel, sessionOutputsDir+"/") {
+		return SessionFileRef{}, fmt.Errorf("outbound file must live under %s", sessionOutputsDir)
+	}
+	manifest, err := m.loadManifest(root)
 	if err != nil {
 		return SessionFileRef{}, err
 	}
@@ -209,9 +239,6 @@ func (m *sessionFilesManager) RecordOutbound(sessionKey, marker string) (Session
 		if item.RelativePath == rel {
 			return item, nil
 		}
-	}
-	if !strings.HasPrefix(rel, sessionOutputsDir+"/") {
-		return SessionFileRef{}, fmt.Errorf("outbound file must live under %s", sessionOutputsDir)
 	}
 	info, err := os.Lstat(resolved)
 	if err != nil {
@@ -310,6 +337,23 @@ func sanitizeFileName(name string) string {
 	return name
 }
 
+// dirMode 返回会话目录模式: workspace 共享卷布局用 0770(Runner 属主可写,
+// 方案 §6), 其他布局保持 0755。
+func (m *sessionFilesManager) dirMode() os.FileMode {
+	if m.workspaceLayout {
+		return 0o770
+	}
+	return 0o755
+}
+
+// fileMode 返回会话文件模式: workspace 布局 0640(共享组可读), 其他 0644。
+func (m *sessionFilesManager) fileMode() os.FileMode {
+	if m.workspaceLayout {
+		return 0o640
+	}
+	return 0o644
+}
+
 func copyFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
@@ -377,11 +421,10 @@ func (m *sessionFilesManager) lockFor(sessionKey string) *sync.Mutex {
 }
 
 func (m *sessionFilesManager) loadManifest(root string) (sessionManifest, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, m.dirMode()); err != nil {
 		return sessionManifest{}, fmt.Errorf("create session sandbox: %w", err)
 	}
-	path := filepath.Join(root, sessionManifestName)
-	raw, err := os.ReadFile(path)
+	raw, err := safefs.ReadFileBeneathLimited(root, sessionManifestName, sessionManifestMaxBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return sessionManifest{}, nil
@@ -392,20 +435,21 @@ func (m *sessionFilesManager) loadManifest(root string) (sessionManifest, error)
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return sessionManifest{}, fmt.Errorf("decode session manifest: %w", err)
 	}
+	if len(manifest.Files) > sessionManifestMaxFiles {
+		return sessionManifest{}, fmt.Errorf("session manifest has %d files (max %d)", len(manifest.Files), sessionManifestMaxFiles)
+	}
+	if manifest.NextSeq < 0 || manifest.NextSeq > sessionManifestMaxFiles*2 {
+		return sessionManifest{}, fmt.Errorf("session manifest next_seq %d out of range", manifest.NextSeq)
+	}
 	return manifest, nil
 }
 
 func (m *sessionFilesManager) saveManifest(root string, manifest sessionManifest) error {
-	path := filepath.Join(root, sessionManifestName)
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode session manifest: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return fmt.Errorf("write session manifest tmp: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := safefs.AtomicWriteBeneath(root, sessionManifestName, raw, m.fileMode()); err != nil {
 		return fmt.Errorf("commit session manifest: %w", err)
 	}
 	return nil

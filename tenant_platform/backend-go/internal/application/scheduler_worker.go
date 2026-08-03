@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"time"
@@ -69,10 +70,13 @@ func (s *scheduler) CancelWorker(ctx context.Context, task domain.Task) error {
 		entry := s.workers[task.SessionKey]
 		s.mu.Unlock()
 		if entry == nil {
-			call.err = fmt.Errorf("no active worker for session %s task %s", task.SessionKey, task.ID)
+			// worker 已不存在 = 已被 dispatch 销毁重建/evict, 取消已生效,
+			// 视为成功而不是向用户报错(否则 CancelTask API 在
+			// cancel-during-StartSession 竞态下返回 500, 尽管任务已中断)。
+			call.err = nil
 			return
 		}
-		call.err = entry.client.CancelTask(ctx, task.ID)
+		call.err = entry.client.CancelTask(ctx, entry.sessionKey, task.ID, entry.runnerGeneration)
 	})
 	return call.err
 }
@@ -132,6 +136,22 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 }
 
 func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) (bool, error) {
+	// 审查(review I4): 复用路径必须确认持久 lease generation 未被接管
+	// (异主接管/重启恢复会 generation+1)。ResolveGeneration 同时刷新 lease
+	// 到期时间(防 idle 过期); 不一致说明旧容器已 fence, 强制替换 Worker。
+	if entry.runnerGeneration > 0 && s.cfg.Runtime != nil {
+		generation, err := s.cfg.Runtime.ResolveGeneration(ctx, entry.sessionKey)
+		if err != nil {
+			return false, fmt.Errorf("resolve runner generation on reuse: %w", err)
+		}
+		if generation != entry.runnerGeneration {
+			slog.InfoContext(ctx, "scheduler: runner lease generation changed; replacing worker",
+				"session_key", entry.sessionKey,
+				"old_generation", entry.runnerGeneration,
+				"new_generation", generation)
+			return true, nil
+		}
+	}
 	if entry.started && entry.runtimeMaxTurns > 0 {
 		maxTurns, err := s.agentMaxTurns(ctx)
 		if err != nil {
@@ -171,13 +191,29 @@ func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) 
 func (s *scheduler) initializeWorkerEntry(
 	ctx context.Context, task domain.Task, entry *workerEntry,
 ) (workerclient.WorkerClient, *workerEntry, error) {
-	credentials, err := s.issueInitialWorkerCredentials(ctx, task)
+	// generation fencing(方案 §7): 先解析持久 lease generation, 再签发绑定
+	// 该 generation 的 per-task capability 与运行时配置(Sandbox 注入容器)。
+	generation, err := s.startGeneration(ctx, task.SessionKey)
 	if err != nil {
 		s.removeWorkerEntry(task.SessionKey, entry)
 		entry.lifecycleMu.Unlock()
 		return nil, nil, err
 	}
-	client, instID, cleanup, generation, err := s.startWorkerProcess(ctx, task.SessionKey)
+	credentials, files, err := s.issueInitialWorkerCredentials(ctx, task, generation)
+	if err != nil {
+		// 审查: lease 已获取/续租但初始化失败——立即释放归还全局容量,
+		// 否则多工作区各失败一次即可占满容量直到 TTL 到期。
+		s.releaseRunnerLeaseBestEffort(task.SessionKey, generation)
+		s.removeWorkerEntry(task.SessionKey, entry)
+		entry.lifecycleMu.Unlock()
+		return nil, nil, err
+	}
+	runtimeConfigFiles := map[string][]byte{}
+	if len(files.JSON) > 0 {
+		runtimeConfigFiles[runtimeConfigFilename] = files.JSON
+		runtimeConfigFiles[myKeyLoaderFilename] = files.Loader
+	}
+	client, instID, cleanup, gen, err := s.startWorkerProcess(ctx, task.SessionKey, runtimeConfigFiles)
 	if err != nil {
 		s.removeWorkerEntry(task.SessionKey, entry)
 		s.revokeCredentialSetBestEffort(context.Background(), credentials)
@@ -187,12 +223,21 @@ func (s *scheduler) initializeWorkerEntry(
 	entry.client = client
 	entry.cleanup = cleanup
 	entry.instID = instID
-	entry.runnerGeneration = generation
+	entry.runnerGeneration = gen
 	entry.credentials = credentials
 	entry.taskID = task.ID
 	entry.lastUsedAt = time.Now().UTC()
 	entry.lifecycleMu.Unlock()
 	return client, entry, nil
+}
+
+// startGeneration 解析会话工作区的 Runner lease generation(方案 §7 fencing)。
+// Loopback 恒为 1; Sandbox 路径由持久 lease 提供(并刷新到期时间)。
+func (s *scheduler) startGeneration(ctx context.Context, sessionKey string) (uint64, error) {
+	if s.cfg.Runtime == nil {
+		return 0, fmt.Errorf("runtime is not configured")
+	}
+	return s.cfg.Runtime.ResolveGeneration(ctx, sessionKey)
 }
 
 func (s *scheduler) workerEntryIsCurrent(sessionKey string, entry *workerEntry) bool {
@@ -219,6 +264,16 @@ func (s *scheduler) configDirFor(sessionKey string) string {
 	return filepath.Join(s.cfg.ConfigRoot, hex.EncodeToString(digest[:]))
 }
 
+// runtimeConfigDir 返回 credential 刷新读写的配置目录(审查 C4):
+// 生产 Runner 模式由部署注入(workspace 共享卷 config/, Runner 可见);
+// 回退到 configDirFor(loopback/测试)。
+func (s *scheduler) runtimeConfigDir(sessionKey string) string {
+	if s.cfg.RuntimeConfigDir != nil {
+		return s.cfg.RuntimeConfigDir(sessionKey)
+	}
+	return s.configDirFor(sessionKey)
+}
+
 func (s *scheduler) cleanupWorkerEntryBestEffort(ctx context.Context, entry *workerEntry) {
 	if entry.cleanup != nil {
 		entry.cleanup()
@@ -234,6 +289,19 @@ func (s *scheduler) cleanupWorkerEntryBestEffort(ctx context.Context, entry *wor
 
 // revokeCredentialSetBestEffort persists every JTI with the token's exact
 // expiry. Token material and full JTIs are never logged.
+
+// releaseRunnerLeaseBestEffort 释放会话的 Runner lease(best-effort):
+// loopback/static 无持久 lease 返回 nil; Sandbox 路径失败只记录日志,
+// 不阻断调用方(容量由 TTL 兜底)。
+func (s *scheduler) releaseRunnerLeaseBestEffort(sessionKey string, generation uint64) {
+	if s.cfg.Runtime == nil || generation == 0 {
+		return
+	}
+	if err := s.cfg.Runtime.ReleaseRunnerLease(context.Background(), sessionKey, generation); err != nil {
+		slog.WarnContext(context.Background(), "scheduler: release runner lease after init failure failed",
+			"session_key", sessionKey, "generation", generation, "error", err)
+	}
+}
 
 // startSessionOnWorker calls StartSession on the worker bound to task.SessionKey.
 // Must be called AFTER MarkDispatchStarted. Idempotent per worker via startOnce.
@@ -256,8 +324,8 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	startReq := &workerv1.StartSessionRequest{
 		SessionKey: task.SessionKey,
 		// 方案 §7: workspace_key + runner_generation 由 Platform 写入, Runner 校验。
-		WorkspaceKey:      task.SessionKey,
-		RunnerGeneration:  entry.runnerGeneration,
+		WorkspaceKey:     task.SessionKey,
+		RunnerGeneration: entry.runnerGeneration,
 		RuntimePolicy: &workerv1.RuntimePolicy{
 			MaxTurns: maxTurns, MaxHistoryBytes: defaultMaxHistoryBytes,
 			MaxWorkingBytes: defaultMaxWorkingBytes, MaxOutputBytes: defaultMaxOutputBytes,
@@ -276,6 +344,8 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 			startReq.SnapshotId = restore.SnapshotID
 			startReq.SnapshotRef = restore.SnapshotRef
 			startReq.SnapshotChecksum = restore.Checksum
+			// 审查 R4-I6: 恢复读取按 Prepare 时的 max_bundle_bytes 限长。
+			startReq.MaxBundleBytes = uint64(restore.MaxBundleBytes)
 		}
 	}
 	if !task.FreshSession && startReq.SnapshotId == "" && task.SnapshotID != "" {
@@ -307,11 +377,12 @@ func (s *scheduler) agentMaxTurns(ctx context.Context) (uint32, error) {
 
 // startWorkerProcess creates the Worker after its runtime JSON and fixed
 // mykey.py loader have been written.
-func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string) (workerclient.WorkerClient, string, func(), uint64, error) {
+func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string, runtimeConfigFiles map[string][]byte) (workerclient.WorkerClient, string, func(), uint64, error) {
 	inst, err := s.cfg.Runtime.Start(ctx, worker.StartRequest{
-		SessionKey: sessionKey,
-		ConfigDir:  s.configDirFor(sessionKey),
-		RuntimeDir: s.cfg.RuntimeRoot,
+		SessionKey:         sessionKey,
+		ConfigDir:          s.configDirFor(sessionKey),
+		RuntimeDir:         s.cfg.RuntimeRoot,
+		RuntimeConfigFiles: runtimeConfigFiles,
 	})
 	if err != nil {
 		return nil, "", nil, 0, err
@@ -334,6 +405,35 @@ func (s *scheduler) shutdownAllWorkers(ctx context.Context) {
 		s.cleanupWorkerEntryBestEffort(ctx, entry)
 		entry.lifecycleMu.Unlock()
 	}
+}
+
+// evictWorkerAfterFailure 在任务失败/取消/异常终止后移除并销毁该 session
+// 的 Worker(审查): 失败任务的内存历史与 working 未持久化, 复用会让下一
+// 任务继承未提交状态, 违反"只有成功 task 推进 state"不变量。下一任务从
+// 最后一个已提交 checkpoint 冷启动(generation+1 重建容器)。
+func (s *scheduler) evictWorkerAfterFailure(sessionKey string) {
+	s.mu.Lock()
+	entry := s.workers[sessionKey]
+	s.mu.Unlock()
+	if entry == nil {
+		return
+	}
+	entry.lifecycleMu.Lock()
+	defer entry.lifecycleMu.Unlock()
+	s.evictWorkerAfterFailureLocked(sessionKey, entry)
+}
+
+// evictWorkerAfterFailureLocked 是 evictWorkerAfterFailure 的持锁变体:
+// 调用方必须已持有 entry.lifecycleMu(如 completeSuccess 的错误分支)。
+// 内部只获取 s.mu(workerEntryIsCurrent/removeWorkerEntry)与执行清理,
+// 不再获取 lifecycleMu, 避免持锁重入自死锁(审查: checkpoint 失败路径
+// 在锁内调用公开版会永久卡死该工作区)。
+func (s *scheduler) evictWorkerAfterFailureLocked(sessionKey string, entry *workerEntry) {
+	if !s.workerEntryIsCurrent(sessionKey, entry) {
+		return
+	}
+	s.removeWorkerEntry(sessionKey, entry)
+	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
 }
 
 // stopSessionWorker evicts the Worker for a session without cancelling any

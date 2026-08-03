@@ -35,11 +35,11 @@ func main() {
 
 func run() error {
 	var (
-		listen       = flag.String("listen", "127.0.0.1:8081", "loopback listen address")
+		listen       = flag.String("listen", firstNonEmpty(os.Getenv("LLM_PROXY_LISTEN"), "127.0.0.1:8081"), "listen address (or LLM_PROXY_LISTEN)")
 		signingKey   = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY)")
 		tokenTTL     = flag.Duration("token-ttl", llmproxy.DefaultTokenTTL, "capability_token lifetime")
 		databaseURL  = flag.String("database-url", "", "PostgreSQL URL to read admin-configured providers (or DATABASE_URL)")
-		cipherKeyHex = flag.String("llm-provider-key", os.Getenv("LLM_PROVIDER_KEY"), "AES-256-GCM hex key for decrypting provider API keys (or LLM_PROVIDER_KEY)")
+		cipherKeyHex = flag.String("llm-provider-key", firstNonEmpty(os.Getenv("LLM_PROVIDER_KEY"), os.Getenv("BOT_TOKEN_KEY")), "AES-256-GCM hex key for decrypting provider API keys (or LLM_PROVIDER_KEY; falls back to BOT_TOKEN_KEY — must equal the key Platform uses to encrypt provider keys)")
 	)
 	flag.Parse()
 
@@ -53,7 +53,7 @@ func run() error {
 		return fmt.Errorf("load cipher: %w", err)
 	}
 
-	providerSource, revocations, providerCleanup, err := buildProviderSource(firstNonEmpty(*databaseURL, os.Getenv("DATABASE_URL")))
+	providerSource, revocations, usageCounter, providerCleanup, err := buildProviderSource(firstNonEmpty(*databaseURL, os.Getenv("DATABASE_URL")))
 	if err != nil {
 		return err
 	}
@@ -68,6 +68,9 @@ func run() error {
 		ProviderSource:       providerSource,
 		Cipher:               cipher,
 		Revocations:          revocations,
+		// 审查 R4-I9: llm-proxy 有 DB 访问, 注入 store 作为按 JTI 的
+		// 预算计量后端, 转发前原子消费 max_turns。
+		UsageCounter:         usageCounter,
 		AllowedUpstreamCIDRs: llmproxy.ParseNetworkPolicyList(os.Getenv("LLM_PROXY_ALLOWED_UPSTREAM_CIDRS")),
 		AllowedHTTPHosts:     llmproxy.ParseNetworkPolicyList(os.Getenv("LLM_PROXY_ALLOW_HTTP_HOSTS")),
 	}
@@ -116,25 +119,25 @@ func firstNonEmpty(a, b string) string {
 func loadCipher(cipherKeyHex string, signingKey []byte) (secret.TokenCipher, error) {
 	_ = signingKey
 	if cipherKeyHex == "" {
-		return nil, fmt.Errorf("--llm-provider-key (or LLM_PROVIDER_KEY) is required; the AES-256-GCM key must be provided explicitly from a secret manager")
+		return nil, fmt.Errorf("--llm-provider-key (or LLM_PROVIDER_KEY, falling back to BOT_TOKEN_KEY) is required; the AES-256-GCM key must be provided explicitly from a secret manager and must equal the key Platform uses to encrypt provider API keys")
 	}
 	return secret.NewStaticKeyCipherFromHex(cipherKeyHex)
 }
 
-func buildProviderSource(databaseURL string) (llmproxy.ProviderSource, llmproxy.CapabilityRevocationSource, func(), error) {
+func buildProviderSource(databaseURL string) (llmproxy.ProviderSource, llmproxy.CapabilityRevocationSource, llmproxy.CapabilityUsageCounter, func(), error) {
 	if databaseURL == "" {
-		return nil, nil, nil, fmt.Errorf("--database-url (or DATABASE_URL) is required")
+		return nil, nil, nil, nil, fmt.Errorf("--database-url (or DATABASE_URL) is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("connect postgres: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("connect postgres: %w", err)
 	}
 	store, err := postgres.NewStore(pool)
 	if err != nil {
 		pool.Close()
-		return nil, nil, nil, fmt.Errorf("create store: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("create store: %w", err)
 	}
-	return store, store, pool.Close, nil
+	return store, store, store, pool.Close, nil
 }

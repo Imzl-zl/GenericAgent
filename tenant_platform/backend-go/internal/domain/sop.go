@@ -72,4 +72,3 @@ func (binding SophubBinding) Status() SophubBindingStatus {
 		UpdatedAt:   binding.UpdatedAt,
 	}
 }
-

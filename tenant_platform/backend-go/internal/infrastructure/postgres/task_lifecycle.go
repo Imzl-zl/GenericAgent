@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 )
 
 // ClaimNextTask claims the oldest queued row for session when no starting/running exists.
@@ -98,6 +99,7 @@ UPDATE tasks SET
   claim_lease_until = timezone('utc', now()) + $3 * interval '1 microsecond',
   updated_at = timezone('utc', now())
 WHERE id = $1 AND claim_owner = $2 AND status IN ('starting','running')
+  AND claim_lease_until > timezone('utc', now())
 `, taskID, platformInstanceID, leaseMicros)
 	if err != nil {
 		return err
@@ -106,6 +108,41 @@ WHERE id = $1 AND claim_owner = $2 AND status IN ('starting','running')
 		return domain.ErrLeaseExpired
 	}
 	return nil
+}
+
+// RequeueTask 把本实例 claim 的 starting 任务退回 queued 并清空 claim 字段。
+// 幂等: 非 starting 或 claim_owner 不匹配时返回 nil(任务已被其他路径处理)。
+func (s *Store) RequeueTask(ctx context.Context, taskID, platformInstanceID string) error {
+	if strings.TrimSpace(platformInstanceID) == "" {
+		return fmt.Errorf("platform instance id is required")
+	}
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE
+`, taskID)
+		t, err := scanTask(row)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if t.Status != domain.TaskStarting || t.ClaimOwner != platformInstanceID {
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE tasks SET
+  status = 'queued',
+  claim_owner = NULL,
+  claimed_at = NULL,
+  claim_lease_until = NULL,
+  updated_at = timezone('utc', now())
+WHERE id = $1
+`, taskID); err != nil {
+			return err
+		}
+		return insertNextEvent(ctx, tx, taskID, "status_transition", nil, nil, "starting", "queued", "", "")
+	})
 }
 
 // MarkDispatchStarted records worker_instance_id and worker_dispatch_started_at before Worker RPC.
@@ -331,6 +368,12 @@ FOR UPDATE
 			return err
 		}
 		for _, t := range list {
+			// 崩溃恢复撤销(审查): 中断任务的 capability JTI 在同一事务内写入
+			// 撤销表, 使旧 token 立即失效——恢复路径不能依赖进程内重试(本实例
+			// 崩溃期间已签发的 token 无人撤销, 旧 Runner 容器在 TTL 内仍可用)。
+			if err := revokeTaskCapabilityJTIs(ctx, tx, t.ID); err != nil {
+				return err
+			}
 			if _, err := finalizeTerminal(ctx, tx, t, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 				"TASK_INTERRUPTED", "prior claim owner lease expired", "", "", ""); err != nil {
 				return err
@@ -340,4 +383,33 @@ FOR UPDATE
 		return nil
 	})
 	return n, err
+}
+
+// revokeTaskCapabilityJTIs 在调用方事务内把任务的 capability JTI 全部写入
+// 撤销表(幂等: ON CONFLICT 取最晚过期)。无 JTI(loopback/未签发)时无操作。
+func revokeTaskCapabilityJTIs(ctx context.Context, tx pgx.Tx, taskID string) error {
+	var jtis []string
+	if err := tx.QueryRow(ctx, `SELECT capability_jtis FROM tasks WHERE id = $1`, taskID).Scan(&jtis); err != nil {
+		return fmt.Errorf("load task capability jtis: %w", err)
+	}
+	expiresAt := time.Now().UTC().Add(recoveryRevocationTTL)
+	for _, jti := range jtis {
+		if jti == "" {
+			continue
+		}
+		digest := llmproxy.HashJTI(jti)
+		if _, err := tx.Exec(ctx, `
+INSERT INTO llm_capability_revocations (jti_hash, expires_at)
+VALUES ($1, $2)
+ON CONFLICT (jti_hash) DO UPDATE
+SET expires_at = GREATEST(llm_capability_revocations.expires_at, EXCLUDED.expires_at)
+`, digest[:], expiresAt); err != nil {
+			return fmt.Errorf("revoke capability jti on recovery: %w", err)
+		}
+		// 计量行随撤销一并清理(审查 R4-I9): 防止 capability_usage 无界增长。
+		if _, err := tx.Exec(ctx, `DELETE FROM capability_usage WHERE jti_hash = $1`, digest[:]); err != nil {
+			return fmt.Errorf("delete capability usage on recovery: %w", err)
+		}
+	}
+	return nil
 }

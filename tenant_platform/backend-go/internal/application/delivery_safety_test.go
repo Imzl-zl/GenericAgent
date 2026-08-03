@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // 交付安全: 符号链接/特殊文件/目录/替换必须拒绝(方案 §4/§6)。
@@ -116,5 +117,37 @@ func TestValidateDeliverableRejectsOversize(t *testing.T) {
 	}
 	if _, err := validateDeliverableLimited(outputs, "big.pdf", 1<<20); err == nil {
 		t.Fatal("oversize deliverable must be rejected")
+	}
+}
+
+// TestValidateDeliverableRejectsFIFONonBlocking 验证交付文件被替换成 FIFO
+// 时, snapshotDeliverable 以 O_NONBLOCK 打开后立即返回错误, 而不是在
+// openat 上永久阻塞耗尽 delivery worker(审查 I7)。
+func TestValidateDeliverableRejectsFIFONonBlocking(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mkfifo requires unix")
+	}
+	root := t.TempDir()
+	outputs := filepath.Join(root, "outputs")
+	if err := os.MkdirAll(outputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(outputs, "trap.docx")
+	if err := mkfifoForTest(fifo); err != nil {
+		t.Fatal(err)
+	}
+	snapDir := t.TempDir()
+	done := make(chan error, 1)
+	go func() {
+		_, err := snapshotDeliverable(fifo, root, "outputs/trap.docx", snapDir, 1<<20)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO deliverable must be rejected")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshotDeliverable blocked on FIFO open (O_NONBLOCK missing)")
 	}
 }

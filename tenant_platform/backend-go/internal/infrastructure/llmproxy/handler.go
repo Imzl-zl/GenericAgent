@@ -2,6 +2,7 @@ package llmproxy
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -41,6 +42,9 @@ func (s *Server) handleProviderPath(
 	}
 	claims, ok := s.validateCapability(w, r)
 	if !ok {
+		return
+	}
+	if !s.consumeBudget(w, r, claims) {
 		return
 	}
 	provider, ok := s.loadBoundProvider(w, r, claims, wantType)
@@ -93,10 +97,80 @@ func (s *Server) validateCapability(w http.ResponseWriter, r *http.Request) (Cap
 	}
 	claims, err := s.validator.ValidateTaskScoped(r.Context(), token)
 	if err != nil {
+		slog.WarnContext(r.Context(), "llm-proxy: capability rejected",
+			"code", capabilityErrorCode(err), "jti", jwtClaimsID(token), "err", err)
 		writeError(w, http.StatusUnauthorized, capabilityErrorCode(err), "capability token rejected")
 		return CapabilityClaims{}, false
 	}
+	// 方案 §7: LLM 路由只接受 llm.chat 操作。
+	if claims.Operation != "llm.chat" {
+		writeError(w, http.StatusUnauthorized, "CAPABILITY_INVALID", "capability operation mismatch")
+		return CapabilityClaims{}, false
+	}
 	return claims, true
+}
+
+// consumeBudget 按 claims.Budget 的 max_turns 计量本次调用(审查 R4-I9):
+// 预算缺失/非法时拒绝(fail-closed), 超额时 429, 计量后端故障时 503——
+// 任何情况下都不允许无界转发。
+func (s *Server) consumeBudget(w http.ResponseWriter, r *http.Request, claims CapabilityClaims) bool {
+	if s.cfg.UsageCounter == nil {
+		writeError(w, http.StatusServiceUnavailable, "BUDGET_UNAVAILABLE", "capability usage counter not configured")
+		return false
+	}
+	maxCalls, ok := parseBudgetMaxTurns(claims.Budget)
+	if !ok {
+		writeError(w, http.StatusForbidden, "CAPABILITY_BUDGET_INVALID", "capability budget missing or invalid")
+		return false
+	}
+	allowed, err := s.cfg.UsageCounter.ConsumeCapabilityCall(r.Context(), HashJTI(claims.ID), maxCalls)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "llmproxy: budget counter failed", "jti", claims.ID, "err", err)
+		writeError(w, http.StatusServiceUnavailable, "BUDGET_UNAVAILABLE", "capability budget counter unavailable")
+		return false
+	}
+	if !allowed {
+		writeError(w, http.StatusTooManyRequests, "CAPABILITY_BUDGET_EXCEEDED", "capability call budget exceeded")
+		return false
+	}
+	return true
+}
+
+// parseBudgetMaxTurns 从 capability budget JSON 提取 max_turns; 缺失或
+// 非正数返回 ok=false(签发方必须填充, 见 worker_credential.go)。
+func parseBudgetMaxTurns(budget string) (int64, bool) {
+	if strings.TrimSpace(budget) == "" {
+		return 0, false
+	}
+	var parsed struct {
+		MaxTurns int64 `json:"max_turns"`
+	}
+	if err := json.Unmarshal([]byte(budget), &parsed); err != nil {
+		return 0, false
+	}
+	if parsed.MaxTurns <= 0 {
+		return 0, false
+	}
+	return parsed.MaxTurns, true
+}
+
+// jwtClaimsID 提取 JWT payload 的 jti 声明(仅调试日志; 解析失败返回空)。
+func jwtClaimsID(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		JTI string `json:"jti"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.JTI
 }
 
 func capabilityErrorCode(err error) string {

@@ -20,12 +20,15 @@ import (
 // staging_ref must be created atomically).
 type StagingRefFunc func(snapshotID, token string, generation int64) string
 
-func (s *Store) PrepareCheckpoint(ctx context.Context, taskID, platformInstanceID string, stagingRefFor StagingRefFunc, maxBundleBytes uint64) (snapshotID, token string, generation int64, err error) {
+func (s *Store) PrepareCheckpoint(ctx context.Context, taskID, platformInstanceID string, runnerGeneration uint64, stagingRefFor StagingRefFunc, maxBundleBytes uint64) (snapshotID, token string, generation int64, err error) {
 	if maxBundleBytes == 0 || maxBundleBytes > uint64(math.MaxInt64) {
 		return "", "", 0, fmt.Errorf("max bundle bytes must be between 1 and %d", int64(math.MaxInt64))
 	}
 	if stagingRefFor == nil {
 		return "", "", 0, fmt.Errorf("stagingRefFor callback is required")
+	}
+	if runnerGeneration == 0 {
+		return "", "", 0, fmt.Errorf("runner generation must be positive")
 	}
 	err = s.withTx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE`, taskID)
@@ -36,8 +39,36 @@ func (s *Store) PrepareCheckpoint(ctx context.Context, taskID, platformInstanceI
 		if t.ClaimOwner != platformInstanceID {
 			return fmt.Errorf("prepare checkpoint: claim owner mismatch")
 		}
+		// 审查: task claim 本身也必须未过期(heartbeat 丢失后不得提交恢复点)。
+		now := time.Now().UTC()
+		if t.ClaimLeaseUntil.IsZero() || !t.ClaimLeaseUntil.After(now) {
+			return fmt.Errorf("prepare checkpoint: task claim lease expired")
+		}
 		if t.Status != domain.TaskStarting && t.Status != domain.TaskRunning {
 			return fmt.Errorf("prepare checkpoint: task status %s", t.Status)
+		}
+		// 校验当前 Runner lease generation 仍等于签发时值(fencing, 审查 I7)。
+		// 生产 Runner 模式必有 lease 行; loopback 开发模式无 lease 行时跳过。
+		// 锁行 + 校验 owner/expiry: 旧 owner 或已过期 lease 的 Runner 不得
+		// 推进恢复指针(审查: lease 失效后提交)。
+		var leaseGen int64
+		var leaseOwner string
+		var leaseExpires time.Time
+		if err = tx.QueryRow(ctx, `
+SELECT generation, owner, expires_at FROM runner_leases WHERE runner_key = $1 FOR UPDATE
+`, t.SessionKey).Scan(&leaseGen, &leaseOwner, &leaseExpires); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err == nil {
+			if leaseGen != int64(runnerGeneration) {
+				return fmt.Errorf("prepare checkpoint: runner generation %d != lease %d", runnerGeneration, leaseGen)
+			}
+			if leaseOwner != platformInstanceID {
+				return fmt.Errorf("prepare checkpoint: runner lease owned by %q", leaseOwner)
+			}
+			if !leaseExpires.After(now) {
+				return fmt.Errorf("prepare checkpoint: runner lease expired")
+			}
 		}
 		var gen int64
 		if err := tx.QueryRow(ctx, `
@@ -54,12 +85,12 @@ SELECT COALESCE(MAX(generation), 0) + 1 FROM workspace_snapshots WHERE workspace
 		if _, err := tx.Exec(ctx, `
 INSERT INTO workspace_snapshots (
   id, workspace_id, task_id, schema_version, state, generation,
-  lease_owner, lease_until, token, staging_ref, max_bundle_bytes
+  runner_generation, lease_owner, lease_until, token, staging_ref, max_bundle_bytes
 ) VALUES (
   $1, $2::uuid, $3, 'genericagent.snapshot.v1', 'writing', $4,
-  $5, $6, $7, $8, $9
+  $5, $6, $7, $8, $9, $10
 )
-`, sid, t.WorkspaceID, t.ID, gen, platformInstanceID, leaseUntil, tok, stagingRef, int64(maxBundleBytes)); err != nil {
+`, sid, t.WorkspaceID, t.ID, gen, runnerGeneration, platformInstanceID, leaseUntil, tok, stagingRef, int64(maxBundleBytes)); err != nil {
 			return err
 		}
 		snapshotID = sid.String()
@@ -71,13 +102,13 @@ INSERT INTO workspace_snapshots (
 }
 
 // LoadSnapshotToken returns writing snapshot metadata for token validation.
-func (s *Store) LoadSnapshotToken(ctx context.Context, snapshotID, token string) (workspaceID, taskID, stagingRef, leaseOwner string, leaseUntil time.Time, generation int64, maxBundleBytes uint64, state string, err error) {
+func (s *Store) LoadSnapshotToken(ctx context.Context, snapshotID, token string) (workspaceID, taskID, stagingRef, leaseOwner string, leaseUntil time.Time, generation, runnerGeneration int64, maxBundleBytes uint64, state string, err error) {
 	var maxBundle int64
 	err = s.pool.QueryRow(ctx, `
 SELECT workspace_id::text, task_id, COALESCE(staging_ref,''), COALESCE(lease_owner,''),
-       COALESCE(lease_until, timezone('utc', now())), generation, max_bundle_bytes, state
+       COALESCE(lease_until, timezone('utc', now())), generation, runner_generation, max_bundle_bytes, state
 FROM workspace_snapshots WHERE id = $1::uuid AND token = $2
-`, snapshotID, token).Scan(&workspaceID, &taskID, &stagingRef, &leaseOwner, &leaseUntil, &generation, &maxBundle, &state)
+`, snapshotID, token).Scan(&workspaceID, &taskID, &stagingRef, &leaseOwner, &leaseUntil, &generation, &runnerGeneration, &maxBundle, &state)
 	if err == nil {
 		maxBundleBytes = uint64(maxBundle)
 	}
@@ -104,6 +135,72 @@ WHERE workspace.id = $1::uuid AND snapshot.state = 'committed'
 	return snapshotID, fileRef, checksum, true, nil
 }
 
+// SnapshotMaxBundleBytes 返回 snapshot 的 max_bundle_bytes(供 ReadResult
+// 对 Runner 可写的 results 文件限长读取, 审查: 防止恶意超大结果耗尽内存)。
+func (s *Store) SnapshotMaxBundleBytes(ctx context.Context, snapshotID string) (int64, error) {
+	var maxBytes int64
+	err := s.pool.QueryRow(ctx, `
+SELECT max_bundle_bytes FROM workspace_snapshots WHERE id = $1::uuid
+`, snapshotID).Scan(&maxBytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("snapshot %s not found", snapshotID)
+	}
+	return maxBytes, err
+}
+
+// QuarantinedWriting 是 SweepExpiredCheckpoints 返回的过期 writing snapshot
+// (staging_ref 保留供调用方删除宿主 staging 文件)。
+type QuarantinedWriting struct {
+	SnapshotID string
+	TaskID     string
+	StagingRef string
+}
+
+// QuarantineExpiredWritingSnapshots 把所有 checkpoint lease 已过期的
+// writing snapshot 置为 quarantined, 并返回其 staging_ref(审查 R4-I12:
+// Prepare 后未 Commit 的 snapshot——崩溃/任务失败/DB 错误——必须定期清理,
+// 否则永久占用 DB 行与宿主磁盘)。staging_ref 在清理前返回, 调用方负责
+// 删除文件。
+func (s *Store) QuarantineExpiredWritingSnapshots(ctx context.Context, before time.Time) ([]QuarantinedWriting, error) {
+	var out []QuarantinedWriting
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+SELECT id::text, task_id, COALESCE(staging_ref, '')
+FROM workspace_snapshots
+WHERE state = 'writing' AND lease_until IS NOT NULL AND lease_until <= $1
+FOR UPDATE
+`, before.UTC())
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var q QuarantinedWriting
+			if err := rows.Scan(&q.SnapshotID, &q.TaskID, &q.StagingRef); err != nil {
+				rows.Close()
+				return err
+			}
+			out = append(out, q)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, q := range out {
+			if _, err := tx.Exec(ctx, `
+UPDATE workspace_snapshots SET
+  state = 'quarantined',
+  lease_owner = NULL,
+  lease_until = NULL
+WHERE id = $1::uuid AND state = 'writing'
+`, q.SnapshotID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
 // CompleteSucceeded commits snapshot + task + delivery in one transaction.
 func (s *Store) CompleteSucceeded(ctx context.Context, taskID, platformInstanceID, snapshotID, fileRef, checksum, resultRef, resultDigest string, resultBytes int) (domain.Task, error) {
 	var task domain.Task
@@ -115,6 +212,11 @@ func (s *Store) CompleteSucceeded(ctx context.Context, taskID, platformInstanceI
 		}
 		if t.ClaimOwner != platformInstanceID {
 			return fmt.Errorf("complete: claim owner mismatch")
+		}
+		// 审查: task claim 必须未过期(heartbeat 丢失后不得提交成功状态)。
+		now := time.Now().UTC()
+		if t.ClaimLeaseUntil.IsZero() || !t.ClaimLeaseUntil.After(now) {
+			return fmt.Errorf("complete: task claim lease expired")
 		}
 		if t.Status.IsTerminal() {
 			return fmt.Errorf("complete: already terminal %s", t.Status)
@@ -137,6 +239,36 @@ WHERE id = $1::uuid AND task_id = $2 AND state = 'writing'
 			}
 			task = tt
 			return nil
+		}
+		// Runner generation fencing(审查 I7): 提交前校验 snapshot 签发时的
+		// runner_generation 仍是当前 lease generation, 旧 generation Runner
+		// 的收尾无法推进恢复点。锁行并校验 owner/expiry(审查: lease 失效
+		// 或已接管后不得提交)。
+		var snapRunnerGen, leaseGen int64
+		var leaseOwner string
+		var leaseExpires time.Time
+		if err := tx.QueryRow(ctx, `
+SELECT runner_generation FROM workspace_snapshots WHERE id = $1::uuid
+`, snapshotID).Scan(&snapRunnerGen); err != nil {
+			return fmt.Errorf("complete: load snapshot runner generation: %w", err)
+		}
+		// 生产 Runner 模式必有 lease 行, 校验 snapshot 签发时的 generation 仍
+		// 是当前 lease generation(审查 I7); loopback 开发模式无 lease 行时跳过。
+		if err = tx.QueryRow(ctx, `
+SELECT generation, owner, expires_at FROM runner_leases WHERE runner_key = $1 FOR UPDATE
+`, t.SessionKey).Scan(&leaseGen, &leaseOwner, &leaseExpires); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err == nil {
+			if snapRunnerGen != leaseGen {
+				return fmt.Errorf("complete: snapshot runner generation %d != lease %d", snapRunnerGen, leaseGen)
+			}
+			if leaseOwner != platformInstanceID {
+				return fmt.Errorf("complete: runner lease owned by %q", leaseOwner)
+			}
+			if !leaseExpires.After(now) {
+				return fmt.Errorf("complete: runner lease expired")
+			}
 		}
 		tag, err := tx.Exec(ctx, `
 UPDATE workspace_snapshots SET
@@ -187,6 +319,19 @@ RETURNING `+taskSelectColumns, taskID, snapshotID, checksum, resultRef, resultDi
 		}
 		if err := insertDelivery(ctx, tx, tt.ID, domain.DeliveryTaskComplete, resultRef, resultDigest, "", "", ""); err != nil {
 			return err
+		}
+		// 审查 R4-C3: 成功终态事务内同步撤销 capability JTI, 与任务状态
+		// 变更原子——成功任务的 token 同样不得在终态后继续被复用。
+		if err := revokeTaskCapabilityJTIs(ctx, tx, tt.ID); err != nil {
+			return err
+		}
+		// 审查 R4-I8: fresh 任务成功终态才清除 reset_at 标记——失败/取消的
+		// fresh 任务保留重置标记, 下一任务仍从干净状态开始, 不会静默恢复
+		// /new 前的旧 snapshot。
+		if t.FreshSession {
+			if _, err := tx.Exec(ctx, `UPDATE workspaces SET reset_at = NULL WHERE session_key = $1`, t.SessionKey); err != nil {
+				return err
+			}
 		}
 		task = tt
 		return nil

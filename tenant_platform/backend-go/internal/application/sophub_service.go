@@ -100,7 +100,26 @@ func (service *sophubService) Search(ctx context.Context, query string, page, pa
 	if err != nil {
 		return domain.SophubSearchResult{}, fmt.Errorf("Sophub search failed")
 	}
+	// 仅可安装项对用户/Worker 可见(方案 §5.2): 私有/未审核/非单文件/非
+	// Markdown 的 SOP 不下发到任何工作区(审查: 与 FetchRemoteSOP 同一准入)。
+	result.Items = filterInstallableSOPs(result.Items)
+	result.Total = len(result.Items)
 	return result, nil
+}
+
+// filterInstallableSOPs 只保留公开 approved 单文件 markdown SOP(审查:
+// 搜索与安装准入一致, 私有项目可能含租户敏感内容)。
+func filterInstallableSOPs(items []domain.SophubRemoteSOP) []domain.SophubRemoteSOP {
+	out := items[:0]
+	for _, item := range items {
+		if item.IsPublic &&
+			strings.EqualFold(item.Status, domain.SOPStatusApproved) &&
+			strings.EqualFold(item.PackageType, domain.SOPPackageTypeSingle) &&
+			strings.EqualFold(item.FileType, domain.SOPFileTypeMarkdown) {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // FetchRemoteSOP 返回远程 SOP(供 Worker proxy; 不写入任何注册表/候选)。

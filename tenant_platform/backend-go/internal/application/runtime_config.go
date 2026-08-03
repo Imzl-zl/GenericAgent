@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
@@ -52,6 +53,8 @@ type RuntimeConfigInput struct {
 	RoutingSnapshotID string
 	Providers         []RuntimeProviderBinding
 	MCP               RuntimeMCPSnapshot
+	// JTIs 随凭证集写入运行时配置, 供 Worker 校验 capability_jti 归属。
+	JTIs []string
 	// Sophub proxy capability(方案 §5.2): 非空时写入 _platform_sophub,
 	// Worker 经 Platform 受控 proxy 搜索/安装 SOP, 不持有 Sophub API Key。
 	Sophub *RuntimeSophubProxy
@@ -64,9 +67,13 @@ type RuntimeSophubProxy struct {
 }
 
 type RuntimeConfigMetadata struct {
-	CredentialGeneration uint64 `json:"credential_generation"`
-	ConfigChecksum       string `json:"config_checksum"`
-	RoutingSnapshotID    string `json:"routing_snapshot_id"`
+	CredentialGeneration uint64   `json:"credential_generation"`
+	ConfigChecksum       string   `json:"config_checksum"`
+	RoutingSnapshotID    string   `json:"routing_snapshot_id"`
+	// JTIs 是本凭证集签发的全部 capability token JTI(方案 §7 per-task
+	// capability): Worker 校验 ExecuteTask 的 capability_jti 必须属于当前
+	// 集合, 防止任意非空 JTI 通过(审查: Worker 身份与 capability 校验)。
+	JTIs []string `json:"jtis,omitempty"`
 }
 
 type RuntimeConfigFiles struct {
@@ -97,6 +104,7 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 		CredentialGeneration: input.Generation,
 		ConfigChecksum:       runtimeChecksumPlaceholder,
 		RoutingSnapshotID:    input.RoutingSnapshotID,
+		JTIs:                 append([]string(nil), input.JTIs...),
 	}
 	document["_platform_runtime"] = metadata
 	if strings.TrimSpace(input.MCP.ID) != "" {
@@ -158,17 +166,28 @@ func WriteRuntimeConfigAtomic(configRoot string, files RuntimeConfigFiles) error
 	if len(files.JSON) == 0 || !bytes.Equal(files.Loader, []byte(MyKeyLoader)) {
 		return fmt.Errorf("runtime config files are incomplete")
 	}
-	if err := os.MkdirAll(configRoot, 0o700); err != nil {
+	// 0640/0770: 生产 Runner 模式写入共享卷 config/(setgid 10003), Runner
+	// 以附加组 10003 读取; loopback 下 ConfigRoot 目录私有不受影响(审查
+	// Blocker#3: 0600 使复用 Runner 的刷新文件对 Runner 不可读)。
+	if err := os.MkdirAll(configRoot, 0o770); err != nil {
 		return fmt.Errorf("create config root: %w", err)
 	}
-	if err := writeFileAtomic(filepath.Join(configRoot, runtimeConfigFilename), files.JSON, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(configRoot, runtimeConfigFilename), files.JSON, 0o640); err != nil {
 		return fmt.Errorf("write runtime JSON: %w", err)
 	}
 	loaderPath := filepath.Join(configRoot, myKeyLoaderFilename)
 	if current, err := os.ReadFile(loaderPath); err == nil && bytes.Equal(current, files.Loader) {
+		// loader 内容固定不变, 但 Worker 的 reload_mykeys(llmcore.py)以 loader
+		// 文件 mtime 判断配置是否变化——凭证刷新后必须 touch, 否则复用 Worker
+		// 的下一个任务继续持有旧 capability token, 被 LLM Proxy 以
+		// CAPABILITY_REVOKED 拒绝(审查: 终态撤销 + 刷新联动的契约断层)。
+		now := time.Now()
+		if err := os.Chtimes(loaderPath, now, now); err != nil {
+			return fmt.Errorf("touch mykey loader: %w", err)
+		}
 		return nil
 	}
-	if err := writeFileAtomic(loaderPath, files.Loader, 0o600); err != nil {
+	if err := writeFileAtomic(loaderPath, files.Loader, 0o640); err != nil {
 		return fmt.Errorf("write mykey loader: %w", err)
 	}
 	return nil

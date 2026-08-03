@@ -125,11 +125,19 @@ class TaskOpsMixin:
                     self._pending = None
 
     def _extract_working(self, agent: Any) -> dict[str, Any]:
+        working: dict[str, Any]
         if getattr(agent, "handler", None) is not None and hasattr(agent.handler, "working"):
-            return copy.deepcopy(agent.handler.working)
-        if hasattr(agent, "_adapter_seed_working"):
-            return copy.deepcopy(agent._adapter_seed_working)
-        return {}
+            working = copy.deepcopy(agent.handler.working)
+        elif hasattr(agent, "_adapter_seed_working"):
+            working = copy.deepcopy(agent._adapter_seed_working)
+        else:
+            working = {}
+        # 项目激活态(方案 §5: "项目激活态"随成功 task 的 working 一起进入
+        # staging state): 项目模式在重启恢复后必须保持激活。
+        project_name = getattr(agent, "_ga_project_mode_name", None)
+        if project_name:
+            working["_ga_project_mode_name"] = project_name
+        return working
 
     def _clear_active_locked(self, task_id: str) -> None:
         if self._pending and self._pending.task_id == task_id:

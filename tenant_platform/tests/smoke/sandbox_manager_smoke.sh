@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# sandbox_manager_smoke.sh — Sandbox Manager 真实 Docker 冒烟(方案 §7/§10)
+# sandbox_manager_smoke.sh — ga-runner 镜像 + 工作区挂载冒烟(方案 §7/§10)
 #
-# 需要: Docker 可用;已构建 ga-runner:local 镜像;一个测试数据库 URL
-# (TEST_DATABASE_URL)以运行 Go 集成测试。
+# 需要: Docker 可用; 已构建 ga-runner:local 镜像。
+#
+# 说明: 本脚本用 docker create 直接验证镜像行为(只读根/挂载/写穿/隔离),
+# 不经过 Sandbox Manager HTTP 控制面(该路径由 Go 测试 + compose 冒烟覆盖)。
 #
 # 验证:
-#   1. 创建 Runner 后 docker inspect 与 server-side 推导的挂载完全一致
+#   1. 创建 Runner 后 docker inspect: 五个工作区 subpath 挂载与只读根一致
 #   2. 工作区 A/B 隔离: A 写入的文件 B 不可见
-#   3. idle 回收(经 Manager DestroyRunner)
+#   3. memory/temp 写穿 + Runner 销毁后工作区保留
 #
 # 用法: tenant_platform/tests/smoke/sandbox_manager_smoke.sh
 
@@ -50,6 +52,8 @@ docker rm -f "$NAME_A" "$NAME_B" >/dev/null 2>&1 || true
 
 start_runner() {
   local name="$1" hash="$2"
+  # 控制面材料(config/)由 Manager 写入; 冒烟直接放一个最小 policy。
+  echo '{}' > "$WS_ROOT/$hash/config/policy.json"
   docker create \
     --name "$name" \
     --label "com.genericagent.runner=true" \
@@ -62,17 +66,21 @@ start_runner() {
     --cpu-period 100000 --cpu-quota 100000 \
     --pids-limit 128 \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-    --env GA_CONFIG_ROOT=/ga/runner-state \
+    --env GA_CONFIG_ROOT=/ga/runner-config \
     --env GA_LEGACY_ROOT=/ga/legacy \
     --env GA_RUNTIME_DIR=/ga/runner-state \
-    --env GA_POLICY_FILE=/ga/policy/foundation.v1.json \
+    --env GA_POLICY_FILE=/ga/runner-config/policy.json \
+    --env GA_WORKER_LISTEN=tcp:0.0.0.0:9443 \
     --workdir /ga/legacy/temp \
     --mount "type=bind,source=$WS_ROOT/$hash/memory,destination=/ga/legacy/memory" \
     --mount "type=bind,source=$WS_ROOT/$hash/temp,destination=/ga/legacy/temp" \
     --mount "type=bind,source=$WS_ROOT/$hash/state,destination=/ga/runner-state" \
-    "$IMAGE" >/dev/null
+    --mount "type=bind,source=$WS_ROOT/$hash/config,destination=/ga/runner-config,readonly" \
+    --mount "type=bind,source=$WS_ROOT/$hash/attachments,destination=/ga/runner-attachments,readonly" \
+    "$IMAGE" \
+    --listen tcp:0.0.0.0:9443 >/dev/null
   docker start "$name" >/dev/null
-  # 等待 Worker 就绪(最多 15s)
+  # 等待 Worker 就绪(TCP 9443 = 0x24E0, 最多 15s)
   for _ in $(seq 1 15); do
     if docker exec "$name" sh -c 'cat /proc/net/tcp 2>/dev/null | grep -q ":24E0"' >/dev/null 2>&1; then
       return 0

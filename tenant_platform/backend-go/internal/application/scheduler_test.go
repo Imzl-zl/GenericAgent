@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -171,7 +172,7 @@ func (w *controlledWorker) BeginCheckpoint(ctx context.Context, _ *workerv1.Begi
 	return w.checkpointReady, nil
 }
 
-func (w *controlledWorker) CancelTask(context.Context, string) error {
+func (w *controlledWorker) CancelTask(context.Context, string, string, uint64) error {
 	w.cancelCalls.Add(1)
 	select {
 	case <-w.streamDone:
@@ -186,7 +187,7 @@ func (w *controlledWorker) Health(context.Context) (*workerv1.HealthResponse, er
 	return &workerv1.HealthResponse{}, nil
 }
 
-func (w *controlledWorker) Shutdown(context.Context, string) error { return nil }
+func (w *controlledWorker) Shutdown(context.Context, string, string, uint64) error { return nil }
 
 func (w *controlledWorker) succeed() {
 	w.events <- workerclient.WorkerEvent{
@@ -245,7 +246,7 @@ type successfulCoordinator struct {
 func (c *successfulCoordinator) Prepare(ctx context.Context, request checkpoint.CheckpointPrepareRequest) (checkpoint.CheckpointLease, error) {
 	ref := "staging-success"
 	stagingRefFor := func(snapshotID, token string, generation int64) string { return ref }
-	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.owner, stagingRefFor, request.MaxBundleBytes)
+	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.owner, 1, stagingRefFor, request.MaxBundleBytes)
 	return checkpoint.CheckpointLease{
 		SnapshotID: snapshotID, Token: token, StagingRef: ref, MaxBundleBytes: request.MaxBundleBytes,
 	}, err
@@ -265,8 +266,23 @@ func (c *successfulCoordinator) CurrentRestorePoint(
 	return c.restorePoint, c.hasRestore, c.restoreErr
 }
 
+func (c *successfulCoordinator) RunnerStagingRef(hostRef string) (string, error) {
+	return hostRef, nil
+}
+
+func (c *successfulCoordinator) HostStagingRef(runnerRef, expectedHostRef string) (string, error) {
+	if runnerRef != expectedHostRef {
+		return "", fmt.Errorf("staging ref mismatch: got %q want %q", runnerRef, expectedHostRef)
+	}
+	return runnerRef, nil
+}
+
 func (c *successfulCoordinator) ReadResult(context.Context, string, string) (domain.ResultPayload, error) {
 	return domain.ResultPayload{Ref: "result:success", Digest: "sha256:result", Body: []byte("result")}, nil
+}
+
+func (c *successfulCoordinator) SweepExpiredCheckpoints(context.Context) (int, error) {
+	return 0, nil
 }
 
 type readFailCoordinator struct {
@@ -277,7 +293,7 @@ type readFailCoordinator struct {
 func (c *readFailCoordinator) Prepare(ctx context.Context, request checkpoint.CheckpointPrepareRequest) (checkpoint.CheckpointLease, error) {
 	ref := "staging-read-fail"
 	stagingRefFor := func(snapshotID, token string, generation int64) string { return ref }
-	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.owner, stagingRefFor, request.MaxBundleBytes)
+	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.owner, 1, stagingRefFor, request.MaxBundleBytes)
 	return checkpoint.CheckpointLease{
 		SnapshotID: snapshotID, Token: token, StagingRef: ref, MaxBundleBytes: request.MaxBundleBytes,
 	}, err
@@ -297,8 +313,20 @@ func (c *readFailCoordinator) CurrentRestorePoint(
 	return checkpoint.RestorePoint{}, false, nil
 }
 
+func (c *readFailCoordinator) RunnerStagingRef(hostRef string) (string, error) {
+	return hostRef, nil
+}
+
+func (c *readFailCoordinator) HostStagingRef(runnerRef, expectedHostRef string) (string, error) {
+	return expectedHostRef, nil
+}
+
 func (c *readFailCoordinator) ReadResult(context.Context, string, string) (domain.ResultPayload, error) {
 	return domain.ResultPayload{}, errors.New("digest-checked result read failed")
+}
+
+func (c *readFailCoordinator) SweepExpiredCheckpoints(context.Context) (int, error) {
+	return 0, nil
 }
 
 func testPolicyRegistry(t *testing.T) policy.Registry {
@@ -829,8 +857,11 @@ func TestScheduler_CancelDuringStartSessionSkipsExecuteTaskAndSendsOneRPC(t *tes
 	case <-ctx.Done():
 		t.Fatal("dispatch did not finish")
 	}
-	if got := worker.cancelCalls.Load(); got != 1 {
-		t.Fatalf("cancel RPC count=%d want 1", got)
+	// 取消在 StartSession 期间被接受: dispatch 检测到 cancel_requested_at 后
+	// 直接销毁 Worker 重建(内存状态未提交, 不复用), 不再发 cancel RPC
+	// (进程已被销毁, RPC 无意义); CancelWorker 观察到 entry 已移除视为已取消。
+	if got := worker.cancelCalls.Load(); got != 0 {
+		t.Fatalf("cancel RPC count=%d want 0 (worker destroyed instead)", got)
 	}
 	final, err := store.GetTask(ctx, task.ID)
 	if err != nil {
@@ -1309,7 +1340,7 @@ type blockedShutdownWorker struct {
 	deadlineObserved chan struct{}
 }
 
-func (w *blockedShutdownWorker) Shutdown(ctx context.Context, _ string) error {
+func (w *blockedShutdownWorker) Shutdown(ctx context.Context, _ string, _ string, _ uint64) error {
 	<-ctx.Done()
 	close(w.deadlineObserved)
 	return ctx.Err()

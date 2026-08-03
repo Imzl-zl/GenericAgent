@@ -61,6 +61,9 @@ class SessionState:
     credential_generation: int
     credential_checksum: str
     routing_snapshot_id: str
+    capability_jtis: frozenset[str] = frozenset()
+    sophub_proxy: Any | None = None
+    workspace_memory: Path | None = None
     workspace_key: str = ""
     runner_generation: int = 0
     seed_working: dict[str, Any] = field(default_factory=dict)
@@ -75,6 +78,10 @@ class SessionState:
     completed: CompletedTask | None = None
     active_task_id: str | None = None
     shutting_down: bool = False
+    # agent_failed: GA agent 主线程以未捕获异常崩溃时置位。置位后 health
+    # 返回 not-ready, 新任务拒绝派发(审查: 崩溃被吞掉会让健康检查/心跳
+    # 继续报告 ready, 后续任务对死亡线程的空队列持续挂起)。
+    agent_failed: bool = False
 
 
 @dataclass
@@ -95,6 +102,7 @@ class TaskRunState:
     loop_unwrap: Callable[[], None] | None = None
     dispatch_unwrap: Callable[[], None] | None = None
     mcp_unwrap: Callable[[], None] | None = None
+    sophub_unwrap: Callable[[], None] | None = None
     seed_unwrap: Callable[[], None] | None = None
     previous_persona: list[str] = field(default_factory=list)
     previous_schema: Any = None

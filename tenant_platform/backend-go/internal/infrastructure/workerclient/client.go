@@ -33,9 +33,11 @@ type WorkerClient interface {
 	ReloadCredentials(ctx context.Context, req *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error)
 	ExecuteTask(ctx context.Context, req *workerv1.ExecuteTaskRequest) (<-chan WorkerEvent, <-chan error)
 	BeginCheckpoint(ctx context.Context, req *workerv1.BeginCheckpointRequest) (*workerv1.CheckpointReady, error)
-	CancelTask(ctx context.Context, taskID string) error
+	// CancelTask/Shutdown 携带 workspace_key + runner_generation(方案 §7,
+	// 审查): 迟到的控制请求必须绑定当前 Runner 身份, Worker 侧拒绝不匹配。
+	CancelTask(ctx context.Context, workspaceKey, taskID string, runnerGeneration uint64) error
 	Health(ctx context.Context) (*workerv1.HealthResponse, error)
-	Shutdown(ctx context.Context, reason string) error
+	Shutdown(ctx context.Context, workspaceKey, reason string, runnerGeneration uint64) error
 }
 
 // Client implements WorkerClient over a single gRPC connection.
@@ -179,15 +181,25 @@ func (c *Client) BeginCheckpoint(ctx context.Context, req *workerv1.BeginCheckpo
 	return ready, nil
 }
 
-func (c *Client) CancelTask(ctx context.Context, taskID string) error {
+func (c *Client) CancelTask(ctx context.Context, workspaceKey, taskID string, runnerGeneration uint64) error {
 	if taskID == "" {
 		return errors.New("workerclient: empty taskID")
 	}
+	if workspaceKey == "" || runnerGeneration == 0 {
+		return errors.New("workerclient: cancel identity (workspace_key, generation) is required")
+	}
 	callCtx, cancel := withDeadline(ctx, defaultUnaryTimeout)
 	defer cancel()
-	_, err := c.raw.CancelTask(callCtx, &workerv1.CancelTaskRequest{TaskId: taskID})
+	resp, err := c.raw.CancelTask(callCtx, &workerv1.CancelTaskRequest{
+		TaskId: taskID, WorkspaceKey: workspaceKey, RunnerGeneration: runnerGeneration,
+	})
 	if err != nil {
 		return wrapRPC("CancelTask", err)
+	}
+	// 审查(review M5): 身份不匹配等拒绝以 accepted=false 返回, 必须显式
+	// 暴露, 否则 Platform 感知不到控制请求被 Worker 拒绝。
+	if !resp.GetAccepted() {
+		return fmt.Errorf("worker cancel not accepted (identity rejected or task unknown)")
 	}
 	return nil
 }
@@ -202,10 +214,15 @@ func (c *Client) Health(ctx context.Context) (*workerv1.HealthResponse, error) {
 	return resp, nil
 }
 
-func (c *Client) Shutdown(ctx context.Context, reason string) error {
+func (c *Client) Shutdown(ctx context.Context, workspaceKey, reason string, runnerGeneration uint64) error {
+	if workspaceKey == "" || runnerGeneration == 0 {
+		return errors.New("workerclient: shutdown identity (workspace_key, generation) is required")
+	}
 	callCtx, cancel := withDeadline(ctx, defaultUnaryTimeout)
 	defer cancel()
-	resp, err := c.raw.Shutdown(callCtx, &workerv1.ShutdownRequest{Reason: reason})
+	resp, err := c.raw.Shutdown(callCtx, &workerv1.ShutdownRequest{
+		Reason: reason, WorkspaceKey: workspaceKey, RunnerGeneration: runnerGeneration,
+	})
 	if err != nil {
 		return wrapRPC("Shutdown", err)
 	}

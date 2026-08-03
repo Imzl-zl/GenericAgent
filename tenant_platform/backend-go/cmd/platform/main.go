@@ -74,32 +74,15 @@ func envInt(name string, fallback int) int {
 	return n
 }
 
-// envIntEither reads the first non-empty of two environment variables;
-// GA_RUNNER_MAX_ACTIVE is the new deployment name, MAX_RUNNING_TASKS the
-// legacy one. The first set variable wins.
-func envIntEither(primary, legacy string, fallback int) int {
-	for _, name := range []string{primary, legacy} {
-		raw := strings.TrimSpace(os.Getenv(name))
-		if raw == "" {
-			continue
-		}
-		n, err := strconv.Atoi(raw)
-		if err != nil {
-			continue
-		}
-		return n
-	}
-	return fallback
-}
-
 // buildWorkerRuntime constructs the production Worker runtime.
 // GA_WORKER_EXECUTION_MODE=user_workspace_runner(默认)使用 Sandbox 工作区
 // Runner; loopback 仅显式用于开发降级(方案 §7: 不作静默回退)。
+// 返回的 managerClient 供 Platform 在附件导入前初始化 workspace 布局。
 func buildWorkerRuntime(
 	boot application.DevBootstrapConfig,
 	store *postgres.Store,
 	instanceID, policyFile, llmProxyAddr, sophubProxyAddr string,
-) (worker.WorkerRuntime, error) {
+) (worker.WorkerRuntime, sandbox.RunnerCLI, error) {
 	mode := strings.TrimSpace(os.Getenv("GA_WORKER_EXECUTION_MODE"))
 	if mode == "" {
 		mode = "user_workspace_runner"
@@ -112,30 +95,30 @@ func buildWorkerRuntime(
 			PolicyFile: boot.PolicyFile,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("loopback runtime: %w", err)
+			return nil, nil, fmt.Errorf("loopback runtime: %w", err)
 		}
-		return runtime, nil
+		return runtime, nil, nil
 	}
 	if mode != "user_workspace_runner" {
-		return nil, fmt.Errorf("unknown GA_WORKER_EXECUTION_MODE %q (user_workspace_runner|loopback)", mode)
+		return nil, nil, fmt.Errorf("unknown GA_WORKER_EXECUTION_MODE %q (user_workspace_runner|loopback)", mode)
 	}
 	if strings.TrimSpace(boot.WorkspacesRoot) == "" {
-		return nil, fmt.Errorf("GA_WORKSPACES_ROOT is required for user_workspace_runner mode")
+		return nil, nil, fmt.Errorf("GA_WORKSPACES_ROOT is required for user_workspace_runner mode")
 	}
 	// Platform 不持有 Docker socket: 所有容器操作经认证的 Manager 控制面
 	// (方案 §7)。GA_MANAGER_ADDR/GA_MANAGER_SECRET 为必填。
 	managerAddr := strings.TrimSpace(os.Getenv("GA_MANAGER_ADDR"))
 	managerSecret := strings.TrimSpace(os.Getenv("GA_MANAGER_SECRET"))
 	if managerAddr == "" || managerSecret == "" {
-		return nil, fmt.Errorf("GA_MANAGER_ADDR and GA_MANAGER_SECRET are required for user_workspace_runner mode")
+		return nil, nil, fmt.Errorf("GA_MANAGER_ADDR and GA_MANAGER_SECRET are required for user_workspace_runner mode")
 	}
 	manager, err := sandbox.NewManagerClient(managerAddr, managerSecret, "ga-runner")
 	if err != nil {
-		return nil, fmt.Errorf("sandbox manager client: %w", err)
+		return nil, nil, fmt.Errorf("sandbox manager client: %w", err)
 	}
 	ca, err := worker.NewPlatformCA()
 	if err != nil {
-		return nil, fmt.Errorf("runner control CA: %w", err)
+		return nil, nil, fmt.Errorf("runner control CA: %w", err)
 	}
 	var env []string
 	if strings.TrimSpace(llmProxyAddr) != "" {
@@ -144,7 +127,7 @@ func buildWorkerRuntime(
 	if strings.TrimSpace(sophubProxyAddr) != "" {
 		env = append(env, "GA_SOPHUB_PROXY_ADDR="+strings.TrimSpace(sophubProxyAddr))
 	}
-	return worker.NewSandbox(worker.SandboxConfig{
+	runtime, err := worker.NewSandbox(worker.SandboxConfig{
 		Manager:            manager,
 		CA:                 ca,
 		LeaseStore:         store,
@@ -155,7 +138,65 @@ func buildWorkerRuntime(
 		ContainerPrefix:    "ga-runner",
 		PolicyFile:         policyFile,
 		Env:                env,
+		MaxActiveRunners:   maxActiveRunners(),
+		RunnerLeaseTTL:     runnerLeaseTTL(),
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return runtime, manager, nil
+}
+
+// runtimeConfigDirFor 返回某 session 的运行时配置目录(credential 刷新写卷
+// 目标, 审查 C4): 生产 Runner 模式写 workspace 共享卷 config/ 子目录
+// (Runner 以 /ga/runner-config 只读挂载, 与 Manager writeConfigFiles 布局
+// 一致); loopback/dev 模式返回 nil 让 scheduler 回退 Platform 本地 ConfigRoot。
+func runtimeConfigDirFor(boot application.DevBootstrapConfig) func(sessionKey string) string {
+	mode := strings.TrimSpace(os.Getenv("GA_WORKER_EXECUTION_MODE"))
+	if mode == "" {
+		mode = "user_workspace_runner"
+	}
+	if mode == "loopback" {
+		return nil
+	}
+	if strings.TrimSpace(boot.WorkspacesRoot) == "" {
+		return nil
+	}
+	return func(sessionKey string) string {
+		hash := sandbox.WorkspaceDirHash(sessionKey)
+		return filepath.Join(boot.WorkspacesRoot, hash, "config")
+	}
+}
+
+// runnerLeaseTTL 返回 Runner lease 时长(GA_RUNNER_IDLE_TTL, 默认 30m)。
+// 与 sandbox-manager 的 idle-ttl 保持同一部署变量: Platform 的 lease 驱动
+// 空闲回收, Manager 的 idle-ttl 仅作兜底日志。非法值拒绝启动而非静默回退。
+func runnerLeaseTTL() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GA_RUNNER_IDLE_TTL"))
+	if raw == "" {
+		return 30 * time.Minute
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil || v <= 0 {
+		slog.Error("invalid GA_RUNNER_IDLE_TTL", "value", raw)
+		os.Exit(2)
+	}
+	return v
+}
+
+// maxActiveRunners 返回 GA_RUNNER_MAX_ACTIVE(活跃 Runner lease 上限)。
+// 非法值(非整数/负数)拒绝启动而非静默回退 0=无限(审查 Important#7)。
+func maxActiveRunners() int64 {
+	raw := strings.TrimSpace(os.Getenv("GA_RUNNER_MAX_ACTIVE"))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v < 0 {
+		slog.Error("invalid GA_RUNNER_MAX_ACTIVE", "value", raw)
+		os.Exit(2)
+	}
+	return v
 }
 
 // sandboxCLI 构建固定 profile 的 Docker CLI(仅 Manager 使用)。
@@ -168,6 +209,42 @@ func sophubProxyBaseURL() string {
 // runnerLeaseReaper 周期清理本实例已过期的 Runner lease: 销毁 lease 记录的
 // 容器并释放 lease(方案 §7: 持久 lease 驱动的重启恢复/孤儿回收)。
 // Worker idle eviction 的正常路径由 scheduler cleanup 直接销毁容器。
+// reconcileExpiredRunnerLeases 扫描并清理所有过期 lease 的容器(审查 C6):
+// Platform 重启后新 instanceID 无法归属旧 lease, 启动时立即执行一次,
+// 避免旧容器残留到 Manager 绝对 TTL。容器是全局资源, 无论 owner 是谁都
+// 必须销毁; 释放(expires_at 置过期)只对本实例 lease 执行。
+func reconcileExpiredRunnerLeases(ctx context.Context, store *postgres.Store, manager sandbox.RunnerCLI, instanceID string) {
+	leases, err := store.ListExpiredRunnerLeases(ctx, time.Now().UTC())
+	if err != nil {
+		slog.ErrorContext(ctx, "platform: list expired runner leases failed", "error", err)
+		return
+	}
+	for _, lease := range leases {
+		if lease.ContainerID != "" {
+			if err := manager.Destroy(ctx, lease.ContainerID); err != nil {
+				slog.WarnContext(ctx, "platform: destroy expired runner failed",
+					"runner_key", lease.RunnerKey, "container", lease.ContainerID, "error", err)
+				continue
+			}
+		}
+		if lease.StaleContainerID != "" {
+			if err := manager.Destroy(ctx, lease.StaleContainerID); err != nil {
+				slog.WarnContext(ctx, "platform: destroy stale runner failed",
+					"runner_key", lease.RunnerKey, "container", lease.StaleContainerID, "error", err)
+			}
+		}
+		if lease.Owner == instanceID {
+			if err := store.ReleaseRunnerLease(ctx, lease.RunnerKey, instanceID, lease.Generation); err != nil {
+				slog.WarnContext(ctx, "platform: release expired runner lease failed",
+					"runner_key", lease.RunnerKey, "error", err)
+			}
+		}
+	}
+}
+
+// runnerLeaseReaper 周期清理已过期的 Runner lease(方案 §7: 持久 lease 驱动
+// 的重启恢复/孤儿回收)。Worker idle eviction 的正常路径由 scheduler cleanup
+// 直接销毁容器。
 func runRunnerLeaseReaper(
 	ctx context.Context,
 	store *postgres.Store,
@@ -182,27 +259,7 @@ func runRunnerLeaseReaper(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			leases, err := store.ListExpiredRunnerLeases(ctx, time.Now().UTC())
-			if err != nil {
-				slog.ErrorContext(ctx, "platform: list expired runner leases failed", "error", err)
-				continue
-			}
-			for _, lease := range leases {
-				if lease.Owner != instanceID {
-					continue // 其他实例的过期 lease 由对应实例接管
-				}
-				if lease.ContainerID != "" {
-					if err := manager.Destroy(ctx, lease.ContainerID); err != nil {
-						slog.WarnContext(ctx, "platform: destroy expired runner failed",
-							"runner_key", lease.RunnerKey, "container", lease.ContainerID, "error", err)
-						continue
-					}
-				}
-				if err := store.ReleaseRunnerLease(ctx, lease.RunnerKey, instanceID); err != nil {
-					slog.WarnContext(ctx, "platform: release expired runner lease failed",
-						"runner_key", lease.RunnerKey, "error", err)
-				}
-			}
+			reconcileExpiredRunnerLeases(ctx, store, manager, instanceID)
 		}
 	}
 }
@@ -352,7 +409,7 @@ func run() error {
 		legacyRoot            = flag.String("legacy-root", "", "GA_LEGACY_ROOT")
 		workerPython          = flag.String("worker-python", "", "python interpreter for worker")
 		workerSrc             = flag.String("worker-src", "", "path to worker-python/src")
-		llmProxyAddr          = flag.String("llm-proxy-addr", "", "external LLM Proxy addr (e.g. http://127.0.0.1:8081); empty = start in-process Proxy in dev-loopback")
+		llmProxyAddr          = flag.String("llm-proxy-addr", os.Getenv("GA_LLM_PROXY_ADDR"), "external LLM Proxy addr (or GA_LLM_PROXY_ADDR, e.g. http://llm-proxy:8081); empty = start in-process Proxy in dev-loopback")
 		capabilitySigningKey  = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=32 bytes")
 		modelPolicyVersion    = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
 		devExtraUsers         = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
@@ -365,7 +422,7 @@ func run() error {
 		botPollerAPISecret    = flag.String("bot-poller-api-secret", os.Getenv("BOT_POLLER_API_SECRET"), "HMAC-SHA256 secret for authenticating requests to Bot Poller /start /send /stop (or BOT_POLLER_API_SECRET); empty = unauthenticated (INSECURE - dev/test only)")
 		platformWebhookURL    = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
 		webhookSecret         = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
-		maxRunningTasks       = flag.Int("max-running-tasks", envIntEither("GA_RUNNER_MAX_ACTIVE", "MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or GA_RUNNER_MAX_ACTIVE/MAX_RUNNING_TASKS); 0 = disabled (dev/test)")
+		maxRunningTasks       = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test). Independent of Runner capacity GA_RUNNER_MAX_ACTIVE: task concurrency is a scheduler gate, Runner capacity is enforced in the lease transaction.")
 		perTenantRunningLimit = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
 		perUserQueueLimit     = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
 		taskTimeoutSeconds    = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
@@ -535,7 +592,7 @@ func run() error {
 		// 生产路径(方案 §5/§7): staging/committed 落在共享工作区卷的 state/ 内,
 		// 由 Sandbox Runner 读写; 要求 GA_WORKSPACES_ROOT 提供共享卷根。
 		if strings.TrimSpace(boot.WorkspacesRoot) == "" {
-			return fmt.Errorf("GA_WORKSPACES_ROOT is required for production checkpoint coordinator")
+			return fmt.Errorf("GA_WORKSPACES_ROOT is required for production checkpoint coordinator (use --dev-loopback for local development)")
 		}
 		if boot.UserID <= 0 {
 			return fmt.Errorf("PLATFORM_DEV_USER_ID is required as the platform admin user id in production")
@@ -597,7 +654,7 @@ func run() error {
 		return fmt.Errorf("capability token issuer: %w", err)
 	}
 
-	runtime, err := buildWorkerRuntime(boot, store, instanceID, resolvedPolicyFile, proxyAddr, sophubProxyBaseURL())
+	runtime, managerClient, err := buildWorkerRuntime(boot, store, instanceID, resolvedPolicyFile, proxyAddr, sophubProxyBaseURL())
 	if err != nil {
 		return err
 	}
@@ -613,6 +670,7 @@ func run() error {
 		Runtime:               runtime,
 		ConfigRoot:            boot.ConfigRoot,
 		SessionScopedConfig:   sessionScopedConfig,
+		RuntimeConfigDir:      runtimeConfigDirFor(boot),
 		RuntimeRoot:           boot.RuntimeRoot,
 		LLMProxyAddr:          proxyAddr,
 		SophubProxyBaseURL:    sophubProxyBaseURL(),
@@ -787,7 +845,14 @@ func run() error {
 		}
 	} else {
 		// 生产: 附件/输出经共享工作区卷 temp/ 与 Runner 互通(方案 §6)。
-		sessionFiles, err = application.NewWorkspaceSessionFiles(boot.WorkspacesRoot)
+		// 附件导入前经 Manager 控制面预置 workspace 目录布局与共享组权限。
+		var ensureWorkspace func(sessionKey string) error
+		if managerClient != nil {
+			ensureWorkspace = func(sessionKey string) error {
+				return managerClient.EnsureWorkspace(context.Background(), sessionKey)
+			}
+		}
+		sessionFiles, err = application.NewWorkspaceSessionFiles(boot.WorkspacesRoot, ensureWorkspace)
 		if err != nil {
 			return fmt.Errorf("workspace session files: %w", err)
 		}
@@ -895,6 +960,9 @@ func run() error {
 		if clientErr != nil {
 			return fmt.Errorf("runner lease reaper manager client: %w", clientErr)
 		}
+		// 启动时立即执行一次过期 lease reconcile(审查 C6: 重启后旧容器
+		// 与新 CA 不兼容, 立即销毁而不是等第一个 tick)。
+		reconcileExpiredRunnerLeases(ctx, store, managerClient, instanceID)
 		go runRunnerLeaseReaper(ctx, store, managerClient, instanceID, time.Minute)
 	}
 	if deliverySvc != nil {

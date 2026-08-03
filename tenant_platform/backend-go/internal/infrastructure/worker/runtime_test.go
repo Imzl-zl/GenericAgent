@@ -30,13 +30,13 @@ func (blockedShutdownClient) BeginCheckpoint(context.Context, *workerv1.BeginChe
 	return nil, nil
 }
 
-func (blockedShutdownClient) CancelTask(context.Context, string) error { return nil }
+func (blockedShutdownClient) CancelTask(context.Context, string, string, uint64) error { return nil }
 
 func (blockedShutdownClient) Health(context.Context) (*workerv1.HealthResponse, error) {
 	return nil, nil
 }
 
-func (blockedShutdownClient) Shutdown(ctx context.Context, _ string) error {
+func (blockedShutdownClient) Shutdown(ctx context.Context, _ string, _ string, _ uint64) error {
 	<-ctx.Done()
 	return ctx.Err()
 }

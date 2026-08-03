@@ -9,7 +9,6 @@ import { DashboardPage } from '../features/user/DashboardPage';
 import { BindingPage } from '../features/user/BindingPage';
 import { PersonaPage } from '../features/user/PersonaPage';
 import { StatusPage } from '../features/user/StatusPage';
-import { SOPLibraryPage } from '../features/user/SOPLibraryPage';
 import { DocsPage } from '../features/docs/DocsPage';
 import { AdminDashboardPage } from '../features/admin/AdminDashboardPage';
 import { UsersPage } from '../features/admin/UsersPage';
@@ -46,7 +45,6 @@ export const router = createBrowserRouter([
       { path: 'binding', element: <BindingPage /> },
       { path: 'persona', element: <PersonaPage /> },
       { path: 'status', element: <StatusPage /> },
-      { path: 'sops', element: <SOPLibraryPage /> },
       { path: 'docs', element: <DocsPage /> },
     ],
   },

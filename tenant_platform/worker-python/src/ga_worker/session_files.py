@@ -23,11 +23,14 @@ def session_key_digest(session_key: str) -> str:
 
 
 def session_sandbox_root(runtime_root: Path, session_key: str) -> Path:
-    # 方案 §6: 附件/输出统一到工作区 temp/, 与工作区持久化一起保留。
-    # 容器 Runner 中 GA_WORKSPACE_TEMP 指向挂载的工作区 temp; 非容器回退 runtime_root。
+    # 方案 §6: 附件/输出统一到工作区 temp/。容器 Runner 中 GA_WORKSPACE_TEMP
+    # 指向挂载的工作区 temp, 且 GA handler.cwd 解析到同一目录(审查: 恢复
+    # 原生相对路径语义, 不再用 session_files/<digest> 中间层)。非容器(loopback
+    # 开发)回退 runtime_root/session_files/<digest>。
     workspace_temp = os.environ.get("GA_WORKSPACE_TEMP", "").strip()
-    base = Path(workspace_temp) if workspace_temp else Path(runtime_root)
-    return base / SESSION_FILES_DIR / session_key_digest(session_key)
+    if workspace_temp:
+        return Path(workspace_temp)
+    return Path(runtime_root) / SESSION_FILES_DIR / session_key_digest(session_key)
 
 
 def ensure_session_sandbox(runtime_root: Path, session_key: str) -> Path:

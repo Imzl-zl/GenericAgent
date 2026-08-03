@@ -327,7 +327,7 @@ func TestWorkerClient_CancelTask_SendsTaskID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := client.CancelTask(ctx, "task-to-cancel"); err != nil {
+	if err := client.CancelTask(ctx, "personal:9", "task-to-cancel", 3); err != nil {
 		t.Fatalf("CancelTask: %v", err)
 	}
 	srv.mu.Lock()
@@ -358,7 +358,7 @@ func TestWorkerClient_HealthAndShutdown(t *testing.T) {
 	if !h.GetReady() || h.GetWorkerInstanceId() != "w-ready" {
 		t.Fatalf("health=%+v", h)
 	}
-	if err := client.Shutdown(ctx, "test-done"); err != nil {
+	if err := client.Shutdown(ctx, "personal:9", "test-done", 3); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 	if !srv.shutdownOK {
@@ -398,6 +398,8 @@ func TestWorkerClientReloadCredentials(t *testing.T) {
 	response, err := client.ReloadCredentials(context.Background(), &workerv1.ReloadCredentialsRequest{
 		CredentialGeneration: 4,
 		ConfigChecksum:       "checksum-4",
+		WorkspaceKey:         "personal:9",
+		RunnerGeneration:     3,
 	})
 	if err != nil {
 		t.Fatal(err)

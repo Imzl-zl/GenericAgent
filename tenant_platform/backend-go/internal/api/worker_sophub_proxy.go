@@ -40,7 +40,7 @@ func (p *WorkerSophubProxy) authenticate(r *http.Request) bool {
 		slog.WarnContext(r.Context(), "sophub proxy: capability rejected", "error", err)
 		return false
 	}
-	return claims.VerifyAudience(llmproxy.SophubAudience, true)
+	return claims.VerifyAudience(llmproxy.SophubAudience, true) && claims.Operation == "sophub"
 }
 
 // ServeSearch 实现 GET /v1/worker/sophub/search?q=...

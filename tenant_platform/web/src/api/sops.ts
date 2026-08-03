@@ -1,4 +1,4 @@
-import { api, userApi } from './client';
+import { api } from './client';
 
 export interface SophubBindingStatus {
   configured: boolean;
@@ -28,40 +28,6 @@ export interface SophubSearchResult {
   has_more: boolean;
 }
 
-export interface SOPCandidate {
-  candidate_id: string;
-  remote_sop_id: string;
-  title: string;
-  description: string;
-  file_type: string;
-  content: string;
-  source_digest: string;
-  status: 'pending' | 'approved' | 'rejected';
-  review_note: string;
-  reviewed_at?: string;
-}
-
-export interface SOPRegistryItem {
-  version_id: string;
-  entry_id: string;
-  candidate_id: string;
-  version: number;
-  title: string;
-  description: string;
-  content: string;
-  digest: string;
-  approved_at: string;
-  loaded: boolean;
-}
-
-export interface LoadedSOP {
-  title: string;
-  description: string;
-  content: string;
-  digest: string;
-  version: number;
-}
-
 export const getSophubBinding = () => api.get<SophubBindingStatus>('/v1/admin/sophub/binding');
 
 export const bindSophub = (apiKey: string) =>
@@ -72,26 +38,5 @@ export const searchSophub = (query: string, page = 1, pageSize = 24) => {
   return api.get<SophubSearchResult>(`/v1/admin/sophub/search?${params.toString()}`);
 };
 
-export const importSOPCandidate = (remoteSOPId: string) =>
-  api.post<SOPCandidate>('/v1/admin/sophub/candidates/import', { remote_sop_id: remoteSOPId });
-
-export const listSOPCandidates = () =>
-  api.get<{ candidates: SOPCandidate[] }>('/v1/admin/sop-candidates').then((reply) => reply.candidates);
-
-export const approveSOPCandidate = (candidateId: string) =>
-  api.post<SOPRegistryItem>(`/v1/admin/sop-candidates/${candidateId}/approve`);
-
-export const rejectSOPCandidate = (candidateId: string, note: string) =>
-  api.post<{ rejected: boolean }>(`/v1/admin/sop-candidates/${candidateId}/reject`, { note });
-
-export const listSOPRegistry = () =>
-  api.get<{ sops: SOPRegistryItem[] }>('/v1/admin/sops').then((reply) => reply.sops);
-
-export const loadSOPVersion = (versionId: string) =>
-  api.post(`/v1/admin/sop-versions/${versionId}/load`);
-
-export const unloadSOPEntry = (entryId: string) =>
-  api.post(`/v1/admin/sops/${entryId}/unload`);
-
-export const listLoadedSOPs = () =>
-  userApi.get<{ sops: LoadedSOP[] }>('/v1/sops').then((reply) => reply.sops);
+// 全局 SOP Registry 已删除(方案 D17): SOP 改为由 Worker 经平台代理
+// 直接下载到工作区 memory/sops/。

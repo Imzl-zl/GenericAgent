@@ -274,7 +274,7 @@ func run() error {
 		return errors.New("checkpoint ready missing checksum")
 	}
 
-	if err := client.Shutdown(ctx, "loopback-complete"); err != nil {
+	if err := client.Shutdown(ctx, defaultSessionKey, "loopback-complete", 1); err != nil {
 		return fmt.Errorf("Shutdown: %w", err)
 	}
 

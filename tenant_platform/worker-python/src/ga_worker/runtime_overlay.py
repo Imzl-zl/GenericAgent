@@ -21,6 +21,9 @@ LEGACY_MODULES = (
 LEGACY_PLUGINS = (
     "plugins/__init__.py",
     "plugins/hooks.py",
+    # 项目模式(审查): 随 overlay 物化并导入, 否则 agent_before hook 不注册,
+    # 项目模式在托管 Runner 中不可用。
+    "plugins/project_mode.py",
 )
 LEGACY_ASSETS = (
     "assets/tools_schema.json",
@@ -140,15 +143,86 @@ def _copy_manifest_entry(src_root: Path, dest_root: Path, rel: str) -> str:
     return digest
 
 
+def _force_remove_tree(path: Path) -> None:
+    """递归删除 overlay 目录(先解除只读位)。POSIX 上 unlink 无需文件写
+    权限; Windows 开发环境只读文件无法删除, 需先 chmod。"""
+    if os.name == "nt":
+        for p in sorted(path.rglob("*"), reverse=True):
+            if p.is_symlink():
+                continue  # chmod 不得跟随 junction/symlink 作用于目标
+            try:
+                p.chmod(p.stat().st_mode | stat.S_IWRITE)
+            except OSError:
+                pass
+    shutil.rmtree(path)
+
+
+def _legacy_source_digest(legacy_root: Path, rel: str) -> str:
+    """计算 legacy_root 下清单条目的当前内容 digest(与 _copy_manifest_entry
+    相同的 symlink 解析语义), 用于 overlay 复用校验。"""
+    src = legacy_root / rel
+    if src.is_symlink():
+        real = src.resolve()
+        try:
+            real.relative_to(legacy_root.resolve())
+        except ValueError as exc:
+            raise OverlayError(f"symlink escapes legacy root: {rel}") from exc
+        src = real
+    else:
+        resolved = src.resolve()
+        try:
+            resolved.relative_to(legacy_root.resolve())
+        except ValueError as exc:
+            raise OverlayError(f"source escapes legacy root: {rel}") from exc
+        src = resolved
+    if not src.is_file():
+        raise OverlayError(f"missing overlay source: {rel}")
+    return _sha256_file(src)
+
+
+def _overlay_digests_match(legacy_root: Path, overlay_dir: Path, manifest: dict[str, Any]) -> bool:
+    """校验 overlay 复用时两重完整性(审查):
+    1. overlay 内每个清单条目文件的内容 digest 与 manifest 一致(Runner 篡改
+       副本后必须重建);
+    2. legacy 源文件当前 digest 与 manifest 一致(镜像升级/代码更新后必须
+       重建, 否则旧代码与安全修复不生效)。
+    """
+    digests = manifest.get("sha256")
+    if not isinstance(digests, dict):
+        return False
+    entries = set(manifest.get("entries", []))
+    if set(digests) != entries or entries != set(OVERLAY_MANIFEST_ENTRIES):
+        return False
+    for rel in OVERLAY_MANIFEST_ENTRIES:
+        expected = digests.get(rel)
+        if not isinstance(expected, str) or not expected:
+            return False
+        overlay_file = overlay_dir / rel
+        try:
+            if not overlay_file.is_file() or _sha256_file(overlay_file) != expected:
+                return False
+            if _legacy_source_digest(legacy_root, rel) != expected:
+                return False
+        except OverlayError:
+            return False
+    return True
+
+
 def materialize_runtime_overlay(
     *,
     legacy_root: Path,
     runtime_root: Path,
     session_id: str,
     lang: str = "zh",
+    overlay_root: Path | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """
-    Materialize immutable overlay at runtime_root/<session_id>/legacy-overlay.
+    Materialize immutable overlay at <overlay_root|runtime_root>/<session_id>/legacy-overlay.
+
+    审查 R4-I13: 容器 Runner 中 overlay_root 指向容器 tmpfs(GA_OVERLAY_ROOT),
+    不落持久 state 卷——每次容器启动重新物化并做 digest 校验, 防止 Runner
+    在会话内篡改副本后经 checkpoint 持久化。loopback 开发未设置时回退
+    runtime_root(与旧行为一致)。
     Returns (overlay_dir, manifest_dict).
     """
     legacy_root = Path(legacy_root)
@@ -161,18 +235,26 @@ def materialize_runtime_overlay(
         raise OverlayError(f"runtime_root missing: {runtime_root}")
 
     session_id = _validate_session_id(session_id)
-    session_dir = _resolve_under(runtime_root, session_id)
-    overlay_dir = _resolve_under(runtime_root, session_id, "legacy-overlay")
+    base = Path(overlay_root) if overlay_root is not None else runtime_root
+    if not base.is_dir():
+        raise OverlayError(f"overlay_root missing: {base}")
+    session_dir = _resolve_under(base, session_id)
+    overlay_dir = _resolve_under(base, session_id, "legacy-overlay")
 
     if overlay_dir.exists():
-        # Collision: only reuse if complete matching manifest is present.
+        # Collision: only reuse if complete matching manifest is present and
+        # every entry still matches the current legacy source content.
         existing = overlay_dir / "OVERLAY_MANIFEST.json"
         if not existing.is_file():
             raise OverlayError(f"overlay collision without manifest: {overlay_dir}")
         manifest = json.loads(existing.read_text(encoding="utf-8"))
-        if set(manifest.get("entries", [])) != set(OVERLAY_MANIFEST_ENTRIES):
-            raise OverlayError("overlay collision with mismatched manifest")
-        return overlay_dir, manifest
+        if not _overlay_digests_match(legacy_root, overlay_dir, manifest):
+            # 审查: 源内容漂移(镜像升级/清单不完整/被篡改)——删除重建。
+            # shutil.rmtree 不跟随目录内符号链接, overlay 内 memory/temp
+            # 指向工作区挂载点的链接不会被误删目标。
+            _force_remove_tree(overlay_dir)
+        else:
+            return overlay_dir, manifest
 
     session_dir.mkdir(parents=True, exist_ok=True)
     overlay_dir.mkdir(parents=True, exist_ok=False)

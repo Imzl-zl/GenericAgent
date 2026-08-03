@@ -285,6 +285,8 @@ def _collect(
     prompt: str,
     persona: list[str] | None = None,
     session_key: str = "personal:1",
+    runner_generation: int = 1,
+    capability_jti: str = "itest-jti",
 ):
     events = list(
         stub.ExecuteTask(
@@ -299,6 +301,8 @@ def _collect(
                     prompt=prompt,
                     persona_snapshot=list(persona or []),
                     tool_policy_version="foundation.no-host-tools.v1",
+                    runner_generation=runner_generation,
+                    capability_jti=capability_jti,
                 )
             )
         )
@@ -382,6 +386,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                     worker_pb2.ReloadCredentialsRequest(
                         credential_generation=2,
                         config_checksum=checksum2,
+                        workspace_key="personal:1",
+                        runner_generation=1,
                     )
                 )
                 assert reloaded.credential_generation == 2
@@ -391,6 +397,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                     worker_pb2.ReloadCredentialsRequest(
                         credential_generation=2,
                         config_checksum=checksum2,
+                        workspace_key="personal:1",
+                        runner_generation=1,
                     )
                 )
                 assert repeated_reload.credential_generation == 2
@@ -414,6 +422,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                         worker_pb2.ReloadCredentialsRequest(
                             credential_generation=3,
                             config_checksum=broken_checksum,
+                            workspace_key="personal:1",
+                            runner_generation=1,
                         )
                     )
                 assert "CREDENTIAL_CONFIG_EMPTY" in reload_error.value.details()
@@ -424,6 +434,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                     worker_pb2.ReloadCredentialsRequest(
                         credential_generation=2,
                         config_checksum=checksum2,
+                        workspace_key="personal:1",
+                        runner_generation=1,
                     )
                 )
                 assert retained.credential_generation == 2
@@ -471,6 +483,7 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                         checkpoint_token="tok-a",
                         staging_ref=str(staging),
                         max_bundle_bytes=2 * 1024 * 1024,
+                        runner_generation=1,
                     )
                 )
                 assert ready.task_id == "t-a"
@@ -511,7 +524,7 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                     "fixture never received LLM request"
                 )
                 cancel_mid = stub.CancelTask(
-                    worker_pb2.CancelTaskRequest(task_id="t-slow")
+                    worker_pb2.CancelTaskRequest(task_id="t-slow", workspace_key="personal:1", runner_generation=1)
                 )
                 assert cancel_mid.accepted is True
                 time.sleep(0.15)
@@ -553,7 +566,7 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 assert reserved_flag.exists(), "worker never reserved pre-start task"
                 pre_req_count = len(srv.requests)
                 cancel_pre = stub.CancelTask(
-                    worker_pb2.CancelTaskRequest(task_id="t-pre")
+                    worker_pb2.CancelTaskRequest(task_id="t-pre", workspace_key="personal:1", runner_generation=1)
                 )
                 assert cancel_pre.accepted is True
                 proceed_flag.write_text("1", encoding="utf-8")
@@ -564,11 +577,11 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 assert term_pre.status == worker_pb2.TASK_CANCELLED
                 assert len(srv.requests) == pre_req_count
                 c_unknown = stub.CancelTask(
-                    worker_pb2.CancelTaskRequest(task_id="no-such")
+                    worker_pb2.CancelTaskRequest(task_id="no-such", workspace_key="personal:1", runner_generation=1)
                 )
                 assert c_unknown.accepted is False
 
-                shut = stub.Shutdown(worker_pb2.ShutdownRequest(reason="swap"))
+                shut = stub.Shutdown(worker_pb2.ShutdownRequest(reason="swap", workspace_key="personal:1", runner_generation=1))
                 assert shut.accepted is True
         finally:
             proc.terminate()
@@ -653,7 +666,7 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                         assert e.chunk.text != "old-display"
 
                 # Graceful shutdown.
-                shut2 = stub.Shutdown(worker_pb2.ShutdownRequest(reason="done"))
+                shut2 = stub.Shutdown(worker_pb2.ShutdownRequest(reason="done", workspace_key="personal:2", runner_generation=1))
                 assert shut2.accepted is True
         finally:
             proc2.terminate()

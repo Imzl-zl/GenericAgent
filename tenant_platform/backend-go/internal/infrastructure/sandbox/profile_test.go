@@ -68,6 +68,41 @@ func TestProfileRejectsEmptyImageOrUnsafeImageSelection(t *testing.T) {
 	}
 }
 
+// TestProfileRuntimeFailClosed(审查 R4-I10): 空运行时(默认 docker)必须
+// 显式 AllowRunc 才允许; 未知运行时一律拒绝; runsc 始终允许。
+func TestProfileRuntimeFailClosed(t *testing.T) {
+	base := ValidProfile()
+	if err := base.Validate(); err == nil {
+		t.Fatal("empty runtime without AllowRunc must fail (fail-closed)")
+	}
+
+	base = ValidProfile()
+	base.Runtime = "runc"
+	if err := base.Validate(); err == nil {
+		t.Fatal("explicit runc without AllowRunc must fail")
+	}
+
+	base = ValidProfile()
+	base.Runtime = ""
+	base.AllowRunc = true
+	if err := base.Validate(); err != nil {
+		t.Fatalf("empty runtime with AllowRunc must pass: %v", err)
+	}
+
+	base = ValidProfile()
+	base.Runtime = "runsc"
+	if err := base.Validate(); err != nil {
+		t.Fatalf("runsc runtime must pass: %v", err)
+	}
+
+	base = ValidProfile()
+	base.Runtime = "some-other-runtime"
+	base.AllowRunc = true
+	if err := base.Validate(); err == nil {
+		t.Fatal("unknown runtime must fail even with AllowRunc")
+	}
+}
+
 func TestWorkspaceMountsRejectNonWorkspaceSources(t *testing.T) {
 	base := ValidProfile()
 	if len(base.WorkspaceSources()) != 3 {

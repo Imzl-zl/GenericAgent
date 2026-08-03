@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,7 +133,7 @@ func TestDeliveryServiceSendsFilesFromResultMarkers(t *testing.T) {
 	if len(deps.transport.sent) != 1 || deps.transport.sent[0].Text != "任务完成：\n整理好了，请查收。" {
 		t.Fatalf("unexpected text deliveries: %+v", deps.transport.sent)
 	}
-	if len(deps.transport.sentFiles) != 1 || deps.transport.sentFiles[0].FilePath != path {
+	if len(deps.transport.sentFiles) != 1 || !strings.HasSuffix(filepath.Base(deps.transport.sentFiles[0].FilePath), "resume.docx") {
 		t.Fatalf("unexpected file deliveries: %+v", deps.transport.sentFiles)
 	}
 	if len(deps.messages.assets) != 1 || deps.messages.assets[0].Direction != domain.MessageOutbound {
@@ -187,7 +188,7 @@ func TestDeliveryServiceRetriesOnlyMissingFileAfterTextSucceeded(t *testing.T) {
 	if len(deps.transport.sent) != 1 {
 		t.Fatalf("second attempt must not repeat completed text: %+v", deps.transport.sent)
 	}
-	if len(deps.transport.sentFiles) != 1 || deps.transport.sentFiles[0].FilePath != path {
+	if len(deps.transport.sentFiles) != 1 || !strings.HasSuffix(filepath.Base(deps.transport.sentFiles[0].FilePath), "resume.docx") {
 		t.Fatalf("second attempt should send only the missing file: %+v", deps.transport.sentFiles)
 	}
 	if len(deps.store.acked) != 1 || deps.store.acked[0] != delivery.DeliveryID {

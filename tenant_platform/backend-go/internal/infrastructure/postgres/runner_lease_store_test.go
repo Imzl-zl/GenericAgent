@@ -13,7 +13,7 @@ func TestAcquireRunnerLeaseCreatesAndReuses(t *testing.T) {
 	ctx := context.Background()
 	store := newChannelBindingTestStore(t)
 
-	lease, created, err := store.AcquireRunnerLease(ctx, "personal:1", "platform-a", 30*time.Minute)
+	lease, created, err := store.AcquireRunnerLease(ctx, "personal:1", "platform-a", 30*time.Minute, 0)
 	if err != nil {
 		t.Fatalf("AcquireRunnerLease: %v", err)
 	}
@@ -28,7 +28,7 @@ func TestAcquireRunnerLeaseCreatesAndReuses(t *testing.T) {
 	}
 
 	// 同 owner 复用:不新增 generation,返回同一 lease。
-	again, created, err := store.AcquireRunnerLease(ctx, "personal:1", "platform-a", 30*time.Minute)
+	again, created, err := store.AcquireRunnerLease(ctx, "personal:1", "platform-a", 30*time.Minute, 0)
 	if err != nil {
 		t.Fatalf("re-acquire: %v", err)
 	}
@@ -40,16 +40,18 @@ func TestAcquireRunnerLeaseCreatesAndReuses(t *testing.T) {
 	}
 }
 
-func TestAcquireRunnerLeaseFailsForForeignOwner(t *testing.T) {
+func TestAcquireRunnerLeaseFailsForForeignOwnerWithActiveTask(t *testing.T) {
 	ctx := context.Background()
 	store := newChannelBindingTestStore(t)
 
-	if _, _, err := store.AcquireRunnerLease(ctx, "personal:2", "platform-a", 30*time.Minute); err != nil {
+	if _, _, err := store.AcquireRunnerLease(ctx, "personal:2", "platform-a", 30*time.Minute, 0); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	_, created, err := store.AcquireRunnerLease(ctx, "personal:2", "platform-b", 30*time.Minute)
+	// 异主 + owner 仍有活跃 task claim: 必须拒绝(多实例同时运行同一 Runner)。
+	seedActiveClaim(t, store, "personal:2", "platform-a")
+	_, created, err := store.AcquireRunnerLease(ctx, "personal:2", "platform-b", 30*time.Minute, 0)
 	if err == nil {
-		t.Fatal("foreign acquire should fail with ErrRunnerLeaseOwned")
+		t.Fatal("foreign acquire with live owner task must fail with ErrRunnerLeaseOwned")
 	}
 	if !errors.Is(err, ErrRunnerLeaseOwned) {
 		t.Fatalf("want ErrRunnerLeaseOwned, got %v", err)
@@ -59,11 +61,74 @@ func TestAcquireRunnerLeaseFailsForForeignOwner(t *testing.T) {
 	}
 }
 
+func TestAcquireRunnerLeaseForeignOwnerTakeoverWithoutActiveTask(t *testing.T) {
+	ctx := context.Background()
+	store := newChannelBindingTestStore(t)
+
+	first, _, err := store.AcquireRunnerLease(ctx, "personal:7", "platform-a", 30*time.Minute, 0)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	if first.Generation != 1 {
+		t.Fatalf("first generation = %d, want 1", first.Generation)
+	}
+	// 异主 + owner 无活跃 task claim(崩溃/长期停机): 允许接管, generation +1。
+	// 审查: 接管必须返回完整 lease 行(generation>0), 否则下游签发零值。
+	taken, created, err := store.AcquireRunnerLease(ctx, "personal:7", "platform-b", 30*time.Minute, 0)
+	if err != nil {
+		t.Fatalf("takeover acquire: %v", err)
+	}
+	if !created {
+		t.Fatal("takeover must report created")
+	}
+	if taken.Generation != 2 {
+		t.Fatalf("takeover generation = %d, want 2 (monotonic +1)", taken.Generation)
+	}
+	if taken.Owner != "platform-b" {
+		t.Fatalf("takeover owner = %q, want platform-b", taken.Owner)
+	}
+}
+
+// seedActiveClaim 为 session_key 插入一条 claim_owner 持有且未过期的
+// starting 任务, 使异主 lease 获取被 ErrRunnerLeaseOwned 拒绝。
+func seedActiveClaim(t *testing.T, store *Store, sessionKey, claimOwner string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `
+INSERT INTO users (id, username, status) VALUES (100, 'lease-owner', 'approved')
+ON CONFLICT (id) DO NOTHING;
+`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `
+INSERT INTO workspaces (id, session_key, owner_user_id, kind, team_id, volume_id, bootstrap_marker)
+VALUES ('00000000-0000-4000-8000-000000000064', $1, 100, 'personal', NULL, 'vol-lease-owner', NULL)
+ON CONFLICT (session_key) DO NOTHING;
+`, sessionKey); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: sessionKey, RequesterUserID: 100, Source: "web", SourceInstanceID: "i",
+		MessageID: "lease-owner", Prompt: "p", PersonaSnapshot: []string{},
+		ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `
+UPDATE tasks SET status='starting', claim_owner=$2, claimed_at=timezone('utc', now()),
+ claim_lease_until=timezone('utc', now()) + interval '10 minute'
+WHERE id=$1
+`, task.ID, claimOwner); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunnerLeaseGenerationIncrementsAfterRelease(t *testing.T) {
 	ctx := context.Background()
 	store := newChannelBindingTestStore(t)
 
-	first, _, err := store.AcquireRunnerLease(ctx, "personal:3", "platform-a", 30*time.Minute)
+	first, _, err := store.AcquireRunnerLease(ctx, "personal:3", "platform-a", 30*time.Minute, 0)
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
@@ -72,14 +137,14 @@ func TestRunnerLeaseGenerationIncrementsAfterRelease(t *testing.T) {
 	}
 
 	// 绑定 container 后释放(Runner 销毁),再获取必须递增 generation。
-	if err := store.AttachRunnerContainer(ctx, first.RunnerKey, "container-abc"); err != nil {
+	if err := store.AttachRunnerContainer(ctx, first.RunnerKey, "container-abc", first.Generation); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	if err := store.ReleaseRunnerLease(ctx, first.RunnerKey, "platform-a"); err != nil {
+	if err := store.ReleaseRunnerLease(ctx, first.RunnerKey, "platform-a", first.Generation); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 
-	second, created, err := store.AcquireRunnerLease(ctx, "personal:3", "platform-a", 30*time.Minute)
+	second, created, err := store.AcquireRunnerLease(ctx, "personal:3", "platform-a", 30*time.Minute, 0)
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
@@ -98,13 +163,13 @@ func TestExpiredRunnerLeaseCanBeReacquiredWithNextGeneration(t *testing.T) {
 	ctx := context.Background()
 	store := newChannelBindingTestStore(t)
 
-	lease, _, err := store.AcquireRunnerLease(ctx, "personal:4", "platform-a", 1*time.Millisecond)
+	lease, _, err := store.AcquireRunnerLease(ctx, "personal:4", "platform-a", 1*time.Millisecond, 0)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	time.Sleep(5 * time.Millisecond)
 
-	next, created, err := store.AcquireRunnerLease(ctx, "personal:4", "platform-b", 30*time.Minute)
+	next, created, err := store.AcquireRunnerLease(ctx, "personal:4", "platform-b", 30*time.Minute, 0)
 	if err != nil {
 		t.Fatalf("acquire after expiry: %v", err)
 	}
@@ -123,10 +188,10 @@ func TestListExpiredRunnerLeasesOnlyReturnsExpired(t *testing.T) {
 	ctx := context.Background()
 	store := newChannelBindingTestStore(t)
 
-	if _, _, err := store.AcquireRunnerLease(ctx, "personal:5", "platform-a", 1*time.Millisecond); err != nil {
+	if _, _, err := store.AcquireRunnerLease(ctx, "personal:5", "platform-a", 1*time.Millisecond, 0); err != nil {
 		t.Fatalf("expiring lease: %v", err)
 	}
-	if _, _, err := store.AcquireRunnerLease(ctx, "personal:6", "platform-a", 30*time.Minute); err != nil {
+	if _, _, err := store.AcquireRunnerLease(ctx, "personal:6", "platform-a", 30*time.Minute, 0); err != nil {
 		t.Fatalf("live lease: %v", err)
 	}
 	time.Sleep(5 * time.Millisecond)
@@ -151,11 +216,11 @@ func TestRunnerLeaseFieldsRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	store := newChannelBindingTestStore(t)
 
-	lease, _, err := store.AcquireRunnerLease(ctx, "personal:7", "platform-a", 30*time.Minute)
+	lease, _, err := store.AcquireRunnerLease(ctx, "personal:7", "platform-a", 30*time.Minute, 0)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-xyz"); err != nil {
+	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-xyz", lease.Generation); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	if err := store.SetRunnerControlEndpoint(ctx, lease.RunnerKey, "https://runner-ctrl:9443"); err != nil {

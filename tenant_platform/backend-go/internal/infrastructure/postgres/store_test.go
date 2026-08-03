@@ -330,7 +330,7 @@ func TestCompleteSucceededMapsAcceptedCancelToInterruptedWithoutPublishingSnapsh
 		t.Fatal(err)
 	}
 	stagingRefFor := func(snapshotID, token string, generation int64) string { return "staging" }
-	snapshotID, _, _, err := store.PrepareCheckpoint(ctx, task.ID, "owner-cancel", stagingRefFor, 1024)
+	snapshotID, _, _, err := store.PrepareCheckpoint(ctx, task.ID, "owner-cancel", 1, stagingRefFor, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}

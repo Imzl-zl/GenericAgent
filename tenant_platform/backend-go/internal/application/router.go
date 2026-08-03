@@ -68,7 +68,8 @@ type RouterStore interface {
 	GetUserStatus(ctx context.Context, userID int64) (domain.UserStatus, error)
 	GetUserToolPolicy(ctx context.Context, userID int64) (string, error)
 	FindRunningTaskBySession(ctx context.Context, sessionKey string) (domain.Task, error)
-	ResetWorkspace(ctx context.Context, sessionKey string) error
+	// ResetWorkspaceForNewSession 设置 reset_at 并取消 queued 任务(/new)。
+	ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error)
 }
 
 // MessageStore persists inbound and outbound WeChat messages for history,
@@ -91,9 +92,11 @@ type CommandRegistry interface {
 	CommandRegistryVersion(ctx context.Context) (string, error)
 }
 
-// ChannelBindingResolver 解析渠道账号(如 iLink user id)对应的 canonical user。
+// ChannelBindingResolver 解析渠道账号(如 iLink user id)对应的 canonical user,
+// 并提供幂等绑定写入(方案 §5.1: 首次消息自动建立绑定)。
 type ChannelBindingResolver interface {
 	ResolveCanonicalUserID(ctx context.Context, channelType, channelAccountID string) (int64, error)
+	BindChannelAccount(ctx context.Context, channelType, channelAccountID string, canonicalUserID int64) (domain.ChannelBinding, error)
 }
 
 // RouterConfig wires the router's dependencies.
@@ -176,20 +179,21 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 }
 
 // resolveOwnerID 解析消息发送者的 canonical user: 渠道绑定存在时用绑定用户
-// (跨渠道统一身份, 方案 §5.1), 否则回退 bot 属主(未启用绑定)。
-func (r *router) resolveOwnerID(ctx context.Context, msg IncomingMessage, botOwnerID int64) int64 {
+// (跨渠道统一身份, 方案 §5.1), 未绑定时回退 bot 属主; 绑定查询发生非
+// "未找到"错误时返回错误(不静默路由到 bot owner 的工作区, 防止 DB 故障
+// 下跨用户串区)。
+func (r *router) resolveOwnerID(ctx context.Context, msg IncomingMessage, botOwnerID int64) (int64, error) {
 	if r.channelBindings == nil || msg.IlinkUserID == "" {
-		return botOwnerID
+		return botOwnerID, nil
 	}
 	canonical, err := r.channelBindings.ResolveCanonicalUserID(ctx, "ilink", msg.IlinkUserID)
 	if err != nil {
-		if !errors.Is(err, domain.ErrChannelBindingNotFound) {
-			slog.WarnContext(ctx, "router: resolve canonical user failed; falling back to bot owner",
-				"ilink_user_id", msg.IlinkUserID, "error", err)
+		if errors.Is(err, domain.ErrChannelBindingNotFound) {
+			return botOwnerID, nil
 		}
-		return botOwnerID
+		return 0, err
 	}
-	return canonical
+	return canonical, nil
 }
 
 // HandleMessage processes one incoming message per spec §6.1.
@@ -215,7 +219,12 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	// Resolve active context early so persistInbound records the correct
 	// session_key (personal:{user_id} vs team:{team_id}). Falls back to
 	// personal session when teams are disabled or context lookup fails.
-	ownerID := r.resolveOwnerID(ctx, msg, bot.OwnerID)
+	ownerID, err := r.resolveOwnerID(ctx, msg, bot.OwnerID)
+	if err != nil {
+		reply := "身份解析失败，请稍后重试"
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
+	}
 	// canonical identity(方案 §5.1): 后续 status/任务提交全部以绑定用户为准。
 	bot.OwnerID = ownerID
 	inboundSessionKey := personalSessionKey(ownerID)
@@ -253,6 +262,15 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 		reply := "identity mismatch"
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
 		return RouterResult{Action: ActionRejected, Reply: reply}, nil
+	}
+	// canonical 绑定写入(方案 §5.1): 身份校验通过后幂等建立渠道账号 →
+	// canonical user 绑定, 保证跨渠道同一用户落在同一工作区。绑定失败
+	// 不阻断消息(仅影响跨渠道身份合并)。
+	if r.channelBindings != nil && msg.IlinkUserID != "" {
+		if _, bindErr := r.channelBindings.BindChannelAccount(ctx, "ilink", msg.IlinkUserID, ownerID); bindErr != nil {
+			slog.WarnContext(ctx, "router: auto-bind channel account failed",
+				"ilink_user_id", msg.IlinkUserID, "canonical_user_id", ownerID, "error", bindErr)
+		}
 	}
 	// Step 3: check user status.
 	status, err := r.store.GetUserStatus(ctx, bot.OwnerID)

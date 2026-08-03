@@ -78,6 +78,29 @@ def _validate_and_reserve(
                 "SESSION_MISMATCH",
                 f"task session_key {task.session_key!r} != active {session.session_key!r}",
             )
+        # generation fencing(方案 §7, 审查): task 必须精确绑定当前 Runner 的
+        # lease generation; generation==0 不得绕过, 旧 generation 的迟到请求
+        # 直接拒绝, 不能消费新 Runner。fencing 校验必须先于会话健康检查, 否则
+        # 旧 generation 任务会因 AGENT_FAILED 抢先而掩盖身份错误(审查 R4-I11)。
+        if task.runner_generation == 0 or task.runner_generation != session.runner_generation:
+            raise WorkerAdapterError(
+                "RUNNER_GENERATION_MISMATCH",
+                f"task runner_generation {task.runner_generation} != active {session.runner_generation}",
+            )
+        # per-task capability(方案 §7, 审查): 每个 task 必须携带独立的
+        # capability JTI, 且必须属于当前会话凭证集(Platform 签发并写入
+        # runtime config 的 JTIs)——任意非空字符串不得通过。
+        if not task.capability_jti:
+            raise WorkerAdapterError("CAPABILITY_JTI_REQUIRED", "task capability_jti required")
+        if session.capability_jtis and task.capability_jti not in session.capability_jtis:
+            raise WorkerAdapterError(
+                "CAPABILITY_JTI_MISMATCH",
+                "task capability_jti not in the session's current credential set",
+            )
+        # 会话健康检查置于身份校验之后: fencing 错误码必须优先暴露, 防止
+        # AGENT_FAILED 掩盖旧 generation/伪造 JTI(审查 R4-I11)。
+        if session.agent_failed:
+            raise WorkerAdapterError("AGENT_FAILED", "worker agent thread crashed; start a new session")
         if adapter._pending is not None or session.active_task_id is not None:
             raise WorkerAdapterError("TASK_ALREADY_RUNNING", "a task is already running")
         try:
@@ -148,7 +171,7 @@ def _setup_runtime(
     from ga_worker.legacy_instrument import (
         apply_tool_policy, install_dispatch_guard, install_global_mcp_tools,
         install_handler_print_counter, install_max_turns, install_session_file_sandbox,
-        prepare_handler_seed,
+        install_sophub_tools, prepare_handler_seed,
     )
     agent = adapter._session.agent
     state = TaskRunState(
@@ -163,6 +186,7 @@ def _setup_runtime(
         adapter._session.generated_output_files = []
     try:
         state.sandbox_unwrap = install_session_file_sandbox(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
+        state.sophub_unwrap = install_sophub_tools(adapter._session, adapter._legacy_mods)
         state.mcp_unwrap = install_global_mcp_tools(adapter._session, adapter._legacy_mods)
         state.previous_schema = apply_tool_policy(tool_policy, adapter._legacy_mods)
         state.dispatch_unwrap = install_dispatch_guard(tool_policy, adapter._legacy_mods)
@@ -189,7 +213,8 @@ def _rollback_runtime_setup(adapter: Any, state: TaskRunState) -> None:
     sandbox_unwrap = getattr(state, "sandbox_unwrap", None)
     for unwrap in (
         state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap,
-        state.seed_unwrap, state.mcp_unwrap, sandbox_unwrap,
+        state.seed_unwrap, state.mcp_unwrap, getattr(state, "sophub_unwrap", None),
+        sandbox_unwrap,
     ):
         if unwrap is not None:
             try:
@@ -229,7 +254,12 @@ def _arm_deadline_timer(adapter: Any, task: worker_pb2.TaskEnvelope, state: Task
 
     def _on_timeout():
         state.timed_out["v"] = True
-        adapter.cancel_task(task.task_id)
+        # 内部 deadline timer 也携带会话身份(cancel_task 现在校验身份)。
+        session = adapter._session
+        if session is not None:
+            adapter.cancel_task(task.task_id, session.workspace_key, session.runner_generation)
+        else:
+            adapter.cancel_task(task.task_id)
 
     state.deadline_timer = threading.Timer(timeout_s, _on_timeout)
     state.deadline_timer.daemon = True

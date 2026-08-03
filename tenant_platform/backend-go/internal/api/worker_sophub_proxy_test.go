@@ -24,7 +24,7 @@ func newTestSophubProxy() *WorkerSophubProxy {
 		func(ctx context.Context, remoteID string) (domain.SophubRemoteSOP, error) {
 			return domain.SophubRemoteSOP{
 				ID: remoteID, Title: "SOP One", FileType: "markdown", Status: "approved",
-				Content: "# SOP\ncontent",
+				PackageType: "single_file", IsPublic: true, Content: "# SOP\ncontent",
 			}, nil
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
@@ -33,6 +33,7 @@ func newTestSophubProxy() *WorkerSophubProxy {
 			}
 			return llmproxy.CapabilityClaims{
 				ProviderID: 1,
+				Operation:  "sophub",
 				RegisteredClaims: jwt.RegisteredClaims{
 					Audience: jwt.ClaimStrings{llmproxy.SophubAudience},
 				},
@@ -97,6 +98,7 @@ func TestWorkerSophubInstallRejectsNonApproved(t *testing.T) {
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
 			return llmproxy.CapabilityClaims{
+				Operation: "sophub",
 				RegisteredClaims: jwt.RegisteredClaims{Audience: jwt.ClaimStrings{llmproxy.SophubAudience}},
 			}, nil
 		},

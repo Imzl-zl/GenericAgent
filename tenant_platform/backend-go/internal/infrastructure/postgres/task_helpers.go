@@ -109,6 +109,12 @@ RETURNING `+taskSelectColumns, t.ID, string(status), code, message, traceID, res
 	if err := insertDelivery(ctx, tx, tt.ID, deliveryType, resultRef, resultDigest, code, message, traceID); err != nil {
 		return domain.Task{}, err
 	}
+	// 审查 R4-C3: 终态事务内同步撤销任务的 capability JTI(与任务状态变更
+	// 原子), 不依赖事务后的进程内重试——Platform 在终态提交后立即崩溃时
+	// 旧 token 也已失效。幂等: 撤销表 ON CONFLICT 取最晚过期。
+	if err := revokeTaskCapabilityJTIs(ctx, tx, tt.ID); err != nil {
+		return domain.Task{}, err
+	}
 	return tt, nil
 }
 

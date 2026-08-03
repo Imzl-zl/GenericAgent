@@ -46,6 +46,7 @@ func validCapabilitySpec() CapabilitySpec {
 		ProviderType:     domain.ProviderNativeOAI,
 		Model:            "gpt-test",
 		PolicyVersion:    "foundation.no-host-tools.v1",
+		Operation:        "llm.chat",
 	}
 }
 
@@ -234,7 +235,7 @@ func TestCapabilityValidatorReturnsTaskBinding(t *testing.T) {
 	tokenString, _, err := issuer.Issue(CapabilitySpec{
 		SessionKey: "personal:1", ProviderID: 3, ProviderRevision: 5,
 		ProviderType: "native_oai", Model: "gpt-4o", PolicyVersion: "v1",
-		TaskID: "task-xyz", RunnerGeneration: 9,
+		TaskID: "task-xyz", RunnerGeneration: 9, Operation: "llm.chat",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -245,5 +246,40 @@ func TestCapabilityValidatorReturnsTaskBinding(t *testing.T) {
 	}
 	if claims.TaskID != "task-xyz" || claims.RunnerGeneration != 9 {
 		t.Fatalf("validator claims task binding = %s/%d", claims.TaskID, claims.RunnerGeneration)
+	}
+}
+
+// TestSophubValidatorRequiresTaskAndGenerationBinding 验证 Sophub capability
+// 必须绑定 task_id + runner_generation(审查 I9), 缺任一字段即拒绝。
+func TestSophubValidatorRequiresTaskAndGenerationBinding(t *testing.T) {
+	v, err := NewSophubValidator([]byte("test-signing-key-at-least-32-bytes"), &fakeRevocationSource{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuer, err := NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 无 task/generation 绑定的 sophub token 必须被拒绝。
+	plain, _, err := issuer.IssueSophubToken("personal:1", "", 0, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Validate(context.Background(), plain); err == nil {
+		t.Fatal("sophub token without task/generation binding must be rejected")
+	}
+
+	// 完整绑定必须通过。
+	bound, _, err := issuer.IssueSophubToken("personal:1", "task-1", 3, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := v.Validate(context.Background(), bound)
+	if err != nil {
+		t.Fatalf("bound sophub token must pass: %v", err)
+	}
+	if claims.TaskID != "task-1" || claims.RunnerGeneration != 3 {
+		t.Fatalf("claims = %+v", claims)
 	}
 }

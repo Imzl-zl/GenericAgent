@@ -14,7 +14,10 @@
             "file_read",
             "file_write",
             "file_patch",
-            "export_docx"
+            "code_run",
+            "export_docx",
+            "sophub_search",
+            "sophub_install"
           ]
         }
       }

@@ -621,3 +621,86 @@ func TestRoutingAuditContainsMetadataWithoutCredentialMaterial(t *testing.T) {
 		t.Fatalf("audit metadata incomplete: %s", detail)
 	}
 }
+
+// TestRefreshWorkerCredentialsKeepsRunnerGeneration 验证 credential 刷新只递增
+// credential 版本(JSON/reload 协议), token 绑定的 RunnerGeneration 保持不变
+// (审查 C4: generation 分离, 复用 Runner 的第二个 task 不会被 Worker 拒绝)。
+func TestRefreshWorkerCredentialsKeepsRunnerGeneration(t *testing.T) {
+	dir := t.TempDir()
+	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
+	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
+	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
+		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
+		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
+		t.Fatal(err)
+	}
+	worker := newControlledWorker()
+	capabilities := &routingCapabilityStore{}
+	entry := &workerEntry{
+		client: worker, sessionKey: "personal:1",
+		runnerGeneration: 7, // 复用 Runner 的真实 lease generation
+		credentials: workerCredentialSet{
+			Generation: 1, RunnerGeneration: 7, Checksum: oldFiles.Checksum,
+			ExpiresAt: time.Now().UTC().Add(time.Minute),
+			JTIs:      []string{"old-jti"}, Snapshot: snapshot,
+		},
+	}
+	s := &scheduler{cfg: SchedulerConfig{
+		TokenIssuer: issuer, CapabilityStore: capabilities, LLMProvider: source,
+		LLMProxyAddr: "http://127.0.0.1:9999", ConfigRoot: dir,
+		ModelPolicyVersion: "test.v1",
+		TokenTTL:           time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
+	}}
+
+	if err := s.refreshWorkerCredentials(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.credentials.Generation != 2 {
+		t.Fatalf("credential generation = %d, want 2", entry.credentials.Generation)
+	}
+	if entry.credentials.RunnerGeneration != 7 {
+		t.Fatalf("runner generation = %d, want 7 (must not change on refresh)", entry.credentials.RunnerGeneration)
+	}
+	if len(worker.reloadRequests) != 1 ||
+		worker.reloadRequests[0].GetCredentialGeneration() != 2 {
+		t.Fatalf("reload requests = %+v", worker.reloadRequests)
+	}
+}
+
+// TestIssueInitialWorkerCredentialsSetsBothGenerations 验证首次签发时
+// credential generation 与 runner generation 都等于 Runner lease generation。
+func TestIssueInitialWorkerCredentialsSetsBothGenerations(t *testing.T) {
+	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
+	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
+	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := domain.Task{ID: "task-9", SessionKey: "personal:9", ToolPolicyVersion: "foundation.no-host-tools.v1"}
+	s := &scheduler{cfg: SchedulerConfig{
+		TokenIssuer: issuer, LLMProvider: source,
+		LLMProxyAddr: "http://127.0.0.1:9999", ConfigRoot: t.TempDir(),
+		ModelPolicyVersion: "test.v1",
+		TokenTTL:           time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
+	}}
+	set, _, err := s.issueInitialWorkerCredentials(context.Background(), task, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Generation != 3 || set.RunnerGeneration != 3 {
+		t.Fatalf("set = %+v, want Generation=3 RunnerGeneration=3", set)
+	}
+}

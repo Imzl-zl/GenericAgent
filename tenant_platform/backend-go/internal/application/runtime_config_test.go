@@ -3,6 +3,7 @@ package application
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -223,5 +224,30 @@ func TestBuildRuntimeConfigRejectsEmptySophubProxy(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("empty sophub base_url must fail")
+	}
+}
+
+// TestWriteRuntimeConfigAtomicGroupReadableMode 验证刷新配置文件为 0640
+// (共享组可读, 审查 Blocker#3: 0600 使复用 Runner 的 Runner 不可读)。
+func TestWriteRuntimeConfigAtomicGroupReadableMode(t *testing.T) {
+	dir := t.TempDir()
+	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999",
+		RoutingSnapshotID: "snapshot",
+		Providers:         []RuntimeProviderBinding{{Provider: provider, Token: "tok"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRuntimeConfigAtomic(dir, files); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, runtimeConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got&0o040 == 0 {
+		t.Fatalf("runtime config mode %o must be group-readable (0640)", got)
 	}
 }

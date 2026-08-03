@@ -66,10 +66,11 @@ func TestLocalCoordinator_PrepareCommitRead_TokenMismatch(t *testing.T) {
 	}
 	ctx := context.Background()
 	lease, err := coord.Prepare(ctx, CheckpointPrepareRequest{
-		TaskID:         task.ID,
-		WorkspaceID:    task.WorkspaceID,
-		SessionKey:     task.SessionKey,
-		MaxBundleBytes: 1024 * 1024,
+		TaskID:           task.ID,
+		WorkspaceID:      task.WorkspaceID,
+		SessionKey:       task.SessionKey,
+		MaxBundleBytes:   1024 * 1024,
+		RunnerGeneration: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -83,15 +84,16 @@ func TestLocalCoordinator_PrepareCommitRead_TokenMismatch(t *testing.T) {
 
 	body := "result-body"
 	bundle := map[string]any{
-		"schema_version":  "genericagent.snapshot.v1",
-		"task_id":         task.ID,
-		"session_key":     task.SessionKey,
-		"backend_history": []any{},
-		"agent_history":   []any{},
-		"working":         map[string]any{},
-		"display_history": []any{},
-		"result":          map[string]any{"content_type": "text/plain; charset=utf-8", "body": body},
-		"result_digest":   "sha256:" + hex.EncodeToString(hashBytes([]byte(body))),
+		"schema_version":     "genericagent.snapshot.v1",
+		"task_id":            task.ID,
+		"session_key":        task.SessionKey,
+		"runner_generation":  1,
+		"backend_history":    []any{},
+		"agent_history":      []any{},
+		"working":            map[string]any{},
+		"display_history":    []any{},
+		"result":             map[string]any{"content_type": "text/plain; charset=utf-8", "body": body},
+		"result_digest":      "sha256:" + hex.EncodeToString(hashBytes([]byte(body))),
 	}
 	raw, _ := json.Marshal(bundle)
 	if err := os.WriteFile(lease.StagingRef, raw, 0o600); err != nil {
@@ -109,6 +111,7 @@ func TestLocalCoordinator_PrepareCommitRead_TokenMismatch(t *testing.T) {
 	committed, err := coord.Commit(ctx, ReadyCheckpoint{
 		TaskID: task.ID, SnapshotID: lease.SnapshotID, CheckpointToken: lease.Token,
 		StagingRef: lease.StagingRef, Checksum: sum, ResultDigest: bundle["result_digest"].(string),
+		RunnerGeneration: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -174,18 +177,19 @@ func TestLocalCoordinator_CommitRejectsBundleAbovePreparedLimit(t *testing.T) {
 	const maxBundleBytes = 128
 	lease, err := coord.Prepare(ctx, CheckpointPrepareRequest{
 		TaskID: task.ID, WorkspaceID: task.WorkspaceID, SessionKey: task.SessionKey,
-		MaxBundleBytes: maxBundleBytes,
+		MaxBundleBytes: maxBundleBytes, RunnerGeneration: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := strings.Repeat("x", 512)
 	bundle := map[string]any{
-		"schema_version": snapshotSchemaVersion,
-		"task_id":        task.ID,
-		"session_key":    task.SessionKey,
-		"result":         map[string]any{"body": body},
-		"result_digest":  "sha256:" + hex.EncodeToString(hashBytes([]byte(body))),
+		"schema_version":    snapshotSchemaVersion,
+		"task_id":           task.ID,
+		"session_key":       task.SessionKey,
+		"runner_generation": 1,
+		"result":            map[string]any{"body": body},
+		"result_digest":     "sha256:" + hex.EncodeToString(hashBytes([]byte(body))),
 	}
 	raw, err := json.Marshal(bundle)
 	if err != nil {
@@ -201,6 +205,7 @@ func TestLocalCoordinator_CommitRejectsBundleAbovePreparedLimit(t *testing.T) {
 	if _, err := coord.Commit(ctx, ReadyCheckpoint{
 		TaskID: task.ID, SnapshotID: lease.SnapshotID, CheckpointToken: lease.Token,
 		StagingRef: lease.StagingRef, Checksum: checksum, ResultDigest: bundle["result_digest"].(string),
+		RunnerGeneration: 1,
 	}); err == nil || !strings.Contains(err.Error(), "max bundle") {
 		t.Fatalf("expected max bundle rejection, got %v", err)
 	}

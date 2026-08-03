@@ -1086,10 +1086,13 @@ def _exercise_initial_oai_binding(
     _set_default_provider(base, secondary["provider_id"])
     _submit_success(base, "ga-existing-after-default", "ga-existing-after-default")
     _captured_request(fixture, "ga-existing-after-default", OAI_TOKEN)
-    assert (
-        _runtime_document(config_root)["_platform_runtime"]["config_checksum"]
-        == checksum
-    )
+    # 每任务 capability(方案 §7): 复用 Worker 时每个新任务都签发绑定自身
+    # task_id 的新 token, 终态后旧 token 撤销——config_checksum 必然推进。
+    # 路由快照不变由"任务仍用 OAI_TOKEN(primary)"断言覆盖。
+    new_checksum = _runtime_document(config_root)["_platform_runtime"][
+        "config_checksum"
+    ]
+    assert new_checksum != checksum
 
 
 def _exercise_new_worker_mixin_and_key_rotation(
@@ -1117,10 +1120,11 @@ def _exercise_new_worker_mixin_and_key_rotation(
     _submit_success(base, "ga-key-rotation", "ga-key-rotation")
     request = _captured_request(fixture, "ga-key-rotation", ROTATED_OAI_TOKEN)
     assert "ga-mixin-fallback" in json.dumps(request["payload"])
-    assert (
-        _runtime_document(config_root)["_platform_runtime"]["config_checksum"]
-        == checksum
-    )
+    # 同 session 新任务同样推进 credential generation(每任务 token 绑定)。
+    new_checksum = _runtime_document(config_root)["_platform_runtime"][
+        "config_checksum"
+    ]
+    assert new_checksum != checksum
     return rotated
 
 

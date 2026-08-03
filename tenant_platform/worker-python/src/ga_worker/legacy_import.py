@@ -21,6 +21,7 @@ LEGACY_MODULE_NAMES = frozenset(
         "simphtml",
         "plugins",
         "plugins.hooks",
+        "plugins.project_mode",
     }
 )
 
@@ -160,7 +161,8 @@ def import_legacy_runtime(
 
     # Ensure simphtml and ga are importable (ga eagerly imports simphtml in real tree).
     # plugins/hooks are on the immutable allowlist — failures must be visible.
-    for name in ("simphtml", "agent_loop", "llmcore", "ga", "plugins", "plugins.hooks", "agentmain"):
+    # project_mode 必须显式导入以注册 agent_before hook(审查: 项目模式可用性)。
+    for name in ("simphtml", "agent_loop", "llmcore", "ga", "plugins", "plugins.hooks", "plugins.project_mode", "agentmain"):
         try:
             imported[name] = _load(name)
         except ModuleNotFoundError as exc:

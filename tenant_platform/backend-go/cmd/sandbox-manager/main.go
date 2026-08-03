@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,10 +32,16 @@ func main() {
 		workspaces         = flag.String("workspaces-root", envOr("GA_WORKSPACES_ROOT", "/var/lib/ga/workspaces"), "daemon-visible root containing workspaces/<hash>/")
 		workspacesVolume   = flag.String("workspaces-volume", envOr("GA_WORKSPACES_VOLUME", ""), "named volume for workspaces (Compose); empty = bind mount from workspaces-root")
 		memoryTmpl         = flag.String("memory-template", envOr("GA_MEMORY_TEMPLATE", "/ga/memory-template"), "read-only memory template path inside the manager image")
-		idleTTL            = flag.Duration("idle-ttl", 30*time.Minute, "Runner idle reclamation TTL (Platform lease drives normal reaping)")
-		absTTL             = flag.Duration("reap-abs-ttl", 24*time.Hour, "absolute orphan TTL: running containers older than this are destroyed as last-resort orphans")
+		idleTTL            = flag.Duration("idle-ttl", 30*time.Minute, "Runner idle TTL(日志参考; 实际空闲回收由 Platform lease 驱动, 见 GA_RUNNER_IDLE_TTL)")
+		absTTL             = flag.Duration("reap-abs-ttl", 24*time.Hour, "legacy flag kept for CLI compatibility; running containers are never reaped by age (review I5: active runners are managed by Platform lease lifecycle)")
 		prefix             = flag.String("container-prefix", "ga-runner", "Runner container name prefix")
-		profileName        = flag.String("security-profile", envOr("GA_RUNNER_SECURITY_PROFILE", ""), "container runtime (runsc for untrusted production; empty = docker)")
+		profileName        = flag.String("security-profile", envOr("GA_RUNNER_SECURITY_PROFILE", ""), "container runtime (runsc for untrusted production; empty = docker, requires --allow-runc)")
+		allowRunc          = flag.Bool("allow-runc", envOrBool("GA_RUNNER_ALLOW_RUNC", false), "explicitly allow the default docker runtime (trusted local dev only; production must use runsc)")
+		shareGID           = flag.Int("share-gid", envOrInt("GA_RUNNER_SHARE_GID", 10003), "shared workspace group id (Platform compose group_add)")
+		memoryBytes        = flag.Int64("memory-bytes", envIntOr("GA_RUNNER_MEMORY_BYTES", 1<<30), "Runner memory limit in bytes (or GA_RUNNER_MEMORY_BYTES)")
+		cpuQuota           = flag.Int64("cpu-quota", envIntOr("GA_RUNNER_CPU_QUOTA", 100000), "Runner CPU quota per period (or GA_RUNNER_CPU_QUOTA)")
+		pidsLimit          = flag.Int64("pids-limit", envIntOr("GA_RUNNER_PIDS_LIMIT", 128), "Runner pids limit (or GA_RUNNER_PIDS_LIMIT)")
+		allowMutableTag    = flag.Bool("allow-mutable-tag", envOrBool("GA_RUNNER_ALLOW_TAG", false), "allow non-digest runner image tag (local dev only)")
 		reapInterval       = flag.Duration("reap-interval", 5*time.Minute, "orphan reclamation sweep interval")
 		controlAddr        = flag.String("control-addr", envOr("GA_MANAGER_CONTROL_ADDR", "0.0.0.0:8091"), "Platform control API listen address")
 		controlSecret      = flag.String("control-secret", envOr("GA_MANAGER_SECRET", ""), "HMAC secret for the Platform control API (required)")
@@ -58,6 +65,13 @@ func main() {
 	profile := sandbox.ValidProfile()
 	profile.Image = *image
 	profile.Runtime = *profileName
+	profile.ShareGID = *shareGID
+	profile.AllowMutableTag = *allowMutableTag
+	profile.AllowRunc = *allowRunc
+	// 审查 M12: compose 暴露的调优变量真正接入固定 profile, 非法值拒绝。
+	profile.MemoryBytes = *memoryBytes
+	profile.CPUQuota = *cpuQuota
+	profile.PIDsLimit = *pidsLimit
 	if err := profile.Validate(); err != nil {
 		slog.Error("invalid runner profile", "error", err)
 		os.Exit(2)
@@ -144,15 +158,18 @@ func main() {
 
 // sweepOrphans 列出本 Manager 创建的 Runner 容器(label 过滤), 清理:
 //   - 已退出/从未启动的容器(僵尸);
-//   - 运行超过 absTTL 的绝对孤儿(Platform 长期无动作, 兜底回收)。
+//   - 运行中容器一律跳过(审查): 活跃 Runner 由 Platform lease 生命周期
+//     管理(续租→idle 回收; lease 过期→Platform reconcile 销毁容器),
+//     按容器创建时间杀运行中容器会误杀仍在续租/正在执行任务的 Runner。
 func sweepOrphans(ctx context.Context, cli *sandbox.DockerCLI, prefix string, absTTL time.Duration) {
+	_ = absTTL
 	containers, err := cli.ListRunnerContainers(ctx, prefix)
 	if err != nil {
 		slog.WarnContext(ctx, "sandbox-manager: list runner containers failed", "error", err)
 		return
 	}
 	for _, c := range containers {
-		if c.Running && time.Since(c.CreatedAt) < absTTL {
+		if c.Running {
 			continue // 活跃 Runner 由 Platform lease 生命周期管理
 		}
 		if err := cli.Destroy(ctx, c.Name); err != nil {
@@ -167,6 +184,39 @@ func sweepOrphans(ctx context.Context, cli *sandbox.DockerCLI, prefix string, ab
 func envOr(name, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envOrInt(name string, fallback int) int {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+// envIntOr 严格解析环境变量为 int64; 值存在但非法时返回 -1 并输出错误,
+// 由调用方拒绝启动(审查 M12: 部署暴露的调优变量非法值不得静默回退)。
+func envIntOr(name string, fallback int64) int64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		slog.Error("invalid integer environment variable", "name", name, "value", v)
+		os.Exit(2)
+	}
+	return parsed
+}
+
+func envOrBool(name string, fallback bool) bool {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			return parsed
+		}
 	}
 	return fallback
 }

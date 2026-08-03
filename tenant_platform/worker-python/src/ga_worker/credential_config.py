@@ -22,6 +22,9 @@ class RuntimeCredentialMetadata:
     generation: int
     checksum: str
     routing_snapshot_id: str
+    # JTIs 是当前凭证集签发的全部 capability token JTI(方案 §7):
+    # task_runner 校验 ExecuteTask 的 capability_jti 必须属于该集合。
+    jtis: frozenset[str] = frozenset()
 
 
 def load_runtime_document(config_root: Path) -> tuple[RuntimeCredentialMetadata, dict[str, Any]]:
@@ -48,6 +51,12 @@ def load_runtime_document(config_root: Path) -> tuple[RuntimeCredentialMetadata,
         raise CredentialConfigError("config_checksum must be hexadecimal") from exc
     if not isinstance(snapshot_id, str) or not snapshot_id:
         raise CredentialConfigError("routing_snapshot_id is required")
+    jtis_raw = metadata.get("jtis")
+    jtis: frozenset[str] = frozenset()
+    if jtis_raw is not None:
+        if not isinstance(jtis_raw, list) or not all(isinstance(j, str) and j for j in jtis_raw):
+            raise CredentialConfigError("jtis must be a list of non-empty strings")
+        jtis = frozenset(jtis_raw)
 
     checksum_bytes = checksum.encode("ascii")
     if encoded.count(checksum_bytes) != 1:
@@ -55,7 +64,7 @@ def load_runtime_document(config_root: Path) -> tuple[RuntimeCredentialMetadata,
     expected = hashlib.sha256(encoded.replace(checksum_bytes, CHECKSUM_PLACEHOLDER.encode("ascii"), 1)).hexdigest()
     if not hmac.compare_digest(expected, checksum):
         raise CredentialConfigError("CONFIG_CHECKSUM_MISMATCH")
-    return RuntimeCredentialMetadata(generation, checksum, snapshot_id), document
+    return RuntimeCredentialMetadata(generation, checksum, snapshot_id, jtis), document
 
 
 def load_runtime_metadata(config_root: Path) -> RuntimeCredentialMetadata:

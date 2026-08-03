@@ -54,7 +54,8 @@ type DockerConfig struct {
 // Platform control plane (workspace_key + Runner lease generation) and the
 // fixed deployment profile (spec §7).
 type RunnerSpec struct {
-	WorkspaceHash  string            // 64-hex, derived from workspace_key
+	WorkspaceKey   string // 控制面 workspace key(注入容器身份 env)
+	WorkspaceHash  string // 64-hex, derived from workspace_key
 	Generation     uint64
 	Image          string            // fixed digest
 	MemoryTemplate string            // 镜像内只读模板路径,空则跳过初始化
@@ -94,6 +95,34 @@ func NewDockerCLI(cfg DockerConfig) (*DockerCLI, error) {
 // CreateAndStart creates and starts a Runner container with the fixed profile.
 // The only mounts are the five workspace subpaths; the container joins only
 // runner-control; docker.sock is never mounted.
+// protectedRunnerEnvKeys 是 Manager 固定的容器环境变量集合(方案 §7:
+// 安全参数由 Manager 固定)。控制面透传 env 不得覆盖这些键——Docker 对
+// 重复 --env 以最后一个为准, 若允许透传覆盖, 空值 GA_RUNNER_TLS_* 会让
+// Worker 以 insecure gRPC 监听, 破坏 mTLS 控制面(审查)。
+var protectedRunnerEnvKeys = map[string]struct{}{
+	"GA_CONFIG_ROOT":       {},
+	"GA_LEGACY_ROOT":       {},
+	"GA_RUNTIME_DIR":       {},
+	"GA_POLICY_FILE":       {},
+	"GA_WORKER_LISTEN":     {},
+	"GA_RUNNER_TLS_CERT":   {},
+	"GA_RUNNER_TLS_KEY":    {},
+	"GA_RUNNER_TLS_CA":     {},
+	"GA_WORKSPACE_MEMORY":  {},
+	"GA_WORKSPACE_TEMP":    {},
+	"GA_WORKSPACE_KEY":     {},
+	"GA_RUNNER_GENERATION": {},
+}
+
+// runnerEnvKey 返回 env 条目 "K=V" 的键部分(无 '=' 的条目视为非法)。
+func runnerEnvKey(e string) (string, error) {
+	k, _, ok := strings.Cut(e, "=")
+	if !ok || strings.TrimSpace(k) == "" {
+		return "", fmt.Errorf("runner env entry %q is not K=V", e)
+	}
+	return k, nil
+}
+
 func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner, error) {
 	if ok, err := d.cfg.Profile.IsValidWorkspaceHash(spec.WorkspaceHash); !ok {
 		return Runner{}, fmt.Errorf("invalid workspace hash: %w", err)
@@ -116,12 +145,12 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 	p := d.cfg.Profile
 
 	// 预置工作区目录(创建容器前),memory 为空时从模板初始化。
-	dirs, err := prepareWorkspaceDirs(d.cfg.WorkspacesRoot, spec.WorkspaceHash, spec.MemoryTemplate, p.UID, p.GID)
+	dirs, err := prepareWorkspaceDirs(d.cfg.WorkspacesRoot, spec.WorkspaceHash, spec.MemoryTemplate, p.UID, p.GID, p.ShareGID)
 	if err != nil {
 		return Runner{}, fmt.Errorf("prepare workspace dirs: %w", err)
 	}
 	// 控制面材料(短期 mTLS 证书/策略清单)原子写入 config/ 并只读挂载。
-	if err := writeConfigFiles(d.cfg.WorkspacesRoot, spec.WorkspaceHash, spec.ConfigFiles, p.UID, p.GID); err != nil {
+	if err := writeConfigFiles(d.cfg.WorkspacesRoot, spec.WorkspaceHash, spec.ConfigFiles, p.UID, p.GID, p.ShareGID); err != nil {
 		return Runner{}, fmt.Errorf("write runner config files: %w", err)
 	}
 
@@ -137,12 +166,21 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges:true",
 		"--user", strconv.Itoa(p.UID) + ":" + strconv.Itoa(p.GID),
+		"--group-add", strconv.Itoa(p.ShareGID),
 		"--memory", strconv.FormatInt(p.MemoryBytes, 10),
 		"--cpu-period", strconv.FormatInt(p.CPUPeriod, 10),
 		"--cpu-quota", strconv.FormatInt(p.CPUQuota, 10),
 		"--pids-limit", strconv.FormatInt(p.PIDsLimit, 10),
 		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
-		"--workdir", LegacyTempMount,
+		// 审查 R4-I13: overlay(legacy 代码副本)放入容器 tmpfs, 不落持久
+		// state 卷——每次容器启动重新物化并做 digest 校验, 防止 Runner 在
+		// 会话内篡改副本后经 checkpoint 持久化。tmpfs 大小时 128m(模板+
+		// assets 约数十 MB)。
+		"--tmpfs", RunnerOverlayMount+":rw,noexec,nosuid,nodev,size=128m",
+		// 进程 workdir 必须是 GA 根(/ga/legacy), 使 handler.cwd='./temp' 解析
+		// 到工作区 temp(审查: 之前用 temp 挂载点做 workdir 会让相对路径
+		// 错位到 temp/temp, 破坏 GA 原生路径语义)。
+		"--workdir", LegacyRoot,
 	}
 	// 工作区挂载: Compose 部署用 named volume + volume-subpath(daemon 可解析),
 	// 裸机用 bind source(Manager 与 daemon 同主机时等价)。
@@ -154,7 +192,6 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		{"temp", LegacyTempMount, false},
 		{"state", RunnerStateMount, false},
 		{"config", RunnerConfigMount, true},
-		{"attachments", RunnerAttachmentsMount, true},
 	}
 	for _, m := range subpaths {
 		mount := m
@@ -184,10 +221,30 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		"--env", "GA_RUNNER_TLS_CA="+RunnerConfigMount+"/ca.crt",
 		"--env", "GA_WORKSPACE_MEMORY="+LegacyMemoryMount,
 		"--env", "GA_WORKSPACE_TEMP="+LegacyTempMount,
+		"--env", "GA_OVERLAY_ROOT="+RunnerOverlayMount,
+	)
+	// 容器不可变身份(方案 §7): workspace key 与 lease generation 由 Manager
+	// 固定注入, Worker 校验 StartSession/ExecuteTask 请求必须与之匹配, 防
+	// 止误路由/迟到的控制面请求在错误工作区挂载中执行。值来自已认证的
+	// Platform 控制面, 不含 '=' / NUL / 换行, 可安全作为 --env K=V。
+	if strings.ContainsAny(spec.WorkspaceKey, "=\x00\n") {
+		return Runner{}, fmt.Errorf("unsafe workspace key in runner env")
+	}
+	args = append(args,
+		"--env", "GA_WORKSPACE_KEY="+spec.WorkspaceKey,
+		"--env", "GA_RUNNER_GENERATION="+strconv.FormatUint(spec.Generation, 10),
 	)
 	for _, e := range spec.Env {
 		if strings.TrimSpace(e) == "" || strings.Contains(e, "\x00") {
 			return Runner{}, fmt.Errorf("invalid runner env entry")
+		}
+		// fail-closed(审查): 拒绝覆盖固定安全变量, 而不是依赖追加顺序。
+		key, err := runnerEnvKey(e)
+		if err != nil {
+			return Runner{}, err
+		}
+		if _, protected := protectedRunnerEnvKeys[key]; protected {
+			return Runner{}, fmt.Errorf("runner env entry %q overrides fixed security variable %s", e, key)
 		}
 		args = append(args, "--env", e)
 	}
@@ -197,7 +254,9 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 	if p.SeccompProfile != "" {
 		args = append(args, "--security-opt", "seccomp="+p.SeccompProfile)
 	}
-	args = append(args, image)
+	// 显式命令参数覆盖镜像 CMD: 固定 mTLS TCP 监听(镜像默认 unix socket
+	// 仅供本地冒烟), 与 Platform 拨号端点 runner-control 内 DNS:9443 一致。
+	args = append(args, image, "--listen", "tcp:0.0.0.0:"+strconv.Itoa(RunnerControlPort))
 
 	stdout, stderr, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, args...)
 	if err != nil {
@@ -218,6 +277,21 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 	return Runner{ContainerID: containerID, Name: name}, nil
 }
 
+// EnsureWorkspace 幂等地预置 workspace 目录布局并修复 ownership(方案 §6)。
+// 只创建目录结构与 setgid/共享组权限, 不种 memory 模板(模板初始化仍由
+// CreateAndStart 首次创建 Runner 时完成, 避免并发初始化竞态)。
+func (d *DockerCLI) EnsureWorkspace(ctx context.Context, workspaceHash string) error {
+	_ = ctx
+	if ok, err := d.cfg.Profile.IsValidWorkspaceHash(workspaceHash); !ok {
+		return fmt.Errorf("invalid workspace hash: %w", err)
+	}
+	p := d.cfg.Profile
+	if _, err := prepareWorkspaceDirs(d.cfg.WorkspacesRoot, workspaceHash, "", p.UID, p.GID, p.ShareGID); err != nil {
+		return fmt.Errorf("ensure workspace dirs: %w", err)
+	}
+	return nil
+}
+
 // RunnerName 返回 workspace hash + generation 的确定性容器名。Platform 与
 // Manager 各自独立推导同一名字, 用于证书 SAN 与拨号地址(方案 §7)。
 func (d *DockerCLI) RunnerName(workspaceHash string, generation uint64) string {
@@ -234,6 +308,17 @@ func (d *DockerCLI) Destroy(ctx context.Context, name string) error {
 		return fmt.Errorf("docker rm runner %s failed (%d): %s", name, exitCode, strings.TrimSpace(string(stderr)))
 	}
 	return nil
+}
+
+// IsRunnerContainer 校验容器(按 ID 或名称)带 com.genericagent.runner=true
+// label。用于销毁前的归属校验: 只有本 Manager 创建的容器可被 rm。
+func (d *DockerCLI) IsRunnerContainer(ctx context.Context, idOrName string) (bool, error) {
+	stdout, _, exitCode, err := d.runner.Run(ctx, d.cfg.Binary,
+		"inspect", "--format", `{{index .Config.Labels "com.genericagent.runner"}}`, idOrName)
+	if err != nil || exitCode != 0 {
+		return false, nil // 不存在或无法读取: 一律拒绝
+	}
+	return strings.TrimSpace(string(stdout)) == "true", nil
 }
 
 // ListRunnerContainers 返回本 Manager 创建的 Runner 容器(label 过滤,

@@ -270,7 +270,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
 				// 后复制到 Platform 私有快照, transport 发送不可变快照,
 				// 消除校验与发送之间的 TOCTOU。
-				snap, snapErr := snapshotDeliverable(file.absPath, s.snapshotDir, defaultMaxDeliverableBytes)
+				snap, snapErr := snapshotDeliverable(file.absPath, file.root, file.relPath, s.snapshotDir, defaultMaxDeliverableBytes)
 				if snapErr != nil {
 					return snapErr
 				}
@@ -388,6 +388,7 @@ func (s *deliveryService) clearUnjournaledPart(key string) {
 
 type deliveryFile struct {
 	absPath     string
+	root        string // session sandbox root(共享卷内; safefs 受限打开)
 	relPath     string
 	displayName string
 }
@@ -437,7 +438,10 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 			if err != nil {
 				return deliveryPayload{}, err
 			}
-			out.Files = append(out.Files, deliveryFile{absPath: absPath, relPath: relPath, displayName: ref.OriginalName})
+			out.Files = append(out.Files, deliveryFile{
+				absPath: absPath, root: s.cfg.SessionFiles.SandboxRoot(task.SessionKey),
+				relPath: relPath, displayName: ref.OriginalName,
+			})
 		}
 		return out, nil
 	case domain.DeliveryTaskFailed:

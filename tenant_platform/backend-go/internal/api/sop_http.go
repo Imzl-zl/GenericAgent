@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,6 +33,12 @@ func (s *Server) handleAdminGetSophubBinding(w http.ResponseWriter, r *http.Requ
 	tid := traceID()
 	status, err := s.sophub.GetBindingStatus(r.Context())
 	if err != nil {
+		// 审查: 未绑定是正常初始状态, 返回 200 configured:false 而不是 502
+		// (与 SophubBindingStatus 契约一致, 前端可据此渲染"去绑定"入口)。
+		if errors.Is(err, domain.ErrSophubNotConfigured) {
+			writeJSON(w, http.StatusOK, sophubBindingStatusReply{Configured: false})
+			return
+		}
 		writeErr(w, http.StatusBadGateway, "SOPHUB_STATUS_FAILED", err.Error(), tid)
 		return
 	}

@@ -91,10 +91,13 @@ type RunnerLease struct {
 	Generation     uint64 // monotonically increasing per Runner recreation
 	ContainerID    string // immutable once attached
 	ControlEndpoint string
-	Status         RunnerLeaseStatus
-	ExpiresAt      time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// StaleContainerID 是 lease 接管/重建时被替换的旧容器 ID, 供调用方定向
+	// 清理(审查 C6: 接管事务不再丢失旧容器身份)。
+	StaleContainerID string
+	Status          RunnerLeaseStatus
+	ExpiresAt       time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // IsExpired reports whether the lease is past its expiry.

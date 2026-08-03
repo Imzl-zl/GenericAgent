@@ -32,9 +32,18 @@ type TaskStore interface {
 	// CountRunningTasks returns the global number of tasks in starting/running
 	// status. Used by the scheduler to enforce MaxRunningTasks.
 	CountRunningTasks(ctx context.Context) (int, error)
+	// RequeueTask moves a starting task claimed by platformInstanceID back to
+	// queued and clears its claim fields. Used when dispatch fails with a
+	// transient Runner capacity/ownership error so the task is retried on a
+	// later tick instead of being terminalized (审查 C3: 满载保持 queued)。
+	RequeueTask(ctx context.Context, taskID, platformInstanceID string) error
 	// CountQueuedTasksByRequester returns the number of queued tasks for a
 	// given requester. Used by SubmitTask to enforce PerUserQueueLimit.
 	CountQueuedTasksByRequester(ctx context.Context, requesterUserID int64) (int, error)
-	// ResetWorkspace marks the session for fresh start (/new command).
-	ResetWorkspace(ctx context.Context, sessionKey string) error
+	// ResetWorkspaceForNewSession marks the session for fresh start (/new):
+	// 设置 reset_at 并取消该 session 所有 queued 任务(审查 R4-I8)。
+	ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error)
+	// SetTaskCapabilityJTIs 持久化任务实际签发的 capability JTI 列表
+	// (崩溃恢复时用于撤销, 审查: 撤销必须是持久工作流)。
+	SetTaskCapabilityJTIs(ctx context.Context, taskID string, jtis []string) error
 }

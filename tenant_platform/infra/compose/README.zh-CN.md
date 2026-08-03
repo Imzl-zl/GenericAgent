@@ -10,7 +10,7 @@
 - Docker Engine；
 - Docker Compose v2；
 - `git` 和 `openssl`；
-- 生产环境建议安装 `gVisor/runsc` 作为 Runner 运行时（`GA_RUNNER_SECURITY_PROFILE=runsc`）；本机开发可用 Docker 加固（默认）。
+- 生产环境必须安装 `gVisor/runsc` 作为 Runner 运行时（`GA_RUNNER_SECURITY_PROFILE=runsc`）；本机开发可用 Docker 加固（需显式设置 `GA_RUNNER_ALLOW_RUNC=1`，未设置时 Manager 拒绝启动）。
 
 Runner 容器由 Sandbox Manager 动态创建，需要 Docker socket 仅挂载给 `sandbox-manager` 服务。不需要安装 GenericAgent 的 systemd 服务，不需要 1Panel，也不需要手工创建 `config`、`runtime`、数据库或数据目录。
 
@@ -54,11 +54,18 @@ openssl rand -hex 32  # LLM_PROXY_CAPABILITY_SIGNING_KEY
 
 ```bash
 docker compose config >/dev/null
-docker compose up -d --build
+docker compose up -d --build   # 构建并启动全部服务(含 ga-runner 镜像)
 docker compose ps
 curl --fail http://127.0.0.1:8088/healthz
 docker compose logs --tail=200 sandbox-manager
 ```
+
+`ga-runner` 服务只构建不常驻(`scale: 0`): 容器实例由 Sandbox Manager 按
+工作区活跃状态动态创建, 无需单独执行 `docker compose build ga-runner`。
+
+本地开发默认允许可变 tag(`GA_RUNNER_ALLOW_TAG=1`); 生产部署必须把
+`GA_RUNNER_IMAGE` 固定为 `@sha256:` digest 引用并把 `GA_RUNNER_ALLOW_TAG`
+设为 0, 否则 Sandbox Manager 拒绝启动(固定 profile 校验)。
 
 默认 Web 只监听服务器本机的 `127.0.0.1:8088`。远程浏览器请通过 SSH 隧道或 HTTPS 反向代理访问，不要把 8088、55432 或数据库端口直接暴露到公网。
 

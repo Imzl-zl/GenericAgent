@@ -6,6 +6,8 @@ package llmproxy
 import (
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,6 +34,9 @@ type Config struct {
 	ProviderSource       ProviderSource
 	Cipher               TokenCipher
 	Revocations          CapabilityRevocationSource
+	// UsageCounter 按 JTI 原子计量 capability 调用次数(审查 R4-I9)。
+	// 非 nil 时 llm.chat 转发前消费预算(max_turns), 超额拒绝。
+	UsageCounter         CapabilityUsageCounter
 	AllowedUpstreamCIDRs []string
 	AllowedHTTPHosts     []string
 }
@@ -44,13 +49,15 @@ func (c Config) WithDefaults() Config {
 	return c
 }
 
-// Validate enforces non-empty, well-formed, loopback-bound configuration.
+// Validate enforces non-empty, well-formed listen configuration.
+// 默认开发态 loopback; 容器部署(llm-proxy 供内部 Runner 经 runner-control
+// 网络访问)显式设置 0.0.0.0:8081(审查 C2: 内部服务必须监听非 loopback)。
 func (c Config) Validate() error {
 	if c.Listen == "" {
 		return fmt.Errorf("listen address is required")
 	}
-	if !isLoopbackAddr(c.Listen) {
-		return fmt.Errorf("listen address must be loopback: %s", c.Listen)
+	if !isValidListenAddr(c.Listen) {
+		return fmt.Errorf("invalid listen address %q", c.Listen)
 	}
 	if c.ProviderSource == nil {
 		return fmt.Errorf("provider source is required")
@@ -77,11 +84,19 @@ func (c Config) NetworkPolicy() (*NetworkPolicy, error) {
 	return NewNetworkPolicy(c.AllowedUpstreamCIDRs, c.AllowedHTTPHosts)
 }
 
-func isLoopbackAddr(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
+// isValidListenAddr 校验监听地址可解析: 允许 loopback(默认)与显式配置的
+// 通配/具体地址(容器内部服务, 审查 C2); 拒绝空 host、无效端口与非法格式。
+func isValidListenAddr(addr string) bool {
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return false
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	if host == "" || strings.ContainsAny(host, " \t/") {
+		return false
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 0 || p > 65535 {
+		return false
+	}
+	return true
 }

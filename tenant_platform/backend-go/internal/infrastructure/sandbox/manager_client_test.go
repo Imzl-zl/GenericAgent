@@ -2,15 +2,22 @@ package sandbox
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeCLI2 记录创建并返回固定 Runner(控制面测试用)。
 type fakeCLI2 struct {
-	specs []RunnerSpec
+	runnerContainer bool
+	specs           []RunnerSpec
+	ensureCalls     []string
 }
 
 func (f *fakeCLI2) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner, error) {
@@ -20,6 +27,13 @@ func (f *fakeCLI2) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner,
 
 func (f *fakeCLI2) Destroy(ctx context.Context, name string) error { return nil }
 func (f *fakeCLI2) Inspect(ctx context.Context, name string) error { return nil }
+func (f *fakeCLI2) IsRunnerContainer(ctx context.Context, idOrName string) (bool, error) {
+	return f.runnerContainer, nil
+}
+func (f *fakeCLI2) EnsureWorkspace(ctx context.Context, workspaceHash string) error {
+	f.ensureCalls = append(f.ensureCalls, workspaceHash)
+	return nil
+}
 
 func TestManagerControlAPIRoundTrip(t *testing.T) {
 	cli := &fakeCLI2{}
@@ -86,6 +100,31 @@ func TestManagerControlAPIRoundTrip(t *testing.T) {
 	}
 }
 
+func TestManagerControlAPIEnsureWorkspaceRoundTrip(t *testing.T) {
+	cli := &fakeCLI2{}
+	manager := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: t.TempDir(), ContainerNamePrefix: "ga-runner"})
+	server, err := NewManagerServer(manager, "0123456789abcdef-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	client, err := NewManagerClient(ts.URL, "0123456789abcdef-secret", "ga-runner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.EnsureWorkspace(context.Background(), "personal:9"); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	if len(cli.ensureCalls) != 1 || cli.ensureCalls[0] != WorkspaceDirHash("personal:9") {
+		t.Fatalf("ensure calls = %v", cli.ensureCalls)
+	}
+	if err := client.EnsureWorkspace(context.Background(), ""); err == nil {
+		t.Fatal("EnsureWorkspace with empty key must fail client-side")
+	}
+}
+
 func TestManagerControlAPIRejectsBadSignature(t *testing.T) {
 	cli := &fakeCLI2{}
 	manager := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: t.TempDir(), ContainerNamePrefix: "ga-runner"})
@@ -120,5 +159,77 @@ func TestManagerControlAPIRejectsUnsafeDestroyName(t *testing.T) {
 	client, _ := NewManagerClient(ts.URL, "0123456789abcdef-secret", "ga-runner")
 	if err := client.Destroy(context.Background(), "../evil"); err == nil {
 		t.Fatal("path traversal name must be rejected")
+	}
+}
+
+// TestManagerControlAPIRejectsReplayedNonce 验证同一签名请求(nonce 相同)
+// 重放会被一次性 nonce 集合拒绝(防重放, 方案 §7)。
+func TestManagerControlAPIRejectsReplayedNonce(t *testing.T) {
+	cli := &fakeCLI2{}
+	manager := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: t.TempDir(), ContainerNamePrefix: "ga-runner"})
+	server, err := NewManagerServer(manager, "0123456789abcdef-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	sign := func(method, path, timestamp, nonce, body string) string {
+		canonical := strings.Join([]string{method, path, timestamp, nonce, body}, "\n")
+		mac := hmac.New(sha256.New, []byte("0123456789abcdef-secret"))
+		_, _ = mac.Write([]byte(canonical))
+		return hex.EncodeToString(mac.Sum(nil))
+	}
+
+	do := func() int {
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+		const nonce = "deadbeefdeadbeefdeadbeefdeadbeef"
+		req, err := http.NewRequest("GET", ts.URL+"/v1/runners", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-GA-Timestamp", timestamp)
+		req.Header.Set("X-GA-Nonce", nonce)
+		req.Header.Set("X-GA-Signature", sign("GET", "/v1/runners", timestamp, nonce, ""))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := do(); code != http.StatusOK {
+		t.Fatalf("first request = %d, want 200", code)
+	}
+	if code := do(); code != http.StatusUnauthorized {
+		t.Fatalf("replayed request = %d, want 401", code)
+	}
+}
+
+// TestManagerControlAPIRejectsArbitraryDestroyName 验证控制面不能销毁
+// 非 Runner 命名模式且无 Runner label 的容器(任意 rm 防护, 方案 §7);
+// 容器 ID 但 label 校验通过(接管清理 stale_container_id 的场景)必须允许。
+func TestManagerControlAPIRejectsArbitraryDestroyName(t *testing.T) {
+	cli := &fakeCLI2{}
+	manager := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: t.TempDir(), ContainerNamePrefix: "ga-runner"})
+	server, _ := NewManagerServer(manager, "0123456789abcdef-secret")
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+	client, _ := NewManagerClient(ts.URL, "0123456789abcdef-secret", "ga-runner")
+	if err := client.Destroy(context.Background(), "postgres-1"); err == nil {
+		t.Fatal("destroying a non-runner container name must be rejected")
+	}
+	if err := client.Destroy(context.Background(), "ga-runner-1234567890xz-g1"); err == nil {
+		t.Fatal("runner name with non-hex hash must be rejected")
+	}
+	// 容器 ID(非命名模式)但带 Runner label: 接管清理路径, 必须允许(审查)。
+	cli.runnerContainer = true
+	if err := client.Destroy(context.Background(), "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b"); err != nil {
+		t.Fatalf("destroying a labeled runner container id must be allowed: %v", err)
+	}
+	// label 校验失败(存在但非 Runner)必须拒绝。
+	cli.runnerContainer = false
+	if err := client.Destroy(context.Background(), "deadbeefdeadbeef"); err == nil {
+		t.Fatal("destroying a non-runner container id must be rejected")
 	}
 }

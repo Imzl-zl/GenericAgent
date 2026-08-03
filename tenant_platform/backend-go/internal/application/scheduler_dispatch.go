@@ -11,7 +11,14 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 )
+
+// isTransientRunnerError 判断 dispatch 启动失败是否属于 Runner 容量/所有权
+// 类瞬时错误: 此类错误不应终态化任务, 而应退回 queued 等待重试(审查 C3)。
+func isTransientRunnerError(err error) bool {
+	return errors.Is(err, postgres.ErrRunnerLeaseCapacity) || errors.Is(err, postgres.ErrRunnerLeaseOwned)
+}
 
 // finalizeOrFail records a terminal task state + delivery and surfaces any
 // persistence failure via log instead of silently dropping it (global rule:
@@ -36,6 +43,8 @@ func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) 
 	if err := s.CancelWorker(cancelCtx, task); err != nil {
 		slog.WarnContext(ctx, "scheduler: deadline cancel failed", "task_id", task.ID, "error", err)
 	}
+	// 超时后 Worker 内存状态不确定, 不复用(审查: 失败后不复用)。
+	s.evictWorkerAfterFailure(task.SessionKey)
 	s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 		"TASK_DEADLINE_EXCEEDED", "task exceeded maximum wall-clock duration", "")
 	_ = s.KickSession(ctx, task.SessionKey)
@@ -60,6 +69,14 @@ func workerTaskEnvelope(task domain.Task, runnerGeneration uint64, capabilityJTI
 }
 
 func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr error) {
+	// 进程内 in-flight gate(审查 R4-C1): tick 对 WorkerDispatchStartedAt==nil
+	// 的任务每轮都会派发; dispatch 在 MarkDispatchStarted 之前有昂贵的初始化,
+	// 冷启动超过一个 tick 间隔时第二个副本会重复创建 Runner/互相销毁
+	// Worker。LoadOrStore 保证同一 task 只有一个 dispatch goroutine。
+	if _, loaded := s.dispatchInFlight.LoadOrStore(task.ID, struct{}{}); loaded {
+		return nil
+	}
+	defer s.dispatchInFlight.Delete(task.ID)
 	defer func() {
 		if r := recover(); r != nil {
 			returnErr = fmt.Errorf("dispatch panic: %v", r)
@@ -68,6 +85,19 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"DISPATCH_PANIC", fmt.Sprintf("%v", r), "")
 		}
+	}()
+	// 终态后立即撤销本任务实际使用的 credential 集(审查 I9): 任务
+	// success/fail/cancel/deadline 后旧 task 的 capability token 不得继续被
+	// Runner 复用。集合在 ExecuteTask 前捕获(entry.credentials 在任务执行
+	// 期间不会刷新: Worker 拒绝任务期 reload), 不能撤销 defer 时刻的
+	// "当前"集合——新任务可能已刷新并替换 entry.credentials。
+	// revokeSessionCredentialsIfTerminal 内部检查任务是否已终态,
+	// requeue 分支(任务仍 queued)不会撤销。
+	var taskCredentialSet workerCredentialSet
+	// 审查(第三轮 review C1): 必须用闭包捕获——Go 的 defer 在注册时立即
+	// 求值实参, 直接传变量会捕获当时的零值空集, 使撤销在任何路径都无效。
+	defer func() {
+		s.revokeSessionCredentialsIfTerminal(ctx, task.ID, task.SessionKey, taskCredentialSet)
 	}()
 	// Re-check under store: may have been cancelled before dispatch.
 	cur, err := s.cfg.Store.GetTask(ctx, task.ID)
@@ -110,6 +140,16 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 
 	client, entry, err := s.ensureWorker(ctx, task)
 	if err != nil {
+		// Runner 容量满或 lease 被其他实例持有: 不是任务失败, 退回 queued
+		// 等下一轮 tick 重试(审查 C3: 满载保持 queued, 绝不终态化)。
+		if isTransientRunnerError(err) {
+			if requeueErr := s.cfg.Store.RequeueTask(ctx, task.ID, s.cfg.PlatformInstanceID); requeueErr != nil {
+				slog.ErrorContext(ctx, "scheduler: requeue task after runner capacity error failed",
+					"task_id", task.ID, "error", requeueErr)
+			}
+			_ = s.KickSession(ctx, task.SessionKey)
+			return nil
+		}
 		s.auditRoutingBinding(ctx, task, entry, "error", "WORKER_CREDENTIAL_PREPARE_FAILED")
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_START_FAILED", err.Error(), "")
@@ -117,7 +157,11 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		return err
 	}
 	s.auditRoutingBinding(ctx, task, entry, "success", "")
-
+	// 捕获本任务使用的 credential 集(撤销 defer 使用; 审查: 必须在任何
+	// 可能终态化的分支之前捕获——StartSession/Policy/MarkRunning 失败等
+	// 早期终态路径同样需要撤销已签发的 token)。任务执行期间 Worker 拒绝
+	// reload, entry.credentials 在 ExecuteTask 期间不会变化。
+	taskCredentialSet = entry.credentials
 	s.workerCallMu.Lock()
 	workerCallLocked := true
 	releaseWorkerCall := func() {
@@ -134,7 +178,26 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	if err != nil {
 		slog.ErrorContext(ctx, "scheduler: MarkDispatchStarted failed",
 			"task_id", task.ID, "error", err)
+		// 审查 R4-C2: 派发无法继续且任务未终态——本地 Worker 已创建但可能
+		// 绑定错误归属(claim 被接管), 销毁防脏复用; 任务保持 starting 由
+		// 下一轮 tick 重新派发(WorkerDispatchStartedAt 仍为 NULL)。
+		s.evictWorkerAfterFailure(task.SessionKey)
 		return nil
+	}
+	// 持久化任务签发的 JTI 列表(崩溃恢复时用于撤销, 审查: 撤销是持久
+	// 工作流)。审查 R4-C3: 写入失败必须 fail-closed——token 已写入 Runner
+	// config, 若 JTI 未持久化, Platform 崩溃后旧 token 无人能撤销。
+	// 销毁 Worker 并终态化任务, 不允许在撤销依据缺失时继续执行。
+	if len(taskCredentialSet.JTIs) > 0 {
+		if err := s.cfg.Store.SetTaskCapabilityJTIs(ctx, task.ID, taskCredentialSet.JTIs); err != nil {
+			slog.ErrorContext(ctx, "scheduler: persist task capability jtis failed; aborting task",
+				"task_id", task.ID, "error", err)
+			s.evictWorkerAfterFailure(task.SessionKey)
+			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+				"CAPABILITY_PERSIST_FAILED", err.Error(), "")
+			_ = s.KickSession(ctx, task.SessionKey)
+			return err
+		}
 	}
 
 	if _, err := s.cfg.Registry.Resolve(CapabilityVersion, task.ToolPolicyVersion); err != nil {
@@ -153,18 +216,33 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}
 
 	if _, err := s.cfg.Store.MarkRunning(ctx, task.ID, s.cfg.PlatformInstanceID); err != nil {
+		// 审查 R4-C2: dispatch 无法继续且任务未终态。销毁本地 Worker 防脏
+		// 复用(任务可能已被接管/终态化, 本地进程不得留给下一任务), 并尽力
+		// 终态化防任务卡死; 失败时由 lease 过期恢复路径兜底, 无副作用。
+		s.evictWorkerAfterFailure(task.SessionKey)
+		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+			"MARK_RUNNING_FAILED", err.Error(), "")
+		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 
 	// Round-trip durable envelope from PostgreSQL (never scheduler memory).
 	taskRow, err := s.cfg.Store.GetTask(ctx, task.ID)
 	if err != nil {
+		// 审查 R4-C2: 同 MarkRunning 失败路径——销毁 Worker + 尽力终态化。
+		s.evictWorkerAfterFailure(task.SessionKey)
+		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+			"TASK_STATE_READ_FAILED", err.Error(), "")
+		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	if taskRow.Status.IsTerminal() {
 		return nil
 	}
 	if taskRow.CancelRequestedAt != nil {
+		// 审查: StartSession 已执行但任务在 ExecuteTask 前被取消, Worker
+		// 内存状态未提交, 销毁重建而非复用。
+		s.evictWorkerAfterFailure(task.SessionKey)
 		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", "task interrupted before worker execution", "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -183,6 +261,9 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		}
 		if err := s.cfg.Store.RecordChunkEvent(ctx, task.ID, byteCount, digest); err != nil {
 			cancelExecute()
+			// chunk 元数据无法持久化: 复用 Worker 会让下一任务的 chunk 序列
+			// 出现缺口, 销毁重建(审查: 失败后不复用)。
+			s.evictWorkerAfterFailure(task.SessionKey)
 			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"CHUNK_EVENT_FAILED", err.Error(), "")
 			_ = s.KickSession(ctx, task.SessionKey)
@@ -262,12 +343,15 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 				"task_id", task.ID)
 			return nil
 		}
+		// 流错误: Worker 状态已推进但未提交, 销毁重建(审查: 失败后不复用)。
+		s.evictWorkerAfterFailure(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_STREAM_ERROR", streamErr.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return streamErr
 	}
 	if terminal == nil {
+		s.evictWorkerAfterFailure(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"MISSING_TERMINAL", "worker stream ended without terminal", "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -276,9 +360,16 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 
 	current, err := s.cfg.Store.GetTask(ctx, task.ID)
 	if err != nil {
+		// 审查 R4-C2: 任务已执行完毕但终态读失败——Worker 内存状态已推进,
+		// 销毁防脏复用, 尽力终态化由恢复路径兜底。
+		s.evictWorkerAfterFailure(task.SessionKey)
+		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+			"TASK_STATE_READ_FAILED", err.Error(), "")
+		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	if current.CancelRequestedAt != nil {
+		s.evictWorkerAfterFailure(task.SessionKey)
 		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", "task interrupted after accepted cancellation", "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -291,9 +382,11 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	case workerv1.TerminalStatus_TASK_SUCCEEDED:
 		return s.completeSuccess(ctx, task, terminal)
 	case workerv1.TerminalStatus_TASK_CANCELLED:
+		s.evictWorkerAfterFailure(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskCancelled, domain.DeliveryTaskCancelled,
 			"TASK_CANCELLED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	case workerv1.TerminalStatus_TASK_INTERRUPTED:
+		s.evictWorkerAfterFailure(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	default:
@@ -301,11 +394,43 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		if terminal.GetError() != nil && terminal.GetError().GetCode() != "" {
 			code = terminal.GetError().GetCode()
 		}
+		s.evictWorkerAfterFailure(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			code, boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	}
 	_ = s.KickSession(ctx, task.SessionKey)
 	return nil
+}
+
+// revokeSessionCredentialsIfTerminal 在任务终态后立即撤销该任务实际使用
+// 的 credential 集的全部 JTI(审查 I9)。set 在 ensureWorker 成功后立即捕获
+// (覆盖 StartSession/Policy 等早期终态路径), 不读 entry 当前集合, 避免误
+// 撤销新任务刷新后的凭证。撤销失败时入 pendingRevocations 由后续
+// prepareWorkerEntry/cleanup 重试, 不静默丢弃。
+func (s *scheduler) revokeSessionCredentialsIfTerminal(ctx context.Context, taskID, sessionKey string, set workerCredentialSet) {
+	latest, err := s.cfg.Store.GetTask(ctx, taskID)
+	if err != nil || !latest.Status.IsTerminal() {
+		return
+	}
+	if s.cfg.CapabilityStore == nil || len(set.JTIs) == 0 {
+		return
+	}
+	revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialRevokeTimeout)
+	defer cancel()
+	if err := s.revokeCredentialSet(revokeCtx, set); err != nil {
+		slog.WarnContext(ctx, "scheduler: capability revocation failed; queued for retry",
+			"task_id", taskID, "count", len(set.JTIs), "error", err)
+		s.mu.Lock()
+		entry := s.workers[sessionKey]
+		s.mu.Unlock()
+		if entry != nil {
+			entry.lifecycleMu.Lock()
+			if s.workerEntryIsCurrent(sessionKey, entry) {
+				entry.pendingRevocations = append(entry.pendingRevocations, set)
+			}
+			entry.lifecycleMu.Unlock()
+		}
+	}
 }
 
 // firstJTI 返回凭证集首个 JTI(空集返回空串), 用于 TaskEnvelope 的

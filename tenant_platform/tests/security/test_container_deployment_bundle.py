@@ -88,10 +88,17 @@ def test_one_env_template_contains_every_compose_value() -> None:
 
 def test_compose_starts_six_services_and_only_sandbox_manager_receives_docker_socket() -> None:
     services = _compose()["services"]
-    assert set(services) == {"postgres", "bot-poller", "platform", "web", "llm-proxy", "sandbox-manager"}
+    # ga-runner 是 scale: 0 服务(只构建不启动), 不算常驻服务。
+    assert set(services) == {"postgres", "bot-poller", "platform", "web", "llm-proxy", "sandbox-manager", "ga-runner"}
+    assert services["ga-runner"].get("scale") == 0, "ga-runner must be scale: 0 (built but not started by up)"
+    assert "build" in services["ga-runner"], "ga-runner must be buildable via docker compose build"
 
     for name, service in services.items():
         assert "env_file" not in service, name
+        # ga-runner 是 scale: 0 服务(restart: no), 其余常驻服务必须自动重启。
+        if name == "ga-runner":
+            assert service.get("restart") == "no", name
+            continue
         assert service.get("restart") == "unless-stopped", name
         assert service.get("privileged") is not True, name
         assert service.get("network_mode") != "host", name
@@ -109,7 +116,11 @@ def test_compose_starts_six_services_and_only_sandbox_manager_receives_docker_so
     assert manager["build"]["dockerfile"] == "tenant_platform/infra/compose/sandbox-manager.Dockerfile"
     assert "/var/run/docker.sock:/var/run/docker.sock" in manager["volumes"]
     assert manager["environment"]["GA_RUNNER_IMAGE"] == "${GA_RUNNER_IMAGE:-ga-runner:local}"
-    assert manager["depends_on"]["postgres"]["condition"] == "service_healthy"
+    # 最小权限(审查): Manager 不依赖数据库, 不得持有 DB 凭据/网络/卷。
+    assert "DATABASE_URL" not in manager["environment"]
+    assert "depends_on" not in manager
+    assert "database" not in manager.get("networks", [])
+    assert not any("platform_runtime" in str(vol) for vol in manager.get("volumes", []))
 
     assert services["postgres"]["environment"] == {
         "POSTGRES_USER": "${POSTGRES_USER}",
@@ -122,7 +133,11 @@ def test_compose_starts_six_services_and_only_sandbox_manager_receives_docker_so
     llm_proxy = services["llm-proxy"]
     assert "ports" not in llm_proxy
     networks = set(llm_proxy.get("networks", []))
-    assert networks == {"database", "runner-control"}
+    # 审查 C2: llm-proxy 是唯一持有出站能力的服务(database/runner-control
+    # internal + llm-egress 出站); Runner/Platform 不得接入 llm-egress。
+    assert networks == {"database", "runner-control", "llm-egress"}
+    for other in ("platform", "sandbox-manager", "bot-poller", "web"):
+        assert "llm-egress" not in services[other].get("networks", []), other
 
 
 def test_application_configuration_uses_named_volumes() -> None:

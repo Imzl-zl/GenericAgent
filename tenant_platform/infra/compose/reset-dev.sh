@@ -45,7 +45,13 @@ done
 
 echo "==> 删除卷: ${volumes[*]}"
 for v in "${volumes[@]}"; do
-  full="${project_name}_${v}"
+  # runner_workspaces 在 compose.yaml 显式 name(无 project 前缀, 供
+  # volume-subpath 挂载); 其余卷为默认 ${project_name}_<name> 命名。
+  if [[ "$v" == "runner_workspaces" ]]; then
+    full="$v"
+  else
+    full="${project_name}_${v}"
+  fi
   if docker volume inspect "$full" >/dev/null 2>&1; then
     docker volume rm "$full"
     echo "    removed $full"

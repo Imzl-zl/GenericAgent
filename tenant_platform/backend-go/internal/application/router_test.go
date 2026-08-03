@@ -65,7 +65,7 @@ func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string) 
 	return *f.runningTask, nil
 }
 
-func (f *fakeRouterStore) ResetWorkspace(_ context.Context, _ string) error { return nil }
+func (f *fakeRouterStore) ResetWorkspaceForNewSession(_ context.Context, _ string) (int, error) { return 0, nil }
 
 // fakeTaskService is a minimal TaskService for router tests.
 type fakeTaskService struct {

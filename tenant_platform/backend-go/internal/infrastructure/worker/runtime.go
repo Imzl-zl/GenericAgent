@@ -32,11 +32,23 @@ type StartRequest struct {
 	SessionKey string
 	ConfigDir  string // GA_CONFIG_ROOT (may be session-scoped)
 	RuntimeDir string // GA_RUNTIME_DIR parent or session-scoped dir
+	// RuntimeConfigFiles 是随控制面材料一并注入容器 config/ 的运行时配置
+	// (mykey.runtime.json 等)。Loopback 路径已直接写 ConfigDir, 忽略该字段;
+	// Sandbox 路径经共享卷 config/ 挂载注入(方案 §7)。
+	RuntimeConfigFiles map[string][]byte
 }
 
 // WorkerRuntime abstracts how the platform creates a Worker for a session.
 type WorkerRuntime interface {
 	Start(ctx context.Context, req StartRequest) (*Instance, error)
+	// ResolveGeneration 返回会话工作区的 Runner lease generation(方案 §7
+	// fencing): Sandbox 路径来自持久 lease, Loopback 恒为 1。签发 per-task
+	// capability 与构造 StartSession 前需要该值。
+	ResolveGeneration(ctx context.Context, sessionKey string) (uint64, error)
+	// ReleaseRunnerLease 释放会话工作区的 Runner lease(审查: 初始化失败
+	// 时归还容量)。Sandbox 路径委托持久 lease store; Loopback/Static 无
+	// 持久 lease, 返回 nil。generation 条件防止释放新 generation。
+	ReleaseRunnerLease(ctx context.Context, sessionKey string, generation uint64) error
 }
 
 // LoopbackConfig carries the host paths needed to launch the Python Worker as a
@@ -54,6 +66,18 @@ type LoopbackWorkerRuntime struct {
 	cfg LoopbackConfig
 }
 
+// ResolveGeneration returns 1: loopback has no persistent Runner lease.
+func (r *LoopbackWorkerRuntime) ResolveGeneration(context.Context, string) (uint64, error) {
+	return 1, nil
+}
+
+// ReleaseRunnerLease is a no-op for loopback (no persistent lease).
+func (r *LoopbackWorkerRuntime) ReleaseRunnerLease(context.Context, string, uint64) error {
+	return nil
+}
+
+var _ WorkerRuntime = (*LoopbackWorkerRuntime)(nil)
+
 // NewLoopback validates config and returns a loopback runtime.
 func NewLoopback(cfg LoopbackConfig) (*LoopbackWorkerRuntime, error) {
 	if strings.TrimSpace(cfg.LegacyRoot) == "" {
@@ -63,6 +87,8 @@ func NewLoopback(cfg LoopbackConfig) (*LoopbackWorkerRuntime, error) {
 }
 
 // Start launches a Python Worker subprocess bound to a loopback TCP port.
+// RuntimeConfigFiles 在 loopback 路径下已由 scheduler 直接写入 ConfigDir,
+// 此处忽略(接口兼容)。
 func (r *LoopbackWorkerRuntime) Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	python := r.cfg.Python
 	if python == "" {
@@ -115,16 +141,18 @@ func (r *LoopbackWorkerRuntime) Start(ctx context.Context, req StartRequest) (*I
 	instID := "loopback-" + listenAddr
 	cleanup := func() {
 		processCleaner{
-			client:      client,
-			closeConn:   conn.Close,
-			killProcess: cmd.Process.Kill,
-			waitProcess: func() error {
+			client:          client,
+			closeConn:       conn.Close,
+			killProcess:     cmd.Process.Kill,
+			waitProcess:     func() error {
 				_, err := cmd.Process.Wait()
 				return err
 			},
+			workspaceKey:     req.SessionKey,
+			runnerGeneration: 1,
 		}.run(workerShutdownTimeout)
 	}
-	return &Instance{Client: client, InstID: instID, Cleanup: cleanup}, nil
+	return &Instance{Client: client, InstID: instID, Cleanup: cleanup, RunnerGeneration: 1}, nil
 }
 
 // StaticRuntime returns a fixed Worker client for unit tests. It is NOT a
@@ -145,7 +173,17 @@ func (s *StaticRuntime) Start(ctx context.Context, req StartRequest) (*Instance,
 	if err != nil {
 		return nil, err
 	}
-	return &Instance{Client: client, InstID: "static-test-worker", Cleanup: cleanup}, nil
+	return &Instance{Client: client, InstID: "static-test-worker", Cleanup: cleanup, RunnerGeneration: 1}, nil
+}
+
+// ResolveGeneration returns 1: static runtime has no persistent lease.
+func (s *StaticRuntime) ResolveGeneration(context.Context, string) (uint64, error) {
+	return 1, nil
+}
+
+// ReleaseRunnerLease is a no-op for the static test runtime.
+func (s *StaticRuntime) ReleaseRunnerLease(context.Context, string, uint64) error {
+	return nil
 }
 
 // --- helpers moved from scheduler.go ---
@@ -155,15 +193,17 @@ const workerShutdownTimeout = 5 * time.Second
 const workerStartTimeout = 30 * time.Second
 
 type processCleaner struct {
-	client      workerclient.WorkerClient
-	closeConn   func() error
-	killProcess func() error
-	waitProcess func() error
+	client           workerclient.WorkerClient
+	closeConn        func() error
+	killProcess       func() error
+	waitProcess       func() error
+	workspaceKey      string
+	runnerGeneration  uint64
 }
 
 func (c processCleaner) run(timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	_ = c.client.Shutdown(ctx, "scheduler-stop")
+	_ = c.client.Shutdown(ctx, c.workspaceKey, "scheduler-stop", c.runnerGeneration)
 	cancel()
 	_ = c.closeConn()
 	_ = c.killProcess()

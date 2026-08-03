@@ -45,6 +45,15 @@ type CapabilitySpec struct {
 	// generation(方案 §7): 终态后的 token 不能被下一条 task 继续使用。
 	TaskID           string
 	RunnerGeneration uint64
+	// Operation 是允许的操作(方案 §7: capability 必须包含操作):
+	// "llm.chat" / "sophub.search" / "sophub.install"。
+	Operation string
+	// Budget 是预算描述(方案 §7: capability 必须包含预算), 采用与
+	// RuntimePolicy 一致的 JSON 片段(如 {"max_turns":N,"max_output_bytes":N});
+	// 由签发方填充。校验方核对结构, 并强制执行调用次数上限
+	// max_turns(llm-proxy 按 JTI 原子计量, 审查 R4-I9); 其余字节类预算
+	// 由 Worker 侧 RuntimePolicy 执行。
+	Budget string
 }
 
 type CapabilityClaims struct {
@@ -55,6 +64,8 @@ type CapabilityClaims struct {
 	PolicyVersion    string                 `json:"policy_version"`
 	TaskID           string                 `json:"task_id,omitempty"`
 	RunnerGeneration uint64                 `json:"runner_generation,omitempty"`
+	Operation        string                 `json:"operation,omitempty"`
+	Budget           string                 `json:"budget,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -69,6 +80,14 @@ func (c CapabilityClaims) VerifyAudience(expected string, required bool) bool {
 
 type CapabilityRevocationSource interface {
 	IsCapabilityRevoked(ctx context.Context, jtiHash [32]byte) (bool, error)
+}
+
+// CapabilityUsageCounter 按 JTI 原子计量 capability 调用次数(审查 R4-I9):
+// ConsumeCapabilityCall 递增计数, 超过 maxCalls 时返回 (false, nil)。
+// llm-proxy 在转发前调用, 防止 Runner 绕过 Worker 的 RuntimePolicy 直接
+// 刷 LLM Proxy。
+type CapabilityUsageCounter interface {
+	ConsumeCapabilityCall(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error)
 }
 
 type Issuer struct {
@@ -111,6 +130,8 @@ func (i *Issuer) Issue(spec CapabilitySpec) (string, CapabilityClaims, error) {
 		PolicyVersion:    spec.PolicyVersion,
 		TaskID:           spec.TaskID,
 		RunnerGeneration: spec.RunnerGeneration,
+		Operation:        spec.Operation,
+		Budget:           spec.Budget,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    CapabilityIssuer,
 			Subject:   spec.SessionKey,
@@ -182,8 +203,9 @@ func (v *Validator) ValidateTaskScoped(ctx context.Context, tokenString string) 
 }
 
 // SophubValidator 校验 Runner → Platform Sophub proxy 的 capability
-// (audience=ga-sophub-proxy, 方案 §5.2): 不要求 provider/task 字段,
-// 但要求 session subject + jti 且未撤销。
+// (audience=ga-sophub-proxy, 方案 §5.2): 不要求 provider 字段, 但要求
+// session subject + jti 未撤销 + task_id/runner_generation 绑定(审查 I9:
+// 终态撤销前旧 task 的 sophub token 不可被新 task 复用)。
 type SophubValidator struct {
 	signingKey  []byte
 	revocations CapabilityRevocationSource
@@ -205,6 +227,18 @@ func (v *SophubValidator) Validate(ctx context.Context, tokenString string) (Cap
 	claims, err := validateWithAudience(v.signingKey, v.revocations, v.clock, ctx, tokenString, SophubAudience)
 	if err != nil {
 		return CapabilityClaims{}, err
+	}
+	// 审查 I9: sophub capability 必须绑定 task 与 runner generation
+	// (与 LLM ValidateTaskScoped 对齐), 防止终态后旧 token 继续可用。
+	if claims.TaskID == "" {
+		return CapabilityClaims{}, fmt.Errorf("%w: task_id binding required", ErrCapabilityInvalid)
+	}
+	if claims.RunnerGeneration == 0 {
+		return CapabilityClaims{}, fmt.Errorf("%w: runner_generation binding required", ErrCapabilityInvalid)
+	}
+	// 方案 §7: capability 必须包含操作, sophub token 只允许 sophub 操作。
+	if claims.Operation != "sophub" {
+		return CapabilityClaims{}, fmt.Errorf("%w: operation must be sophub", ErrCapabilityInvalid)
 	}
 	return claims, nil
 }
@@ -272,8 +306,9 @@ func effectiveAudience(audience string) string {
 }
 
 // IssueSophubToken 签发 Runner → Platform Sophub proxy 的短期 capability
-// (方案 §5.2: Runner 不持有 Sophub API Key)。
-func (i *Issuer) IssueSophubToken(sessionKey string, ttl time.Duration) (string, CapabilityClaims, error) {
+// (方案 §5.2: Runner 不持有 Sophub API Key)。taskID/generation 绑定后,
+// 旧 task 的 sophub token 无法被新 task 复用(方案 §7 generation 墙)。
+func (i *Issuer) IssueSophubToken(sessionKey, taskID string, runnerGeneration uint64, ttl time.Duration) (string, CapabilityClaims, error) {
 	if strings.TrimSpace(sessionKey) == "" {
 		return "", CapabilityClaims{}, fmt.Errorf("session key is required")
 	}
@@ -286,6 +321,10 @@ func (i *Issuer) IssueSophubToken(sessionKey string, ttl time.Duration) (string,
 	}
 	now := i.clock().UTC()
 	claims := CapabilityClaims{
+		TaskID:           taskID,
+		RunnerGeneration: runnerGeneration,
+		Operation:        "sophub",
+		Budget:           "",
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    CapabilityIssuer,
 			Subject:   sessionKey,
@@ -318,6 +357,10 @@ func validateCapabilitySpec(spec CapabilitySpec) error {
 	if spec.Model == "" || spec.PolicyVersion == "" {
 		return fmt.Errorf("model and policy version are required")
 	}
+	// 方案 §7: capability 必须包含操作。
+	if spec.Operation == "" {
+		return fmt.Errorf("operation is required")
+	}
 	return nil
 }
 
@@ -332,6 +375,7 @@ func validateCapabilityClaims(claims CapabilityClaims) error {
 		ProviderType:     claims.ProviderType,
 		Model:            claims.Model,
 		PolicyVersion:    claims.PolicyVersion,
+		Operation:        claims.Operation,
 	}))
 }
 

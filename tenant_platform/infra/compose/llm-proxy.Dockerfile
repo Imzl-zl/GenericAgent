@@ -14,4 +14,5 @@ RUN apk add --no-cache ca-certificates && adduser -D -u 10001 -g 10001 llmproxy
 COPY --from=build --chown=10001:10001 /out/ga-llm-proxy /usr/local/bin/ga-llm-proxy
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/ga-llm-proxy"]
-CMD ["--listen=0.0.0.0:8081"]
+# 监听地址由 LLM_PROXY_LISTEN 决定(compose 默认 0.0.0.0:8081);
+# 不在 CMD 写死 --listen, 否则会覆盖环境变量配置(审查: 配置接线)。

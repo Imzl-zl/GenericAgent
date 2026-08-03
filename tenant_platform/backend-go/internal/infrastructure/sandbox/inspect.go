@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +25,21 @@ type inspectOutput struct {
 	Runtime         string // HostConfig.Runtime("" = 默认 runc)
 	Devices         []string
 	Tmpfs           []string
+	// TmpfsOpts 是 tmpfs 挂载点 → 选项字符串(rw,noexec,nosuid,nodev,...)。
+	TmpfsOpts map[string]string
+	Labels    map[string]string // com.genericagent.runner.* 归属标签
+	// 资源限制(审查 I10: inspect 必须核对 cgroup 限额与附加组)。
+	MemoryBytes int64
+	CPUQuota    int64
+	CPUPeriod   int64
+	PIDsLimit   int64
+	GroupAdd    []string
+	// 补齐校验(审查 I9): CapAdd 必须为空; Env 固定键不得被覆盖;
+	// Cmd 必须等于固定监听参数; AppArmor 不得为 unconfined。
+	CapAdd          []string
+	Env             []string
+	Cmd             []string
+	AppArmorProfile string
 }
 
 type inspectMount struct {
@@ -31,10 +47,13 @@ type inspectMount struct {
 	Source      string
 	Destination string
 	RW          bool
+	// VolumeSubpath 是 Docker 26+ volume-subpath 挂载的卷内子路径
+	// (审查: 必须精确匹配 <workspace-hash>/<sub>, 否则可能挂错工作区)。
+	VolumeSubpath string
 }
 
 // inspectFormat selects only the fields the verification needs.
-const inspectFormat = `[{"Config":{"ReadonlyRootfs":{{json .Config.ReadonlyRootfs}},"User":{{json .Config.User}},"Labels":{{json .Config.Labels}},"Image":{{json .Config.Image}}},"HostConfig":{"Privileged":{{json .HostConfig.Privileged}},"CapDrop":{{json .HostConfig.CapDrop}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"Runtime":{{json .HostConfig.Runtime}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"Devices":{{json .HostConfig.Devices}},"Tmpfs":{{json .HostConfig.Tmpfs}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}}},"Mounts":{{json .Mounts}}}]`
+const inspectFormat = `[{"Config":{"ReadonlyRootfs":{{json .Config.ReadonlyRootfs}},"User":{{json .Config.User}},"Labels":{{json .Config.Labels}},"Image":{{json .Config.Image}},"Env":{{json .Config.Env}},"Cmd":{{json .Config.Cmd}}},"HostConfig":{"Privileged":{{json .HostConfig.Privileged}},"CapDrop":{{json .HostConfig.CapDrop}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"Runtime":{{json .HostConfig.Runtime}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"Devices":{{json .HostConfig.Devices}},"Tmpfs":{{json .HostConfig.Tmpfs}},"Memory":{{json .HostConfig.Memory}},"CpuQuota":{{json .HostConfig.CpuQuota}},"CpuPeriod":{{json .HostConfig.CpuPeriod}},"PidsLimit":{{json .HostConfig.PidsLimit}},"GroupAdd":{{json .HostConfig.GroupAdd}},"CapAdd":{{json .HostConfig.CapAdd}}},"AppArmorProfile":{{json .AppArmorProfile}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}}},"Mounts":{{json .Mounts}}}]`
 
 // Inspect verifies a created Runner against the fixed profile invariants:
 // image reference, runtime, read-only rootfs, no privileged, cap_drop ALL,
@@ -55,24 +74,36 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 			User           string            `json:"User"`
 			Labels         map[string]string `json:"Labels"`
 			Image          string            `json:"Image"`
+			Env            []string          `json:"Env"`
+			Cmd            []string          `json:"Cmd"`
 		} `json:"Config"`
 		HostConfig struct {
-			Privileged      bool     `json:"Privileged"`
-			CapDrop         []string `json:"CapDrop"`
-			SecurityOpt     []string `json:"SecurityOpt"`
-			Runtime         string   `json:"Runtime"`
-			ReadonlyRootfs  bool     `json:"ReadonlyRootfs"`
-			Devices         []struct{ PathOnHost string } `json:"Devices"`
-			Tmpfs           map[string]string `json:"Tmpfs"`
+			Privileged     bool                          `json:"Privileged"`
+			CapDrop        []string                      `json:"CapDrop"`
+			CapAdd         []string                      `json:"CapAdd"`
+			SecurityOpt    []string                      `json:"SecurityOpt"`
+			Runtime        string                        `json:"Runtime"`
+			ReadonlyRootfs bool                          `json:"ReadonlyRootfs"`
+			Devices        []struct{ PathOnHost string } `json:"Devices"`
+			Tmpfs          map[string]string             `json:"Tmpfs"`
+			Memory         int64                         `json:"Memory"`
+			CpuQuota       int64                         `json:"CpuQuota"`
+			CpuPeriod      int64                         `json:"CpuPeriod"`
+			PidsLimit      int64                         `json:"PidsLimit"`
+			GroupAdd       []string                      `json:"GroupAdd"`
 		} `json:"HostConfig"`
+		AppArmorProfile string `json:"AppArmorProfile"`
 		NetworkSettings struct {
 			Networks map[string]struct{} `json:"Networks"`
 		} `json:"NetworkSettings"`
 		Mounts []struct {
-			Type        string `json:"Type"`
-			Source      string `json:"Source"`
-			Destination string `json:"Destination"`
-			RW          bool   `json:"RW"`
+			Type          string `json:"Type"`
+			Source        string `json:"Source"`
+			Destination   string `json:"Destination"`
+			RW            bool   `json:"RW"`
+			VolumeOptions *struct {
+				Subpath string `json:"Subpath"`
+			} `json:"VolumeOptions"`
 		} `json:"Mounts"`
 	}
 	if err := json.Unmarshal(stdout, &raw); err != nil {
@@ -87,34 +118,65 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 		ReadOnlyRootFS:  info.HostConfig.ReadonlyRootfs,
 		Privileged:      info.HostConfig.Privileged,
 		CapDrop:         info.HostConfig.CapDrop,
+		CapAdd:          info.HostConfig.CapAdd,
 		NoNewPrivileges: containsSecurityOpt(info.HostConfig.SecurityOpt, "no-new-privileges"),
 		Seccomp:         securityOptValue(info.HostConfig.SecurityOpt, "seccomp="),
 		User:            info.Config.User,
 		Image:           info.Config.Image,
+		Env:             info.Config.Env,
+		Cmd:             info.Config.Cmd,
+		AppArmorProfile: info.AppArmorProfile,
 		Runtime:         info.HostConfig.Runtime,
+		Labels:          info.Config.Labels,
+		MemoryBytes:     info.HostConfig.Memory,
+		CPUQuota:        info.HostConfig.CpuQuota,
+		CPUPeriod:       info.HostConfig.CpuPeriod,
+		PIDsLimit:       info.HostConfig.PidsLimit,
+		GroupAdd:        info.HostConfig.GroupAdd,
+		TmpfsOpts:       make(map[string]string),
 	}
 	for name := range info.NetworkSettings.Networks {
 		out.Networks = append(out.Networks, name)
 	}
 	sort.Strings(out.Networks)
 	for _, m := range info.Mounts {
+		subpath := ""
+		if m.VolumeOptions != nil {
+			subpath = m.VolumeOptions.Subpath
+		}
 		out.Mounts = append(out.Mounts, inspectMount{
 			Type: m.Type, Source: m.Source, Destination: m.Destination, RW: m.RW,
+			VolumeSubpath: subpath,
 		})
 	}
 	sort.Slice(out.Mounts, func(i, j int) bool { return out.Mounts[i].Destination < out.Mounts[j].Destination })
 	for _, dev := range info.HostConfig.Devices {
 		out.Devices = append(out.Devices, dev.PathOnHost)
 	}
-	for dest := range info.HostConfig.Tmpfs {
+	for dest, opts := range info.HostConfig.Tmpfs {
 		out.Tmpfs = append(out.Tmpfs, dest)
+		out.TmpfsOpts[dest] = opts
 	}
 	sort.Strings(out.Tmpfs)
-	return validateInspect(out, d.cfg.Profile)
+	return validateInspect(out, d.cfg.Profile, d.cfg.WorkspacesRoot, d.cfg.WorkspaceVolume, d.expectedMountSources())
+}
+
+// expectedMountSources 返回每个固定挂载点对应的 workspace 子路径
+// (校验 source 尾缀, 防止任意 bind/volume 源被挂到工作区路径)。
+func (d *DockerCLI) expectedMountSources() map[string]string {
+	return map[string]string{
+		LegacyMemoryMount: "memory",
+		LegacyTempMount:   "temp",
+		RunnerStateMount:  "state",
+		RunnerConfigMount: "config",
+	}
 }
 
 // validateInspect enforces the post-create invariants on parsed inspect output.
-func validateInspect(info inspectOutput, profile Profile) error {
+// mountSubs: destination -> 期望的 workspace 子路径。workspacesRoot 与
+// workspaceVolume 用于精确校验 source 归属(审查 I10: 不只查尾缀, 必须
+// 匹配当前 workspace hash 的完整路径)。
+func validateInspect(info inspectOutput, profile Profile, workspacesRoot, workspaceVolume string, mountSubs map[string]string) error {
 	if !info.ReadOnlyRootFS {
 		return fmt.Errorf("runner root filesystem is not read-only")
 	}
@@ -124,11 +186,19 @@ func validateInspect(info inspectOutput, profile Profile) error {
 	if !containsAll(info.CapDrop, "ALL") {
 		return fmt.Errorf("runner missing cap_drop ALL: %v", info.CapDrop)
 	}
+	// 补齐校验(审查 I9): 创建时未 cap-add, 任何 CapAdd 都意味着 profile 漂移。
+	if len(info.CapAdd) != 0 {
+		return fmt.Errorf("runner has unexpected cap_add: %v", info.CapAdd)
+	}
 	if !info.NoNewPrivileges {
 		return fmt.Errorf("runner missing no-new-privileges")
 	}
 	if info.Seccomp == "unconfined" {
 		return fmt.Errorf("runner seccomp is unconfined")
+	}
+	// AppArmor 显式关闭同样拒绝(缺省 docker-default 可接受)。
+	if info.AppArmorProfile == "unconfined" {
+		return fmt.Errorf("runner apparmor is unconfined")
 	}
 	if len(info.Networks) != 1 || info.Networks[0] != RunnerNetwork {
 		return fmt.Errorf("runner networks = %v, want only %s", info.Networks, RunnerNetwork)
@@ -148,16 +218,91 @@ func validateInspect(info inspectOutput, profile Profile) error {
 	if len(info.Devices) != 0 {
 		return fmt.Errorf("runner devices = %v, want none", info.Devices)
 	}
-	// 固定五个挂载: memory/temp/state 读写, config/attachments 只读。
+	// 补齐校验(审查 I9): 固定环境变量必须精确存在(防止被覆盖/缺失导致
+	// mTLS 监听或工作区路径漂移); Cmd 必须等于固定监听参数。
+	wantEnv := map[string]string{
+		"GA_CONFIG_ROOT":      RunnerConfigMount,
+		"GA_LEGACY_ROOT":      LegacyRoot,
+		"GA_RUNTIME_DIR":      RunnerStateMount,
+		"GA_POLICY_FILE":      RunnerConfigMount + "/policy.json",
+		"GA_WORKER_LISTEN":    fmt.Sprintf("tcp:0.0.0.0:%d", RunnerControlPort),
+		"GA_RUNNER_TLS_CERT":  RunnerConfigMount + "/server.crt",
+		"GA_RUNNER_TLS_KEY":   RunnerConfigMount + "/server.key",
+		"GA_RUNNER_TLS_CA":    RunnerConfigMount + "/ca.crt",
+		"GA_WORKSPACE_MEMORY": LegacyMemoryMount,
+		"GA_WORKSPACE_TEMP":   LegacyTempMount,
+	}
+	env := envMap(info.Env)
+	for k, want := range wantEnv {
+		if env[k] != want {
+			return fmt.Errorf("runner env %s = %q, want %q", k, env[k], want)
+		}
+	}
+	// GA_WORKSPACE_KEY / GA_RUNNER_GENERATION 是 per-request 值, 无法从
+	// profile 推导; 至少要求存在且非空, generation 必须与容器 label 一致。
+	if env["GA_WORKSPACE_KEY"] == "" || env["GA_RUNNER_GENERATION"] == "" {
+		return fmt.Errorf("runner env GA_WORKSPACE_KEY/GA_RUNNER_GENERATION missing")
+	}
+	if gen, err := strconv.ParseUint(env["GA_RUNNER_GENERATION"], 10, 64); err != nil || gen == 0 {
+		return fmt.Errorf("runner env GA_RUNNER_GENERATION invalid: %q", env["GA_RUNNER_GENERATION"])
+	} else if info.Labels["com.genericagent.runner.generation"] != env["GA_RUNNER_GENERATION"] {
+		return fmt.Errorf("runner env generation %q != label %q", env["GA_RUNNER_GENERATION"], info.Labels["com.genericagent.runner.generation"])
+	}
+	wantCmd := []string{"--listen", fmt.Sprintf("tcp:0.0.0.0:%d", RunnerControlPort)}
+	if len(info.Cmd) != len(wantCmd) {
+		return fmt.Errorf("runner cmd = %v, want %v", info.Cmd, wantCmd)
+	}
+	for i := range wantCmd {
+		if info.Cmd[i] != wantCmd[i] {
+			return fmt.Errorf("runner cmd = %v, want %v", info.Cmd, wantCmd)
+		}
+	}
+	// 资源限额与附加组(审查 I10): cgroup 限制与共享组必须与固定 profile 一致。
+	if profile.MemoryBytes > 0 && info.MemoryBytes != profile.MemoryBytes {
+		return fmt.Errorf("runner memory = %d, want %d", info.MemoryBytes, profile.MemoryBytes)
+	}
+	if profile.CPUQuota > 0 && info.CPUQuota != profile.CPUQuota {
+		return fmt.Errorf("runner cpu quota = %d, want %d", info.CPUQuota, profile.CPUQuota)
+	}
+	if profile.CPUPeriod > 0 && info.CPUPeriod != profile.CPUPeriod {
+		return fmt.Errorf("runner cpu period = %d, want %d", info.CPUPeriod, profile.CPUPeriod)
+	}
+	if profile.PIDsLimit > 0 && info.PIDsLimit != profile.PIDsLimit {
+		return fmt.Errorf("runner pids limit = %d, want %d", info.PIDsLimit, profile.PIDsLimit)
+	}
+	if profile.ShareGID > 0 && !exactlyOneGroup(info.GroupAdd, strconv.Itoa(profile.ShareGID)) {
+		return fmt.Errorf("runner shared group must be exactly %d in GroupAdd %v", profile.ShareGID, info.GroupAdd)
+	}
+	// tmpfs 精确校验(审查): 只能有 /tmp 一个 tmpfs, 且必须含安全选项。
+	if len(info.Tmpfs) != 2 || info.Tmpfs[0] != RunnerOverlayMount || info.Tmpfs[1] != "/tmp" {
+		return fmt.Errorf("runner tmpfs = %v, want exactly [%s /tmp]", info.Tmpfs, RunnerOverlayMount)
+	}
+	for _, dest := range []string{"/tmp", RunnerOverlayMount} {
+		for _, flag := range []string{"rw", "noexec", "nosuid", "nodev"} {
+			if !containsTmpfsFlag(info.TmpfsOpts[dest], flag) {
+				return fmt.Errorf("runner tmpfs %s missing %s in opts %q", dest, flag, info.TmpfsOpts[dest])
+			}
+		}
+	}
+	// workspace hash 从容器 label 读取(创建时写入), 用于精确校验挂载 source。
+	workspaceHash := info.Labels["com.genericagent.runner.hash"]
+	if !workspaceHashPattern.MatchString(workspaceHash) {
+		return fmt.Errorf("runner missing or invalid workspace hash label: %q", workspaceHash)
+	}
+	// 固定四个挂载: memory/temp/state 读写, config 只读(审查: attachments
+	// 冗余挂载已移除, 附件统一经工作区 temp/——方案 §6)。
+	// 注意: info.Mounts 已按 Destination 字典序排序(Inspect 中 sort.Slice),
+	// 本表必须保持与排序后完全相同的顺序, 否则真实 docker inspect 解析路径
+	// 会误报。字典序: /ga/legacy/memory < /ga/legacy/temp < /ga/runner-config
+	// < /ga/runner-state。
 	expected := []struct {
 		sub, dst string
 		ro       bool
 	}{
 		{"memory", LegacyMemoryMount, false},
 		{"temp", LegacyTempMount, false},
-		{"state", RunnerStateMount, false},
 		{"config", RunnerConfigMount, true},
-		{"attachments", RunnerAttachmentsMount, true},
+		{"state", RunnerStateMount, false},
 	}
 	if len(info.Mounts) != len(expected) {
 		return fmt.Errorf("runner mounts = %d, want exactly %d: %+v", len(info.Mounts), len(expected), info.Mounts)
@@ -170,6 +315,40 @@ func validateInspect(info inspectOutput, profile Profile) error {
 		if got.Type == "" || got.Source == "" {
 			return fmt.Errorf("runner mount[%d] %q missing type/source", i, want.dst)
 		}
+		// source 归属精确校验(审查 I10): bind 必须为
+		// <workspacesRoot>/<hash>/<sub>, volume 必须为
+		// <workspaceVolume>/_data/<hash>/<sub>(daemon 命名空间)。
+		sub := want.sub
+		if wantSub, ok := mountSubs[want.dst]; ok {
+			sub = wantSub
+		}
+		source := filepath.ToSlash(got.Source)
+		switch got.Type {
+		case "bind":
+			// bind 挂载: source 必须是 <workspacesRoot>/<hash>/<sub> 精确全路径。
+			wantSource := filepath.ToSlash(filepath.Join(workspacesRoot, workspaceHash, sub))
+			if source != wantSource {
+				return fmt.Errorf("runner mount[%d] %q source = %q, want %q", i, want.dst, source, wantSource)
+			}
+		case "volume":
+			// Docker volume-subpath 挂载的 Source 恒为卷根绝对路径
+			// (/var/lib/docker/volumes/<vol>/_data), 不含 subpath。精确校验
+			// 卷名归属 + VolumeOptions.Subpath 必须等于 <hash>/<sub>(Docker
+			// 26+; 审查: 防挂错工作区 subpath)。
+			wantVolume := filepath.ToSlash(filepath.Join("/var/lib/docker/volumes", workspaceVolume, "_data"))
+			if workspaceVolume == "" {
+				return fmt.Errorf("runner mount[%d] %q is a volume but workspace volume is unset", i, want.dst)
+			}
+			if !strings.HasSuffix(source, wantVolume) && source != wantVolume {
+				return fmt.Errorf("runner mount[%d] %q volume source = %q, want %q", i, want.dst, source, wantVolume)
+			}
+			wantSubpath := filepath.ToSlash(filepath.Join(workspaceHash, sub))
+			if got.VolumeSubpath != wantSubpath {
+				return fmt.Errorf("runner mount[%d] %q volume subpath = %q, want %q", i, want.dst, got.VolumeSubpath, wantSubpath)
+			}
+		default:
+			return fmt.Errorf("runner mount[%d] %q type = %q, want bind|volume", i, want.dst, got.Type)
+		}
 		if got.RW == want.ro {
 			state := "rw"
 			if want.ro {
@@ -178,24 +357,28 @@ func validateInspect(info inspectOutput, profile Profile) error {
 			return fmt.Errorf("runner mount[%d] %q is %s, want %s", i, want.dst, state, state)
 		}
 	}
-	if !isNonRootUser(info.User) {
-		return fmt.Errorf("runner user = %q, want non-root uid:gid", info.User)
+	// user 精确匹配(审查): 固定 UID:GID, 仅"非 root"不足以防属性漂移。
+	wantUser := fmt.Sprintf("%d:%d", profile.UID, profile.GID)
+	if info.User != wantUser {
+		return fmt.Errorf("runner user = %q, want %q", info.User, wantUser)
 	}
 	return nil
 }
 
-// isNonRootUser 校验容器 user 是非 root uid:gid。
-func isNonRootUser(user string) bool {
-	parts := strings.Split(user, ":")
-	if len(parts) != 2 {
-		return false
+// exactlyOneGroup 校验附加组列表恰好包含一个且等于 want。
+func exactlyOneGroup(groups []string, want string) bool {
+	return len(groups) == 1 && groups[0] == want
+}
+
+// containsTmpfsFlag 校验 tmpfs 选项字符串包含指定 flag(rw,noexec,nosuid,
+// nodev,size=... 逗号分隔)。
+func containsTmpfsFlag(opts, flag string) bool {
+	for _, part := range strings.Split(opts, ",") {
+		if strings.TrimSpace(part) == flag {
+			return true
+		}
 	}
-	uid, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || uid <= 0 {
-		return false
-	}
-	gid, err := strconv.ParseInt(parts[1], 10, 64)
-	return err == nil && gid > 0
+	return false
 }
 
 func containsSecurityOpt(opts []string, want string) bool {
@@ -224,4 +407,16 @@ func containsAll(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// envMap 把 docker inspect 的 Env 数组(K=V)转为 map, 供固定环境变量精确校验。
+// 重复键按 docker 语义取最后一个(与容器运行时一致)。
+func envMap(envs []string) map[string]string {
+	out := make(map[string]string, len(envs))
+	for _, e := range envs {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			out[k] = v
+		}
+	}
+	return out
 }

@@ -35,6 +35,7 @@ LEGACY_MODULES = (
 LEGACY_PLUGINS = (
     "plugins/__init__.py",
     "plugins/hooks.py",
+    "plugins/project_mode.py",
 )
 LEGACY_ASSETS = (
     "assets/tools_schema.json",
@@ -83,6 +84,7 @@ def _start_req(
     workspace_key: str | None = None,
     runner_generation: int = 1,
     runtime_policy: worker_pb2.RuntimePolicy | None = None,
+    max_bundle_bytes: int = 0,
 ) -> worker_pb2.StartSessionRequest:
     if workspace_key is None:
         workspace_key = session_key  # 方案 §7: workspace_key 必须与 session_key 一致
@@ -94,6 +96,7 @@ def _start_req(
         workspace_key=workspace_key,
         runner_generation=runner_generation,
         runtime_policy=runtime_policy or _runtime_policy(),
+        max_bundle_bytes=max_bundle_bytes,
     )
 
 
@@ -104,6 +107,8 @@ def _task(
     session_key: str = "personal:1",
     persona: list[str] | None = None,
     tool_policy_version: str = "foundation.no-host-tools.v1",
+    runner_generation: int = 1,
+    capability_jti: str = "test-jti",
 ) -> worker_pb2.ExecuteTaskRequest:
     return worker_pb2.ExecuteTaskRequest(
         task=worker_pb2.TaskEnvelope(
@@ -116,6 +121,8 @@ def _task(
             prompt=prompt,
             persona_snapshot=list(persona or []),
             tool_policy_version=tool_policy_version,
+            runner_generation=runner_generation,
+            capability_jti=capability_jti,
         )
     )
 
@@ -346,6 +353,8 @@ def test_reload_credentials_reloads_ga_sessions_and_advances_generation(roots, f
 
     checksum2 = _write_runtime_config(roots["config_root"], 2)
     response = adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        workspace_key="personal:1",
+        runner_generation=1,
         credential_generation=2,
         config_checksum=checksum2,
     ))
@@ -358,6 +367,8 @@ def test_reload_credentials_reloads_ga_sessions_and_advances_generation(roots, f
     assert adapter._session.mcp_tools is mcp_tools
 
     repeated = adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        workspace_key="personal:1",
+        runner_generation=1,
         credential_generation=2,
         config_checksum=checksum2,
     ))
@@ -376,6 +387,8 @@ def test_reload_credentials_rejects_stale_checksum_and_active_task(roots, founda
     checksum2 = _write_runtime_config(roots["config_root"], 2)
     with pytest.raises(WorkerAdapterError) as checksum_error:
         adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        workspace_key="personal:1",
+        runner_generation=1,
             credential_generation=2,
             config_checksum="wrong-checksum",
         ))
@@ -386,6 +399,8 @@ def test_reload_credentials_rejects_stale_checksum_and_active_task(roots, founda
     adapter._session.active_task_id = "task-active"
     with pytest.raises(WorkerAdapterError) as task_error:
         adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        workspace_key="personal:1",
+        runner_generation=1,
             credential_generation=2,
             config_checksum=checksum2,
         ))
@@ -410,6 +425,8 @@ def test_reload_credentials_restores_previous_clients_on_failure(roots, foundati
 
     with pytest.raises(WorkerAdapterError) as reload_error:
         adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        workspace_key="personal:1",
+        runner_generation=1,
             credential_generation=2,
             config_checksum=checksum2,
         ))
@@ -431,6 +448,8 @@ def test_reload_credentials_restores_previous_clients_when_new_config_is_empty(r
 
     with pytest.raises(WorkerAdapterError) as reload_error:
         adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        workspace_key="personal:1",
+        runner_generation=1,
             credential_generation=2,
             config_checksum=checksum2,
         ))
@@ -444,6 +463,8 @@ def test_reload_credentials_requires_started_session(roots, foundation_registry)
     adapter = _make_adapter(roots, foundation_registry, factory=ScriptedAgent)
     with pytest.raises(WorkerAdapterError) as session_error:
         adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
+        workspace_key="personal:1",
+        runner_generation=1,
             credential_generation=2,
             config_checksum="checksum",
         ))
@@ -669,7 +690,7 @@ def test_cancel_before_runner_start_skips_put_task(roots, foundation_registry):
     th = threading.Thread(target=runner, daemon=True)
     th.start()
     assert reserved.wait(2.0)
-    resp = adapter.cancel_task("t-cancel-pre")
+    resp = adapter.cancel_task("t-cancel-pre", "personal:1", 1)
     assert resp.accepted is True
     proceed.set()
     th.join(timeout=3)
@@ -696,7 +717,7 @@ def test_cancel_during_execution_aborts_once(roots, foundation_registry):
     th.start()
     agent = ScriptedAgent.instances[0]
     assert agent._started.wait(2.0)
-    resp = adapter.cancel_task("t-cancel-mid")
+    resp = adapter.cancel_task("t-cancel-mid", "personal:1", 1)
     assert resp.accepted is True
     th.join(timeout=3)
     assert events_box
@@ -761,6 +782,7 @@ def test_checkpoint_not_in_display_stream_and_valid_bundle(roots, foundation_reg
             checkpoint_token="tok-cp1",
             staging_ref=str(staging),
             max_bundle_bytes=1024 * 1024,
+            runner_generation=1,
         )
     )
     assert ready.task_id == "cp1"
@@ -772,6 +794,7 @@ def test_checkpoint_not_in_display_stream_and_valid_bundle(roots, foundation_reg
     assert bundle["schema_version"] == SNAPSHOT_SCHEMA_VERSION
     assert bundle["task_id"] == "cp1"
     assert bundle["session_key"] == "personal:1"
+    assert bundle["runner_generation"] == 1
     assert bundle["working"]["note"] == "from-task"
     assert bundle["result"]["body"] == "final-body"
     assert bundle["result_digest"] == ready.result_digest
@@ -967,6 +990,7 @@ def test_overlay_manifest_and_legacy_root_untouched(roots, foundation_registry):
             checkpoint_token="tok-ov1",
             staging_ref=str(staging),
             max_bundle_bytes=1024 * 1024,
+            runner_generation=1,
         )
     )
     assert roots["sentinel"].read_bytes() == roots["sentinel_bytes"]
@@ -1032,6 +1056,7 @@ def test_begin_checkpoint_rejects_wrong_task_or_token(roots, foundation_registry
                 checkpoint_token="tok",
                 staging_ref=str(staging),
                 max_bundle_bytes=1024,
+                runner_generation=1,
             )
         )
 
@@ -1044,7 +1069,7 @@ def test_health_and_shutdown(roots, foundation_registry):
     h1 = adapter.health()
     assert h1.ready is True
     assert h1.session_key == "personal:1"
-    shut = adapter.shutdown("test-done")
+    shut = adapter.shutdown("test-done", "personal:1", 1)
     assert shut.accepted is True
 
 
@@ -1071,7 +1096,7 @@ def test_shutdown_timeout_closes_mcp_clients(roots, foundation_registry, monkeyp
     monkeypatch.setattr(managed_agent_module, "SHUTDOWN_JOIN_TIMEOUT_S", 0.01)
 
     try:
-        shut = adapter.shutdown("test-timeout")
+        shut = adapter.shutdown("test-timeout", "personal:1", 1)
         assert shut.accepted is False
         assert client.closed is True
     finally:
@@ -1107,6 +1132,51 @@ def test_max_history_bytes_on_restore(roots, foundation_registry):
             )
         )
     assert ei.value.code in {"HISTORY_LIMIT_EXCEEDED", "SNAPSHOT_TOO_LARGE", "POLICY_LIMIT", "INVALID_SNAPSHOT"}
+
+
+def test_snapshot_restore_rejects_oversize_bundle(roots, foundation_registry):
+    """审查 R4-I6: committed/ 被替换为超大文件时, 恢复必须先按
+    max_bundle_bytes 拒绝, 不能无界 read_bytes 后才校验 checksum。"""
+    bundle = build_snapshot_bundle(
+        task_id="h2",
+        session_key="personal:1",
+        backend_history=[],
+        agent_history=[],
+        working={},
+        display_history=[],
+        result_body="ok",
+        max_history_bytes=1024 * 1024,
+        max_working_bytes=1024,
+    )
+    snap_path = roots["runtime_root"] / "snap-big.json"
+    raw = json.dumps(bundle, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    snap_path.write_bytes(raw)
+    checksum = "sha256:" + hashlib.sha256(raw).hexdigest()
+    adapter = _make_adapter(roots, foundation_registry, ScriptedAgent)
+    # 真实大小远小于 max_bundle_bytes: 恢复必须成功。
+    adapter.start_session(
+        _start_req(
+            snapshot_ref=str(snap_path),
+            snapshot_id="big-ok",
+            snapshot_checksum=checksum,
+            max_bundle_bytes=len(raw) + 1024,
+        )
+    )
+    adapter.shutdown("test", "personal:1", 1)
+
+    # 替换为超大文件(超过下发上限): 必须 SNAPSHOT_TOO_LARGE, 不读入内存。
+    snap_path.write_bytes(b"x" * (4 * 1024 * 1024))
+    adapter2 = _make_adapter(roots, foundation_registry, ScriptedAgent)
+    with pytest.raises(WorkerAdapterError) as ei:
+        adapter2.start_session(
+            _start_req(
+                snapshot_ref=str(snap_path),
+                snapshot_id="big-bad",
+                snapshot_checksum=checksum,
+                max_bundle_bytes=1024,
+            )
+        )
+    assert ei.value.code == "SNAPSHOT_TOO_LARGE"
 
 
 def test_max_turns_wraps_legacy_runner_loop(roots, foundation_registry, monkeypatch):
@@ -1222,9 +1292,9 @@ def test_repeated_cancel_and_timeout_abort_once(roots, foundation_registry):
     th.start()
     agent = ScriptedAgent.instances[0]
     assert agent._started.wait(2.0)
-    assert adapter.cancel_task("ab1").accepted is True
-    assert adapter.cancel_task("ab1").accepted is True
-    assert adapter.cancel_task("ab1").accepted is True
+    assert adapter.cancel_task("ab1", "personal:1", 1).accepted is True
+    assert adapter.cancel_task("ab1", "personal:1", 1).accepted is True
+    assert adapter.cancel_task("ab1", "personal:1", 1).accepted is True
     th.join(timeout=3)
     assert box
     term = _terminal(box[0])
@@ -1397,6 +1467,7 @@ def test_overlay_memory_temp_link_to_workspace(monkeypatch, tmp_path):
     (legacy / "plugins").mkdir()
     (legacy / "plugins" / "__init__.py").write_text("")
     (legacy / "plugins" / "hooks.py").write_text("")
+    (legacy / "plugins" / "project_mode.py").write_text("")
     (legacy / "assets").mkdir()
     for name in (
         "tools_schema.json", "tools_schema_cn.json", "sys_prompt.txt",
@@ -1423,3 +1494,78 @@ def test_overlay_memory_temp_link_to_workspace(monkeypatch, tmp_path):
     assert (ws_mem / "user_note.txt").read_text(encoding="utf-8") == "note"
     (overlay / "temp" / "out.txt").write_text("out", encoding="utf-8")
     assert (ws_temp / "out.txt").read_text(encoding="utf-8") == "out"
+
+
+def test_begin_checkpoint_rejects_stale_runner_generation(roots, foundation_registry):
+    """旧 generation Runner 的迟到 checkpoint 请求必须被拒绝(审查 I7 fencing)。"""
+    adapter = _make_adapter(roots, foundation_registry, ScriptedAgent)
+    adapter.start_session(_start_req(runner_generation=3))
+    _events(adapter, _task("ok-gen", "hi", runner_generation=3))
+    staging = roots["runtime_root"] / "staging" / "stale.json"
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(WorkerAdapterError) as exc:
+        adapter.begin_checkpoint(
+            worker_pb2.BeginCheckpointRequest(
+                task_id="ok-gen",
+                checkpoint_token="tok-stale",
+                staging_ref=str(staging),
+                max_bundle_bytes=1024 * 1024,
+                runner_generation=2,  # 旧 generation
+            )
+        )
+    assert exc.value.code == "CHECKPOINT_GENERATION_MISMATCH"
+
+
+def test_agent_thread_crash_marks_session_failed_and_health_not_ready(roots, foundation_registry):
+    """审查 I12: agent 主线程崩溃不得被静默吞掉——health 必须 not-ready,
+    新任务必须拒绝派发, 否则后续任务对死亡线程的空队列持续挂起。"""
+    class CrashingAgent:
+        def run(self):
+            raise RuntimeError("boom")
+
+    def factory(*args, **kwargs):
+        return CrashingAgent()
+
+    adapter = _make_adapter(roots, foundation_registry, factory=factory)
+    req = worker_pb2.StartSessionRequest(
+        session_key="personal:99",
+        workspace_key="personal:99",
+        runner_generation=1,
+        runtime_policy=worker_pb2.RuntimePolicy(
+            capability_version="foundation.v1",
+            policy_digest=foundation_registry.digest,
+            max_turns=8,
+            max_history_bytes=64 * 1024,
+            max_working_bytes=32 * 1024,
+            max_output_bytes=64 * 1024,
+        ),
+    )
+    resp = adapter.start_session(req)
+    assert resp.session_key == "personal:99"
+    # 崩溃线程需要一点时间执行完 _safe_run 的异常捕获。
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with adapter._lock:
+            failed = adapter._session is not None and adapter._session.agent_failed
+        if failed:
+            break
+        time.sleep(0.01)
+    assert failed, "agent_failed must be set after agent thread crash"
+    health = adapter.health()
+    assert not health.ready, "health must report not-ready after agent crash"
+
+    # 新任务拒绝派发。
+    task = worker_pb2.TaskEnvelope(
+        task_id="t1",
+        session_key="personal:99",
+        runner_generation=1,
+        capability_jti="jti-1",
+        tool_policy_version="foundation.no-host-tools.v1",
+    )
+    from ga_worker.task_runner import _validate_and_reserve
+
+    with pytest.raises(WorkerAdapterError) as exc:
+        _validate_and_reserve(
+            adapter, worker_pb2.ExecuteTaskRequest(task=task), task
+        )
+    assert exc.value.code == "AGENT_FAILED"

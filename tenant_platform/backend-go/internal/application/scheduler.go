@@ -41,6 +41,11 @@ type SchedulerConfig struct {
 	// SessionScopedConfig writes each session under a SHA-256 directory and
 	// passes only that directory to the Worker runtime.
 	SessionScopedConfig bool
+	// RuntimeConfigDir 返回某 session 的运行时配置目录(credential 刷新写卷
+	// 目标, 审查 C4)。生产 Runner 模式返回 workspace 共享卷的 config/ 目录
+	// (Runner 以 /ga/runner-config 只读挂载); nil 时回退 configDirFor
+	// (Platform 本地 ConfigRoot, loopback/测试)。
+	RuntimeConfigDir func(sessionKey string) string
 	// RuntimeRoot is the parent directory for checkpoint/runtime data.
 	RuntimeRoot string
 	// Optional injected Worker factory for unit tests. Deprecated: prefer
@@ -67,6 +72,7 @@ type SchedulerConfig struct {
 	MaxTaskWallClock time.Duration
 	// MaxBundleBytes for checkpoint prepare.
 	MaxBundleBytes uint64
+
 	// MaxRunningTasks caps the global number of simultaneously starting/running
 	// tasks. Zero disables the check (dev/test only). Production should set
 	// this to a value derived from host capacity testing.
@@ -146,6 +152,14 @@ type scheduler struct {
 	wake                  chan struct{}
 	workers               map[string]*workerEntry // session_key -> dedicated worker
 	cancelOnce            sync.Map                // taskID -> *cancelCall
+	// lastCheckpointSweep 记录上次 checkpoint 残留清理时间(节流, 审查 R4-I12)。
+	lastCheckpointSweep time.Time
+	// dispatchInFlight 是 dispatch goroutine 的进程内 in-flight gate
+	// (taskID -> struct{}): tick 对 WorkerDispatchStartedAt==nil 的任务每轮
+	// 都会派发, 而 dispatch 在 MarkDispatchStarted 前有昂贵的初始化
+	// (lease/证书/容器/StartSession)。gate 防止同一任务被并发派发两次、
+	// 两个副本互相销毁 Worker 或重复创建 Runner(审查 R4-C1)。
+	dispatchInFlight      sync.Map
 	lastRevocationCleanup time.Time
 }
 
@@ -236,6 +250,16 @@ func validateSchedulerCredentialTiming(cfg SchedulerConfig) error {
 	return nil
 }
 
+// countActiveRunners 返回当前任务并发占用(starting+running 任务数)。
+// 任务并发(MaxRunningTasks)与 Runner 容量(GA_RUNNER_MAX_ACTIVE)是
+// 两个独立不变量(审查 C3): Runner 容量只在新建 lease 时由 DB 原子校验
+// (AcquireRunnerLease), 已有活跃 lease 的 runner_key 复用不占新容量;
+// 调度 tick 只按任务并发门控 claim, 绝不以活跃 lease 数饿死复用 Runner。
+func (s *scheduler) countActiveRunners(ctx context.Context) (int64, error) {
+	count, err := s.cfg.Store.CountRunningTasks(ctx)
+	return int64(count), err
+}
+
 func (s *scheduler) KickSession(ctx context.Context, sessionKey string) error {
 	_ = ctx
 	_ = sessionKey
@@ -278,6 +302,17 @@ func (s *scheduler) tick(ctx context.Context) error {
 	if err := s.cleanupExpiredCapabilityRevocations(ctx, time.Now().UTC()); err != nil {
 		slog.ErrorContext(ctx, "scheduler: cleanup expired capability revocations failed", "error", err)
 	}
+	// 审查 R4-I12: 定期清理 Prepare 后未 Commit 的 checkpoint 残留
+	// (writing snapshot + staging 文件), 防止失败任务永久占用 DB 行与磁盘。
+	// 节流到每 5 分钟一次, 避免每个 tick 都扫表。
+	if s.cfg.Coordinator != nil && time.Since(s.lastCheckpointSweep) > 5*time.Minute {
+		s.lastCheckpointSweep = time.Now()
+		if n, err := s.cfg.Coordinator.SweepExpiredCheckpoints(ctx); err != nil {
+			slog.ErrorContext(ctx, "scheduler: sweep expired checkpoints failed", "error", err)
+		} else if n > 0 {
+			slog.InfoContext(ctx, "scheduler: quarantined expired checkpoint snapshots", "count", n)
+		}
+	}
 	// Recover newly expired foreign-owner work opportunistically.
 	if _, err := s.cfg.Store.RecoverAfterRestart(ctx, s.cfg.PlatformInstanceID); err != nil {
 		return err
@@ -304,6 +339,9 @@ func (s *scheduler) tick(ctx context.Context) error {
 				"status", string(t.Status))
 			_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"LEASE_EXPIRED", "claim lease expired or lost during heartbeat", "")
+			// 审查: lease 丢失意味着旧 Worker 已与持久 lease 脱节(可能被其他
+			// 实例接管/销毁), 立即销毁本地 entry, 防止复用已 fence 的进程。
+			s.evictWorkerAfterFailure(t.SessionKey)
 			_ = s.KickSession(ctx, t.SessionKey)
 			continue
 		default:
@@ -347,15 +385,18 @@ func (s *scheduler) tick(ctx context.Context) error {
 			go s.dispatch(ctx, t)
 		}
 	}
-	// 容量内的新任务 claim + 异步派发, 直到达到全局 running 上限。
+	// 容量内的新任务 claim + 异步派发, 直到达到全局任务并发上限
+	// (MaxRunningTasks = starting+running 任务数)。Runner 容量
+	// (GA_RUNNER_MAX_ACTIVE) 不在此门控: 已在 AcquireRunnerLease 的 DB
+	// 事务内原子校验(审查 C3: 任务并发与 Runner 容量是两个不变量)。
 	// 同 session key 的串行由 store 的活跃任务约束保证。
 	for {
 		if s.cfg.MaxRunningTasks > 0 {
-			running, err := s.cfg.Store.CountRunningTasks(ctx)
+			running, err := s.countActiveRunners(ctx)
 			if err != nil {
 				return err
 			}
-			if running >= s.cfg.MaxRunningTasks {
+			if running >= int64(s.cfg.MaxRunningTasks) {
 				return nil
 			}
 		}

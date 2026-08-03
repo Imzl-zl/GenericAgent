@@ -55,14 +55,13 @@ SELECT id, owner_user_id, kind, COALESCE(team_id::text, ''), reset_at FROM works
 			return err
 		}
 		// /new was issued since the last committed snapshot: the next task
-		// starts with cleared history and working state. Clear the marker in
-		// the same workspace-locked tx so a concurrent submit cannot miss it.
+		// starts with cleared history and working state. 审查 R4-I8: 标记
+		// 不在提交时清除——它保留到 fresh 任务成功终态, 因此 fresh 任务
+		// 失败/取消后, 下一个任务仍然 fresh, 不会静默恢复 /new 前的旧
+		// snapshot。并发提交的多个任务共享同一 fresh 语义。
 		freshSession := false
 		if resetAt != nil {
 			freshSession = true
-			if _, err := tx.Exec(ctx, `UPDATE workspaces SET reset_at = NULL WHERE session_key = $1`, cmd.SessionKey); err != nil {
-				return err
-			}
 		}
 
 		// Hard per-user queue cap inside the workspace lock. Concurrent
@@ -154,12 +153,72 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (domain.Task, error)
 // ResetWorkspace marks the session for fresh start: the next submitted task
 // will have fresh_session=true and the Worker will be restarted without
 // loading the prior snapshot. Implements /new (spec §7).
-func (s *Store) ResetWorkspace(ctx context.Context, sessionKey string) error {
+// recoveryRevocationTTL 是崩溃恢复撤销 JTI 时写入 revocation 表的有效期:
+// capability 签发 TTL(默认 1h)与校验 leeway(30s)的总上界取 2h, 覆盖
+// token 的完整剩余寿命, 保证恢复后旧 token 立即且持续失效。
+const recoveryRevocationTTL = 2 * time.Hour
+
+// SetTaskCapabilityJTIs 持久化任务实际签发的 capability JTI 列表
+// (供 RecoverAfterRestart 在中断任务时同一事务内撤销)。
+func (s *Store) SetTaskCapabilityJTIs(ctx context.Context, taskID string, jtis []string) error {
+	if taskID == "" {
+		return fmt.Errorf("task id is required")
+	}
+	if len(jtis) == 0 {
+		return nil
+	}
 	_, err := s.pool.Exec(ctx, `
+UPDATE tasks SET capability_jtis = $2, updated_at = timezone('utc', now())
+WHERE id = $1
+`, taskID, jtis)
+	return err
+}
+
+// ResetWorkspaceForNewSession marks the session for fresh start (/new):
+// sets reset_at and cancels every queued task of the session in the same
+// transaction. 审查 R4-I8: /new 后排队中的旧任务不得带旧上下文执行, 且
+// 重置标记保留到 fresh 任务成功终态(SubmitTask/CompleteSucceeded), 失败
+// 的 fresh 任务不会让下一个任务恢复 /new 前的旧 snapshot。
+func (s *Store) ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error) {
+	var cancelled int
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
 UPDATE workspaces SET reset_at = timezone('utc', now())
 WHERE session_key = $1
+`, sessionKey); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+SELECT `+taskSelectColumns+` FROM tasks
+WHERE session_key = $1 AND status = 'queued'
+FOR UPDATE
 `, sessionKey)
-	return err
+		if err != nil {
+			return err
+		}
+		var queued []domain.Task
+		for rows.Next() {
+			t, scanErr := scanTask(rows)
+			if scanErr != nil {
+				rows.Close()
+				return scanErr
+			}
+			queued = append(queued, t)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, t := range queued {
+			if _, err := finalizeTerminal(ctx, tx, t, domain.TaskCancelled, domain.DeliveryTaskCancelled,
+				"TASK_CANCELLED", "task cancelled by /new session reset", "", "", ""); err != nil {
+				return err
+			}
+			cancelled++
+		}
+		return nil
+	})
+	return cancelled, err
 }
 
 // ListClaimableSessionKeys returns session keys with queued work and no active

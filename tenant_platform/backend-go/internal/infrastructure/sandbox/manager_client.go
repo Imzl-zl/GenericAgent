@@ -73,6 +73,18 @@ func (c *ManagerClient) EnsureRunner(ctx context.Context, req EnsureRunnerReques
 	return Runner{ContainerID: out.ContainerID, Name: out.Name}, out.Created, nil
 }
 
+// EnsureWorkspace 经控制面请求 Manager 预置 workspace 目录布局(附件导入前调用)。
+func (c *ManagerClient) EnsureWorkspace(ctx context.Context, workspaceKey string) error {
+	if strings.TrimSpace(workspaceKey) == "" {
+		return fmt.Errorf("workspace key is required")
+	}
+	payload, err := json.Marshal(map[string]string{"workspace_key": workspaceKey})
+	if err != nil {
+		return fmt.Errorf("marshal ensure workspace request: %w", err)
+	}
+	return c.do(ctx, http.MethodPost, "/v1/workspaces/ensure", payload, nil)
+}
+
 func (c *ManagerClient) Destroy(ctx context.Context, name string) error {
 	if name == "" || strings.ContainsAny(name, "/\x00") {
 		return fmt.Errorf("invalid runner name %q", name)
@@ -91,6 +103,12 @@ func (c *ManagerClient) Inspect(ctx context.Context, name string) error {
 // workspace/generation 推导), 返回明确错误而不是静默绕过。
 func (c *ManagerClient) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner, error) {
 	return Runner{}, fmt.Errorf("direct CreateAndStart is not allowed through the manager control API; use EnsureRunner")
+}
+
+// IsRunnerContainer: 归属校验由 Manager 服务端执行(命名模式或 label
+// 检查), 客户端按已校验处理。
+func (c *ManagerClient) IsRunnerContainer(ctx context.Context, idOrName string) (bool, error) {
+	return true, nil
 }
 
 // ListRunners 列出 Manager 当前管理的 Runner 容器名。

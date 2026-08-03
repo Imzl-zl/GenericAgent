@@ -80,6 +80,9 @@ func (c *LocalCoordinator) Prepare(ctx context.Context, request CheckpointPrepar
 	if strings.TrimSpace(request.TaskID) == "" {
 		return CheckpointLease{}, fmt.Errorf("task_id required")
 	}
+	if request.RunnerGeneration == 0 {
+		return CheckpointLease{}, fmt.Errorf("runner generation required")
+	}
 	maxB := request.MaxBundleBytes
 	if maxB == 0 {
 		maxB = c.defaultMaxBundle
@@ -87,7 +90,7 @@ func (c *LocalCoordinator) Prepare(ctx context.Context, request CheckpointPrepar
 	stagingRefFor := func(snapshotID, token string, generation int64) string {
 		return filepath.Join(c.runtimeRoot, "staging", token+".bundle.json")
 	}
-	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.platformInstanceID, stagingRefFor, maxB)
+	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.platformInstanceID, request.RunnerGeneration, stagingRefFor, maxB)
 	if err != nil {
 		return CheckpointLease{}, err
 	}
@@ -104,7 +107,7 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 	if ready.TaskID == "" || ready.SnapshotID == "" || ready.CheckpointToken == "" {
 		return CommittedCheckpoint{}, fmt.Errorf("ready checkpoint missing identifiers")
 	}
-	wsID, taskID, stagingRef, leaseOwner, leaseUntil, _, maxBundleBytes, state, err := c.store.LoadSnapshotToken(ctx, ready.SnapshotID, ready.CheckpointToken)
+	wsID, taskID, stagingRef, leaseOwner, leaseUntil, _, runnerGeneration, maxBundleBytes, state, err := c.store.LoadSnapshotToken(ctx, ready.SnapshotID, ready.CheckpointToken)
 	if err != nil {
 		return CommittedCheckpoint{}, fmt.Errorf("token mismatch or unknown snapshot: %w", err)
 	}
@@ -120,6 +123,9 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 	}
 	if time.Now().UTC().After(leaseUntil.UTC()) {
 		return CommittedCheckpoint{}, fmt.Errorf("checkpoint lease expired")
+	}
+	if ready.RunnerGeneration == 0 || ready.RunnerGeneration != uint64(runnerGeneration) {
+		return CommittedCheckpoint{}, fmt.Errorf("runner generation mismatch: worker=%d snapshot=%d", ready.RunnerGeneration, runnerGeneration)
 	}
 	if stagingRef != ready.StagingRef {
 		return CommittedCheckpoint{}, fmt.Errorf("staging ref mismatch")
@@ -149,6 +155,15 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 	}
 	if sv, _ := bundle["schema_version"].(string); sv != snapshotSchemaVersion {
 		return CommittedCheckpoint{}, fmt.Errorf("unsupported schema_version %q", sv)
+	}
+	// Bundle 身份校验(审查 R4-M14): 与 WorkspaceCoordinator 对齐, loopback
+	// 模式不得绕过 task_id/session_key/runner_generation 绑定。
+	taskRow, getErr := c.store.GetTask(ctx, ready.TaskID)
+	if getErr != nil {
+		return CommittedCheckpoint{}, fmt.Errorf("resolve task session: %w", getErr)
+	}
+	if err := validateBundleIdentity(bundle, ready.TaskID, taskRow.SessionKey, int64(runnerGeneration)); err != nil {
+		return CommittedCheckpoint{}, err
 	}
 	resultObj, _ := bundle["result"].(map[string]any)
 	if resultObj == nil {
@@ -227,7 +242,53 @@ func (c *LocalCoordinator) CurrentRestorePoint(
 	if _, err := os.Stat(path); err != nil {
 		return RestorePoint{}, false, fmt.Errorf("stat committed snapshot: %w", err)
 	}
-	return RestorePoint{SnapshotID: snapshotID, SnapshotRef: path, Checksum: checksum}, true, nil
+	// 审查 R4-I6: 恢复必须携带快照的 max_bundle_bytes, Worker 按此限长读取。
+	maxBytes, err := c.store.SnapshotMaxBundleBytes(ctx, snapshotID)
+	if err != nil {
+		return RestorePoint{}, false, fmt.Errorf("resolve snapshot bundle limit: %w", err)
+	}
+	if maxBytes <= 0 {
+		return RestorePoint{}, false, fmt.Errorf("snapshot %s has no bundle limit", snapshotID)
+	}
+	return RestorePoint{
+		SnapshotID: snapshotID, SnapshotRef: path, Checksum: checksum,
+		MaxBundleBytes: maxBytes,
+	}, true, nil
+}
+
+// SweepExpiredCheckpoints 与 WorkspaceCoordinator 同语义(审查 R4-I12):
+// loopback 模式同样清理过期 writing snapshot 与 staging 文件。
+func (c *LocalCoordinator) SweepExpiredCheckpoints(ctx context.Context) (int, error) {
+	expired, err := c.store.QuarantineExpiredWritingSnapshots(ctx, time.Now().UTC())
+	if err != nil {
+		return 0, err
+	}
+	for _, q := range expired {
+		if q.StagingRef == "" {
+			continue
+		}
+		rel, err := filepath.Rel(c.runtimeRoot, q.StagingRef)
+		if err != nil || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(c.runtimeRoot, rel)); err != nil && !os.IsNotExist(err) {
+			// best-effort: 文件已丢失属预期。
+		}
+	}
+	return len(expired), nil
+}
+
+// RunnerStagingRef: loopback 路径下宿主与 Worker 同一文件系统, 原样返回。
+func (c *LocalCoordinator) RunnerStagingRef(hostRef string) (string, error) {
+	return hostRef, nil
+}
+
+// HostStagingRef: loopback 路径下容器内 ref 即宿主 ref, 校验后返回。
+func (c *LocalCoordinator) HostStagingRef(runnerRef, expectedHostRef string) (string, error) {
+	if runnerRef != expectedHostRef {
+		return "", fmt.Errorf("staging ref mismatch: got %q want %q", runnerRef, expectedHostRef)
+	}
+	return runnerRef, nil
 }
 
 // ReadResult resolves only opaque result refs and verifies digest.

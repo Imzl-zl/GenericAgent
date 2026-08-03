@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"context"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -23,9 +25,11 @@ func (f *fakeRunner) Run(_ context.Context, _ string, args ...string) ([]byte, [
 }
 
 func validConfig() DockerConfig {
+	profile := ValidProfile()
+	profile.AllowRunc = true // 测试模拟默认 docker 运行时, 显式 trusted 开关
 	return DockerConfig{
 		Binary:              "docker",
-		Profile:             ValidProfile(),
+		Profile:             profile,
 		WorkspacesRoot:      "/tmp/ws-root",
 		ContainerNamePrefix: "ga-runner",
 	}
@@ -33,14 +37,15 @@ func validConfig() DockerConfig {
 
 func validSpec() RunnerSpec {
 	return RunnerSpec{
+		WorkspaceKey:  "personal:1",
 		WorkspaceHash: strings.Repeat("ab", 32),
 		Generation:    3,
 		Image:         "ga-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Env:           []string{"GA_LLM_PROXY_ADDR=http://llm-proxy:8081"},
 		ConfigFiles: map[string][]byte{
-			"server.crt": []byte("cert"),
-			"server.key": []byte("key"),
-			"ca.crt":     []byte("ca"),
+			"server.crt":  []byte("cert"),
+			"server.key":  []byte("key"),
+			"ca.crt":      []byte("ca"),
 			"policy.json": []byte(`{"version":"foundation.no-host-tools.v1"}`),
 		},
 	}
@@ -62,18 +67,20 @@ func TestCreateRunnerUsesFixedProfileFlags(t *testing.T) {
 		"--network", "runner-control",
 		"--memory", "1073741824",
 		"--pids-limit", "128",
+		"--user", "10002:10002",
+		"--group-add", "10003",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("create args missing %q:\n%s", want, joined)
 		}
 	}
-	// 五个工作区 subpath 必须全部挂载(config/attachments 只读),不得有 docker.sock。
+	// 四个工作区 subpath 必须全部挂载(memory/temp/state 读写, config 只读),
+	// 不得有 docker.sock。
 	for _, want := range []string{
 		"destination=/ga/legacy/memory",
 		"destination=/ga/legacy/temp",
 		"destination=/ga/runner-state",
 		"destination=/ga/runner-config",
-		"destination=/ga/runner-attachments",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("mount missing %q:\n%s", want, joined)
@@ -81,9 +88,6 @@ func TestCreateRunnerUsesFixedProfileFlags(t *testing.T) {
 	}
 	if !strings.Contains(joined, "destination=/ga/runner-config,readonly") {
 		t.Fatalf("config mount must be read-only:\n%s", joined)
-	}
-	if !strings.Contains(joined, "destination=/ga/runner-attachments,readonly") {
-		t.Fatalf("attachments mount must be read-only:\n%s", joined)
 	}
 	if strings.Contains(joined, "docker.sock") || strings.Contains(joined, "/var/run/docker") {
 		t.Fatalf("docker socket mount present:\n%s", joined)
@@ -111,6 +115,11 @@ func TestCreateRunnerUsesFixedProfileFlags(t *testing.T) {
 	expectedName := "ga-runner-" + validSpec().WorkspaceHash[:12] + "-g3"
 	if !strings.Contains(joined, "--name "+expectedName) {
 		t.Fatalf("container name = want %q:\n%s", expectedName, joined)
+	}
+	// 显式命令参数覆盖镜像 CMD: 固定 mTLS TCP 监听(镜像默认 unix socket
+	// 仅供本地冒烟; 覆盖后 Platform 才能按 runner-name:9443 拨号)。
+	if !strings.Contains(joined, "--listen tcp:0.0.0.0:9443") {
+		t.Fatalf("create must pass --listen tcp:0.0.0.0:9443 as command:\n%s", joined)
 	}
 }
 
@@ -169,22 +178,85 @@ func TestCreateRunnerRejectsUnsafeEnv(t *testing.T) {
 	}
 }
 
+// fixedInspectEnv 返回与 docker_cli.CreateAndStart 完全一致的固定环境变量
+// (inspect 校验要求精确匹配, 审查 I9)。
+func fixedInspectEnv(workspaceHash string) []string {
+	return []string{
+		"GA_CONFIG_ROOT=" + RunnerConfigMount,
+		"GA_LEGACY_ROOT=" + LegacyRoot,
+		"GA_RUNTIME_DIR=" + RunnerStateMount,
+		"GA_POLICY_FILE=" + RunnerConfigMount + "/policy.json",
+		"GA_WORKER_LISTEN=tcp:0.0.0.0:" + strconv.Itoa(RunnerControlPort),
+		"GA_RUNNER_TLS_CERT=" + RunnerConfigMount + "/server.crt",
+		"GA_RUNNER_TLS_KEY=" + RunnerConfigMount + "/server.key",
+		"GA_RUNNER_TLS_CA=" + RunnerConfigMount + "/ca.crt",
+		"GA_WORKSPACE_MEMORY=" + LegacyMemoryMount,
+		"GA_WORKSPACE_TEMP=" + LegacyTempMount,
+		"GA_WORKSPACE_KEY=personal:1",
+		"GA_RUNNER_GENERATION=1",
+		"GA_OVERLAY_ROOT=" + RunnerOverlayMount,
+	}
+}
+
+// deepCopyInspect 深拷贝 inspectOutput(审查: 原测试 `bad := good` 浅拷贝
+// 共享 Mounts/TmpfsOpts/GroupAdd 底层数组与 map, 前序 case 的 mutation 会
+// 污染后续 case, 使缺失 tmpfs/extra group 等 drift 测试错误通过)。
+func deepCopyInspect(in inspectOutput) inspectOutput {
+	out := in
+	out.CapDrop = append([]string(nil), in.CapDrop...)
+	out.CapAdd = append([]string(nil), in.CapAdd...)
+	out.Networks = append([]string(nil), in.Networks...)
+	out.Devices = append([]string(nil), in.Devices...)
+	out.GroupAdd = append([]string(nil), in.GroupAdd...)
+	out.Env = append([]string(nil), in.Env...)
+	out.Cmd = append([]string(nil), in.Cmd...)
+	out.Tmpfs = append([]string(nil), in.Tmpfs...)
+	out.TmpfsOpts = make(map[string]string, len(in.TmpfsOpts))
+	for k, v := range in.TmpfsOpts {
+		out.TmpfsOpts[k] = v
+	}
+	out.Labels = make(map[string]string, len(in.Labels))
+	for k, v := range in.Labels {
+		out.Labels[k] = v
+	}
+	out.Mounts = make([]inspectMount, len(in.Mounts))
+	copy(out.Mounts, in.Mounts)
+	return out
+}
+
 func TestInspectRunnerRejectsDrift(t *testing.T) {
 	profile := ValidProfile()
+	profile.AllowRunc = true // 测试模拟默认 docker 运行时, 显式 trusted 开关
 	profile.Image = "ga-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	workspaceHash := strings.Repeat("ab", 32)
 	good := inspectOutput{
 		ReadOnlyRootFS: true, Privileged: false, CapDrop: []string{"ALL"},
 		NoNewPrivileges: true, Networks: []string{"runner-control"},
 		User: "10002:10002", Image: profile.Image, Runtime: "runc",
+		MemoryBytes: profile.MemoryBytes, CPUQuota: profile.CPUQuota,
+		CPUPeriod: profile.CPUPeriod, PIDsLimit: profile.PIDsLimit,
+		GroupAdd:  []string{strconv.Itoa(profile.ShareGID)},
+		Env:       fixedInspectEnv(workspaceHash),
+		Cmd:       []string{"--listen", "tcp:0.0.0.0:" + strconv.Itoa(RunnerControlPort)},
+		Tmpfs:     []string{RunnerOverlayMount, "/tmp"},
+		TmpfsOpts: map[string]string{
+			"/tmp": "rw,noexec,nosuid,nodev,size=64m",
+			RunnerOverlayMount: "rw,noexec,nosuid,nodev,size=128m",
+		},
+		Labels: map[string]string{
+			"com.genericagent.runner.hash":       workspaceHash,
+			"com.genericagent.runner.generation": "1",
+		},
 		Mounts: []inspectMount{
-			{Type: "volume", Source: "runner_workspaces/_vol", Destination: LegacyMemoryMount, RW: true},
-			{Type: "volume", Source: "runner_workspaces/_vol", Destination: LegacyTempMount, RW: true},
-			{Type: "volume", Source: "runner_workspaces/_vol", Destination: RunnerStateMount, RW: true},
-			{Type: "volume", Source: "runner_workspaces/_vol", Destination: RunnerConfigMount, RW: false},
-			{Type: "volume", Source: "runner_workspaces/_vol", Destination: RunnerAttachmentsMount, RW: false},
+			// 实测 Docker 29.6.2: volume-subpath 挂载 Source 为卷根绝对路径。
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyMemoryMount, RW: true, VolumeSubpath: workspaceHash + "/memory"},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyTempMount, RW: true, VolumeSubpath: workspaceHash + "/temp"},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerConfigMount, RW: false, VolumeSubpath: workspaceHash + "/config"},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount, RW: true, VolumeSubpath: workspaceHash + "/state"},
 		},
 	}
-	if err := validateInspect(good, profile); err != nil {
+	mountSubs := map[string]string{LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state", RunnerConfigMount: "config"}
+	if err := validateInspect(good, profile, "/tmp/ws-root", "runner_workspaces", mountSubs); err != nil {
 		t.Fatalf("good inspect rejected: %v", err)
 	}
 
@@ -204,23 +276,168 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 		{"runtime drift", func(o *inspectOutput) { o.Runtime = "runsc" }},
 		{"seccomp unconfined", func(o *inspectOutput) { o.Seccomp = "unconfined" }},
 		{"config mount rw", func(o *inspectOutput) {
-			o.Mounts[3].RW = true
-		}},
-		{"attachments mount rw", func(o *inspectOutput) {
-			o.Mounts[4].RW = true
+			o.Mounts[2].RW = true
 		}},
 		{"mount missing source", func(o *inspectOutput) {
-			o.Mounts[2].Source = ""
+			o.Mounts[3].Source = ""
 		}},
+		{"wrong volume source", func(o *inspectOutput) {
+			// 任意其他卷: 卷归属校验必须拒绝(审查 I10)。
+			o.Mounts[0].Source = "/var/lib/docker/volumes/other_volume/_data"
+		}},
+		{"missing share group", func(o *inspectOutput) { o.GroupAdd = nil }},
+		{"extra share group", func(o *inspectOutput) { o.GroupAdd = []string{"10003", "10004"} }},
+		{"wrong user uid", func(o *inspectOutput) { o.User = "10001:10002" }},
+		{"tmpfs missing noexec", func(o *inspectOutput) { o.TmpfsOpts = map[string]string{"/tmp": "rw,nosuid,nodev,size=64m", RunnerOverlayMount: "rw,noexec,nosuid,nodev,size=128m"} }},
+		{"overlay tmpfs missing", func(o *inspectOutput) { delete(o.TmpfsOpts, RunnerOverlayMount) }},
+		{"missing tmpfs", func(o *inspectOutput) { o.TmpfsOpts = map[string]string{} }},
+		{"volume subpath drift", func(o *inspectOutput) {
+			// 挂到其他 workspace 的 subpath 必须拒绝(审查)。
+			other := strings.Repeat("cd", 32)
+			o.Mounts[0].VolumeSubpath = other + "/memory"
+		}},
+		{"memory drift", func(o *inspectOutput) { o.MemoryBytes = profile.MemoryBytes - 1 }},
 		{"device present", func(o *inspectOutput) { o.Devices = []string{"/dev/kvm"} }},
+		{"cap_add present", func(o *inspectOutput) { o.CapAdd = []string{"SYS_ADMIN"} }},
+		{"apparmor unconfined", func(o *inspectOutput) { o.AppArmorProfile = "unconfined" }},
+		{"env override", func(o *inspectOutput) {
+			for i, e := range o.Env {
+				if strings.HasPrefix(e, "GA_RUNNER_TLS_CERT=") {
+					o.Env[i] = "GA_RUNNER_TLS_CERT="
+				}
+			}
+		}},
+		{"env missing fixed", func(o *inspectOutput) {
+			o.Env = []string{"GA_WORKSPACE_KEY=personal:1", "GA_RUNNER_GENERATION=1"}
+		}},
+		{"generation env mismatch", func(o *inspectOutput) {
+			for i, e := range o.Env {
+				if strings.HasPrefix(e, "GA_RUNNER_GENERATION=") {
+					o.Env[i] = "GA_RUNNER_GENERATION=2"
+				}
+			}
+		}},
+		{"cmd drift", func(o *inspectOutput) { o.Cmd = []string{"--listen", "tcp:0.0.0.0:9999"} }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			bad := good
+			bad := deepCopyInspect(good)
 			tc.mutate(&bad)
-			if err := validateInspect(bad, profile); err == nil {
+			if err := validateInspect(bad, profile, "/tmp/ws-root", "runner_workspaces", mountSubs); err == nil {
 				t.Fatal("drifted inspect must fail")
 			}
 		})
+	}
+}
+
+// TestValidateInspectSortedMounts 验证真实 docker inspect 解析路径
+// (parse -> sort by destination -> validate) 在挂载顺序与创建顺序不同时
+// 也能通过: 防止"单测直调未排序输入, 生产解析排序后误报"的回归。
+func TestValidateInspectSortedMounts(t *testing.T) {
+	profile := ValidProfile()
+	profile.AllowRunc = true // 测试模拟默认 docker 运行时
+	profile.Image = "ga-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	// 模拟 docker inspect 返回创建顺序(与排序后不同的乱序)。
+	workspaceHash := strings.Repeat("ef", 32)
+	raw := inspectOutput{
+		ReadOnlyRootFS: true, CapDrop: []string{"ALL"}, NoNewPrivileges: true,
+		Networks: []string{"runner-control"}, User: "10002:10002",
+		Image: profile.Image, Runtime: "runc",
+		MemoryBytes: profile.MemoryBytes, CPUQuota: profile.CPUQuota,
+		CPUPeriod: profile.CPUPeriod, PIDsLimit: profile.PIDsLimit,
+		GroupAdd:  []string{strconv.Itoa(profile.ShareGID)},
+		Env:       fixedInspectEnv(workspaceHash),
+		Cmd:       []string{"--listen", "tcp:0.0.0.0:" + strconv.Itoa(RunnerControlPort)},
+		Tmpfs:     []string{RunnerOverlayMount, "/tmp"},
+		TmpfsOpts: map[string]string{
+			"/tmp": "rw,noexec,nosuid,nodev,size=64m",
+			RunnerOverlayMount: "rw,noexec,nosuid,nodev,size=128m",
+		},
+		Labels: map[string]string{
+			"com.genericagent.runner.hash":       workspaceHash,
+			"com.genericagent.runner.generation": "1",
+		},
+		Mounts: []inspectMount{
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyTempMount, RW: true, VolumeSubpath: workspaceHash + "/temp"},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount, RW: true, VolumeSubpath: workspaceHash + "/state"},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyMemoryMount, RW: true, VolumeSubpath: workspaceHash + "/memory"},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerConfigMount, RW: false, VolumeSubpath: workspaceHash + "/config"},
+		},
+	}
+	// 复刻 Inspect 中的排序(生产解析路径)。
+	sort.Slice(raw.Mounts, func(i, j int) bool { return raw.Mounts[i].Destination < raw.Mounts[j].Destination })
+	if err := validateInspect(raw, profile, "/tmp/ws-root", "runner_workspaces",
+		map[string]string{LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state", RunnerConfigMount: "config"}); err != nil {
+		t.Fatalf("sorted real-world mounts rejected: %v", err)
+	}
+}
+
+// TestValidateInspectBindExactSource 验证 bind 挂载必须精确匹配
+// <workspacesRoot>/<hash>/<sub> 全路径(审查 I10: 拒绝其他 workspace 子目录)。
+func TestValidateInspectBindExactSource(t *testing.T) {
+	profile := ValidProfile()
+	profile.AllowRunc = true // 测试模拟默认 docker 运行时
+	workspaceHash := strings.Repeat("12", 32)
+	mountSubs := map[string]string{LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state", RunnerConfigMount: "config"}
+	good := inspectOutput{
+		ReadOnlyRootFS: true, CapDrop: []string{"ALL"}, NoNewPrivileges: true,
+		Networks: []string{"runner-control"}, User: "10002:10002",
+		Image: profile.Image, Runtime: "runc",
+		MemoryBytes: profile.MemoryBytes, CPUQuota: profile.CPUQuota,
+		CPUPeriod: profile.CPUPeriod, PIDsLimit: profile.PIDsLimit,
+		GroupAdd:  []string{strconv.Itoa(profile.ShareGID)},
+		Env:       fixedInspectEnv(workspaceHash),
+		Cmd:       []string{"--listen", "tcp:0.0.0.0:" + strconv.Itoa(RunnerControlPort)},
+		Tmpfs:     []string{RunnerOverlayMount, "/tmp"},
+		TmpfsOpts: map[string]string{
+			"/tmp": "rw,noexec,nosuid,nodev,size=64m",
+			RunnerOverlayMount: "rw,noexec,nosuid,nodev,size=128m",
+		},
+		Labels: map[string]string{
+			"com.genericagent.runner.hash":       workspaceHash,
+			"com.genericagent.runner.generation": "1",
+		},
+		Mounts: []inspectMount{
+			{Type: "bind", Source: "/ws/" + workspaceHash + "/memory", Destination: LegacyMemoryMount, RW: true},
+			{Type: "bind", Source: "/ws/" + workspaceHash + "/temp", Destination: LegacyTempMount, RW: true},
+			{Type: "bind", Source: "/ws/" + workspaceHash + "/config", Destination: RunnerConfigMount, RW: false},
+			{Type: "bind", Source: "/ws/" + workspaceHash + "/state", Destination: RunnerStateMount, RW: true},
+		},
+	}
+	if err := validateInspect(good, profile, "/ws", "", mountSubs); err != nil {
+		t.Fatalf("bind exact source rejected: %v", err)
+	}
+	// 其他 workspace 的同名子目录必须拒绝。
+	other := strings.Repeat("cd", 32)
+	bad := deepCopyInspect(good)
+	bad.Mounts[0].Source = "/ws/" + other + "/memory"
+	if err := validateInspect(bad, profile, "/ws", "", mountSubs); err == nil {
+		t.Fatal("cross-workspace bind source must be rejected")
+	}
+}
+
+// TestCreateRunnerRejectsProtectedEnvOverride 验证控制面透传 env 不得覆盖
+// Manager 固定的安全变量(空 GA_RUNNER_TLS_* 会让 Worker 以 insecure 监听,
+// 破坏 mTLS 控制面; 审查 I8 fail-closed)。
+func TestCreateRunnerRejectsProtectedEnvOverride(t *testing.T) {
+	runner := &fakeRunner{}
+	cli := &DockerCLI{cfg: validConfig(), runner: runner}
+	for _, key := range []string{
+		"GA_RUNNER_TLS_CERT", "GA_RUNNER_TLS_KEY", "GA_RUNNER_TLS_CA",
+		"GA_WORKER_LISTEN", "GA_CONFIG_ROOT", "GA_WORKSPACE_KEY",
+		"GA_RUNNER_GENERATION", "GA_POLICY_FILE", "GA_RUNTIME_DIR",
+	} {
+		spec := validSpec()
+		spec.Env = []string{key + "=evil"}
+		if _, err := cli.CreateAndStart(context.Background(), spec); err == nil {
+			t.Fatalf("env override of %s must be rejected", key)
+		}
+	}
+	// 非保护键仍允许透传。
+	runner.stdout = "cid123"
+	spec := validSpec()
+	spec.Env = []string{"GA_LLM_PROXY_ADDR=http://llm-proxy:8081"}
+	if _, err := cli.CreateAndStart(context.Background(), spec); err != nil {
+		t.Fatalf("unprotected env must be allowed: %v", err)
 	}
 }

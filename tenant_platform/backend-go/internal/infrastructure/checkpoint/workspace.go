@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/safefs"
 )
 
 // WorkspaceConfig configures the production workspace coordinator.
@@ -104,11 +106,65 @@ func (c *WorkspaceCoordinator) stateRoot(workspaceKey string) (string, string, e
 	return state, hash, nil
 }
 
+// RunnerStagingRef 把 Prepare 返回的宿主 staging 路径映射为 Runner 容器内
+// 路径(/ga/runner-state/...): Worker 只允许写 runtime root 内的 staging_ref
+// (方案 §7)。校验宿主路径结构, 拒绝越界。
+func (c *WorkspaceCoordinator) RunnerStagingRef(hostRef string) (string, error) {
+	_, token, err := parseStateStagingRef(hostRef, c.workspacesRoot)
+	if err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(filepath.Join(c.runnerStateMount, "staging", token)), nil
+}
+
+// HostStagingRef 校验 Worker 返回的容器内 staging ref 与期望宿主 ref
+// 指向同一 token, 返回宿主 ref(DB 记录为宿主路径, Commit 按它校验)。
+func (c *WorkspaceCoordinator) HostStagingRef(runnerRef, expectedHostRef string) (string, error) {
+	cleanRef := filepath.Clean(filepath.FromSlash(runnerRef))
+	runnerToken, ok := strings.CutPrefix(cleanRef, filepath.Join(c.runnerStateMount, "staging")+string(filepath.Separator))
+	if !ok || runnerToken == "" || strings.ContainsAny(runnerToken, `\/`) {
+		return "", fmt.Errorf("runner staging ref %q not under %s/staging", runnerRef, c.runnerStateMount)
+	}
+	_, expectedToken, err := parseStateStagingRef(expectedHostRef, c.workspacesRoot)
+	if err != nil {
+		return "", err
+	}
+	if runnerToken != expectedToken {
+		return "", fmt.Errorf("runner staging ref token mismatch: got %q want %q", runnerToken, expectedToken)
+	}
+	return filepath.Clean(expectedHostRef), nil
+}
+
+// parseStateStagingRef 校验宿主 staging ref 位于 workspaces/<hash>/state/staging
+// 并返回 hash 与 token。
+func parseStateStagingRef(hostRef, workspacesRoot string) (hash, token string, err error) {
+	absRoot, err := filepath.Abs(workspacesRoot)
+	if err != nil {
+		return "", "", err
+	}
+	absRef, err := filepath.Abs(hostRef)
+	if err != nil {
+		return "", "", err
+	}
+	rel, err := filepath.Rel(absRoot, absRef)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", "", fmt.Errorf("staging ref escapes workspaces root")
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) != 4 || !isHex64(parts[0]) || parts[1] != "state" || parts[2] != "staging" || parts[3] == "" {
+		return "", "", fmt.Errorf("staging ref not under workspaces/<hash>/state/staging")
+	}
+	return parts[0], parts[3], nil
+}
+
 // Prepare creates writing snapshot metadata and a token-scoped staging path
 // under workspaces/<hash>/state/staging (Runner-visible).
 func (c *WorkspaceCoordinator) Prepare(ctx context.Context, request CheckpointPrepareRequest) (CheckpointLease, error) {
 	if strings.TrimSpace(request.TaskID) == "" {
 		return CheckpointLease{}, fmt.Errorf("task_id required")
+	}
+	if request.RunnerGeneration == 0 {
+		return CheckpointLease{}, fmt.Errorf("runner generation required")
 	}
 	// SessionKey == workspace key; fall back to workspace UUID resolution.
 	workspaceKey := request.SessionKey
@@ -124,7 +180,7 @@ func (c *WorkspaceCoordinator) Prepare(ctx context.Context, request CheckpointPr
 		return CheckpointLease{}, err
 	}
 	stagingDir := filepath.Join(stateRoot, "staging")
-	if err := os.MkdirAll(stagingDir, 0o770); err != nil {
+	if err := safefs.MkdirAllBeneath(c.workspacesRoot, filepath.Join(workspaceHashFor(workspaceKey), "state", "staging"), 0o770); err != nil {
 		return CheckpointLease{}, fmt.Errorf("create staging dir: %w", err)
 	}
 	maxB := request.MaxBundleBytes
@@ -134,7 +190,7 @@ func (c *WorkspaceCoordinator) Prepare(ctx context.Context, request CheckpointPr
 	stagingRefFor := func(snapshotID, token string, generation int64) string {
 		return filepath.Join(stagingDir, token+".bundle.json")
 	}
-	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.platformInstanceID, stagingRefFor, maxB)
+	snapshotID, token, _, err := c.store.PrepareCheckpoint(ctx, request.TaskID, c.platformInstanceID, request.RunnerGeneration, stagingRefFor, maxB)
 	if err != nil {
 		return CheckpointLease{}, err
 	}
@@ -153,7 +209,7 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 	if ready.TaskID == "" || ready.SnapshotID == "" || ready.CheckpointToken == "" {
 		return CommittedCheckpoint{}, fmt.Errorf("ready checkpoint missing identifiers")
 	}
-	_, taskID, stagingRef, leaseOwner, leaseUntil, _, maxBundleBytes, state, err := c.store.LoadSnapshotToken(ctx, ready.SnapshotID, ready.CheckpointToken)
+	_, taskID, stagingRef, leaseOwner, leaseUntil, _, runnerGeneration, maxBundleBytes, state, err := c.store.LoadSnapshotToken(ctx, ready.SnapshotID, ready.CheckpointToken)
 	if err != nil {
 		return CommittedCheckpoint{}, fmt.Errorf("token mismatch or unknown snapshot: %w", err)
 	}
@@ -168,6 +224,11 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 	}
 	if time.Now().UTC().After(leaseUntil.UTC()) {
 		return CommittedCheckpoint{}, fmt.Errorf("checkpoint lease expired")
+	}
+	// Runner generation fencing(审查 I7): Worker 回显的 generation 必须与
+	// Prepare 时写入 snapshot 行的一致, 防止旧 generation Runner 提交。
+	if ready.RunnerGeneration == 0 || ready.RunnerGeneration != uint64(runnerGeneration) {
+		return CommittedCheckpoint{}, fmt.Errorf("runner generation mismatch: worker=%d snapshot=%d", ready.RunnerGeneration, runnerGeneration)
 	}
 	if stagingRef != ready.StagingRef {
 		return CommittedCheckpoint{}, fmt.Errorf("staging ref mismatch")
@@ -188,7 +249,7 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 		return CommittedCheckpoint{}, fmt.Errorf("staging ref not under staging dir")
 	}
 
-	raw, err := os.ReadFile(ready.StagingRef)
+	raw, err := safefs.ReadFileBeneathLimited(c.workspacesRoot, rel, int64(maxBundleBytes))
 	if err != nil {
 		return CommittedCheckpoint{}, fmt.Errorf("read staging: %w", err)
 	}
@@ -210,6 +271,16 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 	if sv, _ := bundle["schema_version"].(string); sv != snapshotSchemaVersion {
 		return CommittedCheckpoint{}, fmt.Errorf("unsupported schema_version %q", sv)
 	}
+	// Bundle 身份校验(审查 I7/R4-M14): bundle 声明的 task_id/session_key 必须
+	// 与 DB snapshot 行一致, 防止 Runner 混入其他 task/session 的合法 bundle;
+	// session_key 缺失或为空直接拒绝(不允许跳过身份绑定)。
+	taskRow, getErr := c.store.GetTask(ctx, ready.TaskID)
+	if getErr != nil {
+		return CommittedCheckpoint{}, fmt.Errorf("resolve task session: %w", getErr)
+	}
+	if err := validateBundleIdentity(bundle, ready.TaskID, taskRow.SessionKey, int64(runnerGeneration)); err != nil {
+		return CommittedCheckpoint{}, err
+	}
 	resultObj, _ := bundle["result"].(map[string]any)
 	if resultObj == nil {
 		return CommittedCheckpoint{}, fmt.Errorf("bundle missing result")
@@ -226,17 +297,21 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 		return CommittedCheckpoint{}, fmt.Errorf("result digest mismatch: worker=%s bundle=%s", ready.ResultDigest, resultDigest)
 	}
 
-	committedDir := filepath.Join(stateRoot, "committed")
-	committedPath := filepath.Join(committedDir, ready.SnapshotID+".bundle.json")
-	if err := atomicWrite(committedPath, raw); err != nil {
+	committedRel := filepath.Join(hash, "state", "committed", ready.SnapshotID+".bundle.json")
+	if err := safefs.MkdirAllBeneath(c.workspacesRoot, filepath.Join(hash, "state", "committed"), 0o770); err != nil {
+		return CommittedCheckpoint{}, err
+	}
+	if err := safefs.AtomicWriteBeneath(c.workspacesRoot, committedRel, raw, 0o640); err != nil {
 		return CommittedCheckpoint{}, err
 	}
 	// 删除 staging 前先持久化 committed(不可变重命名语义)。
-	_ = os.Remove(ready.StagingRef)
+	_ = safefs.RemoveBeneath(c.workspacesRoot, rel)
 
-	resultsDir := filepath.Join(stateRoot, "results")
-	resultPath := filepath.Join(resultsDir, ready.SnapshotID+".result")
-	if err := atomicWrite(resultPath, []byte(body)); err != nil {
+	resultRel := filepath.Join(hash, "state", "results", ready.SnapshotID+".result")
+	if err := safefs.MkdirAllBeneath(c.workspacesRoot, filepath.Join(hash, "state", "results"), 0o770); err != nil {
+		return CommittedCheckpoint{}, err
+	}
+	if err := safefs.AtomicWriteBeneath(c.workspacesRoot, resultRel, []byte(body), 0o640); err != nil {
 		return CommittedCheckpoint{}, err
 	}
 
@@ -256,6 +331,29 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 // CurrentRestorePoint resolves the workspace's committed snapshot. The
 // returned SnapshotRef is the Runner-visible container path(state 挂载点内),
 // so StartSession can pass it to the Worker unchanged.
+// validateBundleIdentity 校验 bundle 声明的身份与 DB snapshot/task 行一致:
+// task_id 必须等于 ready 任务; session_key 必须存在且等于任务的 session;
+// bundle 内声明的 runner_generation 必须等于 Prepare 时写入 snapshot 行的
+// generation(审查 R4-M14: 旧 generation Runner 不得把陈旧 bundle 冒充新
+// 快照提交)。纯函数便于无 DB 单测。
+func validateBundleIdentity(bundle map[string]any, readyTaskID, taskSessionKey string, snapshotGeneration int64) error {
+	if bTask, _ := bundle["task_id"].(string); bTask != readyTaskID {
+		return fmt.Errorf("bundle task_id %q != ready %q", bTask, readyTaskID)
+	}
+	if bSession, _ := bundle["session_key"].(string); bSession == "" {
+		return fmt.Errorf("bundle missing session_key")
+	} else if bSession != taskSessionKey {
+		return fmt.Errorf("bundle session_key %q != task session %q", bSession, taskSessionKey)
+	}
+	bGen, _ := bundle["runner_generation"].(float64)
+	if int64(bGen) != snapshotGeneration {
+		return fmt.Errorf(
+			"bundle runner_generation %v != snapshot generation %d", bGen, snapshotGeneration,
+		)
+	}
+	return nil
+}
+
 func (c *WorkspaceCoordinator) CurrentRestorePoint(
 	ctx context.Context,
 	workspaceID string,
@@ -273,21 +371,69 @@ func (c *WorkspaceCoordinator) CurrentRestorePoint(
 	if _, err := os.Stat(platformPath); err != nil {
 		return RestorePoint{}, false, fmt.Errorf("stat committed snapshot: %w", err)
 	}
-	return RestorePoint{SnapshotID: snapshotID, SnapshotRef: runnerPath, Checksum: checksum}, true, nil
+	// 审查 R4-I6: 恢复读取必须按 Prepare 时的 max_bundle_bytes 限长, 防止
+	// committed/ 被 Runner 替换为超大文件后无界读入 Runner 内存。
+	maxBytes, err := c.store.SnapshotMaxBundleBytes(ctx, snapshotID)
+	if err != nil {
+		return RestorePoint{}, false, fmt.Errorf("resolve snapshot bundle limit: %w", err)
+	}
+	if maxBytes <= 0 {
+		return RestorePoint{}, false, fmt.Errorf("snapshot %s has no bundle limit", snapshotID)
+	}
+	return RestorePoint{
+		SnapshotID: snapshotID, SnapshotRef: runnerPath, Checksum: checksum,
+		MaxBundleBytes: maxBytes,
+	}, true, nil
+}
+
+// SweepExpiredCheckpoints 定期清理 checkpoint lease 已过期的 writing
+// snapshot(置为 quarantined)并删除宿主 staging 文件(审查 R4-I12):
+// Prepare 后未 Commit 的 snapshot 会在任务失败/崩溃/DB 错误时残留,
+// 不清理则永久占用 DB 行与宿主磁盘。
+func (c *WorkspaceCoordinator) SweepExpiredCheckpoints(ctx context.Context) (int, error) {
+	expired, err := c.store.QuarantineExpiredWritingSnapshots(ctx, time.Now().UTC())
+	if err != nil {
+		return 0, err
+	}
+	for _, q := range expired {
+		if q.StagingRef == "" {
+			continue
+		}
+		rel, err := filepath.Rel(c.workspacesRoot, q.StagingRef)
+		if err != nil || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+			slog.WarnContext(ctx, "checkpoint sweep: skip staging ref outside workspaces root",
+				"snapshot_id", q.SnapshotID, "staging_ref", q.StagingRef)
+			continue
+		}
+		if err := safefs.RemoveBeneath(c.workspacesRoot, rel); err != nil && !os.IsNotExist(err) {
+			slog.WarnContext(ctx, "checkpoint sweep: remove staging file failed",
+				"snapshot_id", q.SnapshotID, "staging_ref", q.StagingRef, "error", err)
+		}
+	}
+	return len(expired), nil
 }
 
 // ReadResult resolves only opaque result refs and verifies digest.
 func (c *WorkspaceCoordinator) ReadResult(ctx context.Context, ref string, expectedDigest string) (domain.ResultPayload, error) {
-	_ = ctx
 	hash, id, err := parseOpaqueRef(ref, opaqueResultPrefix)
 	if err != nil {
 		return domain.ResultPayload{}, err
+	}
+	// 审查: results/ 位于 Runner 可写的 state 挂载下, Runner 可替换结果文件
+	// 为任意大小——读取必须按 Prepare 时的 max_bundle_bytes 限长, 防止
+	// ReadAll 耗尽 Platform 内存(digest 校验在读完之后, 不能先读后查限)。
+	maxBytes, err := c.store.SnapshotMaxBundleBytes(ctx, id)
+	if err != nil {
+		return domain.ResultPayload{}, fmt.Errorf("resolve result limit: %w", err)
+	}
+	if maxBytes <= 0 {
+		return domain.ResultPayload{}, fmt.Errorf("snapshot %s has no bundle limit", id)
 	}
 	path := filepath.Join(c.workspacesRoot, hash, "state", "results", id+".result")
 	if !strings.HasPrefix(filepath.Clean(path), filepath.Clean(c.workspacesRoot)) {
 		return domain.ResultPayload{}, fmt.Errorf("result path escapes workspaces root")
 	}
-	body, err := os.ReadFile(path)
+	body, err := safefs.ReadFileBeneathLimited(c.workspacesRoot, filepath.Join(hash, "state", "results", id+".result"), maxBytes)
 	if err != nil {
 		return domain.ResultPayload{}, err
 	}

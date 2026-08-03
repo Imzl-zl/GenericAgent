@@ -10,9 +10,9 @@ DROP TABLE IF EXISTS sop_entries CASCADE;
 DROP TABLE IF EXISTS sop_candidates CASCADE;
 
 -- 0035 创建的 tasks 表触发器与函数一并清理(先 drop trigger, 再 drop function)。
-DROP TRIGGER IF EXISTS task_sop_snapshots_sealed ON task_sop_snapshots;
+-- 注意: 上面 DROP TABLE ... CASCADE 已级联删除挂在已删表上的触发器,
+-- 不能再对不存在的表执行 DROP TRIGGER(会直接报 relation does not exist)。
 DROP TRIGGER IF EXISTS tasks_sop_creation_identity_immutable ON tasks;
-DROP TRIGGER IF EXISTS sop_versions_append_only ON sop_versions;
 DROP FUNCTION IF EXISTS guard_task_sop_snapshot();
 DROP FUNCTION IF EXISTS reject_sop_version_mutation();
 

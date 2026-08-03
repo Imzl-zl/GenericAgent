@@ -40,8 +40,19 @@ func (s *scheduler) reapIdleTasks(ctx context.Context, owned []domain.Task, idle
 			"session_key", t.SessionKey,
 			"last_activity_at", formatActivityTime(t.LastActivityAt, t.WorkerDispatchStartedAt),
 			"idle_threshold_seconds", int(idle.Seconds()))
+		// 先取消 Worker 再终态化(审查): 否则串行槽被释放后下一任务即可
+		// claim, 而旧任务仍在 Worker 内执行/写 memory/temp, 违反同一
+		// runner_key 串行不变量。
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.CancelWorker(cancelCtx, t); err != nil {
+			slog.WarnContext(ctx, "scheduler: idle reap cancel failed", "task_id", t.ID, "error", err)
+		}
+		cancel()
 		_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_IDLE", "Worker heartbeat went silent; possible deadlock or hung I/O", "")
+		// 审查: idle 任务被收割后 Worker 内存状态未提交, 不复用——销毁重建,
+		// 否则下一任务会继承未提交的 history/working 或与仍在运行的旧任务重叠。
+		s.evictWorkerAfterFailure(t.SessionKey)
 		_ = s.KickSession(ctx, t.SessionKey)
 	}
 	return nil

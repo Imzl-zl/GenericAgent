@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ga_worker.limits import ToolPolicy
-from ga_worker.session_files import ensure_session_sandbox, resolve_under_root
+from ga_worker.session_files import ensure_session_sandbox
 
 
 def prepare_handler_seed(
@@ -34,6 +34,12 @@ def prepare_handler_seed(
     class (P-M2: previously leaked the WrappedHandler across sessions).
     """
     agent.handler = None
+
+    # 项目激活态恢复(审查): working 中保存的 _ga_project_mode_name 在
+    # checkpoint 恢复后重新设置到 agent 实例, project_mode hook 才能继续注入。
+    project_name = seed_working.get("_ga_project_mode_name") if isinstance(seed_working, dict) else None
+    if project_name:
+        setattr(agent, "_ga_project_mode_name", project_name)
 
     if agent_factory is not None and seed_working:
         class _Seed:
@@ -124,47 +130,145 @@ _EXPORT_DOCX_TOOL = {
     },
 }
 
+_SOPHUB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "sophub_search",
+        "description": "Search approved SOPs in SOPHub via the platform-controlled proxy. Returns matching SOP summaries; use sophub_install to install one into the workspace memory/sops/.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search query"},
+            },
+            "required": ["query"],
+        },
+    },
+}
 
-def install_session_file_sandbox(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
+_SOPHUB_INSTALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "sophub_install",
+        "description": "Install an approved SOP from SOPHub into the current workspace memory/sops/<remote_id>.md via the platform-controlled proxy. Never overwrites a locally modified SOP.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "remote_id": {"type": "string", "description": "SOP remote id from sophub_search results"},
+            },
+            "required": ["remote_id"],
+        },
+    },
+}
+
+
+def install_sophub_tools(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
+    """Expose sophub_search/sophub_install when the session carries a Sophub
+    proxy capability(方案 §5.2 接线, 审查): 工具 schema 追加到
+    _tenant_custom_tools_schema, handler 方法安装到 GenericAgentHandler;
+    policy 必须允许工具名, dispatch guard 仍会二次拦截。
+    """
     if legacy_mods is None or session is None:
         return lambda: None
     ga_mod = legacy_mods.get("ga")
-    if ga_mod is None:
+    agentmain = legacy_mods.get("agentmain")
+    if ga_mod is None or agentmain is None:
         return lambda: None
     handler_cls = getattr(ga_mod, "GenericAgentHandler", None)
     if handler_cls is None:
         return lambda: None
+    proxy = getattr(session, "sophub_proxy", None)
+    workspace_memory = getattr(session, "workspace_memory", None)
+    if proxy is None or workspace_memory is None:
+        return lambda: None
 
-    sandbox_root = ensure_session_sandbox(Path(session.overlay_dir).parents[1], session.session_key)
-    original_init = getattr(handler_cls, "__init__", None)
-    original_get_abs_path = getattr(handler_cls, "_get_abs_path", None)
+    previous_custom_schema = getattr(agentmain, "_tenant_custom_tools_schema", None)
+    original_methods: dict[str, Any] = {}
+    installed_methods: dict[str, Any] = {}
+    custom = list(previous_custom_schema or [])
+    existing_names = {
+        tool.get("function", {}).get("name")
+        for tool in custom
+        if isinstance(tool, dict)
+    }
+    schemas = [(_SOPHUB_SEARCH_TOOL, "sophub_search"), (_SOPHUB_INSTALL_TOOL, "sophub_install")]
+    prepared: list[tuple[str, str]] = []
+    for schema, name in schemas:
+        if name in existing_names:
+            raise ValueError(f"duplicate custom tool name: {name}")
+        prepared.append((schema, name))
+        existing_names.add(name)
 
-    def _set_cwd(handler: Any) -> None:
-        if handler is not None:
-            handler.cwd = str(sandbox_root)
+    def make_sophub_handler(proxy: Any, workspace_memory: Path, tool_name: str) -> Callable[..., Any]:
+        def do_sophub_tool(self, args, response):
+            from ga_worker.sop_tool import SopToolError, sophub_install, sophub_search
+            try:
+                if tool_name == "sophub_search":
+                    result = sophub_search(proxy, args.get("query", ""))
+                    yield f"[SOPHub Search]\n{result}\n"
+                else:
+                    target = sophub_install(proxy, Path(workspace_memory), args.get("remote_id", ""))
+                    yield f"[SOPHub Install] installed SOP to {target}\n"
+            except SopToolError as exc:
+                yield f"[Status] ❌ SOPHub 工具调用失败: {exc.message}\n"
+                step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
+                if step_outcome_cls is None:
+                    raise
+                return step_outcome_cls(
+                    {"status": "error", "message": str(exc.message)},
+                    next_prompt="SOPHub tool failed; report the explicit error instead of assuming success.\n",
+                    should_exit=False,
+                )
+            step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
+            if step_outcome_cls is None:
+                return
+            return step_outcome_cls(None, next_prompt="\n")
+        return do_sophub_tool
 
-    if callable(original_init):
-        def sandboxed_init(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
-            _set_cwd(self)
-        handler_cls.__init__ = sandboxed_init  # type: ignore[assignment]
+    for schema, name in prepared:
+        method_name = f"do_{name}"
+        if hasattr(handler_cls, method_name):
+            raise ValueError(f"SOPHub tool conflicts with existing handler method: {name}")
+        do_sophub_tool = make_sophub_handler(proxy, workspace_memory, name)
+        original_methods[method_name] = getattr(handler_cls, method_name, None)
+        installed_methods[method_name] = do_sophub_tool
+        setattr(handler_cls, method_name, do_sophub_tool)
+        custom.append(schema)
 
-    def sandboxed_get_abs_path(self, path):
-        raw = (path or "").strip()
-        if not raw:
-            return ""
-        return str(resolve_under_root(sandbox_root, raw))
-
-    handler_cls._get_abs_path = sandboxed_get_abs_path  # type: ignore[assignment]
-    _set_cwd(getattr(session.agent, "handler", None))
+    agentmain._tenant_custom_tools_schema = custom
 
     def unwrap() -> None:
-        if callable(original_init) and getattr(handler_cls, "__init__", None) is sandboxed_init:
-            handler_cls.__init__ = original_init  # type: ignore[assignment]
-        if original_get_abs_path is not None and getattr(handler_cls, "_get_abs_path", None) is sandboxed_get_abs_path:
-            handler_cls._get_abs_path = original_get_abs_path  # type: ignore[assignment]
+        for method_name, installed in installed_methods.items():
+            if getattr(handler_cls, method_name, None) is not installed:
+                continue
+            original = original_methods[method_name]
+            if original is None:
+                delattr(handler_cls, method_name)
+            else:
+                setattr(handler_cls, method_name, original)
+        if previous_custom_schema is None:
+            if hasattr(agentmain, "_tenant_custom_tools_schema"):
+                delattr(agentmain, "_tenant_custom_tools_schema")
+        else:
+            agentmain._tenant_custom_tools_schema = previous_custom_schema
 
     return unwrap
+
+
+
+
+def install_session_file_sandbox(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
+    """确保会话文件目录(attachments/outputs)存在。
+
+    审查: 不再重定向 handler.cwd 或重写 _get_abs_path——那会破坏 GA 原生
+    相对路径语义(./temp、../memory、temp/projects)。容器中 GA handler.cwd
+    解析到工作区 temp(进程 workdir 为 GA 根), 附件/输出布局已统一到
+    temp/attachments 与 temp/outputs(方案 §6), GA 文件工具直接用原生
+    相对路径即可读写 Platform 导入的附件与待交付输出。
+    """
+    if session is None:
+        return lambda: None
+    ensure_session_sandbox(Path(session.overlay_dir).parents[1], session.session_key)
+    return lambda: None
 
 
 def install_global_mcp_tools(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:

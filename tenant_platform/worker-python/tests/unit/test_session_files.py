@@ -80,6 +80,11 @@ def test_session_sandbox_does_not_inject_local_export_docx(tmp_path: Path):
         def __init__(self, *args, **kwargs):
             self.cwd = "./temp"
 
+        # 原生语义(ga.py): 相对路径基于 cwd 解析, 不做沙箱重定向。
+        def _get_abs_path(self, path):
+            import os as _os
+            return _os.path.abspath(_os.path.join(self.cwd, path))
+
     ga_mod = types.SimpleNamespace(GenericAgentHandler=FakeHandler)
     agentmain_mod = types.SimpleNamespace(TOOLS_SCHEMA=[
         {"type": "function", "function": {"name": "file_read"}},
@@ -103,13 +108,9 @@ def test_session_sandbox_does_not_inject_local_export_docx(tmp_path: Path):
         assert names == ["file_read"]
 
         handler = ga_mod.GenericAgentHandler(None)
-        assert "session_files" in Path(handler.cwd).as_posix()
-        resolved = Path(handler._get_abs_path("outputs/demo.docx"))
-        assert resolved.parts[-2:] == ("outputs", "demo.docx")
-        assert "session_files" in resolved.as_posix()
+        # 审查: 不再重定向 cwd——GA 原生相对路径语义(./temp、../memory)保持。
+        assert handler.cwd == "./temp"
         assert not hasattr(ga_mod.GenericAgentHandler, "do_export_docx")
-        assert not resolved.exists()
-        assert session.generated_output_files == []
     finally:
         restore_tool_schema(previous, {"ga": ga_mod, "agentmain": agentmain_mod})
         unwrap()

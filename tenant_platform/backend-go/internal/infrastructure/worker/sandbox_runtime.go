@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -20,9 +21,10 @@ import (
 // RunnerLeaseStore 是 Platform 侧持久 Runner lease 的最小接口
 // (实现: postgres.Store; 方案 §7: generation fencing 与重启恢复)。
 type RunnerLeaseStore interface {
-	AcquireRunnerLease(ctx context.Context, runnerKey, owner string, leaseTTL time.Duration) (domain.RunnerLease, bool, error)
-	AttachRunnerContainer(ctx context.Context, runnerKey, containerID string) error
-	ReleaseRunnerLease(ctx context.Context, runnerKey, owner string) error
+	AcquireRunnerLease(ctx context.Context, runnerKey, owner string, leaseTTL time.Duration, maxActive int64) (domain.RunnerLease, bool, error)
+	RenewRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64, leaseTTL time.Duration) error
+	AttachRunnerContainer(ctx context.Context, runnerKey, containerID string, generation uint64) error
+	ReleaseRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64) error
 }
 
 // SandboxConfig carries the deployment-level inputs for the Runner runtime.
@@ -41,6 +43,9 @@ type SandboxConfig struct {
 	Env []string
 	// RunnerLeaseTTL 是 Runner lease 时长(续租驱动 idle 回收)。
 	RunnerLeaseTTL time.Duration
+	// MaxActiveRunners 是全局活跃 Runner lease 上限(0 = 不限制)。
+	// 创建新 lease 时在 DB 事务内原子校验(方案 §7 容量排队)。
+	MaxActiveRunners int64
 	// ControlDialTimeout bounds waiting for the Runner gRPC endpoint.
 	ControlDialTimeout time.Duration
 }
@@ -93,18 +98,27 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 
 	// 1. 持久 lease: 获取/续租 generation(owner = 本 Platform 实例)。
 	lease, created, err := r.cfg.LeaseStore.AcquireRunnerLease(
-		ctx, workspaceKey, r.cfg.PlatformInstanceID, r.cfg.RunnerLeaseTTL)
+		ctx, workspaceKey, r.cfg.PlatformInstanceID, r.cfg.RunnerLeaseTTL, r.cfg.MaxActiveRunners)
 	if err != nil {
 		return nil, fmt.Errorf("acquire runner lease: %w", err)
 	}
 	generation := lease.Generation
+	// fail-closed(审查): 已占用的容量在后续任何步骤失败时都必须立即释放,
+	// 否则多工作区各失败一次即可占满全局容量直到 TTL 到期。释放带 generation
+	// 条件, 不影响更新 generation 的 lease。
+	releaseOnFailure := func() {
+		_ = r.cfg.LeaseStore.ReleaseRunnerLease(context.Background(), workspaceKey, r.cfg.PlatformInstanceID, generation)
+	}
 
 	// 2. 旧 generation 容器接管清理: lease 过期被本实例接管时, 旧容器按
-	//    lease 记录的 container_id 销毁(best-effort; 找不到按孤儿由 Manager 回收)。
-	if created && lease.ContainerID != "" {
-		if err := r.cfg.Manager.Destroy(ctx, lease.ContainerID); err != nil {
+	//    lease 记录的 stale_container_id 销毁(best-effort; 找不到按孤儿由
+	//    Manager 回收)。接管事务把旧 container_id 移入 stale_container_id,
+	//    Platform 重启生成新 CA 后旧容器无法拨号, 必须销毁重建(审查 C6)。
+	staleContainer := lease.StaleContainerID
+	if created && staleContainer != "" {
+		if err := r.cfg.Manager.Destroy(ctx, staleContainer); err != nil {
 			// 容器已不存在(重启后 sweep 已清理)属于预期, 不阻断创建。
-			slogWarn("sandbox runtime: destroy stale runner best-effort", "container", lease.ContainerID, "error", err)
+			slogWarn("sandbox runtime: destroy stale runner best-effort", "container", staleContainer, "error", err)
 		}
 	}
 
@@ -113,21 +127,29 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 	runnerName := r.runnerName(workspaceKey, generation)
 	serverCert, err := r.cfg.CA.IssueRunnerCert(workspaceKey, generation, r.cfg.RunnerLeaseTTL, runnerName)
 	if err != nil {
+		releaseOnFailure()
 		return nil, fmt.Errorf("issue runner cert: %w", err)
 	}
 	clientCert, err := r.cfg.CA.IssuePlatformClientCert(r.cfg.RunnerLeaseTTL)
 	if err != nil {
+		releaseOnFailure()
 		return nil, fmt.Errorf("issue platform client cert: %w", err)
 	}
 	policy, err := os.ReadFile(r.cfg.PolicyFile)
 	if err != nil {
+		releaseOnFailure()
 		return nil, fmt.Errorf("read policy file: %w", err)
 	}
 	configFiles := map[string][]byte{
-		"server.crt": serverCert.CertPEM,
-		"server.key": serverCert.KeyPEM,
-		"ca.crt":     r.cfg.CA.CertPEM,
+		"server.crt":  serverCert.CertPEM,
+		"server.key":  serverCert.KeyPEM,
+		"ca.crt":      r.cfg.CA.CertPEM,
 		"policy.json": policy,
+	}
+	// 运行时配置(mykey.runtime.json 等)随控制面材料一并注入容器 config/:
+	// Runner 的 load_runtime_metadata 从 GA_CONFIG_ROOT 读取(方案 §7)。
+	for name, data := range req.RuntimeConfigFiles {
+		configFiles[name] = data
 	}
 
 	// 4. 创建/复用 Runner(Manager 独占 Docker)。
@@ -138,12 +160,23 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 		ConfigFiles:  configFiles,
 	})
 	if err != nil {
+		releaseOnFailure()
 		return nil, fmt.Errorf("ensure runner %s: %w", workspaceKey, err)
 	}
 	if created {
-		// 绑定容器名到 lease(重启接管时用于销毁旧容器)。
-		if err := r.cfg.LeaseStore.AttachRunnerContainer(ctx, workspaceKey, runner.Name); err != nil {
-			slogWarn("sandbox runtime: attach runner container to lease failed", "runner", runner.Name, "error", err)
+		// 绑定不可变容器 ID 到 lease(generation 条件更新, 防止旧容器名覆盖
+		// 新 lease; 审查: lease 记录容器 ID 而非可推导容器名, 供定向清理)。
+		// 审查 R4-I5: attach 失败必须 fail-closed——lease 已不存在、已被
+		// 接管或 DB 故障时, 该容器无法被 lease 定向清理且可能属于旧
+		// generation, 继续执行会让旧 Runner 拨号后写穿工作区。
+		// 立即销毁容器并释放 lease, 不再继续。
+		if err := r.cfg.LeaseStore.AttachRunnerContainer(ctx, workspaceKey, runner.ContainerID, generation); err != nil {
+			destroyErr := r.cfg.Manager.Destroy(ctx, runner.Name)
+			releaseOnFailure()
+			if destroyErr != nil {
+				slogWarn("sandbox runtime: destroy runner after attach failure", "runner", runner.Name, "error", destroyErr)
+			}
+			return nil, fmt.Errorf("attach runner container to lease: %w", err)
 		}
 	}
 
@@ -152,26 +185,58 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 	conn, err := r.dialMTLS(ctx, endpoint, clientCert)
 	if err != nil {
 		_ = r.cfg.Manager.Destroy(ctx, runner.Name)
+		releaseOnFailure()
 		return nil, fmt.Errorf("dial runner %s: %w", runner.Name, err)
 	}
 	client, err := workerclient.New(conn)
 	if err != nil {
 		_ = conn.Close()
 		_ = r.cfg.Manager.Destroy(ctx, runner.Name)
+		releaseOnFailure()
 		return nil, err
 	}
 
+	// 续租 goroutine: 活跃期间周期刷新 lease(方案 §7), 防止 TTL 到期被
+	// reaper 或其他实例接管; cleanup 时停止并等待退出。续租失败视为 lease
+	// 丢失: 立即 fence(停止 Runner 并释放 lease), 防止已过期 Runner 继续
+	// 执行任务(方案 §7 generation fencing; checkpoint 提交另有 lease 期限校验)。
+	renewStop := make(chan struct{})
+	renewDone := make(chan struct{})
+	var cleanupOnce sync.Once
 	cleanup := func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), workerShutdownTimeout)
-		_ = client.Shutdown(shutCtx, "scheduler-stop")
-		cancel()
-		_ = conn.Close()
-		if created {
-			_ = r.cfg.Manager.Destroy(context.Background(), runner.Name)
-		}
-		// 释放 lease: 下次 acquire 以 generation+1 重建, 防旧容器复活。
-		_ = r.cfg.LeaseStore.ReleaseRunnerLease(context.Background(), workspaceKey, r.cfg.PlatformInstanceID)
+		cleanupOnce.Do(func() {
+			close(renewStop)
+			<-renewDone
+			shutCtx, cancel := context.WithTimeout(context.Background(), workerShutdownTimeout)
+			// 控制面身份 fencing(方案 §7): Shutdown 绑定 workspace/generation。
+			_ = client.Shutdown(shutCtx, workspaceKey, "scheduler-stop", generation)
+			cancel()
+			_ = conn.Close()
+			if created {
+				_ = r.cfg.Manager.Destroy(context.Background(), runner.Name)
+			}
+			// 释放 lease: 下次 acquire 以 generation+1 重建, 防旧容器复活。
+			// 带 generation 条件, 旧 cleanup 无法释放新 generation 的 lease(审查 C6)。
+			_ = r.cfg.LeaseStore.ReleaseRunnerLease(context.Background(), workspaceKey, r.cfg.PlatformInstanceID, generation)
+		})
 	}
+	go func() {
+		defer close(renewDone)
+		ticker := time.NewTicker(r.cfg.RunnerLeaseTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewStop:
+				return
+			case <-ticker.C:
+				if err := r.cfg.LeaseStore.RenewRunnerLease(context.Background(), workspaceKey, r.cfg.PlatformInstanceID, generation, r.cfg.RunnerLeaseTTL); err != nil {
+					slogWarn("sandbox runtime: renew runner lease failed; fencing runner", "runner_key", workspaceKey, "error", err)
+					go cleanup()
+					return
+				}
+			}
+		}
+	}()
 	return &Instance{Client: client, InstID: fmt.Sprintf("runner-%s-g%d", workspaceKey, generation), Cleanup: cleanup, RunnerGeneration: generation}, nil
 }
 
@@ -181,15 +246,21 @@ func (r *SandboxWorkerRuntime) runnerName(workspaceKey string, generation uint64
 	return fmt.Sprintf("%s-%s-g%d", r.cfg.ContainerPrefix, hash[:12], generation)
 }
 
-// resolveGeneration 由持久 lease 提供(方案 §7 generation fencing)。
-// 保留方法以便调用方显式获取当前 generation(例如 task 下发)。
-func (r *SandboxWorkerRuntime) resolveGeneration(ctx context.Context, workspaceKey string) (uint64, error) {
+// ResolveGeneration 由持久 lease 提供(方案 §7 generation fencing);
+// 供 scheduler 在签发 per-task capability 前获取当前 generation。
+func (r *SandboxWorkerRuntime) ResolveGeneration(ctx context.Context, workspaceKey string) (uint64, error) {
 	lease, _, err := r.cfg.LeaseStore.AcquireRunnerLease(
-		ctx, workspaceKey, r.cfg.PlatformInstanceID, r.cfg.RunnerLeaseTTL)
+		ctx, workspaceKey, r.cfg.PlatformInstanceID, r.cfg.RunnerLeaseTTL, r.cfg.MaxActiveRunners)
 	if err != nil {
 		return 0, err
 	}
 	return lease.Generation, nil
+}
+
+// ReleaseRunnerLease 释放本实例持有的 lease(审查: scheduler 初始化失败
+// 路径归还容量)。generation 条件防止误释放更新 generation。
+func (r *SandboxWorkerRuntime) ReleaseRunnerLease(ctx context.Context, workspaceKey string, generation uint64) error {
+	return r.cfg.LeaseStore.ReleaseRunnerLease(ctx, workspaceKey, r.cfg.PlatformInstanceID, generation)
 }
 
 func (r *SandboxWorkerRuntime) dialMTLS(ctx context.Context, endpoint string, clientCert CertMaterial) (*grpc.ClientConn, error) {

@@ -100,7 +100,8 @@ func TestSophubServiceFetchRemoteSOPForWorkerProxy(t *testing.T) {
 	store := &fakeSophubStore{}
 	cipher := &fakeSophubCipher{}
 	client := &fakeSophubClient{remote: domain.SophubRemoteSOP{
-		ID: "sop-remote", FileType: "markdown", Status: "approved", Content: "# SOP",
+		ID: "sop-remote", FileType: "markdown", Status: "approved",
+		PackageType: "single_file", IsPublic: true, Content: "# SOP",
 	}}
 	service, err := NewSophubService(SophubServiceConfig{Store: store, Client: client, Cipher: cipher})
 	if err != nil {

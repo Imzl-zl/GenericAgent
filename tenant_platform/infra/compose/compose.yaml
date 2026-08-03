@@ -117,10 +117,12 @@ services:
       GA_WORKER_EXECUTION_MODE: ${GA_WORKER_EXECUTION_MODE:-user_workspace_runner}
       GA_RUNNER_MAX_ACTIVE: ${GA_RUNNER_MAX_ACTIVE:-4}
       GA_LLM_PROXY_ADDR: ${GA_LLM_PROXY_ADDR:-http://llm-proxy:8081}
-      MAX_RUNNING_TASKS: ${GA_RUNNER_MAX_ACTIVE:-4}
+      GA_RUNNER_IDLE_TTL: ${GA_RUNNER_IDLE_TTL:-30m}
       PER_TENANT_RUNNING_LIMIT: ${PER_TENANT_RUNNING_LIMIT}
       PER_USER_QUEUE_LIMIT: ${PER_USER_QUEUE_LIMIT}
       TASK_IDLE_TIMEOUT_SECONDS: ${TASK_IDLE_TIMEOUT_SECONDS}
+      # 单任务硬性时长上限(原 GA_RUNNER_TASK_TIMEOUT, 审查 M12: 语义属 Platform)
+      TASK_TIMEOUT_SECONDS: ${GA_RUNNER_TASK_TIMEOUT:-300}
       WORKER_IDLE_TTL_SECONDS: ${WORKER_IDLE_TTL_SECONDS}
       # 生产 Runner 控制面(方案 §7): Platform 经认证 Manager API 操作容器。
       GA_WORKSPACES_ROOT: /var/lib/ga/workspaces
@@ -128,7 +130,7 @@ services:
       GA_MANAGER_SECRET: ${GA_MANAGER_SECRET}
       GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
       GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
-      GA_SOPHUB_PROXY_ADDR: ${GA_SOPHUB_PROXY_ADDR:-}
+      GA_SOPHUB_PROXY_ADDR: ${GA_SOPHUB_PROXY_ADDR:-http://platform:8080}
     read_only: true
     cap_drop:
       - ALL
@@ -182,6 +184,14 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       LLM_PROXY_CAPABILITY_SIGNING_KEY: ${LLM_PROXY_CAPABILITY_SIGNING_KEY}
       LLM_PROXY_LISTEN: ${LLM_PROXY_LISTEN:-0.0.0.0:8081}
+      # 解密 provider API key 的 AES-256-GCM 密钥(审查 C2: 缺失则启动必失败)。
+      # 留空时回退 BOT_TOKEN_KEY —— Platform 用 BOT_TOKEN_KEY 加密 provider key。
+      LLM_PROVIDER_KEY: ${LLM_PROVIDER_KEY:-}
+      BOT_TOKEN_KEY: ${BOT_TOKEN_KEY:-}
+      # 受控 egress allowlist: 留空时仅允许公网 unicast 地址(默认);
+      # 生产建议配置为实际 Provider 出口 CIDR/域名。
+      LLM_PROXY_ALLOWED_UPSTREAM_CIDRS: ${LLM_PROXY_ALLOWED_UPSTREAM_CIDRS:-}
+      LLM_PROXY_ALLOW_HTTP_HOSTS: ${LLM_PROXY_ALLOW_HTTP_HOSTS:-}
     read_only: true
     cap_drop:
       - ALL
@@ -192,10 +202,13 @@ services:
     networks:
       - database
       - runner-control
+      # 唯一持有出站能力的服务: 仅 llm-proxy 接入 llm-egress 网络(审查 C2),
+      # Runner/Platform 保持 internal-only。
+      - llm-egress
     depends_on:
       postgres:
         condition: service_healthy
-    # 内部服务: 不映射宿主机端口; 仅 runner-control + database 网络(方案 §7)。
+    # 内部服务: 不映射宿主机端口; runner-control/database internal + llm-egress。
     pids_limit: 128
     mem_limit: 512m
     cpus: 1.0
@@ -226,17 +239,21 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      DATABASE_URL: ${DATABASE_URL}
       GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
+      # fail-closed(审查): 默认拒绝可变 tag。本地开发需在 .env 显式设
+      # GA_RUNNER_ALLOW_TAG=1 或改用 @sha256: digest 镜像; 生产禁止 tag。
+      GA_RUNNER_ALLOW_TAG: ${GA_RUNNER_ALLOW_TAG:-0}
+      GA_RUNNER_SHARE_GID: ${GA_RUNNER_SHARE_GID:-10003}
       GA_RUNNER_SECURITY_PROFILE: ${GA_RUNNER_SECURITY_PROFILE:-}
+      # fail-closed(审查): 生产(不可信 Runner)必须设 GA_RUNNER_SECURITY_PROFILE=runsc;
+      # 未设置时 sandbox-manager 拒绝启动, 除非本地开发显式设 GA_RUNNER_ALLOW_RUNC=1。
+      GA_RUNNER_ALLOW_RUNC: ${GA_RUNNER_ALLOW_RUNC:-0}
       GA_RUNNER_IDLE_TTL: ${GA_RUNNER_IDLE_TTL:-30m}
       GA_RUNNER_MEMORY_BYTES: ${GA_RUNNER_MEMORY_BYTES:-1073741824}
       GA_RUNNER_CPU_QUOTA: ${GA_RUNNER_CPU_QUOTA:-100000}
       GA_RUNNER_PIDS_LIMIT: ${GA_RUNNER_PIDS_LIMIT:-128}
-      GA_RUNNER_TASK_TIMEOUT: ${GA_RUNNER_TASK_TIMEOUT:-300s}
       GA_WORKSPACES_ROOT: ${GA_WORKSPACES_ROOT:-/var/lib/ga/workspaces}
       GA_WORKSPACES_VOLUME: ${GA_WORKSPACES_VOLUME:-runner_workspaces}
-      GA_LLM_PROXY_ADDR: ${GA_LLM_PROXY_ADDR:-http://llm-proxy:8081}
       GA_MANAGER_SECRET: ${GA_MANAGER_SECRET}
       GA_MANAGER_ID: ${GA_MANAGER_ID:-sandbox-manager-1}
       GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
@@ -246,14 +263,9 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner_workspaces:/var/lib/ga/workspaces
-      - platform_runtime:/var/lib/ga/runtime
     networks:
       - application
-      - database
       - runner-control
-    depends_on:
-      postgres:
-        condition: service_healthy
     pids_limit: 128
     mem_limit: 512m
     cpus: 1.0
@@ -298,6 +310,19 @@ services:
     stop_grace_period: 15s
     logging: *default-logging
 
+  # ga-runner 镜像构建入口(方案 §8): scale: 0 使 `docker compose up -d --build`
+  # 构建镜像但不启动容器(审查: 单命令部署必须包含 Runner 镜像构建)。
+  # 容器实例由 Sandbox Manager 按工作区活跃状态动态创建。
+  ga-runner:
+    image: ${GA_RUNNER_IMAGE:-ga-runner:local}
+    build:
+      context: ../../..
+      dockerfile: tenant_platform/infra/compose/ga-runner.Dockerfile
+    scale: 0
+    restart: "no"
+    entrypoint: ["true"]
+    logging: *default-logging
+
 volumes:
   postgres_data:
   platform_runtime:
@@ -315,3 +340,7 @@ networks:
   runner-control:
     internal: true
     name: runner-control
+  # llm-proxy 专有的出站网络(审查 C2): 非 internal, 供代理访问上游
+  # LLM Provider; Runner 不接入, 保持 internal-only。
+  llm-egress:
+    name: llm-egress

@@ -33,6 +33,10 @@ message StartSessionRequest {
   // Platform 在 mTLS 握手后校验; Runner 侧拒绝不匹配的控制请求(方案 §7)。
   string workspace_key = 6;
   uint64 runner_generation = 7;
+  // max_bundle_bytes 是当前恢复快照的硬性大小上限(写入时由 Platform 按
+  // Prepare 的 max_bundle_bytes 校验)。Runner 恢复时必须先按此限长读取,
+  // 防止 committed/ 被替换为超大文件后无界读入内存(审查 R4-I6)。
+  uint64 max_bundle_bytes = 8;
 }
 
 message StartSessionResponse {
@@ -43,6 +47,10 @@ message StartSessionResponse {
 message ReloadCredentialsRequest {
   uint64 credential_generation = 1;
   string config_checksum = 2;
+  // 控制面身份 fencing(方案 §7, 审查): 迟到的 reload 请求必须绑定当前
+  // workspace 与 Runner generation, Worker 侧拒绝不匹配的控制请求。
+  string workspace_key = 3;
+  uint64 runner_generation = 4;
 }
 
 message ReloadCredentialsResponse {
@@ -85,6 +93,10 @@ message BeginCheckpointRequest {
   string checkpoint_token = 2;
   string staging_ref = 3;
   uint64 max_bundle_bytes = 4;
+  // runner_generation 绑定签发 checkpoint 时的 Runner lease generation
+  // (方案 §7 fencing): Worker 回显, Platform 提交时校验, 防止旧 generation
+  // Runner 在 lease 被接管后提交恢复点(审查 I7)。
+  uint64 runner_generation = 5;
 }
 
 message CheckpointReady {
@@ -93,6 +105,7 @@ message CheckpointReady {
   string staging_ref = 3;
   string checksum = 4;
   string result_digest = 5;
+  uint64 runner_generation = 6;
 }
 
 message ErrorEnvelope {
@@ -117,7 +130,12 @@ message WorkerEvent {
   }
 }
 
-message CancelTaskRequest { string task_id = 1; }
+message CancelTaskRequest {
+  string task_id = 1;
+  // 控制面身份 fencing(方案 §7, 审查): 与 ReloadCredentialsRequest 相同。
+  string workspace_key = 2;
+  uint64 runner_generation = 3;
+}
 message CancelTaskResponse { bool accepted = 1; }
 message HealthRequest {}
 message HealthResponse {
@@ -125,7 +143,12 @@ message HealthResponse {
   string session_key = 2;
   bool ready = 3;
 }
-message ShutdownRequest { string reason = 1; }
+message ShutdownRequest {
+  string reason = 1;
+  // 控制面身份 fencing(方案 §7, 审查): 与 ReloadCredentialsRequest 相同。
+  string workspace_key = 2;
+  uint64 runner_generation = 3;
+}
 message ShutdownResponse { bool accepted = 1; }
 
 service WorkerService {
