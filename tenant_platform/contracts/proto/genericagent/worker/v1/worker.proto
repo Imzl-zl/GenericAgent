@@ -97,6 +97,9 @@ message BeginCheckpointRequest {
   // (方案 §7 fencing): Worker 回显, Platform 提交时校验, 防止旧 generation
   // Runner 在 lease 被接管后提交恢复点(审查 I7)。
   uint64 runner_generation = 5;
+  // 审查 R5-I8: 当前 task 的 capability JTI(与 ExecuteTask 同源)。Worker
+  // 校验其在会话活跃凭据集中——终态撤销后旧 JTI 无法再发起 checkpoint。
+  string capability_jti = 6;
 }
 
 message CheckpointReady {
@@ -135,6 +138,9 @@ message CancelTaskRequest {
   // 控制面身份 fencing(方案 §7, 审查): 与 ReloadCredentialsRequest 相同。
   string workspace_key = 2;
   uint64 runner_generation = 3;
+  // 审查 R5-I8: 当前 task 的 capability JTI(与 ExecuteTask 同源), Worker
+  // 校验其在会话活跃凭据集中——终态撤销后旧 JTI 无法取消新任务。
+  string capability_jti = 4;
 }
 message CancelTaskResponse { bool accepted = 1; }
 message HealthRequest {}
@@ -148,6 +154,8 @@ message ShutdownRequest {
   // 控制面身份 fencing(方案 §7, 审查): 与 ReloadCredentialsRequest 相同。
   string workspace_key = 2;
   uint64 runner_generation = 3;
+  // 审查 R5-I8: 当前 task 的 capability JTI, Worker 校验其在会话活跃凭据集中。
+  string capability_jti = 4;
 }
 message ShutdownResponse { bool accepted = 1; }
 

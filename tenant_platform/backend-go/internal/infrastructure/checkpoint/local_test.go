@@ -39,7 +39,7 @@ func seedTask(t *testing.T, store *postgres.Store) domain.Task {
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
-	if _, err := store.MarkDispatchStarted(ctx, claimed.ID, owner, "worker-1"); err != nil {
+	if _, err := store.MarkDispatchStarted(ctx, claimed.ID, owner, "worker-1", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.MarkRunning(ctx, claimed.ID, owner); err != nil {
@@ -123,7 +123,7 @@ func TestLocalCoordinator_PrepareCommitRead_TokenMismatch(t *testing.T) {
 		t.Fatalf("result ref looks like path: %s", committed.ResultRef)
 	}
 
-	if _, err := store.CompleteSucceeded(ctx, task.ID, "platform-a", committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, len(body)); err != nil {
+	if _, err := store.CompleteSucceeded(ctx, task.ID, "platform-a", committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, len(body), nil); err != nil {
 		t.Fatal(err)
 	}
 	restore, ok, err := coord.CurrentRestorePoint(ctx, task.WorkspaceID)

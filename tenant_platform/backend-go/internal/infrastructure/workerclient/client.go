@@ -35,9 +35,11 @@ type WorkerClient interface {
 	BeginCheckpoint(ctx context.Context, req *workerv1.BeginCheckpointRequest) (*workerv1.CheckpointReady, error)
 	// CancelTask/Shutdown 携带 workspace_key + runner_generation(方案 §7,
 	// 审查): 迟到的控制请求必须绑定当前 Runner 身份, Worker 侧拒绝不匹配。
-	CancelTask(ctx context.Context, workspaceKey, taskID string, runnerGeneration uint64) error
+	// capabilityJTI 是当前 task 的 capability JTI(审查 R5-I8): 非空时 Worker
+	// 校验其在会话活跃凭据集中; 清理路径(进程兜底销毁)可传空。
+	CancelTask(ctx context.Context, workspaceKey, taskID string, runnerGeneration uint64, capabilityJTI string) error
 	Health(ctx context.Context) (*workerv1.HealthResponse, error)
-	Shutdown(ctx context.Context, workspaceKey, reason string, runnerGeneration uint64) error
+	Shutdown(ctx context.Context, workspaceKey, reason string, runnerGeneration uint64, capabilityJTI string) error
 }
 
 // Client implements WorkerClient over a single gRPC connection.
@@ -181,7 +183,7 @@ func (c *Client) BeginCheckpoint(ctx context.Context, req *workerv1.BeginCheckpo
 	return ready, nil
 }
 
-func (c *Client) CancelTask(ctx context.Context, workspaceKey, taskID string, runnerGeneration uint64) error {
+func (c *Client) CancelTask(ctx context.Context, workspaceKey, taskID string, runnerGeneration uint64, capabilityJTI string) error {
 	if taskID == "" {
 		return errors.New("workerclient: empty taskID")
 	}
@@ -192,6 +194,7 @@ func (c *Client) CancelTask(ctx context.Context, workspaceKey, taskID string, ru
 	defer cancel()
 	resp, err := c.raw.CancelTask(callCtx, &workerv1.CancelTaskRequest{
 		TaskId: taskID, WorkspaceKey: workspaceKey, RunnerGeneration: runnerGeneration,
+		CapabilityJti: capabilityJTI,
 	})
 	if err != nil {
 		return wrapRPC("CancelTask", err)
@@ -214,7 +217,7 @@ func (c *Client) Health(ctx context.Context) (*workerv1.HealthResponse, error) {
 	return resp, nil
 }
 
-func (c *Client) Shutdown(ctx context.Context, workspaceKey, reason string, runnerGeneration uint64) error {
+func (c *Client) Shutdown(ctx context.Context, workspaceKey, reason string, runnerGeneration uint64, capabilityJTI string) error {
 	if workspaceKey == "" || runnerGeneration == 0 {
 		return errors.New("workerclient: shutdown identity (workspace_key, generation) is required")
 	}
@@ -222,6 +225,7 @@ func (c *Client) Shutdown(ctx context.Context, workspaceKey, reason string, runn
 	defer cancel()
 	resp, err := c.raw.Shutdown(callCtx, &workerv1.ShutdownRequest{
 		Reason: reason, WorkspaceKey: workspaceKey, RunnerGeneration: runnerGeneration,
+		CapabilityJti: capabilityJTI,
 	})
 	if err != nil {
 		return wrapRPC("Shutdown", err)

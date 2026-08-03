@@ -111,7 +111,9 @@ docker compose up -d
 # 删除旧 PG 数据卷与 document_work 卷，然后按新 schema 重建启动
 ./infra/compose/reset-dev.sh
 
-# 完整重置（额外删除 platform_runtime / platform_config / session_files / bot_media）
+# 完整重置（额外删除 platform_runtime / platform_config / session_files /
+# bot_media / runner_workspaces——runner_workspaces 含全部用户记忆/SOP/项目/
+# 文件，删除前脚本会二次确认，审查 F8）
 ./infra/compose/reset-dev.sh --all
 ```
 

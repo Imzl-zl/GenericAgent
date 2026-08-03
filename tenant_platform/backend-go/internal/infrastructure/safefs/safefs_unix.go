@@ -3,6 +3,7 @@
 package safefs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -63,9 +64,16 @@ func ReadFileBeneath(root, rel string) ([]byte, error) {
 	return ReadFileBeneathLimited(root, rel, 0)
 }
 
+// ErrFileTooLarge 表示读取期间文件超过 maxBytes(审查 R5-I5): fstat 后文件
+// 被继续增长时, 旧实现 LimitReader(maxBytes) 会静默截断——现在读取上限为
+// maxBytes+1, 读到超限字节即拒绝, 不返回不完整内容。
+var ErrFileTooLarge = errors.New("file exceeded read limit")
+
 // ReadFileBeneathLimited 读取 root 下 rel 的普通文件, 但先按 size 校验上限
 // (maxBytes > 0 时), 拒绝超限文件而不读入内存(审查 I8: 不可信 staging 文件
 // 不得先 ReadAll 后查限, 防止恶意超大文件耗尽 Platform 内存)。
+// 读取上限为 maxBytes+1: fstat 与读取之间文件被增长时, 读到 maxBytes+1
+// 字节即报 ErrFileTooLarge, 不做静默截断(审查 R5-I5)。
 func ReadFileBeneathLimited(root, rel string, maxBytes int64) ([]byte, error) {
 	f, err := OpenBeneath(root, rel, unix.O_RDONLY, 0)
 	if err != nil {
@@ -83,7 +91,14 @@ func ReadFileBeneathLimited(root, rel string, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("%s exceeds size limit %d (got %d)", rel, maxBytes, info.Size())
 	}
 	if maxBytes > 0 {
-		return io.ReadAll(io.LimitReader(f, maxBytes))
+		buf, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(buf)) > maxBytes {
+			return nil, fmt.Errorf("%w: %s grew beyond %d bytes during read", ErrFileTooLarge, rel, maxBytes)
+		}
+		return buf, nil
 	}
 	return io.ReadAll(f)
 }

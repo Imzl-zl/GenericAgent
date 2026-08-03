@@ -152,6 +152,9 @@ type ServerConfig struct {
 	Sophub                          application.SophubService
 	// SophubValidator 校验 Worker → Platform Sophub proxy 的 capability JWT。
 	SophubValidator func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error)
+	// SophubUsageCounter 按 JTI 原子计量 sophub 代理调用(审查 F10);
+	// 为 nil 时代理跳过计量(仅测试), 生产接线 postgres.Store。
+	SophubUsageCounter llmproxy.CapabilityUsageCounter
 	// SophubProxy 由 NewServer 依据 Sophub+SophubValidator 构造; 非 nil 时注册
 	// /v1/worker/sophub/* 端点。
 	SophubProxy                     *WorkerSophubProxy
@@ -180,10 +183,15 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	// Worker Sophub proxy: 提供 SophubService + capability 校验器时自动接线。
 	if cfg.Sophub != nil && cfg.SophubValidator != nil && cfg.SophubProxy == nil {
+		var consume func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error)
+		if cfg.SophubUsageCounter != nil {
+			consume = cfg.SophubUsageCounter.ConsumeCapabilityCall
+		}
 		cfg.SophubProxy = NewWorkerSophubProxy(
 			cfg.Sophub.Search,
 			cfg.Sophub.FetchRemoteSOP,
 			cfg.SophubValidator,
+			consume,
 		)
 	}
 	s := &Server{

@@ -34,6 +34,20 @@ func TestWorkspaceKeyRejectsNonPositiveIDs(t *testing.T) {
 	}
 }
 
+// 审查 R5-I: team 整数分支必须拒绝 0 与负整数(此前只拒绝 "0", 接受 team:-1)。
+func TestValidateWorkspaceKeyRejectsNonPositiveTeamIDs(t *testing.T) {
+	for _, bad := range []string{"team:-1", "team:0", "team:-999"} {
+		if err := ValidateWorkspaceKey(bad); err == nil {
+			t.Fatalf("ValidateWorkspaceKey(%q) should fail", bad)
+		}
+	}
+	for _, good := range []string{"team:1", "team:42", "team:0007"} {
+		if err := ValidateWorkspaceKey(good); err != nil {
+			t.Fatalf("ValidateWorkspaceKey(%q) should pass: %v", good, err)
+		}
+	}
+}
+
 func TestRunnerKeyEqualsWorkspaceKey(t *testing.T) {
 	ws, err := PersonalWorkspaceKey(99)
 	if err != nil {
@@ -73,6 +87,45 @@ func TestWorkspaceKeyParsing(t *testing.T) {
 	}
 	if _, _, err := ParseWorkspaceKey("unknown:1"); err == nil {
 		t.Fatal("ParseWorkspaceKey(unknown scope) should fail")
+	}
+}
+
+func TestValidateWorkspaceKeyAcceptsTeamUUID(t *testing.T) {
+	// 生产 team 主键为 UUID（PRD §5）：领域校验必须接受 team:<uuid>，
+	// 否则 WorkspaceDirHash/RunnerKeyForWorkspace 无法用于真实团队工作区
+	//（审查 Minor-1：旧 helper 只接受整数 team id）。
+	for _, key := range []string{
+		"team:3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b",
+		"team:7", // 兼容旧整数格式
+		"personal:42",
+	} {
+		if err := ValidateWorkspaceKey(key); err != nil {
+			t.Fatalf("ValidateWorkspaceKey(%q): %v", key, err)
+		}
+		if _, err := WorkspaceDirHash(key); err != nil {
+			t.Fatalf("WorkspaceDirHash(%q): %v", key, err)
+		}
+	}
+	for _, key := range []string{
+		"team:", "team:abc", "personal:abc", "personal:0", "personal:-1",
+		"other:1", "nonsense", "personal:",
+		"team:3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b-extra",
+		"team:3b1f6a2e9d4c4f8e9b2a1c3d5e7f9a0b", // 非规范 UUID 格式
+	} {
+		if err := ValidateWorkspaceKey(key); err == nil {
+			t.Fatalf("ValidateWorkspaceKey(%q) should fail", key)
+		}
+	}
+}
+
+func TestRunnerKeyForWorkspaceAcceptsTeamUUID(t *testing.T) {
+	key := "team:3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b"
+	rk, err := RunnerKeyForWorkspace(key)
+	if err != nil {
+		t.Fatalf("RunnerKeyForWorkspace(team uuid): %v", err)
+	}
+	if rk != key {
+		t.Fatalf("runner key = %q, want %q", rk, key)
 	}
 }
 

@@ -76,7 +76,7 @@ func (s *scheduler) CancelWorker(ctx context.Context, task domain.Task) error {
 			call.err = nil
 			return
 		}
-		call.err = entry.client.CancelTask(ctx, entry.sessionKey, task.ID, entry.runnerGeneration)
+		call.err = entry.client.CancelTask(ctx, entry.sessionKey, task.ID, entry.runnerGeneration, firstJTI(entry.credentials))
 	})
 	return call.err
 }
@@ -107,6 +107,14 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 			entry.lifecycleMu.Unlock()
 			continue
 		}
+		// 审查 R5-I2: 先把 entry.taskID 切换到当前任务, 再执行
+		// prepareWorkerEntry——prepare 内部(凭据到期/待刷新)触发的
+		// credential 刷新以 entry.taskID 签发 token 并持久化 JTI。若仍指向
+		// 已终态旧任务, 新 token 会挂到无法被撤销的行上(旧任务终态事务已
+		// 提交撤销旧集, 恢复扫描只处理未终态任务), 崩溃窗口内无人撤销。
+		taskChanged := entry.taskID != task.ID
+		generationBefore := entry.credentials.Generation
+		entry.taskID = task.ID
 		replace, err := s.prepareWorkerEntry(ctx, entry)
 		if err != nil {
 			entry.lifecycleMu.Unlock()
@@ -114,11 +122,10 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 		}
 		if !replace {
 			entry.lastUsedAt = time.Now().UTC()
-			// per-task capability(方案 §7): 复用 Worker 时也必须为每个新任务
-			// 签发新 token(绑定 task_id/generation), 旧 token 在 ack 后撤销。
-			taskChanged := entry.taskID != task.ID
-			entry.taskID = task.ID
-			if taskChanged && s.cfg.TokenIssuer != nil {
+			// per-task capability(方案 §7): 复用 Worker 时新任务必须签发
+			// 新 token(绑定 task_id/generation); prepare 已因到期/待刷新签发
+			// 过(Generation 已递增)则跳过, 避免重复签发。
+			if taskChanged && s.cfg.TokenIssuer != nil && entry.credentials.Generation == generationBefore {
 				if err := s.refreshWorkerCredentials(ctx, entry); err != nil {
 					entry.lifecycleMu.Unlock()
 					return nil, entry, err

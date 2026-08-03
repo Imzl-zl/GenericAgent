@@ -245,3 +245,29 @@ def test_zero_window_disables_aggregation():
     ], window_ms=0)
 
     assert [item["message_id"] for item in merged] == ["m1", "m2"]
+
+
+# 审查 R5-I10: /send 的 file_name 必须透传到 WxBotClient.send_file——显示名
+# 由 Platform 显式传入, 不能回退到快照临时路径 basename(含 marker hash 前缀)。
+def test_send_passes_explicit_file_name_to_client(monkeypatch):
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def send_file(self, ilink_user_id, file_path, context_token="", file_name=""):
+            self.calls.append((ilink_user_id, file_path, context_token, file_name))
+
+        def send_text(self, ilink_user_id, text, context_token=""):
+            self.calls.append(("text", ilink_user_id, text, context_token))
+
+    manager = poller_server.BotManager(inbound_coalesce_window_ms=2500)
+    entry = poller_server.BotEntry(Client(), "http://platform/webhook", "b1", 2500)
+    manager._bots["b1"] = entry
+
+    manager.send("b1", "u1", "", msg_type="file", file_path="/tmp/abc123_report.docx", file_name="report.docx")
+    assert entry.client.calls == [("u1", "/tmp/abc123_report.docx", "", "report.docx")]
+
+    # 未传 file_name 时回退为空串(客户端侧回退本地 basename), 不报错。
+    entry.client.calls.clear()
+    manager.send("b1", "u1", "", msg_type="file", file_path="/tmp/abc123_other.docx")
+    assert entry.client.calls == [("u1", "/tmp/abc123_other.docx", "", "")]

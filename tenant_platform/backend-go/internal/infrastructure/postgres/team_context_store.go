@@ -101,6 +101,23 @@ WHERE team_id = $1::uuid AND user_id = $2 AND context_notified_at IS NULL
 	return tag.RowsAffected() > 0, nil
 }
 
+// IsApprovedTeamMember 返回用户是否仍是团队的 approved 成员
+// (审查 R5-I4: 终端交付前校验——成员被移除后, 既有任务的结果不得再发送
+// 给已失权成员)。
+func (s *Store) IsApprovedTeamMember(ctx context.Context, teamID string, userID int64) (bool, error) {
+	var status string
+	err := s.pool.QueryRow(ctx, `
+SELECT status FROM team_members WHERE team_id = $1::uuid AND user_id = $2
+`, teamID, userID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return status == string(domain.MemberApproved), nil
+}
+
 // ListUserTeams returns teams where the user is an approved member.
 // Includes both teams the user owns and teams they belong to.
 func (s *Store) ListUserTeams(ctx context.Context, userID int64) ([]domain.Team, error) {

@@ -88,6 +88,45 @@ WHERE d.task_id = t.id
 	return tag.RowsAffected(), nil
 }
 
+// LoadDeliveryFiles 返回 task_complete delivery 绑定的输出文件快照
+// (审查 R5-I3): 内容在任务成功事务时捕获, 发送时不再解析 workspace 路径。
+func (s *Store) LoadDeliveryFiles(ctx context.Context, deliveryID string) ([]domain.DeliveryFile, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT marker, file_name, rel_path, content, digest, size_bytes
+FROM task_delivery_files
+WHERE delivery_id = $1
+ORDER BY marker
+`, deliveryID)
+	if err != nil {
+		return nil, fmt.Errorf("load delivery files: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.DeliveryFile
+	for rows.Next() {
+		var f domain.DeliveryFile
+		if err := rows.Scan(&f.Marker, &f.FileName, &f.RelPath, &f.Content, &f.Digest, &f.SizeBytes); err != nil {
+			return nil, fmt.Errorf("scan delivery file: %w", err)
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteExpiredDeliveryFiles 删除超过保留期的 delivery 文件快照
+// (审查 R5-I3: 快照随 outbox 审计保留, 定期清理防无界增长)。
+func (s *Store) DeleteExpiredDeliveryFiles(ctx context.Context, before time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+DELETE FROM task_delivery_files WHERE created_at < $1
+`, before.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("delete expired delivery files: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // MarkDeliveryAcked records that the carrier accepted the message. Only
 // pending/sending rows can transition to acked; if the row is already acked
 // or dead_letter, the UPDATE matches zero rows and this is a no-op (idempotent).

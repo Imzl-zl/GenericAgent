@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"errors"
 	"bytes"
 	"context"
 	"fmt"
@@ -161,6 +162,9 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		"--label", "com.genericagent.runner.hash=" + spec.WorkspaceHash,
 		"--label", "com.genericagent.runner.generation=" + strconv.FormatUint(spec.Generation, 10),
 		"--label", "com.genericagent.runner.created=" + strconv.FormatInt(time.Now().Unix(), 10),
+		// 审查 F7: 容器写入 Manager 实例 label, 销毁/复用前按归属校验, 防止
+		// 持有控制面凭据的受损 Platform 删除其他部署中命名规则相同的容器。
+		"--label", "com.genericagent.runner.manager=" + d.cfg.ManagerID,
 		"--read-only",
 		"--network", RunnerNetwork,
 		"--cap-drop", "ALL",
@@ -272,9 +276,31 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 
 	_, stderr, exitCode, err = d.runner.Run(ctx, d.cfg.Binary, "start", name)
 	if err != nil || exitCode != 0 {
-		return Runner{}, fmt.Errorf("docker start runner %s failed (%d): %s", name, exitCode, strings.TrimSpace(string(stderr)))
+		// 审查 R5-I7: create 成功但 start 失败时, 立即按容器 ID 清理已创建
+		// 容器(best-effort, 与主错误合并)——否则遗留 Created/stopped 容器,
+		// 同 generation 的后续 Ensure 可能把它误当可复用 Runner。
+		rmErr := d.destroyByID(ctx, containerID)
+		return Runner{}, errors.Join(
+			fmt.Errorf("docker start runner %s failed (%d): %s", name, exitCode, strings.TrimSpace(string(stderr))),
+			rmErr,
+		)
 	}
 	return Runner{ContainerID: containerID, Name: name}, nil
+}
+
+// destroyByID 按容器 ID 删除容器(best-effort): 已不存在视为成功。
+func (d *DockerCLI) destroyByID(ctx context.Context, containerID string) error {
+	if strings.TrimSpace(containerID) == "" {
+		return nil
+	}
+	_, stderr, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, "rm", "-f", containerID)
+	if err != nil {
+		return fmt.Errorf("docker rm runner %s: %w", containerID, err)
+	}
+	if exitCode != 0 && !strings.Contains(string(stderr), "No such container") {
+		return fmt.Errorf("docker rm runner %s failed (%d): %s", containerID, exitCode, strings.TrimSpace(string(stderr)))
+	}
+	return nil
 }
 
 // EnsureWorkspace 幂等地预置 workspace 目录布局并修复 ownership(方案 §6)。
@@ -299,15 +325,63 @@ func (d *DockerCLI) RunnerName(workspaceHash string, generation uint64) string {
 }
 
 // Destroy removes the Runner container (workspace data is never removed).
+// 容器已不存在时幂等成功(审查 F6): 重复销毁/并发清理不得报错, 调用方的
+// 缓存清理依赖此幂等性。
 func (d *DockerCLI) Destroy(ctx context.Context, name string) error {
 	_, stderr, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, "rm", "-f", name)
 	if err != nil {
 		return fmt.Errorf("docker rm runner: %w", err)
 	}
 	if exitCode != 0 {
+		if strings.Contains(string(stderr), "No such container") {
+			return nil // 幂等: 容器已不存在
+		}
 		return fmt.Errorf("docker rm runner %s failed (%d): %s", name, exitCode, strings.TrimSpace(string(stderr)))
 	}
 	return nil
+}
+
+// IsManagerRunner 校验容器带 com.genericagent.runner=true 且 manager label
+// 匹配本 Manager 实例(审查 F7)。ManagerID 为空(未配置)时仅校验 runner
+// label。容器不存在或无法读取时返回 (false, nil)。
+func (d *DockerCLI) IsManagerRunner(ctx context.Context, idOrName string) (bool, error) {
+	format := `{{index .Config.Labels "com.genericagent.runner"}}|{{index .Config.Labels "com.genericagent.runner.manager"}}`
+	stdout, _, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, "inspect", "--format", format, idOrName)
+	if err != nil || exitCode != 0 {
+		return false, nil // 不存在或无法读取: 一律视为未归属
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(stdout)), "|", 2)
+	if len(parts) != 2 || parts[0] != "true" {
+		return false, nil
+	}
+	if d.cfg.ManagerID != "" && parts[1] != d.cfg.ManagerID {
+		return false, nil
+	}
+	return true, nil
+}
+
+// RunnerWorkspaceHash 返回容器 label 中的 workspace hash(审查 R5-C6:
+// 销毁路径定位 config/ 清理目标)。容器不存在或 label 缺失返回 ok=false。
+func (d *DockerCLI) RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error) {
+	format := `{{index .Config.Labels "com.genericagent.runner.hash"}}`
+	stdout, _, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, "inspect", "--format", format, idOrName)
+	if err != nil || exitCode != 0 {
+		return "", false, nil // 不存在或无法读取: 视为无法定位
+	}
+	hash := strings.TrimSpace(string(stdout))
+	if !workspaceHashPattern.MatchString(hash) {
+		return "", false, nil
+	}
+	return hash, true, nil
+}
+
+// ContainerExists 返回容器(按 ID 或名称)是否存在。
+func (d *DockerCLI) ContainerExists(ctx context.Context, idOrName string) (bool, error) {
+	_, _, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, "inspect", idOrName)
+	if err != nil {
+		return false, err
+	}
+	return exitCode == 0, nil
 }
 
 // IsRunnerContainer 校验容器(按 ID 或名称)带 com.genericagent.runner=true
@@ -322,13 +396,23 @@ func (d *DockerCLI) IsRunnerContainer(ctx context.Context, idOrName string) (boo
 }
 
 // ListRunnerContainers 返回本 Manager 创建的 Runner 容器(label 过滤,
-// 避免误删其他组件容器)及其状态。用于孤儿回收(spec §7)。
+// 避免误删其他组件容器)及其状态。用于孤儿回收(spec §7)。ManagerID
+// 非空时额外按实例 label 过滤(审查 F7: 共享 daemon 的多部署互不可见)。
 func (d *DockerCLI) ListRunnerContainers(ctx context.Context, namePrefix string) ([]RunnerInfo, error) {
-	stdout, stderr, exitCode, err := d.runner.Run(ctx, d.cfg.Binary,
-		"ps", "-a",
-		"--filter", "label=com.genericagent.runner=true",
-		"--filter", "name="+namePrefix,
+	filters := []string{
+		"label=com.genericagent.runner=true",
+		"name=" + namePrefix,
+	}
+	if d.cfg.ManagerID != "" {
+		filters = append(filters, "label=com.genericagent.runner.manager="+d.cfg.ManagerID)
+	}
+	args := []string{"ps", "-a"}
+	for _, f := range filters {
+		args = append(args, "--filter", f)
+	}
+	args = append(args,
 		"--format", "{{.Names}}\t{{.State}}\t{{.Label \"com.genericagent.runner.created\"}}")
+	stdout, stderr, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, args...)
 	if err != nil {
 		return nil, fmt.Errorf("docker ps runners: %w", err)
 	}

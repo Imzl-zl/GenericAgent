@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,37 @@ const (
 )
 
 var errInvalidWorkspaceKey = errors.New("invalid workspace key")
+
+// uuidKeyPattern 匹配 Postgres uuid 列的规范字符串形式（PRD §5: team.id 为 UUID）。
+var uuidKeyPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// ValidateWorkspaceKey 校验 workspace key 格式（审查 Minor-1 统一入口）：
+// personal:<positive-int> 或 team:<uuid|positive-int>（兼容旧整数格式）。
+// WorkspaceDirHash/RunnerKeyForWorkspace 与 Sandbox 的 hash 推导共用此校验，
+// 消除 domain 严格校验与 sandbox 宽松 hash 之间的两套逻辑。
+func ValidateWorkspaceKey(key string) error {
+	scope, idText, found := strings.Cut(key, ":")
+	if !found || idText == "" {
+		return fmt.Errorf("%w: missing or empty ':' separator", errInvalidWorkspaceKey)
+	}
+	switch WorkspaceScope(scope) {
+	case ScopePersonal:
+		id, err := strconv.ParseInt(idText, 10, 64)
+		if err != nil || id <= 0 {
+			return fmt.Errorf("%w: invalid personal id %q", errInvalidWorkspaceKey, idText)
+		}
+	case ScopeTeam:
+		if !uuidKeyPattern.MatchString(idText) {
+			id, err := strconv.ParseInt(idText, 10, 64)
+			if err != nil || id <= 0 {
+				return fmt.Errorf("%w: invalid team id %q", errInvalidWorkspaceKey, idText)
+			}
+		}
+	default:
+		return fmt.Errorf("%w: unknown scope %q", errInvalidWorkspaceKey, scope)
+	}
+	return nil
+}
 
 // PersonalWorkspaceKey derives the personal workspace key for a canonical user.
 func PersonalWorkspaceKey(canonicalUserID int64) (string, error) {
@@ -41,7 +73,7 @@ func TeamWorkspaceKey(teamID int64) (string, error) {
 // Per spec §3 the runner key and workspace key have the same form:
 // personal:<canonical_user_id> or team:<team_id>.
 func RunnerKeyForWorkspace(workspaceKey string) (string, error) {
-	if _, _, err := ParseWorkspaceKey(workspaceKey); err != nil {
+	if err := ValidateWorkspaceKey(workspaceKey); err != nil {
 		return "", err
 	}
 	return workspaceKey, nil
@@ -68,7 +100,7 @@ func ParseWorkspaceKey(key string) (WorkspaceScope, int64, error) {
 // WorkspaceDirHash returns the stable directory hash for a workspace key
 // (spec §4: workspaces/<hash(workspace_key)>/).
 func WorkspaceDirHash(workspaceKey string) (string, error) {
-	if _, _, err := ParseWorkspaceKey(workspaceKey); err != nil {
+	if err := ValidateWorkspaceKey(workspaceKey); err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256([]byte(workspaceKey))

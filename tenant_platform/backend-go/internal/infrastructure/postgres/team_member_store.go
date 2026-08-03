@@ -121,10 +121,12 @@ WHERE id = $1
 			return err
 		}
 		// Clear active_contexts.team_id so the user's next message goes personal.
+		// 审查 R5-I4: 必须限定当前团队——无条件清空会把用户正在使用的其他
+		// 团队上下文也抹掉。
 		if _, err := tx.Exec(ctx, `
 UPDATE active_contexts SET team_id = NULL, updated_at = $2
-WHERE user_id = $1
-`, m.UserID, now); err != nil {
+WHERE user_id = $1 AND team_id = $3::uuid
+`, m.UserID, now, m.TeamID); err != nil {
 			return err
 		}
 		// Cancel the removed member's queued tasks in this team's workspace.
@@ -143,6 +145,40 @@ UPDATE tasks SET
   terminal_at = timezone('utc', now()),
   updated_at = timezone('utc', now())
 WHERE requester_user_id = $1 AND session_key = $2 AND status = 'queued'
+`, m.UserID, teamSessionKey); err != nil {
+			return err
+		}
+		// 审查 R5-I4: 已派发(starting/running)任务写 durable cancel_requested_at,
+		// 由 scheduler tick 轮询执行 Worker cancel; 终态事务撤销其 capability
+		// JTI(revokeTaskCapabilityJTIs), 成员移除后既有任务不得继续调用模型。
+		// 未派发(starting + dispatch NULL)任务不在此列——由下方直接终态化。
+		if _, err := tx.Exec(ctx, `
+UPDATE tasks SET
+  cancel_requested_at = timezone('utc', now()),
+  updated_at = timezone('utc', now())
+WHERE requester_user_id = $1 AND session_key = $2
+  AND status IN ('starting','running')
+  AND worker_dispatch_started_at IS NOT NULL
+  AND cancel_requested_at IS NULL
+`, m.UserID, teamSessionKey); err != nil {
+			return err
+		}
+		// 审查 R5-I4: starting 但尚未 MarkDispatchStarted 的任务没有 dispatch
+		// 收尾(dispatch 对取消+未派发直接 return), 只写 cancel_requested_at
+		// 会永久卡在 starting——直接终态化(cancelled), 与 queued 取消一致。
+		if _, err := tx.Exec(ctx, `
+UPDATE tasks SET
+  status = 'cancelled',
+  claim_owner = NULL,
+  claim_lease_until = NULL,
+  claimed_at = NULL,
+  terminal_error_code = 'TASK_CANCELLED',
+  terminal_error_message = 'member removed from team',
+  terminal_at = timezone('utc', now()),
+  updated_at = timezone('utc', now())
+WHERE requester_user_id = $1 AND session_key = $2
+  AND status = 'starting' AND worker_dispatch_started_at IS NULL
+  AND cancel_requested_at IS NULL
 `, m.UserID, teamSessionKey); err != nil {
 			return err
 		}

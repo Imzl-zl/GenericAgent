@@ -30,6 +30,10 @@ type capacityTaskStore struct {
 	finalized      []domain.Task
 	getTask        map[string]domain.Task
 	dispatchMarked bool
+	// heartbeatLeaseLostAfterRequeue 模拟审查 R5-I1 竞态: RequeueTask 提交
+	// queued(claim 已清空)后, dispatch heartbeat ticker 再次 HeartbeatClaim
+	// 得到 0 rows → ErrLeaseExpired。fake 对已 requeue 的任务返回该错误。
+	heartbeatLeaseLostAfterRequeue bool
 }
 
 func newCapacityTaskStore() *capacityTaskStore {
@@ -52,13 +56,20 @@ func (f *capacityTaskStore) GetTask(ctx context.Context, taskID string) (domain.
 func (f *capacityTaskStore) HeartbeatClaim(ctx context.Context, taskID, platformInstanceID string, claimLease time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.heartbeatLeaseLostAfterRequeue {
+		for _, id := range f.requeued {
+			if id == taskID {
+				return domain.ErrLeaseExpired
+			}
+		}
+	}
 	if t, ok := f.getTask[taskID]; ok && !t.Status.IsTerminal() {
 		return nil
 	}
 	return domain.ErrLeaseExpired
 }
 
-func (f *capacityTaskStore) SetTaskCapabilityJTIs(_ context.Context, _ string, _ []string) error {
+func (f *capacityTaskStore) SetTaskCapabilityJTIs(_ context.Context, _ string, _ string, _ []string) error {
 	return nil
 }
 
@@ -69,7 +80,7 @@ func (f *capacityTaskStore) RequeueTask(ctx context.Context, taskID, platformIns
 	return nil
 }
 
-func (f *capacityTaskStore) CompleteFailedTerminal(ctx context.Context, taskID string, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) (domain.Task, error) {
+func (f *capacityTaskStore) CompleteFailedTerminal(ctx context.Context, taskID, owner string, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) (domain.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	t := f.getTask[taskID]
@@ -119,7 +130,7 @@ func (f *capacityTaskStore) RecoverAfterRestart(ctx context.Context, platformIns
 	return 0, nil
 }
 
-func (f *capacityTaskStore) MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string) (domain.Task, error) {
+func (f *capacityTaskStore) MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string, freshSession bool) (domain.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dispatchMarked = true
@@ -138,7 +149,7 @@ func (f *capacityTaskStore) SubmitTask(ctx context.Context, cmd domain.SubmitTas
 func (f *capacityTaskStore) CancelTask(ctx context.Context, taskID string, requesterUserID int64) (domain.Task, bool, error) {
 	panic("unexpected CancelTask")
 }
-func (f *capacityTaskStore) CompleteSucceeded(ctx context.Context, taskID, platformInstanceID, snapshotID, fileRef, checksum, resultRef, resultDigest string, resultBytes int) (domain.Task, error) {
+func (f *capacityTaskStore) CompleteSucceeded(ctx context.Context, taskID, platformInstanceID, snapshotID, fileRef, checksum, resultRef, resultDigest string, resultBytes int, deliveryFiles []domain.DeliveryFile) (domain.Task, error) {
 	panic("unexpected CompleteSucceeded")
 }
 func (f *capacityTaskStore) RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error {
@@ -152,6 +163,9 @@ func (f *capacityTaskStore) CountQueuedTasksByRequester(ctx context.Context, req
 }
 func (f *capacityTaskStore) ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error) {
 	panic("unexpected ResetWorkspaceForNewSession")
+}
+func (f *capacityTaskStore) WorkspaceIsFresh(ctx context.Context, sessionKey string) (bool, error) {
+	return false, nil
 }
 
 // capacityRuntime 是 fake WorkerRuntime: 按配置返回容量错误或成功。
@@ -362,11 +376,11 @@ func (w *fakeRevokeWorker) ExecuteTask(_ context.Context, req *workerv1.ExecuteT
 func (w *fakeRevokeWorker) BeginCheckpoint(context.Context, *workerv1.BeginCheckpointRequest) (*workerv1.CheckpointReady, error) {
 	return &workerv1.CheckpointReady{}, nil
 }
-func (w *fakeRevokeWorker) CancelTask(context.Context, string, string, uint64) error { return nil }
+func (w *fakeRevokeWorker) CancelTask(context.Context, string, string, uint64, string) error { return nil }
 func (w *fakeRevokeWorker) Health(context.Context) (*workerv1.HealthResponse, error) {
 	return &workerv1.HealthResponse{Ready: true}, nil
 }
-func (w *fakeRevokeWorker) Shutdown(context.Context, string, string, uint64) error { return nil }
+func (w *fakeRevokeWorker) Shutdown(context.Context, string, string, uint64, string) error { return nil }
 
 // revokeDispatchRuntime 是 dispatch 成功路径的 fake Runtime。
 type revokeDispatchRuntime struct{}
@@ -429,5 +443,84 @@ func TestDispatchRevokesCredentialsAfterTerminal(t *testing.T) {
 	}
 	if len(capabilities.revoked[0].jti) == 0 {
 		t.Fatalf("revoked jti is empty: %+v", capabilities.revoked[0])
+	}
+}
+
+// TestDispatchHeartbeatRequeueSuppressesLeaseLoss 验证审查 R5-I1 竞态修复:
+// requeue 标记(容量满退回 queued)后, dispatch heartbeat 的 ticker 若在
+// deferred Stop 之前触发 HeartbeatClaim(requeue 已清空 claim → 0 rows →
+// ErrLeaseExpired), 必须静默退出——不得把已 requeue 的任务终态化。
+// 单元级确定性测试: 直接控制 markRequeued 与 requeue 状态。
+func TestDispatchHeartbeatRequeueSuppressesLeaseLoss(t *testing.T) {
+	store := newCapacityTaskStore()
+	store.heartbeatLeaseLostAfterRequeue = true
+	task := domain.Task{
+		ID: "race-unit-1", SessionKey: "personal:9",
+		Status: domain.TaskStarting, ClaimOwner: "p1",
+	}
+	store.getTask[task.ID] = task
+
+	sched := &scheduler{
+		cfg: SchedulerConfig{
+			PlatformInstanceID: "p1",
+			ClaimLease:         60 * time.Millisecond, // ticker 间隔 20ms
+			Store:              store,
+		},
+		workers: map[string]*workerEntry{},
+		mu:      sync.Mutex{},
+	}
+	heartbeat, err := sched.startDispatchHeartbeat(context.Background(), task)
+	if err != nil {
+		t.Fatalf("startDispatchHeartbeat: %v", err)
+	}
+	// 容量错误路径: 先标记 requeue, 再提交 requeue(fake 记录 requeued)。
+	heartbeat.markRequeued()
+	if err := store.RequeueTask(context.Background(), task.ID, "p1"); err != nil {
+		t.Fatalf("RequeueTask: %v", err)
+	}
+	// 让 ticker 在 requeue 后至少触发一次(interval 20ms)。
+	time.Sleep(100 * time.Millisecond)
+	if err := heartbeat.Stop(); err != nil {
+		t.Fatalf("Stop must not report lease loss after requeue, got: %v", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.finalized) != 0 {
+		t.Fatalf("requeued task must not be finalized by heartbeat race, got %+v", store.finalized)
+	}
+}
+
+// TestDispatchRequeueHeartbeatRaceDoesNotFinalize 集成级验证同一竞态: dispatch
+// 全流程中容量错误 requeue 后, 若 heartbeat 触发 lease 丢失也不得终态化。
+func TestDispatchRequeueHeartbeatRaceDoesNotFinalize(t *testing.T) {
+	store := newCapacityTaskStore()
+	store.heartbeatLeaseLostAfterRequeue = true
+	task := domain.Task{
+		ID: "race-int-1", SessionKey: "personal:10",
+		Status: domain.TaskStarting, ClaimOwner: "p1",
+		ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}
+	store.getTask[task.ID] = task
+
+	sched := &scheduler{
+		cfg: SchedulerConfig{
+			PlatformInstanceID: "p1",
+			ClaimLease:         60 * time.Millisecond,
+			Store:              store,
+			Registry:           mustLoadFoundationPolicy(t),
+			Runtime:            &capacityRuntime{err: postgres.ErrRunnerLeaseCapacity},
+		},
+		workers: map[string]*workerEntry{},
+		mu:      sync.Mutex{},
+	}
+	_ = sched.dispatch(context.Background(), task)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.requeued) != 1 || store.requeued[0] != task.ID {
+		t.Fatalf("RequeueTask calls = %v, want [%s]", store.requeued, task.ID)
+	}
+	if len(store.finalized) != 0 {
+		t.Fatalf("requeued task must not be finalized by heartbeat race, got %+v", store.finalized)
 	}
 }

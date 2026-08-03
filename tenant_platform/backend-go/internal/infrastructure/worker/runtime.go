@@ -203,7 +203,7 @@ type processCleaner struct {
 
 func (c processCleaner) run(timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	_ = c.client.Shutdown(ctx, c.workspaceKey, "scheduler-stop", c.runnerGeneration)
+	_ = c.client.Shutdown(ctx, c.workspaceKey, "scheduler-stop", c.runnerGeneration, "")
 	cancel()
 	_ = c.closeConn()
 	_ = c.killProcess()

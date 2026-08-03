@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,26 @@ def _check_history_budget(backend_history: Any, agent_history: Any, max_history_
         )
 
 
+def _trim_history_to_budget(backend_history: list[Any], agent_history: list[Any], max_history_bytes: int) -> None:
+    """成对裁剪最旧消息直到总大小不超限(审查 F9)。
+
+    backend_history 与 agent_history 是同一对话的两个视图(一一对应),
+    每次从头部成对移除一条, 直到 size <= max_history_bytes 或列表耗尽。
+    成功任务不得因历史增长被改判失败——确定性裁剪(保留最近消息)优于
+    整任务报错; 裁剪后的开头可能是单边残留(agent_history 先耗尽), 由
+    模型容忍。注意: 就地修改调用方列表(会话已结束, 无共享引用风险)。
+    """
+    if max_history_bytes <= 0:
+        return
+    while (backend_history or agent_history) and (
+        _utf8_size(backend_history) + _utf8_size(agent_history) > max_history_bytes
+    ):
+        if backend_history:
+            backend_history.pop(0)
+        if agent_history:
+            agent_history.pop(0)
+
+
 def _check_working_budget(working: Any, max_working_bytes: int) -> None:
     size = _utf8_size(working)
     if size > max_working_bytes:
@@ -61,7 +82,9 @@ def build_snapshot_bundle(
 ) -> dict[str, Any]:
     if not isinstance(result_body, str):
         raise CheckpointError("INVALID_RESULT", "result body must be str")
-    _check_history_budget(backend_history, agent_history, max_history_bytes)
+    # 审查 F9: history 超限确定性裁剪(保留最近消息), 不再整任务失败;
+    # working 为结构化状态, 静默裁剪会丢失语义, 超限仍然显式报错。
+    _trim_history_to_budget(backend_history, agent_history, max_history_bytes)
     _check_working_budget(working, max_working_bytes)
     body = result_body
     digest = result_digest_for(body)
@@ -101,23 +124,49 @@ def load_snapshot_bundle(
     max_bundle_bytes: int = 0,
 ) -> dict[str, Any]:
     path = Path(path)
-    if not path.is_file():
-        raise CheckpointError("SNAPSHOT_NOT_FOUND", f"snapshot not found: {path}")
-    # 审查 R4-I6: committed/ 位于 Runner 可写的 state 挂载内, 可能被替换为
-    # 超大文件。必须先按 max_bundle_bytes stat 拒绝超限, 再读入内存, 防止
-    # read_bytes 无界读取耗尽 Runner 内存(checksum 校验在读完之后, 不能
-    # 先读后查限)。
-    if max_bundle_bytes > 0:
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            raise CheckpointError("SNAPSHOT_NOT_FOUND", f"snapshot stat failed: {path}") from exc
-        if size > max_bundle_bytes:
+    # 审查 R5-I5: 单次打开 + 同一 fd 校验/限读——旧实现的
+    # path.stat() + path.read_bytes() 是两次路径解析: 攻击者可在 stat 后把
+    # 文件替换成超大文件或持续扩展同一 inode, 造成无界内存读取(checksum
+    # 校验在读完之后, 不能先读后查限)。O_NOFOLLOW 拒绝最后组件符号链接
+    # (committed/ 位于 Runner 可写挂载), fstat 校验普通文件, 读取上限为
+    # max_bundle_bytes + 1(超限立即拒绝, 不读入内存)。
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise CheckpointError("SNAPSHOT_NOT_FOUND", f"snapshot open failed: {path}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CheckpointError(
+                "SNAPSHOT_NOT_FOUND", f"snapshot is not a regular file: {path}"
+            )
+        limit = max_bundle_bytes if max_bundle_bytes > 0 else None
+        if limit is not None and st.st_size > limit:
             raise CheckpointError(
                 "SNAPSHOT_TOO_LARGE",
-                f"snapshot size {size} exceeds max_bundle_bytes {max_bundle_bytes}",
+                f"snapshot size {st.st_size} exceeds max_bundle_bytes {limit}",
             )
-    raw = path.read_bytes()
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if limit is not None and total > limit:
+                raise CheckpointError(
+                    "SNAPSHOT_TOO_LARGE",
+                    f"snapshot exceeds max_bundle_bytes {limit} while reading",
+                )
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    except CheckpointError:
+        raise
+    except OSError as exc:
+        raise CheckpointError("SNAPSHOT_NOT_FOUND", f"snapshot read failed: {path}") from exc
+    finally:
+        os.close(fd)
     actual = bundle_checksum_bytes(raw)
     if actual != expected_checksum:
         raise CheckpointError(

@@ -549,12 +549,14 @@ class BotManager:
         entry.thread.join(timeout=5)
         return entry.committed_updates_buf
 
-    def send(self, bot_uuid, ilink_user_id, text, context_token='', msg_type=MSG_TYPE_TEXT, file_path=''):
+    def send(self, bot_uuid, ilink_user_id, text, context_token='', msg_type=MSG_TYPE_TEXT, file_path='', file_name=''):
         """Dispatch to send_text/send_image/send_video/send_file based on msg_type.
 
         iLink officially supports image/video/file media sends (see spec).
         Voice send is not implemented in GA Core's WxBotClient, so 'voice'
         is not a valid msg_type here (inbound voice still downloads fine).
+        file_name 是用户可见显示名(审查 R5-I10): 与 file_path 分离, 快照临时
+        文件名含 marker hash 前缀, 不得作为显示名暴露给用户。
         """
         with self._lock:
             entry = self._bots.get(bot_uuid)
@@ -570,7 +572,7 @@ class BotManager:
         elif msg_type == MSG_TYPE_VIDEO:
             entry.client.send_video(ilink_user_id, file_path, context_token=context_token)
         elif msg_type == MSG_TYPE_FILE:
-            entry.client.send_file(ilink_user_id, file_path, context_token=context_token)
+            entry.client.send_file(ilink_user_id, file_path, context_token=context_token, file_name=file_name)
         else:
             raise ValueError(f'unsupported msg_type: {msg_type}')
 
@@ -661,7 +663,8 @@ class PollerHandler(BaseHTTPRequestHandler):
                     return
                 self.manager.send(body['bot_uuid'], body['ilink_user_id'],
                                   body.get('text', ''), body.get('context_token', ''),
-                                  msg_type=msg_type, file_path=body.get('file_path', ''))
+                                  msg_type=msg_type, file_path=body.get('file_path', ''),
+                                  file_name=body.get('file_name', ''))
                 self._reply(200, {'sent': True})
             else:
                 self._reply(404, {'error': 'not found'})

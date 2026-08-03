@@ -2,11 +2,14 @@ package application
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -24,6 +27,9 @@ const (
 	defaultDeliveryClaimLease   = 30 * time.Second
 	defaultDeliveryRetryWindow  = 5 * time.Minute
 	defaultDeliveryMaxBatch     = 8
+	// deliveryFilesRetention 是 task_delivery_files 快照的审计保留期
+	// (审查 R5-I3: 内容随 outbox 保留, 定期清理防无界增长)。
+	deliveryFilesRetention = 30 * 24 * time.Hour
 	// maxDeliveryConcurrency caps in-flight process() calls within one tick.
 	// Each call may block up to deliverySendTimeout on iLink send, so a batch
 	// of 8 with concurrency 4 finishes in ~2 send-windows worst case instead
@@ -50,6 +56,11 @@ type DeliveryStore interface {
 	MarkDeliveryAcked(ctx context.Context, deliveryID string, ackedAt time.Time) error
 	MarkDeliveryRetry(ctx context.Context, deliveryID string, nextAttemptAt time.Time, now time.Time) error
 	MarkDeliveryDeadLetter(ctx context.Context, deliveryID string, errCode, errMessage string, terminalAt time.Time) error
+	// LoadDeliveryFiles 返回 task_complete delivery 绑定的输出文件快照
+	// (审查 R5-I3: 成功事务时捕获, 发送时不再解析 workspace 路径)。
+	LoadDeliveryFiles(ctx context.Context, deliveryID string) ([]domain.DeliveryFile, error)
+	// DeleteExpiredDeliveryFiles 删除超过保留期的 delivery 文件快照。
+	DeleteExpiredDeliveryFiles(ctx context.Context, before time.Time) (int64, error)
 }
 
 // BotResolverByOwner locates the bot registered to a platform user.
@@ -60,6 +71,12 @@ type BotResolverByOwner interface {
 // TaskReader loads task metadata for delivery addressing.
 type TaskReader interface {
 	GetTask(ctx context.Context, taskID string) (domain.Task, error)
+}
+
+// TeamMembershipChecker 校验任务发起人是否仍是被授权的团队成员
+// (审查 R5-I4: 成员移除后, 既有任务的成功文件/结果不得发送给已失权成员)。
+type TeamMembershipChecker interface {
+	IsApprovedTeamMember(ctx context.Context, teamID string, userID int64) (bool, error)
 }
 
 // ResultReader reads the bounded committed result payload for task_complete deliveries.
@@ -83,11 +100,14 @@ type DeliveryServiceConfig struct {
 	Results      ResultReader
 	Messages     MessageStore
 	SessionFiles SessionFiles
-	PollInterval time.Duration
-	ClaimLease   time.Duration
-	RetryWindow  time.Duration
-	MaxBatch     int
-	Now          func() time.Time
+	// TeamMembership 非 nil 时, 团队任务的终端交付前校验发起人成员资格
+	// (审查 R5-I4: 已移除成员不得再收到团队任务结果)。
+	TeamMembership TeamMembershipChecker
+	PollInterval   time.Duration
+	ClaimLease     time.Duration
+	RetryWindow    time.Duration
+	MaxBatch       int
+	Now            func() time.Time
 }
 
 func (cfg DeliveryServiceConfig) withDefaults() DeliveryServiceConfig {
@@ -116,6 +136,8 @@ type deliveryService struct {
 	unjournaledParts map[string]struct{}
 	// snapshotDir 是 Platform 私有文件快照目录(发送前不可变副本)。
 	snapshotDir string
+	// lastFileCleanup 记录上次 delivery 文件快照清理时间(节流, 审查 R5-I3)。
+	lastFileCleanup time.Time
 }
 
 // NewDeliveryService validates config and returns a runnable delivery service.
@@ -183,6 +205,16 @@ func (s *deliveryService) tick(ctx context.Context) error {
 	if err := s.Recover(ctx); err != nil {
 		return err
 	}
+	// 审查 R5-I3: 定期清理超过保留期的 delivery 文件快照(审计保留,
+	// 防无界增长)。节流到每 24 小时一次。
+	if time.Since(s.lastFileCleanup) > 24*time.Hour {
+		s.lastFileCleanup = now
+		if n, err := s.cfg.Store.DeleteExpiredDeliveryFiles(ctx, now.Add(-deliveryFilesRetention)); err != nil {
+			slog.ErrorContext(ctx, "delivery: delete expired delivery files failed", "error", err)
+		} else if n > 0 {
+			slog.InfoContext(ctx, "delivery: deleted expired delivery file snapshots", "count", n)
+		}
+	}
 	deliveries, err := s.cfg.Store.ClaimPendingDeliveries(ctx, s.cfg.MaxBatch, s.cfg.ClaimLease, s.cfg.RetryWindow, now)
 	if err != nil {
 		return err
@@ -214,10 +246,45 @@ func (s *deliveryService) tick(ctx context.Context) error {
 	return g.Wait()
 }
 
+// errDeliveryMemberRemoved 是发送前成员资格复查失败的哨兵错误(审查 R5-I9):
+// 直接死信 MEMBER_REMOVED, 不重试(成员移除是永久状态)。
+var errDeliveryMemberRemoved = errors.New("requester is no longer an approved team member")
+
 func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now time.Time) error {
 	task, err := s.cfg.Tasks.GetTask(ctx, d.TaskID)
 	if err != nil {
 		return s.deadLetter(ctx, d, "TASK_LOOKUP_FAILED", err.Error(), now)
+	}
+	// 审查 R5-I4: 团队任务的发起人在交付前必须仍是 approved 成员——成员被
+	// 移除后, 其既有任务(可能已被移除时取消请求, 但终端交付仍可能因竞态
+	// 存在)的成功文件/结果不得发送给已失权成员。
+	var teamID string
+	if s.cfg.TeamMembership != nil {
+		if tid, ok := teamSessionKey(task.SessionKey); ok {
+			teamID = tid
+			approved, err := s.cfg.TeamMembership.IsApprovedTeamMember(ctx, tid, task.RequesterID)
+			if err != nil {
+				return s.deadLetter(ctx, d, "TEAM_MEMBERSHIP_CHECK_FAILED", err.Error(), now)
+			}
+			if !approved {
+				return s.deadLetter(ctx, d, "MEMBER_REMOVED", "requester is no longer an approved team member", now)
+			}
+		}
+	}
+	// 审查 R5-I9: 开头检查与外部发送之间仍有窗口——成员在窗口内被移除时
+	// 不得发出消息/文件。发送前再次校验; 失败走 MEMBER_REMOVED 死信。
+	assertMemberAtSend := func() error {
+		if s.cfg.TeamMembership == nil || teamID == "" {
+			return nil
+		}
+		approved, err := s.cfg.TeamMembership.IsApprovedTeamMember(ctx, teamID, task.RequesterID)
+		if err != nil {
+			return err
+		}
+		if !approved {
+			return errDeliveryMemberRemoved
+		}
+		return nil
 	}
 	bot, err := s.cfg.Bots.GetBotByOwner(ctx, task.RequesterID)
 	if err != nil {
@@ -237,36 +304,60 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 		_, _, partErr := s.sendAndJournalPart(ctx, deliveryPart{
 			key: partKey,
 			message: domain.Message{
-				UserID:      bot.OwnerID,
-				BotID:       bot.ID,
-				SessionKey:  personalSessionKey(bot.OwnerID),
+				UserID: bot.OwnerID,
+				BotID:  bot.ID,
+				// 审查: 出站消息记录到任务所属 session(个人或团队), 而不是
+				// 硬编码个人 session——团队任务的出站消息此前被错误记入
+				// 个人会话。
+				SessionKey:  task.SessionKey,
 				MessageType: domain.MessageTypeText,
 				Content:     payload.Text,
 				TaskID:      task.ID,
 			},
 			send: func() error {
+				if err := assertMemberAtSend(); err != nil {
+					return err
+				}
 				return s.cfg.Transport.SendMessage(sendCtx, bot.BotUUID, bot.IlinkUserID, payload.Text)
 			},
 			sendErrorCode: "SEND_FAILED",
 		})
 		if partErr != nil {
+			if errors.Is(partErr.err, errDeliveryMemberRemoved) {
+				return s.deadLetterMemberRemoved(ctx, d, partKey, partErr.err, now)
+			}
 			return s.handleDeliveryPartError(ctx, d, task, partKey, partErr, now)
 		}
 	}
 	for _, file := range payload.Files {
-		partKey := d.DeliveryID + ":file:" + file.relPath
+		// 审查 R5-I3: 发送结束后删除 buildPayload 写入的私有临时文件
+		// (顺带清理空子目录)。
+		defer func() {
+			_ = os.Remove(file.absPath)
+			_ = os.Remove(filepath.Dir(file.absPath))
+		}()
+		partKey := d.DeliveryID + ":file:" + file.auditPath
 		msgRow, alreadySent, partErr := s.sendAndJournalPart(ctx, deliveryPart{
 			key: partKey,
 			message: domain.Message{
 				UserID:      bot.OwnerID,
 				BotID:       bot.ID,
-				SessionKey:  personalSessionKey(bot.OwnerID),
+				SessionKey:  task.SessionKey,
 				MessageType: domain.MessageTypeFile,
 				Content:     file.displayName,
-				MediaPath:   file.relPath,
+				MediaPath:   file.auditPath,
 				TaskID:      task.ID,
 			},
 			send: func() error {
+				if err := assertMemberAtSend(); err != nil {
+					return err
+				}
+				// 审查 R5-I3: DB 快照文件的内容来自成功事务的安全捕获
+				// (safefs 限长读取 + 普通文件校验), tmp 位于 Platform 私有
+				// 目录(0700), 直接发送, 无需二次快照。
+				if file.snapshotContent {
+					return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, file.absPath, file.displayName)
+				}
 				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
 				// 后复制到 Platform 私有快照, transport 发送不可变快照,
 				// 消除校验与发送之间的 TOCTOU。
@@ -275,11 +366,14 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 					return snapErr
 				}
 				defer os.Remove(snap)
-				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, snap)
+				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, snap, file.displayName)
 			},
 			sendErrorCode: "SEND_FILE_FAILED",
 		})
 		if partErr != nil {
+			if errors.Is(partErr.err, errDeliveryMemberRemoved) {
+				return s.deadLetterMemberRemoved(ctx, d, partKey, partErr.err, now)
+			}
 			return s.handleDeliveryPartError(ctx, d, task, partKey, partErr, now)
 		}
 		if alreadySent {
@@ -290,7 +384,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 			BotID:       bot.ID,
 			MessageID:   msgRow.ID,
 			FileName:    file.displayName,
-			StoragePath: file.relPath,
+			StoragePath: file.auditPath,
 			ContentType: "application/octet-stream",
 			Direction:   domain.MessageOutbound,
 		}); err != nil && !errors.Is(err, domain.ErrDuplicateMediaAsset) {
@@ -349,6 +443,14 @@ func (s *deliveryService) sendAndJournalPart(ctx context.Context, part deliveryP
 	return msgRow, false, nil
 }
 
+func (s *deliveryService) deadLetterMemberRemoved(ctx context.Context, d domain.Delivery, partKey string, sendErr error, now time.Time) error {
+	err := s.deadLetter(ctx, d, "MEMBER_REMOVED", sendErr.Error(), now)
+	if err == nil {
+		s.clearUnjournaledPart(partKey)
+	}
+	return err
+}
+
 func (s *deliveryService) handleDeliveryPartError(
 	ctx context.Context,
 	d domain.Delivery,
@@ -387,10 +489,12 @@ func (s *deliveryService) clearUnjournaledPart(key string) {
 }
 
 type deliveryFile struct {
-	absPath     string
-	root        string // session sandbox root(共享卷内; safefs 受限打开)
-	relPath     string
-	displayName string
+	absPath         string // 可发送文件的完整路径(Platform 私有快照)
+	root            string // absPath 的受限根(OpenBeneath 用)
+	relPath         string // root 相对路径(OpenBeneath 用)
+	displayName     string
+	auditPath       string // workspace 内相对路径(消息媒体审计, 审查 R5-I3)
+	snapshotContent bool   // true = 内容来自成功事务捕获的 DB 快照, 直接发送
 }
 
 type deliveryPayload struct {
@@ -422,25 +526,36 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 		} else {
 			out.Text = "任务完成。"
 		}
-		if len(markers) == 0 {
+		// 审查 R5-I3: 文件内容在任务成功事务时已快照入 task_delivery_files
+		// (与成功状态原子提交); 发送时直接使用快照, 不再重新解析 workspace
+		// 路径——同 Runner 下一条串行任务可能已覆盖/删除同名输出。
+		files, err := s.cfg.Store.LoadDeliveryFiles(ctx, d.DeliveryID)
+		if err != nil {
+			return deliveryPayload{}, fmt.Errorf("load delivery files: %w", err)
+		}
+		if len(files) == 0 {
 			return out, nil
 		}
-		if s.cfg.SessionFiles == nil {
-			return deliveryPayload{}, errors.New("session files manager is required for [FILE:] markers")
+		if len(markers) > 0 && cleaned == "" {
+			out.Text = "任务完成，请查收文件。"
 		}
-		out.Files = make([]deliveryFile, 0, len(markers))
-		for _, marker := range markers {
-			absPath, relPath, err := s.cfg.SessionFiles.ResolveMarker(task.SessionKey, marker)
-			if err != nil {
-				return deliveryPayload{}, err
+		out.Files = make([]deliveryFile, 0, len(files))
+		for _, f := range files {
+			// 快照内容写入 Platform 私有临时文件(发送后删除)。文件名保留
+			// 用户可见名(transport 以路径 basename 作为显示名), 子目录按
+			// delivery 隔离避免并发同名覆盖; marker 哈希前缀区分同 basename
+			// 的不同输出文件(如 outputs/a.docx 与 outputs/sub/a.docx)。
+			dir := filepath.Join(s.snapshotDir, deliveryFileKey(d.DeliveryID))
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return deliveryPayload{}, fmt.Errorf("create delivery file dir: %w", err)
 			}
-			ref, err := s.cfg.SessionFiles.RecordOutbound(task.SessionKey, marker)
-			if err != nil {
-				return deliveryPayload{}, err
+			tmpPath := filepath.Join(dir, fmt.Sprintf("%s_%s", deliveryFileMarkerKey(f.Marker), f.FileName))
+			if err := os.WriteFile(tmpPath, f.Content, 0o600); err != nil {
+				return deliveryPayload{}, fmt.Errorf("write delivery file snapshot %q: %w", f.Marker, err)
 			}
 			out.Files = append(out.Files, deliveryFile{
-				absPath: absPath, root: s.cfg.SessionFiles.SandboxRoot(task.SessionKey),
-				relPath: relPath, displayName: ref.OriginalName,
+				absPath: tmpPath, root: dir, relPath: filepath.Base(tmpPath),
+				displayName: f.FileName, auditPath: f.RelPath, snapshotContent: true,
 			})
 		}
 		return out, nil
@@ -491,11 +606,35 @@ func nextRetryAt(d domain.Delivery, now time.Time) time.Time {
 	return now.Add(delay)
 }
 
+// teamSessionKey 解析 team:<uuid> 形式的 session key; 非团队 key 返回 ok=false。
+func teamSessionKey(sessionKey string) (string, bool) {
+	if !strings.HasPrefix(sessionKey, "team:") {
+		return "", false
+	}
+	id := strings.TrimPrefix(sessionKey, "team:")
+	if id == "" || strings.ContainsAny(id, ":/\\\x00") {
+		return "", false
+	}
+	return id, true
+}
+
 func truncateBytes(s string, limit int) string {
 	if len(s) <= limit {
 		return s
 	}
 	return s[:limit]
+}
+
+// deliveryFileKey 把 delivery_id(含 ':' 等非文件名字符)转为安全文件名前缀。
+func deliveryFileKey(deliveryID string) string {
+	replacer := strings.NewReplacer(":", "_", "/", "_", "\\", "_", "..", "_")
+	return replacer.Replace(deliveryID)
+}
+
+// deliveryFileMarkerKey 返回 marker 的 8 位哈希前缀(区分同 basename 文件)。
+func deliveryFileMarkerKey(marker string) string {
+	sum := sha256.Sum256([]byte(marker))
+	return hex.EncodeToString(sum[:4])
 }
 
 var (

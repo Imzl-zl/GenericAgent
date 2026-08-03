@@ -150,9 +150,10 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (domain.Task, error)
 	return t, nil
 }
 
-// ResetWorkspace marks the session for fresh start: the next submitted task
-// will have fresh_session=true and the Worker will be restarted without
-// loading the prior snapshot. Implements /new (spec §7).
+// WorkspaceIsFresh 返回 workspaces.reset_at 是否仍待消费(/new 后首个成功
+// 任务之前)。dispatch 时实时判定并写回 tasks.fresh_session(MarkDispatchStarted
+// 事务), 解决多条 queued 任务共享提交时 fresh 快照、第二条任务错误空启动
+// 丢失连续上下文的问题(审查 F2)。
 // recoveryRevocationTTL 是崩溃恢复撤销 JTI 时写入 revocation 表的有效期:
 // capability 签发 TTL(默认 1h)与校验 leeway(30s)的总上界取 2h, 覆盖
 // token 的完整剩余寿命, 保证恢复后旧 token 立即且持续失效。
@@ -160,37 +161,65 @@ const recoveryRevocationTTL = 2 * time.Hour
 
 // SetTaskCapabilityJTIs 持久化任务实际签发的 capability JTI 列表
 // (供 RecoverAfterRestart 在中断任务时同一事务内撤销)。
-func (s *Store) SetTaskCapabilityJTIs(ctx context.Context, taskID string, jtis []string) error {
+// 审查 R5-I2: 更新带任务活跃 claim 条件——status 必须 starting/running 且
+// claim_owner 是本实例且 lease 未过期。已终态/被接管/lease 丢失的任务行
+// 上的 JTI 由终态事务撤销, 新签发的 token 若挂到这样的行上, 崩溃窗口内
+// 无人会再撤销(恢复扫描只处理未终态任务)。
+func (s *Store) SetTaskCapabilityJTIs(ctx context.Context, taskID, platformInstanceID string, jtis []string) error {
 	if taskID == "" {
 		return fmt.Errorf("task id is required")
+	}
+	if platformInstanceID == "" {
+		return fmt.Errorf("platform instance id is required")
 	}
 	if len(jtis) == 0 {
 		return nil
 	}
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 UPDATE tasks SET capability_jtis = $2, updated_at = timezone('utc', now())
 WHERE id = $1
-`, taskID, jtis)
-	return err
+  AND status IN ('starting','running')
+  AND claim_owner = $3
+  AND claim_lease_until > timezone('utc', now())
+`, taskID, jtis, platformInstanceID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("persist capability jtis: task %s not active under %s", taskID, platformInstanceID)
+	}
+	return nil
 }
 
 // ResetWorkspaceForNewSession marks the session for fresh start (/new):
-// sets reset_at and cancels every queued task of the session in the same
-// transaction. 审查 R4-I8: /new 后排队中的旧任务不得带旧上下文执行, 且
-// 重置标记保留到 fresh 任务成功终态(SubmitTask/CompleteSucceeded), 失败
-// 的 fresh 任务不会让下一个任务恢复 /new 前的旧 snapshot。
+// 在 workspace 行锁下原子完成三件事(审查 F3):
+//  1. 设置 reset_at(/new 语义, 保留到 fresh 任务成功终态);
+//  2. 终态化所有 queued 任务与未派发的 starting 任务(worker_dispatch_started_at
+//     IS NULL), 防止旧上下文任务带旧 snapshot 执行;
+//  3. 对已派发的 starting/running 任务写入 durable cancel_requested_at
+//     (tick 驱动 Worker cancel RPC, dispatch 观察后终态化), 闭合
+//     "查询活跃任务 -> claim -> reset" 的竞态窗口——即使任务在
+//     FindRunningTaskBySession 之后才被 claim, 也会在此事务内被取消。
 func (s *Store) ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error) {
 	var cancelled int
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		// workspace 行锁: 与 SubmitTask/ClaimNextTask 串行, 确保取消与
+		// reset 的原子性(审查 F3: /new 不得在返回成功后仍有旧上下文任务执行)。
+		var workspaceID string
+		if err := tx.QueryRow(ctx, `SELECT id FROM workspaces WHERE session_key = $1 FOR UPDATE`, sessionKey).Scan(&workspaceID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `
 UPDATE workspaces SET reset_at = timezone('utc', now())
 WHERE session_key = $1
 `, sessionKey); err != nil {
 			return err
 		}
+		// queued + 未派发的 starting: 直接终态化为 cancelled(与 CancelTask
+		// 的未派发分支语义一致)。
 		rows, err := tx.Query(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
-WHERE session_key = $1 AND status = 'queued'
+WHERE session_key = $1 AND (status = 'queued' OR (status = 'starting' AND worker_dispatch_started_at IS NULL))
 FOR UPDATE
 `, sessionKey)
 		if err != nil {
@@ -216,9 +245,59 @@ FOR UPDATE
 			}
 			cancelled++
 		}
+		// 已派发的 starting/running: 写入 durable cancel request(仅一次)。
+		rows2, err := tx.Query(ctx, `
+SELECT `+taskSelectColumns+` FROM tasks
+WHERE session_key = $1 AND status IN ('starting','running')
+  AND worker_dispatch_started_at IS NOT NULL AND cancel_requested_at IS NULL
+FOR UPDATE
+`, sessionKey)
+		if err != nil {
+			return err
+		}
+		var active []domain.Task
+		for rows2.Next() {
+			t, scanErr := scanTask(rows2)
+			if scanErr != nil {
+				rows2.Close()
+				return scanErr
+			}
+			active = append(active, t)
+		}
+		rows2.Close()
+		if err := rows2.Err(); err != nil {
+			return err
+		}
+		for _, t := range active {
+			row := tx.QueryRow(ctx, `
+UPDATE tasks SET cancel_requested_at = timezone('utc', now()), updated_at = timezone('utc', now())
+WHERE id = $1 AND cancel_requested_at IS NULL
+RETURNING `+taskSelectColumns, t.ID)
+			if _, err := scanTask(row); err != nil {
+				return err
+			}
+			if err := insertNextEvent(ctx, tx, t.ID, "cancel_request", nil, nil, string(t.Status), string(t.Status), t.WorkerInstanceID, "TASK_CANCELLED"); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	return cancelled, err
+}
+
+// WorkspaceIsFresh 返回 workspaces.reset_at 是否仍待消费(/new 后首个成功
+// 任务之前)。dispatch 时实时判定并写回 tasks.fresh_session(MarkDispatchStarted
+// 事务), 解决多条 queued 任务共享提交时 fresh 快照、第二条任务错误空启动
+// 丢失连续上下文的问题(审查 F2)。
+func (s *Store) WorkspaceIsFresh(ctx context.Context, sessionKey string) (bool, error) {
+	var fresh bool
+	err := s.pool.QueryRow(ctx, `
+SELECT COALESCE(reset_at IS NOT NULL, false) FROM workspaces WHERE session_key = $1
+`, sessionKey).Scan(&fresh)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("workspace not found for session_key %q", sessionKey)
+	}
+	return fresh, err
 }
 
 // ListClaimableSessionKeys returns session keys with queued work and no active

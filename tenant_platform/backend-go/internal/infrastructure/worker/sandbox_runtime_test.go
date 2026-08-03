@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -23,6 +24,7 @@ type fakeLeaseStore struct {
 	renewErr      error
 	attachErr     error
 	acquireCalls  int
+	created       bool // AcquireRunnerLease 的接管创建标记(接管路径测试)
 	lease         domain.RunnerLease
 }
 
@@ -34,7 +36,7 @@ func (f *fakeLeaseStore) AcquireRunnerLease(ctx context.Context, runnerKey, owne
 	if f.acquireErr != nil {
 		return domain.RunnerLease{}, false, f.acquireErr
 	}
-	return f.lease, false, nil
+	return f.lease, f.created, nil
 }
 
 func (f *fakeLeaseStore) RenewRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64, leaseTTL time.Duration) error {
@@ -44,7 +46,7 @@ func (f *fakeLeaseStore) RenewRunnerLease(ctx context.Context, runnerKey, owner 
 	return f.renewErr
 }
 
-func (f *fakeLeaseStore) AttachRunnerContainer(ctx context.Context, runnerKey, containerID string, generation uint64) error {
+func (f *fakeLeaseStore) AttachRunnerContainer(ctx context.Context, runnerKey, containerID string, generation uint64, owner string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.attached = append(f.attached, runnerKey)
@@ -60,20 +62,23 @@ func (f *fakeLeaseStore) ReleaseRunnerLease(ctx context.Context, runnerKey, owne
 
 // fakeManagerCLI simulates the Sandbox Manager control plane.
 type fakeManagerCLI struct {
-	ensureErr error
-	destroyed []string
+	ensureErr  error
+	destroyErr error
+	created    int
+	destroyed  []string
 }
 
 func (f *fakeManagerCLI) EnsureRunner(ctx context.Context, req sandbox.EnsureRunnerRequest) (sandbox.Runner, bool, error) {
 	if f.ensureErr != nil {
 		return sandbox.Runner{}, false, f.ensureErr
 	}
+	f.created++
 	return sandbox.Runner{Name: "ga-runner-test-g1", ContainerID: "cid"}, true, nil
 }
 
 func (f *fakeManagerCLI) Destroy(ctx context.Context, name string) error {
 	f.destroyed = append(f.destroyed, name)
-	return nil
+	return f.destroyErr
 }
 
 func (f *fakeManagerCLI) CreateAndStart(ctx context.Context, spec sandbox.RunnerSpec) (sandbox.Runner, error) {
@@ -85,6 +90,9 @@ func (f *fakeManagerCLI) IsRunnerContainer(ctx context.Context, idOrName string)
 	return true, nil
 }
 func (f *fakeManagerCLI) EnsureWorkspace(ctx context.Context, workspaceHash string) error { return nil }
+func (f *fakeManagerCLI) RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error) {
+	return "", false, nil
+}
 
 func newSandboxRuntimeForTest(t *testing.T, leases *fakeLeaseStore, manager *fakeManagerCLI) *SandboxWorkerRuntime {
 	t.Helper()
@@ -128,6 +136,34 @@ func TestStartReleasesLeaseWhenEnsureRunnerFails(t *testing.T) {
 	defer leases.mu.Unlock()
 	if len(leases.released) != 1 || leases.released[0] != "personal:1" {
 		t.Fatalf("lease must be released on failure, released=%v", leases.released)
+	}
+}
+
+// TestStartFailsClosedWhenStaleContainerDestroyFails: lease 接管时旧 generation
+// 容器销毁失败必须 fail-closed(审查 R5-C3)——旧 Runner 仍挂载同一 workspace
+// 且可能写穿 memory/temp/state, 继续创建新容器会让两代并发写破坏 generation
+// fencing。不得继续创建, 并必须释放 lease 归还容量。
+func TestStartFailsClosedWhenStaleContainerDestroyFails(t *testing.T) {
+	leases := &fakeLeaseStore{}
+	manager := &fakeManagerCLI{destroyErr: errors.New("docker daemon unreachable")}
+	r := newSandboxRuntimeForTest(t, leases, manager)
+	// 接管: created=true + stale_container_id 非空。
+	leases.created = true
+	leases.lease = domain.RunnerLease{Generation: 2, StaleContainerID: "old-cid-123"}
+
+	if _, err := r.Start(context.Background(), StartRequest{SessionKey: "personal:1"}); err == nil {
+		t.Fatal("Start must fail when stale container destroy fails")
+	}
+	if len(manager.destroyed) != 1 || manager.destroyed[0] != "old-cid-123" {
+		t.Fatalf("destroyed = %v, want [old-cid-123]", manager.destroyed)
+	}
+	if manager.created != 0 {
+		t.Fatalf("created = %d, want 0 (must not proceed after stale destroy failure)", manager.created)
+	}
+	leases.mu.Lock()
+	defer leases.mu.Unlock()
+	if len(leases.released) != 1 {
+		t.Fatalf("lease must be released on stale-destroy failure, released=%v", leases.released)
 	}
 }
 

@@ -14,7 +14,9 @@ type BotTransportAdapter interface {
 	// SendMessage delivers a text reply to the bound user via the bot.
 	SendMessage(ctx context.Context, botUUID, ilinkUserID, text string) error
 	// SendFile delivers a file reply to the bound user via the bot.
-	SendFile(ctx context.Context, botUUID, ilinkUserID, filePath string) error
+	// fileName 是用户可见的显示文件名(审查 R5-I10): 不得从 filePath 的
+	// basename 推导——快照临时文件名含 marker hash 前缀, 会暴露给用户。
+	SendFile(ctx context.Context, botUUID, ilinkUserID, filePath, fileName string) error
 
 	// RecordMessageIdempotency records (botUUID, messageID) and returns true
 	// if this is the first time the message has been seen. Returns false for

@@ -163,6 +163,12 @@ func (s *ManagerServer) handleInspect(w http.ResponseWriter, r *http.Request) {
 		writeManagerError(w, http.StatusConflict, "RUNNER_INSPECT_FAILED", err.Error())
 		return
 	}
+	// 审查 R5-C6: inspect 同时返回容器 label 中的 workspace hash, 供
+	// Platform 销毁路径(重启后按容器 ID)定位 config/ 清理目标。
+	if hash, ok, err := s.manager.RunnerWorkspaceHash(r.Context(), name); err == nil && ok {
+		writeManagerJSON(w, http.StatusOK, map[string]string{"name": name, "ok": "true", "workspace_hash": hash})
+		return
+	}
 	writeManagerJSON(w, http.StatusOK, map[string]string{"name": name, "ok": "true"})
 }
 

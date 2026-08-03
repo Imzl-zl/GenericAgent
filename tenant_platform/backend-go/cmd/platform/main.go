@@ -78,6 +78,33 @@ func envInt(name string, fallback int) int {
 // GA_WORKER_EXECUTION_MODE=user_workspace_runner(默认)使用 Sandbox 工作区
 // Runner; loopback 仅显式用于开发降级(方案 §7: 不作静默回退)。
 // 返回的 managerClient 供 Platform 在附件导入前初始化 workspace 布局。
+
+// buildSessionFiles 构建附件/输出沙箱(审查 R5-I3): 生产 Runner 模式用共享
+// 工作区卷布局(附件导入前经 Manager 控制面预置目录), loopback 用本地目录。
+func buildSessionFiles(boot application.DevBootstrapConfig, managerClient sandbox.RunnerCLI, devLoopback bool) (application.SessionFiles, error) {
+	if devLoopback {
+		if strings.TrimSpace(boot.RuntimeRoot) == "" {
+			return nil, nil
+		}
+		sf, err := application.NewSessionFiles(boot.RuntimeRoot)
+		if err != nil {
+			return nil, fmt.Errorf("session files: %w", err)
+		}
+		return sf, nil
+	}
+	var ensureWorkspace func(sessionKey string) error
+	if managerClient != nil {
+		ensureWorkspace = func(sessionKey string) error {
+			return managerClient.EnsureWorkspace(context.Background(), sessionKey)
+		}
+	}
+	sf, err := application.NewWorkspaceSessionFiles(boot.WorkspacesRoot, ensureWorkspace)
+	if err != nil {
+		return nil, fmt.Errorf("workspace session files: %w", err)
+	}
+	return sf, nil
+}
+
 func buildWorkerRuntime(
 	boot application.DevBootstrapConfig,
 	store *postgres.Store,
@@ -163,7 +190,13 @@ func runtimeConfigDirFor(boot application.DevBootstrapConfig) func(sessionKey st
 		return nil
 	}
 	return func(sessionKey string) string {
-		hash := sandbox.WorkspaceDirHash(sessionKey)
+		hash, err := sandbox.WorkspaceDirHash(sessionKey)
+		if err != nil {
+			// key 来自 DB（personal:<uid>/team:<uuid>），正常不会失败；
+			// 返回空目录会在写 runtime config 时失败并显式暴露，不静默。
+			slog.Error("runtime config dir: invalid workspace key", "session_key", sessionKey, "error", err)
+			return ""
+		}
 		return filepath.Join(boot.WorkspacesRoot, hash, "config")
 	}
 }
@@ -402,6 +435,7 @@ func run() error {
 		claimLease            = flag.Duration("claim-lease", 0, "positive claim lease duration (required)")
 		devLoopback           = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
 		listen                = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
+		workerInternalListen  = flag.String("worker-internal-listen", "", "internal listener for capability-protected worker endpoints (e.g. 0.0.0.0:8082); empty disables (审查 R5-C1: 主 API 保持 loopback, Runner 经内部 listener 访问 Sophub proxy)")
 		databaseURL           = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
 		migration             = flag.String("migration", "", "path to 0001_foundation.sql")
 		runtimeRoot           = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
@@ -658,6 +692,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// 审查 R5-I3: session files 在 scheduler 之前构建——成功事务前需要
+	// 捕获 [FILE:...] 输出文件快照(SchedulerConfig.SessionFiles)。
+	sessionFiles, err := buildSessionFiles(boot, managerClient, *devLoopback)
+	if err != nil {
+		return err
+	}
 	sessionScopedConfig := true
 
 	sched, err := application.NewScheduler(application.SchedulerConfig{
@@ -667,6 +707,7 @@ func run() error {
 		Store:                 store,
 		Registry:              reg,
 		Coordinator:           coord,
+		SessionFiles:          sessionFiles,
 		Runtime:               runtime,
 		ConfigRoot:            boot.ConfigRoot,
 		SessionScopedConfig:   sessionScopedConfig,
@@ -835,29 +876,6 @@ func run() error {
 		return fmt.Errorf("relay service: %w", err)
 	}
 
-	var sessionFiles application.SessionFiles
-	if *devLoopback {
-		if strings.TrimSpace(boot.RuntimeRoot) != "" {
-			sessionFiles, err = application.NewSessionFiles(boot.RuntimeRoot)
-			if err != nil {
-				return fmt.Errorf("session files: %w", err)
-			}
-		}
-	} else {
-		// 生产: 附件/输出经共享工作区卷 temp/ 与 Runner 互通(方案 §6)。
-		// 附件导入前经 Manager 控制面预置 workspace 目录布局与共享组权限。
-		var ensureWorkspace func(sessionKey string) error
-		if managerClient != nil {
-			ensureWorkspace = func(sessionKey string) error {
-				return managerClient.EnsureWorkspace(context.Background(), sessionKey)
-			}
-		}
-		sessionFiles, err = application.NewWorkspaceSessionFiles(boot.WorkspacesRoot, ensureWorkspace)
-		if err != nil {
-			return fmt.Errorf("workspace session files: %w", err)
-		}
-	}
-
 	routerSvc, err := application.NewRouter(application.RouterConfig{
 		Store:           store,
 		Tasks:           svc,
@@ -894,11 +912,12 @@ func run() error {
 			}
 			return sv.Validate(ctx, token)
 		},
-		Bots:         store,
-		LLMProviders: store, // admin LLM provider management (migration 0007)
-		MCPServers:   store, // global MCP server management (migration 0029)
-		BotLifecycle: botLifecycle,
-		TaskStats:    store,
+		SophubUsageCounter: store, // 审查 F10: sophub 调用按 JTI 原子计量
+		Bots:               store,
+		LLMProviders:       store, // admin LLM provider management (migration 0007)
+		MCPServers:         store, // global MCP server management (migration 0029)
+		BotLifecycle:       botLifecycle,
+		TaskStats:          store,
 		RuntimeProfile: api.RuntimeProfile{
 			ClaimLeaseSeconds:         int((*claimLease) / time.Second),
 			TokenTTLSeconds:           int(llmproxy.DefaultTokenTTL / time.Second),
@@ -930,13 +949,14 @@ func run() error {
 	var deliverySvc application.DeliveryService
 	if cipher != nil && coord != nil {
 		deliveryCfg := application.DeliveryServiceConfig{
-			Store:        store,
-			Tasks:        store,
-			Bots:         store,
-			Transport:    botTransport,
-			Results:      coord,
-			Messages:     store, // audit outbound replies (migration 0013)
-			SessionFiles: sessionFiles,
+			Store:          store,
+			Tasks:          store,
+			Bots:           store,
+			Transport:      botTransport,
+			Results:        coord,
+			Messages:       store, // audit outbound replies (migration 0013)
+			SessionFiles:   sessionFiles,
+			TeamMembership: store, // 审查 R5-I4: 团队任务交付前校验发起人成员资格
 			PollInterval: 2 * time.Second,
 			ClaimLease:   30 * time.Second,
 			RetryWindow:  5 * time.Minute,
@@ -984,6 +1004,24 @@ func run() error {
 
 	fmt.Fprintf(os.Stderr, "platform: instance_id=%s listen=%s session=%s policy_digest=%s\n",
 		instanceID, *listen, devCtx.SessionKey, reg.Digest())
+
+	// 审查 R5-C1: 内部 listener 只挂 capability-protected Worker Sophub 路由
+	// (NewWorkerSophubHandler), 默认关闭; 显式启用时绑定失败即 fail-closed
+	// 终止启动——Runner 依赖它访问 Sophub proxy, 静默降级会让 Runner 的
+	// sophub 工具全部失败。
+	if strings.TrimSpace(*workerInternalListen) != "" {
+		internalHandler := server.WorkerSophubHandler()
+		if internalHandler == nil {
+			return fmt.Errorf("worker-internal-listen requires sophub proxy to be configured")
+		}
+		go func() {
+			slog.Info("platform: worker internal listener", "addr", *workerInternalListen)
+			if err := api.ServeInternalContext(ctx, *workerInternalListen, internalHandler); err != nil && !errors.Is(err, context.Canceled) {
+				slog.ErrorContext(ctx, "platform: worker internal listener failed", "error", err)
+				cancel()
+			}
+		}()
+	}
 
 	// Wrap the HTTP server with sd_notify so systemd Type=notify + WatchdogSec
 	// can supervise this process. When not running under systemd (NOTIFY_SOCKET

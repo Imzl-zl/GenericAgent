@@ -11,7 +11,10 @@ import (
 // 首次创建且 memory 为空时从 template 初始化。
 func TestPrepareWorkspaceDirsCreatesSubdirs(t *testing.T) {
 	root := t.TempDir()
-	hash := WorkspaceDirHash("personal:1")
+	hash, err := WorkspaceDirHash("personal:1")
+	if err != nil {
+		t.Fatalf("workspace hash: %v", err)
+	}
 
 	dirs, err := prepareWorkspaceDirs(root, hash, "", 10002, 10002, 10003)
 	if err != nil {
@@ -30,7 +33,10 @@ func TestPrepareWorkspaceDirsCreatesSubdirs(t *testing.T) {
 
 func TestPrepareWorkspaceDirsSeedsMemoryFromTemplate(t *testing.T) {
 	root := t.TempDir()
-	hash := WorkspaceDirHash("personal:2")
+	hash, err := WorkspaceDirHash("personal:2")
+	if err != nil {
+		t.Fatalf("workspace hash: %v", err)
+	}
 
 	// 构造一个 2 文件的模板目录。
 	tmpl := t.TempDir()
@@ -67,7 +73,10 @@ func TestPrepareWorkspaceDirsSeedsMemoryFromTemplate(t *testing.T) {
 
 func TestPrepareWorkspaceDirsDoesNotOverwriteExistingMemory(t *testing.T) {
 	root := t.TempDir()
-	hash := WorkspaceDirHash("personal:3")
+	hash, err := WorkspaceDirHash("personal:3")
+	if err != nil {
+		t.Fatalf("workspace hash: %v", err)
+	}
 
 	// 预先创建带用户内容的 memory。
 	dirs, err := prepareWorkspaceDirs(root, hash, "", 10002, 10002, 10003)
@@ -108,7 +117,10 @@ func TestPrepareWorkspaceDirsRejectsTraversalHash(t *testing.T) {
 // 必须删除链接并用目录重建, 而不是跟随链接修改外部目标。
 func TestPrepareWorkspaceDirsReplacesSymlinkDirs(t *testing.T) {
 	root := t.TempDir()
-	hash := WorkspaceDirHash("personal:9")
+	hash, err := WorkspaceDirHash("personal:9")
+	if err != nil {
+		t.Fatalf("workspace hash: %v", err)
+	}
 	ws := filepath.Join(root, hash)
 
 	// 模拟 Runner 已把 state/staging 替换为指向外部目录的符号链接。
@@ -148,7 +160,10 @@ func TestPrepareWorkspaceDirsReplacesSymlinkDirs(t *testing.T) {
 // 穿过的中间目录。
 func TestPrepareWorkspaceDirsFixesAncestorPermissions(t *testing.T) {
 	root := t.TempDir()
-	hash := WorkspaceDirHash("personal:10")
+	hash, err := WorkspaceDirHash("personal:10")
+	if err != nil {
+		t.Fatalf("workspace hash: %v", err)
+	}
 	dirs, err := prepareWorkspaceDirs(root, hash, "", 10002, 10002, 10003)
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +188,10 @@ func TestPrepareWorkspaceDirsFixesAncestorPermissions(t *testing.T) {
 // 不得残留 .memory-init-* 临时目录(审查 I13)。
 func TestPrepareWorkspaceDirsSeedsMemoryAtomically(t *testing.T) {
 	root := t.TempDir()
-	hash := WorkspaceDirHash("personal:atomic")
+	hash, err := WorkspaceDirHash("personal:3")
+	if err != nil {
+		t.Fatalf("workspace hash: %v", err)
+	}
 	ws := filepath.Join(root, hash)
 
 	// 失败路径: 模板路径不是目录(ReadDir 失败) → 报错且无残留。
@@ -222,7 +240,10 @@ func TestWriteConfigFilesGroupReadable(t *testing.T) {
 		t.Log("non-root: ownership not asserted, mode still checked")
 	}
 	root := t.TempDir()
-	hash := WorkspaceDirHash("personal:perm")
+	hash, err := WorkspaceDirHash("personal:perm")
+	if err != nil {
+		t.Fatalf("workspace hash: %v", err)
+	}
 	// config/ 目录由 prepareWorkspaceDirs 预置(writeConfigFiles 只写文件)。
 	if _, err := prepareWorkspaceDirs(root, hash, "", 10002, 10002, 10003); err != nil {
 		t.Fatal(err)

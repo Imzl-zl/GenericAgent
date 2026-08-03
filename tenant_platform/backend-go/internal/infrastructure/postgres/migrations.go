@@ -72,6 +72,8 @@ func migrationFiles() []string {
 		"0041_runner_lease_stale_container.sql",
 		"0042_task_capability_jtis.sql",
 		"0043_capability_usage.sql",
+		"0044_task_delivery_files.sql",
+		"0045_delivery_cancelled.sql",
 	}
 }
 
@@ -119,6 +121,8 @@ var pendingMigrations = []struct {
 	{"0041_runner_lease_stale_container.sql", "migration_0041_runner_lease_stale_container_marker"},
 	{"0042_task_capability_jtis.sql", "migration_0042_task_capability_jtis_marker"},
 	{"0043_capability_usage.sql", "migration_0043_capability_usage_marker"},
+	{"0044_task_delivery_files.sql", "migration_0044_task_delivery_files_marker"},
+	{"0045_delivery_cancelled.sql", "migration_0045_delivery_cancelled_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -179,6 +183,10 @@ var foundationTableNames = []string{
 	"migration_0040_checkpoint_runner_generation_marker",
 	"migration_0041_runner_lease_stale_container_marker",
 	"migration_0042_task_capability_jtis_marker",
+	"capability_usage",
+	"migration_0043_capability_usage_marker",
+	"task_delivery_files",
+	"migration_0044_task_delivery_files_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",

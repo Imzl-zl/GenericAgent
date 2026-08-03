@@ -327,7 +327,7 @@ func TestWorkerClient_CancelTask_SendsTaskID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := client.CancelTask(ctx, "personal:9", "task-to-cancel", 3); err != nil {
+	if err := client.CancelTask(ctx, "personal:9", "task-to-cancel", 3, "jti-1"); err != nil {
 		t.Fatalf("CancelTask: %v", err)
 	}
 	srv.mu.Lock()
@@ -358,7 +358,7 @@ func TestWorkerClient_HealthAndShutdown(t *testing.T) {
 	if !h.GetReady() || h.GetWorkerInstanceId() != "w-ready" {
 		t.Fatalf("health=%+v", h)
 	}
-	if err := client.Shutdown(ctx, "personal:9", "test-done", 3); err != nil {
+	if err := client.Shutdown(ctx, "personal:9", "test-done", 3, ""); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 	if !srv.shutdownOK {

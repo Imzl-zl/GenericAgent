@@ -37,7 +37,7 @@ fi
 HASH_A="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 HASH_B="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 for H in "$HASH_A" "$HASH_B"; do
-  mkdir -p "$WS_ROOT/$H"/{memory,temp,state,config,attachments}
+  mkdir -p "$WS_ROOT/$H"/{memory,temp,state,config}
 done
 
 NAME_A="ga-runner-smoke-a-g1"
@@ -71,12 +71,11 @@ start_runner() {
     --env GA_RUNTIME_DIR=/ga/runner-state \
     --env GA_POLICY_FILE=/ga/runner-config/policy.json \
     --env GA_WORKER_LISTEN=tcp:0.0.0.0:9443 \
-    --workdir /ga/legacy/temp \
+    --workdir /ga/legacy \
     --mount "type=bind,source=$WS_ROOT/$hash/memory,destination=/ga/legacy/memory" \
     --mount "type=bind,source=$WS_ROOT/$hash/temp,destination=/ga/legacy/temp" \
     --mount "type=bind,source=$WS_ROOT/$hash/state,destination=/ga/runner-state" \
     --mount "type=bind,source=$WS_ROOT/$hash/config,destination=/ga/runner-config,readonly" \
-    --mount "type=bind,source=$WS_ROOT/$hash/attachments,destination=/ga/runner-attachments,readonly" \
     "$IMAGE" \
     --listen tcp:0.0.0.0:9443 >/dev/null
   docker start "$name" >/dev/null
@@ -95,11 +94,11 @@ start_runner() {
 start_runner "$NAME_A" "$HASH_A"
 start_runner "$NAME_B" "$HASH_B"
 
-echo "==> 2. inspect 校验: 挂载必须恰好是五个工作区 subpath(config/attachments 只读)"
+echo "==> 2. inspect 校验: 挂载必须恰好是四个工作区 subpath(config 只读)"
 for name in "$NAME_A" "$NAME_B"; do
   mounts="$(docker inspect --format '{{range .Mounts}}{{.Destination}} {{end}}' "$name")"
   echo "    $name mounts: $mounts"
-  for want in /ga/legacy/memory /ga/legacy/temp /ga/runner-state /ga/runner-config /ga/runner-attachments; do
+  for want in /ga/legacy/memory /ga/legacy/temp /ga/runner-state /ga/runner-config; do
     case " $mounts " in
       *" $want "*) ;;
       *) echo "错误: $name 缺少挂载 $want" >&2; exit 1;;

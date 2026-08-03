@@ -11,7 +11,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -151,7 +153,10 @@ func main() {
 			slog.Info("sandbox-manager shutting down")
 			return
 		case <-ticker.C:
-			sweepOrphans(ctx, cli, *prefix, *absTTL)
+			if err := sweepOrphans(ctx, manager, *prefix, *absTTL); err != nil {
+				// 审查 R5-I7: 清理错误聚合后统一记录, 不得逐条丢弃。
+				slog.ErrorContext(ctx, "sandbox-manager: orphan sweep completed with errors", "error", err)
+			}
 		}
 	}
 }
@@ -161,24 +166,32 @@ func main() {
 //   - 运行中容器一律跳过(审查): 活跃 Runner 由 Platform lease 生命周期
 //     管理(续租→idle 回收; lease 过期→Platform reconcile 销毁容器),
 //     按容器创建时间杀运行中容器会误杀仍在续租/正在执行任务的 Runner。
-func sweepOrphans(ctx context.Context, cli *sandbox.DockerCLI, prefix string, absTTL time.Duration) {
+// 统一经 Manager.DestroyRunner 执行(归属校验 + workspace config/ 清理,
+// 审查 R5-I7: 绕过 Manager 直接 CLI.Destroy 会让短期私钥残留)。
+func sweepOrphans(ctx context.Context, m *sandbox.Manager, prefix string, absTTL time.Duration) error {
 	_ = absTTL
-	containers, err := cli.ListRunnerContainers(ctx, prefix)
+	containers, err := m.ListRunnerContainers(ctx, prefix)
 	if err != nil {
-		slog.WarnContext(ctx, "sandbox-manager: list runner containers failed", "error", err)
-		return
+		return fmt.Errorf("list runner containers: %w", err)
 	}
+	var sweepErr error
+	destroyed := 0
 	for _, c := range containers {
 		if c.Running {
 			continue // 活跃 Runner 由 Platform lease 生命周期管理
 		}
-		if err := cli.Destroy(ctx, c.Name); err != nil {
-			slog.WarnContext(ctx, "sandbox-manager: destroy orphan runner failed", "name", c.Name, "error", err)
-		} else {
-			slog.InfoContext(ctx, "sandbox-manager: destroyed orphan runner",
-				"name", c.Name, "running", c.Running, "created_at", c.CreatedAt.UTC().Format(time.RFC3339))
+		if err := m.DestroyRunner(ctx, c.Name); err != nil {
+			sweepErr = errors.Join(sweepErr, fmt.Errorf("destroy orphan runner %s: %w", c.Name, err))
+			continue
 		}
+		destroyed++
+		slog.InfoContext(ctx, "sandbox-manager: destroyed orphan runner",
+			"name", c.Name, "running", c.Running, "created_at", c.CreatedAt.UTC().Format(time.RFC3339))
 	}
+	if destroyed > 0 {
+		slog.InfoContext(ctx, "sandbox-manager: orphan sweep", "destroyed", destroyed, "scanned", len(containers))
+	}
+	return sweepErr
 }
 
 func envOr(name, fallback string) string {

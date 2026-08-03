@@ -3,11 +3,16 @@
 #
 # 删除旧 PostgreSQL 数据卷与 Document 相关运行卷,按新 schema 启动。
 # 适用: GA Sandbox Runner 重构启用新部署前,仓库处于开发阶段,无需要保留
-# 的生产历史数据。此脚本破坏性:删除 postgres_data、runner_workspaces 等卷。
+# 的生产历史数据。此脚本破坏性:删除 postgres_data 等卷(默认不含
+# runner_workspaces 持久工作区, 见 --all 说明)。
 #
 # 用法: infra/compose/reset-dev.sh [--all]
-#   --all  同时删除 platform_runtime / platform_config / session_files / bot_media
+#   --all  同时删除 platform_runtime / platform_config / session_files /
+#           bot_media / runner_workspaces
 #           (完整重置;默认只删数据库与 document 卷)
+#
+# 注意(审查 F8): runner_workspaces 保存全部用户记忆/SOP/项目/文件, 属于
+# 不可再生的用户数据, 默认不删除——仅在显式 --all 时清除, 且需要二次确认。
 
 set -euo pipefail
 
@@ -24,11 +29,23 @@ project_name="genericagent"
 echo "==> 停止现有服务(保留卷)"
 docker compose -f "$compose_file" -p "$project_name" down --remove-orphans
 
-volumes=(postgres_data runner_workspaces)
+volumes=(postgres_data)
 
 if [[ "${1:-}" == "--all" ]]; then
-  volumes+=(platform_runtime platform_config session_files bot_media)
-  echo "==> --all 模式: 同时删除运行时/会话/媒体卷"
+  volumes+=(platform_runtime platform_config session_files bot_media runner_workspaces)
+  echo "==> --all 模式: 同时删除运行时/会话/媒体/持久工作区卷"
+  # 审查 F8: runner_workspaces 是不可再生的用户数据(记忆/SOP/项目/文件),
+  # 删除前必须二次确认。
+  read -r -p "确认删除 runner_workspaces 持久工作区卷? 输入 YES 继续: " confirm || true
+  if [[ "$confirm" != "YES" ]]; then
+    echo "已取消 runner_workspaces 删除; 其余 --all 卷继续处理"
+    filtered=()
+    for v in "${volumes[@]}"; do
+      [[ "$v" == "runner_workspaces" ]] && continue
+      filtered+=("$v")
+    done
+    volumes=("${filtered[@]}")
+  fi
 fi
 
 # 旧 Document 系统的遗留卷(重构前部署)也一并清理, 避免残留。

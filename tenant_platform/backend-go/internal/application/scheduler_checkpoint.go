@@ -66,6 +66,9 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		StagingRef:       runnerStagingRef,
 		MaxBundleBytes:   lease.MaxBundleBytes,
 		RunnerGeneration: entry.runnerGeneration,
+		// 审查 R5-I8: 绑定当前 task 的 capability JTI, Worker 校验其在会话
+		// 活跃凭据集中——终态撤销后旧 JTI 无法再发起 checkpoint。
+		CapabilityJti: firstJTI(entry.credentials),
 	})
 	if err != nil {
 		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
@@ -109,8 +112,20 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		return err
 	}
 	resultBytes := len(payload.Body)
+	// 审查 R5-I3: 成功事务前捕获 [FILE:...] 输出文件的安全快照——内容必须
+	// 绑定到任务完成时刻(Worker 仍持有串行槽), 否则同 Runner 下一条任务
+	// 可能覆盖/删除同名输出, 异步 delivery 会交付错误内容。捕获失败
+	// fail-closed: 声明了文件却无法交付的任务不得标记成功。
+	deliveryFiles, err := captureTaskDeliverableFiles(ctx, s.cfg.SessionFiles, task.SessionKey, string(payload.Body))
+	if err != nil {
+		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+			"DELIVERY_FILE_CAPTURE_FAILED", err.Error(), "")
+		_ = s.KickSession(ctx, task.SessionKey)
+		return err
+	}
 	committedTask, err := s.cfg.Store.CompleteSucceeded(ctx, task.ID, s.cfg.PlatformInstanceID,
-		committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, resultBytes)
+		committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, resultBytes, deliveryFiles)
 	if err != nil {
 		// 结果不确定: 可能事务已提交但响应丢失, 也可能确实失败。重读任务
 		// 状态: 已终态则不覆盖(避免把已提交成功覆盖为失败), 仅销毁 Worker

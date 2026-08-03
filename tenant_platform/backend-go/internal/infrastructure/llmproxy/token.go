@@ -308,7 +308,8 @@ func effectiveAudience(audience string) string {
 // IssueSophubToken 签发 Runner → Platform Sophub proxy 的短期 capability
 // (方案 §5.2: Runner 不持有 Sophub API Key)。taskID/generation 绑定后,
 // 旧 task 的 sophub token 无法被新 task 复用(方案 §7 generation 墙)。
-func (i *Issuer) IssueSophubToken(sessionKey, taskID string, runnerGeneration uint64, ttl time.Duration) (string, CapabilityClaims, error) {
+// budget 是预算描述(审查 F10: sophub 调用按 JTI 原子计量, 无预算 = 拒绝)。
+func (i *Issuer) IssueSophubToken(sessionKey, taskID string, runnerGeneration uint64, ttl time.Duration, budget string) (string, CapabilityClaims, error) {
 	if strings.TrimSpace(sessionKey) == "" {
 		return "", CapabilityClaims{}, fmt.Errorf("session key is required")
 	}
@@ -324,7 +325,7 @@ func (i *Issuer) IssueSophubToken(sessionKey, taskID string, runnerGeneration ui
 		TaskID:           taskID,
 		RunnerGeneration: runnerGeneration,
 		Operation:        "sophub",
-		Budget:           "",
+		Budget:           budget,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    CapabilityIssuer,
 			Subject:   sessionKey,

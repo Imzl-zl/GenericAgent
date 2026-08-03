@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +13,11 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
+
+// ErrTaskNotOwned 表示任务当前不被调用方拥有(owner 不匹配/lease 已过期/
+// 已终态)。调用方不得把任务终态化——任务由 RecoverAfterRestart 或新 owner
+// 接管处理(审查 R5-Critical-2)。
+var ErrTaskNotOwned = errors.New("task claim not owned by this platform instance or lease expired")
 
 // PrepareCheckpoint inserts workspace_snapshots(state=writing) with generation token.
 // StagingRefFunc computes the token-scoped staging reference inside the same
@@ -202,7 +208,10 @@ WHERE id = $1::uuid AND state = 'writing'
 }
 
 // CompleteSucceeded commits snapshot + task + delivery in one transaction.
-func (s *Store) CompleteSucceeded(ctx context.Context, taskID, platformInstanceID, snapshotID, fileRef, checksum, resultRef, resultDigest string, resultBytes int) (domain.Task, error) {
+// deliveryFiles 是任务完成时捕获的输出文件快照(审查 R5-I3): 与成功状态
+// 同事务绑定到 task_complete outbox, 异步 delivery 直接发送快照内容,
+// 不再重新解析 workspace 路径(下一条串行任务可能覆盖/删除同名输出)。
+func (s *Store) CompleteSucceeded(ctx context.Context, taskID, platformInstanceID, snapshotID, fileRef, checksum, resultRef, resultDigest string, resultBytes int, deliveryFiles []domain.DeliveryFile) (domain.Task, error) {
 	var task domain.Task
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE`, taskID)
@@ -320,6 +329,17 @@ RETURNING `+taskSelectColumns, taskID, snapshotID, checksum, resultRef, resultDi
 		if err := insertDelivery(ctx, tx, tt.ID, domain.DeliveryTaskComplete, resultRef, resultDigest, "", "", ""); err != nil {
 			return err
 		}
+		// 审查 R5-I3: 输出文件快照与成功事务原子绑定。
+		// delivery_id 与 insertDelivery 的 StableDeliveryID 一致。
+		for _, f := range deliveryFiles {
+			if _, err := tx.Exec(ctx, `
+INSERT INTO task_delivery_files (delivery_id, marker, file_name, rel_path, content, digest, size_bytes)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (delivery_id, marker) DO NOTHING
+`, domain.StableDeliveryID(tt.ID, domain.DeliveryTaskComplete), f.Marker, f.FileName, f.RelPath, f.Content, f.Digest, f.SizeBytes); err != nil {
+				return fmt.Errorf("insert delivery file %q: %w", f.Marker, err)
+			}
+		}
 		// 审查 R4-C3: 成功终态事务内同步撤销 capability JTI, 与任务状态
 		// 变更原子——成功任务的 token 同样不得在终态后继续被复用。
 		if err := revokeTaskCapabilityJTIs(ctx, tx, tt.ID); err != nil {
@@ -340,17 +360,27 @@ RETURNING `+taskSelectColumns, taskID, snapshotID, checksum, resultRef, resultDi
 }
 
 // CompleteFailedTerminal commits failed/cancelled/interrupted without success checkpoint.
-func (s *Store) CompleteFailedTerminal(ctx context.Context, taskID string, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) (domain.Task, error) {
+// 审查 R5-Critical-2: 失败终态由当前 claim owner 在 lease 有效期内执行——
+// 旧实例在 lease 被接管/过期后不得把新 owner 的任务终态化。owner 为空或
+// 不匹配/lease 过期时返回 ErrTaskNotOwned, 任务保持原状(由 RecoverAfterRestart
+// 或新 owner 处理)。管理型终态路径(CancelTask/RemoveMember)使用独立 SQL, 不走此处。
+func (s *Store) CompleteFailedTerminal(ctx context.Context, taskID, owner string, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) (domain.Task, error) {
+	if strings.TrimSpace(owner) == "" {
+		return domain.Task{}, ErrTaskNotOwned
+	}
 	var task domain.Task
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE`, taskID)
+		row := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks
+WHERE id = $1 AND claim_owner = $2
+  AND claim_lease_until > timezone('utc', now())
+  AND status IN ('starting','running')
+FOR UPDATE`, taskID, owner)
 		t, err := scanTask(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrTaskNotOwned
+		}
 		if err != nil {
 			return err
-		}
-		if t.Status.IsTerminal() {
-			task = t
-			return nil
 		}
 		if t.CancelRequestedAt != nil && t.WorkerDispatchStartedAt != nil {
 			status = domain.TaskInterrupted

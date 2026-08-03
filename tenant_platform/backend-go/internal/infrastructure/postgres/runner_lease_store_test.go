@@ -137,7 +137,7 @@ func TestRunnerLeaseGenerationIncrementsAfterRelease(t *testing.T) {
 	}
 
 	// 绑定 container 后释放(Runner 销毁),再获取必须递增 generation。
-	if err := store.AttachRunnerContainer(ctx, first.RunnerKey, "container-abc", first.Generation); err != nil {
+	if err := store.AttachRunnerContainer(ctx, first.RunnerKey, "container-abc", first.Generation, first.Owner); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	if err := store.ReleaseRunnerLease(ctx, first.RunnerKey, "platform-a", first.Generation); err != nil {
@@ -220,7 +220,7 @@ func TestRunnerLeaseFieldsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-xyz", lease.Generation); err != nil {
+	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-xyz", lease.Generation, lease.Owner); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	if err := store.SetRunnerControlEndpoint(ctx, lease.RunnerKey, "https://runner-ctrl:9443"); err != nil {
@@ -245,5 +245,40 @@ func TestRunnerLeaseFieldsRoundTrip(t *testing.T) {
 	}
 	if got.Status != domain.RunnerLeaseActive {
 		t.Fatalf("status = %q, want active", got.Status)
+	}
+}
+
+// 审查 R5-I6: AttachRunnerContainer 必须由 lease owner 在有效期内执行,
+// 且不可覆盖已有 container_id(不可变容器身份)——旧 generation/异主/过期
+// 的 attach 不得改写当前 lease。
+func TestAttachRunnerContainerFencesOwnerLeaseAndImmutableID(t *testing.T) {
+	ctx := context.Background()
+	store := newChannelBindingTestStore(t)
+
+	lease, _, err := store.AcquireRunnerLease(ctx, "personal:8", "platform-a", 30*time.Minute, 0)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-1", lease.Generation, "platform-a"); err != nil {
+		t.Fatalf("owner attach: %v", err)
+	}
+	// 异主 attach 必须拒绝。
+	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-2", lease.Generation, "platform-b"); err == nil {
+		t.Fatal("foreign owner attach must fail")
+	}
+	// 同 owner 覆盖已有 container_id 必须拒绝(不可变身份)。
+	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-3", lease.Generation, "platform-a"); err == nil {
+		t.Fatal("overwriting container id must fail")
+	}
+	// 同值幂等 attach 允许(重试安全)。
+	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-1", lease.Generation, "platform-a"); err != nil {
+		t.Fatalf("idempotent re-attach: %v", err)
+	}
+	// lease 过期后 attach 必须拒绝。
+	if _, err := store.pool.Exec(ctx, `UPDATE runner_leases SET expires_at = timezone('utc', now()) - interval '1 second' WHERE runner_key = $1`, lease.RunnerKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-1", lease.Generation, "platform-a"); err == nil {
+		t.Fatal("attach after lease expiry must fail")
 	}
 }

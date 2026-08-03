@@ -372,9 +372,9 @@ func TestParseBudgetMaxTurns(t *testing.T) {
 		{`not-json`, 0, false},
 	}
 	for _, c := range cases {
-		got, ok := parseBudgetMaxTurns(c.budget)
+		got, ok := ParseBudgetMaxTurns(c.budget)
 		if got != c.want || ok != c.wantOK {
-			t.Errorf("parseBudgetMaxTurns(%q) = (%d,%v), want (%d,%v)", c.budget, got, ok, c.want, c.wantOK)
+			t.Errorf("ParseBudgetMaxTurns(%q) = (%d,%v), want (%d,%v)", c.budget, got, ok, c.want, c.wantOK)
 		}
 	}
 }

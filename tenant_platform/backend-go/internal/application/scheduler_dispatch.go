@@ -24,9 +24,19 @@ func isTransientRunnerError(err error) bool {
 // persistence failure via log instead of silently dropping it (global rule:
 // No Silent Fallbacks). The returned task is the updated row on success, or
 // the original task on failure so callers can continue without a panic.
+// 审查 R5-Critical-2: 终态化必须由当前 claim owner 在 lease 有效期内执行——
+// lease 已被接管/过期时(ErrTaskNotOwned)任务由 RecoverAfterRestart 或新
+// owner 处理, 此处仅记 Warn 不得覆盖其状态。
 func (s *scheduler) finalizeOrFail(ctx context.Context, task domain.Task, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) domain.Task {
-	t, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, status, deliveryType, code, message, traceID)
+	t, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, s.cfg.PlatformInstanceID, status, deliveryType, code, message, traceID)
 	if err != nil {
+		if errors.Is(err, postgres.ErrTaskNotOwned) {
+			slog.WarnContext(ctx, "scheduler: task claim lost; skip terminalization",
+				"task_id", task.ID,
+				"session_key", task.SessionKey,
+				"target_status", string(status))
+			return task
+		}
 		slog.ErrorContext(ctx, "scheduler: CompleteFailedTerminal failed",
 			"task_id", task.ID,
 			"session_key", task.SessionKey,
@@ -114,6 +124,15 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	if cur.Status != domain.TaskStarting {
 		return nil
 	}
+	// /new 消费标记实时判定(审查 F2): fresh 语义由 workspaces.reset_at 的
+	// 当前值决定, 而不是任务提交时的快照——首条 fresh 任务成功清除
+	// reset_at 后, 后提交的 queued 任务在此处判定为非 fresh, 正确继承
+	// 上一条任务已提交的 checkpoint, 而不是再次空启动。
+	fresh, err := s.cfg.Store.WorkspaceIsFresh(ctx, task.SessionKey)
+	if err != nil {
+		return fmt.Errorf("resolve workspace fresh flag: %w", err)
+	}
+	task.FreshSession = fresh
 	heartbeat, err := s.startDispatchHeartbeat(ctx, task)
 	if err != nil {
 		latest, getErr := s.cfg.Store.GetTask(ctx, task.ID)
@@ -124,9 +143,24 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}
 	defer func() {
 		if err := heartbeat.Stop(); err != nil {
-			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = s.CancelWorker(cancelCtx, task)
-			cancel()
+			// 审查 R5-I1: 任务已退回 queued(容量满/foreign-owner 瞬时错误)——
+			// Stop 的 lease 丢失错误是 requeue 的预期结果, 不得终态化任务。
+			if heartbeat.requeued.Load() {
+				return
+			}
+			// heartbeat 持续失败(lease 丢失或瞬时 DB 错误重试耗尽, 审查 F5):
+			// 放弃本次派发。任务未终态时必须立即终态化并销毁 Worker, 否则
+			// 任务卡在 starting 直到 idle reaper(且 dispatch 已无法继续驱动)。
+			fbCtx, fbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer fbCancel()
+			latest, getErr := s.cfg.Store.GetTask(fbCtx, task.ID)
+			if getErr == nil && !latest.Status.IsTerminal() {
+				_ = s.CancelWorker(fbCtx, latest)
+				s.evictWorkerAfterFailure(task.SessionKey)
+				_ = s.finalizeOrFail(fbCtx, latest, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+					"CLAIM_LEASE_LOST", err.Error(), "")
+				_ = s.KickSession(fbCtx, task.SessionKey)
+			}
 			returnErr = fmt.Errorf("claim heartbeat: %w", err)
 		}
 	}()
@@ -143,6 +177,11 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		// Runner 容量满或 lease 被其他实例持有: 不是任务失败, 退回 queued
 		// 等下一轮 tick 重试(审查 C3: 满载保持 queued, 绝不终态化)。
 		if isTransientRunnerError(err) {
+			// 审查 R5-I1: 必须在 RequeueTask 之前标记 requeue——RequeueTask
+			// 提交后 claim 清空, 若 heartbeat ticker 在 deferred Stop 之前触发
+			// HeartbeatClaim, 0 rows 会被误判为 lease 丢失并终态化任务;
+			// 标记后 ticker 静默退出且 Stop fallback 跳过终态化。
+			heartbeat.markRequeued()
 			if requeueErr := s.cfg.Store.RequeueTask(ctx, task.ID, s.cfg.PlatformInstanceID); requeueErr != nil {
 				slog.ErrorContext(ctx, "scheduler: requeue task after runner capacity error failed",
 					"task_id", task.ID, "error", requeueErr)
@@ -173,8 +212,9 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	defer releaseWorkerCall()
 	// Record dispatch intent BEFORE StartSession so cancel-during-StartSession
 	// sees WorkerDispatchStartedAt != nil and records a durable cancel request
-	// instead of finalizing immediately.
-	cur, err = s.cfg.Store.MarkDispatchStarted(ctx, task.ID, s.cfg.PlatformInstanceID, entry.instID)
+	// instead of finalizing immediately. fresh_session 在此事务内写回任务行
+	// (审查 F2: 与 checkpoint 成功提交时的 reset_at 清除判定一致)。
+	cur, err = s.cfg.Store.MarkDispatchStarted(ctx, task.ID, s.cfg.PlatformInstanceID, entry.instID, task.FreshSession)
 	if err != nil {
 		slog.ErrorContext(ctx, "scheduler: MarkDispatchStarted failed",
 			"task_id", task.ID, "error", err)
@@ -184,21 +224,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		s.evictWorkerAfterFailure(task.SessionKey)
 		return nil
 	}
-	// 持久化任务签发的 JTI 列表(崩溃恢复时用于撤销, 审查: 撤销是持久
-	// 工作流)。审查 R4-C3: 写入失败必须 fail-closed——token 已写入 Runner
-	// config, 若 JTI 未持久化, Platform 崩溃后旧 token 无人能撤销。
-	// 销毁 Worker 并终态化任务, 不允许在撤销依据缺失时继续执行。
-	if len(taskCredentialSet.JTIs) > 0 {
-		if err := s.cfg.Store.SetTaskCapabilityJTIs(ctx, task.ID, taskCredentialSet.JTIs); err != nil {
-			slog.ErrorContext(ctx, "scheduler: persist task capability jtis failed; aborting task",
-				"task_id", task.ID, "error", err)
-			s.evictWorkerAfterFailure(task.SessionKey)
-			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-				"CAPABILITY_PERSIST_FAILED", err.Error(), "")
-			_ = s.KickSession(ctx, task.SessionKey)
-			return err
-		}
-	}
+	// 注意: 任务签发的 JTI 已在 issueProviderCapabilitiesWithRuntime 内、
+	// token 暴露给 Runner 之前持久化(审查 F1), 此处不再重复写入。
 
 	if _, err := s.cfg.Registry.Resolve(CapabilityVersion, task.ToolPolicyVersion); err != nil {
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
@@ -243,7 +270,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		// 审查: StartSession 已执行但任务在 ExecuteTask 前被取消, Worker
 		// 内存状态未提交, 销毁重建而非复用。
 		s.evictWorkerAfterFailure(task.SessionKey)
-		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, s.cfg.PlatformInstanceID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", "task interrupted before worker execution", "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
@@ -370,7 +397,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}
 	if current.CancelRequestedAt != nil {
 		s.evictWorkerAfterFailure(task.SessionKey)
-		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, s.cfg.PlatformInstanceID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", "task interrupted after accepted cancellation", "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err

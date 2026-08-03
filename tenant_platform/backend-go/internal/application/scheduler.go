@@ -33,6 +33,9 @@ type SchedulerConfig struct {
 	Store              TaskStore
 	Registry           policy.Registry
 	Coordinator        checkpoint.Coordinator
+	// SessionFiles 供成功事务前捕获 [FILE:...] 输出文件快照(审查 R5-I3);
+	// nil(loopback 未接线)时跳过捕获, 成功事务不绑定文件内容。
+	SessionFiles SessionFiles
 	// Runtime creates a Worker instance for a session. Required.
 	Runtime worker.WorkerRuntime
 	// ConfigRoot holds the token-only runtime JSON and fixed mykey.py loader.

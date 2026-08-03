@@ -115,13 +115,15 @@ workspaces/<hash(workspace_key)>/
     runner-state.json
 ```
 
-Runner 镜像保持 GA 代码只读，Sandbox Manager 将当前工作区的三个确定 subpath 挂载到固定位置：
+Runner 镜像保持 GA 代码只读，Sandbox Manager 将当前工作区的三个确定持久 subpath 挂载到固定位置：
 
 ```text
 /ga/legacy/memory <- workspaces/<hash(workspace_key)>/memory
 /ga/legacy/temp   <- workspaces/<hash(workspace_key)>/temp
 /ga/runner-state  <- workspaces/<hash(workspace_key)>/state
 ```
+
+另有第四个生命周期 subpath `/ga/runner-config <- workspaces/<hash>/config`（只读），承载短期 mTLS 服务证书、策略清单与 task capability runtime 文件（审查 R5-C6）：内容仅存在于 Runner 容器生命周期内，容器销毁时由 Manager 按 workspace hash（进程内 map 或容器 label）强制清理 config/ 目录，创建失败路径同样清理；残留私钥/token 不随 workspace 卷快照长期保存。
 
 这样原生相对路径继续成立：`./temp` 是当前工作区 cwd，`../memory` 是当前工作区记忆。无需为每个工作区复制 `agentmain.py`、`ga.py`、`assets/` 或整个镜像。根文件系统保持只读；`memory/`、`temp/` 与 `state/` 是当前工作区可读写挂载，其中只有 Worker adapter 使用 `/ga/runner-state` 保存运行态。容器的 mount namespace 不包含全局工作区根或其他工作区 subpath，因此 GA 即使用绝对路径、`..` 或 shell 遍历文件系统，也看不到其他工作区。
 
@@ -189,7 +191,7 @@ Sandbox Manager 为每个 Runner 使用固定、部署时审核的 profile，并
 - 固定 digest 的 `ga-runner` 镜像，包含 GA Worker 和文档工具链；
 - 不可信用户生产环境使用 `gVisor/runsc`；普通 Docker 加固仅限本地开发或明确可信内部场景，不能静默回退；
 - 非 root、只读根文件系统、`cap_drop=ALL`、`no-new-privileges`、受控 seccomp、AppArmor/SELinux；
-- 无 Docker socket、无设备、无 `privileged`、无宿主 bind mount；唯一持久化挂载是当前工作区的 `memory/`、`temp/` 与 `state/` subpath；
+- 无 Docker socket、无设备、无 `privileged`、无宿主 bind mount；唯一持久化挂载是当前工作区的 `memory/`、`temp/` 与 `state/` subpath（`config/` 为容器生命周期绑定的短期材料，随容器销毁强制清理）；
 - CPU、内存、PID 和单 task 时长受部署策略限制；V1 不引入每工作区硬磁盘配额，保持原生文件写入语义，仅保留既有单文件大小限制与宿主全局磁盘监控；
 - Runner 只加入 `runner-control` 网络，只能访问 Platform 的受控 Worker/恢复/Sophub 端点和内部 LLM Proxy；不加入 `application`、`database` 或公网网络。
 - Worker RPC 不能把共享网络当作身份边界：Runner 仅接受 Platform control identity 的 mTLS 请求；每个 Runner 使用绑定 `runner_key` hash 与 `runner_generation` 的短期服务证书，Platform 使用独立客户端身份。Runner 不持有可调用其他 Runner 的客户端凭据；mTLS、generation 和 task capability 任一不匹配均拒绝 StartSession、ExecuteTask、CancelTask、Checkpoint 与 Shutdown。

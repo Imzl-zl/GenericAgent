@@ -1569,3 +1569,31 @@ def test_agent_thread_crash_marks_session_failed_and_health_not_ready(roots, fou
             adapter, worker_pb2.ExecuteTaskRequest(task=task), task
         )
     assert exc.value.code == "AGENT_FAILED"
+
+
+# 审查 R5-I8: 控制 RPC(BeginCheckpoint/CancelTask/Shutdown)必须携带当前
+# task 的 capability JTI 且属于会话活跃凭据集——旧任务终态撤销后的 JTI
+# 不得控制复用 Runner 上的新任务。
+def test_control_rpcs_reject_stale_task_capability(roots, foundation_registry):
+    adapter = _make_adapter(roots, foundation_registry, ScriptedAgent)
+    adapter.start_session(_start_req())
+    adapter._session.capability_jtis = ["jti-active"]
+
+    # cancel: 错误/空 JTI 拒绝(accepted=False), 正确 JTI 进入正常流程。
+    assert adapter.cancel_task("t-x", "personal:1", 1, "jti-stale").accepted is False
+    assert adapter.cancel_task("t-x", "personal:1", 1, "").accepted is False
+    # 正确 JTI: 任务未知返回 accepted=False, 但不再因 capability 被拒——
+    # 用 shutdown 区分(正确 JTI 正常接受)。
+    assert adapter.shutdown("done", "personal:1", 1, "jti-stale").accepted is False
+    assert adapter.shutdown("done", "personal:1", 1, "jti-active").accepted is True
+
+    # begin_checkpoint: 错误 JTI 直接抛错(即使任务/世代正确)。
+    req = worker_pb2.BeginCheckpointRequest(
+        task_id="t-x", checkpoint_token="tok", runner_generation=1, capability_jti="jti-stale",
+    )
+    with pytest.raises(WorkerAdapterError):
+        adapter.begin_checkpoint(req)
+
+    # 无活跃凭据集(loopback/清理路径): 空 JTI 允许, 保持兼容。
+    adapter._session.capability_jtis = []
+    assert adapter.shutdown("done", "personal:1", 1, "").accepted is True

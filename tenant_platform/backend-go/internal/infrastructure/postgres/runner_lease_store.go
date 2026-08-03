@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -213,19 +214,23 @@ WHERE runner_key = $1 AND owner = $2 AND generation = $3 AND expires_at > timezo
 // AttachRunnerContainer binds the immutable container ID to the lease,
 // guarded by the generation so a stale attach from an older Runner cannot
 // overwrite the current lease (generation fencing).
-func (s *Store) AttachRunnerContainer(ctx context.Context, runnerKey, containerID string, generation uint64) error {
-	if runnerKey == "" || containerID == "" {
-		return fmt.Errorf("runner key and container id are required")
+// 审查 R5-I6: 附加 owner + lease 有效期 + 不可变 container_id 条件——异主/
+// 过期/覆盖不同 ID 的 attach 一律拒绝(RowsAffected=0), 同值重试幂等成功。
+func (s *Store) AttachRunnerContainer(ctx context.Context, runnerKey, containerID string, generation uint64, owner string) error {
+	if runnerKey == "" || containerID == "" || strings.TrimSpace(owner) == "" {
+		return fmt.Errorf("runner key, container id and owner are required")
 	}
 	tag, err := s.pool.Exec(ctx, `
 UPDATE runner_leases SET container_id = $2, updated_at = timezone('utc', now())
-WHERE runner_key = $1 AND generation = $3
-`, runnerKey, containerID, generation)
+WHERE runner_key = $1 AND generation = $3 AND owner = $4
+  AND expires_at > timezone('utc', now())
+  AND (container_id = '' OR container_id = $2)
+`, runnerKey, containerID, generation, owner)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("runner lease %s generation %d not found", runnerKey, generation)
+		return fmt.Errorf("runner lease %s generation %d not owned by %s or container id already bound", runnerKey, generation, owner)
 	}
 	return nil
 }

@@ -106,6 +106,15 @@ RETURNING `+taskSelectColumns, t.ID, string(status), code, message, traceID, res
 	if err := insertNextEvent(ctx, tx, tt.ID, "status_transition", nil, nil, string(t.Status), string(status), tt.WorkerInstanceID, code); err != nil {
 		return domain.Task{}, err
 	}
+	// 审查 R5-M2: 终态事务取消尚未发送的 task_started(pending), 防止重试
+	// 恢复后用户先见完成消息、后见"正在处理"。sending 中的无法撤回(发送
+	// 中消息顺序正常), 保持现状。cancelled 不参与 claim/重试/死信。
+	if _, err := tx.Exec(ctx, `
+UPDATE task_deliveries SET status = 'cancelled', updated_at = timezone('utc', now())
+WHERE task_id = $1 AND delivery_type = 'task_started' AND status = 'pending'
+`, tt.ID); err != nil {
+		return domain.Task{}, err
+	}
 	if err := insertDelivery(ctx, tx, tt.ID, deliveryType, resultRef, resultDigest, code, message, traceID); err != nil {
 		return domain.Task{}, err
 	}

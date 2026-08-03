@@ -234,10 +234,11 @@ class WxBotClient:
         bio = BytesIO(); im.save(bio, format='JPEG', quality=85)
         return bio.getvalue(), thumb_w, thumb_h
 
-    def _make_media_item(self, item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_size, fp):
+    def _make_media_item(self, item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_size, fp, file_name=''):
         item = {'media': media}
         if item_key == 'file_item':
-            item.update({'file_name': fp.name, 'len': str(len(fp.read_bytes()))})
+            # 审查 R5-I10: 优先使用显式显示名, 回退到本地文件名(兼容旧调用方)。
+            item.update({'file_name': file_name or fp.name, 'len': str(len(fp.read_bytes()))})
         elif item_key == 'image_item':
             thumb_media = self._upload_thumb(resp, media)
             item.update({'mid_size': ciphertext_size, 'thumb_media': thumb_media,
@@ -253,7 +254,7 @@ class WxBotClient:
             return self._upload('', thumb_param, b'', b'\x00' * 16, upload_url=thumb_url)
         return fallback_media
 
-    def _send_media(self, to_user_id, file_path, media_type, item_type, item_key, context_token=''):
+    def _send_media(self, to_user_id, file_path, media_type, item_type, item_key, context_token='', file_name=''):
         fp = Path(file_path)
         raw = fp.read_bytes()
         aes_key = os.urandom(16)
@@ -271,7 +272,9 @@ class WxBotClient:
         if not (upload_param or upload_url):
             raise RuntimeError(f'getuploadurl failed: {resp}')
         media = self._upload(body['filekey'], upload_param, raw, aes_key=aes_key, upload_url=upload_url)
-        item = self._make_media_item(item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_ciphertext_size, fp)
+        # 审查 R5-I10: 用户可见文件名由 Platform 显式传入(file_name), 不从
+        # 本地临时路径 basename 推导(快照文件名含 marker hash 前缀)。
+        item = self._make_media_item(item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_ciphertext_size, fp, file_name=file_name)
         msg = {'from_user_id': '', 'to_user_id': to_user_id,
                'client_id': f'pyclient-{uuid.uuid4().hex[:16]}',
                'message_type': MSG_BOT, 'message_state': STATE_FINISH,
@@ -280,8 +283,8 @@ class WxBotClient:
             msg['context_token'] = context_token
         return self._post('ilink/bot/sendmessage', {'msg': msg, 'base_info': {'channel_version': VER}})
 
-    def send_file(self, to_user_id, file_path, context_token=''):
-        return self._send_media(to_user_id, file_path, 3, ITEM_FILE, 'file_item', context_token)
+    def send_file(self, to_user_id, file_path, context_token='', file_name=''):
+        return self._send_media(to_user_id, file_path, 3, ITEM_FILE, 'file_item', context_token, file_name=file_name)
 
     def send_image(self, to_user_id, file_path, context_token=''):
         return self._send_media(to_user_id, file_path, 1, ITEM_IMAGE, 'image_item', context_token)

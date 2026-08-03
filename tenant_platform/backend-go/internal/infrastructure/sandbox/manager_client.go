@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -109,6 +110,27 @@ func (c *ManagerClient) CreateAndStart(ctx context.Context, spec RunnerSpec) (Ru
 // 检查), 客户端按已校验处理。
 func (c *ManagerClient) IsRunnerContainer(ctx context.Context, idOrName string) (bool, error) {
 	return true, nil
+}
+
+// RunnerWorkspaceHash 经控制面 inspect 端点读取容器 label 中的 workspace
+// hash(审查 R5-C6: 重启后按容器 ID 销毁时定位 config/ 清理目标)。
+func (c *ManagerClient) RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error) {
+	if idOrName == "" || strings.ContainsAny(idOrName, "/\x00") {
+		return "", false, fmt.Errorf("invalid runner name %q", idOrName)
+	}
+	var out struct {
+		WorkspaceHash string `json:"workspace_hash"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/v1/runners/"+idOrName, nil, &out); err != nil {
+		if errors.Is(err, errRunnerNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if out.WorkspaceHash == "" {
+		return "", false, nil
+	}
+	return out.WorkspaceHash, true, nil
 }
 
 // ListRunners 列出 Manager 当前管理的 Runner 容器名。

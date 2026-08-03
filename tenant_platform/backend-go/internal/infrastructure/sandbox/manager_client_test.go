@@ -30,6 +30,10 @@ func (f *fakeCLI2) Inspect(ctx context.Context, name string) error { return nil 
 func (f *fakeCLI2) IsRunnerContainer(ctx context.Context, idOrName string) (bool, error) {
 	return f.runnerContainer, nil
 }
+
+func (f *fakeCLI2) RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error) {
+	return "", false, nil
+}
 func (f *fakeCLI2) EnsureWorkspace(ctx context.Context, workspaceHash string) error {
 	f.ensureCalls = append(f.ensureCalls, workspaceHash)
 	return nil
@@ -117,7 +121,7 @@ func TestManagerControlAPIEnsureWorkspaceRoundTrip(t *testing.T) {
 	if err := client.EnsureWorkspace(context.Background(), "personal:9"); err != nil {
 		t.Fatalf("EnsureWorkspace: %v", err)
 	}
-	if len(cli.ensureCalls) != 1 || cli.ensureCalls[0] != WorkspaceDirHash("personal:9") {
+	if len(cli.ensureCalls) != 1 || cli.ensureCalls[0] != mustWorkspaceHash("personal:9") {
 		t.Fatalf("ensure calls = %v", cli.ensureCalls)
 	}
 	if err := client.EnsureWorkspace(context.Background(), ""); err == nil {

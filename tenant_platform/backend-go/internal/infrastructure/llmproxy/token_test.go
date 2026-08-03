@@ -262,7 +262,7 @@ func TestSophubValidatorRequiresTaskAndGenerationBinding(t *testing.T) {
 	}
 
 	// 无 task/generation 绑定的 sophub token 必须被拒绝。
-	plain, _, err := issuer.IssueSophubToken("personal:1", "", 0, time.Hour)
+	plain, _, err := issuer.IssueSophubToken("personal:1", "", 0, time.Hour, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestSophubValidatorRequiresTaskAndGenerationBinding(t *testing.T) {
 	}
 
 	// 完整绑定必须通过。
-	bound, _, err := issuer.IssueSophubToken("personal:1", "task-1", 3, time.Hour)
+	bound, _, err := issuer.IssueSophubToken("personal:1", "task-1", 3, time.Hour, `{"max_turns":5}`)
 	if err != nil {
 		t.Fatal(err)
 	}

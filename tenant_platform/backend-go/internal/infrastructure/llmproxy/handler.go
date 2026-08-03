@@ -118,7 +118,7 @@ func (s *Server) consumeBudget(w http.ResponseWriter, r *http.Request, claims Ca
 		writeError(w, http.StatusServiceUnavailable, "BUDGET_UNAVAILABLE", "capability usage counter not configured")
 		return false
 	}
-	maxCalls, ok := parseBudgetMaxTurns(claims.Budget)
+	maxCalls, ok := ParseBudgetMaxTurns(claims.Budget)
 	if !ok {
 		writeError(w, http.StatusForbidden, "CAPABILITY_BUDGET_INVALID", "capability budget missing or invalid")
 		return false
@@ -136,9 +136,10 @@ func (s *Server) consumeBudget(w http.ResponseWriter, r *http.Request, claims Ca
 	return true
 }
 
-// parseBudgetMaxTurns 从 capability budget JSON 提取 max_turns; 缺失或
-// 非正数返回 ok=false(签发方必须填充, 见 worker_credential.go)。
-func parseBudgetMaxTurns(budget string) (int64, bool) {
+// ParseBudgetMaxTurns 从 capability budget JSON 提取 max_turns; 缺失或
+// 非正数返回 ok=false(签发方必须填充, 见 worker_credential.go)。导出供
+// Sophub proxy 等使用方复用同一预算语义(审查 F10)。
+func ParseBudgetMaxTurns(budget string) (int64, bool) {
 	if strings.TrimSpace(budget) == "" {
 		return 0, false
 	}

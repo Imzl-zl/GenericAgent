@@ -145,8 +145,10 @@ WHERE id = $1
 	})
 }
 
-// MarkDispatchStarted records worker_instance_id and worker_dispatch_started_at before Worker RPC.
-func (s *Store) MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string) (domain.Task, error) {
+// MarkDispatchStarted records worker_instance_id and worker_dispatch_started_at
+// before Worker RPC. freshSession 是 dispatch 实时判定的 /new 消费标记
+// (审查 F2: 与 reset_at 的实时状态一致, 不再使用提交时的陈旧快照)。
+func (s *Store) MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string, freshSession bool) (domain.Task, error) {
 	var task domain.Task
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
@@ -169,10 +171,11 @@ SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE
 UPDATE tasks SET
   worker_instance_id = $2,
   worker_dispatch_started_at = timezone('utc', now()),
+  fresh_session = $4,
   updated_at = timezone('utc', now())
 WHERE id = $1 AND status = 'starting' AND claim_owner = $3
   AND worker_dispatch_started_at IS NULL
-RETURNING `+taskSelectColumns, taskID, workerInstanceID, platformInstanceID)
+RETURNING `+taskSelectColumns, taskID, workerInstanceID, platformInstanceID, freshSession)
 		t, err = scanTask(row)
 		if err != nil {
 			return err
@@ -368,9 +371,25 @@ FOR UPDATE
 			return err
 		}
 		for _, t := range list {
-			// 崩溃恢复撤销(审查): 中断任务的 capability JTI 在同一事务内写入
-			// 撤销表, 使旧 token 立即失效——恢复路径不能依赖进程内重试(本实例
-			// 崩溃期间已签发的 token 无人撤销, 旧 Runner 容器在 TTL 内仍可用)。
+			if t.Status == domain.TaskStarting && t.WorkerDispatchStartedAt == nil {
+				// 未派发(claim 后、MarkDispatchStarted 前崩溃/lease 过期): 任务
+				// 从未交给 Worker 执行。即使已签发 capability(签发先于
+				// MarkDispatchStarted, 审查 F1), 也先撤销 JTI 再退回 queued,
+				// 由下一轮 tick 重新 claim——容量满载等瞬时窗口不得把任务
+				// 误判为 interrupted(审查 F4: 满载保持 queued)。
+				if err := revokeTaskCapabilityJTIs(ctx, tx, t.ID); err != nil {
+					return err
+				}
+				if err := requeueExpiredTask(ctx, tx, t); err != nil {
+					return err
+				}
+				n++
+				continue
+			}
+			// 已派发/运行中: 崩溃恢复撤销(审查): 中断任务的 capability JTI 在
+			// 同一事务内写入撤销表, 使旧 token 立即失效——恢复路径不能依赖
+			// 进程内重试(本实例崩溃期间已签发的 token 无人撤销, 旧 Runner
+			// 容器在 TTL 内仍可用)。
 			if err := revokeTaskCapabilityJTIs(ctx, tx, t.ID); err != nil {
 				return err
 			}
@@ -383,6 +402,24 @@ FOR UPDATE
 		return nil
 	})
 	return n, err
+}
+
+// requeueExpiredTask 把 lease 过期且未派发的 starting 任务退回 queued 并
+// 清空 claim 字段(审查 F4)。调用方必须已持任务行锁(RecoverAfterRestart
+// 的事务内)。
+func requeueExpiredTask(ctx context.Context, tx pgx.Tx, t domain.Task) error {
+	if _, err := tx.Exec(ctx, `
+UPDATE tasks SET
+  status = 'queued',
+  claim_owner = NULL,
+  claimed_at = NULL,
+  claim_lease_until = NULL,
+  updated_at = timezone('utc', now())
+WHERE id = $1 AND status = 'starting'
+`, t.ID); err != nil {
+		return fmt.Errorf("requeue expired task %s: %w", t.ID, err)
+	}
+	return insertNextEvent(ctx, tx, t.ID, "status_transition", nil, nil, "starting", "queued", t.WorkerInstanceID, "")
 }
 
 // revokeTaskCapabilityJTIs 在调用方事务内把任务的 capability JTI 全部写入

@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 // post-create verification (spec §7: 创建后必须校验).
 type inspectOutput struct {
 	ReadOnlyRootFS  bool
+	// Running 是容器 State.Running(审查 R5-I7): 停止/退出的容器不得复用。
+	Running         bool
 	Privileged      bool
 	CapDrop         []string
 	NoNewPrivileges bool
@@ -40,6 +43,20 @@ type inspectOutput struct {
 	Env             []string
 	Cmd             []string
 	AppArmorProfile string
+	// HostMounts 是 HostConfig.Mounts 的解析结果(审查 C1): Docker 26+ 的
+	// volume-subpath 请求参数(卷名/Target/VolumeOptions.Subpath)只出现在
+	// HostConfig.Mounts, 顶层 .Mounts 只有实际挂载结果(不含 Subpath)。
+	// subpath 归属校验必须从 HostConfig 读取并按 Target 关联。
+	HostMounts []hostMount
+}
+
+// hostMount 是 HostConfig.Mounts 中一项挂载的真实形状。
+type hostMount struct {
+	Type          string
+	Source        string // 卷名(volume)/宿主路径(bind)
+	Target        string
+	ReadOnly      bool
+	VolumeSubpath string // 仅 volume-subpath 挂载有值
 }
 
 type inspectMount struct {
@@ -52,16 +69,23 @@ type inspectMount struct {
 	VolumeSubpath string
 }
 
-// inspectFormat selects only the fields the verification needs.
-const inspectFormat = `[{"Config":{"ReadonlyRootfs":{{json .Config.ReadonlyRootfs}},"User":{{json .Config.User}},"Labels":{{json .Config.Labels}},"Image":{{json .Config.Image}},"Env":{{json .Config.Env}},"Cmd":{{json .Config.Cmd}}},"HostConfig":{"Privileged":{{json .HostConfig.Privileged}},"CapDrop":{{json .HostConfig.CapDrop}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"Runtime":{{json .HostConfig.Runtime}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"Devices":{{json .HostConfig.Devices}},"Tmpfs":{{json .HostConfig.Tmpfs}},"Memory":{{json .HostConfig.Memory}},"CpuQuota":{{json .HostConfig.CpuQuota}},"CpuPeriod":{{json .HostConfig.CpuPeriod}},"PidsLimit":{{json .HostConfig.PidsLimit}},"GroupAdd":{{json .HostConfig.GroupAdd}},"CapAdd":{{json .HostConfig.CapAdd}}},"AppArmorProfile":{{json .AppArmorProfile}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}}},"Mounts":{{json .Mounts}}}]`
+// Inspect 直接解析 docker inspect 的完整 JSON 输出(审查 C1: Docker 模板
+// 对 map 字段不支持属性访问, 完整 JSON 解析路径稳定且含 HostConfig.Mounts)。
+
+// ErrRunnerNotRunning 表示容器存在但已停止/退出(审查 R5-I7): EnsureRunner
+// 不得复用死容器, 应销毁重建; 其他 inspect 错误仍 fail-closed。
+var ErrRunnerNotRunning = errors.New("runner container is not running")
 
 // Inspect verifies a created Runner against the fixed profile invariants:
 // image reference, runtime, read-only rootfs, no privileged, cap_drop ALL,
 // no-new-privileges, seccomp not disabled, exactly one network, no devices,
 // and the exact five workspace mounts (type/source/destination/read-write).
+// 注意: 不使用 `docker inspect --format` 模板——Docker 模板对 map 字段
+// (Config/HostConfig) 必须用 {{index .Config "key"}} 语法, 属性访问
+// .Config.ReadonlyRootfs 会报 "template parsing error"(审查 C1 实证);
+// 直接解析 docker inspect 的完整 JSON 输出, 字段路径稳定且含 HostConfig.Mounts。
 func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
-	stdout, stderr, exitCode, err := d.runner.Run(ctx, d.cfg.Binary,
-		"inspect", "--format", inspectFormat, name)
+	stdout, stderr, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, "inspect", name)
 	if err != nil {
 		return fmt.Errorf("docker inspect runner: %w", err)
 	}
@@ -69,6 +93,9 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 		return fmt.Errorf("docker inspect runner %s failed (%d): %s", name, exitCode, strings.TrimSpace(string(stderr)))
 	}
 	var raw []struct {
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
 		Config struct {
 			ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
 			User           string            `json:"User"`
@@ -91,6 +118,15 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 			CpuPeriod      int64                         `json:"CpuPeriod"`
 			PidsLimit      int64                         `json:"PidsLimit"`
 			GroupAdd       []string                      `json:"GroupAdd"`
+			Mounts         []struct {
+				Type          string `json:"Type"`
+				Source        string `json:"Source"`
+				Target        string `json:"Target"`
+				ReadOnly      bool   `json:"ReadOnly"`
+				VolumeOptions *struct {
+					Subpath string `json:"Subpath"`
+				} `json:"VolumeOptions"`
+			} `json:"Mounts"`
 		} `json:"HostConfig"`
 		AppArmorProfile string `json:"AppArmorProfile"`
 		NetworkSettings struct {
@@ -116,6 +152,7 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 
 	out := inspectOutput{
 		ReadOnlyRootFS:  info.HostConfig.ReadonlyRootfs,
+		Running:         info.State.Running,
 		Privileged:      info.HostConfig.Privileged,
 		CapDrop:         info.HostConfig.CapDrop,
 		CapAdd:          info.HostConfig.CapAdd,
@@ -135,6 +172,19 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 		GroupAdd:        info.HostConfig.GroupAdd,
 		TmpfsOpts:       make(map[string]string),
 	}
+	for _, hm := range info.HostConfig.Mounts {
+		sub := ""
+		if hm.VolumeOptions != nil {
+			sub = hm.VolumeOptions.Subpath
+		}
+		out.HostMounts = append(out.HostMounts, hostMount{
+			Type:          hm.Type,
+			Source:        hm.Source,
+			Target:        hm.Target,
+			ReadOnly:      hm.ReadOnly,
+			VolumeSubpath: sub,
+		})
+	}
 	for name := range info.NetworkSettings.Networks {
 		out.Networks = append(out.Networks, name)
 	}
@@ -149,6 +199,28 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 			VolumeSubpath: subpath,
 		})
 	}
+	// 审查 C1: volume-subpath 的请求参数(卷名/子路径)只出现在
+	// HostConfig.Mounts, 顶层 .Mounts 不含 VolumeOptions.Subpath(Docker
+	// 29.6.2 实测)。subpath 归属校验必须按 Target 从 HostConfig 关联。
+	// 顶层解析保留 VolumeOptions 分支用于兼容旧 Docker(26 之前无
+	// volume-subpath; 26+ 顶层该字段为空)——真正取值以 HostMounts 为准,
+	// 找不到对应 Target 时留空, 由 validateInspect 的 volume 分支拒绝。
+	hostByTarget := make(map[string]string, len(info.HostConfig.Mounts))
+	for _, hm := range info.HostConfig.Mounts {
+		sub := ""
+		if hm.VolumeOptions != nil {
+			sub = hm.VolumeOptions.Subpath
+		}
+		hostByTarget[hm.Target] = sub
+	}
+	for i := range out.Mounts {
+		if out.Mounts[i].Type != "volume" {
+			continue
+		}
+		if sub, ok := hostByTarget[out.Mounts[i].Destination]; ok {
+			out.Mounts[i].VolumeSubpath = sub
+		}
+	}
 	sort.Slice(out.Mounts, func(i, j int) bool { return out.Mounts[i].Destination < out.Mounts[j].Destination })
 	for _, dev := range info.HostConfig.Devices {
 		out.Devices = append(out.Devices, dev.PathOnHost)
@@ -158,6 +230,9 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 		out.TmpfsOpts[dest] = opts
 	}
 	sort.Strings(out.Tmpfs)
+	// 审查 C1: 顶层 .Mounts 的解析值(实际挂载结果)保留在 out.Mounts,
+	// subpath 关联统一在 validateInspect 的 associateVolumeSubpaths 完成,
+	// 保证解析路径与测试直调路径共用同一逻辑。
 	return validateInspect(out, d.cfg.Profile, d.cfg.WorkspacesRoot, d.cfg.WorkspaceVolume, d.expectedMountSources())
 }
 
@@ -172,11 +247,39 @@ func (d *DockerCLI) expectedMountSources() map[string]string {
 	}
 }
 
+// associateVolumeSubpaths 按 Target 把 HostConfig.Mounts 的 volume-subpath
+// 关联到顶层挂载(审查 C1): Docker 26+ 的 volume-subpath 请求参数只在
+// HostConfig.Mounts, 顶层 .Mounts 的 VolumeOptions.Subpath 恒为空。
+// 返回副本, 不修改调用者。
+func associateVolumeSubpaths(info inspectOutput) inspectOutput {
+	out := info
+	out.Mounts = append([]inspectMount(nil), info.Mounts...)
+	hostByTarget := make(map[string]string, len(info.HostMounts))
+	for _, hm := range info.HostMounts {
+		hostByTarget[hm.Target] = hm.VolumeSubpath
+	}
+	for i := range out.Mounts {
+		if out.Mounts[i].Type != "volume" {
+			continue
+		}
+		if sub, ok := hostByTarget[out.Mounts[i].Destination]; ok {
+			out.Mounts[i].VolumeSubpath = sub
+		}
+	}
+	return out
+}
+
 // validateInspect enforces the post-create invariants on parsed inspect output.
 // mountSubs: destination -> 期望的 workspace 子路径。workspacesRoot 与
 // workspaceVolume 用于精确校验 source 归属(审查 I10: 不只查尾缀, 必须
 // 匹配当前 workspace hash 的完整路径)。
 func validateInspect(info inspectOutput, profile Profile, workspacesRoot, workspaceVolume string, mountSubs map[string]string) error {
+	info = associateVolumeSubpaths(info)
+	// 审查 R5-I7: 停止/退出(State.Running=false)的容器不得被复用——Runner
+	// 崩溃退出后 EnsureRunner 必须销毁重建, 而不是把死容器当作可用 Worker。
+	if !info.Running {
+		return fmt.Errorf("%w", ErrRunnerNotRunning)
+	}
 	if !info.ReadOnlyRootFS {
 		return fmt.Errorf("runner root filesystem is not read-only")
 	}

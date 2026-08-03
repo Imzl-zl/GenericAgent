@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -155,10 +157,13 @@ func TestRecoverExpiredPriorOwnerOnly(t *testing.T) {
 		Prompt: "queued", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
 	})
 
-	// Manually place expired prior owner into starting.
+	// Manually place expired prior owner into starting(已派发: 有 dispatch 标记,
+	// 与真实运行中的任务一致——未派发场景见
+	// TestRecoverAfterRestartRequeuesUndispatchedStarting)。
 	_, err = pool.Exec(ctx, `
 UPDATE tasks SET status='starting', claim_owner='prior', claimed_at=timezone('utc', now()),
- claim_lease_until=timezone('utc', now()) - interval '1 minute'
+ claim_lease_until=timezone('utc', now()) - interval '1 minute',
+ worker_dispatch_started_at=timezone('utc', now())
 WHERE id=$1
 `, expired.ID)
 	if err != nil {
@@ -215,6 +220,82 @@ WHERE id=$1
 	qTask, _ := store.GetTask(ctx, queued.ID)
 	if qTask.Status != domain.TaskQueued {
 		t.Fatalf("queued should remain: %s", qTask.Status)
+	}
+}
+
+// TestRecoverAfterRestartRequeuesUndispatchedStarting 验证 F4: claim 后、
+// MarkDispatchStarted 前崩溃/lease 过期的 starting 任务(worker_dispatch_started_at
+// IS NULL)必须退回 queued 并清空 claim 字段, 而不是被误判为 interrupted——
+// 容量满载等瞬时窗口的任务从未交给 Worker 执行, 应保持排队等待重试。
+func TestRecoverAfterRestartRequeuesUndispatchedStarting(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1, Source: "web", SourceInstanceID: "i", MessageID: "undisp",
+		Prompt: "undisp", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 未派发 starting + lease 过期。
+	_, err = pool.Exec(ctx, `
+UPDATE tasks SET status='starting', claim_owner='prior-undisp', claimed_at=timezone('utc', now()),
+ claim_lease_until=timezone('utc', now()) - interval '1 minute',
+ worker_dispatch_started_at=NULL
+WHERE id=$1
+`, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := store.RecoverAfterRestart(ctx, "new-instance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("recovered=%d want 1", n)
+	}
+	got, _ := store.GetTask(ctx, task.ID)
+	if got.Status != domain.TaskQueued {
+		t.Fatalf("undispatched expired must be requeued, got %s", got.Status)
+	}
+	if got.ClaimOwner != "" {
+		t.Fatalf("requeued task claim_owner must be cleared: %q", got.ClaimOwner)
+	}
+	if !got.ClaimLeaseUntil.IsZero() {
+		t.Fatalf("requeued task claim_lease_until must be cleared")
+	}
+	// 已派发(有 dispatch 标记)的过期 starting 仍按 interrupted 恢复。
+	task2, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1, Source: "web", SourceInstanceID: "i", MessageID: "disp2",
+		Prompt: "disp2", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = pool.Exec(ctx, `
+UPDATE tasks SET status='starting', claim_owner='prior-disp', claimed_at=timezone('utc', now()),
+ claim_lease_until=timezone('utc', now()) - interval '1 minute',
+ worker_dispatch_started_at=timezone('utc', now())
+WHERE id=$1
+`, task2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, err := store.RecoverAfterRestart(ctx, "new-instance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n2 != 1 {
+		t.Fatalf("recovered dispatched=%d want 1", n2)
+	}
+	got2, _ := store.GetTask(ctx, task2.ID)
+	if got2.Status != domain.TaskInterrupted {
+		t.Fatalf("dispatched expired must be interrupted, got %s", got2.Status)
 	}
 }
 
@@ -323,7 +404,7 @@ func TestCompleteSucceededMapsAcceptedCancelToInterruptedWithoutPublishingSnapsh
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
-	if _, err := store.MarkDispatchStarted(ctx, claimed.ID, "owner-cancel", "worker-cancel"); err != nil {
+	if _, err := store.MarkDispatchStarted(ctx, claimed.ID, "owner-cancel", "worker-cancel", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.MarkRunning(ctx, claimed.ID, "owner-cancel"); err != nil {
@@ -338,7 +419,7 @@ func TestCompleteSucceededMapsAcceptedCancelToInterruptedWithoutPublishingSnapsh
 		t.Fatalf("cancel: needWorker=%v err=%v", needWorker, err)
 	}
 	final, err := store.CompleteSucceeded(ctx, task.ID, "owner-cancel", snapshotID,
-		"snapshot:race", "sha256:bundle", "result:race", "sha256:result", 6)
+		"snapshot:race", "sha256:bundle", "result:race", "sha256:result", 6, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,5 +522,410 @@ WHERE table_schema='public' AND table_name='workspace_snapshots' AND column_name
 	}
 	if n != 1 {
 		t.Fatalf("max_bundle_bytes column missing on fresh DB (count=%d)", n)
+	}
+}
+
+// TestSetTaskCapabilityJTIsRequiresActiveClaim 验证审查 R5-I2: JTI 持久化
+// 必须绑定任务活跃 claim——已终态/被接管/lease 过期的任务行不得接受新签发
+// 的 JTI(否则崩溃窗口内无人撤销)。
+func TestSetTaskCapabilityJTIsRequiresActiveClaim(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	submit := func(msgID string) domain.Task {
+		t.Helper()
+		task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+			SessionKey: dev.SessionKey, RequesterUserID: 1,
+			Source: "web", SourceInstanceID: "bot-jti", MessageID: msgID,
+			Prompt: "jti-claim", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return task
+	}
+
+	// queued(未 claim)必须拒绝。
+	q := submit("jti-q")
+	if err := store.SetTaskCapabilityJTIs(ctx, q.ID, "p1", []string{"jti-x"}); err == nil {
+		t.Fatal("SetTaskCapabilityJTIs on queued task must fail")
+	}
+	// starting + 本实例 claim 必须成功。
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	if err := store.SetTaskCapabilityJTIs(ctx, claimed.ID, "p1", []string{"jti-1"}); err != nil {
+		t.Fatalf("SetTaskCapabilityJTIs on active claim: %v", err)
+	}
+	// 其他实例 owner 必须拒绝(用第二个 session 避免同 session 活跃约束)。
+	dev2, err := store.EnsureDevelopmentContext(ctx, 2, "dev2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherTask, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev2.SessionKey, RequesterUserID: 2,
+		Source: "web", SourceInstanceID: "bot-jti2", MessageID: "jti-o",
+		Prompt: "jti-claim-2", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, ok, err := store.ClaimNextTask(ctx, dev2.SessionKey, "p2", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("second claim: %v ok=%v", err, ok)
+	}
+	_ = otherTask
+	if err := store.SetTaskCapabilityJTIs(ctx, other.ID, "p1", []string{"jti-2"}); err == nil {
+		t.Fatal("SetTaskCapabilityJTIs with foreign owner must fail")
+	}
+	// 终态任务必须拒绝。
+	if _, err := store.CompleteFailedTerminal(ctx, other.ID, "p2", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTaskCapabilityJTIs(ctx, other.ID, "p2", []string{"jti-3"}); err == nil {
+		t.Fatal("SetTaskCapabilityJTIs on terminal task must fail")
+	}
+}
+
+// TestCompleteSucceededPersistsDeliveryFiles 验证审查 R5-I3: 成功事务把
+// [FILE:...] 输出文件快照与任务成功状态原子绑定到 task_complete outbox,
+// delivery 可经 LoadDeliveryFiles 读取快照内容。
+func TestCompleteSucceededPersistsDeliveryFiles(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-df", MessageID: "df-1",
+		Prompt: "files", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	// Prepare checkpoint(需要 workspace 行锁与 lease 校验; loopback 无 lease 行跳过)。
+	snapshotID, token, gen, err := store.PrepareCheckpoint(ctx, claimed.ID, "p1", 1, func(sid, tok string, g int64) string {
+		return "staging:" + sid + ":" + tok
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	_ = token
+	_ = gen
+	files := []domain.DeliveryFile{
+		{Marker: "outputs/report.docx", FileName: "report.docx", RelPath: "outputs/report.docx",
+			Content: []byte("final-content"), Digest: "sha256:abc", SizeBytes: 13},
+	}
+	final, err := store.CompleteSucceeded(ctx, claimed.ID, "p1", snapshotID,
+		"snapshot:df", "sha256:bundle", "result:df", "sha256:result", 5, files)
+	if err != nil {
+		t.Fatalf("CompleteSucceeded: %v", err)
+	}
+	if final.Status != domain.TaskSucceeded {
+		t.Fatalf("status = %s", final.Status)
+	}
+	// LoadDeliveryFiles 必须返回快照。
+	got, err := store.LoadDeliveryFiles(ctx, domain.StableDeliveryID(task.ID, domain.DeliveryTaskComplete))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || string(got[0].Content) != "final-content" || got[0].Marker != "outputs/report.docx" {
+		t.Fatalf("delivery files = %+v", got)
+	}
+}
+
+// TestRemoveMemberCancelsDispatchedTasksAndScopesContextClear 验证审查 R5-I4:
+// 移除团队成员时, 已派发(starting/running)任务写入 durable cancel_requested_at
+// (scheduler 轮询执行 Worker cancel, 终态撤销 JTI); active_contexts 清理
+// 限定当前团队(不抹掉用户其他团队上下文)。
+func TestRemoveMemberCancelsDispatchedTasksAndScopesContextClear(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	seedDev(t, store)
+	if _, err := store.EnsureDevelopmentContext(ctx, 2, "dev2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnsureDevelopmentContext(ctx, 3, "dev3"); err != nil {
+		t.Fatal(err)
+	}
+	// owner=1 建团队, member=2 加入。
+	team, err := store.CreateTeam(ctx, 1, "review-team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO team_members (team_id, user_id, role, status)
+VALUES ($1::uuid, 2, 'member', 'approved')
+`, team.ID); err != nil {
+		t.Fatal(err)
+	}
+	var memberID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM team_members WHERE team_id = $1::uuid AND user_id = 2`, team.ID).Scan(&memberID); err != nil {
+		t.Fatal(err)
+	}
+	// 另一团队上下文(用户 2 正在使用): 移除后不得被清掉。
+	other, err := store.CreateTeam(ctx, 3, "other-team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 用户 2 同时是 other 团队的成员(正在使用该团队上下文)。
+	if _, err := pool.Exec(ctx, `
+INSERT INTO team_members (team_id, user_id, role, status)
+VALUES ($1::uuid, 2, 'member', 'approved')
+`, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetActiveContextTeam(ctx, 2, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 用户 2 在目标团队提交任务并 claim(starting, 已派发)。
+	sessionKey := fmt.Sprintf("team:%s", team.ID)
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: sessionKey, RequesterUserID: 2,
+		Source: "web", SourceInstanceID: "bot-rm", MessageID: "rm-1",
+		Prompt: "member task", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, sessionKey, "p1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	// 模拟已派发(dispatch 已 MarkDispatchStarted)。
+	if _, err := store.MarkDispatchStarted(ctx, task.ID, "p1", "worker-1", false); err != nil {
+		t.Fatalf("MarkDispatchStarted: %v", err)
+	}
+	// 移除成员。
+	if _, err := store.RemoveMember(ctx, fmt.Sprintf("t-%d", memberID), 1); err != nil {
+		t.Fatalf("RemoveMember: %v", err)
+	}
+	// 已派发任务必须带 durable cancel_requested_at(未终态化, 由 scheduler 收尾)。
+	got, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CancelRequestedAt == nil {
+		t.Fatal("dispatched task must have durable cancel_requested_at after member removal")
+	}
+	if got.Status != domain.TaskStarting {
+		t.Fatalf("dispatched task status = %s, want starting (scheduler drives terminalization)", got.Status)
+	}
+	// active_contexts: 用户 2 的其他团队上下文保留。
+	ac, err := store.GetActiveContext(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac.TeamID == nil || *ac.TeamID != other.ID {
+		t.Fatalf("other team context must be preserved, got %v", ac.TeamID)
+	}
+}
+
+// 审查 R5-Critical-2: 失败终态必须由当前 claim owner 在 lease 有效期内
+// 执行——旧实例在 lease 被接管/过期后不得把新 owner 的任务终态化。
+func TestCompleteFailedTerminalRequiresOwnedActiveClaim(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-fn", MessageID: "fn-1",
+		Prompt: "fencing", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	// 其他实例(非 owner)不得终态化。
+	if _, err := store.CompleteFailedTerminal(ctx, claimed.ID, "p2", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); !errors.Is(err, ErrTaskNotOwned) {
+		t.Fatalf("foreign owner finalize err = %v, want ErrTaskNotOwned", err)
+	}
+	got, err := store.GetTask(ctx, claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskStarting {
+		t.Fatalf("task status = %s after foreign finalize, want starting", got.Status)
+	}
+	// 空 owner 同样拒绝。
+	if _, err := store.CompleteFailedTerminal(ctx, claimed.ID, "", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); !errors.Is(err, ErrTaskNotOwned) {
+		t.Fatalf("empty owner finalize err = %v, want ErrTaskNotOwned", err)
+	}
+	// owner 匹配且 lease 有效: 成功终态。
+	if _, err := store.CompleteFailedTerminal(ctx, claimed.ID, "p1", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); err != nil {
+		t.Fatalf("owner finalize: %v", err)
+	}
+	got, err = store.GetTask(ctx, claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskFailed {
+		t.Fatalf("task status = %s after owner finalize, want failed", got.Status)
+	}
+}
+
+func TestCompleteFailedTerminalRejectsExpiredLease(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-fn2", MessageID: "fn-2",
+		Prompt: "fencing-expired", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	// 模拟 lease 已过期(旧实例续租失败)。
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET claim_lease_until = timezone('utc', now()) - interval '1 second' WHERE id = $1`, claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteFailedTerminal(ctx, claimed.ID, "p1", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); !errors.Is(err, ErrTaskNotOwned) {
+		t.Fatalf("expired lease finalize err = %v, want ErrTaskNotOwned", err)
+	}
+	got, err := store.GetTask(ctx, claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskStarting {
+		t.Fatalf("task status = %s after expired-lease finalize, want starting", got.Status)
+	}
+}
+
+// 审查 R5-I4: 移除成员时 starting 但尚未 MarkDispatchStarted 的任务不得
+// 永久卡在 starting——直接终态化(cancelled), 而不是只写 cancel_requested_at
+// 依赖 dispatch 兜底(dispatch 对未派发取消任务直接 return, 无人收尾)。
+func TestRemoveMemberTerminalizesUndispatchedStartingTask(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	seedDev(t, store)
+	if _, err := store.EnsureDevelopmentContext(ctx, 2, "dev2"); err != nil {
+		t.Fatal(err)
+	}
+	team, err := store.CreateTeam(ctx, 1, "rm-team2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO team_members (team_id, user_id, role, status)
+VALUES ($1::uuid, 2, 'member', 'approved')
+`, team.ID); err != nil {
+		t.Fatal(err)
+	}
+	var memberID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM team_members WHERE team_id = $1::uuid AND user_id = 2`, team.ID).Scan(&memberID); err != nil {
+		t.Fatal(err)
+	}
+	sessionKey := fmt.Sprintf("team:%s", team.ID)
+	if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: sessionKey, RequesterUserID: 2,
+		Source: "web", SourceInstanceID: "bot-rm2", MessageID: "rm-2",
+		Prompt: "member task undispatched", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, sessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	if claimed.WorkerDispatchStartedAt != nil {
+		t.Fatal("claimed task must not have dispatch started yet")
+	}
+	if _, err := store.RemoveMember(ctx, fmt.Sprintf("t-%d", memberID), 1); err != nil {
+		t.Fatalf("RemoveMember: %v", err)
+	}
+	got, err := store.GetTask(ctx, claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskCancelled {
+		t.Fatalf("undispatched starting task status = %s after removal, want cancelled", got.Status)
+	}
+	if got.ClaimOwner != "" || !got.ClaimLeaseUntil.IsZero() {
+		t.Fatalf("undispatched starting task claim must be cleared after removal: owner=%q lease=%v", got.ClaimOwner, got.ClaimLeaseUntil)
+	}
+	if got.CancelRequestedAt != nil {
+		t.Fatal("terminalized task must not carry cancel_requested_at")
+	}
+}
+
+// 审查 R5-M2: 终态事务必须取消尚未发送的 task_started delivery——否则
+// task_started 发送失败重试期间, 用户会先收到完成消息、后收到"正在处理"。
+func TestTerminalFinalizeCancelsPendingTaskStartedDelivery(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-ts", MessageID: "ts-1",
+		Prompt: "started-cancel", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	// task_started delivery 已随 SubmitTask 插入(pending)。
+	var stStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM task_deliveries WHERE task_id = $1 AND delivery_type = 'task_started'`, claimed.ID).Scan(&stStatus); err != nil {
+		t.Fatal(err)
+	}
+	if stStatus != "pending" {
+		t.Fatalf("task_started status = %q, want pending", stStatus)
+	}
+	if _, err := store.CompleteFailedTerminal(ctx, claimed.ID, "p1", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM task_deliveries WHERE task_id = $1 AND delivery_type = 'task_started'`, claimed.ID).Scan(&stStatus); err != nil {
+		t.Fatal(err)
+	}
+	if stStatus != "cancelled" {
+		t.Fatalf("task_started status after terminal = %q, want cancelled", stStatus)
+	}
+	// 终态 delivery 本身仍 pending 等待发送。
+	var failStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM task_deliveries WHERE task_id = $1 AND delivery_type = 'task_failed'`, claimed.ID).Scan(&failStatus); err != nil {
+		t.Fatal(err)
+	}
+	if failStatus != "pending" {
+		t.Fatalf("task_failed status = %q, want pending", failStatus)
 	}
 }

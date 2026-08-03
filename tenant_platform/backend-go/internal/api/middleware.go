@@ -70,6 +70,7 @@ func userIDFromContext(ctx context.Context) (int64, bool) {
 // ctx is cancelled. The handler chain applies: body-size limit (prevents
 // memory exhaustion), panic recovery (logs stack trace, returns 500 without
 // leaking internals). Timeouts protect against Slowloris and stuck writers.
+// 主 API 只允许 loopback(审查: 管理/用户 API 不外泄到容器网络)。
 func ServeContext(ctx context.Context, addr string, h http.Handler) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -79,6 +80,22 @@ func ServeContext(ctx context.Context, addr string, h http.Handler) error {
 	if ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("platform API must bind loopback, got %s", addr)
 	}
+	return serveUntil(ctx, addr, h)
+}
+
+// ServeInternalContext 运行显式启用的内部 listener(审查 R5-C1): 只挂
+// capability-protected 的 Worker 端点(如 /v1/worker/sophub/*), 不注册任何
+// 管理/用户路由; 由部署显式传 --worker-internal-listen 启用, 默认关闭。
+// 与主 API 共享相同的 timeout/recover/body-limit 中间件, 但不要求 loopback——
+// 独立 Runner 容器经 runner-control 网络访问。
+func ServeInternalContext(ctx context.Context, addr string, h http.Handler) error {
+	if addr == "" {
+		return fmt.Errorf("internal listener address is required")
+	}
+	return serveUntil(ctx, addr, h)
+}
+
+func serveUntil(ctx context.Context, addr string, h http.Handler) error {
 	wrapped := recoverMiddleware(bodyLimitMiddleware(MaxRequestBodyBytes)(h))
 	srv := &http.Server{
 		Addr:              addr,

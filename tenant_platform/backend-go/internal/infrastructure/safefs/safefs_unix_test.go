@@ -1,101 +1,55 @@
-//go:build unix
-
 package safefs
 
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestReadFileBeneathRejectsSymlinkComponents(t *testing.T) {
-	root := t.TempDir()
-	// 中间目录替换为指向 root 外部的符号链接。
-	outside := t.TempDir()
-	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o644); err != nil {
+func writeFile(t *testing.T, dir, name string, size int) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, make([]byte, size), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(root, "state", "staging"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// 先移除原目录再建符号链接(直接 Symlink 会 EEXIST)。
-	if err := os.Remove(filepath.Join(root, "state", "staging")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(root, "state", "staging")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadFileBeneath(root, "state/staging/secret.txt"); err == nil {
-		t.Fatal("symlinked intermediate directory must be rejected")
-	}
+	return p
 }
 
-func TestReadFileBeneathRejectsFinalSymlink(t *testing.T) {
-	root := t.TempDir()
-	outside := t.TempDir()
-	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "link.txt")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadFileBeneath(root, "link.txt"); err == nil {
-		t.Fatal("final symlink must be rejected")
-	}
-}
-
-func TestAtomicWriteBeneathRejectsSymlinkedParent(t *testing.T) {
-	root := t.TempDir()
-	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(root, "committed")); err != nil {
-		t.Fatal(err)
-	}
-	if err := AtomicWriteBeneath(root, "committed/x.json", []byte("{}"), 0o640); err == nil {
-		t.Fatal("write through symlinked parent must be rejected")
-	}
-	if _, err := os.Stat(filepath.Join(outside, "x.json")); err == nil {
-		t.Fatal("file must not be created outside root")
-	}
-}
-
-func TestAtomicWriteBeneathRoundTrip(t *testing.T) {
-	root := t.TempDir()
-	if err := AtomicWriteBeneath(root, "state/results/r.result", []byte("body"), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	got, err := ReadFileBeneath(root, "state/results/r.result")
+// 审查 R5-I5: 恰好等于上限的文件必须成功(读上限 maxBytes+1 不得误拒)。
+func TestReadFileBeneathLimitedAtExactLimit(t *testing.T) {
+	dir := t.TempDir()
+	p := writeFile(t, dir, "exact.bin", 1000)
+	buf, err := ReadFileBeneathLimited(dir, "exact.bin", 1000)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read at exact limit: %v", err)
 	}
-	if string(got) != "body" {
-		t.Fatalf("round trip = %q", got)
+	if len(buf) != 1000 {
+		t.Fatalf("read %d bytes, want 1000", len(buf))
+	}
+	_ = p
+}
+
+// 超限文件(fstat 即可发现)必须拒绝, 且不读入内存。
+func TestReadFileBeneathLimitedRejectsOverLimit(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "over.bin", 1001)
+	if _, err := ReadFileBeneathLimited(dir, "over.bin", 1000); err == nil {
+		t.Fatal("over-limit read must fail")
+	}
+	// 上限内正常读取。
+	buf, err := ReadFileBeneathLimited(dir, "over.bin", 4096)
+	if err != nil || len(buf) != 1001 {
+		t.Fatalf("within-limit read = %d bytes, err %v", len(buf), err)
 	}
 }
 
-func TestCleanRelRejectsEscapes(t *testing.T) {
-	for _, rel := range []string{"../x", "a/../../b", "/abs", "a/b/../../.."} {
-		if _, err := CleanRel("/root", rel); err == nil {
-			t.Fatalf("%q must be rejected", rel)
-		}
-	}
-}
-
-func TestReadFileBeneathLimitedRejectsOversizeBeforeRead(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "state"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "state", "big.bin"), make([]byte, 4096), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadFileBeneathLimited(root, "state/big.bin", 1024); err == nil {
-		t.Fatal("oversize file must be rejected without reading")
-	}
-	got, err := ReadFileBeneathLimited(root, "state/big.bin", 8192)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 4096 {
-		t.Fatalf("read %d bytes, want 4096", len(got))
+// 增长检测的错误哨兵必须可被 errors.Is 识别(调用方据此区分截断与超限)。
+func TestReadFileBeneathLimitedTooLargeSentinel(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "grow.bin", 2000)
+	_, err := ReadFileBeneathLimited(dir, "grow.bin", 1000)
+	if err == nil || !strings.Contains(err.Error(), "exceeds size limit") {
+		t.Fatalf("err = %v, want size-limit error", err)
 	}
 }

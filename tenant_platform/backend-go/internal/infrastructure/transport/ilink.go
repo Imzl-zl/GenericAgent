@@ -50,7 +50,7 @@ func (a *ILinkAdapter) SendMessage(ctx context.Context, botUUID, ilinkUserID, te
 	})
 }
 
-func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, ilinkUserID, filePath string) error {
+func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, ilinkUserID, filePath, fileName string) error {
 	if botUUID == "" || ilinkUserID == "" || filePath == "" {
 		return errors.New("bot uuid, ilink user id, and file path are required")
 	}
@@ -59,6 +59,7 @@ func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, ilinkUserID, fileP
 		ILinkUserID: ilinkUserID,
 		MsgType:     poller.MsgTypeFile,
 		FilePath:    filePath,
+		FileName:    fileName,
 	})
 }
 

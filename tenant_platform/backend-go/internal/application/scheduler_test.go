@@ -172,7 +172,7 @@ func (w *controlledWorker) BeginCheckpoint(ctx context.Context, _ *workerv1.Begi
 	return w.checkpointReady, nil
 }
 
-func (w *controlledWorker) CancelTask(context.Context, string, string, uint64) error {
+func (w *controlledWorker) CancelTask(context.Context, string, string, uint64, string) error {
 	w.cancelCalls.Add(1)
 	select {
 	case <-w.streamDone:
@@ -187,7 +187,7 @@ func (w *controlledWorker) Health(context.Context) (*workerv1.HealthResponse, er
 	return &workerv1.HealthResponse{}, nil
 }
 
-func (w *controlledWorker) Shutdown(context.Context, string, string, uint64) error { return nil }
+func (w *controlledWorker) Shutdown(context.Context, string, string, uint64, string) error { return nil }
 
 func (w *controlledWorker) succeed() {
 	w.events <- workerclient.WorkerEvent{
@@ -632,7 +632,7 @@ func TestScheduler_MissingWorkerDuringCheckpointFinalizesFailure(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
-	if _, err := store.MarkDispatchStarted(ctx, task.ID, "missing-worker-owner", "worker-gone"); err != nil {
+	if _, err := store.MarkDispatchStarted(ctx, task.ID, "missing-worker-owner", "worker-gone", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.MarkRunning(ctx, task.ID, "missing-worker-owner"); err != nil {
@@ -1340,7 +1340,7 @@ type blockedShutdownWorker struct {
 	deadlineObserved chan struct{}
 }
 
-func (w *blockedShutdownWorker) Shutdown(ctx context.Context, _ string, _ string, _ uint64) error {
+func (w *blockedShutdownWorker) Shutdown(ctx context.Context, _ string, _ string, _ uint64, _ string) error {
 	<-ctx.Done()
 	close(w.deadlineObserved)
 	return ctx.Err()
@@ -1408,7 +1408,7 @@ func TestSchedulerGlobalCapacityKeepsTasksQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Mark first as running so CountRunningTasks sees 1 (claim alone leaves it starting).
-	if _, err := store.MarkDispatchStarted(ctx, first.ID, "cap-owner", "cap-worker"); err != nil {
+	if _, err := store.MarkDispatchStarted(ctx, first.ID, "cap-owner", "cap-worker", false); err != nil {
 		t.Fatal(err)
 	}
 	if err := sched.(*scheduler).tick(ctx); err != nil {

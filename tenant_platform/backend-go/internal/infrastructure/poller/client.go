@@ -138,6 +138,9 @@ type SendMessageRequest struct {
 	ContextToken string `json:"context_token,omitempty"`
 	MsgType      string `json:"msg_type,omitempty"`
 	FilePath     string `json:"file_path,omitempty"`
+	// FileName 是用户可见的文件名(审查 R5-I10): 与 file_path 分离, 快照
+	// 临时文件名不得作为显示名暴露给用户。
+	FileName string `json:"file_name,omitempty"`
 }
 
 // SendMessage delivers a text or media reply via the poller (which calls

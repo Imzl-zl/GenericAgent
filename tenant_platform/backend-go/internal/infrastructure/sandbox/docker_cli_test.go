@@ -8,16 +8,33 @@ import (
 	"testing"
 )
 
-// fakeRunner 记录 docker 调用并返回预设输出。
+// fakeRunner 记录 docker 调用并返回预设输出。scripted 非空时按调用顺序
+// 依次弹出(create 成功、start 失败等时序场景)。
 type fakeRunner struct {
-	calls  []string
+	calls    []string
+	stdout   string
+	stderr   string
+	err      error
+	scripted []fakeRunResult
+}
+
+type fakeRunResult struct {
 	stdout string
 	stderr string
+	code   int
 	err    error
 }
 
 func (f *fakeRunner) Run(_ context.Context, _ string, args ...string) ([]byte, []byte, int, error) {
 	f.calls = append(f.calls, strings.Join(args, " "))
+	if len(f.scripted) > 0 {
+		r := f.scripted[0]
+		f.scripted = f.scripted[1:]
+		if r.err != nil {
+			return nil, nil, r.code, r.err
+		}
+		return []byte(r.stdout), []byte(r.stderr), r.code, nil
+	}
 	if f.err != nil {
 		return nil, nil, 1, f.err
 	}
@@ -221,7 +238,21 @@ func deepCopyInspect(in inspectOutput) inspectOutput {
 	}
 	out.Mounts = make([]inspectMount, len(in.Mounts))
 	copy(out.Mounts, in.Mounts)
+	out.HostMounts = make([]hostMount, len(in.HostMounts))
+	copy(out.HostMounts, in.HostMounts)
 	return out
+}
+
+// hostMountsForWorkspace 构造真实 Docker HostConfig.Mounts 形状：volume-subpath
+// 的请求参数（卷名/目标/子路径）在 HostConfig.Mounts，顶层 .Mounts 只有实际
+// 挂载结果（审查 C1：Docker 29.6.2 实测顶层无 VolumeOptions.Subpath）。
+func hostMountsForWorkspace(workspaceHash, volume string) []hostMount {
+	return []hostMount{
+		{Type: "volume", Source: volume, Target: LegacyMemoryMount, VolumeSubpath: workspaceHash + "/memory"},
+		{Type: "volume", Source: volume, Target: LegacyTempMount, VolumeSubpath: workspaceHash + "/temp"},
+		{Type: "volume", Source: volume, Target: RunnerConfigMount, ReadOnly: true, VolumeSubpath: workspaceHash + "/config"},
+		{Type: "volume", Source: volume, Target: RunnerStateMount, VolumeSubpath: workspaceHash + "/state"},
+	}
 }
 
 func TestInspectRunnerRejectsDrift(t *testing.T) {
@@ -230,7 +261,7 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 	profile.Image = "ga-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	workspaceHash := strings.Repeat("ab", 32)
 	good := inspectOutput{
-		ReadOnlyRootFS: true, Privileged: false, CapDrop: []string{"ALL"},
+		ReadOnlyRootFS: true, Running: true, Privileged: false, CapDrop: []string{"ALL"},
 		NoNewPrivileges: true, Networks: []string{"runner-control"},
 		User: "10002:10002", Image: profile.Image, Runtime: "runc",
 		MemoryBytes: profile.MemoryBytes, CPUQuota: profile.CPUQuota,
@@ -248,12 +279,14 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 			"com.genericagent.runner.generation": "1",
 		},
 		Mounts: []inspectMount{
-			// 实测 Docker 29.6.2: volume-subpath 挂载 Source 为卷根绝对路径。
-			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyMemoryMount, RW: true, VolumeSubpath: workspaceHash + "/memory"},
-			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyTempMount, RW: true, VolumeSubpath: workspaceHash + "/temp"},
-			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerConfigMount, RW: false, VolumeSubpath: workspaceHash + "/config"},
-			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount, RW: true, VolumeSubpath: workspaceHash + "/state"},
+			// 实测 Docker 29.6.2: 顶层 .Mounts 的 volume 挂载不含
+			// VolumeOptions.Subpath（真实 subpath 在 HostConfig.Mounts）。
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyMemoryMount, RW: true},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyTempMount, RW: true},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerConfigMount, RW: false},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount, RW: true},
 		},
+		HostMounts: hostMountsForWorkspace(workspaceHash, "runner_workspaces"),
 	}
 	mountSubs := map[string]string{LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state", RunnerConfigMount: "config"}
 	if err := validateInspect(good, profile, "/tmp/ws-root", "runner_workspaces", mountSubs); err != nil {
@@ -268,6 +301,7 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 			o.Mounts = append(o.Mounts, inspectMount{Type: "bind", Source: "/var/run/docker.sock", Destination: "/var/run/docker.sock", RW: true})
 		}},
 		{"extra network", func(o *inspectOutput) { o.Networks = []string{"runner-control", "database"} }},
+		{"stopped runner", func(o *inspectOutput) { o.Running = false }},
 		{"privileged", func(o *inspectOutput) { o.Privileged = true }},
 		{"no cap drop", func(o *inspectOutput) { o.CapDrop = nil }},
 		{"writable root", func(o *inspectOutput) { o.ReadOnlyRootFS = false }},
@@ -294,7 +328,12 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 		{"volume subpath drift", func(o *inspectOutput) {
 			// 挂到其他 workspace 的 subpath 必须拒绝(审查)。
 			other := strings.Repeat("cd", 32)
-			o.Mounts[0].VolumeSubpath = other + "/memory"
+			o.HostMounts[0].VolumeSubpath = other + "/memory"
+		}},
+		{"host mount missing subpath", func(o *inspectOutput) {
+			// HostConfig.Mounts 缺少该挂载的 volume-subpath 参数(审查 C1:
+			// subpath 只从 HostConfig 读取, 缺失时不得静默接受)。
+			o.HostMounts = o.HostMounts[1:]
 		}},
 		{"memory drift", func(o *inspectOutput) { o.MemoryBytes = profile.MemoryBytes - 1 }},
 		{"device present", func(o *inspectOutput) { o.Devices = []string{"/dev/kvm"} }},
@@ -340,7 +379,7 @@ func TestValidateInspectSortedMounts(t *testing.T) {
 	// 模拟 docker inspect 返回创建顺序(与排序后不同的乱序)。
 	workspaceHash := strings.Repeat("ef", 32)
 	raw := inspectOutput{
-		ReadOnlyRootFS: true, CapDrop: []string{"ALL"}, NoNewPrivileges: true,
+		ReadOnlyRootFS: true, Running: true, CapDrop: []string{"ALL"}, NoNewPrivileges: true,
 		Networks: []string{"runner-control"}, User: "10002:10002",
 		Image: profile.Image, Runtime: "runc",
 		MemoryBytes: profile.MemoryBytes, CPUQuota: profile.CPUQuota,
@@ -358,12 +397,15 @@ func TestValidateInspectSortedMounts(t *testing.T) {
 			"com.genericagent.runner.generation": "1",
 		},
 		Mounts: []inspectMount{
-			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyTempMount, RW: true, VolumeSubpath: workspaceHash + "/temp"},
-			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount, RW: true, VolumeSubpath: workspaceHash + "/state"},
-			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyMemoryMount, RW: true, VolumeSubpath: workspaceHash + "/memory"},
-			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerConfigMount, RW: false, VolumeSubpath: workspaceHash + "/config"},
+			// 真实顶层形状(无 VolumeOptions.Subpath, 审查 C1)。
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyTempMount, RW: true},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount, RW: true},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyMemoryMount, RW: true},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerConfigMount, RW: false},
 		},
+		HostMounts: hostMountsForWorkspace(workspaceHash, "runner_workspaces"),
 	}
+
 	// 复刻 Inspect 中的排序(生产解析路径)。
 	sort.Slice(raw.Mounts, func(i, j int) bool { return raw.Mounts[i].Destination < raw.Mounts[j].Destination })
 	if err := validateInspect(raw, profile, "/tmp/ws-root", "runner_workspaces",
@@ -380,7 +422,7 @@ func TestValidateInspectBindExactSource(t *testing.T) {
 	workspaceHash := strings.Repeat("12", 32)
 	mountSubs := map[string]string{LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state", RunnerConfigMount: "config"}
 	good := inspectOutput{
-		ReadOnlyRootFS: true, CapDrop: []string{"ALL"}, NoNewPrivileges: true,
+		ReadOnlyRootFS: true, Running: true, CapDrop: []string{"ALL"}, NoNewPrivileges: true,
 		Networks: []string{"runner-control"}, User: "10002:10002",
 		Image: profile.Image, Runtime: "runc",
 		MemoryBytes: profile.MemoryBytes, CPUQuota: profile.CPUQuota,
@@ -439,5 +481,31 @@ func TestCreateRunnerRejectsProtectedEnvOverride(t *testing.T) {
 	spec.Env = []string{"GA_LLM_PROXY_ADDR=http://llm-proxy:8081"}
 	if _, err := cli.CreateAndStart(context.Background(), spec); err != nil {
 		t.Fatalf("unprotected env must be allowed: %v", err)
+	}
+}
+
+// 审查 R5-I7: docker create 成功但 docker start 失败时, 必须立即 rm -f
+// 已创建容器——否则遗留 Created/stopped 容器, 且 config/ 清理依赖 Manager
+// 的 cleanupWorkspaceConfig(仅 CreateAndStart 返回错误路径)。
+func TestCreateAndStartRemovesContainerWhenStartFails(t *testing.T) {
+	runner := &fakeRunner{scripted: []fakeRunResult{
+		{stdout: "cid123\n"},
+		{stderr: "start failed", code: 1},
+	}}
+	cli := &DockerCLI{cfg: validConfig(), runner: runner}
+	ctx := context.Background()
+
+	if _, err := cli.CreateAndStart(ctx, validSpec()); err == nil {
+		t.Fatal("start failure must return error")
+	}
+	// 必须发起 rm -f(按容器 ID)。
+	found := false
+	for _, call := range runner.calls {
+		if strings.Contains(call, "rm") && strings.Contains(call, "-f") && strings.Contains(call, "cid123") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected rm -f of created container, calls=%v", runner.calls)
 	}
 }

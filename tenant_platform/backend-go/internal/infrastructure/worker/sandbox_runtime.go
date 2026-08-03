@@ -23,7 +23,7 @@ import (
 type RunnerLeaseStore interface {
 	AcquireRunnerLease(ctx context.Context, runnerKey, owner string, leaseTTL time.Duration, maxActive int64) (domain.RunnerLease, bool, error)
 	RenewRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64, leaseTTL time.Duration) error
-	AttachRunnerContainer(ctx context.Context, runnerKey, containerID string, generation uint64) error
+	AttachRunnerContainer(ctx context.Context, runnerKey, containerID string, generation uint64, owner string) error
 	ReleaseRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64) error
 }
 
@@ -117,8 +117,13 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 	staleContainer := lease.StaleContainerID
 	if created && staleContainer != "" {
 		if err := r.cfg.Manager.Destroy(ctx, staleContainer); err != nil {
-			// 容器已不存在(重启后 sweep 已清理)属于预期, 不阻断创建。
-			slogWarn("sandbox runtime: destroy stale runner best-effort", "container", staleContainer, "error", err)
+			// 审查 R5-C3: 旧 generation 容器销毁失败必须 fail-closed——旧
+			// Runner 仍挂载同一 workspace 且可能写穿 memory/temp/state, 继续
+			// 创建新容器会让两代并发写, 破坏串行执行与 generation fencing。
+			// Destroy 对不存在容器幂等成功, 此处的错误即真实故障; 释放 lease
+			// 归还容量, 由调度层将任务退回重试(下一轮重新接管/清理)。
+			releaseOnFailure()
+			return nil, fmt.Errorf("destroy stale runner %s: %w", staleContainer, err)
 		}
 	}
 
@@ -170,7 +175,7 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 		// 接管或 DB 故障时, 该容器无法被 lease 定向清理且可能属于旧
 		// generation, 继续执行会让旧 Runner 拨号后写穿工作区。
 		// 立即销毁容器并释放 lease, 不再继续。
-		if err := r.cfg.LeaseStore.AttachRunnerContainer(ctx, workspaceKey, runner.ContainerID, generation); err != nil {
+		if err := r.cfg.LeaseStore.AttachRunnerContainer(ctx, workspaceKey, runner.ContainerID, generation, r.cfg.PlatformInstanceID); err != nil {
 			destroyErr := r.cfg.Manager.Destroy(ctx, runner.Name)
 			releaseOnFailure()
 			if destroyErr != nil {
@@ -209,7 +214,7 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 			<-renewDone
 			shutCtx, cancel := context.WithTimeout(context.Background(), workerShutdownTimeout)
 			// 控制面身份 fencing(方案 §7): Shutdown 绑定 workspace/generation。
-			_ = client.Shutdown(shutCtx, workspaceKey, "scheduler-stop", generation)
+			_ = client.Shutdown(shutCtx, workspaceKey, "scheduler-stop", generation, "")
 			cancel()
 			_ = conn.Close()
 			if created {
@@ -242,7 +247,12 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 
 // runnerName 与 Manager 的容器名推导保持一致。
 func (r *SandboxWorkerRuntime) runnerName(workspaceKey string, generation uint64) string {
-	hash := sandbox.WorkspaceDirHash(workspaceKey)
+	hash, err := sandbox.WorkspaceDirHash(workspaceKey)
+	if err != nil {
+		// 调用方已用同一校验通过（Start 入口），此处兜底：空 hash 生成的名字
+		// 不会匹配任何合法容器，后续 dial/attach 会失败并 fail-closed。
+		return fmt.Sprintf("%s-invalid-%d", r.cfg.ContainerPrefix, generation)
+	}
 	return fmt.Sprintf("%s-%s-g%d", r.cfg.ContainerPrefix, hash[:12], generation)
 }
 

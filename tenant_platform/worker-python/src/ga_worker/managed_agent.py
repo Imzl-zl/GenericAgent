@@ -177,12 +177,33 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
                 f"control runner_generation {runner_generation} != active {self._session.runner_generation}",
             )
 
-    def cancel_task(self, task_id: str, workspace_key: str = "", runner_generation: int = 0) -> worker_pb2.CancelTaskResponse:
+    def _assert_task_capability(self, capability_jti: str) -> None:
+        """审查 R5-I8: 控制 RPC(BeginCheckpoint/CancelTask/Shutdown)携带的
+        capability JTI 必须属于当前会话活跃凭据集——任务终态后 Platform 撤销
+        JTI(DB), 复用 Runner 的下一任务持有新 JTI; 旧 JTI 无法控制新任务。
+        空 JTI 仅允许在无凭据场景(清理路径/测试), 有活跃集时拒绝空值。"""
+        if self._session is None:
+            return
+        if not capability_jti:
+            if self._session.capability_jtis:
+                raise WorkerAdapterError(
+                    "CAPABILITY_JTI_REQUIRED",
+                    "control rpc requires the active task's capability_jti",
+                )
+            return
+        if self._session.capability_jtis and capability_jti not in self._session.capability_jtis:
+            raise WorkerAdapterError(
+                "CAPABILITY_JTI_MISMATCH",
+                "control capability_jti not in the session's current credential set",
+            )
+
+    def cancel_task(self, task_id: str, workspace_key: str = "", runner_generation: int = 0, capability_jti: str = "") -> worker_pb2.CancelTaskResponse:
         with self._lock:
             if self._session is None:
                 return worker_pb2.CancelTaskResponse(accepted=False)
             try:
                 self._assert_control_identity(workspace_key, runner_generation)
+                self._assert_task_capability(capability_jti)
             except WorkerAdapterError:
                 return worker_pb2.CancelTaskResponse(accepted=False)
             agent = self._session.agent
@@ -209,6 +230,8 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
                     "CHECKPOINT_GENERATION_MISMATCH",
                     f"checkpoint runner_generation {request.runner_generation} != active {self._session.runner_generation}",
                 )
+            # 审查 R5-I8: checkpoint 必须携带当前 task 的 capability JTI。
+            self._assert_task_capability(request.capability_jti)
             completed = self._session.completed
             if completed is None or completed.task_id != request.task_id:
                 raise WorkerAdapterError(
@@ -218,12 +241,13 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
         self._validate_checkpoint_request(request)
         return self._write_checkpoint(request)
 
-    def shutdown(self, reason: str, workspace_key: str = "", runner_generation: int = 0) -> worker_pb2.ShutdownResponse:
+    def shutdown(self, reason: str, workspace_key: str = "", runner_generation: int = 0, capability_jti: str = "") -> worker_pb2.ShutdownResponse:
         with self._lock:
             if self._session is None:
                 return worker_pb2.ShutdownResponse(accepted=True)
             try:
                 self._assert_control_identity(workspace_key, runner_generation)
+                self._assert_task_capability(capability_jti)
             except WorkerAdapterError:
                 return worker_pb2.ShutdownResponse(accepted=False)
             self._session.shutting_down = True

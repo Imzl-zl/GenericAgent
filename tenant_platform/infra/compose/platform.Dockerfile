@@ -51,5 +51,7 @@ WORKDIR /opt/ga
 EXPOSE 8080
 ENTRYPOINT ["/bin/sh", "-c", "umask 0027; exec /opt/ga/bin/platform \"$@\"", "--"]
 # 生产 Runner 模式(方案 §7): 不启用 dev-loopback。GA_MANAGER_ADDR/GA_MANAGER_SECRET
-# 等环境由 compose 注入; --listen=0.0.0.0 供同一 application 网络内的容器访问。
-CMD ["--policy-file=/opt/ga/policy/foundation.v1.json", "--claim-lease=30s", "--listen=0.0.0.0:8080"]
+# 等环境由 compose 注入; --listen=127.0.0.1 保持主 API loopback(安全 guard),
+# --worker-internal-listen 提供 capability-protected Worker Sophub 内部端点
+# (审查 R5-C1: 独立 Runner 经 runner-control 网络访问, 管理/用户 API 不暴露)。
+CMD ["--policy-file=/opt/ga/policy/foundation.v1.json", "--claim-lease=30s", "--listen=127.0.0.1:8080", "--worker-internal-listen=0.0.0.0:8082"]

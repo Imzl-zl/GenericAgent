@@ -3,7 +3,6 @@ package application
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -110,14 +109,13 @@ func TestDeliveryServiceSendsFilesFromResultMarkers(t *testing.T) {
 	deps.tasks.task = domain.Task{ID: "t1", SessionKey: "personal:1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
 	deps.bots.bot = boundBot(1)
 
-	root := deps.sessionFiles.SandboxRoot("personal:1")
-	path := filepath.Join(root, "outputs", "resume.docx")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("docx"), 0o644); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
+	// 审查 R5-I3: 文件内容在成功事务时已快照入 task_delivery_files,
+	// delivery 发送时直接使用快照, 不再解析 workspace 路径。
+	deps.store.files = []domain.DeliveryFile{{
+		Marker: "outputs/resume.docx", FileName: "resume.docx", RelPath: "outputs/resume.docx",
+		Content: []byte("docx"), Digest: "sha256:6b25d6e95c3c4c6c7b0a2e6f7a6b5a4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7",
+		SizeBytes: 4,
+	}}
 	deps.results.payload = domain.ResultPayload{
 		Ref:    "ref:1",
 		Digest: "sha256:a",
@@ -136,6 +134,11 @@ func TestDeliveryServiceSendsFilesFromResultMarkers(t *testing.T) {
 	if len(deps.transport.sentFiles) != 1 || !strings.HasSuffix(filepath.Base(deps.transport.sentFiles[0].FilePath), "resume.docx") {
 		t.Fatalf("unexpected file deliveries: %+v", deps.transport.sentFiles)
 	}
+	// 审查 R5-I10: transport 收到的显示名必须是用户可见名, 而不是快照临时
+	// 路径的 basename(含 marker hash 前缀)。
+	if len(deps.transport.sentFiles) != 1 || deps.transport.sentFiles[0].FileName != "resume.docx" {
+		t.Fatalf("file display name = %+v, want resume.docx", deps.transport.sentFiles)
+	}
 	if len(deps.messages.assets) != 1 || deps.messages.assets[0].Direction != domain.MessageOutbound {
 		t.Fatalf("unexpected outbound assets: %+v", deps.messages.assets)
 	}
@@ -146,14 +149,13 @@ func TestDeliveryServiceRetriesOnlyMissingFileAfterTextSucceeded(t *testing.T) {
 	deps.tasks.task = domain.Task{ID: "t1", SessionKey: "personal:1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
 	deps.bots.bot = boundBot(1)
 
-	root := deps.sessionFiles.SandboxRoot("personal:1")
-	path := filepath.Join(root, "outputs", "resume.docx")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("docx"), 0o644); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
+	// 审查 R5-I3: 文件内容在成功事务时已快照入 task_delivery_files,
+	// delivery 发送时直接使用快照, 不再解析 workspace 路径。
+	deps.store.files = []domain.DeliveryFile{{
+		Marker: "outputs/resume.docx", FileName: "resume.docx", RelPath: "outputs/resume.docx",
+		Content: []byte("docx"), Digest: "sha256:6b25d6e95c3c4c6c7b0a2e6f7a6b5a4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7",
+		SizeBytes: 4,
+	}}
 	deps.results.payload = domain.ResultPayload{
 		Ref:    "ref:1",
 		Digest: "sha256:a",
@@ -263,14 +265,13 @@ func TestDeliveryServiceReconcilesCarrierFileSuccessAfterTransientDatabaseFailur
 	ctx, svc, deps := setupDeliveryService(t)
 	deps.tasks.task = domain.Task{ID: "t1", SessionKey: "personal:1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
 	deps.bots.bot = boundBot(1)
-	root := deps.sessionFiles.SandboxRoot("personal:1")
-	path := filepath.Join(root, "outputs", "resume.docx")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("docx"), 0o644); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
+	// 审查 R5-I3: 文件内容在成功事务时已快照入 task_delivery_files,
+	// delivery 发送时直接使用快照, 不再解析 workspace 路径。
+	deps.store.files = []domain.DeliveryFile{{
+		Marker: "outputs/resume.docx", FileName: "resume.docx", RelPath: "outputs/resume.docx",
+		Content: []byte("docx"), Digest: "sha256:6b25d6e95c3c4c6c7b0a2e6f7a6b5a4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7",
+		SizeBytes: 4,
+	}}
 	deps.results.payload = domain.ResultPayload{
 		Ref: "ref:1", Digest: "sha256:a", Body: []byte("done\n[FILE:outputs/resume.docx]"),
 	}
@@ -378,6 +379,24 @@ type deliveryDeps struct {
 	results      *fakeResultReader
 	messages     *fakeMessageStore
 	sessionFiles SessionFiles
+	membership   *fakeMembershipChecker
+}
+
+// fakeMembershipChecker 模拟团队成员资格检查(审查 R5-I4)。
+type fakeMembershipChecker struct {
+	approved map[string]bool // teamID -> approved
+	// 审查 R5-I9: 模拟"检查通过后、发送前成员被移除"——从第 removeAfter 次
+	// 调用起返回 false(0 表示不启用)。
+	removeAfter int
+	calls       int
+}
+
+func (f *fakeMembershipChecker) IsApprovedTeamMember(_ context.Context, teamID string, _ int64) (bool, error) {
+	f.calls++
+	if f.removeAfter > 0 && f.calls > f.removeAfter {
+		return false, nil
+	}
+	return f.approved[teamID], nil
 }
 
 func setupDeliveryService(t *testing.T) (context.Context, *deliveryService, deliveryDeps) {
@@ -395,16 +414,18 @@ func setupDeliveryService(t *testing.T) (context.Context, *deliveryService, deli
 		results:      &fakeResultReader{},
 		messages:     &fakeMessageStore{},
 		sessionFiles: sessionFiles,
+		membership:   &fakeMembershipChecker{approved: map[string]bool{}},
 	}
 	svc, err := NewDeliveryService(DeliveryServiceConfig{
-		Store:        deps.store,
-		Tasks:        deps.tasks,
-		Bots:         deps.bots,
-		Transport:    deps.transport,
-		Results:      deps.results,
-		Messages:     deps.messages,
-		SessionFiles: deps.sessionFiles,
-		Now:          func() time.Time { return time.Now().UTC() },
+		Store:          deps.store,
+		Tasks:          deps.tasks,
+		Bots:           deps.bots,
+		Transport:      deps.transport,
+		Results:        deps.results,
+		Messages:       deps.messages,
+		SessionFiles:   deps.sessionFiles,
+		TeamMembership: deps.membership,
+		Now:            func() time.Time { return time.Now().UTC() },
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
@@ -424,10 +445,19 @@ type fakeDeliveryStore struct {
 	retries       []string
 	deadLetters   []deadLetterRecord
 	deadLetterErr error
+	files         []domain.DeliveryFile // LoadDeliveryFiles 返回值(审查 R5-I3)
 }
 
 type deadLetterRecord struct {
 	ID, Code, Message string
+}
+
+func (s *fakeDeliveryStore) LoadDeliveryFiles(_ context.Context, _ string) ([]domain.DeliveryFile, error) {
+	return s.files, nil
+}
+
+func (s *fakeDeliveryStore) DeleteExpiredDeliveryFiles(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
 }
 
 func (s *fakeDeliveryStore) ClaimPendingDeliveries(_ context.Context, limit int, _ time.Duration, _ time.Duration, _ time.Time) ([]domain.Delivery, error) {
@@ -494,7 +524,7 @@ type transportRecord struct {
 }
 
 type fileTransportRecord struct {
-	BotUUID, IlinkUserID, FilePath string
+	BotUUID, IlinkUserID, FilePath, FileName string
 }
 
 func (t *fakeTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, text string) error {
@@ -505,14 +535,14 @@ func (t *fakeTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, tex
 	return nil
 }
 
-func (t *fakeTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath string) error {
+func (t *fakeTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath, fileName string) error {
 	if t.fileErr != nil {
 		return t.fileErr
 	}
 	if t.err != nil {
 		return t.err
 	}
-	t.sentFiles = append(t.sentFiles, fileTransportRecord{BotUUID: botUUID, IlinkUserID: ilinkUserID, FilePath: filePath})
+	t.sentFiles = append(t.sentFiles, fileTransportRecord{BotUUID: botUUID, IlinkUserID: ilinkUserID, FilePath: filePath, FileName: fileName})
 	return nil
 }
 
@@ -578,4 +608,59 @@ func (s *fakeMessageStore) InsertMediaAsset(_ context.Context, m domain.MediaAss
 	}
 	s.assets = append(s.assets, m)
 	return m, nil
+}
+
+// TestDeliveryServiceRejectsRemovedTeamMember 验证审查 R5-I4: 团队任务的
+// 发起人已不是 approved 成员时, 终端交付 dead-letter(MEMBER_REMOVED),
+// 不得发送任务结果/文件。
+func TestDeliveryServiceRejectsRemovedTeamMember(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", SessionKey: "team:3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("done")}
+	// 成员已被移除: 非 approved。
+	deps.membership.approved["3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b"] = false
+
+	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}}
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sent) != 0 || len(deps.transport.sentFiles) != 0 {
+		t.Fatalf("removed member must not receive task results: text=%+v files=%+v", deps.transport.sent, deps.transport.sentFiles)
+	}
+	if len(deps.store.deadLetters) != 1 || deps.store.deadLetters[0].Code != "MEMBER_REMOVED" {
+		t.Fatalf("expected MEMBER_REMOVED dead-letter, got %+v", deps.store.deadLetters)
+	}
+	// 仍是 approved 成员时正常发送。
+	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}}
+	deps.membership.approved["3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b"] = true
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sent) != 1 {
+		t.Fatalf("approved member must receive task results, got %+v", deps.transport.sent)
+	}
+}
+
+// 审查 R5-I9: 成员资格检查与外部发送之间仍有窗口——成员在 process 开头
+// 检查通过后、发送前被移除时, 不得发出消息/文件(发送前再次检查)。
+func TestDeliveryServiceRejectsMemberRemovedBetweenCheckAndSend(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", SessionKey: "team:3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("done")}
+	deps.membership.approved["3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b"] = true
+	// 第一次检查(process 开头)通过, 之后(发送前)视为已移除。
+	deps.membership.removeAfter = 1
+
+	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}}
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sent) != 0 {
+		t.Fatalf("removed member must not receive text after send-time check, got %+v", deps.transport.sent)
+	}
+	if len(deps.store.deadLetters) != 1 || deps.store.deadLetters[0].Code != "MEMBER_REMOVED" {
+		t.Fatalf("expected MEMBER_REMOVED dead-letter, got %+v", deps.store.deadLetters)
+	}
 }

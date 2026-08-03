@@ -2,8 +2,11 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +20,10 @@ type ContainerCLI interface {
 	// IsRunnerContainer 校验容器 ID/名带 com.genericagent.runner=true label
 	// (销毁前归属校验, 方案 §7: 控制面不能任意删除宿主任意容器)。
 	IsRunnerContainer(ctx context.Context, idOrName string) (bool, error)
+	// RunnerWorkspaceHash 返回容器 label 中的 workspace hash(审查 R5-C6:
+	// Manager 重启后按容器 ID 销毁时, 用它恢复 hash 以定位 config/ 清理
+	// 目标——短期私钥不得因进程内 map 丢失而残留)。容器不存在返回 ok=false。
+	RunnerWorkspaceHash(ctx context.Context, idOrName string) (hash string, ok bool, err error)
 	// EnsureWorkspace 幂等地预置 workspace 目录布局(memory/temp/state/
 	// config/attachments + session_files 子目录), 修复 ownership 与 setgid。
 	// 供 Platform 在附件导入前经控制面调用(方案 §6: fresh workspace 首条
@@ -78,7 +85,10 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 	if strings.TrimSpace(req.WorkspaceKey) == "" {
 		return Runner{}, false, fmt.Errorf("workspace key is required")
 	}
-	hash := WorkspaceDirHash(req.WorkspaceKey)
+	hash, err := WorkspaceDirHash(req.WorkspaceKey)
+	if err != nil {
+		return Runner{}, false, fmt.Errorf("invalid workspace key: %w", err)
+	}
 
 	// per-workspace 锁: 防止并发 EnsureRunner 为同一工作区创建两个容器。
 	m.mu.Lock()
@@ -98,9 +108,23 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 	if hasExisting && strings.HasSuffix(existing, "-g"+strconv.FormatUint(req.Generation, 10)) {
 		// 同 generation 复用:校验后直接返回。
 		if err := m.cfg.CLI.Inspect(ctx, existing); err != nil {
-			return Runner{}, false, fmt.Errorf("inspect existing runner %s: %w", existing, err)
+			// 审查 R5-I7: 容器已停止/退出(ErrRunnerNotRunning)时不得复用——
+			// 销毁重建; 其他 inspect 错误(配置漂移等)fail-closed, 由调度层
+			// 退回重试。
+			if errors.Is(err, ErrRunnerNotRunning) {
+				if err := m.cfg.CLI.Destroy(ctx, existing); err != nil {
+					return Runner{}, false, fmt.Errorf("destroy stopped runner %s: %w", existing, err)
+				}
+				m.mu.Lock()
+				delete(m.runners, hash)
+				m.mu.Unlock()
+				hasExisting = false // 已销毁, 下方"旧 generation 或首次"分支不得二次销毁
+			} else {
+				return Runner{}, false, fmt.Errorf("inspect existing runner %s: %w", existing, err)
+			}
+		} else {
+			return Runner{Name: existing}, false, nil
 		}
-		return Runner{Name: existing}, false, nil
 	}
 
 	// 内存 map 无该 workspace 记录(如 Manager 重启)时, 按确定性容器名前缀
@@ -127,6 +151,13 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 				switch {
 				case gen == req.Generation:
 					if err := m.cfg.CLI.Inspect(ctx, info.Name); err != nil {
+						// 审查 R5-I7: 停止/退出的容器不得复用, 销毁重建。
+						if errors.Is(err, ErrRunnerNotRunning) {
+							if err := m.cfg.CLI.Destroy(ctx, info.Name); err != nil {
+								return Runner{}, false, fmt.Errorf("destroy stopped runner %s: %w", info.Name, err)
+							}
+							continue
+						}
 						return Runner{}, false, fmt.Errorf("inspect existing runner %s: %w", info.Name, err)
 					}
 					m.mu.Lock()
@@ -139,9 +170,11 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 						info.Name, gen, req.Generation)
 				default:
 					if err := m.cfg.CLI.Destroy(ctx, info.Name); err != nil {
-						// 可能已被并发清理; 不阻断创建(创建后 inspect 兜底校验)。
-						slog.WarnContext(ctx, "sandbox manager: destroy stale runner container failed",
-							"name", info.Name, "error", err)
+						// 审查 R5-C3: 扫描路径销毁旧 generation 失败必须 fail-closed。
+						// Destroy 对不存在容器幂等成功, 此处的错误即真实故障——旧
+						// 容器仍挂载同一 workspace, 继续创建新容器会让两代并发写
+						// memory/temp/state, 破坏串行执行与 generation fencing。
+						return Runner{}, false, fmt.Errorf("destroy stale runner %s: %w", info.Name, err)
 					}
 				}
 			}
@@ -160,6 +193,12 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 		if err := m.cfg.CLI.Destroy(ctx, existing); err != nil {
 			return Runner{}, false, fmt.Errorf("destroy stale runner %s: %w", existing, err)
 		}
+		// 销毁成功后立即清缓存(审查 F6): 后续创建失败时 map 不得指向已
+		// 不存在的容器名——否则下次重试会反复销毁同一名字并因 not-found
+		// 之外的错误卡住, 该工作区永久无法创建新 Runner。
+		m.mu.Lock()
+		delete(m.runners, hash)
+		m.mu.Unlock()
 	}
 
 	spec := RunnerSpec{
@@ -173,10 +212,16 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 	}
 	runner, err := m.cfg.CLI.CreateAndStart(ctx, spec)
 	if err != nil {
+		// 审查 R5-C6: create/start 中途失败(如 docker create 后 start 失败)
+		// 必须清理已写入 workspace config/ 的短期私钥/证书/token——清理不能
+		// 依赖进程内 map(下次创建会重建), 否则残留私钥随卷快照长期保存。
+		m.cleanupWorkspaceConfig(hash)
 		return Runner{}, false, err
 	}
 	if err := m.cfg.CLI.Inspect(ctx, runner.Name); err != nil {
-		_ = m.cfg.CLI.Destroy(ctx, runner.Name)
+		// 审查 R5-C6: 走 DestroyRunner(而非 CLI.Destroy)以执行归属校验与
+		// workspace config/ 清理; 直接调 CLI.Destroy 会绕过清理, 让私钥残留。
+		_ = m.DestroyRunner(ctx, runner.Name)
 		return Runner{}, false, fmt.Errorf("post-create inspect failed: %w", err)
 	}
 
@@ -190,9 +235,12 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 // Manager 以 root 运行, 可 chown 目录到 Runner uid + 共享组并保留 setgid,
 // 之后 Platform(组 10003 成员) 写入的附件/输出文件才能被 Runner 读取。
 func (m *Manager) EnsureWorkspace(ctx context.Context, workspaceKey string) error {
-	hash := WorkspaceDirHash(workspaceKey)
 	if workspaceKey == "" {
 		return fmt.Errorf("workspace key is required")
+	}
+	hash, err := WorkspaceDirHash(workspaceKey)
+	if err != nil {
+		return fmt.Errorf("invalid workspace key: %w", err)
 	}
 	return m.cfg.CLI.EnsureWorkspace(ctx, hash)
 }
@@ -228,25 +276,115 @@ func (m *Manager) Destroy(ctx context.Context, name string) error {
 }
 
 // DestroyRunner removes a Runner container by name or container ID.
-// 归属校验: 必须匹配本 Manager 的命名模式, 或经 label 校验确认为 Runner。
+// 归属校验(审查 F7): 命名模式匹配后仍须通过 manager label 校验——容器名
+// 模式可被其他部署复用, 只有 label 才能证明是本 Manager 实例创建; 容器已
+// 不存在时幂等成功(审查 F6)。
 func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
-	if !m.IsRunnerName(name) {
-		ok, err := m.cfg.CLI.IsRunnerContainer(ctx, name)
-		if err != nil || !ok {
-			return fmt.Errorf("refusing to destroy %q: not a managed runner (label check failed: %v)", name, err)
+	if m.IsRunnerName(name) {
+		if checker, ok := m.cfg.CLI.(interface {
+			IsManagerRunner(ctx context.Context, idOrName string) (bool, error)
+			ContainerExists(ctx context.Context, idOrName string) (bool, error)
+		}); ok {
+			managed, err := checker.IsManagerRunner(ctx, name)
+			if err != nil {
+				return fmt.Errorf("refusing to destroy %q: manager label check failed: %w", name, err)
+			}
+			if !managed {
+				exists, existsErr := checker.ContainerExists(ctx, name)
+				if existsErr != nil {
+					return fmt.Errorf("refusing to destroy %q: existence check failed: %w", name, existsErr)
+				}
+				if !exists {
+					return nil // 已不存在: 幂等成功
+				}
+				return fmt.Errorf("refusing to destroy %q: not created by this manager instance", name)
+			}
+		}
+	} else {
+		// 审查 R5-I6: 容器 ID 路径(非 RunnerName 模式)同样必须通过 manager
+		// label 归属校验——只有 runner=true 标签不能证明是本 Manager 创建,
+		// 其他部署/宿主任意容器的 runner=true 标签不得被销毁。
+		if checker, ok := m.cfg.CLI.(interface {
+			IsManagerRunner(ctx context.Context, idOrName string) (bool, error)
+		}); ok {
+			managed, err := checker.IsManagerRunner(ctx, name)
+			if err != nil {
+				return fmt.Errorf("refusing to destroy %q: manager label check failed: %w", name, err)
+			}
+			if !managed {
+				return fmt.Errorf("refusing to destroy %q: not created by this manager instance", name)
+			}
+		} else {
+			ok, err := m.cfg.CLI.IsRunnerContainer(ctx, name)
+			if err != nil || !ok {
+				return fmt.Errorf("refusing to destroy %q: not a managed runner (label check failed: %v)", name, err)
+			}
+		}
+	}
+	// 审查 F11/R5-C6: 短期 mTLS 私钥/证书/token 不跨容器生命周期残留——销毁
+	// 容器后清理 workspace config/ 目录(下次创建由 CreateAndStart 重建)。
+	// 进程内 map 无记录(Manager 重启后按名/ID 销毁)时, 从容器 label 恢复
+	// workspace hash 定位清理目标。注意: 必须在 Destroy **之前**读取
+	// label——容器被 rm 后 inspect 无法再返回任何信息。
+	var hashFromLabel string
+	if getter, ok := m.cfg.CLI.(interface {
+		RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error)
+	}); ok {
+		if h, found, err := getter.RunnerWorkspaceHash(context.WithoutCancel(ctx), name); err == nil && found {
+			hashFromLabel = h
 		}
 	}
 	if err := m.cfg.CLI.Destroy(ctx, name); err != nil {
 		return err
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for hash, n := range m.runners {
+	var hash string
+	for h, n := range m.runners {
 		if n == name {
-			delete(m.runners, hash)
+			hash = h
+			delete(m.runners, h)
 		}
 	}
+	m.mu.Unlock()
+	if hash == "" {
+		hash = hashFromLabel
+	}
+	if hash != "" {
+		m.cleanupWorkspaceConfig(hash)
+	}
 	return nil
+}
+
+// cleanupWorkspaceConfig 删除工作区 config/ 目录内容(best-effort)。
+// 目录结构由下次 CreateAndStart 的 prepareWorkspaceDirs/writeConfigFiles
+// 重建; 失败仅记日志, 不阻断销毁路径。
+func (m *Manager) cleanupWorkspaceConfig(hash string) {
+	if m.cfg.WorkspaceRoot == "" {
+		return
+	}
+	dir := filepath.Join(m.cfg.WorkspaceRoot, hash, "config")
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Warn("sandbox manager: cleanup workspace config dir failed",
+			"workspace_hash", hash, "error", err)
+	}
+}
+
+// RunnerWorkspaceHash 从容器 label 读取 workspace hash(审查 R5-C6:
+// Platform 销毁路径按容器 ID 定位 config/ 清理目标)。
+func (m *Manager) RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error) {
+	return m.cfg.CLI.RunnerWorkspaceHash(ctx, idOrName)
+}
+
+// ListRunnerContainers 列出本 Manager 创建的 Runner 容器(label 过滤,
+// 含 stopped), 供孤儿回收使用(审查 R5-I7)。
+func (m *Manager) ListRunnerContainers(ctx context.Context, namePrefix string) ([]RunnerInfo, error) {
+	lister, ok := m.cfg.CLI.(interface {
+		ListRunnerContainers(ctx context.Context, namePrefix string) ([]RunnerInfo, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("CLI does not support listing runner containers")
+	}
+	return lister.ListRunnerContainers(ctx, namePrefix)
 }
 
 // IsRunnerContainer 委托 CLI 校验容器 ID/名带 com.genericagent.runner=true

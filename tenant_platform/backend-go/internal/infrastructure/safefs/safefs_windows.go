@@ -3,12 +3,17 @@
 package safefs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// ErrFileTooLarge 表示读取期间文件超过 maxBytes(审查 R5-I5): 与 Unix 实现
+// 同语义, fstat 后文件继续增长时读取上限为 maxBytes+1, 超限即拒绝。
+var ErrFileTooLarge = errors.New("file exceeded read limit")
 
 // OpenBeneath Windows 开发回退: 逐组件 Lstat 拒绝符号链接后打开。
 // 生产部署是 Linux(方案 §13), 该实现只保证开发环境行为一致。
@@ -28,7 +33,8 @@ func ReadFileBeneath(root, rel string) ([]byte, error) {
 	return ReadFileBeneathLimited(root, rel, 0)
 }
 
-// ReadFileBeneathLimited Windows 开发回退: 与 Unix 分支同语义(先校验 size 上限)。
+// ReadFileBeneathLimited Windows 开发回退: 与 Unix 分支同语义(先校验 size
+// 上限 + maxBytes+1 读取检测, 审查 R5-I5: fstat 后文件增长不得静默截断)。
 func ReadFileBeneathLimited(root, rel string, maxBytes int64) ([]byte, error) {
 	f, err := OpenBeneath(root, rel, os.O_RDONLY, 0)
 	if err != nil {
@@ -46,7 +52,14 @@ func ReadFileBeneathLimited(root, rel string, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("%s exceeds size limit %d (got %d)", rel, maxBytes, info.Size())
 	}
 	if maxBytes > 0 {
-		return io.ReadAll(io.LimitReader(f, maxBytes))
+		buf, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(buf)) > maxBytes {
+			return nil, fmt.Errorf("%w: %s grew beyond %d bytes during read", ErrFileTooLarge, rel, maxBytes)
+		}
+		return buf, nil
 	}
 	return io.ReadAll(f)
 }

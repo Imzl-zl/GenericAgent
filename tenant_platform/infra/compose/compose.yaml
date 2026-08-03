@@ -130,7 +130,7 @@ services:
       GA_MANAGER_SECRET: ${GA_MANAGER_SECRET}
       GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
       GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
-      GA_SOPHUB_PROXY_ADDR: ${GA_SOPHUB_PROXY_ADDR:-http://platform:8080}
+      GA_SOPHUB_PROXY_ADDR: ${GA_SOPHUB_PROXY_ADDR:-http://platform:8082}
     read_only: true
     cap_drop:
       - ALL
@@ -236,6 +236,12 @@ services:
       - CHOWN
       - DAC_OVERRIDE
       - DAC_READ_SEARCH
+      # 审查 R5-C2: 预置 workspace 需要 chown 到 Runner UID/GID 后保留
+      # setgid 位——Fchown 后目录属主已不是 root, 无 CAP_FOWNER 时 Fchmod
+      # 直接 EPERM; 仅 FOWNER 仍会因缺 CAP_FSETID 清除非属主组的 setgid
+      # (实测: FOWNER 得 0770, 加 FSETID 才得 02770)。
+      - FOWNER
+      - FSETID
     security_opt:
       - no-new-privileges:true
     environment:
@@ -263,9 +269,11 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner_workspaces:/var/lib/ga/workspaces
+    # 审查 F11: 持 Docker socket(=宿主 root)的 Manager 不接入 runner-control
+    # 内部网络, 与不可信 Runner 保持网络隔离——Manager 经 docker.sock 控制
+    # 容器, 不需要也无法拨号 Runner 的 mTLS 端点(拨号由 Platform 完成)。
     networks:
       - application
-      - runner-control
     pids_limit: 128
     mem_limit: 512m
     cpus: 1.0

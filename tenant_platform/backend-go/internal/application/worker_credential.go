@@ -36,6 +36,9 @@ type pendingCredentialRefresh struct {
 	Next          workerCredentialSet
 	PreviousJSON  []byte
 	RollbackCause error
+	// taskID 记录签发 Next 时的任务(审查 R5-I3): pending 跨任务边界必须
+	// 丢弃而非 ack 提升——Next 绑定旧任务, 旧任务终态已撤销其 JTI。
+	TaskID string
 }
 
 func (s *scheduler) issueProviderCapabilities(
@@ -117,7 +120,10 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 	// 终态撤销后旧 task 的 sophub token 立即失效。
 	var sophub *RuntimeSophubProxy
 	if s.cfg.TokenIssuer != nil && s.cfg.SophubProxyBaseURL != "" {
-		sophubToken, sophubClaims, err := s.cfg.TokenIssuer.IssueSophubToken(sessionKey, taskID, runnerGeneration, llmproxy.DefaultTokenTTL)
+		// 审查 F10: sophub capability 必须携带预算——Runner 不得在 token
+		// 有效期内无限调用代理(search/install 合计按 JTI 原子计量)。
+		sophubBudget := fmt.Sprintf(`{"max_turns":%d}`, maxTurns)
+		sophubToken, sophubClaims, err := s.cfg.TokenIssuer.IssueSophubToken(sessionKey, taskID, runnerGeneration, llmproxy.DefaultTokenTTL, sophubBudget)
 		if err != nil {
 			s.revokeCredentialSetBestEffort(ctx, set)
 			return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("issue sophub capability: %w", err)
@@ -140,6 +146,19 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 	if err != nil {
 		s.revokeCredentialSetBestEffort(ctx, set)
 		return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("build token-only runtime config: %w", err)
+	}
+	// 审查 F1: JTI 必须在 token 暴露给 Runner 之前持久化(写 runtime config /
+	// 启动容器 / ReloadCredentials RPC 都发生在本函数返回之后)。若 Platform
+	// 在签发后、暴露前崩溃, 恢复路径(RecoverAfterRestart)依据 tasks.
+	// capability_jtis 撤销 token; 未持久化则旧 token 在 TTL 内无人能撤销。
+	// 失败 fail-closed: 就地撤销已签发 token 并中止, 不允许在撤销依据
+	// 缺失时继续。taskID 为空(loopback/测试签发)或 Store 未接线(单测)
+	// 时跳过——生产 NewScheduler 强制 Store 非 nil。
+	if taskID != "" && s.cfg.Store != nil && len(set.JTIs) > 0 {
+		if err := s.cfg.Store.SetTaskCapabilityJTIs(ctx, taskID, s.cfg.PlatformInstanceID, set.JTIs); err != nil {
+			s.revokeCredentialSetBestEffort(ctx, set)
+			return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("persist task capability jtis before exposure: %w", err)
+		}
 	}
 	set.Checksum = files.Checksum
 	return set, files, nil
@@ -179,6 +198,13 @@ func (s *scheduler) credentialsNeedRefresh(set workerCredentialSet) bool {
 }
 
 func (s *scheduler) refreshWorkerCredentials(ctx context.Context, entry *workerEntry) error {
+	// 审查 R5-I3: pending 绑定上一任务时, 不得 ack 提升——其 Next 是旧任务
+	// 已终态撤销的 token。丢弃(撤销 Next)后按当前任务重新签发; Worker 若
+	// 已应用旧 Next, 由随后对新 generation 的 ReloadCredentials 整体替换覆盖。
+	if entry.pendingRefresh != nil && entry.pendingRefresh.TaskID != entry.taskID {
+		s.revokeCredentialSetBestEffort(ctx, entry.pendingRefresh.Next)
+		entry.pendingRefresh = nil
+	}
 	if entry.pendingRefresh == nil {
 		generation := entry.credentials.Generation + 1
 		if generation == 0 {
@@ -204,6 +230,7 @@ func (s *scheduler) refreshWorkerCredentials(ctx context.Context, entry *workerE
 		}
 		entry.pendingRefresh = &pendingCredentialRefresh{
 			Previous: entry.credentials, Next: newSet, PreviousJSON: previousJSON,
+			TaskID: entry.taskID,
 		}
 		if err := WriteRuntimeConfigAtomic(s.runtimeConfigDir(entry.sessionKey), files); err != nil {
 			entry.pendingRefresh.RollbackCause = fmt.Errorf("write refreshed runtime config: %w", err)
