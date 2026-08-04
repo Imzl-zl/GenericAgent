@@ -91,13 +91,7 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 	}
 
 	// per-workspace 锁: 防止并发 EnsureRunner 为同一工作区创建两个容器。
-	m.mu.Lock()
-	lock, ok := m.locks[hash]
-	if !ok {
-		lock = &sync.Mutex{}
-		m.locks[hash] = lock
-	}
-	m.mu.Unlock()
+	lock := m.workspaceLock(hash)
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -112,12 +106,11 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 			// 销毁重建; 其他 inspect 错误(配置漂移等)fail-closed, 由调度层
 			// 退回重试。
 			if errors.Is(err, ErrRunnerNotRunning) {
-				if err := m.cfg.CLI.Destroy(ctx, existing); err != nil {
+				// Round8: 持锁调用私有销毁变体(不得重入公开 DestroyRunner 死锁),
+				// 并清理同 generation 的 config 短期材料。
+				if err := m.destroyRunnerLocked(ctx, existing, hash, req.Generation); err != nil {
 					return Runner{}, false, fmt.Errorf("destroy stopped runner %s: %w", existing, err)
 				}
-				m.mu.Lock()
-				delete(m.runners, hash)
-				m.mu.Unlock()
 				hasExisting = false // 已销毁, 下方"旧 generation 或首次"分支不得二次销毁
 			} else {
 				return Runner{}, false, fmt.Errorf("inspect existing runner %s: %w", existing, err)
@@ -153,7 +146,7 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 					if err := m.cfg.CLI.Inspect(ctx, info.Name); err != nil {
 						// 审查 R5-I7: 停止/退出的容器不得复用, 销毁重建。
 						if errors.Is(err, ErrRunnerNotRunning) {
-							if err := m.cfg.CLI.Destroy(ctx, info.Name); err != nil {
+							if err := m.destroyRunnerLocked(ctx, info.Name, hash, gen); err != nil {
 								return Runner{}, false, fmt.Errorf("destroy stopped runner %s: %w", info.Name, err)
 							}
 							continue
@@ -169,7 +162,8 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 						"runner %s generation %d is newer than requested %d; refresh runner lease and retry",
 						info.Name, gen, req.Generation)
 				default:
-					if err := m.cfg.CLI.Destroy(ctx, info.Name); err != nil {
+					// Round8: 持锁销毁并清理旧 generation config(原 CLI.Destroy 绕过清理)。
+					if err := m.destroyRunnerLocked(ctx, info.Name, hash, gen); err != nil {
 						// 审查 R5-C3: 扫描路径销毁旧 generation 失败必须 fail-closed。
 						// Destroy 对不存在容器幂等成功, 此处的错误即真实故障——旧
 						// 容器仍挂载同一 workspace, 继续创建新容器会让两代并发写
@@ -185,20 +179,19 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 	if hasExisting {
 		// generation 回退防护(方案 §7): 旧 lease 的迟到请求不得销毁
 		// 更新的容器并回退 generation; 调用方应刷新 lease 后重试。
-		if existingGen, err := m.runnerGenerationOf(existing); err == nil && existingGen > req.Generation {
+		existingGen, genErr := m.runnerGenerationOf(existing)
+		if genErr == nil && existingGen > req.Generation {
 			return Runner{}, false, fmt.Errorf(
 				"runner %s generation %d is newer than requested %d; refresh runner lease and retry",
 				existing, existingGen, req.Generation)
 		}
-		if err := m.cfg.CLI.Destroy(ctx, existing); err != nil {
+		// Round8: 持锁销毁并清理旧 generation config(原 CLI.Destroy 绕过清理)。
+		if err := m.destroyRunnerLocked(ctx, existing, hash, existingGen); err != nil {
 			return Runner{}, false, fmt.Errorf("destroy stale runner %s: %w", existing, err)
 		}
-		// 销毁成功后立即清缓存(审查 F6): 后续创建失败时 map 不得指向已
+		// destroyRunnerLocked 已清缓存(审查 F6): 后续创建失败时 map 不得指向已
 		// 不存在的容器名——否则下次重试会反复销毁同一名字并因 not-found
 		// 之外的错误卡住, 该工作区永久无法创建新 Runner。
-		m.mu.Lock()
-		delete(m.runners, hash)
-		m.mu.Unlock()
 	}
 
 	spec := RunnerSpec{
@@ -213,15 +206,18 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 	runner, err := m.cfg.CLI.CreateAndStart(ctx, spec)
 	if err != nil {
 		// 审查 R5-C6: create/start 中途失败(如 docker create 后 start 失败)
-		// 必须清理已写入 workspace config/ 的短期私钥/证书/token——清理不能
-		// 依赖进程内 map(下次创建会重建), 否则残留私钥随卷快照长期保存。
-		m.cleanupWorkspaceConfig(hash)
+		// 必须清理已写入 workspace config/g<gen> 的短期私钥/证书/token
+		// ——清理不能依赖进程内 map(下次创建会重建),
+		// 否则残留私钥随卷快照长期保存(审查 C1/I6:
+		// 按 generation 清理, 不影响已创建的新一代 config)。
+		m.cleanupWorkspaceConfig(hash, req.Generation)
 		return Runner{}, false, err
 	}
 	if err := m.cfg.CLI.Inspect(ctx, runner.Name); err != nil {
-		// 审查 R5-C6: 走 DestroyRunner(而非 CLI.Destroy)以执行归属校验与
-		// workspace config/ 清理; 直接调 CLI.Destroy 会绕过清理, 让私钥残留。
-		_ = m.DestroyRunner(ctx, runner.Name)
+		// 审查 R5-C6: 销毁并清理 workspace config/(短期私钥/证书/token)。
+		// Round8: 必须调用持锁私有变体——公开 DestroyRunner 会再次获取
+		// 本函数持有的 workspace 锁, 造成确定性死锁。
+		_ = m.destroyRunnerLocked(ctx, runner.Name, hash, req.Generation)
 		return Runner{}, false, fmt.Errorf("post-create inspect failed: %w", err)
 	}
 
@@ -322,11 +318,13 @@ func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
 		}
 	}
 	// 审查 F11/R5-C6: 短期 mTLS 私钥/证书/token 不跨容器生命周期残留——销毁
-	// 容器后清理 workspace config/ 目录(下次创建由 CreateAndStart 重建)。
-	// 进程内 map 无记录(Manager 重启后按名/ID 销毁)时, 从容器 label 恢复
-	// workspace hash 定位清理目标。注意: 必须在 Destroy **之前**读取
-	// label——容器被 rm 后 inspect 无法再返回任何信息。
+	// 容器后清理 workspace config/g<generation> 目录(下次创建由
+	// CreateAndStart 重建)。进程内 map 无记录(Manager 重启后按名/ID
+	// 销毁)时, 从容器 label 恢复 workspace hash 定位清理目标。
+	// 注意: 必须在 Destroy **之前**读取 label——容器被 rm 后
+	// inspect 无法再返回任何信息。
 	var hashFromLabel string
+	var genFromLabel uint64
 	if getter, ok := m.cfg.CLI.(interface {
 		RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error)
 	}); ok {
@@ -334,11 +332,58 @@ func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
 			hashFromLabel = h
 		}
 	}
+	if genGetter, ok := m.cfg.CLI.(interface {
+		RunnerGenerationLabel(ctx context.Context, idOrName string) (uint64, bool, error)
+	}); ok {
+		if g, found, err := genGetter.RunnerGenerationLabel(context.WithoutCancel(ctx), name); err == nil && found {
+			genFromLabel = g
+		}
+	}
+	// 审查 C1/I6: 与 EnsureRunner 共享 per-workspace 锁——同一工作区的
+	// 创建/销毁串行, 旧 generation 销毁的 config 清理不得与新创建写入
+	// 交错(否则可删掉新一代的 mTLS 材料)。
+	m.mu.Lock()
+	var hash string
+	for h, n := range m.runners {
+		if n == name {
+			hash = h
+			break
+		}
+	}
+	m.mu.Unlock()
+	if hash == "" {
+		hash = hashFromLabel
+	}
+	// 审查 C1/I6(收紧): get-or-create 取锁——若 DestroyRunner 在
+	// EnsureRunner 创建锁之前读取了 nil, 同 generation 的销毁可能与
+	// writeConfigFiles 交错。
+	var lock *sync.Mutex
+	if hash != "" {
+		lock = m.workspaceLock(hash)
+	}
+	if lock != nil {
+		lock.Lock()
+		defer lock.Unlock()
+	}
+	generation := genFromLabel
+	if generation == 0 {
+		if gen, err := m.runnerGenerationOf(name); err == nil {
+			generation = gen
+		}
+	}
+	return m.destroyRunnerLocked(ctx, name, hash, generation)
+}
+
+// destroyRunnerLocked 是持锁销毁变体:调用方必须已持有 workspaceLock(hash)
+// (hash 为空时无锁, 仅当 label 与 map 都无法定位 workspace)。Round8 审查:
+// EnsureRunner 持锁期间销毁容器必须走本变体——公开 DestroyRunner 会再次
+// 获取同一把非重入锁, 造成确定性死锁; 同时统一保证所有销毁路径清理
+// workspace config/g<generation> 的短期 mTLS 材料。
+func (m *Manager) destroyRunnerLocked(ctx context.Context, name, hash string, generation uint64) error {
 	if err := m.cfg.CLI.Destroy(ctx, name); err != nil {
 		return err
 	}
 	m.mu.Lock()
-	var hash string
 	for h, n := range m.runners {
 		if n == name {
 			hash = h
@@ -346,26 +391,29 @@ func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
 		}
 	}
 	m.mu.Unlock()
-	if hash == "" {
-		hash = hashFromLabel
-	}
 	if hash != "" {
-		m.cleanupWorkspaceConfig(hash)
+		m.cleanupWorkspaceConfig(hash, generation)
 	}
 	return nil
 }
 
-// cleanupWorkspaceConfig 删除工作区 config/ 目录内容(best-effort)。
-// 目录结构由下次 CreateAndStart 的 prepareWorkspaceDirs/writeConfigFiles
+// cleanupWorkspaceConfig 删除工作区 config/g<generation> 目录
+// (best-effort, 审查 C1/I6: 按 generation 隔离, 不影响已创建的新一代
+// 配置)。目录结构由下次 CreateAndStart 的 writeConfigFiles
 // 重建; 失败仅记日志, 不阻断销毁路径。
-func (m *Manager) cleanupWorkspaceConfig(hash string) {
+func (m *Manager) cleanupWorkspaceConfig(hash string, generation uint64) {
 	if m.cfg.WorkspaceRoot == "" {
 		return
 	}
-	dir := filepath.Join(m.cfg.WorkspaceRoot, hash, "config")
+	if generation == 0 {
+		// 无法定位 generation(名称/label 都不可用): 不删除,
+		// 防止误删新一代配置。残留由下次创建覆盖。
+		return
+	}
+	dir := filepath.Join(m.cfg.WorkspaceRoot, hash, "config", fmt.Sprintf("g%d", generation))
 	if err := os.RemoveAll(dir); err != nil {
 		slog.Warn("sandbox manager: cleanup workspace config dir failed",
-			"workspace_hash", hash, "error", err)
+			"workspace_hash", hash, "generation", generation, "error", err)
 	}
 }
 
@@ -412,6 +460,19 @@ func (m *Manager) IsRunnerName(name string) bool {
 	}
 	gen, err := strconv.ParseUint(rest[sep+2:], 10, 64)
 	return err == nil && gen > 0
+}
+
+// workspaceLock 返回工作区锁, 不存在时创建(审查 C1/I6:
+// EnsureRunner 与 DestroyRunner 必须共享同一锁实例, 避免创建/销毁交错)。
+func (m *Manager) workspaceLock(hash string) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lock, ok := m.locks[hash]
+	if !ok {
+		lock = &sync.Mutex{}
+		m.locks[hash] = lock
+	}
+	return lock
 }
 
 // runnerGenerationOf 解析容器名后缀 -g<generation>。

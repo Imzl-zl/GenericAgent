@@ -51,16 +51,16 @@ func (r *router) handleRelay(ctx context.Context, msg IncomingMessage, bot domai
 	username, body, ok := parseRelayMention(text)
 	if !ok {
 		reply := "用法：@<用户名> <消息内容>\n例：@alice 你好"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if err := r.relay.Relay(ctx, bot.OwnerID, username, body); err != nil {
 		reply := formatRelayError(err, username)
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	reply := fmt.Sprintf("已转发给 %s", username)
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 	return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
@@ -68,16 +68,16 @@ func (r *router) handleRelay(ctx context.Context, msg IncomingMessage, bot domai
 func (r *router) handleRelayOff(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
 	if r.relay == nil {
 		reply := "转发功能未启用"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if err := r.relay.SetOptOut(ctx, bot.OwnerID, true); err != nil {
 		reply := fmt.Sprintf("操作失败: %s", err.Error())
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	reply := "已关闭 @用户名 转发接收\n发送 /relay_on 重新开启"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 	return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
@@ -85,16 +85,16 @@ func (r *router) handleRelayOff(ctx context.Context, msg IncomingMessage, bot do
 func (r *router) handleRelayOn(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
 	if r.relay == nil {
 		reply := "转发功能未启用"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if err := r.relay.SetOptOut(ctx, bot.OwnerID, false); err != nil {
 		reply := fmt.Sprintf("操作失败: %s", err.Error())
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	reply := "已开启 @用户名 转发接收"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 	return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 }
 

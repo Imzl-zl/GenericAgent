@@ -29,6 +29,8 @@ func (s *scheduler) cleanupExpiredCapabilityRevocations(ctx context.Context, now
 // HeartbeatTimeout pattern). Legitimate long tasks keep last_activity_at fresh
 // via windowed RecordChunkEvent writes and RecordHeartbeat (drain poll), so
 // they are NOT reaped. Only called when SchedulerConfig.IdleTimeout > 0.
+// 审查 C1/I8: Worker 心跳只在推进窗口内发出(agent 最近有 display 事件),
+// agent 卡死时心跳停发 → last_activity_at 陈旧 → 本函数按 idle 阈值收割。
 func (s *scheduler) reapIdleTasks(ctx context.Context, owned []domain.Task, idle time.Duration) error {
 	cutoff := time.Now().UTC().Add(-idle)
 	for _, t := range owned {

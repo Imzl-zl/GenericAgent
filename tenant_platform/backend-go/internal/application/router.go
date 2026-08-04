@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -77,6 +79,10 @@ type RouterStore interface {
 // backstop (replacing the in-memory seen map as the source of truth).
 type MessageStore interface {
 	InsertInboundMessage(ctx context.Context, m domain.Message) (domain.Message, error)
+	// HasInboundMessage 只读检查 (bot_id, message_id) 是否已入库(round9 审查:
+	// 路由成功后才写消息行, 因此消息行存在 = 该消息已成功处理过——重启/多
+	// 实例后内存幂等缓存变冷时, 用它短路重复的 relay/命令副作用)。
+	HasInboundMessage(ctx context.Context, botID int64, messageID string) (bool, error)
 	InsertOutboundMessage(ctx context.Context, m domain.Message) (domain.Message, error)
 	HasOutboundMessage(ctx context.Context, taskID, messageType, content, mediaPath string) (bool, error)
 	InsertMediaAsset(ctx context.Context, m domain.MediaAsset) (domain.MediaAsset, error)
@@ -118,6 +124,10 @@ type RouterConfig struct {
 	// Relay is the @username forwarding service. Optional; when nil,
 	// @-mentions fall through to normal task routing.
 	Relay RelayService
+	// BotMediaRoot 是 Bot Poller 媒体文件的宿主根目录(compose: bot_media 卷)。
+	// 非空时, 入站 media_paths 必须解析后仍位于该根内(Round8 审查: Poller
+	// 可被攻破时防止读取 Platform 容器任意文件); 空 = 不校验(loopback/dev)。
+	BotMediaRoot string
 }
 
 // Router processes incoming bot messages: identity resolution, status check,
@@ -142,6 +152,7 @@ type router struct {
 	channelBindings ChannelBindingResolver
 	toolPolicy     string
 	sourceInstance string
+	botMediaRoot   string
 	// Trigger-invalidated cache for command registry. Admin update handlers
 	// call InvalidateCommandCache() after changing platform_commands.
 	cacheMu        sync.Mutex
@@ -164,18 +175,61 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 		cfg.SourceInstance = "router"
 	}
 	return &router{
-		store:          cfg.Store,
-		tasks:          cfg.Tasks,
-		transport:      cfg.Transport,
-		commands:       cfg.Commands,
-		messages:       cfg.Messages,
-		sessionFiles:   cfg.SessionFiles,
-		teams:          cfg.Teams,
-		relay:          cfg.Relay,
-		channelBindings: cfg.ChannelBindings,
-		toolPolicy:     cfg.ToolPolicy,
-		sourceInstance: cfg.SourceInstance,
+		store:            cfg.Store,
+		tasks:            cfg.Tasks,
+		transport:        cfg.Transport,
+		commands:         cfg.Commands,
+		messages:         cfg.Messages,
+		sessionFiles:     cfg.SessionFiles,
+		teams:            cfg.Teams,
+		relay:            cfg.Relay,
+		channelBindings:  cfg.ChannelBindings,
+		toolPolicy:       cfg.ToolPolicy,
+		sourceInstance:   cfg.SourceInstance,
+		botMediaRoot:     cfg.BotMediaRoot,
 	}, nil
+}
+
+// validateMediaPaths 校验入站媒体文件路径必须位于 BotMediaRoot 内(Round8 审查:
+// webhook 的 media_paths 来自 Bot Poller, HMAC 只能证明请求来自 Poller——Poller
+// 被攻破后可提交任意宿主路径读取 Platform 容器文件, 如 /proc/self/environ 的
+// 数据库/Manager/JWT 密钥)。校验: 绝对路径 + EvalSymlinks 解析全部组件后仍
+// 在根内(防符号链接逃逸) + 普通文件。root 为空时不校验(loopback/dev)。
+func validateMediaPaths(root string, paths []string) error {
+	if root == "" {
+		return nil
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve bot media root %q: %w", root, err)
+	}
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if !filepath.IsAbs(p) {
+			return fmt.Errorf("media path must be absolute: %q", p)
+		}
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return fmt.Errorf("resolve media path %q: %w", p, err)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return fmt.Errorf("stat media path %q: %w", p, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("media path %q is a directory", p)
+		}
+		rel, err := filepath.Rel(absRoot, resolved)
+		if err != nil {
+			return fmt.Errorf("relate media path %q: %w", p, err)
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("media path %q escapes bot media root", p)
+		}
+	}
+	return nil
 }
 
 // resolveOwnerID 解析消息发送者的 canonical user: 渠道绑定存在时用绑定用户
@@ -197,71 +251,74 @@ func (r *router) resolveOwnerID(ctx context.Context, msg IncomingMessage, botOwn
 }
 
 // HandleMessage processes one incoming message per spec §6.1.
+//
+// Round8 审查(处理顺序重构): 幂等标记从"处理前"改为"成功处理后"——任何
+// 中途失败(授权/路由/任务提交)返回 error 时都不标记, Poller 重试能真正
+// 重新处理; 消息持久化从授权检查之前移到路由成功之后——身份不匹配/未绑定/
+// 被阻止的发送者不得向目标租户写入 messages/media_assets 记录; 任务提交
+// 先于消息入库, 重试撞 DB 唯一键时任务已存在, 不会丢任务。
 func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (RouterResult, error) {
 	if msg.BotUUID == "" || msg.IlinkUserID == "" || msg.MessageID == "" {
 		return RouterResult{Action: ActionRejected, Reply: "missing required fields"}, nil
 	}
-	// Step 1: idempotency check.
-	first, err := r.transport.RecordMessageIdempotency(ctx, msg.BotUUID, msg.MessageID)
+	// Step 1: 幂等只读检查(成功处理后 Mark, 见函数末尾)。
+	seen, err := r.transport.CheckMessageIdempotency(ctx, msg.BotUUID, msg.MessageID)
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("idempotency: %w", err)
 	}
-	if !first {
+	if seen {
 		return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
 	}
 	// Step 2: resolve bot identity.
 	bot, err := r.store.GetBotByUUID(ctx, msg.BotUUID)
 	if err != nil {
 		reply := "unknown bot"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply}, nil
 	}
-	// Resolve active context early so persistInbound records the correct
-	// session_key (personal:{user_id} vs team:{team_id}). Falls back to
-	// personal session when teams are disabled or context lookup fails.
+	// Step 2.5: DB 级幂等(round9 审查: 重启/多实例后内存 seen 缓存变冷,
+	// 任务唯一键只保护任务不重复, relay 转发与团队命令没有等价兜底)。
+	// 入站消息行在路由成功后写入, 因此消息行已存在 = 该消息已成功处理过,
+	// 直接按 duplicate 短路, 不再执行路由(不重复 relay/命令副作用)。
+	// 残余窗口: 第一次路由成功但消息行写入前崩溃——重试会重新路由,
+	// 任务由唯一键去重, relay 仍可能重复(Round8 已声明限制)。
+	if r.messages != nil {
+		dup, hasErr := r.messages.HasInboundMessage(ctx, bot.ID, msg.MessageID)
+		if hasErr != nil {
+			return RouterResult{}, fmt.Errorf("inbound idempotency: %w", hasErr)
+		}
+		if dup {
+			return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
+		}
+	}
+	// canonical identity(方案 §5.1): 后续 status/任务提交全部以绑定用户为准。
 	ownerID, err := r.resolveOwnerID(ctx, msg, bot.OwnerID)
 	if err != nil {
 		reply := "身份解析失败，请稍后重试"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	// canonical identity(方案 §5.1): 后续 status/任务提交全部以绑定用户为准。
 	bot.OwnerID = ownerID
-	inboundSessionKey := personalSessionKey(ownerID)
-	if r.teams != nil {
-		if ac, err := r.teams.GetActiveContext(ctx, ownerID); err == nil {
-			inboundSessionKey = ac.SessionKey(ownerID)
-		}
-	}
-	// Persist inbound message for history/audit and as the cross-instance
-	// idempotency backstop. The partial UNIQUE(bot_id, message_id) index
-	// rejects duplicates when the in-memory seen map is cold (restart) or
-	// split across instances. Persistence failure is non-fatal: the message
-	// is still routed so the user is not blocked; the missing audit row is
-	// acceptable, but we log loudly so DB issues surface fast.
-	if _, perr := r.persistInbound(ctx, msg, bot, inboundSessionKey); perr != nil {
-		if errors.Is(perr, domain.ErrDuplicateInboundMessage) {
-			return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
-		}
-		slog.ErrorContext(ctx, "router: persist inbound message failed",
-			"message_id", msg.MessageID,
-			"bot_uuid", msg.BotUUID,
-			"error", perr)
-	}
-	// Unbound bot: with the official iLink QR binding flow, bots are always
-	// created with ilink_user_id set. An unbound bot means it was created
-	// outside the QR flow (legacy path) or the binding was revoked. Either
-	// way, the bot cannot process messages; reject and surface the state.
+	// Step 3: 授权检查(Round8: 全部先于任何持久化——未授权发送者不得写入
+	// 目标租户的 messages/media_assets)。
 	if !bot.IsBound() {
 		reply := "bot not bound; contact admin to rebind via WeChat QR"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	// Bound bot: verify from_user_id matches (spec §6.1 step 2).
 	if bot.IlinkUserID != msg.IlinkUserID {
 		reply := "identity mismatch"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply}, nil
+	}
+	status, err := r.store.GetUserStatus(ctx, bot.OwnerID)
+	if err != nil {
+		return RouterResult{}, fmt.Errorf("user status: %w", err)
+	}
+	if status != domain.UserApproved {
+		reply := fmt.Sprintf("user is %s, cannot process messages", status)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	// canonical 绑定写入(方案 §5.1): 身份校验通过后幂等建立渠道账号 →
 	// canonical user 绑定, 保证跨渠道同一用户落在同一工作区。绑定失败
@@ -272,18 +329,50 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 				"ilink_user_id", msg.IlinkUserID, "canonical_user_id", ownerID, "error", bindErr)
 		}
 	}
-	// Step 3: check user status.
-	status, err := r.store.GetUserStatus(ctx, bot.OwnerID)
-	if err != nil {
-		return RouterResult{}, fmt.Errorf("user status: %w", err)
-	}
-	if status != domain.UserApproved {
-		reply := fmt.Sprintf("user is %s, cannot process messages", status)
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	// Round8: media_paths 必须位于 BotMediaRoot 内(Poller 可被攻破时防止
+	// 读取 Platform 容器任意文件); 非法路径 fail-closed 拒绝整条消息。
+	if err := validateMediaPaths(r.botMediaRoot, msg.MediaPaths); err != nil {
+		slog.ErrorContext(ctx, "router: rejected message with out-of-root media path",
+			"bot_uuid", msg.BotUUID, "message_id", msg.MessageID, "error", err)
+		reply := "invalid media path"
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	// Steps 4-7: parse command and route.
-	return r.routeBoundMessage(ctx, msg, bot)
+	// Step 4: 路由(命令/中继/任务提交)。失败返回 error 且不标记幂等,
+	// Poller 按 webhook 契约重试; 成功路径才继续持久化。
+	result, err := r.routeBoundMessage(ctx, msg, bot)
+	if err != nil {
+		return RouterResult{}, err
+	}
+	// Step 5: 成功路由后持久化入站消息(Round8: 任务已提交, 消息入库失败
+	// 非致命——用户不被阻断, 审计缺失可接受, 但记日志便于 DB 故障暴露)。
+	inboundSessionKey := personalSessionKey(ownerID)
+	if r.teams != nil {
+		if ac, err := r.teams.GetActiveContext(ctx, ownerID); err == nil {
+			inboundSessionKey = ac.SessionKey(ownerID)
+		}
+	}
+	if _, perr := r.persistInbound(ctx, msg, bot, inboundSessionKey); perr != nil {
+		if errors.Is(perr, domain.ErrDuplicateInboundMessage) {
+			// 消息行已存在(崩溃恢复窗口内任务已提交): 视为已处理, 幂等语义
+			// 由任务唯一键与本次标记共同保证。
+			result = RouterResult{Action: ActionDuplicate, Reply: result.Reply, UserID: result.UserID}
+		} else {
+			slog.ErrorContext(ctx, "router: persist inbound message failed",
+				"message_id", msg.MessageID,
+				"bot_uuid", msg.BotUUID,
+				"error", perr)
+		}
+	}
+	// Step 6: 标记幂等——仅当处理成功(无 error)。
+	// 已知限制(Round8 review): 路由成功与 Mark 之间崩溃(或跨实例并发投递)
+	// 时, relay 转发与团队命令(/accept /remove 等)可能重复执行——任务提交由
+	// DB 唯一键 (source, source_instance_id, message_idempotency_key) 兜底
+	// 不产生重复任务, 但中继/命令无等价兜底; 单实例+无崩溃场景不受影响。
+	if err := r.transport.MarkMessageIdempotency(ctx, msg.BotUUID, msg.MessageID); err != nil {
+		return RouterResult{}, fmt.Errorf("mark idempotency: %w", err)
+	}
+	return result, nil
 }
 
 // routeBoundMessage parses platform-level commands and routes everything else
@@ -374,6 +463,6 @@ func isRestrictedUserCommand(text string) bool {
 
 func (r *router) rejectUnavailableCommand(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
 	reply := "该命令不可用。发送 /help 查看可用命令。"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 	return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 }

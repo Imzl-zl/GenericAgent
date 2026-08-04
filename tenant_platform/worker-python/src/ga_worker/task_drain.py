@@ -31,6 +31,13 @@ HANDLER_WRAP_SLEEP_S = 0.01
 # Empty-text Chunk is used as the heartbeat carrier to avoid a proto change
 # (no protoc on Windows dev). Go scheduler identifies text=="" as heartbeat.
 HEARTBEAT_INTERVAL_S = 30.0
+# 审查 C1/I8: 心跳是**推进信号**而非纯存活信号——drain 空轮询只在自上次
+# 真实 display 事件(last_progress_at)不超过 PROGRESS_WINDOW_S 时发心跳。
+# agent 卡死在 LLM/工具 I/O 时无新事件, 心跳停止, 平台 idle reaper 按
+# last_activity_at 收割(默认 idle 300s > 窗口)。长 LLM 思考由 llm-proxy
+# 响应头超时(默认 120s)兜底: 思考超时必然返回/报错, agent 恢复推进,
+# 不会误收割。
+PROGRESS_WINDOW_S = 150.0
 
 
 def _emit_heartbeat(task: worker_pb2.TaskEnvelope, state: TaskRunState) -> worker_pb2.WorkerEvent:
@@ -71,6 +78,10 @@ def drain_display_queue(
             if should_break:
                 return
             continue
+        # 审查 C1/I8: 取到真实 display 事件 = 任务推进点, 刷新心跳窗口
+        # (覆盖 next/done 两条路径; 不能在 cancel/timeout 分支更新——
+        # 那个分支心跳本就停发, 会让复用 Worker 永远无法发心跳)。
+        state.last_progress_at = time.monotonic()
         if "next" in item:
             should_break = yield from _handle_next_item(adapter, task, state, item)
             if should_break:
@@ -95,10 +106,11 @@ def _handle_empty_poll(
         install_handler_print_counter(state.agent, state.count_fn, adapter._legacy_mods)
     # Heartbeat: keep platform's tasks.last_activity_at fresh while LLM is
     # thinking or files are processing. Skipped when cancel/timeout is pending
-    # (terminal path takes over).
+    # (terminal path takes over). 审查 C1/I8: 仅当 agent 在推进窗口内
+    # (最近有 display 事件)才发心跳——卡死时停发, 让 idle reaper 收割。
     if not (pending.cancel_requested or state.timed_out["v"]):
         now = time.monotonic()
-        if now - state.last_heartbeat_at >= HEARTBEAT_INTERVAL_S:
+        if now - state.last_progress_at <= PROGRESS_WINDOW_S and now - state.last_heartbeat_at >= HEARTBEAT_INTERVAL_S:
             yield _emit_heartbeat(task, state)
         return False  # continue polling
     try:
@@ -127,9 +139,8 @@ def _handle_next_item(
             yield from emit_output_exceeded_terminal(adapter, task, state)
         return True
     state.display_history.append({"text": text, "turn": turn})
-    with adapter._lock:
-        if adapter._session is not None:
-            adapter._session.display_history.append({"text": text, "turn": turn})
+    # round9 审查: 不再双写 session.display_history(从未被消费, 复用 Runner
+    # 时按任务线性泄漏内存); 展示历史只属于当前 TaskRunState。
     yield worker_pb2.WorkerEvent(
         chunk=worker_pb2.Chunk(task_id=task.task_id, text=text, turn=turn)
     )

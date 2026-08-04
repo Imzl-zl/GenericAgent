@@ -115,15 +115,20 @@ workspaces/<hash(workspace_key)>/
     runner-state.json
 ```
 
-Runner 镜像保持 GA 代码只读，Sandbox Manager 将当前工作区的三个确定持久 subpath 挂载到固定位置：
+Runner 镜像保持 GA 代码只读，Sandbox Manager 将当前工作区的持久 subpath 挂载到固定位置：
 
 ```text
-/ga/legacy/memory <- workspaces/<hash(workspace_key)>/memory
-/ga/legacy/temp   <- workspaces/<hash(workspace_key)>/temp
-/ga/runner-state  <- workspaces/<hash(workspace_key)>/state
+/ga/legacy/memory          <- workspaces/<hash(workspace_key)>/memory
+/ga/legacy/temp            <- workspaces/<hash(workspace_key)>/temp
+/ga/runner-state           <- workspaces/<hash(workspace_key)>/state
+/ga/runner-state/committed <- workspaces/<hash(workspace_key)>/state/committed (只读)
+/ga/runner-state/results   <- workspaces/<hash(workspace_key)>/state/results (只读)
+/ga/runner-config          <- workspaces/<hash(workspace_key)>/config/g<generation> (只读)
 ```
 
-另有第四个生命周期 subpath `/ga/runner-config <- workspaces/<hash>/config`（只读），承载短期 mTLS 服务证书、策略清单与 task capability runtime 文件（审查 R5-C6）：内容仅存在于 Runner 容器生命周期内，容器销毁时由 Manager 按 workspace hash（进程内 map 或容器 label）强制清理 config/ 目录，创建失败路径同样清理；残留私钥/token 不随 workspace 卷快照长期保存。
+审查 C3: `state/committed` 与 `state/results` 以只读子挂载遮蔽顶层 rw `state` 挂载——Runner 不得删除/替换已提交快照与结果文件(Platform 写 committed/results 不受影响, 挂载 ro 是容器侧视图)。
+
+另有生命周期 subpath `/ga/runner-config <- workspaces/<hash>/config/g<generation>`（只读），承载短期 mTLS 服务证书、策略清单与 task capability runtime 文件（审查 R5-C6/C1-I6）：config 按 generation 隔离, 内容仅存在于对应 Runner 容器生命周期内，容器销毁时由 Manager 按 workspace hash + generation（进程内 map 或容器 label）清理对应 config/g<gen> 子目录（DestroyRunner 与 EnsureRunner 共享 per-workspace 锁, 旧 generation 清理不得误删新配置），创建失败路径同样清理；残留私钥/token 不随 workspace 卷快照长期保存。
 
 这样原生相对路径继续成立：`./temp` 是当前工作区 cwd，`../memory` 是当前工作区记忆。无需为每个工作区复制 `agentmain.py`、`ga.py`、`assets/` 或整个镜像。根文件系统保持只读；`memory/`、`temp/` 与 `state/` 是当前工作区可读写挂载，其中只有 Worker adapter 使用 `/ga/runner-state` 保存运行态。容器的 mount namespace 不包含全局工作区根或其他工作区 subpath，因此 GA 即使用绝对路径、`..` 或 shell 遍历文件系统，也看不到其他工作区。
 
@@ -133,7 +138,7 @@ Runner 镜像保持 GA 代码只读，Sandbox Manager 将当前工作区的三�
 - Platform 保存入站附件并从当前工作区 `temp/outputs/` 交付生成文件；Runner 对自己的 `memory/`、`temp/` 和 `state/` 直接读写，不发生 Platform -> Manager -> Runner 的文件中转。
 - Manager 只能从已认证的 `workspace_key` 推导 volume subpath；task、渠道消息、SOP 和 Agent 工具调用都不能传入路径、volume 名或挂载选项。
 - 创建前 Manager 预置当前工作区的 `memory/`、`temp/` 与 `state/` 子目录，并设定固定非 root Runner UID/GID 的读写所有权。
-- Manager 必须使用 Docker volume subpath 或等价的预置 scope-specific volume。若不能只挂当前工作区目录则启动失败；严禁挂整个全局工作区卷、任意宿主路径或其他工作区子目录。创建后必须通过 `docker inspect` 校验容器只挂载这三个预期 subpath，且不存在 Docker socket、其他卷或 host bind mount。
+- Manager 必须使用 Docker volume subpath 或等价的预置 scope-specific volume。若不能只挂当前工作区目录则启动失败；严禁挂整个全局工作区卷、任意宿主路径或其他工作区子目录。创建后必须通过 `docker inspect` 校验容器只挂载上述预期 subpath（含 committed/results 只读遮蔽与 config/g<gen> 归属），且不存在 Docker socket、其他卷或 host bind mount。
 - Platform 只交付 `outputs/` 下的最终普通文件。Runner 若以符号链接或临时文件生成结果，必须先在 `outputs/` 内复制为独立普通文件；Platform 不跟随符号链接，并以受限根目录、文件描述符校验、文件类型和大小上限拒绝设备文件、管道、目录、越界路径及交付期间被替换的文件。正常 DOCX、PDF、XLSX 的读取和交付不受影响。
 - Runner 销毁时不删除工作区。成功 task 的 state 不采用“最后一次文件写入即生效”的模型：Platform 在 task 已领取且当前 Runner generation 有效时创建带 task ID、generation 和 checkpoint token 的 state staging 记录；Worker 将裁剪后的 history、working memory 和项目激活态原子写入 `state/staging/<token>.json`，采用临时文件、`fsync` 和 rename，并返回 checksum。
 - `memory/` 与 `temp/` 不进入上述 state 事务，始终保留原生写穿行为；失败、取消和租约丢失 task 留下的文件或记忆修改保留，但其 staging state 永不成为恢复点。

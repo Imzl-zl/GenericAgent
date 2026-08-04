@@ -59,6 +59,16 @@ func (s *Server) handleProviderPath(
 		writeError(w, http.StatusConflict, "MODEL_MISMATCH", "request model does not match capability")
 		return
 	}
+	// round9 审查: 在线 task/lease/成员联查放在全部 provider/请求语义检查
+	// 之后——错误码优先级: 签名/撤销 > 预算 > provider 404/409 > body model
+	// > 在线 REVOKED。已终态/被接管/成员移除的任务在此被拒绝, 不等 token
+	// 自然过期(撤销/接管/成员变更的生效时间收敛到下一次调用)。
+	if err := s.validator.CheckTaskActive(r.Context(), claims); err != nil {
+		slog.WarnContext(r.Context(), "llm-proxy: task no longer active",
+			"code", capabilityErrorCode(err), "jti", jwtClaimsID(extractBearer(r)), "err", err)
+		writeError(w, http.StatusUnauthorized, capabilityErrorCode(err), "capability token rejected")
+		return
+	}
 	target, err := ResolveUpstreamTarget(provider, r.URL)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "UPSTREAM_URL_REJECTED", "upstream URL is not allowed")

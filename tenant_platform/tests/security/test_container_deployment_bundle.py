@@ -127,7 +127,22 @@ def test_compose_starts_six_services_and_only_sandbox_manager_receives_docker_so
         "POSTGRES_PASSWORD": "${POSTGRES_PASSWORD}",
         "POSTGRES_DB": "${POSTGRES_DB}",
     }
-    assert services["web"]["network_mode"] == "service:platform"
+    # round9 审查: web 独立网络命名空间(不再 network_mode: service:platform)——
+    # 旧拓扑让 Nginx 在 runner-control 可达的 Platform 容器内监听 8088, Runner
+    # 可访问完整用户/管理 API; 新拓扑 web 只接入 application 网络, Runner 不可达。
+    web = services["web"]
+    assert "network_mode" not in web
+    assert set(web.get("networks", [])) == {"application"}
+    assert web["ports"] == ["${GA_HTTP_BIND:-127.0.0.1}:${GA_HTTP_PORT:-8088}:8088"]
+    # Platform 不再发布宿主端口; 容器内只有 loopback 8080 与 capability 保护 8082。
+    assert "ports" not in services["platform"]
+    platform_networks = set(services["platform"].get("networks", []))
+    assert "runner-control" in platform_networks
+    # Platform 必须注入稳定 instance ID(round9: task 去重唯一键依赖)。
+    assert services["platform"]["environment"]["GA_PLATFORM_INSTANCE_ID"] == "${GA_PLATFORM_INSTANCE_ID:-platform-1}"
+    # 交付 spool: Platform rw + Poller ro 共享卷。
+    assert any("delivery_spool:/var/lib/ga/delivery-spool" == str(v) for v in services["platform"].get("volumes", []))
+    assert any("delivery_spool:/var/lib/ga/delivery-spool:ro" == str(v) for v in services["bot-poller"].get("volumes", []))
 
     # llm-proxy 仅内部网络, 不映射宿主端口(方案 §7)。
     llm_proxy = services["llm-proxy"]
@@ -145,6 +160,7 @@ def test_application_configuration_uses_named_volumes() -> None:
     assert set(volumes) == {
         "postgres_data", "platform_runtime", "platform_config",
         "session_files", "bot_media", "runner_workspaces",
+        "delivery_spool",
     }
     # runner_workspaces 显式 name: sandbox-manager 需以 daemon 可解析的卷名
     # 做 volume-subpath 挂载(方案 §7); 其余卷保持默认声明。
@@ -157,7 +173,9 @@ def test_application_configuration_uses_named_volumes() -> None:
 
 def test_only_loopback_application_ports_are_published() -> None:
     services = _compose()["services"]
-    assert services["platform"]["ports"] == ["${GA_HTTP_BIND:-127.0.0.1}:${GA_HTTP_PORT:-8088}:8088"]
+    # round9 审查: 宿主 8088 由独立 web 容器发布(nginx), Platform 不再暴露端口。
+    assert services["web"]["ports"] == ["${GA_HTTP_BIND:-127.0.0.1}:${GA_HTTP_PORT:-8088}:8088"]
+    assert "ports" not in services["platform"]
     assert services["postgres"]["ports"] == ["${GA_POSTGRES_BIND:-127.0.0.1}:${GA_POSTGRES_PORT:-55432}:5432"]
     assert "ports" not in services["bot-poller"]
     assert "ports" not in services["llm-proxy"]

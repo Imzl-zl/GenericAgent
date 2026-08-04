@@ -23,44 +23,47 @@ func newTestCache(ttl time.Duration, maxPerShard int) *idempotencyCache {
 	return c
 }
 
-func TestIdempotencyFirstSeenReturnsTrue(t *testing.T) {
+func TestIdempotencyCheckThenMark(t *testing.T) {
 	c := newTestCache(time.Minute, 100)
-	if !c.Record("bot-1", "msg-1") {
-		t.Fatal("first record should return true")
+	if c.Check("bot-1", "msg-1") {
+		t.Fatal("unseen message must not be seen")
 	}
-	if c.Record("bot-1", "msg-1") {
-		t.Fatal("duplicate record should return false")
+	// Check 只读: 不写入。
+	if c.Check("bot-1", "msg-1") {
+		t.Fatal("check must not mark")
 	}
+	c.Mark("bot-1", "msg-1")
+	if !c.Check("bot-1", "msg-1") {
+		t.Fatal("marked message must be seen")
+	}
+	// Mark 幂等。
+	c.Mark("bot-1", "msg-1")
 }
 
 func TestIdempotencyDifferentBotsIndependent(t *testing.T) {
 	c := newTestCache(time.Minute, 100)
-	if !c.Record("bot-1", "msg-1") {
-		t.Fatal("bot-1 msg-1 first")
-	}
-	if !c.Record("bot-2", "msg-1") {
+	c.Mark("bot-1", "msg-1")
+	if c.Check("bot-2", "msg-1") {
 		t.Fatal("bot-2 msg-1 should be independent of bot-1")
 	}
-	// Same message id under different bots must not collide.
-	if c.Record("bot-2", "msg-1") {
-		t.Fatal("bot-2 msg-1 duplicate")
+	c.Mark("bot-2", "msg-1")
+	if !c.Check("bot-2", "msg-1") {
+		t.Fatal("bot-2 msg-1 must be seen after mark")
 	}
 }
 
 func TestIdempotencyTTLExpiryReAdmits(t *testing.T) {
 	c := newTestCache(50*time.Millisecond, 100)
-	if !c.Record("bot-1", "msg-1") {
-		t.Fatal("first")
-	}
-	if c.Record("bot-1", "msg-1") {
-		t.Fatal("duplicate within TTL")
+	c.Mark("bot-1", "msg-1")
+	if !c.Check("bot-1", "msg-1") {
+		t.Fatal("must be seen within TTL")
 	}
 	time.Sleep(60 * time.Millisecond)
 	// After TTL expires the entry is eligible for re-admission. In production
 	// this is rare (iLink doesn't replay 30-min-old messages), but the cache
 	// must not permanently block a key after TTL.
-	if !c.Record("bot-1", "msg-1") {
-		t.Fatal("should re-admit after TTL expiry")
+	if c.Check("bot-1", "msg-1") {
+		t.Fatal("must re-admit after TTL expiry")
 	}
 }
 
@@ -78,12 +81,12 @@ func TestIdempotencyEvictionCapBounded(t *testing.T) {
 	}
 	// Fill the shard to capacity with distinct keys.
 	for i := 0; i < 3; i++ {
-		c.Record("bot-1", "msg-"+strconv.Itoa(i))
+		c.Mark("bot-1", "msg-"+strconv.Itoa(i))
 	}
 	// Next write triggers evictExpired; with all entries live (not expired),
 	// the oldest-expiring one is dropped to make room. The cache must not grow
 	// beyond maxPerShard.
-	c.Record("bot-1", "msg-new")
+	c.Mark("bot-1", "msg-new")
 	s := &c.shards[0]
 	s.mu.Lock()
 	got := len(s.seen)
@@ -102,7 +105,7 @@ func TestIdempotencyConcurrentRecordsAreSafe(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				c.Record("bot-1", "msg-"+strconv.Itoa(n*100+j))
+				c.Mark("bot-1", "msg-"+strconv.Itoa(n*100+j))
 			}
 		}(i)
 	}

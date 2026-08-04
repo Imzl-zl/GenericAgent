@@ -51,6 +51,26 @@ RETURNING id, user_id, bot_id, session_key, direction, COALESCE(message_id, ''),
 	return out, nil
 }
 
+// HasInboundMessage 只读检查 (bot_id, message_id) 是否已成功处理过
+// (round9 审查: 入站消息行在路由成功后写入, 是跨重启/多实例的持久幂等
+// 事实源——内存 seen 缓存变冷时, router 用它短路重复副作用)。
+func (s *Store) HasInboundMessage(ctx context.Context, botID int64, messageID string) (bool, error) {
+	if botID <= 0 || messageID == "" {
+		return false, fmt.Errorf("bot id and message id are required")
+	}
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+SELECT EXISTS (
+    SELECT 1 FROM messages
+    WHERE direction = 'inbound' AND bot_id = $1 AND message_id = $2
+)
+`, botID, messageID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check inbound message: %w", err)
+	}
+	return exists, nil
+}
+
 // InsertOutboundMessage persists a reply sent to WeChat. Outbound messages have
 // no iLink-assigned message_id, so they are exempt from the dedup index.
 func (s *Store) InsertOutboundMessage(ctx context.Context, m domain.Message) (domain.Message, error) {

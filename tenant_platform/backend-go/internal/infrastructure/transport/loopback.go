@@ -11,6 +11,7 @@ type SentMessage struct {
 	BotUUID     string
 	IlinkUserID string
 	Text        string
+	ClientID    string
 }
 
 type SentFile struct {
@@ -18,6 +19,7 @@ type SentFile struct {
 	IlinkUserID string
 	FilePath    string
 	FileName    string
+	ClientID    string
 }
 
 // LoopbackTransport is an in-memory BotTransportAdapter for tests and dev
@@ -44,40 +46,46 @@ func (t *LoopbackTransport) SetSendError(err error) {
 }
 
 // SendMessage records the message in the sent slice. Returns sendErr if set.
-func (t *LoopbackTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, text string) error {
+func (t *LoopbackTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, text, clientID string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.sendErr != nil {
 		return t.sendErr
 	}
-	t.sent = append(t.sent, SentMessage{BotUUID: botUUID, IlinkUserID: ilinkUserID, Text: text})
+	t.sent = append(t.sent, SentMessage{BotUUID: botUUID, IlinkUserID: ilinkUserID, Text: text, ClientID: clientID})
 	return nil
 }
 
-func (t *LoopbackTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath, fileName string) error {
+func (t *LoopbackTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath, fileName, clientID string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.sendErr != nil {
 		return t.sendErr
 	}
-	t.sentFiles = append(t.sentFiles, SentFile{BotUUID: botUUID, IlinkUserID: ilinkUserID, FilePath: filePath, FileName: fileName})
+	t.sentFiles = append(t.sentFiles, SentFile{BotUUID: botUUID, IlinkUserID: ilinkUserID, FilePath: filePath, FileName: fileName, ClientID: clientID})
 	return nil
 }
 
-// RecordMessageIdempotency returns true the first time (botUUID, messageID) is
-// seen; false on subsequent calls with the same pair.
-func (t *LoopbackTransport) RecordMessageIdempotency(_ context.Context, botUUID, messageID string) (bool, error) {
+// CheckMessageIdempotency 只读检查 (botUUID, messageID) 是否已标记(Round8:
+// 处理失败路径不写入, 保证 Poller 重试可重新处理)。
+func (t *LoopbackTransport) CheckMessageIdempotency(_ context.Context, botUUID, messageID string) (bool, error) {
 	if botUUID == "" || messageID == "" {
 		return false, fmt.Errorf("bot uuid and message id are required")
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	key := botUUID + "|" + messageID
-	if t.seen[key] {
-		return false, nil
+	return t.seen[botUUID+"|"+messageID], nil
+}
+
+// MarkMessageIdempotency 标记消息已成功处理(幂等)。
+func (t *LoopbackTransport) MarkMessageIdempotency(_ context.Context, botUUID, messageID string) error {
+	if botUUID == "" || messageID == "" {
+		return fmt.Errorf("bot uuid and message id are required")
 	}
-	t.seen[key] = true
-	return true, nil
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.seen[botUUID+"|"+messageID] = true
+	return nil
 }
 
 // SentMessages returns a copy of all sent messages (test helper).

@@ -66,7 +66,7 @@ func captureTaskDeliverableFiles(ctx context.Context, sf SessionFiles, sessionKe
 		sum := sha256.Sum256(content)
 		files = append(files, domain.DeliveryFile{
 			Marker:    marker,
-			FileName:  ref.OriginalName,
+			FileName:  sanitizeDeliverableDisplayName(ref.OriginalName, relPath),
 			RelPath:   relPath,
 			Digest:    "sha256:" + hex.EncodeToString(sum[:]),
 			SizeBytes: int64(len(content)),

@@ -182,7 +182,7 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
 	}
-	if err := WriteRuntimeConfigAtomic(s.runtimeConfigDir(task.SessionKey), files); err != nil {
+	if err := WriteRuntimeConfigAtomic(s.runtimeConfigDir(task.SessionKey, generation), files); err != nil {
 		s.revokeCredentialSetBestEffort(ctx, set)
 		return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("write token-only runtime config: %w", err)
 	}
@@ -210,7 +210,7 @@ func (s *scheduler) refreshWorkerCredentials(ctx context.Context, entry *workerE
 		if generation == 0 {
 			return errors.New("credential generation overflow")
 		}
-		configPath := filepath.Join(s.runtimeConfigDir(entry.sessionKey), runtimeConfigFilename)
+		configPath := filepath.Join(s.runtimeConfigDir(entry.sessionKey, entry.runnerGeneration), runtimeConfigFilename)
 		previousJSON, err := os.ReadFile(configPath)
 		if err != nil {
 			return fmt.Errorf("read previous runtime config: %w", err)
@@ -232,7 +232,7 @@ func (s *scheduler) refreshWorkerCredentials(ctx context.Context, entry *workerE
 			Previous: entry.credentials, Next: newSet, PreviousJSON: previousJSON,
 			TaskID: entry.taskID,
 		}
-		if err := WriteRuntimeConfigAtomic(s.runtimeConfigDir(entry.sessionKey), files); err != nil {
+		if err := WriteRuntimeConfigAtomic(s.runtimeConfigDir(entry.sessionKey, entry.runnerGeneration), files); err != nil {
 			entry.pendingRefresh.RollbackCause = fmt.Errorf("write refreshed runtime config: %w", err)
 			return s.rollbackPendingCredentialRefresh(ctx, entry)
 		}
@@ -281,7 +281,7 @@ func isDefinitiveReloadRejection(err error) bool {
 
 func (s *scheduler) rollbackPendingCredentialRefresh(ctx context.Context, entry *workerEntry) error {
 	pending := entry.pendingRefresh
-	configPath := filepath.Join(s.runtimeConfigDir(entry.sessionKey), runtimeConfigFilename)
+	configPath := filepath.Join(s.runtimeConfigDir(entry.sessionKey, entry.runnerGeneration), runtimeConfigFilename)
 	restoreErr := writeFileAtomic(configPath, pending.PreviousJSON, 0o640)
 	revokeErr := s.revokeCredentialSet(ctx, pending.Next)
 	cause := pending.RollbackCause

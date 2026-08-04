@@ -86,7 +86,7 @@ func buildSessionFiles(boot application.DevBootstrapConfig, managerClient sandbo
 		if strings.TrimSpace(boot.RuntimeRoot) == "" {
 			return nil, nil
 		}
-		sf, err := application.NewSessionFiles(boot.RuntimeRoot)
+		sf, err := application.NewSessionFiles(boot.RuntimeRoot, "")
 		if err != nil {
 			return nil, fmt.Errorf("session files: %w", err)
 		}
@@ -98,7 +98,7 @@ func buildSessionFiles(boot application.DevBootstrapConfig, managerClient sandbo
 			return managerClient.EnsureWorkspace(context.Background(), sessionKey)
 		}
 	}
-	sf, err := application.NewWorkspaceSessionFiles(boot.WorkspacesRoot, ensureWorkspace)
+	sf, err := application.NewWorkspaceSessionFiles(boot.WorkspacesRoot, strings.TrimSpace(os.Getenv("GA_BOT_MEDIA_ROOT")), ensureWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("workspace session files: %w", err)
 	}
@@ -178,7 +178,7 @@ func buildWorkerRuntime(
 // 目标, 审查 C4): 生产 Runner 模式写 workspace 共享卷 config/ 子目录
 // (Runner 以 /ga/runner-config 只读挂载, 与 Manager writeConfigFiles 布局
 // 一致); loopback/dev 模式返回 nil 让 scheduler 回退 Platform 本地 ConfigRoot。
-func runtimeConfigDirFor(boot application.DevBootstrapConfig) func(sessionKey string) string {
+func runtimeConfigDirFor(boot application.DevBootstrapConfig) func(sessionKey string, generation uint64) string {
 	mode := strings.TrimSpace(os.Getenv("GA_WORKER_EXECUTION_MODE"))
 	if mode == "" {
 		mode = "user_workspace_runner"
@@ -189,7 +189,7 @@ func runtimeConfigDirFor(boot application.DevBootstrapConfig) func(sessionKey st
 	if strings.TrimSpace(boot.WorkspacesRoot) == "" {
 		return nil
 	}
-	return func(sessionKey string) string {
+	return func(sessionKey string, generation uint64) string {
 		hash, err := sandbox.WorkspaceDirHash(sessionKey)
 		if err != nil {
 			// key 来自 DB（personal:<uid>/team:<uuid>），正常不会失败；
@@ -197,7 +197,9 @@ func runtimeConfigDirFor(boot application.DevBootstrapConfig) func(sessionKey st
 			slog.Error("runtime config dir: invalid workspace key", "session_key", sessionKey, "error", err)
 			return ""
 		}
-		return filepath.Join(boot.WorkspacesRoot, hash, "config")
+		// 审查 C1/I6: config 按 generation 隔离为 config/g<gen>——与容器实际
+		// 挂载的子目录一致, 否则 Runner 读不到刷新后的 token。
+		return filepath.Join(boot.WorkspacesRoot, hash, "config", fmt.Sprintf("g%d", generation))
 	}
 }
 
@@ -306,6 +308,8 @@ type llmProxyConfig struct {
 	providerSource       llmproxy.ProviderSource
 	cipher               llmproxy.TokenCipher
 	revocations          llmproxy.CapabilityRevocationSource
+	taskChecker          llmproxy.TaskCapabilityChecker // round9: 在线 task/lease/成员校验
+	usageCounter         llmproxy.CapabilityUsageCounter // round9: 内嵌 proxy 也强制预算计量
 	allowedUpstreamCIDRs []string
 	allowedHTTPHosts     []string
 }
@@ -337,6 +341,10 @@ func startLLMProxy(ctx context.Context, cfg llmProxyConfig) (string, func(), err
 		ProviderSource:       cfg.providerSource,
 		Cipher:               cfg.cipher,
 		Revocations:          cfg.revocations,
+		TaskChecker:          cfg.taskChecker,
+		// round9 审查: 内嵌 proxy 与独立 llm-proxy 进程一致, 强制按 JTI 预算
+		// 计量(缺失时 consumeBudget 直接 503, 不会无界转发)。
+		UsageCounter:         cfg.usageCounter,
 		AllowedUpstreamCIDRs: cfg.allowedUpstreamCIDRs,
 		AllowedHTTPHosts:     cfg.allowedHTTPHosts,
 	}
@@ -454,6 +462,7 @@ func run() error {
 		ilinkClientVersion    = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
 		botPollerURL          = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
 		botPollerAPISecret    = flag.String("bot-poller-api-secret", os.Getenv("BOT_POLLER_API_SECRET"), "HMAC-SHA256 secret for authenticating requests to Bot Poller /start /send /stop (or BOT_POLLER_API_SECRET); empty = unauthenticated (INSECURE - dev/test only)")
+		botMediaRoot         = flag.String("bot-media-root", os.Getenv("GA_BOT_MEDIA_ROOT"), "Bot Poller media root directory (or GA_BOT_MEDIA_ROOT); inbound media_paths are rejected unless they resolve inside this root; empty = no check (loopback/dev)")
 		platformWebhookURL    = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
 		webhookSecret         = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
 		maxRunningTasks       = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test). Independent of Runner capacity GA_RUNNER_MAX_ACTIVE: task concurrency is a scheduler gate, Runner capacity is enforced in the lease transaction.")
@@ -477,10 +486,18 @@ func run() error {
 		return fmt.Errorf("resolve --policy-file: %w", err)
 	}
 
-	// Generate platform instance id exactly once before opening PostgreSQL.
-	instanceID, err := application.NewPlatformInstanceID()
-	if err != nil {
-		return fmt.Errorf("platform instance id: %w", err)
+	// 生成 platform instance id: 部署可经 GA_PLATFORM_INSTANCE_ID 固定
+	// (round9 审查: task 去重唯一键 (source, source_instance_id, message_id)
+	// 依赖该值——每次重启随机生成会让重启后 Poller 重试的同一消息撞不到
+	// 唯一键, 产生重复任务; 单实例部署应固定为稳定值, 多实例部署每个
+	// 实例必须配不同值)。缺省随机生成。
+	envInstanceID := strings.TrimSpace(os.Getenv("GA_PLATFORM_INSTANCE_ID"))
+	instanceID := envInstanceID
+	if instanceID == "" {
+		instanceID, err = application.NewPlatformInstanceID()
+		if err != nil {
+			return fmt.Errorf("platform instance id: %w", err)
+		}
 	}
 	if instanceID == "" {
 		return fmt.Errorf("platform instance id generation returned empty id")
@@ -675,6 +692,8 @@ func run() error {
 		providerSource:       store,
 		cipher:               cipher,
 		revocations:          store,
+		taskChecker:          store, // round9 审查: 在线 task/lease/成员校验
+		usageCounter:         store, // round9 审查: 内嵌 proxy 预算计量(与独立进程一致)
 		allowedUpstreamCIDRs: llmproxy.ParseNetworkPolicyList(os.Getenv("LLM_PROXY_ALLOWED_UPSTREAM_CIDRS")),
 		allowedHTTPHosts:     llmproxy.ParseNetworkPolicyList(os.Getenv("LLM_PROXY_ALLOW_HTTP_HOSTS")),
 	})
@@ -888,6 +907,7 @@ func run() error {
 		Teams:           teamSvc,  // P1 team lifecycle (migration 0016)
 		Relay:           relaySvc, // P1 @username relay (migration 0017)
 		ChannelBindings: store,    // channel_bindings canonical identity (migration 0037)
+		BotMediaRoot:    *botMediaRoot,
 	})
 	if err != nil {
 		return err
@@ -910,6 +930,8 @@ func run() error {
 			if err != nil {
 				return llmproxy.CapabilityClaims{}, err
 			}
+			// round9 审查: sophub 调用同样在线联查 task/lease/成员状态。
+			sv.WithTaskChecker(store)
 			return sv.Validate(ctx, token)
 		},
 		SophubUsageCounter: store, // 审查 F10: sophub 调用按 JTI 原子计量

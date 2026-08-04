@@ -19,6 +19,25 @@ from ga_worker.state import TaskRunState
 ERROR_MSG_MAX_LEN = 500
 
 
+def cleanup_legacy_subprocesses(adapter: Any) -> None:
+    """任务终态前清理 legacy code_run 遗留进程组(审查 C2)。
+
+    code_run 以独立进程组运行(ga.py), 正常返回后可能仍有派生的后台子进程
+    (如 nohup ... &)。Runner 按 workspace 复用, 这些进程若跨任务存活可窃取
+    下一任务的 capability 凭据或继续写工作区。经 adapter._legacy_mods 调用
+    ga.kill_all_code_run_processes; 无 ga 模块(测试/无凭据环境)时静默跳过。
+    """
+    mods = getattr(adapter, "_legacy_mods", None) or {}
+    ga_mod = mods.get("ga")
+    if ga_mod is not None:
+        kill_all = getattr(ga_mod, "kill_all_code_run_processes", None)
+        if callable(kill_all):
+            try:
+                kill_all()
+            except Exception:
+                pass  # 清理是 best-effort, 不得阻断终态产出
+
+
 def map_exception_code(exc: BaseException) -> str:
     """Map a Python exception to a structured terminal error code.
 
@@ -69,6 +88,7 @@ def emit_error_terminal(
         user_message=message[:ERROR_MSG_MAX_LEN],
         error_code=code, result_body=state.final_body,
     )
+    cleanup_legacy_subprocesses(adapter)
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
     state.terminal_emitted = True
@@ -84,6 +104,7 @@ def emit_output_exceeded_terminal(
         task.task_id, worker_pb2.TASK_FAILED,
         user_message=message[:ERROR_MSG_MAX_LEN], error_code="MAX_OUTPUT_BYTES",
     )
+    cleanup_legacy_subprocesses(adapter)
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
     state.terminal_emitted = True
@@ -101,6 +122,7 @@ def emit_cancel_or_timeout_terminal(
         user_message=message[:ERROR_MSG_MAX_LEN],
         error_code=code,
     )
+    cleanup_legacy_subprocesses(adapter)
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
     state.terminal_emitted = True
@@ -128,6 +150,7 @@ def emit_final_terminal(
             task.task_id, worker_pb2.TASK_SUCCEEDED,
             user_message=state.final_body, result_body=state.final_body,
         )
+    cleanup_legacy_subprocesses(adapter)
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
     state.terminal_emitted = True
@@ -149,6 +172,7 @@ def emit_missing_terminal_if_needed(
             task.task_id, worker_pb2.TASK_FAILED,
             user_message=message[:ERROR_MSG_MAX_LEN], error_code="MISSING_TERMINAL",
         )
+    cleanup_legacy_subprocesses(adapter)
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
     state.terminal_emitted = True
@@ -163,6 +187,9 @@ def emit_exception_terminal(
         task.task_id, worker_pb2.TASK_FAILED,
         user_message=message[:ERROR_MSG_MAX_LEN], error_code=code,
     )
+    # 审查 C1/I8: agent 未捕获异常崩溃的终态路径同样必须清理 code_run
+    # 残留进程组——这是最可能遗留后台进程的路径(agent 中断时任务未正常收尾)。
+    cleanup_legacy_subprocesses(adapter)
     agent = state.agent if state is not None else None
     try:
         if agent is not None:

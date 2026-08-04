@@ -21,7 +21,10 @@ import (
 type Instance struct {
 	Client  workerclient.WorkerClient
 	InstID  string
-	Cleanup func()
+	// Cleanup 接受 capabilityJTI(审查 C1/I7): Sandbox 路径把 JTI 传给
+	// Shutdown 控制 RPC, 生产会话(有活跃 JTI 集)下空 JTI 会被 Worker 拒绝。
+	// Loopback/Static 忽略参数。
+	Cleanup func(capabilityJTI string)
 	// RunnerGeneration 是 Runner lease generation(方案 §7 fencing)。
 	// loopback 路径恒为 1; Sandbox 路径来自持久 lease。
 	RunnerGeneration uint64
@@ -139,7 +142,7 @@ func (r *LoopbackWorkerRuntime) Start(ctx context.Context, req StartRequest) (*I
 		return nil, err
 	}
 	instID := "loopback-" + listenAddr
-	cleanup := func() {
+	cleanup := func(_ string) {
 		processCleaner{
 			client:          client,
 			closeConn:       conn.Close,
@@ -158,13 +161,14 @@ func (r *LoopbackWorkerRuntime) Start(ctx context.Context, req StartRequest) (*I
 // StaticRuntime returns a fixed Worker client for unit tests. It is NOT a
 // production runtime.
 type StaticRuntime struct {
-	dial func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(), error)
+	dial func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(string), error)
 }
 
 // NewStaticRuntime builds a runtime that always returns the supplied client.
-// The dial function matches the legacy SchedulerConfig.DialWorker signature so
-// existing tests can migrate without change.
-func NewStaticRuntime(dial func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(), error)) *StaticRuntime {
+// The dial function matches the SchedulerConfig.DialWorker signature so
+// existing tests can migrate without change (审查 C1/I7: cleanup 接受 JTI
+// 参数, legacy 路径忽略)。
+func NewStaticRuntime(dial func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(string), error)) *StaticRuntime {
 	return &StaticRuntime{dial: dial}
 }
 
@@ -173,7 +177,9 @@ func (s *StaticRuntime) Start(ctx context.Context, req StartRequest) (*Instance,
 	if err != nil {
 		return nil, err
 	}
-	return &Instance{Client: client, InstID: "static-test-worker", Cleanup: cleanup, RunnerGeneration: 1}, nil
+	return &Instance{Client: client, InstID: "static-test-worker",
+		// 审查 C1/I7: 将存量 cleanup 包装为接受 JTI 的形式(忽略参数)。
+		Cleanup: func(_ string) { cleanup("") }, RunnerGeneration: 1}, nil
 }
 
 // ResolveGeneration returns 1: static runtime has no persistent lease.

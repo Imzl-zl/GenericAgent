@@ -42,7 +42,7 @@ func TestILinkAdapterSendMessage(t *testing.T) {
 		_, _ = w.Write([]byte(`{"sent":true}`))
 	})
 
-	err := adapter.SendMessage(context.Background(), "bot-1", "user-1", "hello")
+	err := adapter.SendMessage(context.Background(), "bot-1", "user-1", "hello", "ga-test-id")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestILinkAdapterSendMessagePollerFailure(t *testing.T) {
 		_, _ = w.Write([]byte("poller downstream error"))
 	})
 
-	err := adapter.SendMessage(context.Background(), "bot-1", "user-1", "hello")
+	err := adapter.SendMessage(context.Background(), "bot-1", "user-1", "hello", "ga-test-id")
 	if err == nil {
 		t.Fatal("expected error on poller failure")
 	}
@@ -80,39 +80,57 @@ func TestILinkAdapterSendMessageRejectsEmpty(t *testing.T) {
 		{"bot-1", "user-1", ""},
 	}
 	for _, c := range cases {
-		if err := adapter.SendMessage(context.Background(), c.botUUID, c.ilinkUserID, c.text); err == nil {
+		if err := adapter.SendMessage(context.Background(), c.botUUID, c.ilinkUserID, c.text, ""); err == nil {
 			t.Fatalf("expected error for %+v", c)
 		}
 	}
 }
 
-func TestILinkAdapterRecordIdempotency(t *testing.T) {
+func TestILinkAdapterIdempotencyCheckMark(t *testing.T) {
 	adapter, _ := newPollerAdapter(t, func(w http.ResponseWriter, _ *http.Request) {})
 
 	ctx := context.Background()
-	first, err := adapter.RecordMessageIdempotency(ctx, "bot-1", "msg-1")
-	if err != nil || !first {
-		t.Fatalf("first: first=%v err=%v", first, err)
+	// Check 只读: 未处理过时 false, 且不写入。
+	seen, err := adapter.CheckMessageIdempotency(ctx, "bot-1", "msg-1")
+	if err != nil || seen {
+		t.Fatalf("unseen message: seen=%v err=%v", seen, err)
 	}
-	second, err := adapter.RecordMessageIdempotency(ctx, "bot-1", "msg-1")
-	if err != nil || second {
-		t.Fatalf("second: first=%v err=%v", second, err)
+	seen2, err := adapter.CheckMessageIdempotency(ctx, "bot-1", "msg-1")
+	if err != nil || seen2 {
+		t.Fatalf("check must not mark: seen=%v err=%v", seen2, err)
 	}
-	// Different message under same bot → first.
-	third, err := adapter.RecordMessageIdempotency(ctx, "bot-1", "msg-2")
-	if err != nil || !third {
-		t.Fatalf("third: first=%v err=%v", third, err)
+	// Mark 后 Check 命中; 不同消息仍未处理。
+	if err := adapter.MarkMessageIdempotency(ctx, "bot-1", "msg-1"); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	seen3, err := adapter.CheckMessageIdempotency(ctx, "bot-1", "msg-1")
+	if err != nil || !seen3 {
+		t.Fatalf("marked message must be seen: seen=%v err=%v", seen3, err)
+	}
+	seen4, err := adapter.CheckMessageIdempotency(ctx, "bot-1", "msg-2")
+	if err != nil || seen4 {
+		t.Fatalf("different message must be unseen: seen=%v err=%v", seen4, err)
+	}
+	// Mark 幂等。
+	if err := adapter.MarkMessageIdempotency(ctx, "bot-1", "msg-1"); err != nil {
+		t.Fatalf("mark again: %v", err)
 	}
 }
 
 func TestILinkAdapterIdempotencyRejectsEmpty(t *testing.T) {
 	adapter, _ := newPollerAdapter(t, func(w http.ResponseWriter, _ *http.Request) {})
 
-	if _, err := adapter.RecordMessageIdempotency(context.Background(), "", "msg-1"); err == nil {
+	if _, err := adapter.CheckMessageIdempotency(context.Background(), "", "msg-1"); err == nil {
 		t.Fatal("expected error for empty bot uuid")
 	}
-	if _, err := adapter.RecordMessageIdempotency(context.Background(), "bot-1", ""); err == nil {
+	if _, err := adapter.CheckMessageIdempotency(context.Background(), "bot-1", ""); err == nil {
 		t.Fatal("expected error for empty message id")
+	}
+	if err := adapter.MarkMessageIdempotency(context.Background(), "", "msg-1"); err == nil {
+		t.Fatal("expected error for empty bot uuid on mark")
+	}
+	if err := adapter.MarkMessageIdempotency(context.Background(), "bot-1", ""); err == nil {
+		t.Fatal("expected error for empty message id on mark")
 	}
 }
 

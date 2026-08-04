@@ -14,7 +14,7 @@ import (
 // 与内容; 无标记时返回 nil 不阻断。
 func TestCaptureTaskDeliverableFilesSnapshotsMarkers(t *testing.T) {
 	root := t.TempDir()
-	files, err := NewSessionFiles(root)
+	files, err := NewSessionFiles(root, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestCaptureTaskDeliverableFilesSnapshotsMarkers(t *testing.T) {
 // marker 文件缺失/非 outputs/超限时返回错误, 成功事务不得提交。
 func TestCaptureTaskDeliverableFilesFailClosed(t *testing.T) {
 	root := t.TempDir()
-	files, err := NewSessionFiles(root)
+	files, err := NewSessionFiles(root, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestCaptureTaskDeliverableFilesFailClosed(t *testing.T) {
 // 总字节上限——大量小文件可累计数十 GB 内存/事务压力。
 func TestCaptureTaskDeliverableFilesRejectsAggregateOverflow(t *testing.T) {
 	root := t.TempDir()
-	files, err := NewSessionFiles(root)
+	files, err := NewSessionFiles(root, "")
 	if err != nil {
 		t.Fatal(err)
 	}

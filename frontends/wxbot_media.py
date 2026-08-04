@@ -21,12 +21,15 @@ MAX_MEDIA_BYTES = 100 * 1024 * 1024
 _DL_CHUNK = 64 * 1024
 
 
-def download_media(items, dest_dir=None):
+def download_media(items, dest_dir=None, with_names=False):
     """Download & decrypt all media items from an inbound message.
 
     Args:
         items: the item_list from an iLink message.
         dest_dir: where to write decrypted files. Defaults to ../temp.
+        with_names: True 时返回 [(path, original_file_name), ...] 元组列表——
+            落盘名含内容 hash 前缀, Poller 需要原始 file_name 做用户可见名
+            (Round8 审查: 不按位置索引 item_list, 下载失败的项会使索引错位)。
 
     Returns:
         List of local file paths for successfully decrypted media.
@@ -42,7 +45,10 @@ def download_media(items, dest_dir=None):
                 continue
             path = _decrypt_one(sub, ext, dest_dir)
             if path:
-                paths.append(path)
+                if with_names:
+                    paths.append((path, sub.get('file_name') or os.path.basename(path)))
+                else:
+                    paths.append(path)
             break  # one media per item
     return paths
 
@@ -112,7 +118,12 @@ def _decrypt_one(sub, ext, dest_dir):
             return None
 
         fname = _safe_filename(sub.get('file_name'), ext)
-        p = os.path.join(dest_dir, fname)
+        # Round8 审查: 落盘名加内容 hash 前缀——同一批次/coalescing 窗口内
+        # 两个同名不同内容文件不再互相覆盖; 同内容重试下载得到相同文件名
+        # (os.replace 原子覆盖), 不产生重复残留。用户可见名由 Poller 从
+        # 原始 file_name 恢复(media_items), 不受前缀影响。
+        digest = hashlib.md5(pt).hexdigest()[:10]
+        p = os.path.join(dest_dir, f'{digest}_{fname}')
         # Atomic write: never leave a half-written file for the worker to read.
         tmp = p + f'.{uuid.uuid4().hex[:8]}.tmp'
         try:

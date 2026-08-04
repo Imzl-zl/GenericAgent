@@ -221,16 +221,35 @@ func copyTree(src, dst string, uid, gid, shareGID int) error {
 }
 
 // writeConfigFiles atomically writes the control-plane files (mTLS material,
-// policy manifest) into workspaces/<hash>/config/. File names are restricted
-// to plain base names so nothing can escape the config directory.
-func writeConfigFiles(root, workspaceHash string, files map[string][]byte, uid, gid, shareGID int) error {
+// policy manifest) into workspaces/<hash>/config/g<generation>/. File names are
+// restricted to plain base names so nothing can escape the config directory.
+// 审查 C1/I6: config 按 generation 隔离——旧 generation 容器销毁后的清理
+// 只删自己的子目录, 不得影响已创建的新 generation 配置(否则新 Runner
+// 丢失 mTLS 材料或挂载已 unlink 目录)。
+func writeConfigFiles(root, workspaceHash string, generation uint64, files map[string][]byte, uid, gid, shareGID int) error {
 	if len(files) == 0 {
 		return nil
+	}
+	if generation == 0 {
+		return fmt.Errorf("config generation must be positive")
 	}
 	if shareGID <= 0 {
 		shareGID = gid
 	}
-	dir := filepath.Join(root, workspaceHash, "config")
+	dir := filepath.Join(root, workspaceHash, "config", fmt.Sprintf("g%d", generation))
+	if err := os.MkdirAll(dir, workspaceDirsMode); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+	// Runner 以只读挂载 config, 但目录执行/读权限必须允许 Runner 读文件:
+	// 属主固定为 Runner uid + 共享组(setgid 继承组)。
+	if os.Geteuid() == 0 {
+		if err := os.Chown(dir, uid, shareGID); err != nil {
+			return fmt.Errorf("chown config dir: %w", err)
+		}
+		if err := os.Chmod(dir, workspaceDirsMode); err != nil {
+			return fmt.Errorf("chmod config dir: %w", err)
+		}
+	}
 	for name, data := range files {
 		if name == "" || filepath.Base(name) != name || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
 			return fmt.Errorf("unsafe config file name %q", name)

@@ -929,14 +929,22 @@ def _assert_capability_rejections(proxy_base: str, token: str, provider: dict) -
         "messages": [{"role": "user", "content": "direct-proxy"}],
         "stream": False,
     }
+    # round9 审查: 语义变体必须换新 jti——任务终态后原 token 已被撤销表
+    # 拒绝(401 REVOKED 抢先), 换 jti 才能让各语义检查按既定顺序返回
+    # (错误码优先级: 签名/撤销 > 预算 > provider 404/409 > body model > 在线)。
     status, body = _proxy_json(
         proxy_base,
         "/v1/chat/completions",
-        token,
+        _capability_variant(token, jti="model-mismatch-e2e"),
         {**valid_body, "model": "wrong-model"},
     )
     assert (status, body.get("code")) == (409, "MODEL_MISMATCH"), body
-    status, body = _proxy_json(proxy_base, "/v1/messages", token, {"model": model})
+    status, body = _proxy_json(
+        proxy_base,
+        "/v1/messages",
+        _capability_variant(token, jti="type-mismatch-e2e"),
+        {"model": model},
+    )
     assert (status, body.get("code")) == (409, "PROVIDER_TYPE_MISMATCH"), body
     now = int(time.time())
     variants = [
@@ -1061,6 +1069,41 @@ def _configure_oai_providers(base: str, fixture: _Fixture) -> tuple[dict, dict]:
     return primary, secondary
 
 
+def _submit_started(base: str, message_id: str, prompt: str) -> dict:
+    """提交任务并返回响应 body(不等待完成)。"""
+    code, body = _http_json(
+        "POST",
+        f"{base}/v1/sessions/personal:{DEV_USER_ID}/tasks",
+        {
+            "message_id": message_id,
+            "source_instance_id": "ga-contract-e2e",
+            "prompt": prompt,
+            "source": "web",
+            "persona_snapshot": ["You are a concise contract-test agent."],
+            "tool_policy_version": "foundation.no-host-tools.v1",
+        },
+    )
+    assert code == 202, body
+    return body
+
+
+def _wait_runtime_token(
+    config_root: Path, primary: dict, prev_checksum: str, timeout: float = 40.0
+) -> tuple[str, str]:
+    """轮询 runtime JSON 直到出现新的真实 capability token(任务执行期间
+    签发, 尚未终态撤销)。round9 审查: 已终态任务的 token 会被在线校验与
+    撤销表拒绝, capability 语义变体测试必须在任务活跃窗口内取样。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        document = _runtime_document(config_root)
+        if document["_platform_runtime"]["config_checksum"] != prev_checksum:
+            runtime_primary = _runtime_provider(document, primary)
+            if runtime_primary["apikey"] not in REAL_KEY_SENTINELS:
+                return runtime_primary["apikey"], runtime_primary["apibase"].removesuffix("/v1")
+        time.sleep(0.2)
+    raise AssertionError("no fresh runtime capability token appeared")
+
+
 def _exercise_initial_oai_binding(
     proc: subprocess.Popen,
     base: str,
@@ -1069,19 +1112,27 @@ def _exercise_initial_oai_binding(
     primary: dict,
     secondary: dict,
 ) -> None:
-    _submit_success(base, "ga-chat-primary", "ga-chat-primary")
+    # round9 审查: capability 语义变体测试(MODEL_MISMATCH/PROVIDER_TYPE_
+    # MISMATCH/stream)必须在任务活跃窗口内取样 token——任务终态后 JTI 被
+    # 撤销且在线校验拒绝, 401 CAPABILITY_REVOKED 会正确抢先于 409/404。
+    # runtime JSON 可能在首个任务前尚未生成: 空 checksum 使任何新签发都匹配。
+    prev_checksum = ""
+    try:
+        prev_doc = _runtime_document(config_root)
+        prev_checksum = prev_doc["_platform_runtime"]["config_checksum"]
+    except AssertionError:
+        pass
+    started = _submit_started(base, "ga-chat-primary", "ga-chat-primary")
+    token, proxy_base = _wait_runtime_token(config_root, primary, prev_checksum)
+    _assert_capability_rejections(proxy_base, token, primary)
+    _assert_stream_first_chunk_unbuffered(proxy_base, token, primary["model"])
+    final = _poll_status(base, started["task_id"], {"succeeded", "failed"}, timeout=150)
+    assert final["status"] == "succeeded", final
     first_request = _captured_request(fixture, "ga-chat-primary", OAI_TOKEN)
     assert first_request["path"] == "/v1/chat/completions"
-    document = _runtime_document(config_root)
-    runtime_primary = _runtime_provider(document, primary)
-    assert runtime_primary["apikey"] not in REAL_KEY_SENTINELS
-    proxy_base = runtime_primary["apibase"].removesuffix("/v1")
-    _assert_capability_rejections(proxy_base, runtime_primary["apikey"], primary)
-    _assert_stream_first_chunk_unbuffered(
-        proxy_base, runtime_primary["apikey"], primary["model"]
-    )
     _assert_worker_process_isolated(proc.pid, config_root, REAL_KEY_SENTINELS)
 
+    document = _runtime_document(config_root)
     checksum = document["_platform_runtime"]["config_checksum"]
     _set_default_provider(base, secondary["provider_id"])
     _submit_success(base, "ga-existing-after-default", "ga-existing-after-default")
@@ -1144,10 +1195,12 @@ def _exercise_responses_and_claude_default(
         session_config={"api_mode": "responses", "stream": True, "max_retries": 0},
     )
     assert responses["revision"] == primary["revision"] + 1
+    # round9 审查: 语义变体换新 jti——任务终态后原 token 已被撤销表拒绝,
+    # 换 jti 才能测到 revision 语义(409 优先于在线校验)。
     status, body = _proxy_json(
         proxy_base,
         "/v1/chat/completions",
-        old_token,
+        _capability_variant(old_token, jti="revision-mismatch-e2e"),
         {
             "model": primary["model"],
             "messages": [{"role": "user", "content": "old-revision"}],
@@ -1241,10 +1294,11 @@ def _exercise_provider_disable(
     disabled = _set_provider_state(base, primary_id, "disabled")
     assert disabled["state"] == "disabled"
     assert disabled["revision"] == current["revision"] + 1
+    # round9 审查: 语义变体换新 jti(同 revision/type 断言, 撤销表不抢先)。
     status, body = _proxy_json(
         proxy_base,
         "/v1/responses",
-        old_token,
+        _capability_variant(old_token, jti="provider-disabled-e2e"),
         {"model": current["model"], "input": "disabled-provider"},
     )
     assert (status, body.get("code")) == (409, "PROVIDER_DISABLED"), body

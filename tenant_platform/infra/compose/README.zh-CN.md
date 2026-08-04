@@ -28,9 +28,17 @@ tenant_platform/infra/compose/
 
 ```bash
 cd tenant_platform/infra/compose
-cp .env.example .env
+cp .env.example .env          # 生产基线模板(fail-closed: digest + runsc)
 chmod 600 .env
 ```
+
+> **本地开发(可信机器)**: 使用 `.env.example.dev` 模板(允许可变 tag 与默认
+> docker 运行时, 两个都是显式信任开关, sandbox-manager 不会静默退化为不安全
+> 配置):
+>
+> ```bash
+> cp .env.example.dev .env
+> ```
 
 编辑 `.env`，只需要处理以下内容：
 
@@ -50,6 +58,18 @@ openssl rand -hex 32  # LLM_PROXY_CAPABILITY_SIGNING_KEY
 4. 将 `BOT_POLLER_API_SECRET` 和 `PLATFORM_WEBHOOK_SECRET` 各填一个值即可，Platform 与 Bot Poller 会自动读取同一个变量。
 5. 替换全部 `CHANGE_ME...`。其余变量保持默认即可。
 
+生产模板额外要求(不可跳过, 缺失即 sandbox-manager 拒绝启动):
+
+- `GA_RUNNER_IMAGE` 必须是 `@sha256:` digest 引用——本地构建镜像后取 digest:
+
+```bash
+# 先按开发模板构建 ga-runner 镜像, 然后:
+docker inspect --format='{{index .RepoDigests 0}}' ga-runner:local
+# 把输出中的 ga-runner@sha256:... 填到 GA_RUNNER_IMAGE
+```
+
+- 主机必须安装并配置 `gVisor/runsc`(`GA_RUNNER_SECURITY_PROFILE=runsc`)。
+
 检查并启动：
 
 ```bash
@@ -63,9 +83,9 @@ docker compose logs --tail=200 sandbox-manager
 `ga-runner` 服务只构建不常驻(`scale: 0`): 容器实例由 Sandbox Manager 按
 工作区活跃状态动态创建, 无需单独执行 `docker compose build ga-runner`。
 
-本地开发默认允许可变 tag(`GA_RUNNER_ALLOW_TAG=1`); 生产部署必须把
-`GA_RUNNER_IMAGE` 固定为 `@sha256:` digest 引用并把 `GA_RUNNER_ALLOW_TAG`
-设为 0, 否则 Sandbox Manager 拒绝启动(固定 profile 校验)。
+生产模板默认 `GA_RUNNER_ALLOW_TAG=0` + `GA_RUNNER_ALLOW_RUNC=0` + `runsc`;
+本地开发模板显式放宽(见上)。任何非 digest 镜像引用或非 runsc 运行时都会让
+Sandbox Manager 拒绝启动(fail-closed, 不会静默降级)。
 
 默认 Web 只监听服务器本机的 `127.0.0.1:8088`。远程浏览器请通过 SSH 隧道或 HTTPS 反向代理访问，不要把 8088、55432 或数据库端口直接暴露到公网。
 

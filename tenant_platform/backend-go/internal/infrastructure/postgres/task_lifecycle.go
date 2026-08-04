@@ -164,6 +164,12 @@ SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE
 		if t.ClaimOwner != platformInstanceID {
 			return fmt.Errorf("task %s claim owner mismatch", taskID)
 		}
+		// round9 审查: 已派发但 claim lease 已过期(进程暂停/心跳丢失后恢复)
+		// 的任务不得继续派发——旧 owner 必须先经 RecoverAfterRestart/新 owner
+		// 接管, 否则可能与接管者重叠执行。
+		if t.ClaimLeaseUntil.IsZero() || !t.ClaimLeaseUntil.After(time.Now().UTC()) {
+			return fmt.Errorf("task %s claim lease expired before dispatch", taskID)
+		}
 		if t.CancelRequestedAt != nil {
 			return fmt.Errorf("task %s cancel already requested before dispatch", taskID)
 		}
@@ -175,6 +181,7 @@ UPDATE tasks SET
   updated_at = timezone('utc', now())
 WHERE id = $1 AND status = 'starting' AND claim_owner = $3
   AND worker_dispatch_started_at IS NULL
+  AND claim_lease_until > timezone('utc', now())
 RETURNING `+taskSelectColumns, taskID, workerInstanceID, platformInstanceID, freshSession)
 		t, err = scanTask(row)
 		if err != nil {
@@ -193,6 +200,9 @@ RETURNING `+taskSelectColumns, taskID, workerInstanceID, platformInstanceID, fre
 // row no longer matches (cancelled, lease lost, or already terminal), the
 // UPDATE returns zero rows; we re-read the current state so callers can
 // distinguish "task was cancelled" from "task not found".
+// round9 审查: lease 已过期/owner 已变/状态异常(非终态、未取消)必须返回
+// 错误——调度器据此中止派发并销毁 Worker, 否则旧 owner 会继续 ExecuteTask
+// 与接管者重叠执行。
 func (s *Store) MarkRunning(ctx context.Context, taskID, platformInstanceID string) (domain.Task, error) {
 	var task domain.Task
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
@@ -201,6 +211,7 @@ UPDATE tasks SET status = 'running', updated_at = timezone('utc', now())
 WHERE id = $1 AND claim_owner = $2 AND status = 'starting'
   AND worker_dispatch_started_at IS NOT NULL
   AND cancel_requested_at IS NULL
+  AND claim_lease_until > timezone('utc', now())
 RETURNING `+taskSelectColumns, taskID, platformInstanceID)
 		t, err := scanTask(row)
 		if err != nil {
@@ -210,10 +221,15 @@ RETURNING `+taskSelectColumns, taskID, platformInstanceID)
 				r2 := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1`, taskID)
 				t2, err2 := scanTask(r2)
 				if err2 != nil {
-					return err
+					return err2
 				}
-				task = t2
-				return nil
+				if t2.Status.IsTerminal() || t2.CancelRequestedAt != nil {
+					// 已终态或已请求取消: 属预期竞争, 返回当前行让调用方决定。
+					task = t2
+					return nil
+				}
+				return fmt.Errorf("task %s no longer dispatchable under %s (status=%s, lease expired or owner changed)",
+					taskID, platformInstanceID, t2.Status)
 			}
 			return err
 		}

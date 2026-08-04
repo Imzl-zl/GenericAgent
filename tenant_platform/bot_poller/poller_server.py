@@ -403,8 +403,12 @@ class BotManager:
         media_items = []
         if entry.media_dir:
             try:
-                media_paths = download_media(msg.get('item_list', []), dest_dir=entry.media_dir)
-                media_items = self._collect_media_items(media_paths)
+                # Round8: with_names 返回 (path, 原始 file_name) 同序对, 避免
+                # 按位置索引 item_list 错位(下载失败的项会使索引偏移)。
+                downloaded = download_media(msg.get('item_list', []), dest_dir=entry.media_dir, with_names=True)
+                media_paths = [p for p, _ in downloaded]
+                media_names = [n for _, n in downloaded]
+                media_items = self._collect_media_items(media_paths, media_names)
             except Exception as exc:
                 print(f'[Poller] media dl err ({entry.bot_uuid}): {exc}', flush=True)
         return {
@@ -419,7 +423,7 @@ class BotManager:
             '_received_at_ms': _message_time_ms(msg, fallback_time_ms),
         }
 
-    def _collect_media_items(self, paths):
+    def _collect_media_items(self, paths, names=None):
         """Build metadata for each downloaded media file.
 
         Returns list of dicts with file_name, storage_path (relative to
@@ -431,12 +435,18 @@ class BotManager:
         if not paths:
             return []
         items = []
-        for path in paths:
+        for idx, path in enumerate(paths):
             try:
                 size = os.path.getsize(path)
             except OSError:
                 size = 0
+            # Round8 审查: 落盘名含内容 hash 前缀(防同名覆盖), 用户可见名
+            # 恢复为发送者原始 file_name。names 由 download_media(with_names)
+            # 与 paths 同序产出, 不得按位置索引原始 item_list(下载失败项
+            # 会使索引错位)。
             file_name = os.path.basename(path)
+            if names is not None and idx < len(names) and names[idx]:
+                file_name = names[idx]
             if self._media_root:
                 rel = os.path.relpath(path, self._media_root)
             else:
@@ -549,7 +559,7 @@ class BotManager:
         entry.thread.join(timeout=5)
         return entry.committed_updates_buf
 
-    def send(self, bot_uuid, ilink_user_id, text, context_token='', msg_type=MSG_TYPE_TEXT, file_path='', file_name=''):
+    def send(self, bot_uuid, ilink_user_id, text, context_token='', msg_type=MSG_TYPE_TEXT, file_path='', file_name='', client_id=''):
         """Dispatch to send_text/send_image/send_video/send_file based on msg_type.
 
         iLink officially supports image/video/file media sends (see spec).
@@ -557,22 +567,24 @@ class BotManager:
         is not a valid msg_type here (inbound voice still downloads fine).
         file_name 是用户可见显示名(审查 R5-I10): 与 file_path 分离, 快照临时
         文件名含 marker hash 前缀, 不得作为显示名暴露给用户。
+        client_id 是 Platform 传入的稳定幂等键(round9 审查: delivery 重试投递
+        同一内容时保持同 id, 供 iLink 服务端去重); 空值回退随机。
         """
         with self._lock:
             entry = self._bots.get(bot_uuid)
         if not entry:
             raise KeyError(f'bot {bot_uuid} not running')
         if msg_type == MSG_TYPE_TEXT or not msg_type:
-            entry.client.send_text(ilink_user_id, text, context_token=context_token)
+            entry.client.send_text(ilink_user_id, text, context_token=context_token, client_id=client_id)
             return
         if not file_path:
             raise ValueError(f'file_path is required for msg_type={msg_type}')
         if msg_type == MSG_TYPE_IMAGE:
-            entry.client.send_image(ilink_user_id, file_path, context_token=context_token)
+            entry.client.send_image(ilink_user_id, file_path, context_token=context_token, client_id=client_id)
         elif msg_type == MSG_TYPE_VIDEO:
-            entry.client.send_video(ilink_user_id, file_path, context_token=context_token)
+            entry.client.send_video(ilink_user_id, file_path, context_token=context_token, client_id=client_id)
         elif msg_type == MSG_TYPE_FILE:
-            entry.client.send_file(ilink_user_id, file_path, context_token=context_token, file_name=file_name)
+            entry.client.send_file(ilink_user_id, file_path, context_token=context_token, file_name=file_name, client_id=client_id)
         else:
             raise ValueError(f'unsupported msg_type: {msg_type}')
 
@@ -664,7 +676,8 @@ class PollerHandler(BaseHTTPRequestHandler):
                 self.manager.send(body['bot_uuid'], body['ilink_user_id'],
                                   body.get('text', ''), body.get('context_token', ''),
                                   msg_type=msg_type, file_path=body.get('file_path', ''),
-                                  file_name=body.get('file_name', ''))
+                                  file_name=body.get('file_name', ''),
+                                  client_id=body.get('client_id', ''))
                 self._reply(200, {'sent': True})
             else:
                 self._reply(404, {'error': 'not found'})

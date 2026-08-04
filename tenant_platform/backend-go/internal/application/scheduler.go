@@ -44,17 +44,20 @@ type SchedulerConfig struct {
 	// SessionScopedConfig writes each session under a SHA-256 directory and
 	// passes only that directory to the Worker runtime.
 	SessionScopedConfig bool
-	// RuntimeConfigDir 返回某 session 的运行时配置目录(credential 刷新写卷
-	// 目标, 审查 C4)。生产 Runner 模式返回 workspace 共享卷的 config/ 目录
-	// (Runner 以 /ga/runner-config 只读挂载); nil 时回退 configDirFor
-	// (Platform 本地 ConfigRoot, loopback/测试)。
-	RuntimeConfigDir func(sessionKey string) string
+	// RuntimeConfigDir 返回某 session 在某 Runner generation 下的运行时配置
+	// 目录(credential 刷新写卷共享 config/g<generation>, 与容器挂载一致,
+	// 审查 C4/C1-I6: config 按 generation 隔离后写入必须落在容器实际挂载
+	// 的 g<gen> 子目录, 否则 Runner 读不到刷新后的 token)。
+	// nil 时回退 configDirFor(Platform 本地 ConfigRoot, loopback/测试)。
+	RuntimeConfigDir func(sessionKey string, generation uint64) string
 	// RuntimeRoot is the parent directory for checkpoint/runtime data.
 	RuntimeRoot string
 	// Optional injected Worker factory for unit tests. Deprecated: prefer
 	// passing a worker.StaticRuntime as Runtime. When set and Runtime is nil,
 	// the scheduler wraps it in a static runtime.
-	DialWorker func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(), error)
+	// DialWorker 兼容 legacy loopback 拨号(审查 C1/I7: cleanup 接受 JTI
+	// 参数; loopback 路径忽略)。
+	DialWorker func(ctx context.Context, sessionKey string) (workerclient.WorkerClient, func(string), error)
 	// LLM Proxy capability issuance. Required for real Worker paths.
 	TokenIssuer               *llmproxy.Issuer
 	CapabilityStore           CapabilityStore
@@ -99,7 +102,10 @@ type SchedulerConfig struct {
 	// alive but deadlocked" (LLM HTTP call hung, GIL deadlock, infinite loop)
 	// — the scenario gRPC stream errors + heartbeat lease loss cannot catch.
 	// Worker keeps last_activity_at fresh via chunk events + drain poll
-	// heartbeats. Zero disables idle reaping (dev/test only).
+	// heartbeats, but heartbeat is a *progress* signal (审查 C1/I8): the drain
+	// loop only emits it while the agent recently produced display events, so
+	// a stalled agent stops refreshing last_activity_at and gets reaped.
+	// Zero disables idle reaping (dev/test only).
 	IdleTimeout time.Duration
 	// WorkerIdleTTL sets how long a Worker process can stay resident after its
 	// session becomes idle (no queued/starting/running task). When > 0, the

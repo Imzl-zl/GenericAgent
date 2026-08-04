@@ -141,6 +141,9 @@ type SendMessageRequest struct {
 	// FileName 是用户可见的文件名(审查 R5-I10): 与 file_path 分离, 快照
 	// 临时文件名不得作为显示名暴露给用户。
 	FileName string `json:"file_name,omitempty"`
+	// ClientID 是稳定幂等键(round9 审查: delivery 重试投递同一内容时保持
+	// 同一 client_id, 供 iLink 服务端去重; 空值由 Poller 回退随机)。
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // SendMessage delivers a text or media reply via the poller (which calls

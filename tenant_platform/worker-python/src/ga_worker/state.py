@@ -69,8 +69,10 @@ class SessionState:
     seed_working: dict[str, Any] = field(default_factory=dict)
     seed_backend_history: list[Any] = field(default_factory=list)
     seed_agent_history: list[Any] = field(default_factory=list)
-    seed_display_history: list[Any] = field(default_factory=list)
-    display_history: list[Any] = field(default_factory=list)
+    # round9 审查: 删除 session 级 display_history/seed_display_history——
+    # 每个 chunk 双写第二份副本且从未被消费, 复用 Runner 时按任务数线性
+    # 泄漏内存。展示历史只保留在 TaskRunState.display_history(任务作用域)
+    # 与 CompletedTask.display_history(checkpoint 快照)。
     generated_output_files: list[str] = field(default_factory=list)
     mcp_snapshot_id: str = "disabled"
     mcp_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -113,6 +115,11 @@ class TaskRunState:
     count_fn: Callable[[str], bool] | None = None
     # monotonic clock of the last heartbeat emission; see task_drain.HEARTBEAT_INTERVAL_S.
     last_heartbeat_at: float = 0.0
+    # monotonic clock of the last real task progress (display item received;
+    # see task_drain.PROGRESS_WINDOW_S). 审查 C1/I8: 心跳只允许在推进窗口
+    # 内发出——agent 卡死(无 display 事件)时停止心跳, 平台 idle reaper
+    # 才能按 last_activity_at 收割死锁任务。
+    last_progress_at: float = 0.0
 
 
 AgentFactory = Callable[[], Any]

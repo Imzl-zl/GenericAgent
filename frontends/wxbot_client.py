@@ -162,9 +162,11 @@ class WxBotClient:
         return resp.get('msgs') or []
 
     # ── send text ──
-    def send_text(self, to_user_id, text, context_token=''):
+    def send_text(self, to_user_id, text, context_token='', client_id=None):
+        # 审查 round9: client_id 由 Platform 传入稳定幂等键(delivery_id:part),
+        # 重试投递同一内容时保持同 id, 供服务端去重; 空值回退随机(兼容旧调用方)。
         msg = {'from_user_id': '', 'to_user_id': to_user_id,
-               'client_id': f'pyclient-{uuid.uuid4().hex[:16]}',
+               'client_id': client_id or f'pyclient-{uuid.uuid4().hex[:16]}',
                'message_type': MSG_BOT, 'message_state': STATE_FINISH,
                'item_list': [{'type': ITEM_TEXT, 'text_item': {'text': text}}]}
         if context_token:
@@ -254,7 +256,7 @@ class WxBotClient:
             return self._upload('', thumb_param, b'', b'\x00' * 16, upload_url=thumb_url)
         return fallback_media
 
-    def _send_media(self, to_user_id, file_path, media_type, item_type, item_key, context_token='', file_name=''):
+    def _send_media(self, to_user_id, file_path, media_type, item_type, item_key, context_token='', file_name='', client_id=None):
         fp = Path(file_path)
         raw = fp.read_bytes()
         aes_key = os.urandom(16)
@@ -276,21 +278,21 @@ class WxBotClient:
         # 本地临时路径 basename 推导(快照文件名含 marker hash 前缀)。
         item = self._make_media_item(item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_ciphertext_size, fp, file_name=file_name)
         msg = {'from_user_id': '', 'to_user_id': to_user_id,
-               'client_id': f'pyclient-{uuid.uuid4().hex[:16]}',
+               'client_id': client_id or f'pyclient-{uuid.uuid4().hex[:16]}',
                'message_type': MSG_BOT, 'message_state': STATE_FINISH,
                'item_list': [{'type': item_type, item_key: item}]}
         if context_token:
             msg['context_token'] = context_token
         return self._post('ilink/bot/sendmessage', {'msg': msg, 'base_info': {'channel_version': VER}})
 
-    def send_file(self, to_user_id, file_path, context_token='', file_name=''):
-        return self._send_media(to_user_id, file_path, 3, ITEM_FILE, 'file_item', context_token, file_name=file_name)
+    def send_file(self, to_user_id, file_path, context_token='', file_name='', client_id=None):
+        return self._send_media(to_user_id, file_path, 3, ITEM_FILE, 'file_item', context_token, file_name=file_name, client_id=client_id)
 
-    def send_image(self, to_user_id, file_path, context_token=''):
-        return self._send_media(to_user_id, file_path, 1, ITEM_IMAGE, 'image_item', context_token)
+    def send_image(self, to_user_id, file_path, context_token='', client_id=None):
+        return self._send_media(to_user_id, file_path, 1, ITEM_IMAGE, 'image_item', context_token, client_id=client_id)
 
-    def send_video(self, to_user_id, file_path, context_token=''):
-        return self._send_media(to_user_id, file_path, 2, ITEM_VIDEO, 'video_item', context_token)
+    def send_video(self, to_user_id, file_path, context_token='', client_id=None):
+        return self._send_media(to_user_id, file_path, 2, ITEM_VIDEO, 'video_item', context_token, client_id=client_id)
 
     @staticmethod
     def extract_text(msg):

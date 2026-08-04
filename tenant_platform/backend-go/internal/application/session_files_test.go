@@ -13,7 +13,7 @@ import (
 func TestWorkspaceSessionFilesFreshWorkspaceImportInbound(t *testing.T) {
 	root := t.TempDir()
 	var ensured []string
-	files, err := NewWorkspaceSessionFiles(root, func(sessionKey string) error {
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
 		ensured = append(ensured, sessionKey)
 		// 模拟 Manager 预置布局: 创建 SandboxRoot 链路。
 		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp",
@@ -51,7 +51,7 @@ func TestWorkspaceSessionFilesFreshWorkspaceImportInbound(t *testing.T) {
 // 附件导入必须显式失败(不允许在未初始化的目录上静默写文件)。
 func TestWorkspaceSessionFilesEnsureFailureFailsImport(t *testing.T) {
 	root := t.TempDir()
-	files, err := NewWorkspaceSessionFiles(root, func(sessionKey string) error {
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
 		return os.ErrPermission
 	})
 	if err != nil {
@@ -71,7 +71,7 @@ func TestWorkspaceSessionFilesEnsureFailureFailsImport(t *testing.T) {
 // RecordOutbound 必须先校验 outputs/ 前缀再查 manifest(审查 R4-I7)。
 func TestRecordOutboundRejectsNonOutputsEvenIfInManifest(t *testing.T) {
 	root := t.TempDir()
-	files, err := NewWorkspaceSessionFiles(root, func(sessionKey string) error {
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
 		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
@@ -107,7 +107,7 @@ func TestRecordOutboundRejectsNonOutputsEvenIfInManifest(t *testing.T) {
 // TestRecordOutboundAcceptsOutputsFile 验证 outputs/ 下文件的正常登记路径。
 func TestRecordOutboundAcceptsOutputsFile(t *testing.T) {
 	root := t.TempDir()
-	files, err := NewWorkspaceSessionFiles(root, func(sessionKey string) error {
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
 		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
@@ -138,7 +138,7 @@ func TestRecordOutboundAcceptsOutputsFile(t *testing.T) {
 // (审查 R4-C4: Runner 可写 temp/ 内的 manifest 不得无界读入 Platform 内存)。
 func TestLoadManifestRejectsOversize(t *testing.T) {
 	root := t.TempDir()
-	files, err := NewWorkspaceSessionFiles(root, func(sessionKey string) error {
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
 		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
@@ -158,5 +158,90 @@ func TestLoadManifestRejectsOversize(t *testing.T) {
 	}
 	if _, err := files.RecordOutbound(sessionKey, "outputs/x"); err == nil {
 		t.Fatal("RecordOutbound must fail when manifest exceeds size limit")
+	}
+}
+
+// TestLoadManifestRejectsUnsafeOriginalName 验证 manifest 条目 OriginalName
+// 含路径分隔符/.. 时(值源于 Runner 可写的 manifest, 审查 C1), 读取/登记必须
+// 失败——该值会流入交付快照文件名与用户可见 displayName。
+func TestLoadManifestRejectsUnsafeOriginalName(t *testing.T) {
+	root := t.TempDir()
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
+		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+	})
+	if err != nil {
+		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
+	}
+	const sessionKey = "personal:7"
+	sandbox := files.SandboxRoot(sessionKey)
+	if err := os.MkdirAll(filepath.Join(sandbox, sessionOutputsDir), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sandbox, sessionOutputsDir, "ok.txt"), []byte("x"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	bad := sessionManifest{NextSeq: 1, Files: []SessionFileRef{{
+		Alias: "F001", OriginalName: "../../../evil.txt",
+		RelativePath: "outputs/ok.txt", Direction: "outbound", CreatedAt: time.Now().UTC(),
+	}}}
+	if err := files.(*sessionFilesManager).saveManifest(sandbox, bad); err != nil {
+		t.Fatalf("save fake manifest: %v", err)
+	}
+	if _, err := files.RecordOutbound(sessionKey, "outputs/ok.txt"); err == nil {
+		t.Fatal("RecordOutbound must reject manifest with path-traversal OriginalName")
+	}
+}
+
+// TestLoadManifestRejectsEscapingRelativePath 验证 manifest 条目 RelativePath
+// 逃逸 outputs/(如 ../../x)时读取/登记必须失败。
+func TestLoadManifestRejectsEscapingRelativePath(t *testing.T) {
+	root := t.TempDir()
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
+		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+	})
+	if err != nil {
+		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
+	}
+	const sessionKey = "personal:8"
+	sandbox := files.SandboxRoot(sessionKey)
+	if err := os.MkdirAll(filepath.Join(sandbox, sessionOutputsDir), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	bad := sessionManifest{NextSeq: 1, Files: []SessionFileRef{{
+		Alias: "F001", OriginalName: "ok.txt",
+		RelativePath: "../../../etc/passwd", Direction: "outbound", CreatedAt: time.Now().UTC(),
+	}}}
+	if err := files.(*sessionFilesManager).saveManifest(sandbox, bad); err != nil {
+		t.Fatalf("save fake manifest: %v", err)
+	}
+	if _, err := files.Recent(sessionKey, 8); err == nil {
+		t.Fatal("Recent must reject manifest with escaping RelativePath")
+	}
+}
+
+// TestLoadManifestRejectsMidPathDotDot 验证 manifest RelativePath 含中段
+// ..(如 outputs/../../x)时拒绝(审查 C1 收紧: Clean 后仍逃出沙箱)。
+func TestLoadManifestRejectsMidPathDotDot(t *testing.T) {
+	root := t.TempDir()
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
+		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+	})
+	if err != nil {
+		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
+	}
+	const sessionKey = "personal:9"
+	sandbox := files.SandboxRoot(sessionKey)
+	if err := os.MkdirAll(filepath.Join(sandbox, sessionOutputsDir), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	bad := sessionManifest{NextSeq: 1, Files: []SessionFileRef{{
+		Alias: "F001", OriginalName: "ok.txt",
+		RelativePath: "outputs/../../etc/passwd", Direction: "outbound", CreatedAt: time.Now().UTC(),
+	}}}
+	if err := files.(*sessionFilesManager).saveManifest(sandbox, bad); err != nil {
+		t.Fatalf("save fake manifest: %v", err)
+	}
+	if _, err := files.Recent(sessionKey, 8); err == nil {
+		t.Fatal("Recent must reject manifest with mid-path .. traversal")
 	}
 }

@@ -316,6 +316,14 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			if !time.Now().Before(taskDeadline) {
 				return s.finalizeTaskDeadline(ctx, task)
 			}
+			// round9 审查: 派发上下文被取消(heartbeat 检测到 lease 丢失/任务被
+			// 恢复流程终态化/scheduler 关闭)时, Worker 可能仍在执行任务——先
+			// 优雅 CancelWorker(cancelOnce 防重复), 再销毁 Worker 防脏复用;
+			// 任务状态由恢复流程/新 owner 管理, 此处不终态化。
+			cancelCtx, cancelRPC := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = s.CancelWorker(cancelCtx, task)
+			cancelRPC()
+			s.evictWorkerAfterFailure(task.SessionKey)
 			return executeCtx.Err()
 		case ev, ok := <-events:
 			if !ok {

@@ -106,7 +106,7 @@ func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain
 	task, err := r.store.FindRunningTaskBySession(ctx, sessionKey)
 	if errors.Is(err, pgx.ErrNoRows) {
 		reply := "no running task to stop"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionNoRunning, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if err != nil {
@@ -114,11 +114,11 @@ func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain
 	}
 	if _, err := r.tasks.CancelTask(ctx, task.ID, bot.OwnerID); err != nil {
 		reply := fmt.Sprintf("cancel failed: %s", err.Error())
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	reply := "task cancelled"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 	return RouterResult{Action: ActionStopped, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
@@ -141,7 +141,7 @@ func (r *router) handleNew(ctx context.Context, msg IncomingMessage, bot domain.
 		return RouterResult{}, fmt.Errorf("reset workspace: %w", err)
 	}
 	reply := "已开启新会话，history 和 working 已清空"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 	return RouterResult{Action: ActionNewSession, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
@@ -161,7 +161,7 @@ func (r *router) handleStatus(ctx context.Context, msg IncomingMessage, bot doma
 	default:
 		reply = "🔴 running — task in progress"
 	}
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 	return RouterResult{Action: ActionStatus, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
@@ -170,7 +170,7 @@ func (r *router) handleStatus(ctx context.Context, msg IncomingMessage, bot doma
 func (r *router) handleHelp(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
 	commands := r.loadCommands(ctx)
 	reply := buildHelpText(commands)
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 	return RouterResult{Action: ActionHelp, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
@@ -207,7 +207,7 @@ func buildHelpText(commands map[string]domain.PlatformCommand) string {
 func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, text string) (RouterResult, error) {
 	if text == "" && len(msg.MediaPaths) == 0 {
 		reply := "empty message ignored"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	prompt := text
@@ -263,9 +263,10 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		ToolPolicyVersion: userPolicy,
 	})
 	if err != nil {
-		reply := fmt.Sprintf("task submission failed: %s", err.Error())
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply)
-		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
+		// Round8 审查: 提交失败必须返回 error(而非 Rejected 200)——Poller 收到
+		// 5xx 后重试, 且幂等标记尚未写入, 重试会真正重新提交; 消息持久化也
+		// 在路由成功之后, 不会撞 DB 唯一键提前返回。
+		return RouterResult{}, fmt.Errorf("submit task: %w", err)
 	}
 	// Normal message acceptance is delivered through the durable task_started
 	// outbox path so users get exactly one acknowledgment instead of a sync

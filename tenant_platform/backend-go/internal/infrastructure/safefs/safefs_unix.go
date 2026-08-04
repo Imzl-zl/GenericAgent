@@ -43,7 +43,10 @@ func OpenBeneath(root, rel string, flags int, perm os.FileMode) (*os.File, error
 			fd, openErr := unix.Openat(dirFD, part, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm))
 			closeDir()
 			if openErr != nil {
-				return nil, fmt.Errorf("open %s under %s: %w", rel, root, openErr)
+				// Round8(发现): 裸 Errno 无法被 errors.Is(err, os.ErrNotExist)
+				// 识别——Linux 上 os.IsNotExist 判定失效(manifest 缺失被当错误)。
+				// 包成 *os.PathError 保持标准库语义。
+				return nil, &os.PathError{Op: "open", Path: filepath.Join(root, filepath.FromSlash(rel)), Err: openErr}
 			}
 			return os.NewFile(uintptr(fd), filepath.Join(root, filepath.FromSlash(rel))), nil
 		}
@@ -225,25 +228,144 @@ func AtomicWriteBeneath(root, rel string, data []byte, perm os.FileMode) error {
 }
 
 // CopyFileBeneath 把 src 复制为 root 下 rel(目标侧不跟随符号链接)。
-func CopyFileBeneath(root, rel, src string, perm os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open source %s: %w", src, err)
-	}
-	defer in.Close()
-	out, err := OpenBeneath(root, rel, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC, perm)
+// Round8 审查: 源侧同样 fail-closed——O_NOFOLLOW 拒绝符号链接源, fstat
+// 校验普通文件(设备/FIFO/socket 拒绝), maxBytes>0 时复制中限长截断
+// (防 Poller 被攻破后读取 Platform 容器任意文件/特殊文件)。
+// round9 审查: 目标侧失败清理不再用 os.Remove(out.Name())——复制期间
+// 目标父目录被替换为 symlink 时, 路径式删除会沿新链接删除其他目录的
+// 同名文件; 改为保留父目录 dirfd 并用 unlinkat 清理。
+func CopyFileBeneath(root, rel, src string, perm os.FileMode, maxBytes int64) error {
+	rel, err := CleanRel(root, rel)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	in, err := unix.Open(src, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open source %s: %w", src, err)
+	}
+	defer unix.Close(in)
+	var st unix.Stat_t
+	if err := unix.Fstat(in, &st); err != nil {
+		return fmt.Errorf("stat source %s: %w", src, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("source %s is not a regular file", src)
+	}
+
+	out, dirFD, cleanup, err := createBeneath(root, rel, perm)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(dirFD)
+	copied, copyErr := copyBounded(out, in, maxBytes)
+	if copyErr != nil {
 		out.Close()
-		return fmt.Errorf("copy to %s: %w", rel, err)
+		cleanup()
+		return copyErr
+	}
+	if maxBytes > 0 && copied > maxBytes {
+		out.Close()
+		cleanup()
+		return fmt.Errorf("%w: source %s exceeded %d bytes during copy", ErrFileTooLarge, src, maxBytes)
 	}
 	if err := out.Sync(); err != nil {
 		out.Close()
 		return fmt.Errorf("sync %s: %w", rel, err)
 	}
 	return out.Close()
+}
+
+// CopyFileFromBeneath 把 srcRoot 下 srcRel 复制为 dstRoot 下 dstRel。
+// round9 审查(媒体路径 TOCTOU): 源侧用 openat2 RESOLVE_BENEATH|
+// RESOLVE_NO_SYMLINKS 在单次内核路径解析中完成"不逃逸根 + 无符号链接"
+// 校验(openSrcBeneath), 与调用方 EvalSymlinks 预检之间不存在检查-使用
+// 窗口; 目标侧同 CopyFileBeneath(dirfd + unlinkat 清理)。
+func CopyFileFromBeneath(srcRoot, srcRel, dstRoot, dstRel string, perm os.FileMode, maxBytes int64) error {
+	in, err := openSrcBeneath(srcRoot, srcRel, unix.O_RDONLY|unix.O_NONBLOCK)
+	if err != nil {
+		return fmt.Errorf("open source %s under %s: %w", srcRel, srcRoot, err)
+	}
+	defer unix.Close(in)
+	var st unix.Stat_t
+	if err := unix.Fstat(in, &st); err != nil {
+		return fmt.Errorf("stat source %s: %w", srcRel, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("source %s is not a regular file", srcRel)
+	}
+
+	out, dirFD, cleanup, err := createBeneath(dstRoot, dstRel, perm)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(dirFD)
+	copied, copyErr := copyBounded(out, in, maxBytes)
+	if copyErr != nil {
+		out.Close()
+		cleanup()
+		return copyErr
+	}
+	if maxBytes > 0 && copied > maxBytes {
+		out.Close()
+		cleanup()
+		return fmt.Errorf("%w: source %s exceeded %d bytes during copy", ErrFileTooLarge, srcRel, maxBytes)
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return fmt.Errorf("sync %s: %w", dstRel, err)
+	}
+	return out.Close()
+}
+
+// createBeneath 在 root 下 rel 创建目标文件: 父目录 dirfd + openat
+// O_NOFOLLOW(中间组件与最终组件均不跟随符号链接)。返回文件、父目录 fd
+// 与 unlinkat 清理函数——失败路径必须用清理函数删除目标, 禁止按路径删除。
+func createBeneath(root, rel string, perm os.FileMode) (*os.File, int, func(), error) {
+	dirRel, base := filepath.Split(rel)
+	dirRel = strings.TrimSuffix(dirRel, string(filepath.Separator))
+	if dirRel == "" {
+		dirRel = "."
+	}
+	dirFD, err := openDirBeneath(root, dirRel)
+	if err != nil {
+		return nil, -1, nil, err
+	}
+	fd, err := unix.Openat(dirFD, base, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm))
+	if err != nil {
+		unix.Close(dirFD)
+		return nil, -1, nil, fmt.Errorf("open target %s under %s: %w", rel, root, err)
+	}
+	out := os.NewFile(uintptr(fd), filepath.Join(root, filepath.FromSlash(rel)))
+	cleanup := func() { _ = unix.Unlinkat(dirFD, base, 0) }
+	return out, dirFD, cleanup, nil
+}
+
+// copyBounded 从 fd 复制到 dst 并返回字节数;maxBytes>0 时超限立即返回
+// ErrFileTooLarge(不读入内存, 不阻塞特殊文件)。
+func copyBounded(dst *os.File, fd int, maxBytes int64) (int64, error) {
+	buf := make([]byte, 64*1024)
+	var total int64
+	for {
+		n, err := unix.Read(fd, buf)
+		if n > 0 {
+			if maxBytes > 0 && total+int64(n) > maxBytes {
+				return total, ErrFileTooLarge
+			}
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+		}
+		if err == unix.EINTR || err == unix.EAGAIN {
+			continue
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, nil
+		}
+	}
 }
 
 func openDirBeneath(root, rel string) (int, error) {

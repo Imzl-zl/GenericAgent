@@ -82,6 +82,14 @@ type CapabilityRevocationSource interface {
 	IsCapabilityRevoked(ctx context.Context, jtiHash [32]byte) (bool, error)
 }
 
+// TaskCapabilityChecker 在调用时刻联查 capability 绑定的 task 是否仍活跃
+// (round9 审查): task 未终态且 claim 未过期 + runner lease generation 仍有效
+// + 团队任务 requester 仍是 approved 成员。llm-proxy/sophub proxy 每次调用
+// 前执行, 把成员移除/接管/恢复的生效时间收敛到下一次调用, 而不是 token TTL。
+type TaskCapabilityChecker interface {
+	IsTaskCapabilityActive(ctx context.Context, taskID string, runnerGeneration uint64) (bool, error)
+}
+
 // CapabilityUsageCounter 按 JTI 原子计量 capability 调用次数(审查 R4-I9):
 // ConsumeCapabilityCall 递增计数, 超过 maxCalls 时返回 (false, nil)。
 // llm-proxy 在转发前调用, 防止 Runner 绕过 Worker 的 RuntimePolicy 直接
@@ -154,6 +162,8 @@ func (i *Issuer) Issue(spec CapabilitySpec) (string, CapabilityClaims, error) {
 type Validator struct {
 	signingKey  []byte
 	revocations CapabilityRevocationSource
+	// taskChecker 非 nil 时(生产), 每次调用在线联查 task/lease/成员状态。
+	taskChecker TaskCapabilityChecker
 	clock       func() time.Time
 }
 
@@ -171,6 +181,13 @@ func NewValidator(signingKey []byte, revocations CapabilityRevocationSource) (*V
 	}, nil
 }
 
+// WithTaskChecker 注入在线 task 活跃性校验(round9 审查: 生产必须配置;
+// 测试/loopback 不配置时保持仅签名+撤销校验)。
+func (v *Validator) WithTaskChecker(checker TaskCapabilityChecker) *Validator {
+	v.taskChecker = checker
+	return v
+}
+
 func (v *Validator) Validate(ctx context.Context, tokenString string) (CapabilityClaims, error) {
 	claims, err := v.validateWithAudience(ctx, tokenString, CapabilityAudience)
 	if err != nil {
@@ -184,7 +201,9 @@ func (v *Validator) Validate(ctx context.Context, tokenString string) (Capabilit
 
 // ValidateTaskScoped 在 Validate 基础上强制 task 绑定(方案 §7): LLM capability
 // 必须绑定 task_id 与 runner_generation, 终态撤销 + 绑定校验后旧 token 无法
-// 被下一条 task 复用。
+// 被下一条 task 复用。round9 审查: 在线 task/lease/成员联查由 handler 在
+// provider 语义检查之后显式调用 CheckTaskActive(错误码优先级: 签名/撤销 >
+// provider 404/409 > 在线 REVOKED)。
 func (v *Validator) ValidateTaskScoped(ctx context.Context, tokenString string) (CapabilityClaims, error) {
 	claims, err := v.validateWithAudience(ctx, tokenString, CapabilityAudience)
 	if err != nil {
@@ -202,6 +221,24 @@ func (v *Validator) ValidateTaskScoped(ctx context.Context, tokenString string) 
 	return claims, nil
 }
 
+// CheckTaskActive 在线联查 capability 绑定的 task 是否仍活跃(round9 审查):
+// 成员移除/接管/恢复的生效时间收敛到下一次调用。未配置 taskChecker(测试/
+// 显式降级)时跳过。
+func (v *Validator) CheckTaskActive(ctx context.Context, claims CapabilityClaims) error {
+	if v.taskChecker == nil {
+		return nil
+	}
+	active, err := v.taskChecker.IsTaskCapabilityActive(ctx, claims.TaskID, claims.RunnerGeneration)
+	if err != nil {
+		return fmt.Errorf("check task capability active: %w", err)
+	}
+	if !active {
+		return fmt.Errorf("%w: task %s no longer active at generation %d",
+			ErrCapabilityRevoked, claims.TaskID, claims.RunnerGeneration)
+	}
+	return nil
+}
+
 // SophubValidator 校验 Runner → Platform Sophub proxy 的 capability
 // (audience=ga-sophub-proxy, 方案 §5.2): 不要求 provider 字段, 但要求
 // session subject + jti 未撤销 + task_id/runner_generation 绑定(审查 I9:
@@ -209,6 +246,7 @@ func (v *Validator) ValidateTaskScoped(ctx context.Context, tokenString string) 
 type SophubValidator struct {
 	signingKey  []byte
 	revocations CapabilityRevocationSource
+	taskChecker TaskCapabilityChecker
 	clock       func() time.Time
 }
 
@@ -221,6 +259,12 @@ func NewSophubValidator(signingKey []byte, revocations CapabilityRevocationSourc
 		return nil, fmt.Errorf("capability revocation source is required")
 	}
 	return &SophubValidator{signingKey: append([]byte(nil), signingKey...), revocations: revocations, clock: time.Now}, nil
+}
+
+// WithTaskChecker 注入在线 task 活跃性校验(round9 审查, 同 Validator)。
+func (v *SophubValidator) WithTaskChecker(checker TaskCapabilityChecker) *SophubValidator {
+	v.taskChecker = checker
+	return v
 }
 
 func (v *SophubValidator) Validate(ctx context.Context, tokenString string) (CapabilityClaims, error) {
@@ -239,6 +283,17 @@ func (v *SophubValidator) Validate(ctx context.Context, tokenString string) (Cap
 	// 方案 §7: capability 必须包含操作, sophub token 只允许 sophub 操作。
 	if claims.Operation != "sophub" {
 		return CapabilityClaims{}, fmt.Errorf("%w: operation must be sophub", ErrCapabilityInvalid)
+	}
+	// round9 审查: 在线联查 task/lease/成员状态(同 Validator)。
+	if v.taskChecker != nil {
+		active, checkErr := v.taskChecker.IsTaskCapabilityActive(ctx, claims.TaskID, claims.RunnerGeneration)
+		if checkErr != nil {
+			return CapabilityClaims{}, fmt.Errorf("check task capability active: %w", checkErr)
+		}
+		if !active {
+			return CapabilityClaims{}, fmt.Errorf("%w: task %s no longer active at generation %d",
+				ErrCapabilityRevoked, claims.TaskID, claims.RunnerGeneration)
+		}
 	}
 	return claims, nil
 }

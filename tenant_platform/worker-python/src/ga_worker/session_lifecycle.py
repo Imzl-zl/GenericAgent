@@ -130,7 +130,7 @@ class SessionLifecycleMixin:
         except OverlayError as exc:
             raise WorkerAdapterError("OVERLAY_ERROR", str(exc)) from exc
 
-        seed_working, seed_backend, seed_agent, seed_display = self._load_snapshot_if_any(request)
+        seed_working, seed_backend, seed_agent = self._load_snapshot_if_any(request)
         try:
             credential_metadata = load_runtime_metadata(self.config_root)
         except CredentialConfigError as exc:
@@ -180,8 +180,7 @@ class SessionLifecycleMixin:
             seed_working=seed_working,
             seed_backend_history=seed_backend,
             seed_agent_history=seed_agent,
-            seed_display_history=seed_display,
-            display_history=[],
+            # round9 审查: session 级 display_history 已删除(从未消费)。
             mcp_snapshot_id=mcp_snapshot.snapshot_id,
             mcp_tools=mcp_tools,
             mcp_clients=mcp_clients,
@@ -232,11 +231,11 @@ class SessionLifecycleMixin:
 
     def _load_snapshot_if_any(
         self, request: worker_pb2.StartSessionRequest,
-    ) -> tuple[dict[str, Any], list[Any], list[Any], list[Any]]:
+    ) -> tuple[dict[str, Any], list[Any], list[Any]]:
         if not request.snapshot_ref:
-            return {}, [], [], []
-        working, backend, agent_hist, display = self._load_snapshot(request, request.runtime_policy)
-        return working, backend, agent_hist, display
+            return {}, [], []
+        working, backend, agent_hist = self._load_snapshot(request, request.runtime_policy)
+        return working, backend, agent_hist
 
     def _session_matches(self, request: worker_pb2.StartSessionRequest) -> bool:
         assert self._session is not None
@@ -261,7 +260,7 @@ class SessionLifecycleMixin:
 
     def _load_snapshot(
         self, request: worker_pb2.StartSessionRequest, policy: worker_pb2.RuntimePolicy,
-    ) -> tuple[dict[str, Any], list[Any], list[Any], list[Any]]:
+    ) -> tuple[dict[str, Any], list[Any], list[Any]]:
         ref = Path(request.snapshot_ref)
         try:
             resolved = ref.resolve()
@@ -293,8 +292,7 @@ class SessionLifecycleMixin:
         working = copy.deepcopy(data.get("working") or {})
         backend = copy.deepcopy(data.get("backend_history") or [])
         agent_hist = copy.deepcopy(data.get("agent_history") or [])
-        display = copy.deepcopy(data.get("display_history") or [])
-        return working, backend, agent_hist, display
+        return working, backend, agent_hist
 
     def _validate_checkpoint_request(self, request: worker_pb2.BeginCheckpointRequest) -> None:
         if not request.checkpoint_token:
@@ -342,6 +340,13 @@ class SessionLifecycleMixin:
             )
         except CheckpointError as exc:
             raise WorkerAdapterError(exc.code, exc.message) from exc
+        # round9 审查: build_snapshot_bundle 在 completed 副本上原地裁剪 history
+        # ——裁剪结果必须同步回 live Agent, 否则复用 Runner 时内存历史无界增长,
+        # 且"复用"与"重建(只恢复裁剪快照)"的下一个任务看到不同上下文。
+        # 只对成功任务同步(失败/取消不产生可恢复快照, 保留原始内存供诊断)。
+        with self._lock:
+            if self._session is not None:
+                self._sync_trimmed_history_locked(completed)
         with self._lock:
             if self._session is not None and self._session.completed is not None:
                 self._session.completed.checkpoint_token = request.checkpoint_token
@@ -353,6 +358,22 @@ class SessionLifecycleMixin:
             result_digest=result_digest,
             runner_generation=request.runner_generation,
         )
+
+    def _sync_trimmed_history_locked(self, completed: CompletedTask) -> None:
+        """把裁剪后的历史同步回 live Agent(调用方持锁)。"""
+        if completed.status != worker_pb2.TASK_SUCCEEDED:
+            return
+        agent = self._session.agent  # type: ignore[union-attr]
+        if agent is None:
+            return
+        try:
+            agent.history = copy.deepcopy(list(completed.agent_history))
+        except Exception:
+            pass
+        try:
+            self._set_backend_history(agent, copy.deepcopy(list(completed.backend_history)))
+        except Exception:
+            pass
 
     def _close_session_mcp(self) -> None:
         if self._session is None:

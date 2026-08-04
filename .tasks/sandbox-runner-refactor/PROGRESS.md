@@ -12,7 +12,7 @@
 - Truth: 本文件追加段 + SUBTASKS.csv 保持 active
 - 目标: 修复审查 R5 的 10 项(C1/C2/C3 部署阻断, I1-I6, Minor), 全部先测试后实现
 - 批次: R10 workspace-key 校验统一 → R1 inspect HostConfig.Mounts → R2 compose caps → R3/C6 fail-closed+config 回收 → R4 requeue 竞态 → R5 JTI → R6 outbox 文件绑定(0044 迁移) → R7 成员移除 → R8 checkpoint.py → 全量验证
-- 测试库: genericagent_test (TEST_DATABASE_URL=postgres://admin:REDACTED@127.0.0.1:5432/genericagent_test?sslmode=disable)
+- 测试库: genericagent_test (TEST_DATABASE_URL=postgres://admin:CHANGE_ME_BEFORE_RUN.@127.0.0.1:5432/genericagent_test?sslmode=disable)
 # Round 5 fixes 完成(2026-08-03)
 - R10 workspace-key 校验统一: domain.ValidateWorkspaceKey(team:<uuid>|personal:<int>), sandbox.WorkspaceDirHash 改签名共用校验
 - R1(C1) inspect 改解析 docker inspect 完整 JSON(模板语法对 map 字段失效是另一实证缺陷), subpath 从 HostConfig.Mounts 按 Target 关联; 新增 3 个真实 Docker 集成测试(create/start/inspect 全链路、subpath 漂移拒绝、卷内子目录预建契约)
@@ -42,3 +42,18 @@
 - B6: ServeInternalContext + NewWorkerSophubHandler(只挂 /v1/worker/sophub/*); --worker-internal-listen flag 默认关闭; platform.Dockerfile CMD 改 127.0.0.1:8080 + 0.0.0.0:8082; compose/.env.example GA_SOPHUB_PROXY_ADDR=http://platform:8082
 - 验证: Go 全量 -p 1 + TEST_DATABASE_URL 全绿; race 4 关键包全绿; worker-python 125 passed + bot_poller 13; 契约安全 13; compose config OK; GOOS=linux build OK; go vet OK; git diff --check OK
 - 残余: runsc/mTLS 端到端仍需真实 Linux 主机(方案 §10 声明); 内部 listener 真实网络连通性需 compose 冒烟(本机无 platform 镜像)
+# Round 7 fixes (2026-08-04, 独立审查 8 findings 修复批次)
+- Truth: tasks/16-fix-review-round7/DESIGN.md + SUBTASKS.csv id=16
+- 目标: 修复独立审查报告的 3C/5I, 全部先测试后实现(TDD 红绿闭环)
+- 批次: C1 交付快照文件名穿越 → C2 code_run 进程组 → C3 state committed/results ro 遮蔽 → I4 JTI 追加去重 → I5 RemoveMember 统一终态 → I6 config generation 隔离+锁 → I7 timeout/Shutdown JTI → I8 推进点心跳 → 连锁修复(RuntimeConfigDir generation 化) → 文档同步
+- 验证: Go 全量 18 包 + TEST_DATABASE_URL 全绿; race 4 关键包全绿; worker-python 106 passed; bot_poller 13; 契约+安全 35; compose config OK; GOOS=linux build OK; go vet OK; git diff --check OK; dbx 实测 PG16 追加去重 SQL
+- 残余(仓库已声明): runsc/mTLS 端到端、真实六服务 compose 冒烟、真实 Sophub 需部署主机
+# Round 7 reviewer-fix pass (2026-08-04, 独立审查后修复)
+- 独立 reviewer(zhanggui-requesting-code-review)发现 3 Important + 4 Minor, 全部修复并有测试:
+  - I8 接线 bug: last_progress_at 只在 cancel/timeout 分支更新 → 移到 drain 主循环(item 到达即刷新), 新增 drain 级集成测试
+  - C2 Windows 回归: _kill_process_group 无 killpg 时回退 process.kill(不再是 no-op); 注册表改存 Popen 对象 + poll() 跳过已退出(防 PID 复用)
+  - C2 emit_exception_terminal 补 cleanup_legacy_subprocesses(6/6 emit 全覆盖)+ 测试
+  - C1 收紧: validateManifestEntry Clean 后拒绝中段 ..(outputs/../../x); displayName 剥离控制字符
+  - I6 锁 get-or-create(workspaceLock helper), 消除 DestroyRunner 与 EnsureRunner 的锁创建竞态
+- 验证: Go 全量 18 包 + race 4 关键包 + vet + linux build 全绿; worker-python 110 passed; bot_poller 13; 契约安全 35; compose config OK; git diff --check OK
+- 残余(仓库已声明): runsc/mTLS 端到端、六服务 compose 冒烟、真实 Sophub 需部署主机; sandbox_runtime 续租失败路径 Shutdown 仍传空 JTI(best-effort, Manager.Destroy 兜底 fencing)

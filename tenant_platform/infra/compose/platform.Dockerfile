@@ -42,6 +42,7 @@ RUN install -d -o 10001 -g 10001 -m 0750 \
     && install -d -o 10001 -g 10003 -m 2770 \
         /var/lib/ga/runtime/session_files \
         /var/lib/ga/bot-media \
+        /var/lib/ga/delivery-spool \
     && install -d -o 10001 -g 10002 -m 2770 \
         /var/lib/ga/workspaces \
     && chmod -R a-w /opt/ga/bin /opt/ga/legacy /opt/ga/worker-python /opt/ga/policy /opt/ga/migrations

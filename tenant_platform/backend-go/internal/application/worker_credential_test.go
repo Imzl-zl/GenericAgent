@@ -544,10 +544,10 @@ func TestEnsureWorkerAppliesProviderChangesOnlyAtNextTaskBoundary(t *testing.T) 
 	}
 	var started []*controlledWorker
 	cleanupCalls := 0
-	runtime := worker.NewStaticRuntime(func(context.Context, string) (workerclient.WorkerClient, func(), error) {
+	runtime := worker.NewStaticRuntime(func(context.Context, string) (workerclient.WorkerClient, func(string), error) {
 		client := newControlledWorker()
 		started = append(started, client)
-		return client, func() { cleanupCalls++ }, nil
+		return client, func(_ string) { cleanupCalls++ }, nil
 	})
 	capabilities := &routingCapabilityStore{}
 	s := &scheduler{
@@ -958,5 +958,61 @@ func TestRefreshWorkerCredentialsDiscardsPendingBoundToPreviousTask(t *testing.T
 	// Worker 最终 ack 的是绑定 B 的新 gen2; 序列 [A 的失败 ack, B 的成功 ack]。
 	if n := len(worker.reloadRequests); n != 2 || worker.reloadRequests[n-1].GetCredentialGeneration() != 2 {
 		t.Fatalf("reload generations = %+v, want [2, 2]", worker.reloadRequests)
+	}
+}
+
+// TestCleanupWorkerEntryPassesFirstJTI 验证审查 C1/I7: Worker 清理/关闭时
+// 必须携带当前凭据集的首个 JTI(生产会话有活跃 JTI 集, 空 JTI 的 Shutdown
+// 会被 Worker 拒绝, 优雅关闭必然失败)。
+func TestCleanupWorkerEntryPassesFirstJTI(t *testing.T) {
+	s := &scheduler{}
+	var got string
+	entry := &workerEntry{
+		credentials: workerCredentialSet{JTIs: []string{"jti-active", "jti-other"}},
+		cleanup:     func(jti string) { got = jti },
+	}
+	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+	if got != "jti-active" {
+		t.Fatalf("cleanup received JTI %q, want firstJTI jti-active", got)
+	}
+}
+
+// TestIssueInitialCredentialsWritesGenerationScopedConfigDir 验证审查 C1/I6
+// 连锁修复: config 按 generation 隔离后, Platform 的 credential 初始写入
+// 必须落在容器实际挂载的 config/g<generation> 子目录(而非 config/ 根),
+// 否则 Runner 读不到 token。回调必须收到当前 Runner generation。
+func TestIssueInitialCredentialsWritesGenerationScopedConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
+	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
+	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotGen uint64
+	var gotDir string
+	s := &scheduler{cfg: SchedulerConfig{
+		PlatformInstanceID: "p1",
+		TokenIssuer:        issuer,
+		LLMProvider:        source,
+		LLMProxyAddr:       "http://127.0.0.1:9999",
+		ConfigRoot:         dir,
+		ModelPolicyVersion: "test.v1",
+		Registry:           testPolicyRegistry(t),
+		RuntimeConfigDir: func(sessionKey string, generation uint64) string {
+			gotGen = generation
+			gotDir = filepath.Join(dir, fmt.Sprintf("g%d", generation))
+			return gotDir
+		},
+	}}
+	task := domain.Task{ID: "t-gen-scoped", SessionKey: "personal:1"}
+	if _, _, err := s.issueInitialWorkerCredentials(context.Background(), task, 2); err != nil {
+		t.Fatalf("issueInitialWorkerCredentials: %v", err)
+	}
+	if gotGen != 2 {
+		t.Fatalf("runtime config dir callback received generation %d, want 2", gotGen)
+	}
+	if _, err := os.Stat(filepath.Join(gotDir, runtimeConfigFilename)); err != nil {
+		t.Fatalf("runtime config must be written under config/g2 (err=%v)", err)
 	}
 }

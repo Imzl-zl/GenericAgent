@@ -53,7 +53,7 @@ func run() error {
 		return fmt.Errorf("load cipher: %w", err)
 	}
 
-	providerSource, revocations, usageCounter, providerCleanup, err := buildProviderSource(firstNonEmpty(*databaseURL, os.Getenv("DATABASE_URL")))
+	providerSource, revocations, usageCounter, taskChecker, providerCleanup, err := buildProviderSource(firstNonEmpty(*databaseURL, os.Getenv("DATABASE_URL")))
 	if err != nil {
 		return err
 	}
@@ -68,6 +68,8 @@ func run() error {
 		ProviderSource:       providerSource,
 		Cipher:               cipher,
 		Revocations:          revocations,
+		// round9 审查: 在线 task/lease/成员校验(成员移除/接管即时生效)。
+		TaskChecker:          taskChecker,
 		// 审查 R4-I9: llm-proxy 有 DB 访问, 注入 store 作为按 JTI 的
 		// 预算计量后端, 转发前原子消费 max_turns。
 		UsageCounter:         usageCounter,
@@ -124,20 +126,21 @@ func loadCipher(cipherKeyHex string, signingKey []byte) (secret.TokenCipher, err
 	return secret.NewStaticKeyCipherFromHex(cipherKeyHex)
 }
 
-func buildProviderSource(databaseURL string) (llmproxy.ProviderSource, llmproxy.CapabilityRevocationSource, llmproxy.CapabilityUsageCounter, func(), error) {
+func buildProviderSource(databaseURL string) (llmproxy.ProviderSource, llmproxy.CapabilityRevocationSource, llmproxy.CapabilityUsageCounter, llmproxy.TaskCapabilityChecker, func(), error) {
 	if databaseURL == "" {
-		return nil, nil, nil, nil, fmt.Errorf("--database-url (or DATABASE_URL) is required")
+		return nil, nil, nil, nil, nil, fmt.Errorf("--database-url (or DATABASE_URL) is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("connect postgres: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("connect postgres: %w", err)
 	}
 	store, err := postgres.NewStore(pool)
 	if err != nil {
 		pool.Close()
-		return nil, nil, nil, nil, fmt.Errorf("create store: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("create store: %w", err)
 	}
-	return store, store, store, pool.Close, nil
+	// round9 审查: store 同时承担在线 task 活跃性校验(IsTaskCapabilityActive)。
+	return store, store, store, store, pool.Close, nil
 }

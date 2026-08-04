@@ -402,7 +402,7 @@ func (f *fakeMembershipChecker) IsApprovedTeamMember(_ context.Context, teamID s
 func setupDeliveryService(t *testing.T) (context.Context, *deliveryService, deliveryDeps) {
 	t.Helper()
 	root := t.TempDir()
-	sessionFiles, err := NewSessionFiles(root)
+	sessionFiles, err := NewSessionFiles(root, "")
 	if err != nil {
 		t.Fatalf("new session files: %v", err)
 	}
@@ -520,34 +520,38 @@ type fakeTransport struct {
 }
 
 type transportRecord struct {
-	BotUUID, IlinkUserID, Text string
+	BotUUID, IlinkUserID, Text, ClientID string
 }
 
 type fileTransportRecord struct {
-	BotUUID, IlinkUserID, FilePath, FileName string
+	BotUUID, IlinkUserID, FilePath, FileName, ClientID string
 }
 
-func (t *fakeTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, text string) error {
+func (t *fakeTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, text, clientID string) error {
 	if t.err != nil {
 		return t.err
 	}
-	t.sent = append(t.sent, transportRecord{BotUUID: botUUID, IlinkUserID: ilinkUserID, Text: text})
+	t.sent = append(t.sent, transportRecord{BotUUID: botUUID, IlinkUserID: ilinkUserID, Text: text, ClientID: clientID})
 	return nil
 }
 
-func (t *fakeTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath, fileName string) error {
+func (t *fakeTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath, fileName, clientID string) error {
 	if t.fileErr != nil {
 		return t.fileErr
 	}
 	if t.err != nil {
 		return t.err
 	}
-	t.sentFiles = append(t.sentFiles, fileTransportRecord{BotUUID: botUUID, IlinkUserID: ilinkUserID, FilePath: filePath, FileName: fileName})
+	t.sentFiles = append(t.sentFiles, fileTransportRecord{BotUUID: botUUID, IlinkUserID: ilinkUserID, FilePath: filePath, FileName: fileName, ClientID: clientID})
 	return nil
 }
 
-func (t *fakeTransport) RecordMessageIdempotency(_ context.Context, _, _ string) (bool, error) {
+func (t *fakeTransport) CheckMessageIdempotency(_ context.Context, _, _ string) (bool, error) {
 	return true, nil
+}
+
+func (t *fakeTransport) MarkMessageIdempotency(_ context.Context, _, _ string) error {
+	return nil
 }
 
 type fakeResultReader struct {
@@ -576,6 +580,18 @@ func (s *fakeMessageStore) InsertInboundMessage(_ context.Context, m domain.Mess
 	}
 	s.inbound = append(s.inbound, m)
 	return m, nil
+}
+
+func (s *fakeMessageStore) HasInboundMessage(_ context.Context, botID int64, messageID string) (bool, error) {
+	if s.lookupErr != nil {
+		return false, s.lookupErr
+	}
+	for _, m := range s.inbound {
+		if m.BotID == botID && m.MessageID == messageID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *fakeMessageStore) InsertOutboundMessage(_ context.Context, m domain.Message) (domain.Message, error) {
@@ -662,5 +678,111 @@ func TestDeliveryServiceRejectsMemberRemovedBetweenCheckAndSend(t *testing.T) {
 	}
 	if len(deps.store.deadLetters) != 1 || deps.store.deadLetters[0].Code != "MEMBER_REMOVED" {
 		t.Fatalf("expected MEMBER_REMOVED dead-letter, got %+v", deps.store.deadLetters)
+	}
+}
+
+// TestDeliveryServiceSnapshotFileNameCannotEscapeSnapshotDir 验证 DB 快照中
+// 的 FileName 含路径穿越时(该值源于 Runner 可写的 manifest, 审查 C1),
+// buildPayload 不得把快照写到 snapshotDir 之外(Platform 以自身权限
+// WriteFile/Remove 的逃逸点), 且 displayName 必须被清洗为纯 basename。
+func TestDeliveryServiceSnapshotFileNameCannotEscapeSnapshotDir(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("see [FILE:outputs/evil.docx]")}
+	deps.store.files = []domain.DeliveryFile{{
+		Marker: "outputs/evil.docx", FileName: strings.Repeat("../", 12) + "pwned",
+		RelPath: "outputs/evil.docx", Digest: "sha256:b", SizeBytes: 3, Content: []byte("abc"),
+	}}
+	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}}
+
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sentFiles) != 1 {
+		t.Fatalf("expected 1 sent file, got %d", len(deps.transport.sentFiles))
+	}
+	sent := deps.transport.sentFiles[0]
+	rel, err := filepath.Rel(svc.snapshotDir, sent.FilePath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		t.Fatalf("snapshot path %q escaped snapshotDir %q (rel=%q)", sent.FilePath, svc.snapshotDir, rel)
+	}
+	if sent.FileName != "pwned" {
+		t.Fatalf("displayName = %q, want sanitized basename pwned", sent.FileName)
+	}
+}
+
+// TestDeliveryServiceSnapshotFileNameWindowsSlashCannotEscape 验证 FileName
+// 含反斜杠路径分隔符(Windows 风格穿越)时同样被清洗, 不产生嵌套子路径。
+func TestDeliveryServiceSnapshotFileNameWindowsSlashCannotEscape(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("see [FILE:outputs/evil.docx]")}
+	deps.store.files = []domain.DeliveryFile{{
+		Marker: "outputs/evil.docx", FileName: strings.Repeat(`..\`, 12) + "pwned",
+		RelPath: "outputs/evil.docx", Digest: "sha256:b", SizeBytes: 3, Content: []byte("abc"),
+	}}
+	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}}
+
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sentFiles) != 1 {
+		t.Fatalf("expected 1 sent file, got %d", len(deps.transport.sentFiles))
+	}
+	sent := deps.transport.sentFiles[0]
+	rel, err := filepath.Rel(svc.snapshotDir, sent.FilePath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		t.Fatalf("snapshot path %q escaped snapshotDir %q (rel=%q)", sent.FilePath, svc.snapshotDir, rel)
+	}
+	if sent.FileName != "pwned" {
+		t.Fatalf("displayName = %q, want sanitized basename pwned", sent.FileName)
+	}
+}
+
+// TestSanitizeDeliverableDisplayNameStripsControlChars 验证显示名中的控制
+// 字符(换行等)被剥离——该值流入消息 Content 与 MediaAsset.FileName。
+func TestSanitizeDeliverableDisplayNameStripsControlChars(t *testing.T) {
+	got := sanitizeDeliverableDisplayName("evil\r\nname.txt", "outputs/evil.txt")
+	if got != "evilname.txt" {
+		t.Fatalf("displayName = %q, want control chars stripped", got)
+	}
+	if got := deliverableSnapshotBase("outputs/.."); got != "deliverable.bin" {
+		t.Fatalf("snapshot base of .. = %q, want deliverable.bin", got)
+	}
+}
+
+// Round8 审查: 快照文件 key 的 8 字节哈希不得被 4 字节前缀碰撞击穿——
+// outputs/d4561/report.docx 与 outputs/d36751/report.docx 在 4 字节前缀下
+// 同为 73262a8d, 后写覆盖前写, 两个发送项读到同一份内容。
+func TestDeliveryFileMarkerKeyRejectsShortCollision(t *testing.T) {
+	a := deliveryFileMarkerKey("outputs/d4561/report.docx")
+	b := deliveryFileMarkerKey("outputs/d36751/report.docx")
+	if a == b {
+		t.Fatalf("marker keys must not collide: both %q", a)
+	}
+	if len(a) != 16 {
+		t.Fatalf("expected 16 hex chars (8 bytes), got %d (%q)", len(a), a)
+	}
+	if len(b) != 16 {
+		t.Fatalf("expected 16 hex chars (8 bytes), got %d (%q)", len(b), b)
+	}
+}
+
+// Round8 审查: 快照 basename 截断必须为 hash 前缀留出空间(16 hex + '_'),
+// 超长 basename 回退 deliverable.bin 不得生成超限文件名。
+func TestDeliverableSnapshotBaseLeavesRoomForPrefix(t *testing.T) {
+	long := "x"
+	for i := 0; i < 300; i++ {
+		long += "x"
+	}
+	name := deliverableSnapshotBase("outputs/" + long + ".docx")
+	if len(name) > 255 {
+		t.Fatalf("snapshot base must fit 255-byte filename budget, got %d", len(name))
+	}
+	// 常规名不受影响。
+	if got := deliverableSnapshotBase("outputs/report.docx"); got != "report.docx" {
+		t.Fatalf("expected report.docx, got %q", got)
 	}
 }

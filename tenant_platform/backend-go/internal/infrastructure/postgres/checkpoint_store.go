@@ -45,9 +45,14 @@ func (s *Store) PrepareCheckpoint(ctx context.Context, taskID, platformInstanceI
 		if t.ClaimOwner != platformInstanceID {
 			return fmt.Errorf("prepare checkpoint: claim owner mismatch")
 		}
+		// round9 审查: 时钟统一用 DB 时钟(与 claim_lease_until 同源), 避免
+		// Platform 本地时钟偏差使 DB 视角已过期的 claim 仍能提交恢复点。
+		var dbNow time.Time
+		if err := tx.QueryRow(ctx, `SELECT timezone('utc', now())`).Scan(&dbNow); err != nil {
+			return fmt.Errorf("prepare checkpoint: read db clock: %w", err)
+		}
 		// 审查: task claim 本身也必须未过期(heartbeat 丢失后不得提交恢复点)。
-		now := time.Now().UTC()
-		if t.ClaimLeaseUntil.IsZero() || !t.ClaimLeaseUntil.After(now) {
+		if t.ClaimLeaseUntil.IsZero() || !t.ClaimLeaseUntil.After(dbNow) {
 			return fmt.Errorf("prepare checkpoint: task claim lease expired")
 		}
 		if t.Status != domain.TaskStarting && t.Status != domain.TaskRunning {
@@ -72,7 +77,7 @@ SELECT generation, owner, expires_at FROM runner_leases WHERE runner_key = $1 FO
 			if leaseOwner != platformInstanceID {
 				return fmt.Errorf("prepare checkpoint: runner lease owned by %q", leaseOwner)
 			}
-			if !leaseExpires.After(now) {
+			if !leaseExpires.After(dbNow) {
 				return fmt.Errorf("prepare checkpoint: runner lease expired")
 			}
 		}
@@ -222,9 +227,13 @@ func (s *Store) CompleteSucceeded(ctx context.Context, taskID, platformInstanceI
 		if t.ClaimOwner != platformInstanceID {
 			return fmt.Errorf("complete: claim owner mismatch")
 		}
+		// round9 审查: 时钟统一用 DB 时钟(与 claim_lease_until 同源)。
+		var dbNow time.Time
+		if err := tx.QueryRow(ctx, `SELECT timezone('utc', now())`).Scan(&dbNow); err != nil {
+			return fmt.Errorf("complete: read db clock: %w", err)
+		}
 		// 审查: task claim 必须未过期(heartbeat 丢失后不得提交成功状态)。
-		now := time.Now().UTC()
-		if t.ClaimLeaseUntil.IsZero() || !t.ClaimLeaseUntil.After(now) {
+		if t.ClaimLeaseUntil.IsZero() || !t.ClaimLeaseUntil.After(dbNow) {
 			return fmt.Errorf("complete: task claim lease expired")
 		}
 		if t.Status.IsTerminal() {
@@ -275,7 +284,7 @@ SELECT generation, owner, expires_at FROM runner_leases WHERE runner_key = $1 FO
 			if leaseOwner != platformInstanceID {
 				return fmt.Errorf("complete: runner lease owned by %q", leaseOwner)
 			}
-			if !leaseExpires.After(now) {
+			if !leaseExpires.After(dbNow) {
 				return fmt.Errorf("complete: runner lease expired")
 			}
 		}

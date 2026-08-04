@@ -387,7 +387,7 @@ type revokeDispatchRuntime struct{}
 
 func (r *revokeDispatchRuntime) Start(context.Context, worker.StartRequest) (*worker.Instance, error) {
 	return &worker.Instance{
-		Client: &fakeRevokeWorker{}, InstID: "revoke-worker", Cleanup: func() {}, RunnerGeneration: 1,
+		Client: &fakeRevokeWorker{}, InstID: "revoke-worker", Cleanup: func(_ string) {}, RunnerGeneration: 1,
 	}, nil
 }
 func (r *revokeDispatchRuntime) ResolveGeneration(context.Context, string) (uint64, error) {

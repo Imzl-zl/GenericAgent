@@ -110,25 +110,10 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Persist the cursor pushed by the Poller BEFORE routing the message.
-	// This is a hard sync: if the cursor can't be durably stored, we must not
-	// route the message — because a platform restart after routing would
-	// resume polling from the OLD cursor and re-deliver this same message,
-	// breaking exactly-once inbound delivery. Surfacing 5xx here lets the
-	// Poller retry the whole webhook; UpsertBotTransportState is idempotent
-	// (ON CONFLICT DO UPDATE) so a retry that re-sends the same cursor is safe.
-	if s.botLifecycle != nil && body.UpdatesBuf != "" {
-		if err := s.botLifecycle.PersistUpdatesBuf(r.Context(), body.BotUUID, body.UpdatesBuf); err != nil {
-			slog.ErrorContext(r.Context(), "im_webhook: cursor persist failed; returning 5xx so Poller retries",
-				"bot_uuid", body.BotUUID,
-				"trace_id", tid,
-				"error", err)
-			writeErr(w, http.StatusServiceUnavailable, "CURSOR_PERSIST_FAILED",
-				"failed to persist updates cursor; message not routed to avoid duplicate delivery on restart", tid)
-			return
-		}
-	}
-
+	// round9 审查: cursor 持久化从"路由前"移到"路由成功后"。旧顺序在
+	// cursor 已提交但消息尚未路由时崩溃, 会永久跳过该消息(丢消息);
+	// 新顺序中任何中间崩溃都由重试协议收敛: 任务/消息行唯一键保证路由
+	// 幂等, 路由成功后再提交 cursor, 2xx 语义 = 消息已处理且 cursor 已确认。
 	result, err := s.router.HandleMessage(r.Context(), application.IncomingMessage{
 		BotUUID:     body.BotUUID,
 		IlinkUserID: body.IlinkUserID,
@@ -140,6 +125,19 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "ROUTER_ERROR", err.Error(), tid)
 		return
+	}
+	// 路由成功后才持久化 cursor。失败返回 5xx: Poller 重试时路由幂等
+	// (消息行/任务唯一键短路), 重试会再次尝试持久化 cursor, 不丢不重。
+	if s.botLifecycle != nil && body.UpdatesBuf != "" {
+		if err := s.botLifecycle.PersistUpdatesBuf(r.Context(), body.BotUUID, body.UpdatesBuf); err != nil {
+			slog.ErrorContext(r.Context(), "im_webhook: cursor persist failed; returning 5xx so Poller retries",
+				"bot_uuid", body.BotUUID,
+				"trace_id", tid,
+				"error", err)
+			writeErr(w, http.StatusServiceUnavailable, "CURSOR_PERSIST_FAILED",
+				"failed to persist updates cursor; message routed idempotently, retry will converge", tid)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"action":  string(result.Action),

@@ -19,7 +19,7 @@ import (
 // workerEntry holds a dedicated Worker process bound to one session_key.
 type workerEntry struct {
 	client             workerclient.WorkerClient
-	cleanup            func()
+	cleanup            func(capabilityJTI string)
 	instID             string
 	sessionKey         string
 	taskID             string // 当前已下发 capability 的 task(方案 §7 per-task capability)
@@ -274,16 +274,21 @@ func (s *scheduler) configDirFor(sessionKey string) string {
 // runtimeConfigDir 返回 credential 刷新读写的配置目录(审查 C4):
 // 生产 Runner 模式由部署注入(workspace 共享卷 config/, Runner 可见);
 // 回退到 configDirFor(loopback/测试)。
-func (s *scheduler) runtimeConfigDir(sessionKey string) string {
+// runtimeConfigDir 返回 session 在 runnerGeneration 下的运行时配置目录
+// (审查 C1/I6: 必须按 generation 隔离, 与容器挂载的 config/g<gen> 一致)。
+func (s *scheduler) runtimeConfigDir(sessionKey string, runnerGeneration uint64) string {
 	if s.cfg.RuntimeConfigDir != nil {
-		return s.cfg.RuntimeConfigDir(sessionKey)
+		return s.cfg.RuntimeConfigDir(sessionKey, runnerGeneration)
 	}
 	return s.configDirFor(sessionKey)
 }
 
 func (s *scheduler) cleanupWorkerEntryBestEffort(ctx context.Context, entry *workerEntry) {
 	if entry.cleanup != nil {
-		entry.cleanup()
+		// 审查 C1/I7: 清理/关闭携带当前凭据集 JTI, Worker 校验通过后
+		// 才能优雅停止; 任务终态后 credentials 可能已被撤销, 但 Worker
+		// 内存 session 的 JTI 集在 Reload 时更新, firstJTI 仍在集合内。
+		entry.cleanup(firstJTI(entry.credentials))
 	}
 	if entry.pendingRefresh != nil {
 		s.revokeCredentialSetBestEffort(ctx, entry.pendingRefresh.Next)
@@ -384,7 +389,7 @@ func (s *scheduler) agentMaxTurns(ctx context.Context) (uint32, error) {
 
 // startWorkerProcess creates the Worker after its runtime JSON and fixed
 // mykey.py loader have been written.
-func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string, runtimeConfigFiles map[string][]byte) (workerclient.WorkerClient, string, func(), uint64, error) {
+func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string, runtimeConfigFiles map[string][]byte) (workerclient.WorkerClient, string, func(string), uint64, error) {
 	inst, err := s.cfg.Runtime.Start(ctx, worker.StartRequest{
 		SessionKey:         sessionKey,
 		ConfigDir:          s.configDirFor(sessionKey),

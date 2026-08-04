@@ -150,8 +150,9 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 	if err != nil {
 		return Runner{}, fmt.Errorf("prepare workspace dirs: %w", err)
 	}
-	// 控制面材料(短期 mTLS 证书/策略清单)原子写入 config/ 并只读挂载。
-	if err := writeConfigFiles(d.cfg.WorkspacesRoot, spec.WorkspaceHash, spec.ConfigFiles, p.UID, p.GID, p.ShareGID); err != nil {
+	// 控制面材料(短期 mTLS 证书/策略清单)原子写入 config/g<generation>
+	// 并只读挂载(审查 C1/I6: 按 generation 隔离, 旧代清理不误删新配置)。
+	if err := writeConfigFiles(d.cfg.WorkspacesRoot, spec.WorkspaceHash, spec.Generation, spec.ConfigFiles, p.UID, p.GID, p.ShareGID); err != nil {
 		return Runner{}, fmt.Errorf("write runner config files: %w", err)
 	}
 
@@ -188,6 +189,9 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 	}
 	// 工作区挂载: Compose 部署用 named volume + volume-subpath(daemon 可解析),
 	// 裸机用 bind source(Manager 与 daemon 同主机时等价)。
+	// 审查 C3: state/committed 与 state/results 以只读子挂载遮蔽顶层 rw
+	// state 挂载, Runner 不得删除/替换已提交快照与结果文件(Platform 写
+	// committed/results 不受影响——挂载 ro 是容器侧视图)。
 	subpaths := []struct {
 		sub, dst string
 		ro       bool
@@ -195,7 +199,9 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		{"memory", LegacyMemoryMount, false},
 		{"temp", LegacyTempMount, false},
 		{"state", RunnerStateMount, false},
-		{"config", RunnerConfigMount, true},
+		{"state/committed", RunnerStateMount + "/committed", true},
+		{"state/results", RunnerStateMount + "/results", true},
+		{"config/g" + strconv.FormatUint(spec.Generation, 10), RunnerConfigMount, true},
 	}
 	for _, m := range subpaths {
 		mount := m
@@ -373,6 +379,23 @@ func (d *DockerCLI) RunnerWorkspaceHash(ctx context.Context, idOrName string) (s
 		return "", false, nil
 	}
 	return hash, true, nil
+}
+
+// RunnerGenerationLabel 返回容器 label 中的 runner generation(审查
+// Round8: 按容器 ID 销毁时从 label 恢复 generation, 否则 config/g<gen>
+// 清理因无法定位 generation 而跳过, 短期 mTLS 材料残留)。容器不存在或
+// label 缺失返回 ok=false。
+func (d *DockerCLI) RunnerGenerationLabel(ctx context.Context, idOrName string) (uint64, bool, error) {
+	format := `{{index .Config.Labels "com.genericagent.runner.generation"}}`
+	stdout, _, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, "inspect", "--format", format, idOrName)
+	if err != nil || exitCode != 0 {
+		return 0, false, nil // 不存在或无法读取: 视为无法定位
+	}
+	gen, err := strconv.ParseUint(strings.TrimSpace(string(stdout)), 10, 64)
+	if err != nil || gen == 0 {
+		return 0, false, nil
+	}
+	return gen, true, nil
 }
 
 // ContainerExists 返回容器(按 ID 或名称)是否存在。

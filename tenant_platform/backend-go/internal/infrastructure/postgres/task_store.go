@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,6 +12,11 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
+
+// queueAdvisoryNamespace 是 per-user 队列限流 advisory lock 的命名空间前缀
+// (审查 round9: 只锁 workspace 行时, 同一 requester 并发向个人与多个团队
+// workspace 提交会各自看到未超限的计数并同时插入, 突破硬上限)。
+const queueAdvisoryNamespace = "ga:per-user-queue:"
 
 // SubmitTask inserts a queued task or returns the existing dedupe row unchanged.
 // PerUserQueueLimit, when > 0, is enforced inside this transaction (after the
@@ -34,6 +40,15 @@ func (s *Store) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (d
 
 	var task domain.Task
 	err = s.withTx(ctx, func(tx pgx.Tx) error {
+		// 审查 round9: 按 requester 持有事务级 advisory lock, 把同一用户跨
+		// 所有 workspace(个人+多个团队)的提交串行化——workspace 行锁只覆盖
+		// 单 workspace, 跨 workspace 并发会让队列计数检查失效。锁在所有
+		// workspace 读取之前获取, 全局统一串行点, 不会形成锁序环。
+		if s.perUserQueueLimit > 0 && cmd.RequesterUserID > 0 {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, queueAdvisoryNamespace+strconv.FormatInt(cmd.RequesterUserID, 10)); err != nil {
+				return err
+			}
+		}
 		var workspaceID uuid.UUID
 		var ownerID int64
 		var kind, teamID string
@@ -175,8 +190,16 @@ func (s *Store) SetTaskCapabilityJTIs(ctx context.Context, taskID, platformInsta
 	if len(jtis) == 0 {
 		return nil
 	}
+	// 审查 C1(I4): 追加去重而不是整体替换——刷新凭据时旧 JTI 对应的 token
+	// 在 Worker 确认前尚未撤销, 若被覆盖, Platform 崩溃后恢复事务(读全量
+	// capability_jtis 撤销)无法撤销旧 token, 其存活至 TTL。终态事务的
+	// revokeTaskCapabilityJTIs 读全量数组, 历史 JTI 一并撤销。
 	tag, err := s.pool.Exec(ctx, `
-UPDATE tasks SET capability_jtis = $2, updated_at = timezone('utc', now())
+UPDATE tasks SET
+  capability_jtis = ARRAY(
+    SELECT DISTINCT x FROM unnest(COALESCE(capability_jtis, ARRAY[]::text[]) || $2::text[]) AS x
+  ),
+  updated_at = timezone('utc', now())
 WHERE id = $1
   AND status IN ('starting','running')
   AND claim_owner = $3

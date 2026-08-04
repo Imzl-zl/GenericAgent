@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -91,20 +92,20 @@ func TestCreateRunnerUsesFixedProfileFlags(t *testing.T) {
 			t.Fatalf("create args missing %q:\n%s", want, joined)
 		}
 	}
-	// 四个工作区 subpath 必须全部挂载(memory/temp/state 读写, config 只读),
-	// 不得有 docker.sock。
+	// 工作区 subpath 必须全部挂载(memory/temp/state 读写, config 只读),
+	// state/committed 与 state/results 必须以只读子挂载遮蔽顶层 rw
+	// (审查 C3: Runner 不得删除/替换已提交快照与结果文件), 不得有 docker.sock。
 	for _, want := range []string{
 		"destination=/ga/legacy/memory",
 		"destination=/ga/legacy/temp",
 		"destination=/ga/runner-state",
-		"destination=/ga/runner-config",
+		"destination=/ga/runner-state/committed,readonly",
+		"destination=/ga/runner-state/results,readonly",
+		"destination=/ga/runner-config,readonly",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("mount missing %q:\n%s", want, joined)
 		}
-	}
-	if !strings.Contains(joined, "destination=/ga/runner-config,readonly") {
-		t.Fatalf("config mount must be read-only:\n%s", joined)
 	}
 	if strings.Contains(joined, "docker.sock") || strings.Contains(joined, "/var/run/docker") {
 		t.Fatalf("docker socket mount present:\n%s", joined)
@@ -250,8 +251,12 @@ func hostMountsForWorkspace(workspaceHash, volume string) []hostMount {
 	return []hostMount{
 		{Type: "volume", Source: volume, Target: LegacyMemoryMount, VolumeSubpath: workspaceHash + "/memory"},
 		{Type: "volume", Source: volume, Target: LegacyTempMount, VolumeSubpath: workspaceHash + "/temp"},
-		{Type: "volume", Source: volume, Target: RunnerConfigMount, ReadOnly: true, VolumeSubpath: workspaceHash + "/config"},
+		// 审查 C1/I6: config 按 generation 隔离为 config/g<gen>(测试固定 g1,
+		// 与 good inspect 的 Labels generation=1 一致)。
+		{Type: "volume", Source: volume, Target: RunnerConfigMount, ReadOnly: true, VolumeSubpath: workspaceHash + "/config/g1"},
 		{Type: "volume", Source: volume, Target: RunnerStateMount, VolumeSubpath: workspaceHash + "/state"},
+		{Type: "volume", Source: volume, Target: RunnerStateMount + "/committed", ReadOnly: true, VolumeSubpath: workspaceHash + "/state/committed"},
+		{Type: "volume", Source: volume, Target: RunnerStateMount + "/results", ReadOnly: true, VolumeSubpath: workspaceHash + "/state/results"},
 	}
 }
 
@@ -281,14 +286,21 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 		Mounts: []inspectMount{
 			// 实测 Docker 29.6.2: 顶层 .Mounts 的 volume 挂载不含
 			// VolumeOptions.Subpath（真实 subpath 在 HostConfig.Mounts）。
+			// 按 Destination 字典序: memory < temp < config < state < state/committed < state/results
 			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyMemoryMount, RW: true},
 			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyTempMount, RW: true},
 			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerConfigMount, RW: false},
 			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount, RW: true},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount + "/committed", RW: false},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount + "/results", RW: false},
 		},
 		HostMounts: hostMountsForWorkspace(workspaceHash, "runner_workspaces"),
 	}
-	mountSubs := map[string]string{LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state", RunnerConfigMount: "config"}
+	mountSubs := map[string]string{
+		LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state",
+		RunnerConfigMount: "config", RunnerStateMount + "/committed": "state/committed",
+		RunnerStateMount + "/results": "state/results",
+	}
 	if err := validateInspect(good, profile, "/tmp/ws-root", "runner_workspaces", mountSubs); err != nil {
 		t.Fatalf("good inspect rejected: %v", err)
 	}
@@ -311,6 +323,15 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 		{"seccomp unconfined", func(o *inspectOutput) { o.Seccomp = "unconfined" }},
 		{"config mount rw", func(o *inspectOutput) {
 			o.Mounts[2].RW = true
+		}},
+		{"committed mount rw", func(o *inspectOutput) {
+			// 审查 C3: committed 只读是不可侵犯边界,
+			// 变回 rw 必须拒绝(否则 Runner 可删除快照)。
+			o.Mounts[4].RW = true
+		}},
+		{"results mount rw", func(o *inspectOutput) {
+			// 审查 C3: results 不得变回可写。
+			o.Mounts[5].RW = true
 		}},
 		{"mount missing source", func(o *inspectOutput) {
 			o.Mounts[3].Source = ""
@@ -402,6 +423,8 @@ func TestValidateInspectSortedMounts(t *testing.T) {
 			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount, RW: true},
 			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: LegacyMemoryMount, RW: true},
 			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerConfigMount, RW: false},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount + "/committed", RW: false},
+			{Type: "volume", Source: "/var/lib/docker/volumes/runner_workspaces/_data", Destination: RunnerStateMount + "/results", RW: false},
 		},
 		HostMounts: hostMountsForWorkspace(workspaceHash, "runner_workspaces"),
 	}
@@ -409,7 +432,11 @@ func TestValidateInspectSortedMounts(t *testing.T) {
 	// 复刻 Inspect 中的排序(生产解析路径)。
 	sort.Slice(raw.Mounts, func(i, j int) bool { return raw.Mounts[i].Destination < raw.Mounts[j].Destination })
 	if err := validateInspect(raw, profile, "/tmp/ws-root", "runner_workspaces",
-		map[string]string{LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state", RunnerConfigMount: "config"}); err != nil {
+		map[string]string{
+			LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state",
+			RunnerConfigMount: "config", RunnerStateMount + "/committed": "state/committed",
+			RunnerStateMount + "/results": "state/results",
+		}); err != nil {
 		t.Fatalf("sorted real-world mounts rejected: %v", err)
 	}
 }
@@ -420,7 +447,11 @@ func TestValidateInspectBindExactSource(t *testing.T) {
 	profile := ValidProfile()
 	profile.AllowRunc = true // 测试模拟默认 docker 运行时
 	workspaceHash := strings.Repeat("12", 32)
-	mountSubs := map[string]string{LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state", RunnerConfigMount: "config"}
+	mountSubs := map[string]string{
+		LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state",
+		RunnerConfigMount: "config", RunnerStateMount + "/committed": "state/committed",
+		RunnerStateMount + "/results": "state/results",
+	}
 	good := inspectOutput{
 		ReadOnlyRootFS: true, Running: true, CapDrop: []string{"ALL"}, NoNewPrivileges: true,
 		Networks: []string{"runner-control"}, User: "10002:10002",
@@ -442,8 +473,11 @@ func TestValidateInspectBindExactSource(t *testing.T) {
 		Mounts: []inspectMount{
 			{Type: "bind", Source: "/ws/" + workspaceHash + "/memory", Destination: LegacyMemoryMount, RW: true},
 			{Type: "bind", Source: "/ws/" + workspaceHash + "/temp", Destination: LegacyTempMount, RW: true},
-			{Type: "bind", Source: "/ws/" + workspaceHash + "/config", Destination: RunnerConfigMount, RW: false},
+			// 审查 C1/I6: config 按 generation 隔离为 config/g<gen>(测试 g1)。
+			{Type: "bind", Source: "/ws/" + workspaceHash + "/config/g1", Destination: RunnerConfigMount, RW: false},
 			{Type: "bind", Source: "/ws/" + workspaceHash + "/state", Destination: RunnerStateMount, RW: true},
+			{Type: "bind", Source: "/ws/" + workspaceHash + "/state/committed", Destination: RunnerStateMount + "/committed", RW: false},
+			{Type: "bind", Source: "/ws/" + workspaceHash + "/state/results", Destination: RunnerStateMount + "/results", RW: false},
 		},
 	}
 	if err := validateInspect(good, profile, "/ws", "", mountSubs); err != nil {
@@ -507,5 +541,30 @@ func TestCreateAndStartRemovesContainerWhenStartFails(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected rm -f of created container, calls=%v", runner.calls)
+	}
+}
+
+// Round8(review): DockerCLI 必须能从容器 label 恢复 generation——按容器 ID
+// 销毁(Manager 重启后)时, 没有它 config/g<gen> 清理会因 generation=0 跳过,
+// 短期 mTLS 材料残留。
+func TestDockerCLIRunnerGenerationLabel(t *testing.T) {
+	fr := &fakeRunner{stdout: "7\n"}
+	d := &DockerCLI{runner: fr, cfg: validConfig()}
+
+	gen, ok, err := d.RunnerGenerationLabel(context.Background(), "some-container-id")
+	if err != nil || !ok || gen != 7 {
+		t.Fatalf("expected gen=7 ok=true, got gen=%d ok=%v err=%v", gen, ok, err)
+	}
+	// 非法 label → ok=false。
+	fr2 := &fakeRunner{stdout: "not-a-number"}
+	d2 := &DockerCLI{runner: fr2, cfg: validConfig()}
+	if _, ok, _ := d2.RunnerGenerationLabel(context.Background(), "x"); ok {
+		t.Fatal("invalid generation label must be ok=false")
+	}
+	// 容器不存在 → ok=false。
+	fr3 := &fakeRunner{err: errors.New("no such container")}
+	d3 := &DockerCLI{runner: fr3, cfg: validConfig()}
+	if _, ok, _ := d3.RunnerGenerationLabel(context.Background(), "x"); ok {
+		t.Fatal("missing container must be ok=false")
 	}
 }

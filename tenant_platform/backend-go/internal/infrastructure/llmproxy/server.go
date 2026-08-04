@@ -26,6 +26,11 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// round9 审查: 生产(llm-proxy 进程/内嵌)必须配置在线 task 活跃性校验;
+	// 未配置(测试)保持签名+撤销校验。
+	if cfg.TaskChecker != nil {
+		validator.WithTaskChecker(cfg.TaskChecker)
+	}
 	policy, err := NewNetworkPolicy(cfg.AllowedUpstreamCIDRs, cfg.AllowedHTTPHosts)
 	if err != nil {
 		return nil, err

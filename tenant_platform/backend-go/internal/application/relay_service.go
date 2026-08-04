@@ -132,7 +132,7 @@ func (s *relayService) Relay(ctx context.Context, fromUserID int64, toUsername, 
 	// inbound HTTP request. Mirrors deliverySendTimeout in delivery_service.go.
 	sendCtx, cancel := context.WithTimeout(ctx, relaySendTimeout)
 	defer cancel()
-	if err := s.transport.SendMessage(sendCtx, recipient.BotUUID, recipient.IlinkUserID, relayText); err != nil {
+	if err := s.transport.SendMessage(sendCtx, recipient.BotUUID, recipient.IlinkUserID, relayText, ""); err != nil {
 		return fmt.Errorf("send relay: %w", err)
 	}
 

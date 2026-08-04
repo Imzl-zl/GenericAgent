@@ -110,7 +110,7 @@ func TestRealDockerCreateStartInspectVolumeSubpath(t *testing.T) {
 	mustRealRun(t, dockerBin, "run", "--rm",
 		"--mount", "type=volume,source="+volumeName+",destination=/v",
 		"busybox:latest", "sh", "-c",
-		"mkdir -p /v/"+hash+"/memory /v/"+hash+"/temp /v/"+hash+"/state /v/"+hash+"/config")
+		"mkdir -p /v/"+hash+"/memory /v/"+hash+"/temp /v/"+hash+"/state/staging /v/"+hash+"/state/committed /v/"+hash+"/state/results /v/"+hash+"/config/g1")
 
 	profile := ValidProfile()
 	profile.AllowRunc = true // 测试用默认 runc 运行时(显式 trusted 开关)

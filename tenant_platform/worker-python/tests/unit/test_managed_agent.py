@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import queue
 import sys
 import threading
@@ -1597,3 +1598,349 @@ def test_control_rpcs_reject_stale_task_capability(roots, foundation_registry):
     # 无活跃凭据集(loopback/清理路径): 空 JTI 允许, 保持兼容。
     adapter._session.capability_jtis = []
     assert adapter.shutdown("done", "personal:1", 1, "").accepted is True
+
+
+# ---------- Round 7 C2: code_run 进程组清理 ----------
+
+def _import_overlay_ga(roots):
+    """加载 legacy ga.py 的隔离副本。
+
+    不经过 import_legacy_runtime(其 preload 检查会拒绝全量运行时前序测试
+    已加载的 ga), 直接以 legacy_root 源文件 exec; 产生的依赖模块
+    (agent_loop 等)从 sys.modules 清理, 保持测试顺序无关。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("ga_round7_test", roots["legacy_root"] / "ga.py")
+    ga = importlib.util.module_from_spec(spec)
+    sys.modules["ga_round7_test"] = ga
+    old_path = list(sys.path)
+    sys.path.insert(0, str(roots["legacy_root"]))
+    # 前序测试(如 test_plugins_hooks_import_fail)可能把坏 plugins.hooks 或
+    # 其他 overlay 的 legacy 模块留在 sys.modules, 全部清理保证从当前
+    # legacy_root 重新导入。
+    for name in ("agent_loop", "simphtml", "llmcore", "plugins", "plugins.hooks", "plugins.project_mode"):
+        sys.modules.pop(name, None)
+    try:
+        spec.loader.exec_module(ga)
+    finally:
+        sys.path[:] = old_path
+        for name in ("ga_round7_test", "agent_loop", "simphtml", "llmcore", "plugins", "plugins.hooks", "plugins.project_mode"):
+            sys.modules.pop(name, None)
+    return ga
+
+
+def test_kill_all_code_run_processes_kills_registered_groups(roots, monkeypatch):
+    """审查 C2 (Round8): 任务终态清理必须对登记的全部 code_run 进程组执行
+    killpg。注册表保存创建时快照的 PGID——直接父进程已退出但组内仍有后台
+    子进程时, 不能靠 getpgid(pid) 定位(父 pid 已消失), 只能按快照 PGID 杀。
+    (Windows 无真实 killpg, 经 monkeypatch 验证调用序列; 真实语义由 Linux CI 覆盖。)"""
+    ga = _import_overlay_ga(roots)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(ga.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)), raising=False)
+
+    ga._code_run_pgids = {11, 22}
+    ga.kill_all_code_run_processes()
+    assert sorted(killed) == [(11, 9), (22, 9)]  # SIGKILL=9
+    assert ga._code_run_pgids == set()
+
+
+def test_code_run_timeout_kills_process_group(roots, monkeypatch):
+    """审查 C2: code_run 超时路径必须 killpg 整个进程组, 而非仅杀直接子进程。
+    (Windows 无真实 killpg, 经 monkeypatch 验证调用序列; 真实语义由 Linux CI 覆盖。)"""
+    ga = _import_overlay_ga(roots)
+
+    class BlockingStdout:
+        def readline(self):
+            time.sleep(5)  # 阻塞 stream_reader 线程, 触发超时分支
+            return b""
+
+        def close(self):
+            pass
+
+    class FakeProc:
+        pid = 4242
+        stdout = BlockingStdout()
+
+        def kill(self):
+            raise AssertionError("plain kill() must not be used; use killpg")
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(ga.subprocess, "Popen", lambda *a, **kw: FakeProc())
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(ga.os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(ga.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)), raising=False)
+
+    out = list(ga.code_run("print('hi')", code_type="python", timeout=1, cwd=".", myprint=lambda *a, **kw: None))
+    assert killed == [(4242, 9)], f"expected killpg on timeout, got {killed}"
+    assert any("超时" in str(x) for x in out)
+    assert 4242 not in ga._code_run_pgids
+
+
+def test_timeout_kills_via_snapshot_pgid_when_leader_exited(roots, monkeypatch):
+    """Round8(review): 超时分支父 shell 已退出(实时 getpgid 抛
+    ProcessLookupError)但后台子进程仍持有 stdout 时, 必须按注册表快照 PGID
+    killpg——否则 kill 落空且注销登记, 终态清理无目标可杀。"""
+    ga = _import_overlay_ga(roots)
+
+    class BlockingStdout:
+        def readline(self):
+            time.sleep(5)
+            return b""
+        def close(self):
+            pass
+
+    class FakeProc:
+        pid = 4242
+        stdout = BlockingStdout()
+        def kill(self):
+            raise AssertionError("killpg path must be used")
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(ga.subprocess, "Popen", lambda *a, **kw: FakeProc())
+    killed: list[tuple[int, int]] = []
+    # 父进程已退出: 实时 getpgid 抛 ProcessLookupError。
+    def dying_getpgid(pid):
+        raise ProcessLookupError(3, "No such process")
+    monkeypatch.setattr(ga.os, "getpgid", dying_getpgid, raising=False)
+    monkeypatch.setattr(ga.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)), raising=False)
+
+    # 模拟登记时快照的 PGID(创建时 getpgid 成功)。
+    ga._code_run_pgids = {4242}
+    out = list(ga.code_run("print('hi')", code_type="python", timeout=1, cwd=".", myprint=lambda *a, **kw: None))
+    assert killed == [(4242, 9)], f"timeout kill must use snapshot pgid, got {killed}"
+    assert 4242 not in ga._code_run_pgids, "registration must be dropped after kill"
+    assert any("超时" in str(x) for x in out)
+
+
+def test_inline_eval_disabled_in_runner_env(roots, monkeypatch):
+    """Round8 审查: GA_DISABLE_INLINE_EVAL=1(Runner 镜像固定)时 inline_eval
+    必须被拒绝——该路径在 Worker 进程内 eval/exec, 绕过 code_run 进程组隔离。"""
+    ga = _import_overlay_ga(roots)
+    monkeypatch.setenv("GA_DISABLE_INLINE_EVAL", "1")
+
+    from types import SimpleNamespace
+    handler = SimpleNamespace(
+        cwd=".",
+        parent=SimpleNamespace(llmclient=SimpleNamespace(backend=SimpleNamespace(history=[]))),
+        code_stop_signal=None,
+        print=lambda *a, **kw: None,
+        _get_anchor_prompt=lambda skip=0: "",
+        _extract_code_block=lambda resp, ct: None,
+        _get_tool_maxlen=lambda l, args, growth_rate=1.0: 10000,
+    )
+    gen = ga.GenericAgentHandler.do_code_run(handler, {"type": "python", "code": "1+1", "inline_eval": True}, None)
+    try:
+        next(gen)
+        raise AssertionError("inline_eval guard must return before any yield")
+    except StopIteration as si:
+        result = si.value
+    assert "inline_eval is disabled" in str(result), f"expected disabled error, got {result!r}"
+
+
+def test_inline_eval_allowed_when_not_disabled(roots, monkeypatch):
+    """Round8: 未禁用(本地开发)时 inline_eval 仍可用。"""
+    ga = _import_overlay_ga(roots)
+    monkeypatch.delenv("GA_DISABLE_INLINE_EVAL", raising=False)
+
+    from types import SimpleNamespace
+    handler = SimpleNamespace(
+        cwd=".",
+        parent=SimpleNamespace(llmclient=SimpleNamespace(backend=SimpleNamespace(history=[]))),
+        code_stop_signal=None,
+        print=lambda *a, **kw: None,
+        _get_anchor_prompt=lambda skip=0: "",
+        _extract_code_block=lambda resp, ct: None,
+        _get_tool_maxlen=lambda l, args, growth_rate=1.0: 10000,
+    )
+    gen = ga.GenericAgentHandler.do_code_run(handler, {"type": "python", "code": "1+1", "inline_eval": True}, None)
+    try:
+        next(gen)
+        raise AssertionError("inline_eval branch returns, not yields")
+    except StopIteration as si:
+        result = si.value
+    assert "2" in str(result), f"inline_eval must evaluate when not disabled, got {result!r}"
+
+
+def test_task_terminal_cleanup_invokes_ga_kill_all(monkeypatch):
+    """审查 C2: 任务终态产出前必须清理 legacy code_run 残留进程组。"""
+    import types
+
+    from ga_worker import task_terminal
+
+    killed: list[bool] = []
+    fake_ga = types.SimpleNamespace(kill_all_code_run_processes=lambda: killed.append(True))
+    adapter = types.SimpleNamespace(_legacy_mods={"ga": fake_ga})
+    task_terminal.cleanup_legacy_subprocesses(adapter)
+    assert killed == [True]
+
+    # 无 ga 模块(测试/无凭据环境)时静默跳过, 不抛异常。
+    adapter2 = types.SimpleNamespace(_legacy_mods={})
+    task_terminal.cleanup_legacy_subprocesses(adapter2)
+
+
+def test_emit_final_terminal_cleans_up_subprocesses_before_terminal(roots, foundation_registry, monkeypatch):
+    """审查 C2: emit_final_terminal(成功路径)产出 terminal 前调用清理。"""
+    from ga_worker import task_terminal
+
+    calls: list[bool] = []
+    monkeypatch.setattr(task_terminal, "cleanup_legacy_subprocesses", lambda adapter: calls.append(True))
+    adapter = _make_adapter(roots, foundation_registry, ScriptedAgent)
+    adapter.start_session(_start_req())
+    events = _events(adapter, _task("c2-done", "hello"))
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_SUCCEEDED
+    assert calls, "emit_final_terminal must clean up legacy subprocesses before terminal"
+
+
+# ---------- Round 7 I7: 内部 timeout 携带 capability JTI ----------
+
+def test_task_deadline_timeout_carries_capability_jti(roots, foundation_registry):
+    """审查 C1(I7): 生产会话(有活跃 JTI 集)下任务超时的内部 cancel 必须携带
+    当前任务的 capability_jti, 否则 _assert_task_capability 拒绝、agent 无法
+    被 abort, 任务超时形同虚设。"""
+    class HangAgent(ScriptedAgent):
+        def __init__(self):
+            super().__init__(hang_on={"deadline-jti"})
+
+    adapter = _make_adapter(roots, foundation_registry, HangAgent)
+    adapter.start_session(_start_req(runtime_policy=_runtime_policy(task_timeout_seconds=1)))
+    # 模拟生产会话: ReloadCredentials 后持有活跃 JTI 集(空 JTI 会被拒绝)。
+    adapter._session.capability_jtis = ["test-jti"]
+    events = _events(adapter, _task("dl-jti", "deadline-jti", capability_jti="test-jti"))
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_INTERRUPTED
+    assert term.error.code == "TASK_TIMEOUT"
+    # abort 由内部 cancel 触发: 不带 JTI 会被拒, 无法中断 agent 线程。
+    assert ScriptedAgent.instances[0].abort_calls == 1
+
+
+def test_kill_process_group_falls_back_to_kill_without_killpg(roots, monkeypatch):
+    """审查 C1/I8(I7 修复轮): Windows/无 killpg 环境必须回退 process.kill(),
+    不能变成 no-op——否则超时/异常路径的 code_run 进程永远存活。"""
+    from types import SimpleNamespace
+
+    ga = _import_overlay_ga(roots)
+    monkeypatch.setattr(ga.os, "killpg", None, raising=False)
+    monkeypatch.setattr(ga.os, "getpgid", None, raising=False)
+    killed: list[bool] = []
+    proc = SimpleNamespace(pid=1, kill=lambda: killed.append(True))
+    ga._kill_process_group(proc)
+    assert killed == [True], "Windows fallback must call process.kill()"
+
+
+def test_kill_all_kills_pgid_even_when_leader_exited(roots, monkeypatch):
+    """Round8 审查: 父 shell 已退出但后台子进程仍存活时, 按创建时快照的
+    PGID 直接 killpg(ESRCH 无害)——旧实现 poll()!=None 会跳过整个进程组,
+    后台进程跨任务存活。"""
+    ga = _import_overlay_ga(roots)
+    killed: list[int] = []
+    monkeypatch.setattr(ga.os, "killpg", lambda pgid, sig: killed.append(pgid), raising=False)
+
+    ga._code_run_pgids = {501, 502}
+    ga.kill_all_code_run_processes()
+    assert sorted(killed) == [501, 502], f"every registered pgid must be killed, got {killed}"
+    assert ga._code_run_pgids == set()
+
+
+def test_emit_exception_terminal_cleans_up_subprocesses(monkeypatch):
+    """审查 C1/I8: agent 未捕获异常崩溃的终态路径同样必须清理 code_run
+    残留进程组——这是最可能遗留后台进程的路径(agent 中断时任务未正常收尾)。"""
+    import types
+
+    from ga_worker import task_terminal
+    from ga_worker.state import PendingTask, TaskRunState
+
+    calls: list[bool] = []
+    monkeypatch.setattr(task_terminal, "cleanup_legacy_subprocesses", lambda adapter: calls.append(True))
+    adapter = types.SimpleNamespace(
+        _terminal=lambda *a, **kw: worker_pb2.Terminal(task_id="t1", status=worker_pb2.TASK_FAILED),
+        _record_completed=lambda *a, **kw: None,
+        _lock=threading.Lock(),
+        _clear_active_locked=lambda *a, **kw: None,
+    )
+    pending = PendingTask(task_id="t1", request=None)
+    state = TaskRunState(pending=pending, agent=None)
+    events = list(task_terminal.emit_exception_terminal(adapter, worker_pb2.TaskEnvelope(task_id="t1"), state, RuntimeError("boom")))
+    assert any(e.HasField("terminal") for e in events)
+    assert calls, "emit_exception_terminal must clean up legacy subprocesses"
+
+
+# round9 审查(M13): build_snapshot_bundle 的 history 裁剪必须同步回 live
+# Agent——复用 Runner 时内存历史与已提交快照保持一致, 避免无界增长与
+# 复用/重建上下文分叉。
+def test_checkpoint_trims_live_history_on_reuse(roots, foundation_registry, tmp_path):
+    class HugeHistoryAgent(ScriptedAgent):
+        def run(self):
+            while True:
+                task = self.task_queue.get()
+                if isinstance(task, str):
+                    break
+                self.is_running = True
+                self.handler = SeededHandler({"note": "x"})
+                self.history = ["agent-" + "x" * 20000]
+                self.llmclient = type("LC", (), {"backend": type("B", (), {"history": [{"role": "user", "content": "b" * 20000}]})()})()
+                task["output"].put({"done": "final-body", "turn": 1})
+                self.is_running = False
+                self.task_queue.task_done()
+
+    adapter = _make_adapter(roots, foundation_registry, HugeHistoryAgent)
+    # max_history_bytes 设为 8KiB: 40KiB 历史必然触发确定性裁剪。
+    policy = _runtime_policy(max_history_bytes=8 * 1024)
+    adapter.start_session(_start_req(runtime_policy=policy))
+    events = _events(adapter, _task("cp-live", "checkpoint-live"))
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_SUCCEEDED
+
+    staging = roots["runtime_root"] / "staging" / "cp-live.bundle.json"
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    adapter.begin_checkpoint(
+        worker_pb2.BeginCheckpointRequest(
+            task_id="cp-live",
+            checkpoint_token="tok-live",
+            staging_ref=str(staging),
+            max_bundle_bytes=1024 * 1024,
+            runner_generation=1,
+        )
+    )
+    # 裁剪后 live agent 的 history 必须被同步(与快照一致, 不再保留完整历史)。
+    session = adapter._session
+    assert session is not None
+    assert session.completed is not None
+    live_agent = session.agent
+    live_total = len(live_agent.history) + len(live_agent.llmclient.backend.history)
+    assert live_total <= 2, f"live history must be trimmed to checkpoint budget, got {live_total} entries"
+    assert session.completed.agent_history == live_agent.history
+    assert session.completed.backend_history == live_agent.llmclient.backend.history
+
+
+def test_kill_all_kills_setsid_escaped_process(roots, monkeypatch):
+    """round9 审查(C3): 任务代码用 setsid 创建新会话后, 登记 PGID 无法覆盖;
+    /proc 枚举兜底必须杀掉逃逸进程(容器 PID namespace 内)。Linux 专属——
+    该测试在真实 Linux 容器中验证逃逸进程被 SIGKILL, Windows 跳过。"""
+    import platform
+    import subprocess
+    import sys
+
+    if platform.system() != "Linux":
+        pytest.skip("Linux-only: verifies /proc sweep semantics")
+    ga = _import_overlay_ga(roots)
+    # 以新会话启动一个长时间存活的后台进程(setsid 语义)。
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        start_new_session=True,
+    )
+    try:
+        # 进程必须存活(证明它脱离任何可登记的 PGID 场景)。
+        assert proc.poll() is None, "escaped process must be alive before cleanup"
+        ga.kill_all_code_run_processes()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError("setsid-escaped process survived /proc sweep")
+    finally:
+        if proc.poll() is None:
+            proc.kill()

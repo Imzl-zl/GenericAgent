@@ -2,8 +2,8 @@ package sandbox
 
 import (
 	"context"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -14,7 +14,7 @@ import (
 // inspectOutput is the parsed subset of `docker inspect` used for the
 // post-create verification (spec §7: 创建后必须校验).
 type inspectOutput struct {
-	ReadOnlyRootFS  bool
+	ReadOnlyRootFS bool
 	// Running 是容器 State.Running(审查 R5-I7): 停止/退出的容器不得复用。
 	Running         bool
 	Privileged      bool
@@ -240,10 +240,12 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 // (校验 source 尾缀, 防止任意 bind/volume 源被挂到工作区路径)。
 func (d *DockerCLI) expectedMountSources() map[string]string {
 	return map[string]string{
-		LegacyMemoryMount: "memory",
-		LegacyTempMount:   "temp",
-		RunnerStateMount:  "state",
-		RunnerConfigMount: "config",
+		LegacyMemoryMount:               "memory",
+		LegacyTempMount:                 "temp",
+		RunnerStateMount:                "state",
+		RunnerStateMount + "/committed": "state/committed",
+		RunnerStateMount + "/results":   "state/results",
+		RunnerConfigMount:               "config",
 	}
 }
 
@@ -392,12 +394,14 @@ func validateInspect(info inspectOutput, profile Profile, workspacesRoot, worksp
 	if !workspaceHashPattern.MatchString(workspaceHash) {
 		return fmt.Errorf("runner missing or invalid workspace hash label: %q", workspaceHash)
 	}
-	// 固定四个挂载: memory/temp/state 读写, config 只读(审查: attachments
-	// 冗余挂载已移除, 附件统一经工作区 temp/——方案 §6)。
+	// 固定六个挂载: memory/temp/state 读写, config 只读, 且审查 C3:
+	// state/committed 与 state/results 必须以只读子挂载遮蔽顶层 rw state
+	// 挂载——Runner 不得删除/替换已提交快照与结果文件。
+	// (审查: attachments 冗余挂载已移除, 附件统一经工作区 temp/——方案 §6)。
 	// 注意: info.Mounts 已按 Destination 字典序排序(Inspect 中 sort.Slice),
 	// 本表必须保持与排序后完全相同的顺序, 否则真实 docker inspect 解析路径
 	// 会误报。字典序: /ga/legacy/memory < /ga/legacy/temp < /ga/runner-config
-	// < /ga/runner-state。
+	// < /ga/runner-state < /ga/runner-state/committed < /ga/runner-state/results。
 	expected := []struct {
 		sub, dst string
 		ro       bool
@@ -406,6 +410,8 @@ func validateInspect(info inspectOutput, profile Profile, workspacesRoot, worksp
 		{"temp", LegacyTempMount, false},
 		{"config", RunnerConfigMount, true},
 		{"state", RunnerStateMount, false},
+		{"state/committed", RunnerStateMount + "/committed", true},
+		{"state/results", RunnerStateMount + "/results", true},
 	}
 	if len(info.Mounts) != len(expected) {
 		return fmt.Errorf("runner mounts = %d, want exactly %d: %+v", len(info.Mounts), len(expected), info.Mounts)
@@ -422,7 +428,12 @@ func validateInspect(info inspectOutput, profile Profile, workspacesRoot, worksp
 		// <workspacesRoot>/<hash>/<sub>, volume 必须为
 		// <workspaceVolume>/_data/<hash>/<sub>(daemon 命名空间)。
 		sub := want.sub
-		if wantSub, ok := mountSubs[want.dst]; ok {
+		if want.dst == RunnerConfigMount {
+			// 审查 C1/I6: config 挂载源按 generation 隔离为
+			// config/g<generation>, generation 从容器 label 读取(与 env
+			// 一致性已在上方校验)。
+			sub = "config/g" + info.Labels["com.genericagent.runner.generation"]
+		} else if wantSub, ok := mountSubs[want.dst]; ok {
 			sub = wantSub
 		}
 		source := filepath.ToSlash(got.Source)

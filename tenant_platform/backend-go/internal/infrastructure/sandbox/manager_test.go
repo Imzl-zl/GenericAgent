@@ -29,6 +29,9 @@ type fakeCLI struct {
 	// runnerHash 是 RunnerWorkspaceHash 的返回值(模拟 Manager 重启后
 	// 按容器 ID 销毁时从 label 恢复 workspace hash, 审查 R5-C6)。
 	runnerHash string
+	// runnerGen 是 RunnerGenerationLabel 的返回值(审查 C1/I6:
+	// 销毁时按 generation 清理 config 子目录)。
+	runnerGen uint64
 	// inspectErr 控制 Inspect 返回值(模拟容器停止/配置漂移)。
 	inspectErr error
 	// inspectFailOn 指定第 N 次 Inspect 调用返回 inspectErr(0 表示不启用),
@@ -93,6 +96,13 @@ func (f *fakeCLI) RunnerWorkspaceHash(ctx context.Context, idOrName string) (str
 		return "", false, nil
 	}
 	return f.runnerHash, true, nil
+}
+
+func (f *fakeCLI) RunnerGenerationLabel(ctx context.Context, idOrName string) (uint64, bool, error) {
+	if f.runnerGen == 0 {
+		return 0, false, nil
+	}
+	return f.runnerGen, true, nil
 }
 
 func (f *fakeCLI) EnsureWorkspace(ctx context.Context, workspaceHash string) error {
@@ -161,7 +171,7 @@ func TestManagerDestroyRunnerCleansConfigAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	hash, _ := WorkspaceDirHash("personal:88")
 	root := t.TempDir()
-	configDir := filepath.Join(root, hash, "config")
+	configDir := filepath.Join(root, hash, "config", "g1")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +179,7 @@ func TestManagerDestroyRunnerCleansConfigAfterRestart(t *testing.T) {
 	if err := os.WriteFile(secret, []byte("private-key-material"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cli := &fakeCLI{runnerHash: hash, managerManaged: true, containerExists: true}
+	cli := &fakeCLI{runnerHash: hash, runnerGen: 1, managerManaged: true, containerExists: true}
 	m := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: root, ContainerNamePrefix: "ga-runner"})
 
 	// 按容器 ID 销毁(map 无记录, 模拟重启)。
@@ -374,14 +384,14 @@ func TestManagerDestroyRunnerClearsCacheAndConfig(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	hash, _ := WorkspaceDirHash("personal:1")
-	configDir := root + "/" + hash + "/config"
+	configDir := root + "/" + hash + "/config/g1"
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(configDir+"/server.key", []byte("key"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cli := &fakeCLI{managerManaged: true, containerExists: true}
+	cli := &fakeCLI{managerManaged: true, containerExists: true, runnerHash: hash, runnerGen: 1}
 	m := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: root, ContainerNamePrefix: "ga-runner"})
 	first, created, err := m.EnsureRunner(ctx, EnsureRunnerRequest{WorkspaceKey: "personal:1", Generation: 1})
 	if err != nil || !created {
@@ -446,5 +456,87 @@ func TestManagerDestroyRunnerByIDRejectsForeignManager(t *testing.T) {
 	}
 	if len(cli.destroyed) != 0 {
 		t.Fatalf("foreign container must not be destroyed: %v", cli.destroyed)
+	}
+}
+
+// TestManagerDestroyRunnerCleansOnlyOwnGenerationConfig 验证审查 C1/I6:
+// config 按 generation 隔离后, DestroyRunner 的清理只删自己 generation 的
+// config/g<gen> 子目录——旧 generation 容器销毁不得删除新 generation 已
+// 写入的 mTLS 材料(否则新 Runner 丢失凭据/挂载已 unlink 目录)。
+func TestManagerDestroyRunnerCleansOnlyOwnGenerationConfig(t *testing.T) {
+	ctx := context.Background()
+	cli := &fakeCLI{}
+	root := t.TempDir()
+	m := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: root, ContainerNamePrefix: "ga-runner"})
+	hash := mustWorkspaceHash("personal:1")
+	// 预写两个 generation 的 config(模拟 g1 遗留 + g2 已创建)。
+	if err := os.MkdirAll(filepath.Join(root, hash, "config", "g1"), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, hash, "config", "g2"), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, hash, "config", "g1", "server.crt"), []byte("old"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, hash, "config", "g2", "server.crt"), []byte("new"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟 Manager 重启后按容器名销毁: label 提供 hash 与 generation。
+	cli.runnerHash = hash
+	cli.runnerGen = 1
+	cli.managerManaged = true
+	cli.containerExists = true
+	if err := m.DestroyRunner(ctx, "ga-runner-"+hash[:12]+"-g1"); err != nil {
+		t.Fatalf("DestroyRunner: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, hash, "config", "g1")); !os.IsNotExist(err) {
+		t.Fatal("g1 config dir must be removed after destroy")
+	}
+	if _, err := os.Stat(filepath.Join(root, hash, "config", "g2", "server.crt")); err != nil {
+		t.Fatal("g2 config must survive old-generation destroy")
+	}
+}
+
+// TestManagerDestroyRunnerSerializesWithEnsureRunner 验证审查 C1/I6:
+// DestroyRunner 与 EnsureRunner 共享 per-workspace 锁——并发时旧 generation
+// 销毁清理不得与新建(写 config/g<new>)交错, 避免"旧删新"竞态。
+func TestManagerDestroyRunnerSerializesWithEnsureRunner(t *testing.T) {
+	ctx := context.Background()
+	cli := &fakeCLI{}
+	root := t.TempDir()
+	m := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: root, ContainerNamePrefix: "ga-runner"})
+	hash := mustWorkspaceHash("personal:1")
+	if err := os.MkdirAll(filepath.Join(root, hash, "config", "g2"), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	cli.runnerHash = hash
+	cli.runnerGen = 1
+	cli.managerManaged = true
+	cli.containerExists = true
+	// 同一 workspace: 先创建 g2(写 config/g2), 再销毁 g1(只应删 config/g1)。
+	if err := os.WriteFile(filepath.Join(root, hash, "config", "g2", "server.crt"), []byte("new-cert"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.EnsureRunner(ctx, EnsureRunnerRequest{
+		WorkspaceKey: "personal:1", Generation: 2,
+		ConfigFiles: map[string][]byte{"server.crt": []byte("new-cert")},
+	}); err != nil {
+		t.Fatalf("EnsureRunner g2: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, hash, "config", "g1"), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, hash, "config", "g1", "server.crt"), []byte("old"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DestroyRunner(ctx, "ga-runner-"+hash[:12]+"-g1"); err != nil {
+		t.Fatalf("DestroyRunner: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, hash, "config", "g1")); !os.IsNotExist(err) {
+		t.Fatal("g1 config dir must be removed")
+	}
+	if _, err := os.Stat(filepath.Join(root, hash, "config", "g2", "server.crt")); err != nil {
+		t.Fatal("g2 config written by EnsureRunner must survive destroy of g1")
 	}
 }

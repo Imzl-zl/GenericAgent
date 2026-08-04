@@ -8,7 +8,7 @@ import (
 
 func TestLoopbackSendMessageRecordsMessage(t *testing.T) {
 	tr := NewLoopbackTransport()
-	if err := tr.SendMessage(context.Background(), "bot-1", "user-1", "hello"); err != nil {
+	if err := tr.SendMessage(context.Background(), "bot-1", "user-1", "hello", ""); err != nil {
 		t.Fatal(err)
 	}
 	sent := tr.SentMessages()
@@ -23,48 +23,56 @@ func TestLoopbackSendMessageRecordsMessage(t *testing.T) {
 func TestLoopbackSendMessageSurfacesInjectedError(t *testing.T) {
 	tr := NewLoopbackTransport()
 	tr.SetSendError(errors.New("transport down"))
-	if err := tr.SendMessage(context.Background(), "bot", "user", "text"); err == nil {
+	if err := tr.SendMessage(context.Background(), "bot", "user", "text", ""); err == nil {
 		t.Fatal("expected injected error")
 	}
 }
 
-func TestLoopbackIdempotencyFirstCallTrueSecondFalse(t *testing.T) {
+func TestLoopbackIdempotencyCheckDoesNotMark(t *testing.T) {
 	tr := NewLoopbackTransport()
 	ctx := context.Background()
-	first, err := tr.RecordMessageIdempotency(ctx, "bot-1", "msg-1")
-	if err != nil {
+	seen, err := tr.CheckMessageIdempotency(ctx, "bot-1", "msg-1")
+	if err != nil || seen {
+		t.Fatalf("unseen message: seen=%v err=%v", seen, err)
+	}
+	// Check 只读: 再次检查仍 unseen。
+	seen2, err := tr.CheckMessageIdempotency(ctx, "bot-1", "msg-1")
+	if err != nil || seen2 {
+		t.Fatalf("check must not mark: seen=%v err=%v", seen2, err)
+	}
+	if err := tr.MarkMessageIdempotency(ctx, "bot-1", "msg-1"); err != nil {
 		t.Fatal(err)
 	}
-	if !first {
-		t.Fatal("first call should return true")
-	}
-	second, err := tr.RecordMessageIdempotency(ctx, "bot-1", "msg-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second {
-		t.Fatal("second call should return false (duplicate)")
+	seen3, err := tr.CheckMessageIdempotency(ctx, "bot-1", "msg-1")
+	if err != nil || !seen3 {
+		t.Fatalf("marked message must be seen: seen=%v err=%v", seen3, err)
 	}
 }
 
-func TestLoopbackIdempotencyDifferentMessagesBothTrue(t *testing.T) {
+func TestLoopbackIdempotencyDifferentMessagesIndependent(t *testing.T) {
 	tr := NewLoopbackTransport()
 	ctx := context.Background()
-	first, _ := tr.RecordMessageIdempotency(ctx, "bot-1", "msg-1")
-	second, _ := tr.RecordMessageIdempotency(ctx, "bot-1", "msg-2")
-	if !first || !second {
-		t.Fatal("different messages should both return true")
+	_ = tr.MarkMessageIdempotency(ctx, "bot-1", "msg-1")
+	seen, _ := tr.CheckMessageIdempotency(ctx, "bot-1", "msg-2")
+	if seen {
+		t.Fatal("different messages must be independent")
 	}
 }
 
 func TestLoopbackIdempotencyRejectsEmptyInputs(t *testing.T) {
 	tr := NewLoopbackTransport()
 	ctx := context.Background()
-	if _, err := tr.RecordMessageIdempotency(ctx, "", "msg"); err == nil {
+	if _, err := tr.CheckMessageIdempotency(ctx, "", "msg"); err == nil {
 		t.Fatal("expected error for empty bot uuid")
 	}
-	if _, err := tr.RecordMessageIdempotency(ctx, "bot", ""); err == nil {
+	if _, err := tr.CheckMessageIdempotency(ctx, "bot", ""); err == nil {
 		t.Fatal("expected error for empty message id")
+	}
+	if err := tr.MarkMessageIdempotency(ctx, "", "msg"); err == nil {
+		t.Fatal("expected error for empty bot uuid on mark")
+	}
+	if err := tr.MarkMessageIdempotency(ctx, "bot", ""); err == nil {
+		t.Fatal("expected error for empty message id on mark")
 	}
 }
 
@@ -75,8 +83,8 @@ func TestLoopbackLastSentMessage(t *testing.T) {
 	if ok {
 		t.Fatal("expected no messages initially")
 	}
-	_ = tr.SendMessage(ctx, "bot", "user", "first")
-	_ = tr.SendMessage(ctx, "bot", "user", "second")
+	_ = tr.SendMessage(ctx, "bot", "user", "first", "")
+	_ = tr.SendMessage(ctx, "bot", "user", "second", "")
 	last, ok := tr.LastSentMessage()
 	if !ok || last.Text != "second" {
 		t.Fatalf("expected last message 'second', got %+v ok=%v", last, ok)
@@ -86,14 +94,14 @@ func TestLoopbackLastSentMessage(t *testing.T) {
 func TestLoopbackResetClearsState(t *testing.T) {
 	tr := NewLoopbackTransport()
 	ctx := context.Background()
-	_ = tr.SendMessage(ctx, "bot", "user", "text")
-	_, _ = tr.RecordMessageIdempotency(ctx, "bot", "msg")
+	_ = tr.SendMessage(ctx, "bot", "user", "text", "")
+	_ = tr.MarkMessageIdempotency(ctx, "bot", "msg")
 	tr.Reset()
 	if len(tr.SentMessages()) != 0 {
 		t.Fatal("expected no messages after reset")
 	}
-	first, _ := tr.RecordMessageIdempotency(ctx, "bot", "msg")
-	if !first {
-		t.Fatal("expected true after reset (state cleared)")
+	seen, _ := tr.CheckMessageIdempotency(ctx, "bot", "msg")
+	if seen {
+		t.Fatal("expected unseen after reset (state cleared)")
 	}
 }

@@ -49,7 +49,10 @@ func newIdempotencyCache() *idempotencyCache {
 // Subsequent calls within TTL return false. Expired entries are evicted lazily
 // when a shard exceeds maxPerShard, so memory stays bounded without a background
 // goroutine.
-func (c *idempotencyCache) Record(botUUID, messageID string) bool {
+//
+// Round8 审查: 拆分为 Check(只读)与 Mark(写入)——处理失败路径不得提前
+// 消费消息, 否则 Poller 重试会被判 Duplicate 而永久丢消息。
+func (c *idempotencyCache) Check(botUUID, messageID string) bool {
 	key := botUUID + "|" + messageID
 	idx := c.shardIndex(key)
 	now := time.Now()
@@ -57,13 +60,23 @@ func (c *idempotencyCache) Record(botUUID, messageID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if exp, ok := s.seen[key]; ok && now.Before(exp) {
-		return false
+		return true
 	}
+	return false
+}
+
+// Mark 记录 (botUUID, messageID) 已成功处理(幂等; TTL 内重复标记无害)。
+func (c *idempotencyCache) Mark(botUUID, messageID string) {
+	key := botUUID + "|" + messageID
+	idx := c.shardIndex(key)
+	now := time.Now()
+	s := &c.shards[idx]
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.seen) >= c.maxPerShard {
 		c.evictExpired(s, now)
 	}
 	s.seen[key] = now.Add(c.ttl)
-	return true
 }
 
 func (c *idempotencyCache) shardIndex(key string) int {

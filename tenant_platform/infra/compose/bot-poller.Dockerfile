@@ -10,6 +10,7 @@ RUN groupadd --system --gid 10003 ga-delivery \
     && useradd --system --uid 10002 --gid 10002 --groups ga-delivery --create-home --home-dir /home/ga-bot ga-bot \
     && install -d -o 10002 -g 10002 -m 0700 /home/ga-bot/.wxbot \
     && install -d -o 10002 -g 10003 -m 2770 /var/lib/ga/bot-media \
+    && install -d -o 10002 -g 10003 -m 2770 /var/lib/ga/delivery-spool \
     && pip install --no-cache-dir 'requests>=2.28' 'pycryptodome>=3.19' 'qrcode>=7.4' 'pillow>=9.0'
 
 COPY tenant_platform/bot_poller/poller_server.py /opt/ga/legacy/tenant_platform/bot_poller/poller_server.py

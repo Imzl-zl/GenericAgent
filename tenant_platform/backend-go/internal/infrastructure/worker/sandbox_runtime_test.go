@@ -228,3 +228,31 @@ func TestStartCleanupReleasesLeaseExactlyOnce(t *testing.T) {
 		t.Fatalf("expected exactly one release, got %d", got)
 	}
 }
+
+// round9 审查: scheduler 先 ResolveGeneration(接管, created=true) 再 Start
+// (同 owner 续租, created=false) 时, 二次获取会丢失接管标记——Start 必须
+// 对任何非空 stale_container_id 无条件销毁(不依赖 created), 否则旧容器
+// 继续挂载同一工作区产生双写。
+func TestStartDestroysStaleContainerEvenWhenLeaseNotCreated(t *testing.T) {
+	leases := &fakeLeaseStore{}
+	manager := &fakeManagerCLI{}
+	r := newSandboxRuntimeForTest(t, leases, manager)
+	// 模拟二次获取: created=false 但 stale_container_id 非空(上次接管写入,
+	// 同 owner 续租不清理)。
+	leases.created = false
+	leases.lease = domain.RunnerLease{Generation: 2, StaleContainerID: "old-cid-456"}
+
+	// dial 会失败, 但 stale 销毁必须发生在 dial 之前。
+	if _, err := r.Start(context.Background(), StartRequest{SessionKey: "personal:9"}); err == nil {
+		t.Fatal("Start expected to fail on dial (no server)")
+	}
+	if len(manager.destroyed) == 0 || manager.destroyed[0] != "old-cid-456" {
+		t.Fatalf("stale container must be destroyed first regardless of created flag, destroyed=%v", manager.destroyed)
+	}
+	// 销毁后失败路径还释放 lease。
+	leases.mu.Lock()
+	defer leases.mu.Unlock()
+	if len(leases.released) != 1 {
+		t.Fatalf("lease must be released, released=%v", leases.released)
+	}
+}

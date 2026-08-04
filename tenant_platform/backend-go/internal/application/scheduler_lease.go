@@ -93,9 +93,13 @@ func (s *scheduler) startDispatchHeartbeat(parent context.Context, task domain.T
 			case <-ticker.C:
 				if err := heartbeatOnce(); err != nil {
 					// 任务已终态(正常完成/取消后 dispatch 尚未退出): 0 rows 是
-					// 预期, 不记录错误, 静默退出(审查 F5——不能把正常完成的
-					// 任务误报为 lease 丢失)。
+					// 预期。round9 审查: 不能直接静默退出——任务可能被恢复流程/
+					// 新 owner 终态化而本 dispatch 仍在执行(旧进程暂停后恢复),
+					// 必须取消派发上下文让 ExecuteTask 中断并销毁 Worker, 防止与
+					// 接管者重叠执行。正常完成路径 terminal 已收到, cancel 无
+					// 副作用; 不 setError, 避免误触发 fallback 终态化覆盖他方状态。
 					if current, getErr := s.cfg.Store.GetTask(ctx, task.ID); getErr == nil && current.Status.IsTerminal() {
+						cancel()
 						return
 					}
 					// lease 丢失(0 rows 且任务未终态)是确定性事件, 不重试(审查 F5)。
@@ -127,6 +131,7 @@ func (s *scheduler) startDispatchHeartbeat(parent context.Context, task domain.T
 							break
 						}
 						if current, getErr := s.cfg.Store.GetTask(ctx, task.ID); getErr == nil && current.Status.IsTerminal() {
+							cancel()
 							return
 						}
 						if errors.Is(retryErr, domain.ErrLeaseExpired) {
@@ -143,6 +148,7 @@ func (s *scheduler) startDispatchHeartbeat(parent context.Context, task domain.T
 					}
 					current, getErr := s.cfg.Store.GetTask(ctx, task.ID)
 					if getErr == nil && current.Status.IsTerminal() {
+						cancel()
 						return
 					}
 					if heartbeat.requeued.Load() {

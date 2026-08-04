@@ -73,9 +73,11 @@ type fakeTaskService struct {
 	submitErr     error
 	cancelledID   string
 	cancelErr     error
+	submitCount   int
 }
 
 func (f *fakeTaskService) SubmitTask(_ context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error) {
+	f.submitCount++
 	if f.submitErr != nil {
 		return domain.Task{}, f.submitErr
 	}
@@ -117,7 +119,7 @@ func newTestRouter(store *fakeRouterStore, tr *transport.LoopbackTransport) (Rou
 func newTestRouterWithSessionFiles(t *testing.T, store *fakeRouterStore, tr *transport.LoopbackTransport) (Router, *fakeTaskService, SessionFiles) {
 	t.Helper()
 	tasks := &fakeTaskService{}
-	sessionFiles, err := NewSessionFiles(t.TempDir())
+	sessionFiles, err := NewSessionFiles(t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("new session files: %v", err)
 	}
@@ -145,8 +147,40 @@ func TestRouterRejectsMissingFields(t *testing.T) {
 	}
 }
 
+// Round8 语义: 未消费的失败(unknown bot)不得标记幂等——Poller 重试必须
+// 能重新处理; 若 bot 恢复存在, 同一条消息重试应能正常路由而非 Duplicate。
+func TestRouterUnknownBotDoesNotConsumeIdempotency(t *testing.T) {
+	store := newFakeRouterStore()
+	tr := transport.NewLoopbackTransport()
+	r, _ := newTestRouter(store, tr)
+	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}
+	if _, err := r.HandleMessage(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	// bot 恢复后, 同消息重试必须真正处理(而非被幂等缓存挡住)。
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	res, err := r.HandleMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Action != ActionTaskCreated {
+		t.Fatalf("retry after unknown-bot failure must be processed, got %s", res.Action)
+	}
+	// 成功后再重试才是 Duplicate。
+	res, err = r.HandleMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Action != ActionDuplicate {
+		t.Fatalf("expected duplicate after success, got %s", res.Action)
+	}
+}
+
 func TestRouterDuplicateMessageIgnored(t *testing.T) {
 	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}

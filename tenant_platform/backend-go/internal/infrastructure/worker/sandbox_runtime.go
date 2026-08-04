@@ -114,8 +114,13 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 	//    lease 记录的 stale_container_id 销毁(best-effort; 找不到按孤儿由
 	//    Manager 回收)。接管事务把旧 container_id 移入 stale_container_id,
 	//    Platform 重启生成新 CA 后旧容器无法拨号, 必须销毁重建(审查 C6)。
+	//    round9 审查: 销毁条件不再依赖 created——scheduler 先 ResolveGeneration
+	//    (接管, created=true) 再调用 Start(同 owner 续租, created=false) 时,
+	//    二次获取会丢失接管标记并跳过销毁, 旧容器继续挂载同一工作区产生
+	//    双写; stale_container_id 在接管时写入且同 owner 续租不清理, 因此
+	//    只要非空就无条件销毁(幂等, 对不存在容器成功), 失败 fail-closed。
 	staleContainer := lease.StaleContainerID
-	if created && staleContainer != "" {
+	if staleContainer != "" {
 		if err := r.cfg.Manager.Destroy(ctx, staleContainer); err != nil {
 			// 审查 R5-C3: 旧 generation 容器销毁失败必须 fail-closed——旧
 			// Runner 仍挂载同一 workspace 且可能写穿 memory/temp/state, 继续
@@ -208,17 +213,24 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 	renewStop := make(chan struct{})
 	renewDone := make(chan struct{})
 	var cleanupOnce sync.Once
-	cleanup := func() {
+	// round9 审查: cleanup 无条件销毁容器(不再依赖 created)——复用容器在
+	// 续租失败/取消/idle 回收时同样必须销毁, 否则 lease 已释放但容器继续
+	// 挂载工作区并可能执行旧任务; 销毁按确定性容器名幂等, 失败不阻塞
+	// lease 释放(下次 acquire 以 generation+1 重建, 旧容器由 Manager 扫描
+	// 或下次接管兜底清理)。
+	cleanup := func(capabilityJTI string) {
 		cleanupOnce.Do(func() {
 			close(renewStop)
 			<-renewDone
 			shutCtx, cancel := context.WithTimeout(context.Background(), workerShutdownTimeout)
-			// 控制面身份 fencing(方案 §7): Shutdown 绑定 workspace/generation。
-			_ = client.Shutdown(shutCtx, workspaceKey, "scheduler-stop", generation, "")
+			// 控制面身份 fencing(方案 §7): Shutdown 绑定 workspace/generation,
+			// 并携带当前凭据集 JTI(审查 C1/I7: 生产会话有活跃 JTI 集时,
+			// 空 JTI 会被 Worker 拒绝, 优雅关闭必然失败)。
+			_ = client.Shutdown(shutCtx, workspaceKey, "scheduler-stop", generation, capabilityJTI)
 			cancel()
 			_ = conn.Close()
-			if created {
-				_ = r.cfg.Manager.Destroy(context.Background(), runner.Name)
+			if err := r.cfg.Manager.Destroy(context.Background(), runner.Name); err != nil {
+				slogWarn("sandbox runtime: destroy runner on cleanup failed", "runner", runner.Name, "error", err)
 			}
 			// 释放 lease: 下次 acquire 以 generation+1 重建, 防旧容器复活。
 			// 带 generation 条件, 旧 cleanup 无法释放新 generation 的 lease(审查 C6)。
@@ -236,7 +248,7 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 			case <-ticker.C:
 				if err := r.cfg.LeaseStore.RenewRunnerLease(context.Background(), workspaceKey, r.cfg.PlatformInstanceID, generation, r.cfg.RunnerLeaseTTL); err != nil {
 					slogWarn("sandbox runtime: renew runner lease failed; fencing runner", "runner_key", workspaceKey, "error", err)
-					go cleanup()
+					go cleanup("")
 					return
 				}
 			}

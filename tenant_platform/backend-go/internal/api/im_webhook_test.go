@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -321,5 +322,30 @@ func TestIMWebhookRejectsTamperedBody(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for tampered body, got %d", rec.Code)
+	}
+}
+
+// round9 审查: cursor 持久化从路由前移到路由成功后——路由失败时不得推进
+// cursor(否则消息被跳过且 Poller 以为已确认), 返回 5xx 让 Poller 重试。
+func TestIMWebhookDoesNotPersistCursorWhenRoutingFails(t *testing.T) {
+	lc := &fakeBotLifecycle{}
+	router := &fakeRouter{err: errors.New("router down")}
+	server := newTestServerWithRouterAndLifecycle(t, router, lc)
+
+	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
+		BotUUID:    "bot-1",
+		IlinkUserID: "user-1",
+		MessageID:  "msg-1",
+		Text:       "hello",
+		UpdatesBuf: "cursor-123",
+	})
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on routing failure, got %d", rec.Code)
+	}
+	if lc.persistBuf != "" {
+		t.Fatalf("cursor must not be persisted when routing fails, got %q", lc.persistBuf)
 	}
 }

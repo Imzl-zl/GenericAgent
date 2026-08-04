@@ -27,6 +27,9 @@ const (
 	sessionManifestMaxBytes = 1 << 20 // 1 MiB
 	// sessionManifestMaxFiles 限制 manifest 条目数, 防止解析后处理爆炸。
 	sessionManifestMaxFiles = 4096
+	// sessionManifestNameMaxBytes 限制单条目名称长度(审查 C1): 名称流入
+	// 交付快照文件名与用户可见 displayName, 超长名称必须拒绝。
+	sessionManifestNameMaxBytes = 255
 )
 
 var fileMarkerRE = regexp.MustCompile(`\[FILE:([^\]]+)\]`)
@@ -51,6 +54,10 @@ type SessionFiles interface {
 
 type sessionFilesManager struct {
 	root string
+	// mediaRoot 是入站媒体源根(BotMediaRoot, Poller 下载目录)。非空时
+	// ImportInbound 用 CopyFileFromBeneath 以 openat2 原子校验源路径
+	// (round9 审查: 消除 EvalSymlinks 预检与复制之间的 TOCTOU 窗口)。
+	mediaRoot string
 	// workspaceLayout 为 true 时(root = GA_WORKSPACES_ROOT)按
 	// <root>/<workspace-hash>/temp/session_files/<digest> 布局落盘:
 	// 附件/输出经共享卷 temp 对 Runner 可见(方案 §4/§6)。
@@ -65,7 +72,15 @@ type sessionManifest struct {
 	Files   []SessionFileRef `json:"files"`
 }
 
-func NewSessionFiles(root string) (SessionFiles, error) {
+func cleanOptionalRoot(root string) string {
+	// filepath.Clean("") 返回 ".", 会破坏"空 = 未配置"的语义(round9)。
+	if strings.TrimSpace(root) == "" {
+		return ""
+	}
+	return filepath.Clean(root)
+}
+
+func NewSessionFiles(root, mediaRoot string) (SessionFiles, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("session files root is required")
 	}
@@ -77,7 +92,7 @@ func NewSessionFiles(root string) (SessionFiles, error) {
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return nil, fmt.Errorf("create session files root: %w", err)
 	}
-	return &sessionFilesManager{root: base}, nil
+	return &sessionFilesManager{root: base, mediaRoot: cleanOptionalRoot(mediaRoot)}, nil
 }
 
 // NewWorkspaceSessionFiles 构建共享卷布局的 SessionFiles(生产 Runner 模式):
@@ -85,12 +100,13 @@ func NewSessionFiles(root string) (SessionFiles, error) {
 // GA_WORKSPACE_TEMP(/ga/legacy/temp) 的 worker 侧布局完全一致。
 // ensureWorkspace 非 nil 时在每次附件导入前调用(方案 §6: fresh workspace
 // 首条带附件消息必须先由 Manager 预置目录布局与共享组权限)。
-func NewWorkspaceSessionFiles(workspacesRoot string, ensureWorkspace func(sessionKey string) error) (SessionFiles, error) {
+func NewWorkspaceSessionFiles(workspacesRoot, mediaRoot string, ensureWorkspace func(sessionKey string) error) (SessionFiles, error) {
 	if strings.TrimSpace(workspacesRoot) == "" {
 		return nil, fmt.Errorf("workspaces root is required")
 	}
 	return &sessionFilesManager{
 		root:            filepath.Clean(workspacesRoot),
+		mediaRoot:       cleanOptionalRoot(mediaRoot),
 		workspaceLayout: true,
 		ensureWorkspace: ensureWorkspace,
 	}, nil
@@ -105,6 +121,11 @@ func (m *sessionFilesManager) SandboxRoot(sessionKey string) string {
 	}
 	return filepath.Join(m.root, sessionKeyDigest(sessionKey))
 }
+
+// maxInboundMediaBytes 限制入站附件复制上限(对齐 Bot Poller 下载器的
+// MAX_MEDIA_BYTES=100MB; Round8 审查: 纵深防御, 防被攻破的 Poller 提交
+// 超限文件耗尽 Platform 磁盘)。
+const maxInboundMediaBytes = 100 << 20
 
 func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []string) ([]SessionFileRef, error) {
 	if len(sourcePaths) == 0 {
@@ -123,6 +144,12 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 
 	root := m.SandboxRoot(sessionKey)
 	dirMode := m.dirMode()
+	// Round8(发现): MkdirAllBeneath 要求 root 已存在(unix.Open O_DIRECTORY);
+	// ensureWorkspace 为 nil 的路径(dev loopback)必须先创建 root, 否则
+	// Linux 上带附件消息在创建 attachments 目录时失败。
+	if err := os.MkdirAll(root, dirMode); err != nil {
+		return nil, fmt.Errorf("create session sandbox root: %w", err)
+	}
 	if err := safefs.MkdirAllBeneath(root, sessionAttachmentsDir, dirMode); err != nil {
 		return nil, fmt.Errorf("create attachments dir: %w", err)
 	}
@@ -138,13 +165,6 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 		if strings.TrimSpace(src) == "" {
 			continue
 		}
-		info, err := os.Stat(src)
-		if err != nil {
-			return nil, fmt.Errorf("stat source attachment %q: %w", src, err)
-		}
-		if info.IsDir() {
-			return nil, fmt.Errorf("source attachment %q is a directory", src)
-		}
 		manifest.NextSeq++
 		alias := fmt.Sprintf("F%03d", manifest.NextSeq)
 		safeName := sanitizeFileName(filepath.Base(src))
@@ -152,8 +172,28 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 			safeName = "file"
 		}
 		rel := filepath.ToSlash(filepath.Join(sessionAttachmentsDir, alias+"_"+safeName))
-		if err := safefs.CopyFileBeneath(root, filepath.FromSlash(rel), src, m.fileMode()); err != nil {
-			return nil, fmt.Errorf("copy attachment %q: %w", src, err)
+		if m.mediaRoot != "" {
+			// round9 审查: 源路径在 BotMediaRoot 内, 由 openat2 单次解析
+			// 完成"不逃逸根 + 无符号链接"校验, 消除预检-复制 TOCTOU 窗口。
+			srcRel, err := filepath.Rel(m.mediaRoot, src)
+			if err != nil || srcRel == ".." || strings.HasPrefix(srcRel, ".."+string(filepath.Separator)) || filepath.IsAbs(srcRel) {
+				return nil, fmt.Errorf("source attachment %q escapes media root %q", src, m.mediaRoot)
+			}
+			if err := safefs.CopyFileFromBeneath(m.mediaRoot, srcRel, root, filepath.FromSlash(rel), m.fileMode(), maxInboundMediaBytes); err != nil {
+				return nil, fmt.Errorf("copy attachment %q: %w", src, err)
+			}
+		} else {
+			// 无媒体根(loopback/dev): 保持旧语义(路径式源, 调用方已校验)。
+			info, err := os.Stat(src)
+			if err != nil {
+				return nil, fmt.Errorf("stat source attachment %q: %w", src, err)
+			}
+			if info.IsDir() {
+				return nil, fmt.Errorf("source attachment %q is a directory", src)
+			}
+			if err := safefs.CopyFileBeneath(root, filepath.FromSlash(rel), src, m.fileMode(), maxInboundMediaBytes); err != nil {
+				return nil, fmt.Errorf("copy attachment %q: %w", src, err)
+			}
 		}
 		ref := SessionFileRef{
 			Alias:        alias,
@@ -441,7 +481,38 @@ func (m *sessionFilesManager) loadManifest(root string) (sessionManifest, error)
 	if manifest.NextSeq < 0 || manifest.NextSeq > sessionManifestMaxFiles*2 {
 		return sessionManifest{}, fmt.Errorf("session manifest next_seq %d out of range", manifest.NextSeq)
 	}
+	// 审查 C1: manifest 位于 Runner 可写的 temp/ 下, 条目字段不可信——
+	// OriginalName 会流入交付快照文件名与用户可见 displayName, RelativePath
+	// 会流入提示上下文。非法条目 fail-closed, 不得静默丢弃(否则攻击者可
+	// 通过丢弃合法条目制造混乱)。
+	for _, e := range manifest.Files {
+		if err := validateManifestEntry(e); err != nil {
+			return sessionManifest{}, err
+		}
+	}
 	return manifest, nil
+}
+
+// validateManifestEntry 校验 manifest 单个条目(审查 C1)。
+func validateManifestEntry(e SessionFileRef) error {
+	if e.Alias == "" || strings.HasPrefix(e.Alias, "..") || strings.ContainsAny(e.Alias, `\/`) {
+		return fmt.Errorf("session manifest entry has unsafe alias %q", e.Alias)
+	}
+	if e.OriginalName == "" || e.OriginalName == "." || e.OriginalName == ".." ||
+		filepath.Base(e.OriginalName) != e.OriginalName || strings.ContainsAny(e.OriginalName, `\/`) ||
+		len(e.OriginalName) > sessionManifestNameMaxBytes {
+		return fmt.Errorf("session manifest entry %q has unsafe original_name %q", e.Alias, e.OriginalName)
+	}
+	rel := filepath.FromSlash(e.RelativePath)
+	cleaned := filepath.Clean(rel)
+	if e.RelativePath == "" || filepath.IsAbs(rel) || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) || strings.Contains(rel, "\x00") ||
+		cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		// 审查 C1 收紧: Clean 后仍含 .. 段(outputs/../../x)
+		// 等中段跑逃一律拒绝。
+		return fmt.Errorf("session manifest entry %q relative path escapes: %q", e.Alias, e.RelativePath)
+	}
+	return nil
 }
 
 func (m *sessionFilesManager) saveManifest(root string, manifest sessionManifest) error {

@@ -9,6 +9,148 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from agent_loop import BaseHandler, StepOutcome, json_default
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
+# 审查 C2 (Round8): 多租户 Runner 按 workspace 复用, code_run 派生的后台进程若跨任务
+# 存活, 可窃取下一任务的 capability 凭据或继续写工作区。模块级注册表登记每个
+# code_run 进程组的 **创建时快照 PGID**(POSIX), 任务终态时按 PGID 直接 killpg——
+# 不能存 Popen 对象再 getpgid: 父进程退出后 getpgid(pid) 抛 ProcessLookupError,
+# 但组内后台子进程可能仍存活, 无法再定位进程组。无 getpgid 的平台(Windows)
+# 回退登记 Popen 对象。
+_code_run_pgids: set = set()  # POSIX: int pgid
+_code_run_procs: set = set()  # 无进程组语义平台: Popen 回退
+_code_run_pids_lock = threading.Lock()
+
+
+# register_code_run_process 登记一个 code_run 进程组: POSIX 保存创建时快照的
+# PGID, 其他平台保存 Popen 对象(process.kill 回退)。
+def register_code_run_process(process) -> None:
+    if os.name != 'nt' and getattr(os, "getpgid", None) is not None:
+        try:
+            pgid = os.getpgid(process.pid)
+        except (ProcessLookupError, OSError):
+            pgid = None  # 进程已退出: 无需登记
+        if pgid is not None:
+            with _code_run_pids_lock:
+                _code_run_pgids.add(pgid)
+            return
+    with _code_run_pids_lock:
+        _code_run_procs.add(process)
+
+
+# unregister_code_run_process 移除登记(超时/异常路径已杀组时调用)。
+def unregister_code_run_process(process) -> None:
+    with _code_run_pids_lock:
+        _code_run_procs.discard(process)
+        for pgid in list(_code_run_pgids):
+            if pgid == process.pid:
+                _code_run_pgids.discard(pgid)
+
+
+def _kill_pgid(pgid) -> None:
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return
+    try:
+        killpg(pgid, 9)  # SIGKILL
+    except (ProcessLookupError, OSError):
+        pass  # 组已空: 无害
+
+
+# kill_registered_process_group 优先按注册表快照 PGID 杀组(Round8 review):
+# 超时/异常路径的父进程可能已退出, 实时 os.getpgid(pid) 抛 ProcessLookupError
+# 导致 kill 落空——但组内后台子进程可能仍存活(如持有 stdout 管道使 stream_reader
+# 线程保持活跃)。快照 PGID 在创建时登记, 与父进程存活状态无关。
+def kill_registered_process_group(process) -> None:
+    with _code_run_pids_lock:
+        for pgid in list(_code_run_pgids):
+            if pgid == process.pid:
+                _kill_pgid(pgid)
+                return
+    # 无快照(Windows/登记失败): 回退实时定位。
+    _kill_process_group(process)
+
+
+def kill_all_code_run_processes() -> None:
+    """任务终态/任务启动时清理遗留的 code_run 进程组(审查 C2 Round8)。幂等。
+    按创建时快照的 PGID 直接 killpg, 不检查父进程存活状态——父 shell 可能已
+    退出而组内后台子进程仍存活, poll()!=None 跳过会导致进程跨任务存活。
+    round9 审查: 任务代码可用 setsid/start_new_session 创建新会话逃逸 PGID
+    登记——再枚举 /proc 杀掉容器 PID namespace 内一切非自身进程(线程除外),
+    覆盖任意逃逸路径。"""
+    with _code_run_pids_lock:
+        pgids = list(_code_run_pgids)
+        _code_run_pgids.clear()
+        procs = list(_code_run_procs)
+        _code_run_procs.clear()
+    for pgid in pgids:
+        _kill_pgid(pgid)
+    for proc in procs:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    _kill_other_processes()
+
+
+def _kill_other_processes() -> None:
+    """POSIX 兜底: 枚举 /proc, 杀掉容器 PID namespace 内所有非自身进程。
+
+    任务代码可用 setsid 或 subprocess.Popen(start_new_session=True) 脱离已登记
+    的进程组, 使其逃过 killpg; 但进程无法逃出容器的 PID namespace, 且孤儿
+    进程会被 Worker 主进程(subreaper)收养。按 /proc/<pid>/status 的 Tgid 字段
+    排除自身进程与自身线程, 其余全部 SIGKILL。非 POSIX(Windows)无 /proc
+    语义, 保持已有 Popen 回退。
+    """
+    if os.name == 'nt':
+        return
+    try:
+        import glob
+    except ImportError:
+        return
+    self_pid = os.getpid()
+    for entry in glob.glob('/proc/[0-9]*'):
+        pid = entry.rsplit('/', 1)[-1]
+        try:
+            pid_int = int(pid)
+        except ValueError:
+            continue
+        if pid_int == self_pid:
+            continue
+        try:
+            tgid = None
+            with open(f'/proc/{pid}/status', 'r', encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    if line.startswith('Tgid:'):
+                        tgid = int(line.split()[1])
+                        break
+            if tgid is None:
+                continue
+            if tgid == self_pid:
+                continue  # 自身线程: 不能杀
+            os.kill(pid_int, 9)
+        except (OSError, ValueError):
+            continue
+
+
+def _kill_process_group(process) -> None:
+    """杀死进程组全部进程(含派生子进程)。POSIX 用 killpg(SIGKILL),
+    ESRCH(组已空)无害; Windows 无进程组语义, 回退 process.kill()
+    (审查: 不能变成 no-op, 否则超时/异常路径的进程永远存活)。"""
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if killpg is not None and getpgid is not None:
+        try:
+            killpg(getpgid(process.pid), 9)  # SIGKILL
+        except (ProcessLookupError, OSError):
+            pass
+        return
+    try:
+        process.kill()
+    except Exception:
+        pass
+
+
+
+
 def safe_print(*args, **kwargs):
     try: print(*args, **kwargs)
     except: pass
@@ -59,8 +201,12 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
             cmd, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             bufsize=0, cwd=cwd, startupinfo=startupinfo,
-            creationflags=0x08000000 if os.name == 'nt' else 0
+            creationflags=0x08000000 if os.name == 'nt' else 0,
+            # 审查 C2: POSIX 下派生到独立进程组, 使超时/取消可 killpg 清理
+            # 整个进程树, 而不是只杀直接子进程。
+            start_new_session=(os.name != 'nt'),
         )
+        register_code_run_process(process)
         start_t = time.time()
         t = threading.Thread(target=stream_reader, args=(process, full_stdout), daemon=True)
         t.start()
@@ -68,7 +214,8 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         while t.is_alive():
             istimeout = time.time() - start_t > timeout
             if istimeout or stop_signal:
-                process.kill()
+                kill_registered_process_group(process)
+                unregister_code_run_process(process)
                 myprint("[Debug] Process killed due to timeout or stop signal.")
                 if istimeout: full_stdout.append("\n[Timeout Error] 超时强制终止")
                 else: full_stdout.append("\n[Stopped] 用户强制终止")
@@ -77,6 +224,8 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
 
         t.join(timeout=1)
         exit_code = process.poll()
+        # 审查 C2: 进程组可能仍有派生的后台子进程(如 nohup ... &);
+        # 正常返回时保留登记, 由任务终态的 kill_all_code_run_processes 统一清理。
 
         stdout_str = "".join(full_stdout)
         status = "success" if exit_code == 0 else "error"
@@ -92,7 +241,9 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
             "exit_code": exit_code
         }
     except Exception as e:
-        if 'process' in locals(): process.kill()
+        if 'process' in locals():
+            kill_registered_process_group(process)
+            unregister_code_run_process(process)
         return {"status": "error", "msg": str(e)}
     finally:
         if code_type == "python" and tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
@@ -319,6 +470,11 @@ class GenericAgentHandler(BaseHandler):
         code_cwd = os.path.normpath(self.cwd)
         maxlen = self._get_tool_maxlen(10000, args)
         if code_type == 'python' and _arg(args, "inline_eval", False, bool):
+            # Round8 审查: inline_eval 直接在当前 Worker 进程内 eval/exec, 完全绕过
+            # code_run 的进程组隔离与终态清理——派生线程/后台进程可跨任务存活窃取
+            # 下一任务凭据。多租户 Runner 镜像固定禁用(GA_DISABLE_INLINE_EVAL=1)。
+            if os.environ.get("GA_DISABLE_INLINE_EVAL", "") == "1":
+                return StepOutcome("[Error] inline_eval is disabled in this environment; use code_run instead", next_prompt="\n")
             ns = {'handler':self, 'parent':self.parent, 'history':json.dumps(self.parent.llmclient.backend.history)}
             old_cwd = os.getcwd()
             try:

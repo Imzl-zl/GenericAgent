@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -244,14 +245,16 @@ func TestWriteConfigFilesGroupReadable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
-	// config/ 目录由 prepareWorkspaceDirs 预置(writeConfigFiles 只写文件)。
+	// config/目录由 prepareWorkspaceDirs 预置; writeConfigFiles 写入
+	// config/g<generation> 子目录(审查 C1/I6: 按 generation 隔离,
+	// 旧 generation 销毁时的清理不得误删新 config)。
 	if _, err := prepareWorkspaceDirs(root, hash, "", 10002, 10002, 10003); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeConfigFiles(root, hash, map[string][]byte{"policy.json": []byte("{}")}, 10002, 10002, 10003); err != nil {
+	if err := writeConfigFiles(root, hash, 3, map[string][]byte{"policy.json": []byte("{}")}, 10002, 10002, 10003); err != nil {
 		t.Fatalf("writeConfigFiles: %v", err)
 	}
-	info, err := os.Stat(filepath.Join(root, hash, "config", "policy.json"))
+	info, err := os.Stat(filepath.Join(root, hash, "config", "g3", "policy.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,5 +267,39 @@ func TestWriteConfigFilesGroupReadable(t *testing.T) {
 	}
 	if perm&0o002 != 0 {
 		t.Fatalf("config file mode %o: world writable", perm)
+	}
+}
+
+
+// TestWriteConfigFilesGenerationIsolation 验证审查 C1/I6: config 按
+// generation 写入独立子目录 config/g<gen>——旧 generation 容器销毁后的
+// 清理只删自己的子目录, 不得影响已创建的新 generation 配置(mTLS 材料)。
+func TestWriteConfigFilesGenerationIsolation(t *testing.T) {
+	root := t.TempDir()
+	hash, err := WorkspaceDirHash("personal:777")
+	if err != nil {
+		t.Fatalf("workspace hash: %v", err)
+	}
+	if _, err := prepareWorkspaceDirs(root, hash, "", 10002, 10002, 10003); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeConfigFiles(root, hash, 1, map[string][]byte{"server.crt": []byte("old-cert")}, 10002, 10002, 10003); err != nil {
+		t.Fatalf("writeConfigFiles g1: %v", err)
+	}
+	if err := writeConfigFiles(root, hash, 2, map[string][]byte{"server.crt": []byte("new-cert")}, 10002, 10002, 10003); err != nil {
+		t.Fatalf("writeConfigFiles g2: %v", err)
+	}
+	// 两个 generation 的配置必须并存且内容独立。
+	for _, tc := range []struct {
+		gen  uint64
+		want string
+	}{{1, "old-cert"}, {2, "new-cert"}} {
+		body, err := os.ReadFile(filepath.Join(root, hash, "config", fmt.Sprintf("g%d", tc.gen), "server.crt"))
+		if err != nil {
+			t.Fatalf("read config g%d: %v", tc.gen, err)
+		}
+		if string(body) != tc.want {
+			t.Fatalf("config g%d = %q, want %q", tc.gen, body, tc.want)
+		}
 	}
 }

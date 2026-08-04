@@ -96,6 +96,43 @@ def test_coalescing_buffer_merges_text_and_file_across_poll_batches():
     assert ready[0]["context_token"] == "ctx-2"
 
 
+def test_collect_media_items_restores_original_file_name():
+    """Round8 审查: 落盘名含内容 hash 前缀时, media_items.file_name 必须恢复
+    为发送者原始文件名(不得暴露 hash 前缀)。"""
+    mgr = poller_server.BotManager(media_root="/media")
+    paths = ["/media/b1/a1b2c3d4e5_resume.txt"]
+    names = ["resume.txt"]
+    items = mgr._collect_media_items(paths, names)
+    assert len(items) == 1
+    assert items[0]["file_name"] == "resume.txt"
+    assert items[0]["storage_path"] == "b1/a1b2c3d4e5_resume.txt"
+    # 无 names 时回退 basename。
+    fallback = mgr._collect_media_items(paths)
+    assert fallback[0]["file_name"] == "a1b2c3d4e5_resume.txt"
+
+
+def test_collect_media_items_names_align_with_paths_not_item_list():
+    """Round8(review): names 与 paths 同序对齐——item_list 中下载失败的项
+    不产生 path, 若按位置索引 item_list 会错位(张冠李戴)。"""
+    mgr = poller_server.BotManager(media_root="/media")
+    # item_list 3 项, 中间项下载失败 → 只返回 2 个 path。
+    paths = ["/media/b1/a1b2c3d4e5_a.txt", "/media/b1/f6e7d8c9b0a1_c.txt"]
+    names = ["a.txt", "c.txt"]
+    items = mgr._collect_media_items(paths, names)
+    assert [it["file_name"] for it in items] == ["a.txt", "c.txt"]
+    # names 短于 paths 时剩余回退 basename。
+    short = mgr._collect_media_items(paths, ["a.txt"])
+    assert short[1]["file_name"] == "f6e7d8c9b0a1_c.txt"
+
+
+def test_collect_media_items_restores_original_name_without_media_root():
+    """Round8: 未配置 media_root 时同样恢复原始文件名。"""
+    mgr = poller_server.BotManager(media_root=None)
+    paths = ["/tmp/x/a1b2c3d4e5_report.docx"]
+    items = mgr._collect_media_items(paths, ["report.docx"])
+    assert items[0]["file_name"] == "report.docx"
+
+
 def test_file_upload_key_is_random_hex_not_filename(tmp_path):
     path = tmp_path / "简历方法.docx"
     path.write_bytes(b"docx")
@@ -254,20 +291,25 @@ def test_send_passes_explicit_file_name_to_client(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def send_file(self, ilink_user_id, file_path, context_token="", file_name=""):
-            self.calls.append((ilink_user_id, file_path, context_token, file_name))
+        def send_file(self, ilink_user_id, file_path, context_token="", file_name="", client_id=None):
+            self.calls.append((ilink_user_id, file_path, context_token, file_name, client_id))
 
-        def send_text(self, ilink_user_id, text, context_token=""):
-            self.calls.append(("text", ilink_user_id, text, context_token))
+        def send_text(self, ilink_user_id, text, context_token="", client_id=None):
+            self.calls.append(("text", ilink_user_id, text, context_token, client_id))
 
     manager = poller_server.BotManager(inbound_coalesce_window_ms=2500)
     entry = poller_server.BotEntry(Client(), "http://platform/webhook", "b1", 2500)
     manager._bots["b1"] = entry
 
     manager.send("b1", "u1", "", msg_type="file", file_path="/tmp/abc123_report.docx", file_name="report.docx")
-    assert entry.client.calls == [("u1", "/tmp/abc123_report.docx", "", "report.docx")]
+    assert entry.client.calls == [("u1", "/tmp/abc123_report.docx", "", "report.docx", "")]
 
     # 未传 file_name 时回退为空串(客户端侧回退本地 basename), 不报错。
     entry.client.calls.clear()
     manager.send("b1", "u1", "", msg_type="file", file_path="/tmp/abc123_other.docx")
-    assert entry.client.calls == [("u1", "/tmp/abc123_other.docx", "", "")]
+    assert entry.client.calls == [("u1", "/tmp/abc123_other.docx", "", "", "")]
+
+    # round9 审查: client_id 透传到客户端(稳定幂等键)。
+    entry.client.calls.clear()
+    manager.send("b1", "u1", "hi", client_id="ga-abc123")
+    assert entry.client.calls == [("text", "u1", "hi", "", "ga-abc123")]

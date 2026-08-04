@@ -283,3 +283,78 @@ func TestSophubValidatorRequiresTaskAndGenerationBinding(t *testing.T) {
 		t.Fatalf("claims = %+v", claims)
 	}
 }
+
+type fakeTaskChecker struct {
+	active bool
+	err    error
+}
+
+func (f *fakeTaskChecker) IsTaskCapabilityActive(context.Context, string, uint64) (bool, error) {
+	return f.active, f.err
+}
+
+// round9 审查: 在线 task 校验在 handler 层显式执行(CheckTaskActive), task
+// 不再活跃(终态化/接管/成员移除)的 capability 必须被拒绝。
+func TestValidateTaskScopedRejectsInactiveTask(t *testing.T) {
+	issuer, validator := newJWTTestPair(t, time.Hour, &fakeRevocationSource{})
+	validator.WithTaskChecker(&fakeTaskChecker{active: false})
+
+	spec := validCapabilitySpec()
+	spec.TaskID = "task-1"
+	spec.RunnerGeneration = 3
+	token, _, err := issuer.Issue(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := validator.ValidateTaskScoped(context.Background(), token)
+	if err != nil {
+		t.Fatalf("token validation itself must pass, got %v", err)
+	}
+	if err := validator.CheckTaskActive(context.Background(), claims); !errors.Is(err, ErrCapabilityRevoked) {
+		t.Fatalf("inactive task must be rejected as revoked, got %v", err)
+	}
+}
+
+// round9 审查: task 活跃时在线检查通过; 检查器错误时 fail-closed(不转发)。
+func TestValidateTaskScopedActiveTaskAndCheckerError(t *testing.T) {
+	issuer, validator := newJWTTestPair(t, time.Hour, &fakeRevocationSource{})
+	validator.WithTaskChecker(&fakeTaskChecker{active: true})
+	spec := validCapabilitySpec()
+	spec.TaskID = "task-1"
+	spec.RunnerGeneration = 3
+	token, _, err := issuer.Issue(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := validator.ValidateTaskScoped(context.Background(), token)
+	if err != nil {
+		t.Fatalf("token validation must pass, got %v", err)
+	}
+	if err := validator.CheckTaskActive(context.Background(), claims); err != nil {
+		t.Fatalf("active task must validate, got %v", err)
+	}
+	validator.WithTaskChecker(&fakeTaskChecker{err: errors.New("db down")})
+	if err := validator.CheckTaskActive(context.Background(), claims); err == nil {
+		t.Fatal("checker error must fail closed")
+	}
+}
+
+// round9 审查: Sophub capability 同样受在线 task 校验约束。
+func TestSophubValidatorRejectsInactiveTask(t *testing.T) {
+	issuer, err := NewIssuer(testJWTKey, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv, err := NewSophubValidator(testJWTKey, &fakeRevocationSource{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv.WithTaskChecker(&fakeTaskChecker{active: false})
+	token, _, err := issuer.IssueSophubToken("personal:42", "task-1", 3, time.Hour, `{"max_turns":5}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sv.Validate(context.Background(), token); !errors.Is(err, ErrCapabilityRevoked) {
+		t.Fatalf("inactive task must be rejected by sophub validator, got %v", err)
+	}
+}

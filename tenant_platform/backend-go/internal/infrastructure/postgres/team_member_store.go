@@ -133,54 +133,59 @@ WHERE user_id = $1 AND team_id = $3::uuid
 		// Without this, tasks submitted before removal would still dispatch to
 		// a Worker after the member lost access (authorizeSubmitter would now
 		// reject, but the task is already queued and may be claimed).
+		// 审查 C1(I5): queued 与未派发 starting 任务统一走 finalizeTerminal——
+		// 在同一事务内撤销已签发 capability JTI(签发先于 MarkDispatchStarted,
+		// 裸 UPDATE 会绕过撤销, Platform 崩溃后终态行不被恢复扫描、旧 token
+		// 在 TTL 内仍可调用模型)、写 status_transition 事件并取消 pending
+		// task_started delivery, 与 CancelTask 的 queued 分支语义一致。
 		teamSessionKey := fmt.Sprintf("team:%s", m.TeamID)
-		if _, err := tx.Exec(ctx, `
-UPDATE tasks SET
-  status = 'cancelled',
-  claim_owner = NULL,
-  claim_lease_until = NULL,
-  claimed_at = NULL,
-  terminal_error_code = 'TASK_CANCELLED',
-  terminal_error_message = 'member removed from team',
-  terminal_at = timezone('utc', now()),
-  updated_at = timezone('utc', now())
-WHERE requester_user_id = $1 AND session_key = $2 AND status = 'queued'
-`, m.UserID, teamSessionKey); err != nil {
+		if err := cancelRemovedMemberTasks(ctx, tx, m.UserID, teamSessionKey); err != nil {
 			return err
 		}
 		// 审查 R5-I4: 已派发(starting/running)任务写 durable cancel_requested_at,
 		// 由 scheduler tick 轮询执行 Worker cancel; 终态事务撤销其 capability
 		// JTI(revokeTaskCapabilityJTIs), 成员移除后既有任务不得继续调用模型。
-		// 未派发(starting + dispatch NULL)任务不在此列——由下方直接终态化。
-		if _, err := tx.Exec(ctx, `
-UPDATE tasks SET
-  cancel_requested_at = timezone('utc', now()),
-  updated_at = timezone('utc', now())
+		// 未派发(starting + dispatch NULL)任务由 cancelRemovedMemberTasks 终态化。
+		// round9 审查: 已派发任务的 JTI 必须在移除事务内立即撤销, 而不是等
+		// 终态事务——若 scheduler 停机/取消 RPC 卡住/Worker 不返回终态, 被移除
+		// 成员的任务在 TTL 内仍可调用 LLM/Sophub。逐行 FOR UPDATE 后先撤销
+		// JTI 再写 cancel_requested_at, 撤销失败则整个移除事务回滚。
+		rows, err := tx.Query(ctx, `
+SELECT `+taskSelectColumns+` FROM tasks
 WHERE requester_user_id = $1 AND session_key = $2
   AND status IN ('starting','running')
   AND worker_dispatch_started_at IS NOT NULL
   AND cancel_requested_at IS NULL
-`, m.UserID, teamSessionKey); err != nil {
+FOR UPDATE
+`, m.UserID, teamSessionKey)
+		if err != nil {
 			return err
 		}
-		// 审查 R5-I4: starting 但尚未 MarkDispatchStarted 的任务没有 dispatch
-		// 收尾(dispatch 对取消+未派发直接 return), 只写 cancel_requested_at
-		// 会永久卡在 starting——直接终态化(cancelled), 与 queued 取消一致。
-		if _, err := tx.Exec(ctx, `
-UPDATE tasks SET
-  status = 'cancelled',
-  claim_owner = NULL,
-  claim_lease_until = NULL,
-  claimed_at = NULL,
-  terminal_error_code = 'TASK_CANCELLED',
-  terminal_error_message = 'member removed from team',
-  terminal_at = timezone('utc', now()),
-  updated_at = timezone('utc', now())
-WHERE requester_user_id = $1 AND session_key = $2
-  AND status = 'starting' AND worker_dispatch_started_at IS NULL
-  AND cancel_requested_at IS NULL
-`, m.UserID, teamSessionKey); err != nil {
+		var dispatched []domain.Task
+		for rows.Next() {
+			t, scanErr := scanTask(rows)
+			if scanErr != nil {
+				rows.Close()
+				return scanErr
+			}
+			dispatched = append(dispatched, t)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return err
+		}
+		for _, t := range dispatched {
+			if err := revokeTaskCapabilityJTIs(ctx, tx, t.ID); err != nil {
+				return fmt.Errorf("revoke dispatched task capability jtis on member removal: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+UPDATE tasks SET
+  cancel_requested_at = timezone('utc', now()),
+  updated_at = timezone('utc', now())
+WHERE id = $1 AND cancel_requested_at IS NULL
+`, t.ID); err != nil {
+				return err
+			}
 		}
 		m.Status = domain.MemberRemoved
 		m.RemovedAt = &now
@@ -232,4 +237,41 @@ func (s *Store) transitionMember(ctx context.Context, shortID string, ownerID in
 		return nil
 	})
 	return out, err
+}
+
+// cancelRemovedMemberTasks 终态化被移除成员在团队工作区的 queued 与未派发
+// starting 任务(审查 C1/I5)。逐行 FOR UPDATE 锁后走 finalizeTerminal:
+// 同一事务内撤销已签发 capability JTI、写 status_transition 事件、取消
+// pending task_started 并生成 cancelled delivery。裸 UPDATE 会绕过撤销,
+// Platform 崩溃后终态行不被恢复扫描, 旧 token 在 TTL 内仍可调用模型。
+func cancelRemovedMemberTasks(ctx context.Context, tx pgx.Tx, userID int64, sessionKey string) error {
+	rows, err := tx.Query(ctx, `
+SELECT `+taskSelectColumns+` FROM tasks
+WHERE requester_user_id = $1 AND session_key = $2
+  AND ((status = 'queued') OR
+       (status = 'starting' AND worker_dispatch_started_at IS NULL AND cancel_requested_at IS NULL))
+FOR UPDATE
+`, userID, sessionKey)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var list []domain.Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return err
+		}
+		list = append(list, t)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, t := range list {
+		if _, err := finalizeTerminal(ctx, tx, t, domain.TaskCancelled, domain.DeliveryTaskCancelled,
+			"TASK_CANCELLED", "member removed from team", "", "", ""); err != nil {
+			return err
+		}
+	}
+	return nil
 }

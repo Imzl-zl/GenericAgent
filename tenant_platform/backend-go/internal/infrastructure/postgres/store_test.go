@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 )
 
 func requireDB(t *testing.T) *pgxpool.Pool {
@@ -43,6 +44,79 @@ func TestAgentMaxTurnsSettingPersistsAndValidates(t *testing.T) {
 	}
 	if _, err := store.UpdateAgentMaxTurns(ctx, domain.MaxAgentMaxTurns+1, 1); err == nil {
 		t.Fatal("expected max-turn validation error")
+	}
+}
+
+// TestSubmitPerUserQueueLimitSerializesAcrossWorkspaces 验证 round9 修复:
+// per-user 队列硬上限必须跨 workspace 串行(同一 requester 并发向个人与
+// 第二 workspace 提交时, 只有一个能通过限流检查)。修复前两个事务各自持有
+// 不同 workspace 行锁、计数都未超限, 双双插入突破上限。
+func TestSubmitPerUserQueueLimitSerializesAcrossWorkspaces(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetPerUserQueueLimit(1)
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	// 第二个 requester=1 可提交的 workspace(personal:1b, owner 仍是 1)。
+	if _, err := pool.Exec(ctx, `
+INSERT INTO workspaces (id, session_key, owner_user_id, kind, team_id, volume_id, bootstrap_marker)
+VALUES ('00000000-0000-4000-8000-0000000000b1', 'personal:1b', 1, 'personal', NULL, 'vol-test-1b', NULL)
+ON CONFLICT (session_key) DO NOTHING;
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// 串行基线: 第一个任务占用唯一的队列槽位; 满槽时同 workspace 也拒绝。
+	first, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1, Source: "web", SourceInstanceID: "i", MessageID: "base",
+		Prompt: "base", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1, Source: "web", SourceInstanceID: "i", MessageID: "overflow-same-ws",
+		Prompt: "overflow", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}); !errors.Is(err, domain.ErrPerUserQueueFull) {
+		t.Fatalf("same-workspace overflow: want ErrPerUserQueueFull, got %v", err)
+	}
+
+	// 释放占位槽位(取消 queued 任务), 使并发测试从空队列开始。
+	if _, _, err := store.CancelTask(ctx, first.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 并发跨 workspace(队列为空, limit=1): 两个事务同时进入, 修复后串行在
+	// requester advisory lock 上, 第一个看到 0 个 queued 成功插入, 第二个
+	// 看到 1 个 -> 拒绝。修复前两者各自持不同 workspace 行锁、计数均未超限。
+	var wg sync.WaitGroup
+	results := make([]error, 2)
+	cmds := []domain.SubmitTaskCommand{
+		{SessionKey: dev.SessionKey, RequesterUserID: 1, Source: "web", SourceInstanceID: "i", MessageID: "race-a", Prompt: "a", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1"},
+		{SessionKey: "personal:1b", RequesterUserID: 1, Source: "web", SourceInstanceID: "i", MessageID: "race-b", Prompt: "b", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1"},
+	}
+	for i := range cmds {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, results[i] = store.SubmitTask(ctx, cmds[i])
+		}(i)
+	}
+	wg.Wait()
+	succeeded := 0
+	for _, err := range results {
+		if err == nil {
+			succeeded++
+		} else if !errors.Is(err, domain.ErrPerUserQueueFull) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("cross-workspace concurrency allowed %d inserts (want 1): results=%v", succeeded, results)
 	}
 }
 
@@ -927,5 +1001,293 @@ func TestTerminalFinalizeCancelsPendingTaskStartedDelivery(t *testing.T) {
 	}
 	if failStatus != "pending" {
 		t.Fatalf("task_failed status = %q, want pending", failStatus)
+	}
+}
+
+// TestSetTaskCapabilityJTIsAppendsAndDeduplicates 验证审查 C1(I4): 刷新凭据
+// 时 SetTaskCapabilityJTIs 必须**追加去重**而不是整体替换——旧 JTI 对应的
+// token 在 Worker 确认前尚未撤销, 若被覆盖, Platform 崩溃后恢复事务只能
+// 撤销新 JTI, 旧 token 存活至 TTL。
+func TestSetTaskCapabilityJTIsAppendsAndDeduplicates(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-jti-append", MessageID: "jti-a",
+		Prompt: "jti-append", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	_ = task
+
+	if err := store.SetTaskCapabilityJTIs(ctx, claimed.ID, "p1", []string{"jti-old-1", "jti-old-2"}); err != nil {
+		t.Fatalf("first SetTaskCapabilityJTIs: %v", err)
+	}
+	// 刷新: 新 JTI 与旧 JTI 部分重叠(重复项必须去重)。
+	if err := store.SetTaskCapabilityJTIs(ctx, claimed.ID, "p1", []string{"jti-old-2", "jti-new"}); err != nil {
+		t.Fatalf("second SetTaskCapabilityJTIs: %v", err)
+	}
+	row := store.pool.QueryRow(ctx, `SELECT capability_jtis FROM tasks WHERE id = $1`, claimed.ID)
+	var jtis []string
+	if err := row.Scan(&jtis); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, j := range jtis {
+		got[j] = true
+	}
+	for _, want := range []string{"jti-old-1", "jti-old-2", "jti-new"} {
+		if !got[want] {
+			t.Fatalf("capability_jtis = %v, missing %q (must append+dedupe, not replace)", jtis, want)
+		}
+	}
+	if len(jtis) != 3 {
+		t.Fatalf("capability_jtis = %v, want exactly 3 unique entries", jtis)
+	}
+}
+
+// TestRemoveMemberRevokesCapabilityJTIsOfUndispatchedStartingTask 验证审查
+// C1(I5): 移除成员直接终态化 starting 未派发任务时, 必须走统一终态逻辑
+// (finalizeTerminal)——已签发并暴露给 Runner 的 capability JTI 必须与任务
+// 终态在同一事务内写入撤销表, 否则 Platform 崩溃后该终态行不被恢复扫描,
+// 旧 token 在 TTL 内仍可调用模型。
+func TestRemoveMemberRevokesCapabilityJTIsOfUndispatchedStartingTask(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	seedDev(t, store)
+	if _, err := store.EnsureDevelopmentContext(ctx, 2, "dev2"); err != nil {
+		t.Fatal(err)
+	}
+	team, err := store.CreateTeam(ctx, 1, "rm-jti-team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO team_members (team_id, user_id, role, status)
+VALUES ($1::uuid, 2, 'member', 'approved')
+`, team.ID); err != nil {
+		t.Fatal(err)
+	}
+	var memberID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM team_members WHERE team_id = $1::uuid AND user_id = 2`, team.ID).Scan(&memberID); err != nil {
+		t.Fatal(err)
+	}
+	sessionKey := fmt.Sprintf("team:%s", team.ID)
+	if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: sessionKey, RequesterUserID: 2,
+		Source: "web", SourceInstanceID: "bot-rm-jti", MessageID: "rm-jti-1",
+		Prompt: "member task jti", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, sessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	// 签发 JTI(签发先于 MarkDispatchStarted, 与生产路径一致)。
+	if err := store.SetTaskCapabilityJTIs(ctx, claimed.ID, "p1", []string{"jti-member-1", "jti-member-2"}); err != nil {
+		t.Fatalf("SetTaskCapabilityJTIs: %v", err)
+	}
+	if _, err := store.RemoveMember(ctx, fmt.Sprintf("t-%d", memberID), 1); err != nil {
+		t.Fatalf("RemoveMember: %v", err)
+	}
+	// 撤销表必须包含全部已签发 JTI。
+	for _, jti := range []string{"jti-member-1", "jti-member-2"} {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM llm_capability_revocations WHERE jti_hash = $1`, func() []byte { d := llmproxy.HashJTI(jti); return d[:] }()).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf("capability JTI %s must be revoked after member removal (rows=%d)", jti, n)
+		}
+	}
+	// 统一终态逻辑必须写 status_transition 事件(供审计/前端追踪)。
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM task_events WHERE task_id = $1 AND event_type = 'status_transition'`, claimed.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("member-removal terminalization must write a status_transition event")
+	}
+}
+
+// round9 审查: MarkDispatchStarted/MarkRunning 必须拒绝 claim lease 已过期
+// 的任务(进程暂停/心跳丢失后恢复不得继续派发, 防与接管者重叠执行)。
+func TestMarkDispatchStartedRejectsExpiredClaim(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1, Source: "web", SourceInstanceID: "i", MessageID: "exp-claim",
+		Prompt: "p", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "owner-1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	// 模拟心跳丢失: lease 过期。
+	if _, err := pool.Exec(ctx, `
+UPDATE tasks SET claim_lease_until = timezone('utc', now()) - interval '1 second' WHERE id = $1
+`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkDispatchStarted(ctx, task.ID, "owner-1", "w1", false); err == nil {
+		t.Fatal("MarkDispatchStarted must reject expired claim")
+	}
+	// 续租(直接 SQL 模拟心跳成功)后可以派发; 再次过期后 MarkRunning 也必须拒绝。
+	if _, err := pool.Exec(ctx, `
+UPDATE tasks SET claim_lease_until = timezone('utc', now()) + interval '10 minutes' WHERE id = $1
+`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkDispatchStarted(ctx, task.ID, "owner-1", "w1", false); err != nil {
+		t.Fatalf("MarkDispatchStarted after renew: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE tasks SET claim_lease_until = timezone('utc', now()) - interval '1 second' WHERE id = $1
+`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, task.ID, "owner-1"); err == nil {
+		t.Fatal("MarkRunning must reject expired claim")
+	}
+}
+
+// round9 审查: 成员移除必须在移除事务内立即撤销已派发任务的 capability
+// JTI——不等终态事务(若 scheduler 停机/取消 RPC 卡住, 旧 token 在 TTL 内
+// 仍可调用 LLM/Sophub)。
+func TestRemoveMemberRevokesDispatchedTaskJTIs(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	seedDev(t, store)
+	if _, err := store.EnsureDevelopmentContext(ctx, 2, "dev2"); err != nil {
+		t.Fatal(err)
+	}
+	team, err := store.CreateTeam(ctx, 1, "jti-team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO team_members (team_id, user_id, role, status)
+VALUES ($1::uuid, 2, 'member', 'approved')
+`, team.ID); err != nil {
+		t.Fatal(err)
+	}
+	var memberID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM team_members WHERE team_id = $1::uuid AND user_id = 2`, team.ID).Scan(&memberID); err != nil {
+		t.Fatal(err)
+	}
+	sessionKey := fmt.Sprintf("team:%s", team.ID)
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: sessionKey, RequesterUserID: 2,
+		Source: "web", SourceInstanceID: "bot-jti", MessageID: "rm-jti",
+		Prompt: "member task", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, sessionKey, "p1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", ok, err)
+	}
+	if _, err := store.MarkDispatchStarted(ctx, task.ID, "p1", "worker-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTaskCapabilityJTIs(ctx, task.ID, "p1", []string{"jti-member-removed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RemoveMember(ctx, fmt.Sprintf("t-%d", memberID), 1); err != nil {
+		t.Fatalf("RemoveMember: %v", err)
+	}
+	revoked, err := store.IsCapabilityRevoked(ctx, llmproxy.HashJTI("jti-member-removed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Fatal("dispatched task JTI must be revoked inside the removal transaction")
+	}
+	got, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CancelRequestedAt == nil {
+		t.Fatal("dispatched task must still carry durable cancel_requested_at")
+	}
+}
+
+// round9 审查: 在线 task 活跃性校验的状态矩阵。
+func TestIsTaskCapabilityActiveMatrix(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	// runner lease 行(generation=1, 未过期)。
+	if _, err := pool.Exec(ctx, `
+INSERT INTO runner_leases (runner_key, owner, generation, status, expires_at)
+VALUES ($1, 'p1', 1, 'active', timezone('utc', now()) + interval '10 minutes')
+`, dev.SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1, Source: "web", SourceInstanceID: "i", MessageID: "active-matrix",
+		Prompt: "p", PersonaSnapshot: []string{}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// queued 状态: 不活跃。
+	if active, err := store.IsTaskCapabilityActive(ctx, task.ID, 1); err != nil || active {
+		t.Fatalf("queued task must be inactive, active=%v err=%v", active, err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", ok, err)
+	}
+	if _, err := store.MarkDispatchStarted(ctx, task.ID, "p1", "w1", false); err != nil {
+		t.Fatal(err)
+	}
+	// starting + 有效 lease: 活跃。
+	if active, err := store.IsTaskCapabilityActive(ctx, task.ID, 1); err != nil || !active {
+		t.Fatalf("starting task with valid lease must be active, active=%v err=%v", active, err)
+	}
+	// generation 不匹配: 不活跃。
+	if active, err := store.IsTaskCapabilityActive(ctx, task.ID, 2); err != nil || active {
+		t.Fatalf("generation mismatch must be inactive, active=%v err=%v", active, err)
+	}
+	// lease 过期: 不活跃。
+	if _, err := pool.Exec(ctx, `
+UPDATE runner_leases SET expires_at = timezone('utc', now()) - interval '1 second'
+WHERE runner_key = $1
+`, dev.SessionKey); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := store.IsTaskCapabilityActive(ctx, task.ID, 1); err != nil || active {
+		t.Fatalf("expired lease must be inactive, active=%v err=%v", active, err)
 	}
 }

@@ -161,9 +161,20 @@ func NewDeliveryService(cfg DeliveryServiceConfig) (DeliveryService, error) {
 	if cfg.Messages == nil {
 		return nil, errors.New("MessageStore is required")
 	}
-	snapshotDir, err := os.MkdirTemp("", "ga-delivery-*")
-	if err != nil {
-		return nil, fmt.Errorf("create deliverable snapshot dir: %w", err)
+	// round9 审查: 交付快照目录从 Platform 私有 MkdirTemp 改为部署共享的
+	// delivery spool(GA_DELIVERY_SPOOL_DIR, compose 中 Platform rw / Bot
+	// Poller ro 挂载同一卷)——旧实现把快照写在 Platform /tmp(独立 tmpfs),
+	// 而 Poller 在另一容器按绝对路径读文件, DOCX/PDF/XLSX 交付必然失败。
+	// 未配置 env(单元测试/loopback)时保持私有临时目录。
+	snapshotDir := strings.TrimSpace(os.Getenv("GA_DELIVERY_SPOOL_DIR"))
+	var err error
+	if snapshotDir == "" {
+		snapshotDir, err = os.MkdirTemp("", "ga-delivery-*")
+		if err != nil {
+			return nil, fmt.Errorf("create deliverable snapshot dir: %w", err)
+		}
+	} else if err := os.MkdirAll(snapshotDir, 0o770); err != nil {
+		return nil, fmt.Errorf("create delivery spool dir %s: %w", snapshotDir, err)
 	}
 	return &deliveryService{
 		cfg:              cfg,
@@ -318,7 +329,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				if err := assertMemberAtSend(); err != nil {
 					return err
 				}
-				return s.cfg.Transport.SendMessage(sendCtx, bot.BotUUID, bot.IlinkUserID, payload.Text)
+				return s.cfg.Transport.SendMessage(sendCtx, bot.BotUUID, bot.IlinkUserID, payload.Text, deliveryClientID(partKey))
 			},
 			sendErrorCode: "SEND_FAILED",
 		})
@@ -356,7 +367,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				// (safefs 限长读取 + 普通文件校验), tmp 位于 Platform 私有
 				// 目录(0700), 直接发送, 无需二次快照。
 				if file.snapshotContent {
-					return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, file.absPath, file.displayName)
+					return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, file.absPath, file.displayName, deliveryClientID(partKey))
 				}
 				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
 				// 后复制到 Platform 私有快照, transport 发送不可变快照,
@@ -366,7 +377,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 					return snapErr
 				}
 				defer os.Remove(snap)
-				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, snap, file.displayName)
+				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, snap, file.displayName, deliveryClientID(partKey))
 			},
 			sendErrorCode: "SEND_FILE_FAILED",
 		})
@@ -541,21 +552,24 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 		}
 		out.Files = make([]deliveryFile, 0, len(files))
 		for _, f := range files {
-			// 快照内容写入 Platform 私有临时文件(发送后删除)。文件名保留
-			// 用户可见名(transport 以路径 basename 作为显示名), 子目录按
-			// delivery 隔离避免并发同名覆盖; marker 哈希前缀区分同 basename
-			// 的不同输出文件(如 outputs/a.docx 与 outputs/sub/a.docx)。
+			// 快照内容写入 Platform 私有临时文件(发送后删除)。文件名用
+			// 服务端可信的 relPath basename(审查 C1: FileName 源于 Runner
+			// 可写的 manifest, 不得进入路径拼接), 子目录按 delivery 隔离避免
+			// 并发同名覆盖; marker 哈希前缀区分同 basename 的不同输出文件
+			// (如 outputs/a.docx 与 outputs/sub/a.docx)。用户可见名单独经
+			// sanitizeDeliverableDisplayName 清洗。
 			dir := filepath.Join(s.snapshotDir, deliveryFileKey(d.DeliveryID))
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return deliveryPayload{}, fmt.Errorf("create delivery file dir: %w", err)
 			}
-			tmpPath := filepath.Join(dir, fmt.Sprintf("%s_%s", deliveryFileMarkerKey(f.Marker), f.FileName))
+			tmpPath := filepath.Join(dir, fmt.Sprintf("%s_%s", deliveryFileMarkerKey(f.Marker), deliverableSnapshotBase(f.RelPath)))
 			if err := os.WriteFile(tmpPath, f.Content, 0o600); err != nil {
 				return deliveryPayload{}, fmt.Errorf("write delivery file snapshot %q: %w", f.Marker, err)
 			}
 			out.Files = append(out.Files, deliveryFile{
 				absPath: tmpPath, root: dir, relPath: filepath.Base(tmpPath),
-				displayName: f.FileName, auditPath: f.RelPath, snapshotContent: true,
+				displayName: sanitizeDeliverableDisplayName(f.FileName, f.RelPath),
+				auditPath:   f.RelPath, snapshotContent: true,
 			})
 		}
 		return out, nil
@@ -606,6 +620,14 @@ func nextRetryAt(d domain.Delivery, now time.Time) time.Time {
 	return now.Add(delay)
 }
 
+// deliveryClientID 返回发送幂等键(round9 审查): 同一 delivery part 重试时
+// 保持同 client_id, 供 iLink 服务端去重。partKey 可能含路径等长内容,
+// 截断+哈希保证稳定且在平台 id 长度约束内。
+func deliveryClientID(partKey string) string {
+	sum := sha256.Sum256([]byte(partKey))
+	return "ga-" + hex.EncodeToString(sum[:8])
+}
+
 // teamSessionKey 解析 team:<uuid> 形式的 session key; 非团队 key 返回 ok=false。
 func teamSessionKey(sessionKey string) (string, bool) {
 	if !strings.HasPrefix(sessionKey, "team:") {
@@ -631,10 +653,53 @@ func deliveryFileKey(deliveryID string) string {
 	return replacer.Replace(deliveryID)
 }
 
-// deliveryFileMarkerKey 返回 marker 的 8 位哈希前缀(区分同 basename 文件)。
+// deliveryFileMarkerKey 返回 marker 的 16 位哈希前缀(8 字节, 区分同 basename
+// 文件)。Round8 审查: 原 4 字节前缀(2^32 空间)在数百个 marker 内即可能碰撞
+// (实证: outputs/d4561/report.docx 与 outputs/d36751/report.docx 同为
+// 73262a8d), 碰撞导致同一 delivery 的两个快照互相覆盖、发送重复内容。
+// 8 字节(2^64 空间)在同一 delivery 的文件规模下不可碰撞。
 func deliveryFileMarkerKey(marker string) string {
 	sum := sha256.Sum256([]byte(marker))
-	return hex.EncodeToString(sum[:4])
+	return hex.EncodeToString(sum[:8])
+}
+
+// stripControlChars 移除 ASCII 控制字符(换行/回车等)——显示名会流入消息
+// Content 与 MediaAsset.FileName(审查 C1), 控制字符会造成日志/消息注入。
+func stripControlChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// deliverableSnapshotBase 返回写入 Platform 私有快照目录的服务端可信
+// 文件名(审查 C1): 只从 DB 快照的 RelPath 派生 basename(该值由服务端
+// resolveUnderRoot 解析生成), 不信任 manifest 提供的 FileName。
+// Round8 审查: 文件名还要拼接 16 位 hash 前缀 + '_', basename 必须为
+// 前缀留出空间(255 - 17), 否则整体文件名超过 NAME_MAX 写入失败。
+const maxSnapshotBaseLen = 255 - 17
+
+func deliverableSnapshotBase(relPath string) string {
+	name := stripControlChars(filepath.Base(filepath.FromSlash(relPath)))
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `\/`) || len(name) > maxSnapshotBaseLen {
+		return "deliverable.bin"
+	}
+	return name
+}
+
+// sanitizeDeliverableDisplayName 清洗用户可见显示名(审查 C1): FileName
+// 源于 Runner 可写的 manifest(如 path traversal / 反斜杠分隔符), 必须
+// 降级为纯 basename; 非法时回退到服务端可信的 relPath basename。
+func sanitizeDeliverableDisplayName(fileName, relPath string) string {
+	// 反斜杠视作分隔符(Windows 风格穿越), 统一转斜杠后取最后一段;
+	// 控制字符一并剥离(流入消息 Content / MediaAsset.FileName)。
+	name := stripControlChars(filepath.Base(filepath.FromSlash(strings.ReplaceAll(fileName, `\`, "/"))))
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `\/`) || len(name) > 255 {
+		name = deliverableSnapshotBase(relPath)
+	}
+	return name
 }
 
 var (

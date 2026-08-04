@@ -20,7 +20,9 @@ ENV PYTHONUNBUFFERED=1 \
     GA_LEGACY_ROOT=/ga/legacy \
     GA_WORKER_SRC=/ga/worker-python/src \
     GA_MEMORY_TEMPLATE=/ga/memory-template \
-    GA_DISABLE_HOST_BROWSER=1
+    GA_DISABLE_HOST_BROWSER=1 \
+    # Round8 审查: inline_eval 在 Worker 进程内执行, 绕过进程组清理, Runner 禁用。
+    GA_DISABLE_INLINE_EVAL=1
 
 # 固定非 root Runner UID/GID(部署 profile 与 Manager 预置目录所有权一致)。
 RUN groupadd --system --gid 10002 ga-runner \

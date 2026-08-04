@@ -34,6 +34,9 @@ type Config struct {
 	ProviderSource       ProviderSource
 	Cipher               TokenCipher
 	Revocations          CapabilityRevocationSource
+	// TaskChecker 在线联查 capability 绑定的 task/lease/成员状态(round9
+	// 审查): 非 nil 时每次调用前执行, 成员移除/接管即时生效。
+	TaskChecker          TaskCapabilityChecker
 	// UsageCounter 按 JTI 原子计量 capability 调用次数(审查 R4-I9)。
 	// 非 nil 时 llm.chat 转发前消费预算(max_turns), 超额拒绝。
 	UsageCounter         CapabilityUsageCounter

@@ -69,6 +69,9 @@ services:
     volumes:
       - bot_media:/var/lib/ga/bot-media
       - session_files:/var/lib/ga/runtime/session_files:ro
+      # round9 审查: 交付 spool 共享卷(Poller 只读)——Platform 写入的
+      # 文件快照在此被 Poller 直接读取, 与 Platform 私有 /tmp 隔离。
+      - delivery_spool:/var/lib/ga/delivery-spool:ro
     networks:
       - application
     healthcheck:
@@ -131,6 +134,15 @@ services:
       GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
       GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
       GA_SOPHUB_PROXY_ADDR: ${GA_SOPHUB_PROXY_ADDR:-http://platform:8082}
+      # round9 审查: task 去重唯一键依赖稳定 source_instance_id; 单实例部署
+      # 固定该值, 重启后 Poller 重试的同一消息命中唯一键, 不产生重复任务。
+      GA_PLATFORM_INSTANCE_ID: ${GA_PLATFORM_INSTANCE_ID:-platform-1}
+      # Round8 审查: 入站 media_paths 必须位于该根内(Poller 被攻破时防任意文件读取)。
+      # 与 bot-poller 的 BOT_POLLER_MEDIA_DIR 共用同一配置源, 避免两处不一致
+      # 导致所有媒体消息 fail-closed 拒绝。
+      GA_BOT_MEDIA_ROOT: ${BOT_POLLER_MEDIA_DIR:-/var/lib/ga/bot-media}
+      # round9 审查: 交付 spool 目录(与卷挂载一致, 见 volumes)。
+      GA_DELIVERY_SPOOL_DIR: /var/lib/ga/delivery-spool
     read_only: true
     cap_drop:
       - ALL
@@ -145,8 +157,8 @@ services:
       - bot_media:/var/lib/ga/bot-media:ro
       # 共享工作区卷: 附件/输出经 temp/ 与 Runner 互通(方案 §6)。
       - runner_workspaces:/var/lib/ga/workspaces
-    ports:
-      - "${GA_HTTP_BIND:-127.0.0.1}:${GA_HTTP_PORT:-8088}:8088"
+      # round9 审查: 交付 spool(Platform 可写, Poller 只读)。
+      - delivery_spool:/var/lib/ga/delivery-spool
     networks:
       - application
       - database
@@ -291,7 +303,15 @@ services:
       dockerfile: tenant_platform/infra/compose/web.Dockerfile
     restart: unless-stopped
     user: "101:101"
-    network_mode: service:platform
+    # round9 审查: web 不再共享 Platform 的网络命名空间——旧拓扑让 Nginx
+    # 在 runner-control 可达的 Platform 容器内监听 8088, Runner 可经
+    # platform:8088 访问完整用户/管理 API(注册/登录等)。web 现在独立接入
+    # application 网络, nginx 经 Docker DNS 代理到 platform:8080; Platform
+    # 容器内只剩 loopback 8080 与 capability 保护的 8082, Runner 不可达。
+    networks:
+      - application
+    ports:
+      - "${GA_HTTP_BIND:-127.0.0.1}:${GA_HTTP_PORT:-8088}:8088"
     depends_on:
       platform:
         condition: service_healthy
@@ -337,6 +357,8 @@ volumes:
   platform_config:
   session_files:
   bot_media:
+  # round9 审查: 交付 spool 卷(Platform rw / Poller ro), 文件快照跨容器可见。
+  delivery_spool:
   # 显式卷名: sandbox-manager 用 volume-subpath 挂载子目录到 Runner(daemon 可解析)。
   runner_workspaces:
     name: runner_workspaces

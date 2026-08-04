@@ -39,7 +39,7 @@ func NewILinkAdapter(cfg ILinkAdapterConfig) (*ILinkAdapter, error) {
 }
 
 // SendMessage delivers a text reply via the Bot Poller (iLink sendmessage).
-func (a *ILinkAdapter) SendMessage(ctx context.Context, botUUID, ilinkUserID, text string) error {
+func (a *ILinkAdapter) SendMessage(ctx context.Context, botUUID, ilinkUserID, text, clientID string) error {
 	if botUUID == "" || ilinkUserID == "" || text == "" {
 		return errors.New("bot uuid, ilink user id, and text are required")
 	}
@@ -47,10 +47,11 @@ func (a *ILinkAdapter) SendMessage(ctx context.Context, botUUID, ilinkUserID, te
 		BotUUID:     botUUID,
 		ILinkUserID: ilinkUserID,
 		Text:        text,
+		ClientID:    clientID,
 	})
 }
 
-func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, ilinkUserID, filePath, fileName string) error {
+func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, ilinkUserID, filePath, fileName, clientID string) error {
 	if botUUID == "" || ilinkUserID == "" || filePath == "" {
 		return errors.New("bot uuid, ilink user id, and file path are required")
 	}
@@ -60,15 +61,23 @@ func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, ilinkUserID, fileP
 		MsgType:     poller.MsgTypeFile,
 		FilePath:    filePath,
 		FileName:    fileName,
+		ClientID:    clientID,
 	})
 }
 
-// RecordMessageIdempotency returns true the first time a message is seen
-// within the TTL window. Sharded by key hash so concurrent bots don't contend
-// on a single mutex.
-func (a *ILinkAdapter) RecordMessageIdempotency(_ context.Context, botUUID, messageID string) (bool, error) {
+// CheckMessageIdempotency 只读检查消息是否已成功处理(Round8: 不写入)。
+func (a *ILinkAdapter) CheckMessageIdempotency(_ context.Context, botUUID, messageID string) (bool, error) {
 	if botUUID == "" || messageID == "" {
 		return false, errors.New("bot uuid and message id are required")
 	}
-	return a.idempotency.Record(botUUID, messageID), nil
+	return a.idempotency.Check(botUUID, messageID), nil
+}
+
+// MarkMessageIdempotency 在消息成功处理后标记(Round8: 失败路径不得消费消息)。
+func (a *ILinkAdapter) MarkMessageIdempotency(_ context.Context, botUUID, messageID string) error {
+	if botUUID == "" || messageID == "" {
+		return errors.New("bot uuid and message id are required")
+	}
+	a.idempotency.Mark(botUUID, messageID)
+	return nil
 }

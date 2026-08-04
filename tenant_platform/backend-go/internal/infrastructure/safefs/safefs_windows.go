@@ -112,7 +112,19 @@ func AtomicWriteBeneath(root, rel string, data []byte, perm os.FileMode) error {
 	return os.Rename(tmpPath, abs)
 }
 
-func CopyFileBeneath(root, rel, src string, perm os.FileMode) error {
+func CopyFileBeneath(root, rel, src string, perm os.FileMode, maxBytes int64) error {
+	// Round8 审查: 源侧 Lstat 不跟随符号链接 + 普通文件校验 + 限长复制
+	// (Windows 开发回退; 生产部署是 Linux)。
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("source %s is not a regular file", src)
+	}
+	if maxBytes > 0 && info.Size() > maxBytes {
+		return fmt.Errorf("%w: source %s size %d exceeds %d", ErrFileTooLarge, src, info.Size(), maxBytes)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -122,7 +134,71 @@ func CopyFileBeneath(root, rel, src string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if maxBytes > 0 {
+		n, copyErr := io.Copy(out, io.LimitReader(in, maxBytes+1))
+		if copyErr != nil {
+			out.Close()
+			return copyErr
+		}
+		if n > maxBytes {
+			out.Close()
+			_ = RemoveBeneath(root, rel)
+			return fmt.Errorf("%w: source %s exceeded %d bytes during copy", ErrFileTooLarge, src, maxBytes)
+		}
+	} else if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// CopyFileFromBeneath 把 srcRoot 下 srcRel 复制为 dstRoot 下 dstRel。
+// Windows 开发回退: 逐组件 Lstat 拒绝符号链接(含最终组件)后按路径复制;
+// 生产部署是 Linux(openat2 原子校验, 见 safefs_linux.go)。
+func CopyFileFromBeneath(srcRoot, srcRel, dstRoot, dstRel string, perm os.FileMode, maxBytes int64) error {
+	srcRel, err := CleanRel(srcRoot, srcRel)
+	if err != nil {
+		return err
+	}
+	absSrc := filepath.Join(srcRoot, filepath.FromSlash(srcRel))
+	if err := rejectSymlinkComponents(srcRoot, absSrc); err != nil {
+		return err
+	}
+	info, err := os.Lstat(absSrc)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("source %s is not a regular file", srcRel)
+	}
+	if maxBytes > 0 && info.Size() > maxBytes {
+		return fmt.Errorf("%w: source %s size %d exceeds %d", ErrFileTooLarge, srcRel, info.Size(), maxBytes)
+	}
+	in, err := os.Open(absSrc)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := OpenBeneath(dstRoot, dstRel, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if maxBytes > 0 {
+		n, copyErr := io.Copy(out, io.LimitReader(in, maxBytes+1))
+		if copyErr != nil {
+			out.Close()
+			return copyErr
+		}
+		if n > maxBytes {
+			out.Close()
+			_ = RemoveBeneath(dstRoot, dstRel)
+			return fmt.Errorf("%w: source %s exceeded %d bytes during copy", ErrFileTooLarge, srcRel, maxBytes)
+		}
+	} else if _, err := io.Copy(out, in); err != nil {
 		out.Close()
 		return err
 	}

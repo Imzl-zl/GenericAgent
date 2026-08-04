@@ -254,10 +254,12 @@ def _arm_deadline_timer(adapter: Any, task: worker_pb2.TaskEnvelope, state: Task
 
     def _on_timeout():
         state.timed_out["v"] = True
-        # 内部 deadline timer 也携带会话身份(cancel_task 现在校验身份)。
+        # 内部 deadline timer 也携带会话身份与当前任务 capability JTI
+        # (审查 C1/I7: 生产会话有活跃 JTI 集时, 不带 JTI 的 cancel 会被
+        # _assert_task_capability 拒绝, 超时无法中断 agent 线程)。
         session = adapter._session
         if session is not None:
-            adapter.cancel_task(task.task_id, session.workspace_key, session.runner_generation)
+            adapter.cancel_task(task.task_id, session.workspace_key, session.runner_generation, task.capability_jti)
         else:
             adapter.cancel_task(task.task_id)
 
