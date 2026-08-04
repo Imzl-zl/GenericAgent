@@ -113,15 +113,16 @@ RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_m
 `, userID, now), &u); err != nil {
 			return err
 		}
-		// Cancel queued tasks directly (spec §5.3: "queued 任务直接标记 cancelled").
-		if _, err := tx.Exec(ctx, `
-UPDATE tasks
-SET status = 'cancelled', cancel_requested_at = $2, terminal_at = $2, updated_at = $2
-WHERE requester_user_id = $1 AND status = 'queued'
-`, userID, now); err != nil {
+		// 直接终态化 queued 与未派发 starting 任务(round10 审查 B5): 未派发
+		// starting 若只写 cancel_requested_at, dispatch 会因
+		// "WorkerDispatchStartedAt==nil" 直接返回, 任务永久卡在 starting
+		// 占住串行槽; queued 若用裸 UPDATE 也不取消 pending task_started
+		// delivery(用户会收到"正在处理"却无后续)。统一走 finalizeTerminal:
+		// 撤销已签发 JTI、写 status_transition、取消 task_started、清 claim。
+		if err := cancelBlockedUserTasks(ctx, tx, userID); err != nil {
 			return err
 		}
-		// Mark running/starting tasks for cooperative cancellation.
+		// Mark running/starting(已派发)任务 for cooperative cancellation。
 		rows, err := tx.Query(ctx, `
 UPDATE tasks
 SET cancel_requested_at = $2, updated_at = $2
@@ -152,6 +153,43 @@ RETURNING `+taskSelectColumns, userID, now)
 		TargetID:    fmt.Sprintf("%d", userID),
 	})
 	return u, affected, nil
+}
+
+// cancelBlockedUserTasks 终态化用户所有 queued 与未派发 starting 任务
+// (round10 审查 B5): 复用 RemoveMember 的 cancelRemovedMemberTasks 语义
+// (finalizeTerminal: 撤销 JTI、写事件、取消 pending task_started、清 claim),
+// 跨该用户全部 workspace。已派发(starting + dispatch 已开始)任务由调用方
+// 写 durable cancel_requested_at, 由 scheduler tick 驱动 Worker 取消。
+func cancelBlockedUserTasks(ctx context.Context, tx pgx.Tx, userID int64) error {
+	rows, err := tx.Query(ctx, `
+SELECT `+taskSelectColumns+` FROM tasks
+WHERE requester_user_id = $1
+  AND ((status = 'queued') OR
+       (status = 'starting' AND worker_dispatch_started_at IS NULL AND cancel_requested_at IS NULL))
+FOR UPDATE
+`, userID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var list []domain.Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return err
+		}
+		list = append(list, t)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, t := range list {
+		if _, err := finalizeTerminal(ctx, tx, t, domain.TaskCancelled, domain.DeliveryTaskCancelled,
+			"TASK_CANCELLED", "user blocked", "", "", ""); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ListPendingUsers returns all users with status 'pending'.

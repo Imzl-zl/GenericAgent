@@ -19,13 +19,16 @@ from ga_worker.state import TaskRunState
 ERROR_MSG_MAX_LEN = 500
 
 
-def cleanup_legacy_subprocesses(adapter: Any) -> None:
+def cleanup_legacy_subprocesses(adapter: Any) -> bool:
     """任务终态前清理 legacy code_run 遗留进程组(审查 C2)。
 
     code_run 以独立进程组运行(ga.py), 正常返回后可能仍有派生的后台子进程
     (如 nohup ... &)。Runner 按 workspace 复用, 这些进程若跨任务存活可窃取
     下一任务的 capability 凭据或继续写工作区。经 adapter._legacy_mods 调用
     ga.kill_all_code_run_processes; 无 ga 模块(测试/无凭据环境)时静默跳过。
+    round10 审查(B4): 返回 False 表示清理不干净(fail-closed)——调用方必须
+    把任务标记为失败(error_code=SUBPROCESS_CLEANUP_FAILED), Platform 对失败
+    任务销毁 Runner, 残留进程无法跨任务存活。
     """
     mods = getattr(adapter, "_legacy_mods", None) or {}
     ga_mod = mods.get("ga")
@@ -33,9 +36,10 @@ def cleanup_legacy_subprocesses(adapter: Any) -> None:
         kill_all = getattr(ga_mod, "kill_all_code_run_processes", None)
         if callable(kill_all):
             try:
-                kill_all()
+                return bool(kill_all())
             except Exception:
-                pass  # 清理是 best-effort, 不得阻断终态产出
+                return False  # 清理异常同样 fail-closed
+    return True
 
 
 def map_exception_code(exc: BaseException) -> str:
@@ -143,14 +147,30 @@ def emit_final_terminal(
             user_message=message[:ERROR_MSG_MAX_LEN],
             error_code=code, result_body=state.final_body,
         )
+        # 取消/超时路径同样清理残留(cancel/timeout 终态由 Platform evict
+        # Runner, 清理失败由容器销毁兜底, 无需 fail-closed)。
+        cleanup_legacy_subprocesses(adapter)
     else:
         if generated:
             state.final_body = append_missing_file_markers(state.final_body, generated)
+        # round10 审查(B4): 成功路径必须确认子进程清理干净——残留进程可窃取
+        # 下一任务凭据或继续写工作区, 不得复用 Runner。清理失败时任务判失败
+        # (error_code=SUBPROCESS_CLEANUP_FAILED), Platform 对失败任务销毁
+        # Runner(fail-closed)。
+        if not cleanup_legacy_subprocesses(adapter):
+            term = adapter._terminal(
+                task.task_id, worker_pb2.TASK_FAILED,
+                user_message="task subprocess cleanup failed; runner will be discarded",
+                error_code="SUBPROCESS_CLEANUP_FAILED", result_body=state.final_body,
+            )
+            adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
+            yield worker_pb2.WorkerEvent(terminal=term)
+            state.terminal_emitted = True
+            return
         term = adapter._terminal(
             task.task_id, worker_pb2.TASK_SUCCEEDED,
             user_message=state.final_body, result_body=state.final_body,
         )
-    cleanup_legacy_subprocesses(adapter)
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
     state.terminal_emitted = True

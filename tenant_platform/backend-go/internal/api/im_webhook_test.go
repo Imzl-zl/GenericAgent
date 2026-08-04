@@ -212,6 +212,9 @@ type fakeTaskService struct{}
 func (s *fakeTaskService) SubmitTask(_ context.Context, _ domain.SubmitTaskCommand) (domain.Task, error) {
 	return domain.Task{}, nil
 }
+func (s *fakeTaskService) SubmitTaskWithInboundMessage(_ context.Context, _ domain.SubmitTaskCommand, _ domain.Message) (domain.Task, domain.Message, error) {
+	return domain.Task{}, domain.Message{}, nil
+}
 func (s *fakeTaskService) GetTask(_ context.Context, _ string) (domain.Task, error) {
 	return domain.Task{}, nil
 }

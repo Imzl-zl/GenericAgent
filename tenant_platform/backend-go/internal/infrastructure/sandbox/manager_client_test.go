@@ -16,6 +16,7 @@ import (
 // fakeCLI2 记录创建并返回固定 Runner(控制面测试用)。
 type fakeCLI2 struct {
 	runnerContainer bool
+	containerExists bool
 	specs           []RunnerSpec
 	ensureCalls     []string
 }
@@ -29,6 +30,10 @@ func (f *fakeCLI2) Destroy(ctx context.Context, name string) error { return nil 
 func (f *fakeCLI2) Inspect(ctx context.Context, name string) error { return nil }
 func (f *fakeCLI2) IsRunnerContainer(ctx context.Context, idOrName string) (bool, error) {
 	return f.runnerContainer, nil
+}
+
+func (f *fakeCLI2) ContainerExists(ctx context.Context, idOrName string) (bool, error) {
+	return f.containerExists, nil
 }
 
 func (f *fakeCLI2) RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error) {
@@ -220,9 +225,15 @@ func TestManagerControlAPIRejectsArbitraryDestroyName(t *testing.T) {
 	ts := httptest.NewServer(server.Handler())
 	defer ts.Close()
 	client, _ := NewManagerClient(ts.URL, "0123456789abcdef-secret", "ga-runner")
+	// 存在但非 Runner 的容器名(如 compose 里的 postgres-1)必须拒绝。
+	cli.runnerContainer = false
+	cli.containerExists = true
 	if err := client.Destroy(context.Background(), "postgres-1"); err == nil {
 		t.Fatal("destroying a non-runner container name must be rejected")
 	}
+	// 名字不匹配模式但容器存在且非 Runner: 必须拒绝(防任意 rm)。
+	cli.runnerContainer = false
+	cli.containerExists = true
 	if err := client.Destroy(context.Background(), "ga-runner-1234567890xz-g1"); err == nil {
 		t.Fatal("runner name with non-hex hash must be rejected")
 	}
@@ -233,7 +244,16 @@ func TestManagerControlAPIRejectsArbitraryDestroyName(t *testing.T) {
 	}
 	// label 校验失败(存在但非 Runner)必须拒绝。
 	cli.runnerContainer = false
+	cli.containerExists = true
 	if err := client.Destroy(context.Background(), "deadbeefdeadbeef"); err == nil {
 		t.Fatal("destroying a non-runner container id must be rejected")
+	}
+	// round10 审查(B1): 容器已不存在时销毁必须幂等成功(lease 记录的
+	// container_id 可能已被 idle 回收删除; 拒绝会让 stale_container_id
+	// 清理永久失败, 该工作区无法重建 Runner)。
+	cli.runnerContainer = false
+	cli.containerExists = false
+	if err := client.Destroy(context.Background(), "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b"); err != nil {
+		t.Fatalf("destroying a missing container id must be idempotent success: %v", err)
 	}
 }

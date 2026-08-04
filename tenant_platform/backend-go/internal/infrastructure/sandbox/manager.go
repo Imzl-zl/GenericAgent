@@ -300,14 +300,26 @@ func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
 		// 审查 R5-I6: 容器 ID 路径(非 RunnerName 模式)同样必须通过 manager
 		// label 归属校验——只有 runner=true 标签不能证明是本 Manager 创建,
 		// 其他部署/宿主任意容器的 runner=true 标签不得被销毁。
+		// round10 审查(B1): 容器已不存在时幂等成功(与名称路径一致)——
+		// idle 回收后 lease 记录的 container_id 可能在 Destroy 与 release
+		// 之间已被其他路径删除, 若把"不存在"当作拒绝, stale_container_id
+		// 清理会永久失败, 该工作区无法重建 Runner。
 		if checker, ok := m.cfg.CLI.(interface {
 			IsManagerRunner(ctx context.Context, idOrName string) (bool, error)
+			ContainerExists(ctx context.Context, idOrName string) (bool, error)
 		}); ok {
 			managed, err := checker.IsManagerRunner(ctx, name)
 			if err != nil {
 				return fmt.Errorf("refusing to destroy %q: manager label check failed: %w", name, err)
 			}
 			if !managed {
+				exists, existsErr := checker.ContainerExists(ctx, name)
+				if existsErr != nil {
+					return fmt.Errorf("refusing to destroy %q: existence check failed: %w", name, existsErr)
+				}
+				if !exists {
+					return nil // 已不存在: 幂等成功
+				}
 				return fmt.Errorf("refusing to destroy %q: not created by this manager instance", name)
 			}
 		} else {
@@ -439,6 +451,17 @@ func (m *Manager) ListRunnerContainers(ctx context.Context, namePrefix string) (
 // label(销毁前归属校验, 方案 §7: 控制面不能任意删除宿主任意容器)。
 func (m *Manager) IsRunnerContainer(ctx context.Context, idOrName string) (bool, error) {
 	return m.cfg.CLI.IsRunnerContainer(ctx, idOrName)
+}
+
+// ContainerExists 委托 CLI 判断容器(按 ID 或名称)是否存在
+// (round10 审查 B1: 销毁路径区分"不存在=幂等成功"与"存在但非 Runner=拒绝")。
+func (m *Manager) ContainerExists(ctx context.Context, idOrName string) (bool, error) {
+	if checker, ok := m.cfg.CLI.(interface {
+		ContainerExists(ctx context.Context, idOrName string) (bool, error)
+	}); ok {
+		return checker.ContainerExists(ctx, idOrName)
+	}
+	return false, fmt.Errorf("CLI does not support container existence checks")
 }
 
 // IsRunnerName 校验 name 是否符合本 Manager 的 Runner 命名模式

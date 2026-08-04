@@ -72,6 +72,12 @@ func TestAcquireRunnerLeaseForeignOwnerTakeoverWithoutActiveTask(t *testing.T) {
 	if first.Generation != 1 {
 		t.Fatalf("first generation = %d, want 1", first.Generation)
 	}
+	// 绑定容器后异主接管: 旧容器必须移入 stale_container_id 供定向销毁,
+	// 新 generation 的 container_id 保持为空(round10 审查 B2: 重启后新
+	// processID 接管旧进程 lease 时, 旧 Runner 必须被销毁重建并注入新 CA)。
+	if err := store.AttachRunnerContainer(ctx, first.RunnerKey, "old-container-1", first.Generation, "platform-a"); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
 	// 异主 + owner 无活跃 task claim(崩溃/长期停机): 允许接管, generation +1。
 	// 审查: 接管必须返回完整 lease 行(generation>0), 否则下游签发零值。
 	taken, created, err := store.AcquireRunnerLease(ctx, "personal:7", "platform-b", 30*time.Minute, 0)
@@ -86,6 +92,12 @@ func TestAcquireRunnerLeaseForeignOwnerTakeoverWithoutActiveTask(t *testing.T) {
 	}
 	if taken.Owner != "platform-b" {
 		t.Fatalf("takeover owner = %q, want platform-b", taken.Owner)
+	}
+	if taken.StaleContainerID != "old-container-1" {
+		t.Fatalf("takeover stale_container_id = %q, want old-container-1", taken.StaleContainerID)
+	}
+	if taken.ContainerID != "" {
+		t.Fatalf("takeover container_id = %q, want empty", taken.ContainerID)
 	}
 }
 
@@ -142,6 +154,18 @@ func TestRunnerLeaseGenerationIncrementsAfterRelease(t *testing.T) {
 	}
 	if err := store.ReleaseRunnerLease(ctx, first.RunnerKey, "platform-a", first.Generation); err != nil {
 		t.Fatalf("release: %v", err)
+	}
+
+	// round10 审查(B1): release 必须同时清空容器字段——残留的 container_id
+	// 会在下次接管时进入 stale_container_id, 对已删除容器定向销毁失败导致
+	// 该工作区永久无法重建 Runner。
+	released, err := store.GetRunnerLease(ctx, first.RunnerKey)
+	if err != nil {
+		t.Fatalf("get released lease: %v", err)
+	}
+	if released.ContainerID != "" || released.StaleContainerID != "" || released.ControlEndpoint != "" {
+		t.Fatalf("release must clear container fields: container=%q stale=%q endpoint=%q",
+			released.ContainerID, released.StaleContainerID, released.ControlEndpoint)
 	}
 
 	second, created, err := store.AcquireRunnerLease(ctx, "personal:3", "platform-a", 30*time.Minute, 0)

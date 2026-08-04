@@ -256,13 +256,21 @@ WHERE runner_key = $1
 // ReleaseRunnerLease marks the lease immediately expired so the next acquire
 // takes over with generation + 1. The generation condition (审查 C6) prevents
 // a stale cleanup from releasing a newer generation's lease.
+// round10 审查(B1): release 语义是"容器已销毁、lease 归还"——必须同时清空
+// container_id/stale_container_id/control_endpoint, 否则接管事务会把已删除的
+// 容器 ID 移入 stale_container_id, 下次 Start 对不存在的容器销毁失败
+// (Manager 归属校验拒绝), 该工作区永久无法重建 Runner。
 func (s *Store) ReleaseRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64) error {
 	if generation == 0 {
 		return fmt.Errorf("runner generation must be positive")
 	}
 	tag, err := s.pool.Exec(ctx, `
 UPDATE runner_leases
-SET expires_at = timezone('utc', now()) - interval '1 second', updated_at = timezone('utc', now())
+SET expires_at = timezone('utc', now()) - interval '1 second',
+    container_id = '',
+    stale_container_id = '',
+    control_endpoint = '',
+    updated_at = timezone('utc', now())
 WHERE runner_key = $1 AND owner = $2 AND generation = $3
 `, runnerKey, owner, generation)
 	if err != nil {

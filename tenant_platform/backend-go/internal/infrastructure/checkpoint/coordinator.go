@@ -67,6 +67,11 @@ type Coordinator interface {
 	// SweepExpiredCheckpoints 定期清理 checkpoint lease 已过期的 writing
 	// snapshot(置为 quarantined)并删除其宿主 staging 文件(审查 R4-I12)。
 	SweepExpiredCheckpoints(ctx context.Context) (int, error)
+	// CleanupCommittedFiles 删除 Commit 已物化但 DB 提交失败的 committed/
+	// results 文件(round10 审查 B9a): Commit 写文件与 CompleteSucceeded
+	// 事务不是原子的, 事务失败后这些文件不被任何恢复指针引用, 必须清理,
+	// 否则重复故障会永久占用宿主磁盘。
+	CleanupCommittedFiles(ctx context.Context, committed CommittedCheckpoint) error
 	// RunnerStagingRef 映射宿主 staging 路径为容器内路径(方案 §7:
 	// Worker 只接受 runtime root 内的 staging_ref)。Local 实现原样返回。
 	RunnerStagingRef(hostRef string) (string, error)

@@ -18,29 +18,11 @@ func personalSessionKey(userID int64) string {
 	return fmt.Sprintf("personal:%d", userID)
 }
 
-// persistInbound writes the received message to the message store and inserts
-// a media_assets row for each media item. The first media path (if any) is
-// persisted alongside the text body for quick access. Media asset insertions
-// are best-effort: failures are logged but do not block message routing, and
-// duplicates (ErrDuplicateMediaAsset) are silent successes (the cross-instance
-// UNIQUE constraint already recorded the file).
-func (r *router) persistInbound(ctx context.Context, msg IncomingMessage, bot domain.Bot, sessionKey string) (domain.Message, error) {
-	mediaPath := ""
-	if len(msg.MediaPaths) > 0 {
-		mediaPath = msg.MediaPaths[0]
-	}
-	msgRow, err := r.messages.InsertInboundMessage(ctx, domain.Message{
-		UserID:      bot.OwnerID,
-		BotID:       bot.ID,
-		SessionKey:  sessionKey,
-		MessageID:   msg.MessageID,
-		MessageType: inferMessageType(msg.MediaPaths),
-		Content:     msg.Text,
-		MediaPath:   mediaPath,
-	})
-	if err != nil {
-		return msgRow, err
-	}
+// persistInboundMedia 为已持久化的入站消息行补插 media_assets 审计
+// (round10 审查 B7): 消息行本身已在路由时持久化(任务同事务 / 命令-relay
+// claim), 此处只插入媒体资产元数据。插入幂等(UNIQUE on message_id +
+// storage_path); 失败非致命——消息已持久化并路由, 缺失媒体审计行可接受。
+func (r *router) persistInboundMedia(ctx context.Context, msg IncomingMessage, bot domain.Bot, msgRow domain.Message) error {
 	// Insert media_assets metadata. Idempotent (UNIQUE on message_id +
 	// storage_path). Failure is non-fatal: the message is already persisted
 	// and routed; a missing media audit row is acceptable.
@@ -62,7 +44,7 @@ func (r *router) persistInbound(ctx context.Context, msg IncomingMessage, bot do
 				"error", merr)
 		}
 	}
-	return msgRow, nil
+	return nil
 }
 
 // inferMessageType maps media presence to a coarse type. The Poller does not

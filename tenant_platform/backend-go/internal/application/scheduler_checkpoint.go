@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
@@ -133,9 +134,18 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		// running 占住串行槽(dispatch goroutine 已结束, 无人会再驱动收尾)。
 		latest, getErr := s.cfg.Store.GetTask(ctx, task.ID)
 		if getErr == nil && latest.Status.IsTerminal() {
+			// 事务实际已提交: committed/result 文件是恢复点, 不得删除。
 			s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
 			_ = s.KickSession(ctx, task.SessionKey)
 			return nil
+		}
+		// round10 审查(B9a): 提交失败且任务未终态——已物化的 committed/result
+		// 文件不被任何恢复指针引用, 必须清理, 否则重复故障永久占用宿主磁盘。
+		if s.cfg.Coordinator != nil {
+			if cleanupErr := s.cfg.Coordinator.CleanupCommittedFiles(ctx, committed); cleanupErr != nil {
+				slog.ErrorContext(ctx, "scheduler: cleanup orphan committed files failed",
+					"task_id", task.ID, "snapshot_id", committed.SnapshotID, "error", cleanupErr)
+			}
 		}
 		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,

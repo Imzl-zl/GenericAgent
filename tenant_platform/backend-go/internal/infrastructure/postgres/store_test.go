@@ -1291,3 +1291,245 @@ WHERE runner_key = $1
 		t.Fatalf("expired lease must be inactive, active=%v err=%v", active, err)
 	}
 }
+
+// round10 审查(B5): BlockUser 必须终态化未派发 starting 任务(而不是只写
+// cancel_requested_at)——dispatch 对未派发取消任务直接 return, 残留任务会
+// 永久卡在 starting 占住串行槽; 同时 pending task_started delivery 必须取消
+// (用户不得收到"正在处理"却无后续), claim 必须清空。
+func TestBlockUserTerminalizesUndispatchedStartingTask(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-blk", MessageID: "blk-1",
+		Prompt: "blocked undispatched", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	// 模拟 capability 已签发(签发先于 MarkDispatchStarted, 审查 F1)。
+	if err := store.SetTaskCapabilityJTIs(ctx, claimed.ID, "p1", []string{"jti-blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	// queued 任务在封禁前提交, 同样必须被终态化。
+	if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-blk", MessageID: "blk-2",
+		Prompt: "blocked queued", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.BlockUser(ctx, 1); err != nil {
+		t.Fatalf("BlockUser: %v", err)
+	}
+	got, err := store.GetTask(ctx, claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskCancelled {
+		t.Fatalf("undispatched starting task status = %s after block, want cancelled", got.Status)
+	}
+	if got.ClaimOwner != "" || !got.ClaimLeaseUntil.IsZero() {
+		t.Fatalf("claim must be cleared after block: owner=%q lease=%v", got.ClaimOwner, got.ClaimLeaseUntil)
+	}
+	if got.CancelRequestedAt != nil {
+		t.Fatal("terminalized task must not carry cancel_requested_at")
+	}
+	// JTI 必须被撤销(终态事务内)。
+	var revoked bool
+	if err := pool.QueryRow(ctx, `
+SELECT EXISTS (SELECT 1 FROM llm_capability_revocations WHERE jti_hash = sha256('jti-blocked'::bytea))
+`).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Fatal("capability JTI must be revoked in the block transaction")
+	}
+	// pending task_started delivery 必须取消。
+	var stStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM task_deliveries WHERE task_id = $1 AND delivery_type = 'task_started'`, claimed.ID).Scan(&stStatus); err != nil {
+		t.Fatal(err)
+	}
+	if stStatus != "cancelled" {
+		t.Fatalf("task_started delivery status = %q after block, want cancelled", stStatus)
+	}
+	var qStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM tasks WHERE message_id = 'blk-2'`).Scan(&qStatus); err != nil {
+		t.Fatal(err)
+	}
+	if qStatus != "cancelled" {
+		t.Fatalf("queued task status = %q after block, want cancelled", qStatus)
+	}
+}
+
+// round10 审查(B5): IsTaskCapabilityActive 必须对 blocked 用户的任务返回
+// inactive——封禁后下一次 LLM/Sophub 调用即被拒绝, 不等 Worker 终态化。
+func TestIsTaskCapabilityActiveRejectsBlockedUser(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-blk2", MessageID: "blk-active",
+		Prompt: "p", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	if _, err := store.MarkDispatchStarted(ctx, task.ID, "p1", "w1", false); err != nil {
+		t.Fatal(err)
+	}
+	// loopback/dev 模式无 runner_leases 行 → 跳过 lease 校验; 用户 approved → 活跃。
+	if active, err := store.IsTaskCapabilityActive(ctx, task.ID, 1); err != nil || !active {
+		t.Fatalf("approved user task must be active, active=%v err=%v", active, err)
+	}
+	// task1 已派发(starting)且用户被 BlockUser(已派发任务只写
+	// cancel_requested_at, 状态仍 starting)——capability 在线校验必须因
+	// users.status='blocked' 拒绝(封禁后下一次 LLM/Sophub 调用即失效)。
+	if _, _, err := store.BlockUser(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := store.IsTaskCapabilityActive(ctx, task.ID, 1); err != nil || active {
+		t.Fatalf("blocked user task must be inactive, active=%v err=%v", active, err)
+	}
+}
+
+// round10 审查(B8): 同一 task 的 task_started 未完成(pending/sending)时,
+// 其他 delivery(task_complete/task_failed 等)不得被 claim——否则并发发送
+// 会让完成消息先于"正在处理"送达。task_started 自身始终可 claim。
+func TestClaimPendingDeliveriesDefersTerminalUntilStartedAcked(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-ord", MessageID: "ord-1",
+		Prompt: "ordering", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim task: %v ok=%v", err, ok)
+	}
+	// 终态事务插入 task_failed delivery 并取消 pending task_started。
+	if _, err := store.CompleteFailedTerminal(ctx, task.ID, "p1", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// task_started 已被终态事务置 cancelled → task_failed 可 claim。
+	dels, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute, 5*time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dels) != 1 || dels[0].DeliveryType != domain.DeliveryTaskFailed {
+		t.Fatalf("terminal delivery must be claimable after task_started cancelled, got %+v", dels)
+	}
+
+	// 场景 B: 模拟 task_started 仍 pending(如发送失败重试中)——同 task 的
+	// terminal delivery 不得被 claim; task_started 自身可 claim。
+	if _, err := pool.Exec(ctx, `
+UPDATE task_deliveries SET status = 'pending' WHERE task_id = $1 AND delivery_type = 'task_started'
+`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 重置 task_failed 为 pending 供 claim。
+	if _, err := pool.Exec(ctx, `UPDATE task_deliveries SET status = 'pending', attempt_lease_until = NULL, next_attempt_at = NULL WHERE task_id = $1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	dels, err = store.ClaimPendingDeliveries(ctx, 10, time.Minute, 5*time.Minute, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dels) != 1 || dels[0].DeliveryType != domain.DeliveryTaskStarted {
+		t.Fatalf("only task_started may be claimed while it is pending, got %+v", dels)
+	}
+}
+
+// round10 审查(B7): 任务与入站消息行同事务——成功时原子写入; 消息行已存在
+// (已处理过)时短路且任务不重复创建; 任务已存在(崩溃重试)时返回已有任务并
+// 补齐消息行。
+func TestSubmitTaskWithInboundMessageAtomicity(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+	// messages.bot_id 外键要求 bot 行存在。
+	if _, err := pool.Exec(ctx, `
+INSERT INTO bots (id, bot_uuid, owner_id, token_ciphertext, state, created_at, updated_at)
+VALUES (1, '00000000-0000-4000-8000-000000000001', 1, 'ciphertext', 'active', timezone('utc', now()), timezone('utc', now()))
+ON CONFLICT (id) DO NOTHING
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	msg := domain.Message{
+		UserID: 1, BotID: 1, SessionKey: dev.SessionKey, MessageID: "atomic-1",
+		MessageType: domain.MessageTypeText, Content: "hello",
+	}
+	cmd := domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-atom", MessageID: "atomic-1",
+		Prompt: "p", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	}
+	task, msgRow, err := store.SubmitTaskWithInboundMessage(ctx, cmd, msg)
+	if err != nil {
+		t.Fatalf("atomic submit: %v", err)
+	}
+	if task.ID == "" || msgRow.ID == 0 {
+		t.Fatalf("atomic submit must persist both task and message, task=%q msg=%d", task.ID, msgRow.ID)
+	}
+
+	// 消息行已存在 → ErrDuplicateInboundMessage, 且不创建第二个任务。
+	if _, _, err := store.SubmitTaskWithInboundMessage(ctx, cmd, msg); !errors.Is(err, domain.ErrDuplicateInboundMessage) {
+		t.Fatalf("duplicate message must short-circuit with ErrDuplicateInboundMessage, got %v", err)
+	}
+	var taskCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM tasks WHERE message_id = 'atomic-1'`).Scan(&taskCount); err != nil {
+		t.Fatal(err)
+	}
+	if taskCount != 1 {
+		t.Fatalf("task count = %d, want 1 (no duplicate task)", taskCount)
+	}
+
+	// 模拟崩溃重试: 任务已存在但消息行缺失(删除消息行)——重试必须返回已有
+	// 任务并补齐消息行, 不创建重复任务。
+	if _, err := pool.Exec(ctx, `DELETE FROM messages WHERE id = $1`, msgRow.ID); err != nil {
+		t.Fatal(err)
+	}
+	retryTask, retryRow, err := store.SubmitTaskWithInboundMessage(ctx, cmd, msg)
+	if err != nil {
+		t.Fatalf("retry after crash window: %v", err)
+	}
+	if retryTask.ID != task.ID {
+		t.Fatalf("retry must return existing task %s, got %s", task.ID, retryTask.ID)
+	}
+	if retryRow.ID == 0 {
+		t.Fatal("retry must backfill the inbound message row")
+	}
+}

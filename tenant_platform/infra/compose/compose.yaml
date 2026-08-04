@@ -303,11 +303,10 @@ services:
       dockerfile: tenant_platform/infra/compose/web.Dockerfile
     restart: unless-stopped
     user: "101:101"
-    # round9 审查: web 不再共享 Platform 的网络命名空间——旧拓扑让 Nginx
-    # 在 runner-control 可达的 Platform 容器内监听 8088, Runner 可经
-    # platform:8088 访问完整用户/管理 API(注册/登录等)。web 现在独立接入
-    # application 网络, nginx 经 Docker DNS 代理到 platform:8080; Platform
-    # 容器内只剩 loopback 8080 与 capability 保护的 8082, Runner 不可达。
+    # round10 审查(B1c): web 独立网络命名空间; nginx 经共享卷上的 unix
+    # socket 代理 Platform 主 API(/v1/, /healthz)——API 面不绑定 TCP 端口,
+    # runner-control 网络中的 Runner 无法访问完整用户/管理 API。Platform 容器
+    # 内只剩 loopback 8080(healthcheck)与 capability 保护的 8082。
     networks:
       - application
     ports:
@@ -322,6 +321,9 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=101,gid=101,mode=0700
+    volumes:
+      # round10 审查(B1c): nginx 经共享卷上的 unix socket 代理 Platform 主 API。
+      - platform_sock:/var/run/ga:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8088/healthz"]
       interval: 10s
@@ -352,6 +354,7 @@ services:
     logging: *default-logging
 
 volumes:
+  platform_sock:
   postgres_data:
   platform_runtime:
   platform_config:

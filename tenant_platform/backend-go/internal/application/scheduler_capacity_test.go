@@ -143,6 +143,11 @@ func (f *capacityTaskStore) MarkRunning(ctx context.Context, taskID, platformIns
 	return f.getTask[taskID], nil
 }
 
+func (f *capacityTaskStore) SubmitTaskWithInboundMessage(ctx context.Context, cmd domain.SubmitTaskCommand, msg domain.Message) (domain.Task, domain.Message, error) {
+	t, err := f.SubmitTask(ctx, cmd)
+	return t, domain.Message{}, err
+}
+
 func (f *capacityTaskStore) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error) {
 	panic("unexpected SubmitTask")
 }

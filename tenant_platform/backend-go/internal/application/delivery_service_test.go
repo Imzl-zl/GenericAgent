@@ -574,6 +574,8 @@ type fakeMessageStore struct {
 	assetErr        error
 }
 
+func (s *fakeMessageStore) DeleteInboundMessage(_ context.Context, _ int64, _ string) error { return nil }
+
 func (s *fakeMessageStore) InsertInboundMessage(_ context.Context, m domain.Message) (domain.Message, error) {
 	if s.inErr != nil {
 		return domain.Message{}, s.inErr

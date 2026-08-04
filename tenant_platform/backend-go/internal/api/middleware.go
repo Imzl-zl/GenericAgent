@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -96,9 +98,42 @@ func ServeInternalContext(ctx context.Context, addr string, h http.Handler) erro
 }
 
 func serveUntil(ctx context.Context, addr string, h http.Handler) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return serveListener(ctx, ln, h)
+}
+
+// ServeUnixContext 在 unix socket 上运行主 API(round10 审查 B1c): 独立
+// nginx 容器经共享卷挂载该 socket 代理 /v1/, 使 Web/API 面不暴露给
+// runner-control 网络(Platform 必须接入 runner-control 拨号 Runner, 因此
+// 主 API 不能监听 0.0.0.0)。socket 权限 0660、属组 10001(Platform 主组),
+// web 容器 group_add 10001 后即可读写。与 loopback TCP listener 共用
+// timeout/recover/body-limit 中间件; 退出时删除 socket 文件。
+func ServeUnixContext(ctx context.Context, path string, h http.Handler) error {
+	if path == "" {
+		return fmt.Errorf("unix listen path is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o2750); err != nil {
+		return fmt.Errorf("create unix listen dir: %w", err)
+	}
+	_ = os.Remove(path) // 清理上次进程残留(同进程重复调用/崩溃遗留)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return fmt.Errorf("listen unix %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("chmod unix socket: %w", err)
+	}
+	defer os.Remove(path)
+	return serveListener(ctx, ln, h)
+}
+
+func serveListener(ctx context.Context, ln net.Listener, h http.Handler) error {
 	wrapped := recoverMiddleware(bodyLimitMiddleware(MaxRequestBodyBytes)(h))
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           wrapped,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -107,7 +142,7 @@ func serveUntil(ctx context.Context, addr string, h http.Handler) error {
 		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
+	go func() { errCh <- srv.Serve(ln) }()
 	select {
 	case <-ctx.Done():
 		shctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

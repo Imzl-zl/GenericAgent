@@ -16,6 +16,9 @@ const CapabilityVersion = "foundation.v1"
 // TaskService is the application-facing task API.
 type TaskService interface {
 	SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error)
+	// SubmitTaskWithInboundMessage 在同一事务内持久化入站消息行与任务
+	// (round10 审查 B7): 消除任务/消息行二段写入的崩溃与并发窗口。
+	SubmitTaskWithInboundMessage(ctx context.Context, cmd domain.SubmitTaskCommand, msg domain.Message) (domain.Task, domain.Message, error)
 	GetTask(ctx context.Context, taskID string) (domain.Task, error)
 	CancelTask(ctx context.Context, taskID string, requesterUserID int64) (domain.Task, error)
 	ClaimNextTask(ctx context.Context, sessionKey, platformInstanceID string) (domain.Task, bool, error)
@@ -105,6 +108,31 @@ func (s *taskService) SubmitTask(ctx context.Context, cmd domain.SubmitTaskComma
 		s.kick(ctx, task.SessionKey)
 	}
 	return task, nil
+}
+
+// SubmitTaskWithInboundMessage 原子提交入站消息行与任务(round10 审查 B7)。
+func (s *taskService) SubmitTaskWithInboundMessage(ctx context.Context, cmd domain.SubmitTaskCommand, msg domain.Message) (domain.Task, domain.Message, error) {
+	if _, err := s.registry.Resolve(CapabilityVersion, cmd.ToolPolicyVersion); err != nil {
+		return domain.Task{}, domain.Message{}, fmt.Errorf("tool_policy_version: %w", err)
+	}
+	// 软预检与 SubmitTask 一致(队列上限快速拒绝; 硬校验在事务内)。
+	if s.perUserQueueLimit > 0 && cmd.RequesterUserID > 0 {
+		queued, err := s.store.CountQueuedTasksByRequester(ctx, cmd.RequesterUserID)
+		if err != nil {
+			return domain.Task{}, domain.Message{}, fmt.Errorf("count queued: %w", err)
+		}
+		if queued >= s.perUserQueueLimit {
+			return domain.Task{}, domain.Message{}, ErrPerUserQueueFull
+		}
+	}
+	task, msgRow, err := s.store.SubmitTaskWithInboundMessage(ctx, cmd, msg)
+	if err != nil {
+		return domain.Task{}, domain.Message{}, err
+	}
+	if s.kick != nil {
+		s.kick(ctx, task.SessionKey)
+	}
+	return task, msgRow, nil
 }
 
 func (s *taskService) GetTask(ctx context.Context, taskID string) (domain.Task, error) {

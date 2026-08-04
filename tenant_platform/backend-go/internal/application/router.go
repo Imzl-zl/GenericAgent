@@ -83,6 +83,9 @@ type MessageStore interface {
 	// 路由成功后才写消息行, 因此消息行存在 = 该消息已成功处理过——重启/多
 	// 实例后内存幂等缓存变冷时, 用它短路重复的 relay/命令副作用)。
 	HasInboundMessage(ctx context.Context, botID int64, messageID string) (bool, error)
+	// DeleteInboundMessage 删除 claim 后副作用失败的消息行(round10 审查 B7):
+	// 允许 Poller 重试重新执行命令/relay。
+	DeleteInboundMessage(ctx context.Context, botID int64, messageID string) error
 	InsertOutboundMessage(ctx context.Context, m domain.Message) (domain.Message, error)
 	HasOutboundMessage(ctx context.Context, taskID, messageType, content, mediaPath string) (bool, error)
 	InsertMediaAsset(ctx context.Context, m domain.MediaAsset) (domain.MediaAsset, error)
@@ -338,37 +341,34 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	// Step 4: 路由(命令/中继/任务提交)。失败返回 error 且不标记幂等,
-	// Poller 按 webhook 契约重试; 成功路径才继续持久化。
-	result, err := r.routeBoundMessage(ctx, msg, bot)
-	if err != nil {
-		return RouterResult{}, err
-	}
-	// Step 5: 成功路由后持久化入站消息(Round8: 任务已提交, 消息入库失败
-	// 非致命——用户不被阻断, 审计缺失可接受, 但记日志便于 DB 故障暴露)。
+	// Step 4: 路由(命令/中继/任务提交)。round10 审查(B7): 消息行不再在
+	// 副作用之后单独写入——命令/relay 先原子 claim 消息行再执行副作用
+	// (失败删除 claim 行, 允许 Poller 重试重新执行); 任务提交与消息行在
+	// 同一 DB 事务内(SubmitTaskWithInboundMessage), 消除二段写入的崩溃/
+	// 并发窗口。失败返回 error 且不标记幂等, Poller 按 webhook 契约重试。
 	inboundSessionKey := personalSessionKey(ownerID)
 	if r.teams != nil {
 		if ac, err := r.teams.GetActiveContext(ctx, ownerID); err == nil {
 			inboundSessionKey = ac.SessionKey(ownerID)
 		}
 	}
-	if _, perr := r.persistInbound(ctx, msg, bot, inboundSessionKey); perr != nil {
-		if errors.Is(perr, domain.ErrDuplicateInboundMessage) {
-			// 消息行已存在(崩溃恢复窗口内任务已提交): 视为已处理, 幂等语义
-			// 由任务唯一键与本次标记共同保证。
-			result = RouterResult{Action: ActionDuplicate, Reply: result.Reply, UserID: result.UserID}
-		} else {
-			slog.ErrorContext(ctx, "router: persist inbound message failed",
+	result, msgRow, err := r.routeBoundMessage(ctx, msg, bot, inboundSessionKey)
+	if err != nil {
+		return RouterResult{}, err
+	}
+	// Step 5: 消息行已随路由持久化(任务同事务 / 命令-relay claim);此处只
+	// 补 media_assets 审计(失败非致命, 记日志便于 DB 故障暴露)。
+	if msgRow != nil && r.messages != nil {
+		if perr := r.persistInboundMedia(ctx, msg, bot, *msgRow); perr != nil {
+			slog.ErrorContext(ctx, "router: persist inbound media failed",
 				"message_id", msg.MessageID,
 				"bot_uuid", msg.BotUUID,
 				"error", perr)
 		}
 	}
-	// Step 6: 标记幂等——仅当处理成功(无 error)。
-	// 已知限制(Round8 review): 路由成功与 Mark 之间崩溃(或跨实例并发投递)
-	// 时, relay 转发与团队命令(/accept /remove 等)可能重复执行——任务提交由
-	// DB 唯一键 (source, source_instance_id, message_idempotency_key) 兜底
-	// 不产生重复任务, 但中继/命令无等价兜底; 单实例+无崩溃场景不受影响。
+	// Step 6: 标记幂等——仅当处理成功(无 error)。命令/relay 的副作用已由
+	// claim 行串行化(并发重复被唯一键短路, 崩溃窗口只可能丢命令、用户
+	// 可重发), 任务路径零窗口(同事务); 此处内存标记仅做 TTL 内的快速短路。
 	if err := r.transport.MarkMessageIdempotency(ctx, msg.BotUUID, msg.MessageID); err != nil {
 		return RouterResult{}, fmt.Errorf("mark idempotency: %w", err)
 	}
@@ -385,7 +385,7 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 //
 // The command set is admin-configurable via the platform_commands table
 // (migration 0004). If CommandRegistry is nil (tests), falls back to defaults.
-func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, inboundSessionKey string) (RouterResult, *domain.Message, error) {
 	text := strings.TrimSpace(msg.Text)
 	// Relay intercept: "@<username> <body>" is forwarded directly to the
 	// named user's WeChat, bypassing the LLM/Worker. Checked before command
@@ -393,17 +393,85 @@ func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot
 	// RelayService is nil, handleRelay falls through to handleNormalMessage.
 	// Only triggered in personal context; in team context @username is a
 	// normal message to the team AI (spec §6 R4).
+	// round10 审查(B7): relay 是副作用(转发消息), 先 claim 消息行再执行——
+	// 并发重复被唯一键短路, 崩溃窗口内残留行只导致转发丢失(用户可重发),
+	// 不再重复转发。
 	if strings.HasPrefix(text, relayAtPrefix) && r.isPersonalContext(ctx, bot.OwnerID) {
-		return r.handleRelay(ctx, msg, bot, text)
+		if r.relay == nil {
+			// 功能禁用: @mention 按普通任务处理(消息行与任务同事务), 避免
+			// 外层 claim 与事务内消息行插入冲突。
+			msgRow, result, err := r.handleNormalMessage(ctx, msg, bot, text, inboundSessionKey)
+			return result, msgRow, err
+		}
+		return r.claimAndRun(ctx, msg, bot, inboundSessionKey, func() (RouterResult, error) {
+			return r.handleRelay(ctx, msg, bot, text)
+		})
 	}
 	cmd, found := r.resolveCommand(ctx, text)
 	if strings.HasPrefix(text, "/") {
 		if isRestrictedUserCommand(text) || !found || cmd.Action != domain.CommandIntercept {
-			return r.rejectUnavailableCommand(ctx, msg, bot)
+			// 拒绝类命令同样 claim(处理已完整, 用户收到拒绝回复), 防并发重放。
+			msgRow, err := r.claimInboundMessage(ctx, msg, bot, inboundSessionKey)
+			if err != nil {
+				if errors.Is(err, domain.ErrDuplicateInboundMessage) {
+					return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil, nil
+				}
+				return RouterResult{}, nil, err
+			}
+			result, _ := r.rejectUnavailableCommand(ctx, msg, bot)
+			return result, &msgRow, nil
 		}
-		return r.dispatchHandler(ctx, msg, bot, cmd.Handler, text)
+		return r.claimAndRun(ctx, msg, bot, inboundSessionKey, func() (RouterResult, error) {
+			return r.dispatchHandler(ctx, msg, bot, cmd.Handler, text)
+		})
 	}
-	return r.handleNormalMessage(ctx, msg, bot, text)
+	// 任务路径: 与消息行同事务提交(round10 审查 B7), 零二段写入窗口。
+	msgRow, result, err := r.handleNormalMessage(ctx, msg, bot, text, inboundSessionKey)
+	return result, msgRow, err
+}
+
+// claimAndRun 先原子 claim 入站消息行(冲突=已处理→duplicate 短路), 再执行
+// 命令/relay 副作用; 副作用失败时删除 claim 行并返回 error, 让 Poller 重试
+// 能重新执行(round10 审查 B7: 把"副作用后写行"的重复窗口换成"先写行后
+// 副作用"的丢失窗口——命令可重发, 重复执行(如重复转发/重复加人)危害更大)。
+func (r *router) claimAndRun(ctx context.Context, msg IncomingMessage, bot domain.Bot, inboundSessionKey string, run func() (RouterResult, error)) (RouterResult, *domain.Message, error) {
+	if r.messages == nil {
+		result, err := run()
+		return result, nil, err
+	}
+	msgRow, err := r.claimInboundMessage(ctx, msg, bot, inboundSessionKey)
+	if err != nil {
+		if errors.Is(err, domain.ErrDuplicateInboundMessage) {
+			return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil, nil
+		}
+		return RouterResult{}, nil, fmt.Errorf("claim inbound message: %w", err)
+	}
+	result, err := run()
+	if err != nil {
+		if delErr := r.messages.DeleteInboundMessage(ctx, bot.ID, msg.MessageID); delErr != nil {
+			slog.ErrorContext(ctx, "router: delete claimed message after side-effect failure failed",
+				"message_id", msg.MessageID, "bot_uuid", msg.BotUUID, "error", delErr)
+		}
+		return RouterResult{}, nil, err
+	}
+	return result, &msgRow, nil
+}
+
+// claimInboundMessage 插入入站消息行作为"处理中"标记(round10 审查 B7)。
+func (r *router) claimInboundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, inboundSessionKey string) (domain.Message, error) {
+	mediaPath := ""
+	if len(msg.MediaPaths) > 0 {
+		mediaPath = msg.MediaPaths[0]
+	}
+	return r.messages.InsertInboundMessage(ctx, domain.Message{
+		UserID:      bot.OwnerID,
+		BotID:       bot.ID,
+		SessionKey:  inboundSessionKey,
+		MessageID:   msg.MessageID,
+		MessageType: inferMessageType(msg.MediaPaths),
+		Content:     msg.Text,
+		MediaPath:   mediaPath,
+	})
 }
 
 // dispatchHandler routes to the Go handler func by handler key.

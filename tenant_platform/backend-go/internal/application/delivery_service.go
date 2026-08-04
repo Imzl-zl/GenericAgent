@@ -173,7 +173,7 @@ func NewDeliveryService(cfg DeliveryServiceConfig) (DeliveryService, error) {
 		if err != nil {
 			return nil, fmt.Errorf("create deliverable snapshot dir: %w", err)
 		}
-	} else if err := os.MkdirAll(snapshotDir, 0o770); err != nil {
+	} else if err := os.MkdirAll(snapshotDir, 0o2770); err != nil {
 		return nil, fmt.Errorf("create delivery spool dir %s: %w", snapshotDir, err)
 	}
 	return &deliveryService{
@@ -559,11 +559,11 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 			// (如 outputs/a.docx 与 outputs/sub/a.docx)。用户可见名单独经
 			// sanitizeDeliverableDisplayName 清洗。
 			dir := filepath.Join(s.snapshotDir, deliveryFileKey(d.DeliveryID))
-			if err := os.MkdirAll(dir, 0o700); err != nil {
+			if err := os.MkdirAll(dir, 0o2770); err != nil {
 				return deliveryPayload{}, fmt.Errorf("create delivery file dir: %w", err)
 			}
 			tmpPath := filepath.Join(dir, fmt.Sprintf("%s_%s", deliveryFileMarkerKey(f.Marker), deliverableSnapshotBase(f.RelPath)))
-			if err := os.WriteFile(tmpPath, f.Content, 0o600); err != nil {
+			if err := os.WriteFile(tmpPath, f.Content, 0o640); err != nil {
 				return deliveryPayload{}, fmt.Errorf("write delivery file snapshot %q: %w", f.Marker, err)
 			}
 			out.Files = append(out.Files, deliveryFile{

@@ -13,6 +13,9 @@ import (
 // in-process gRPC test service and a real temporary-filesystem coordinator").
 type TaskStore interface {
 	SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error)
+	// SubmitTaskWithInboundMessage 同一事务内提交入站消息行与任务
+	// (round10 审查 B7)。
+	SubmitTaskWithInboundMessage(ctx context.Context, cmd domain.SubmitTaskCommand, msg domain.Message) (domain.Task, domain.Message, error)
 	GetTask(ctx context.Context, taskID string) (domain.Task, error)
 	CancelTask(ctx context.Context, taskID string, requesterUserID int64) (domain.Task, bool, error)
 	ClaimNextTask(ctx context.Context, sessionKey, platformInstanceID string, claimLease time.Duration) (domain.Task, bool, error)

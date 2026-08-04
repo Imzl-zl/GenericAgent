@@ -1,0 +1,10 @@
+id,phase,title,scope,status,validation
+1,P1,B1 lease 残留容器 ID:ReleaseRunnerLease 清空容器字段 + Manager 销毁不存在容器幂等成功,backend-go,DONE,单测 + dbx 集成
+2,P1,B2 拆分 sourceInstanceID(稳定去重)与 processID(claim/lease/checkpoint owner),backend-go,DONE,单测 + dbx 集成
+3,P1,B9a checkpoint Commit 失败清理 committed/result 文件,backend-go,DONE,单测
+4,P2,B5 封禁用户:未派发 starting 终态化 + 个人 capability 校验用户状态,backend-go,DONE,dbx 集成
+5,P3,B6 交付快照权限 0770/0640(共享组),backend-go,DONE,单测 + 容器复现
+6,P3,B8 delivery claim 排除未完成 task_started,backend-go,DONE,dbx 集成
+7,P4,B7 入站消息幂等:任务+消息同事务;命令/relay 先 claim,backend-go,DONE,单测 + dbx 集成
+8,P5,B4 进程清理:循环扫描 + SUBPROCESS_CLEANUP_FAILED 终态 + Platform evict,ga.py+worker-python+backend-go,DONE,容器复现 + pytest
+9,P6,B1c Compose unix socket 通道 + webhook 地址修正,infra/compose,DONE,compose 冒烟

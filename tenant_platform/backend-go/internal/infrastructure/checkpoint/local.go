@@ -196,6 +196,8 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 	resultID := ready.SnapshotID
 	resultPath := filepath.Join(c.runtimeRoot, "results", resultID+".result")
 	if err := atomicWrite(resultPath, []byte(body)); err != nil {
+		// round10 审查(B9a): committed 已写入但 results 失败——清理已物化文件。
+		_ = os.Remove(committedPath)
 		return CommittedCheckpoint{}, err
 	}
 
@@ -276,6 +278,18 @@ func (c *LocalCoordinator) SweepExpiredCheckpoints(ctx context.Context) (int, er
 		}
 	}
 	return len(expired), nil
+}
+
+// CleanupCommittedFiles 删除 Commit 已物化但 DB 提交失败的 committed/result
+// 文件(round10 审查 B9a, loopback 实现)。
+func (c *LocalCoordinator) CleanupCommittedFiles(ctx context.Context, committed CommittedCheckpoint) error {
+	sid := strings.TrimPrefix(committed.FileRef, opaqueFilePrefix)
+	if sid == "" || sid != committed.SnapshotID {
+		return fmt.Errorf("cleanup committed files: ref snapshot mismatch")
+	}
+	_ = os.Remove(filepath.Join(c.runtimeRoot, "committed", sid+".bundle.json"))
+	_ = os.Remove(filepath.Join(c.runtimeRoot, "results", sid+".result"))
+	return nil
 }
 
 // RunnerStagingRef: loopback 路径下宿主与 Worker 同一文件系统, 原样返回。

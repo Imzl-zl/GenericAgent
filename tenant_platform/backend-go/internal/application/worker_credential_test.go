@@ -721,6 +721,11 @@ func (f *jtiPersistingStore) RequeueTask(ctx context.Context, taskID, platformIn
 	panic("unexpected")
 }
 
+func (f *jtiPersistingStore) SubmitTaskWithInboundMessage(ctx context.Context, cmd domain.SubmitTaskCommand, msg domain.Message) (domain.Task, domain.Message, error) {
+	t, err := f.SubmitTask(ctx, cmd)
+	return t, domain.Message{}, err
+}
+
 func (f *jtiPersistingStore) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error) {
 	panic("unexpected")
 }

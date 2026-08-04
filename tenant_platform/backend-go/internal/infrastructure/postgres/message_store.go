@@ -51,6 +51,25 @@ RETURNING id, user_id, bot_id, session_key, direction, COALESCE(message_id, ''),
 	return out, nil
 }
 
+// DeleteInboundMessage 删除 claim 后副作用失败的消息行(round10 审查 B7):
+// 命令/relay 路径先插入消息行(claim)再执行副作用, 副作用失败时删除该行,
+// 让 Poller 重试能重新执行(而不是被残留行短路)。best-effort: 崩溃窗口内
+// 残留的行会让重试短路(命令丢失, 用户可重发), 但不会重复执行副作用。
+func (s *Store) DeleteInboundMessage(ctx context.Context, botID int64, messageID string) error {
+	if botID <= 0 || messageID == "" {
+		return fmt.Errorf("bot id and message id are required")
+	}
+	tag, err := s.pool.Exec(ctx, `
+DELETE FROM messages
+WHERE direction = 'inbound' AND bot_id = $1 AND message_id = $2
+`, botID, messageID)
+	if err != nil {
+		return fmt.Errorf("delete inbound message: %w", err)
+	}
+	_ = tag
+	return nil
+}
+
 // HasInboundMessage 只读检查 (bot_id, message_id) 是否已成功处理过
 // (round9 审查: 入站消息行在路由成功后写入, 是跨重启/多实例的持久幂等
 // 事实源——内存 seen 缓存变冷时, router 用它短路重复副作用)。

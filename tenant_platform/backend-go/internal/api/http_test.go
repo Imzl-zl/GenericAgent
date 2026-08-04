@@ -162,6 +162,9 @@ type dashboardFakeTaskStats struct{ running int }
 func (dashboardFakeTaskService) SubmitTask(context.Context, domain.SubmitTaskCommand) (domain.Task, error) {
 	return domain.Task{}, nil
 }
+func (dashboardFakeTaskService) SubmitTaskWithInboundMessage(context.Context, domain.SubmitTaskCommand, domain.Message) (domain.Task, domain.Message, error) {
+	return domain.Task{}, domain.Message{}, nil
+}
 func (dashboardFakeTaskService) GetTask(context.Context, string) (domain.Task, error) {
 	return domain.Task{}, nil
 }

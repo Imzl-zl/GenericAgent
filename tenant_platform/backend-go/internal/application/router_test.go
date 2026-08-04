@@ -74,6 +74,24 @@ type fakeTaskService struct {
 	cancelledID   string
 	cancelErr     error
 	submitCount   int
+	// messages 模拟真实 store 的"任务+消息行同事务"语义(round10 审查 B7):
+	// 成功提交时写入 inbound 行, 失败时不写(真实实现中二者同事务回滚)。
+	messages *fakeMessageStore
+}
+
+func (f *fakeTaskService) SubmitTaskWithInboundMessage(_ context.Context, cmd domain.SubmitTaskCommand, msg domain.Message) (domain.Task, domain.Message, error) {
+	t, err := f.SubmitTask(context.Background(), cmd)
+	if err != nil {
+		return domain.Task{}, domain.Message{}, err
+	}
+	if f.messages != nil {
+		row, ierr := f.messages.InsertInboundMessage(context.Background(), msg)
+		if ierr != nil {
+			return domain.Task{}, domain.Message{}, ierr
+		}
+		return t, row, nil
+	}
+	return t, domain.Message{}, nil
 }
 
 func (f *fakeTaskService) SubmitTask(_ context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error) {

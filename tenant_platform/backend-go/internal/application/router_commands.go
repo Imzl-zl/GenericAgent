@@ -204,11 +204,11 @@ func buildHelpText(commands map[string]domain.PlatformCommand) string {
 
 // handleNormalMessage forwards a non-command text/media payload as a task to
 // the Worker via TaskService.SubmitTask.
-func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, text string) (RouterResult, error) {
+func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, text string, inboundSessionKey string) (*domain.Message, RouterResult, error) {
 	if text == "" && len(msg.MediaPaths) == 0 {
 		reply := "empty message ignored"
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
-		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
+		return nil, RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	prompt := text
 	if prompt == "" && len(msg.MediaPaths) > 0 {
@@ -219,23 +219,23 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	// to different users at runtime.
 	userPolicy, err := r.store.GetUserToolPolicy(ctx, bot.OwnerID)
 	if err != nil {
-		return RouterResult{}, fmt.Errorf("resolve user tool policy: %w", err)
+		return nil, RouterResult{}, fmt.Errorf("resolve user tool policy: %w", err)
 	}
 	if userPolicy == "" {
 		userPolicy = r.toolPolicy // fallback to global default
 	}
 	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
 	if err != nil {
-		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
+		return nil, RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
 	if r.sessionFiles != nil {
 		currentRefs, err := r.sessionFiles.ImportInbound(sessionKey, msg.MediaPaths)
 		if err != nil {
-			return RouterResult{}, fmt.Errorf("stage session files: %w", err)
+			return nil, RouterResult{}, fmt.Errorf("stage session files: %w", err)
 		}
 		recentRefs, err := r.sessionFiles.Recent(sessionKey, 8)
 		if err != nil {
-			return RouterResult{}, fmt.Errorf("list session files: %w", err)
+			return nil, RouterResult{}, fmt.Errorf("list session files: %w", err)
 		}
 		if hint := sessionFilesPrompt(currentRefs, recentRefs); hint != "" {
 			if prompt != "" {
@@ -252,25 +252,53 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		}
 		prompt += "[Attached files: " + strings.Join(msg.MediaPaths, ", ") + "]"
 	}
-	_, err = r.tasks.SubmitTask(ctx, domain.SubmitTaskCommand{
-		SessionKey:        sessionKey,
-		RequesterUserID:   bot.OwnerID,
-		Source:            domain.SourceWechat,
-		SourceInstanceID:  r.sourceInstance,
-		MessageID:         msg.MessageID,
-		Prompt:            prompt,
-		PersonaSnapshot:   []string{},
-		ToolPolicyVersion: userPolicy,
-	})
-	if err != nil {
-		// Round8 审查: 提交失败必须返回 error(而非 Rejected 200)——Poller 收到
-		// 5xx 后重试, 且幂等标记尚未写入, 重试会真正重新提交; 消息持久化也
-		// 在路由成功之后, 不会撞 DB 唯一键提前返回。
-		return RouterResult{}, fmt.Errorf("submit task: %w", err)
+	// round10 审查(B7): 消息行与任务在同一 DB 事务内提交——消息行冲突(23505)
+	// 时返回 ErrDuplicateInboundMessage 由调用方短路, 任务冲突时返回已有任务;
+	// 崩溃/并发下任务既不重复也不丢失, 消息审计与任务状态原子一致。
+	var msgRow *domain.Message
+	if r.messages != nil {
+		_, row, err := r.tasks.SubmitTaskWithInboundMessage(ctx, domain.SubmitTaskCommand{
+			SessionKey:        sessionKey,
+			RequesterUserID:   bot.OwnerID,
+			Source:            domain.SourceWechat,
+			SourceInstanceID:  r.sourceInstance,
+			MessageID:         msg.MessageID,
+			Prompt:            prompt,
+			PersonaSnapshot:   []string{},
+			ToolPolicyVersion: userPolicy,
+		}, domain.Message{
+			UserID:      bot.OwnerID,
+			BotID:       bot.ID,
+			SessionKey:  inboundSessionKey,
+			MessageID:   msg.MessageID,
+			MessageType: inferMessageType(msg.MediaPaths),
+			Content:     msg.Text,
+		})
+		if err != nil {
+			// Round8 审查: 提交失败必须返回 error(而非 Rejected 200)——Poller
+			// 收到 5xx 后重试; 同事务内消息行随任务一起回滚, 重试可完整重放,
+			// 任务由唯一键兜底不重复。
+			return nil, RouterResult{}, fmt.Errorf("submit task: %w", err)
+		}
+		msgRow = &row
+	} else {
+		// 测试环境未接线 messages store: 退化为纯任务提交。
+		if _, err := r.tasks.SubmitTask(ctx, domain.SubmitTaskCommand{
+			SessionKey:        sessionKey,
+			RequesterUserID:   bot.OwnerID,
+			Source:            domain.SourceWechat,
+			SourceInstanceID:  r.sourceInstance,
+			MessageID:         msg.MessageID,
+			Prompt:            prompt,
+			PersonaSnapshot:   []string{},
+			ToolPolicyVersion: userPolicy,
+		}); err != nil {
+			return nil, RouterResult{}, fmt.Errorf("submit task: %w", err)
+		}
 	}
 	// Normal message acceptance is delivered through the durable task_started
 	// outbox path so users get exactly one acknowledgment instead of a sync
 	// "收到" plus an async "正在处理" duplicate.
 	reply := "✓ 收到，正在处理您的任务..."
-	return RouterResult{Action: ActionTaskCreated, Reply: reply, UserID: bot.OwnerID}, nil
+	return msgRow, RouterResult{Action: ActionTaskCreated, Reply: reply, UserID: bot.OwnerID}, nil
 }

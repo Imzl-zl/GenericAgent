@@ -285,6 +285,10 @@ func (c *successfulCoordinator) SweepExpiredCheckpoints(context.Context) (int, e
 	return 0, nil
 }
 
+func (c *successfulCoordinator) CleanupCommittedFiles(context.Context, checkpoint.CommittedCheckpoint) error {
+	return nil
+}
+
 type readFailCoordinator struct {
 	store *postgres.Store
 	owner string
@@ -327,6 +331,10 @@ func (c *readFailCoordinator) ReadResult(context.Context, string, string) (domai
 
 func (c *readFailCoordinator) SweepExpiredCheckpoints(context.Context) (int, error) {
 	return 0, nil
+}
+
+func (c *readFailCoordinator) CleanupCommittedFiles(context.Context, checkpoint.CommittedCheckpoint) error {
+	return nil
 }
 
 func testPolicyRegistry(t *testing.T) policy.Registry {

@@ -39,6 +39,7 @@ COPY tenant_platform/infra/postgres/migrations/ /opt/ga/migrations/
 RUN install -d -o 10001 -g 10001 -m 0750 \
         /etc/ga/config \
         /var/lib/ga/runtime \
+        /var/run/ga \
     && install -d -o 10001 -g 10003 -m 2770 \
         /var/lib/ga/runtime/session_files \
         /var/lib/ga/bot-media \
@@ -55,4 +56,4 @@ ENTRYPOINT ["/bin/sh", "-c", "umask 0027; exec /opt/ga/bin/platform \"$@\"", "--
 # 等环境由 compose 注入; --listen=127.0.0.1 保持主 API loopback(安全 guard),
 # --worker-internal-listen 提供 capability-protected Worker Sophub 内部端点
 # (审查 R5-C1: 独立 Runner 经 runner-control 网络访问, 管理/用户 API 不暴露)。
-CMD ["--policy-file=/opt/ga/policy/foundation.v1.json", "--claim-lease=30s", "--listen=127.0.0.1:8080", "--worker-internal-listen=0.0.0.0:8082"]
+CMD ["--policy-file=/opt/ga/policy/foundation.v1.json", "--claim-lease=30s", "--listen=127.0.0.1:8080", "--unix-listen=/var/run/ga/api.sock", "--worker-internal-listen=0.0.0.0:8082"]

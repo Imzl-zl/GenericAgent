@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
@@ -23,6 +25,61 @@ const queueAdvisoryNamespace = "ga:per-user-queue:"
 // workspace row lock serializes concurrent submits for the same user) to
 // prevent TOCTOU races.
 func (s *Store) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error) {
+	var task domain.Task
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		task, err = s.submitTaskTx(ctx, tx, cmd)
+		return err
+	})
+	return task, err
+}
+
+// SubmitTaskWithInboundMessage 在同一事务内持久化入站消息行与任务提交
+// (round10 审查 B7): 消息行与任务原子写入, 消除"任务已提交但消息行未写"
+// 与"消息行已写但任务未提交"的崩溃/并发窗口——重试要么被消息行唯一键短路,
+// 要么完整重放(任务唯一键兜底不重复), relay/命令不会因任务路径的残留窗口
+// 重复执行, 任务也不会因先写消息行后崩溃而永久丢失。消息行已存在(23505)
+// 时返回 domain.ErrDuplicateInboundMessage, 整个事务回滚。
+func (s *Store) SubmitTaskWithInboundMessage(ctx context.Context, cmd domain.SubmitTaskCommand, msg domain.Message) (domain.Task, domain.Message, error) {
+	if msg.BotID <= 0 || msg.UserID <= 0 || msg.MessageID == "" || msg.SessionKey == "" {
+		return domain.Task{}, domain.Message{}, fmt.Errorf("inbound message fields required for atomic submit")
+	}
+	var task domain.Task
+	var out domain.Message
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		if err := scanMessage(tx.QueryRow(ctx, `
+INSERT INTO messages (user_id, bot_id, session_key, direction, message_id,
+                      message_type, content, media_path, task_id)
+VALUES ($1, $2, $3, 'inbound', $4, $5, $6, $7, NULL)
+RETURNING id, user_id, bot_id, session_key, direction, COALESCE(message_id, ''),
+          message_type, COALESCE(content, ''), COALESCE(media_path, ''),
+          COALESCE(task_id, ''), created_at
+`, msg.UserID, msg.BotID, msg.SessionKey, msg.MessageID, msg.MessageType,
+			msg.Content, nullString(msg.MediaPath)), &out); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.ErrDuplicateInboundMessage
+			}
+			return err
+		}
+		if task, err = s.submitTaskTx(ctx, tx, cmd); err != nil {
+			return err
+		}
+		// 任务 id 回填消息行(审计关联; 失败非致命, 消息行已持久化)。
+		if task.ID != "" {
+			if _, err := tx.Exec(ctx, `UPDATE messages SET task_id = $1 WHERE id = $2`, task.ID, out.ID); err != nil {
+				slog.WarnContext(ctx, "submit task with message: backfill task_id failed", "task_id", task.ID, "message_id", out.ID, "error", err)
+			}
+		}
+		return nil
+	})
+	return task, out, err
+}
+
+// submitTaskTx 是 SubmitTask 的事务体(round10 审查 B7 抽取, 供原子消息+
+// 任务提交复用)。
+func (s *Store) submitTaskTx(ctx context.Context, tx pgx.Tx, cmd domain.SubmitTaskCommand) (domain.Task, error) {
 	if err := validateSubmit(cmd); err != nil {
 		return domain.Task{}, err
 	}
@@ -39,7 +96,7 @@ func (s *Store) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (d
 	}
 
 	var task domain.Task
-	err = s.withTx(ctx, func(tx pgx.Tx) error {
+	submitErr := func() error {
 		// 审查 round9: 按 requester 持有事务级 advisory lock, 把同一用户跨
 		// 所有 workspace(个人+多个团队)的提交串行化——workspace 行锁只覆盖
 		// 单 workspace, 跨 workspace 并发会让队列计数检查失效。锁在所有
@@ -148,8 +205,8 @@ FOR UPDATE
 		}
 		task = t
 		return nil
-	})
-	return task, err
+	}()
+	return task, submitErr
 }
 
 // GetTask loads a task by id.

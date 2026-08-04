@@ -12,10 +12,12 @@ import (
 //   - runner lease 的 generation 仍等于签发值且未过期(旧 generation Runner 失效);
 //     loopback/dev 模式无 runner_leases 行(claim 由 loopback scheduler 维护,
 //     且任务 claim 检查已独立生效), 此时跳过 lease 校验;
-//   - 团队任务的 requester 仍是 approved 成员(成员移除即时生效, 不等 JTI 撤销)。
+//   - 团队任务的 requester 仍是 approved 成员(成员移除即时生效, 不等 JTI 撤销);
+//   - requester 用户仍是 approved 状态(round10 审查 B5: 封禁用户的任务
+//     capability 立即失效, 下一次 LLM/Sophub 调用即被拒绝, 不等 Worker 终态化)。
 //
-// llm-proxy 与 sophub proxy 在每次调用前执行, 把撤销/接管/成员变更的生效
-// 时间从"token TTL"收敛到"下一次调用"。
+// llm-proxy 与 sophub proxy 在每次调用前执行, 把撤销/接管/成员变更/封禁的
+// 生效时间从"token TTL"收敛到"下一次调用"。
 func (s *Store) IsTaskCapabilityActive(ctx context.Context, taskID string, runnerGeneration uint64) (bool, error) {
 	if taskID == "" || runnerGeneration == 0 {
 		return false, fmt.Errorf("task id and runner generation are required")
@@ -33,6 +35,9 @@ SELECT
         AND rl.generation = $2
         AND rl.expires_at > timezone('utc', now())
     )
+  )
+  AND EXISTS (
+    SELECT 1 FROM users u WHERE u.id = t.requester_user_id AND u.status = 'approved'
   )
   AND (
     w.kind = 'personal'

@@ -108,7 +108,7 @@ func buildSessionFiles(boot application.DevBootstrapConfig, managerClient sandbo
 func buildWorkerRuntime(
 	boot application.DevBootstrapConfig,
 	store *postgres.Store,
-	instanceID, policyFile, llmProxyAddr, sophubProxyAddr string,
+	processID, policyFile, llmProxyAddr, sophubProxyAddr string,
 ) (worker.WorkerRuntime, sandbox.RunnerCLI, error) {
 	mode := strings.TrimSpace(os.Getenv("GA_WORKER_EXECUTION_MODE"))
 	if mode == "" {
@@ -158,7 +158,7 @@ func buildWorkerRuntime(
 		Manager:            manager,
 		CA:                 ca,
 		LeaseStore:         store,
-		PlatformInstanceID: instanceID,
+		PlatformInstanceID: processID,
 		WorkspaceRoot:      boot.WorkspacesRoot,
 		MemoryTemplate:     boot.MemoryTemplate,
 		Image:              boot.RunnerImage,
@@ -245,10 +245,10 @@ func sophubProxyBaseURL() string {
 // 容器并释放 lease(方案 §7: 持久 lease 驱动的重启恢复/孤儿回收)。
 // Worker idle eviction 的正常路径由 scheduler cleanup 直接销毁容器。
 // reconcileExpiredRunnerLeases 扫描并清理所有过期 lease 的容器(审查 C6):
-// Platform 重启后新 instanceID 无法归属旧 lease, 启动时立即执行一次,
+// Platform 重启后新 processID 无法归属旧 lease, 启动时立即执行一次,
 // 避免旧容器残留到 Manager 绝对 TTL。容器是全局资源, 无论 owner 是谁都
 // 必须销毁; 释放(expires_at 置过期)只对本实例 lease 执行。
-func reconcileExpiredRunnerLeases(ctx context.Context, store *postgres.Store, manager sandbox.RunnerCLI, instanceID string) {
+func reconcileExpiredRunnerLeases(ctx context.Context, store *postgres.Store, manager sandbox.RunnerCLI, processID string) {
 	leases, err := store.ListExpiredRunnerLeases(ctx, time.Now().UTC())
 	if err != nil {
 		slog.ErrorContext(ctx, "platform: list expired runner leases failed", "error", err)
@@ -268,8 +268,8 @@ func reconcileExpiredRunnerLeases(ctx context.Context, store *postgres.Store, ma
 					"runner_key", lease.RunnerKey, "container", lease.StaleContainerID, "error", err)
 			}
 		}
-		if lease.Owner == instanceID {
-			if err := store.ReleaseRunnerLease(ctx, lease.RunnerKey, instanceID, lease.Generation); err != nil {
+		if lease.Owner == processID {
+			if err := store.ReleaseRunnerLease(ctx, lease.RunnerKey, processID, lease.Generation); err != nil {
 				slog.WarnContext(ctx, "platform: release expired runner lease failed",
 					"runner_key", lease.RunnerKey, "error", err)
 			}
@@ -284,7 +284,7 @@ func runRunnerLeaseReaper(
 	ctx context.Context,
 	store *postgres.Store,
 	manager sandbox.RunnerCLI,
-	instanceID string,
+	processID string,
 	interval time.Duration,
 ) {
 	ticker := time.NewTicker(interval)
@@ -294,7 +294,7 @@ func runRunnerLeaseReaper(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			reconcileExpiredRunnerLeases(ctx, store, manager, instanceID)
+			reconcileExpiredRunnerLeases(ctx, store, manager, processID)
 		}
 	}
 }
@@ -444,6 +444,7 @@ func run() error {
 		devLoopback           = flag.Bool("dev-loopback", false, "enable development loopback bootstrap and local coordinator")
 		listen                = flag.String("listen", "127.0.0.1:8080", "loopback listen address")
 		workerInternalListen  = flag.String("worker-internal-listen", "", "internal listener for capability-protected worker endpoints (e.g. 0.0.0.0:8082); empty disables (审查 R5-C1: 主 API 保持 loopback, Runner 经内部 listener 访问 Sophub proxy)")
+		unixListen            = flag.String("unix-listen", "", "additional unix socket path for the main API (shared volume visible to nginx); empty disables (round10 审查 B1c: 独立 web 容器经 socket 代理 /v1/, API 面不暴露给 runner-control 网络)")
 		databaseURL           = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
 		migration             = flag.String("migration", "", "path to 0001_foundation.sql")
 		runtimeRoot           = flag.String("runtime-root", "", "GA_RUNTIME_DIR for local coordinator/worker")
@@ -501,6 +502,21 @@ func run() error {
 	}
 	if instanceID == "" {
 		return fmt.Errorf("platform instance id generation returned empty id")
+	}
+
+	// round10 审查(B2): 每进程唯一的 claim/lease/checkpoint owner 与稳定的
+	// 渠道去重 ID(instanceID)分离。重启后新进程必须以新 owner 接管旧进程
+	// 的 lease(递增 generation、销毁持有旧 CA 的 Runner 并注入新 CA), 同时
+	// 任务去重键 (source, source_instance_id, message_id) 保持稳定; 若两者
+	// 共用同一 ID, 同 owner 未过期 lease 不递增 generation, 旧 Runner 复用
+	// 导致 mTLS 失败, 且旧进程的 running claim 会被新进程误认为自己的。
+	// 部署可经 GA_PLATFORM_PROCESS_ID 固定(测试/调试), 缺省每次启动随机。
+	processID := strings.TrimSpace(os.Getenv("GA_PLATFORM_PROCESS_ID"))
+	if processID == "" {
+		processID, err = application.NewPlatformInstanceID()
+		if err != nil {
+			return fmt.Errorf("platform process id: %w", err)
+		}
 	}
 
 	dbURL := strings.TrimSpace(*databaseURL)
@@ -632,7 +648,7 @@ func run() error {
 		}
 		local, err := checkpoint.NewLocalCoordinator(checkpoint.LocalConfig{
 			RuntimeRoot:        boot.RuntimeRoot,
-			PlatformInstanceID: instanceID,
+			PlatformInstanceID: processID,
 			Store:              store,
 		})
 		if err != nil {
@@ -659,7 +675,7 @@ func run() error {
 		devCtx = adminCtx
 		workspaceCoord, err := checkpoint.NewWorkspaceCoordinator(checkpoint.WorkspaceConfig{
 			WorkspacesRoot:     boot.WorkspacesRoot,
-			PlatformInstanceID: instanceID,
+			PlatformInstanceID: processID,
 			Store:              store,
 			RunnerStateMount:   "/ga/runner-state",
 		})
@@ -707,7 +723,7 @@ func run() error {
 		return fmt.Errorf("capability token issuer: %w", err)
 	}
 
-	runtime, managerClient, err := buildWorkerRuntime(boot, store, instanceID, resolvedPolicyFile, proxyAddr, sophubProxyBaseURL())
+	runtime, managerClient, err := buildWorkerRuntime(boot, store, processID, resolvedPolicyFile, proxyAddr, sophubProxyBaseURL())
 	if err != nil {
 		return err
 	}
@@ -720,7 +736,7 @@ func run() error {
 	sessionScopedConfig := true
 
 	sched, err := application.NewScheduler(application.SchedulerConfig{
-		PlatformInstanceID:    instanceID,
+		PlatformInstanceID:    processID,
 		ClaimLease:            *claimLease,
 		PollInterval:          500 * time.Millisecond,
 		Store:                 store,
@@ -755,7 +771,7 @@ func run() error {
 	}
 
 	// Recovery before accepting HTTP traffic.
-	if err := sched.Recover(ctx, instanceID); err != nil {
+	if err := sched.Recover(ctx, processID); err != nil {
 		return fmt.Errorf("recover: %w", err)
 	}
 
@@ -763,7 +779,7 @@ func run() error {
 		Store:              store,
 		Registry:           reg,
 		Coordinator:        coord,
-		PlatformInstanceID: instanceID,
+		PlatformInstanceID: processID,
 		ClaimLease:         *claimLease,
 		PerUserQueueLimit:  *perUserQueueLimit,
 		Kick: func(ctx context.Context, sessionKey string) {
@@ -1004,8 +1020,8 @@ func run() error {
 		}
 		// 启动时立即执行一次过期 lease reconcile(审查 C6: 重启后旧容器
 		// 与新 CA 不兼容, 立即销毁而不是等第一个 tick)。
-		reconcileExpiredRunnerLeases(ctx, store, managerClient, instanceID)
-		go runRunnerLeaseReaper(ctx, store, managerClient, instanceID, time.Minute)
+		reconcileExpiredRunnerLeases(ctx, store, managerClient, processID)
+		go runRunnerLeaseReaper(ctx, store, managerClient, processID, time.Minute)
 	}
 	if deliverySvc != nil {
 		go func() {
@@ -1027,6 +1043,18 @@ func run() error {
 	fmt.Fprintf(os.Stderr, "platform: instance_id=%s listen=%s session=%s policy_digest=%s\n",
 		instanceID, *listen, devCtx.SessionKey, reg.Digest())
 
+	// round10 审查(B1c): 主 API 的 unix socket listener——nginx 容器经共享卷
+	// 挂载该 socket 代理 /v1/, 使 Web/API 面在独立网络命名空间可达, 同时
+	// 不把 API 绑定 0.0.0.0 暴露给 runner-control 网络。绑定失败即 fail-closed。
+	if strings.TrimSpace(*unixListen) != "" {
+		go func() {
+			slog.Info("platform: unix api listener", "path", *unixListen)
+			if err := api.ServeUnixContext(ctx, *unixListen, server.Handler()); err != nil && !errors.Is(err, context.Canceled) {
+				slog.ErrorContext(ctx, "platform: unix api listener failed", "error", err)
+				cancel()
+			}
+		}()
+	}
 	// 审查 R5-C1: 内部 listener 只挂 capability-protected Worker Sophub 路由
 	// (NewWorkerSophubHandler), 默认关闭; 显式启用时绑定失败即 fail-closed
 	// 终止启动——Runner 依赖它访问 Sophub proxy, 静默降级会让 Runner 的

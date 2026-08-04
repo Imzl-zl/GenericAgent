@@ -1786,13 +1786,31 @@ def test_emit_final_terminal_cleans_up_subprocesses_before_terminal(roots, found
     from ga_worker import task_terminal
 
     calls: list[bool] = []
-    monkeypatch.setattr(task_terminal, "cleanup_legacy_subprocesses", lambda adapter: calls.append(True))
+    def _cleanup(_adapter):
+        calls.append(True)
+        return True
+    monkeypatch.setattr(task_terminal, "cleanup_legacy_subprocesses", _cleanup)
     adapter = _make_adapter(roots, foundation_registry, ScriptedAgent)
     adapter.start_session(_start_req())
     events = _events(adapter, _task("c2-done", "hello"))
     term = _terminal(events)
     assert term.status == worker_pb2.TASK_SUCCEEDED
     assert calls, "emit_final_terminal must clean up legacy subprocesses before terminal"
+
+
+def test_emit_final_terminal_fails_closed_when_cleanup_incomplete(roots, foundation_registry, monkeypatch):
+    """round10 审查(B4): 成功路径清理不干净(fail-closed)——任务必须判失败且
+    error_code=SUBPROCESS_CLEANUP_FAILED, Platform 据此销毁 Runner, 残留进程
+    无法跨任务窃取下一任务凭据。"""
+    from ga_worker import task_terminal
+
+    monkeypatch.setattr(task_terminal, "cleanup_legacy_subprocesses", lambda adapter: False)
+    adapter = _make_adapter(roots, foundation_registry, ScriptedAgent)
+    adapter.start_session(_start_req())
+    events = _events(adapter, _task("c2-dirty", "hello"))
+    term = _terminal(events)
+    assert term.status == worker_pb2.TASK_FAILED, "incomplete cleanup must fail the task"
+    assert term.error.code == "SUBPROCESS_CLEANUP_FAILED", "must carry SUBPROCESS_CLEANUP_FAILED"
 
 
 # ---------- Round 7 I7: 内部 timeout 携带 capability JTI ----------

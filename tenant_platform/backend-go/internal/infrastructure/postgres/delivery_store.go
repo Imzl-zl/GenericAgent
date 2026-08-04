@@ -31,6 +31,19 @@ WITH eligible AS (
           t.terminal_at IS NULL
           OR $1 < t.terminal_at + $4::interval
       )
+      -- round10 审查(B8): 同一 task 的 task_started 未完成(pending/sending)
+      -- 时不得 claim 其他 delivery——否则并发发送会让完成消息先于"正在处理"
+      -- 送达。task_started 自身不受限(否则永远无法发送); 终态事务已把
+      -- pending 的 task_started 置 cancelled(task_helpers.go), 不会卡死。
+      AND (
+          d.delivery_type = 'task_started'
+          OR NOT EXISTS (
+              SELECT 1 FROM task_deliveries prior
+              WHERE prior.task_id = d.task_id
+                AND prior.delivery_type = 'task_started'
+                AND prior.status IN ('pending','sending')
+          )
+      )
     ORDER BY d.created_at
     FOR UPDATE OF d SKIP LOCKED
     LIMIT $2

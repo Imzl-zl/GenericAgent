@@ -69,13 +69,18 @@ def kill_registered_process_group(process) -> None:
     _kill_process_group(process)
 
 
-def kill_all_code_run_processes() -> None:
+def kill_all_code_run_processes() -> bool:
     """任务终态/任务启动时清理遗留的 code_run 进程组(审查 C2 Round8)。幂等。
     按创建时快照的 PGID 直接 killpg, 不检查父进程存活状态——父 shell 可能已
     退出而组内后台子进程仍存活, poll()!=None 跳过会导致进程跨任务存活。
     round9 审查: 任务代码可用 setsid/start_new_session 创建新会话逃逸 PGID
     登记——再枚举 /proc 杀掉容器 PID namespace 内一切非自身进程(线程除外),
-    覆盖任意逃逸路径。"""
+    覆盖任意逃逸路径。
+    round10 审查(B4): 单次 /proc 快照可被持续 fork 绕过(快照之后派生的进程
+    逃过枚举)——改为循环扫描最多 3 轮(轮间 50ms), 快照后新派生的进程也会
+    被后续轮次 SIGKILL。返回 True=容器内已无非自身活动进程, 调用方可以安全
+    复用 Runner; False=仍检测到残留(fail-closed: 调用方必须让任务失败并销毁
+    Runner, 残留进程可能窃取下一任务凭据或继续写工作区)。"""
     with _code_run_pids_lock:
         pgids = list(_code_run_pgids)
         _code_run_pgids.clear()
@@ -88,25 +93,32 @@ def kill_all_code_run_processes() -> None:
             proc.kill()
         except Exception:
             pass
-    _kill_other_processes()
+    for _ in range(3):
+        _kill_other_processes()
+        time.sleep(0.05)
+        if not _other_process_pids():
+            return True
+    return False
 
 
-def _kill_other_processes() -> None:
-    """POSIX 兜底: 枚举 /proc, 杀掉容器 PID namespace 内所有非自身进程。
+def _other_process_pids() -> list:
+    """返回容器 PID namespace 内非自身、非自身线程、非僵尸的进程。
 
-    任务代码可用 setsid 或 subprocess.Popen(start_new_session=True) 脱离已登记
-    的进程组, 使其逃过 killpg; 但进程无法逃出容器的 PID namespace, 且孤儿
-    进程会被 Worker 主进程(subreaper)收养。按 /proc/<pid>/status 的 Tgid 字段
-    排除自身进程与自身线程, 其余全部 SIGKILL。非 POSIX(Windows)无 /proc
-    语义, 保持已有 Popen 回退。
+    POSIX 兜底枚举(round9/round10 审查 B4): 任务代码可用 setsid 或
+    subprocess.Popen(start_new_session=True) 脱离已登记的进程组, 使其逃过
+    killpg; 但进程无法逃出容器的 PID namespace, 且孤儿进程会被 Worker 主
+    进程(subreaper)收养。按 /proc/<pid>/status 的 Tgid 字段排除自身进程与
+    自身线程; 跳过僵尸(State=Z, 已死不执行代码, 由 subreaper 回收, 不影响
+    跨任务隔离)。非 POSIX(Windows)无 /proc 语义, 返回空列表。
     """
     if os.name == 'nt':
-        return
+        return []
     try:
         import glob
     except ImportError:
-        return
+        return []
     self_pid = os.getpid()
+    out = []
     for entry in glob.glob('/proc/[0-9]*'):
         pid = entry.rsplit('/', 1)[-1]
         try:
@@ -117,15 +129,34 @@ def _kill_other_processes() -> None:
             continue
         try:
             tgid = None
+            state = ''
             with open(f'/proc/{pid}/status', 'r', encoding='utf-8', errors='replace') as fh:
                 for line in fh:
                     if line.startswith('Tgid:'):
                         tgid = int(line.split()[1])
+                    elif line.startswith('State:'):
+                        state = line.split()[1]
+                    if tgid is not None and state:
                         break
             if tgid is None:
                 continue
             if tgid == self_pid:
                 continue  # 自身线程: 不能杀
+            if state == 'Z':
+                continue  # 僵尸: 已死, 等待回收
+            out.append(pid_int)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _kill_other_processes() -> None:
+    """SIGKILL 容器 PID namespace 内所有非自身活动进程(round9 兜底)。
+
+    由 kill_all_code_run_processes 循环调用; 单轮只负责杀当前枚举到的进程,
+    快照后新派生的进程由下一轮枚举处理(round10 审查 B4)。"""
+    for pid_int in _other_process_pids():
+        try:
             os.kill(pid_int, 9)
         except (OSError, ValueError):
             continue

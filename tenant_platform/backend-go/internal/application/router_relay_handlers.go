@@ -46,7 +46,8 @@ func (r *router) handleRelay(ctx context.Context, msg IncomingMessage, bot domai
 	if r.relay == nil {
 		// Feature disabled: treat as a normal message so the agent can
 		// respond. This keeps @-text usable in loopback/dev mode.
-		return r.handleNormalMessage(ctx, msg, bot, text)
+		_, result, err := r.handleNormalMessage(ctx, msg, bot, text, "")
+		return result, err
 	}
 	username, body, ok := parseRelayMention(text)
 	if !ok {

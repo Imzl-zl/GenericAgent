@@ -13,6 +13,7 @@ import (
 
 // round8Router 构造带可观测 MessageStore 的 router。
 func round8Router(store *fakeRouterStore, tr *transport.LoopbackTransport, messages *fakeMessageStore, tasks *fakeTaskService) Router {
+	tasks.messages = messages
 	r, _ := NewRouter(RouterConfig{
 		Store:          store,
 		Tasks:          tasks,
@@ -158,6 +159,7 @@ func TestRouterRejectsMediaPathOutsideBotMediaRoot(t *testing.T) {
 	messages := &fakeMessageStore{}
 	tasks := &fakeTaskService{}
 	root := t.TempDir()
+	tasks.messages = messages
 	r, _ := NewRouter(RouterConfig{
 		Store:          store,
 		Tasks:          tasks,
@@ -207,6 +209,7 @@ func TestRouterAcceptsMediaPathInsideBotMediaRoot(t *testing.T) {
 	if err := os.WriteFile(media, []byte("jpg"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	tasks.messages = messages
 	r, _ := NewRouter(RouterConfig{
 		Store:          store,
 		Tasks:          tasks,
@@ -303,5 +306,33 @@ func TestRouterDurableInboundDedupShortCircuitsRouting(t *testing.T) {
 	}
 	if len(tr.SentMessages()) != 0 {
 		t.Fatalf("duplicate must not re-send replies: %d", len(tr.SentMessages()))
+	}
+}
+
+// round10 审查(B7): 被拒命令的 claim 冲突(消息行已存在)必须短路为
+// Duplicate 而不是返回 error——否则 Poller 对 5xx 无限重试。
+func TestRouterRejectedCommandClaimConflictShortCircuits(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	messages := &fakeMessageStore{}
+	tasks := &fakeTaskService{}
+	r := round8Router(store, tr, messages, tasks)
+
+	// 消息行已存在(已处理过)——内存缓存清空模拟重启窗口。
+	_, _ = messages.InsertInboundMessage(context.Background(), domain.Message{
+		UserID: 42, BotID: 1, SessionKey: "personal:42",
+		MessageID: "m-rejected", MessageType: domain.MessageTypeText,
+	})
+	tr.Reset()
+	res, err := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m-rejected", Text: "/bogus",
+	})
+	if err != nil {
+		t.Fatalf("claim conflict must not surface as error: %v", err)
+	}
+	if res.Action != ActionDuplicate {
+		t.Fatalf("expected duplicate, got %s", res.Action)
 	}
 }

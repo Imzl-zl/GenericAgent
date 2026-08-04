@@ -40,11 +40,16 @@ func snapshotDeliverable(absPath, root, rel, snapshotDir string, maxBytes int64)
 	if maxBytes > 0 && info.Size() > maxBytes {
 		return "", fmt.Errorf("deliverable %q exceeds size limit %d (got %d)", absPath, maxBytes, info.Size())
 	}
-	if err := os.MkdirAll(snapshotDir, 0o700); err != nil {
+	// 快照目录/文件必须允许部署共享组读取(round10 审查 B6): Compose 中
+	// Platform(10001)写 delivery_spool 共享卷, Bot Poller(10002, 组 10003)
+	// 只读挂载并直接读取——0700/0600 会让 Poller 必然 EACCES。卷根由
+	// platform.Dockerfile 预置为 10001:10003 2770(setgid 继承组), 此处用
+	// 0770/0640 即可让共享组成员可读。
+	if err := os.MkdirAll(snapshotDir, 0o2770); err != nil {
 		return "", fmt.Errorf("create deliverable snapshot dir: %w", err)
 	}
 	dstName := filepath.Join(snapshotDir, snapshotFileName(absPath))
-	dst, err := os.OpenFile(dstName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	dst, err := os.OpenFile(dstName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
 	if err != nil {
 		return "", fmt.Errorf("create deliverable snapshot: %w", err)
 	}

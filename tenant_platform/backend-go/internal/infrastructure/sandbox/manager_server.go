@@ -142,6 +142,14 @@ func (s *ManagerServer) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	if !s.manager.IsRunnerName(name) {
 		ok, err := s.manager.IsRunnerContainer(r.Context(), name)
 		if err != nil || !ok {
+			// round10 审查(B1): 容器已不存在时幂等成功(lease 记录的容器 ID
+			// 可能已被其他路径删除)——把"不存在"当作拒绝会让 stale_container_id
+			// 清理永久失败。存在但非本 Manager Runner 才拒绝。
+			exists, existsErr := s.manager.ContainerExists(r.Context(), name)
+			if existsErr == nil && !exists {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 			writeManagerError(w, http.StatusBadRequest, "NAME_REJECTED", "not a managed runner")
 			return
 		}

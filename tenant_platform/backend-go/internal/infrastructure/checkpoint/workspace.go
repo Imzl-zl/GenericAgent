@@ -309,9 +309,13 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 
 	resultRel := filepath.Join(hash, "state", "results", ready.SnapshotID+".result")
 	if err := safefs.MkdirAllBeneath(c.workspacesRoot, filepath.Join(hash, "state", "results"), 0o770); err != nil {
+		// round10 审查(B9a): committed 已写入但 results 写入失败——清理已物化
+		// 文件, 避免 DB 未提交时残留伪 committed 文件占用磁盘。
+		c.removeCommittedArtifacts(hash, ready.SnapshotID)
 		return CommittedCheckpoint{}, err
 	}
 	if err := safefs.AtomicWriteBeneath(c.workspacesRoot, resultRel, []byte(body), 0o640); err != nil {
+		c.removeCommittedArtifacts(hash, ready.SnapshotID)
 		return CommittedCheckpoint{}, err
 	}
 
@@ -326,6 +330,29 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 		ResultRef:    resultRef,
 		ResultDigest: resultDigest,
 	}, nil
+}
+
+// removeCommittedArtifacts 删除已物化的 committed/result 文件(best-effort,
+// 不存在视为成功)。供 Commit 内部失败与 CleanupCommittedFiles 使用。
+func (c *WorkspaceCoordinator) removeCommittedArtifacts(hash, snapshotID string) {
+	_ = safefs.RemoveBeneath(c.workspacesRoot, filepath.Join(hash, "state", "committed", snapshotID+".bundle.json"))
+	_ = safefs.RemoveBeneath(c.workspacesRoot, filepath.Join(hash, "state", "results", snapshotID+".result"))
+}
+
+// CleanupCommittedFiles 删除 Commit 已物化但 DB 提交失败的 committed/result
+// 文件(round10 审查 B9a)。从 opaque ref 解析 workspace hash, 只删除本次
+// Commit 产生的 snapshot 文件; 被 workspaces.current_snapshot_id 引用的文件
+// 由调用方保证不会走到这里(提交失败且任务未终态时才调用)。
+func (c *WorkspaceCoordinator) CleanupCommittedFiles(ctx context.Context, committed CommittedCheckpoint) error {
+	hash, id, err := parseOpaqueRef(committed.FileRef, opaqueFilePrefix)
+	if err != nil {
+		return fmt.Errorf("cleanup committed files: %w", err)
+	}
+	if id != committed.SnapshotID {
+		return fmt.Errorf("cleanup committed files: ref snapshot %s != committed snapshot %s", id, committed.SnapshotID)
+	}
+	c.removeCommittedArtifacts(hash, id)
+	return nil
 }
 
 // CurrentRestorePoint resolves the workspace's committed snapshot. The
