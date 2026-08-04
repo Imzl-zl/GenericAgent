@@ -57,3 +57,16 @@
   - I6 锁 get-or-create(workspaceLock helper), 消除 DestroyRunner 与 EnsureRunner 的锁创建竞态
 - 验证: Go 全量 18 包 + race 4 关键包 + vet + linux build 全绿; worker-python 110 passed; bot_poller 13; 契约安全 35; compose config OK; git diff --check OK
 - 残余(仓库已声明): runsc/mTLS 端到端、六服务 compose 冒烟、真实 Sophub 需部署主机; sandbox_runtime 续租失败路径 Shutdown 仍传空 JTI(best-effort, Manager.Destroy 兜底 fencing)
+
+## Round10 修复(2026-08-04, e242c52)
+
+9 项真实问题全部修复并验证:
+- B1( Critical): idle 回收后 lease 残留容器 ID → ReleaseRunnerLease 清空容器字段 + Manager 对不存在受控容器幂等销毁。
+- B2( Important): 稳定去重 ID(GA_PLATFORM_INSTANCE_ID)与每进程唯一 processID(claim/lease/checkpoint owner)拆分——重启后新进程接管旧 lease、递增 generation、销毁旧 CA 容器。
+- B4( Important): ga.py 循环 /proc 扫描(3 轮); 成功任务清理不干净时 fail-closed(SUBPROCESS_CLEANUP_FAILED → Platform 销毁 Runner)。
+- B5( Important): BlockUser 终态化未派发 starting(撤销 JTI/取消 task_started/清 claim); IsTaskCapabilityActive 增加用户状态校验。
+- B6( Important): 交付快照 0o2770 目录 + 0o640 文件(setgid 继承共享组 10003)——容器复现 Poller 读取 OK。
+- B7( Important): 任务+入站消息行同事务(SubmitTaskWithInboundMessage); 命令/relay 先 claim 后副作用(失败删行)。
+- B8( Minor): delivery claim 排除同 task 未完成 task_started, 完成消息不再先于"正在处理"。
+- B9a( Minor): checkpoint Commit 失败清理已物化 committed/result 文件。
+- B1c( Critical): Compose 主 API 改 unix socket(nginx 经 platform_sock 卷代理 /v1/ 与 /healthz), webhook 指向 web:8088, API 面不暴露 runner-control。
