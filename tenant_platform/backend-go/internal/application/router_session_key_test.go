@@ -64,6 +64,46 @@ func (s *switchingTeamService) GetActiveContext(ctx context.Context, userID int6
 	return domain.ActiveContext{UserID: userID}, nil
 }
 
+// round13 审查(D2): @mention 的 relay 判定必须使用入口单次解析的上下文。
+// 修复前 relay 分支二次解析 active context: 首次解析为团队、二次解析切换
+// 为个人时, 团队消息会被误转发给其他用户(跨用户隐私泄露)。用
+// switchingTeamService(第一次团队、后续个人)验证——若 relay 分支独立重查,
+// 本测试会观察到 relayCalls 非空。
+func TestRouterRelayUsesSingleResolvedContext(t *testing.T) {
+	store := boundBotStore(1)
+	tr := transport.NewLoopbackTransport()
+	msgStore := &fakeMessageStore{}
+	tasks := &fakeTaskService{messages: msgStore}
+	relay := &fakeRelayService{}
+	teams := &switchingTeamService{fakeTeamService: &fakeTeamService{}}
+	r, err := NewRouter(RouterConfig{
+		Store:          store,
+		Tasks:          tasks,
+		Transport:      tr,
+		Messages:       msgStore,
+		ToolPolicy:     "foundation.no-host-tools.v1",
+		SourceInstance: "test-router",
+		Relay:          relay,
+		Teams:          teams,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@alice 你好",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(relay.relayCalls) != 0 {
+		t.Fatalf("team-context @mention must not relay, relayCalls=%v", relay.relayCalls)
+	}
+	want := "team:11111111-2222-3333-4444-555555555555"
+	if tasks.submittedTask.SessionKey != want {
+		t.Fatalf("team-context @mention must be submitted to the team session, got %+v", tasks.submittedTask)
+	}
+}
+
 // TestRouterTaskAndMessageShareSingleSessionKey: 任务与消息行必须使用同一
 // 次解析的会话 key(团队), 第二次独立解析不得产生分叉。
 func TestRouterTaskAndMessageShareSingleSessionKey(t *testing.T) {

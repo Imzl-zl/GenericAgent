@@ -258,7 +258,10 @@ func (s *ManagerServer) authenticate(next http.Handler) http.Handler {
 		// nonce 一次性消费: 同一 nonce 在窗口内只能使用一次(防重放)。
 		// round12 审查(I4): 持久化失败 fail-closed——已消费 nonce 未落盘时
 		// 放行会让重启窗口重新打开。
-		ok, err := s.consumeNonce(nonce)
+		// round13 审查(X1): nonce 过期基准必须是签名时间戳 ts——服务允许
+		// 未来 5 分钟内的签名, 若按接收时刻记过期, now+5m 签名的合法窗口
+		// 可达 10 分钟而 nonce 仅保留 6 分钟, 第 6~10 分钟可重放。
+		ok, err := s.consumeNonce(ts, nonce)
 		if err != nil {
 			writeManagerError(w, http.StatusServiceUnavailable, "NONCE_PERSIST_FAILED", "could not persist consumed nonce")
 			return
@@ -273,9 +276,11 @@ func (s *ManagerServer) authenticate(next http.Handler) http.Handler {
 }
 
 // consumeNonce 记录并消费 nonce; 重复使用返回 false。顺带惰性清理过期项。
+// 过期时间绑定签名时间戳 ts(而非接收时刻): 签名在 [ts-window, ts+window]
+// 均合法, nonce 必须覆盖整个合法使用期——ts+2*window+margin。
 // stateDir 配置时先原子持久化再返回 true, 持久化失败返回错误(调用方
 // fail-closed 拒绝请求)。
-func (s *ManagerServer) consumeNonce(nonce string) (bool, error) {
+func (s *ManagerServer) consumeNonce(ts int64, nonce string) (bool, error) {
 	s.seenNoncesMu.Lock()
 	defer s.seenNoncesMu.Unlock()
 	now := s.now()
@@ -287,7 +292,8 @@ func (s *ManagerServer) consumeNonce(nonce string) (bool, error) {
 	if _, seen := s.seenNonces[nonce]; seen {
 		return false, nil
 	}
-	s.seenNonces[nonce] = now.Add(managerAuthWindow + time.Minute)
+	expires := time.Unix(ts, 0).Add(2*managerAuthWindow + time.Minute)
+	s.seenNonces[nonce] = expires
 	if s.nonceFile != "" {
 		if err := s.persistNoncesLocked(); err != nil {
 			// 未落盘前不放行: 该 nonce 仍可被重启后的实例接受。
@@ -323,6 +329,13 @@ func (s *ManagerServer) persistNoncesLocked() error {
 	}
 	if err := os.Rename(tmp, s.nonceFile); err != nil {
 		return fmt.Errorf("commit nonce state: %w", err)
+	}
+	// round13 审查(X1): rename 后 fsync 父目录, 否则掉电时目录项可能未持久,
+	// 重启后可能回退到旧 nonce 状态重开重放窗口。Windows 不支持目录 fsync,
+	// 忽略其错误(文件本身已 Sync)。
+	if dir, err := os.Open(s.stateDir); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 	return nil
 }

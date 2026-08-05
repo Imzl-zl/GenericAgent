@@ -23,20 +23,6 @@ func (r *router) resolveSessionKey(ctx context.Context, userID int64) (string, e
 	return ac.SessionKey(userID), nil
 }
 
-// isPersonalContext returns true when the user is in personal context (or
-// when team service is unavailable). Relay is only allowed in personal
-// context; in team context @username is a normal message to the team AI.
-func (r *router) isPersonalContext(ctx context.Context, userID int64) bool {
-	if r.teams == nil {
-		return true
-	}
-	ac, err := r.teams.GetActiveContext(ctx, userID)
-	if err != nil {
-		return false
-	}
-	return ac.IsPersonal()
-}
-
 // handleIdentity replies with the user's current context (personal or team).
 func (r *router) handleIdentity(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
 	reply := "当前上下文：个人助手"

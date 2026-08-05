@@ -290,8 +290,10 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	if !task.FreshSession && s.cfg.Coordinator != nil {
 		restore, ok, err := s.cfg.Coordinator.CurrentRestorePoint(ctx, task.WorkspaceID)
 		if err != nil {
-			s.removeWorkerEntry(task.SessionKey, entry)
-			s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+			// round13 审查(D4): 统一走 disposeWorkerEntryCore(本函数已持有
+			// lifecycleMu)——修复前直接 cleanup 绕过 destroyed CAS, 与
+			// dispatch defer 的 teardown 并发时可能重复清理。
+			s.disposeWorkerEntryCore(context.Background(), task.SessionKey, entry)
 			return fmt.Errorf("resolve current workspace checkpoint: %w", err)
 		}
 		if ok {
@@ -355,49 +357,67 @@ func (s *scheduler) startWorkerProcess(ctx context.Context, sessionKey string, r
 
 // shutdownAllWorkers revokes active capability sets and tears down every
 // Worker process. Called once on platform shutdown.
+// round13 审查(D4): 统一走 disposeWorkerEntry(身份校验 + destroyed CAS +
+// lifecycleMu), 不再绕过 CAS 直接 cleanup——shutdown 与并发 dispatch 的
+// deferred teardown 之间保证每 entry 恰好清理一次。
 func (s *scheduler) shutdownAllWorkers(ctx context.Context) {
 	s.mu.Lock()
 	entries := make([]*workerEntry, 0, len(s.workers))
-	for sessionKey, entry := range s.workers {
+	for _, entry := range s.workers {
 		entries = append(entries, entry)
-		delete(s.workers, sessionKey)
 	}
+	clear(s.workers)
 	s.mu.Unlock()
 	for _, entry := range entries {
-		entry.lifecycleMu.Lock()
-		s.cleanupWorkerEntryBestEffort(ctx, entry)
-		entry.lifecycleMu.Unlock()
+		s.disposeWorkerEntry(ctx, entry.sessionKey, entry)
 	}
 }
 
-// destroyTaskWorkerEntry 按身份销毁指定 entry(round12 审查 I1): 仅当
-// s.workers[sessionKey] 仍指向该 entry 时删除并清理——旧任务收尾不得误毁
-// 同 session 新任务的 Worker(dispatch 的 deferred teardown 与并发派发之间的
-// 竞争窗口由身份校验闭合)。内部获取 lifecycleMu。
-func (s *scheduler) destroyTaskWorkerEntry(sessionKey string, entry *workerEntry) {
+// disposeWorkerEntry 统一销毁入口(round13 审查 D4): map 身份校验 + destroyed
+// CAS + cancelOnce + lifecycleMu + cleanup 全部收敛于此。所有清理路径
+// (任务终态/初始化失败/恢复失败/平台关闭)必须走本方法或其持锁变体,
+// 保证同一 entry 恰好清理一次。
+func (s *scheduler) disposeWorkerEntry(ctx context.Context, sessionKey string, entry *workerEntry) {
 	if entry == nil {
 		return
 	}
+	entry.lifecycleMu.Lock()
+	defer entry.lifecycleMu.Unlock()
+	s.disposeWorkerEntryCore(ctx, sessionKey, entry)
+}
+
+// disposeWorkerEntryCore 是 disposeWorkerEntry 的持锁变体: 调用方必须已
+// 持有 entry.lifecycleMu(如 completeSuccess 的错误分支、startSessionOnWorker
+// 的恢复失败路径)。检查与删除在 s.mu 下原子完成(审查: 无锁读 s.workers 与
+// createTaskWorker 写入并发会触发 Go map 读写竞争; 且同 session 下一任务在
+// 终态提交与销毁之间派发时可能误跳过销毁)。
+// round12 审查(I1 补充/独立审查): 身份不匹配(同 session 新任务已替换
+// map entry)时仍必须清理旧 entry——旧任务已终态, 其容器/凭据不得因被
+// 替换而泄漏(completeSuccess 终态提交与销毁之间的替换窗口); 只是不
+// 触碰 map 中的新 entry。
+// round13 L2: destroyed CAS 保证同一 entry 恰好清理一次。
+func (s *scheduler) disposeWorkerEntryCore(ctx context.Context, sessionKey string, entry *workerEntry) {
 	s.mu.Lock()
 	current := s.workers[sessionKey] == entry
 	if current {
 		delete(s.workers, sessionKey)
 	}
 	s.mu.Unlock()
-	// round12 审查(I1 补充/独立审查): 身份不匹配(同 session 新任务已替换
-	// map entry)时仍必须清理旧 entry——旧任务已终态, 其容器/凭据不得因被
-	// 替换而泄漏(completeSuccess 终态提交与销毁之间的替换窗口); 只是不
-	// 触碰 map 中的新 entry。
-	// round13 L2: destroyed CAS 保证同一 entry 恰好清理一次。
 	if !entry.destroyed.CompareAndSwap(false, true) {
 		return
 	}
 	if entry.taskID != "" {
 		s.cancelOnce.Delete(entry.taskID)
 	}
-	entry.lifecycleMu.Lock()
-	defer entry.lifecycleMu.Unlock()
-	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+	s.cleanupWorkerEntryBestEffort(ctx, entry)
+}
+
+// destroyTaskWorkerEntry 按身份销毁指定 entry(round12 审查 I1): 仅当
+// s.workers[sessionKey] 仍指向该 entry 时删除并清理——旧任务收尾不得误毁
+// 同 session 新任务的 Worker(dispatch 的 deferred teardown 与并发派发之间的
+// 竞争窗口由身份校验闭合)。统一走 disposeWorkerEntry(round13 审查 D4)。
+func (s *scheduler) destroyTaskWorkerEntry(sessionKey string, entry *workerEntry) {
+	s.disposeWorkerEntry(context.Background(), sessionKey, entry)
 }
 
 // destroyTaskWorker 销毁任务 Worker(决策 D2.1: 任务终态即销毁): 优雅停止
@@ -418,22 +438,7 @@ func (s *scheduler) destroyTaskWorker(sessionKey string) {
 // s.mu 下原子完成(审查: 无锁读 s.workers 与 createTaskWorker 写入并发会
 // 触发 Go map 读写竞争; 且同 session 下一任务在终态提交与销毁之间派发时
 // 可能误跳过销毁)。内部不再获取 lifecycleMu, 避免持锁重入死锁。
+// round13 审查(D4): 统一走 disposeWorkerEntryCore。
 func (s *scheduler) destroyTaskWorkerLocked(sessionKey string, entry *workerEntry) {
-	s.mu.Lock()
-	current := s.workers[sessionKey] == entry
-	if current {
-		delete(s.workers, sessionKey)
-	}
-	s.mu.Unlock()
-	// round12 审查(I1 补充/独立审查): 身份不匹配时同样清理旧 entry(终态
-	// 任务不得因 map 被替换而泄漏容器/凭据), 只是不触碰 map 中的新 entry。
-	// 调用方必须已持有 entry.lifecycleMu。
-	// round13 L2: destroyed CAS 保证同一 entry 恰好清理一次。
-	if !entry.destroyed.CompareAndSwap(false, true) {
-		return
-	}
-	if entry.taskID != "" {
-		s.cancelOnce.Delete(entry.taskID)
-	}
-	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+	s.disposeWorkerEntryCore(context.Background(), sessionKey, entry)
 }

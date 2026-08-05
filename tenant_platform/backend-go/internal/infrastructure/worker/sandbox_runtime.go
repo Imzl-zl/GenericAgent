@@ -35,6 +35,10 @@ type RunnerLeaseStore interface {
 	RenewRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64, leaseTTL time.Duration) error
 	AttachRunnerContainer(ctx context.Context, runnerKey, containerID string, generation uint64, owner string) error
 	ReleaseRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64) error
+	// ExpireRunnerLease 仅归还容量、保留容器引用: 失败路径(销毁旧容器失败/
+	// 拨号失败/attach 失败)使用, 让下一轮接管能定向销毁仍挂载 workspace 的
+	// 旧容器; 只有确认销毁成功才用 ReleaseRunnerLease 清空引用。
+	ExpireRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64) error
 }
 
 // SandboxConfig carries the deployment-level inputs for the Runner runtime.
@@ -117,10 +121,15 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 	}
 	generation := lease.Generation
 	// fail-closed(审查): 已占用的容量在后续任何步骤失败时都必须立即释放,
-	// 否则多工作区各失败一次即可占满全局容量直到 TTL 到期。释放带 generation
-	// 条件, 不影响更新 generation 的 lease。
+	// 否则多工作区各失败一次即可占满全局容量直到 TTL 到期。
+	// round13 审查(D3): 失败路径只归还容量(ExpireRunnerLease), 不清空
+	// container_id/stale_container_id——销毁失败/未销毁时容器仍可能挂载
+	// workspace, 引用必须保留给下一轮接管定向销毁, 否则新 generation 直接
+	// 创建容器造成双写。context 带超时, 防止 DB 半开时无限阻塞。
 	releaseOnFailure := func() {
-		_ = r.cfg.LeaseStore.ReleaseRunnerLease(context.Background(), workspaceKey, r.cfg.PlatformInstanceID, generation)
+		expireCtx, cancel := context.WithTimeout(context.Background(), managerControlTimeout)
+		defer cancel()
+		_ = r.cfg.LeaseStore.ExpireRunnerLease(expireCtx, workspaceKey, r.cfg.PlatformInstanceID, generation)
 	}
 
 	// 2. 旧 generation 容器接管清理: lease 过期被本实例接管时, 旧容器按
@@ -273,14 +282,22 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 			// round12 审查(I3): 控制面与 DB 调用带明确超时, 防止半开连接
 			// 让清理无限阻塞。
 			destroyCtx, destroyCancel := context.WithTimeout(context.Background(), managerControlTimeout)
-			if err := r.cfg.Manager.Destroy(destroyCtx, runner.Name); err != nil {
-				slogWarn("sandbox runtime: destroy runner on cleanup failed", "runner", runner.Name, "error", err)
-			}
+			destroyErr := r.cfg.Manager.Destroy(destroyCtx, runner.Name)
 			destroyCancel()
-			// 释放 lease: 下次 acquire 以 generation+1 重建, 防旧容器复活。
-			// 带 generation 条件, 旧 cleanup 无法释放新 generation 的 lease(审查 C6)。
+			// round13 审查(D3): 容器引用清除必须与"确认销毁"绑定——Destroy
+			// 成功才清空引用(ReleaseRunnerLease); 销毁失败保留引用并归还
+			// 容量(ExpireRunnerLease), 下一轮 acquire 以 generation+1 接管时
+			// 把 container_id 移入 stale_container_id 并先销毁再创建, 防止
+			// 旧容器继续挂载 workspace 与新 generation 双写。
 			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), managerControlTimeout)
-			_ = r.cfg.LeaseStore.ReleaseRunnerLease(releaseCtx, workspaceKey, r.cfg.PlatformInstanceID, generation)
+			if destroyErr != nil {
+				slogWarn("sandbox runtime: destroy runner on cleanup failed; retaining container ref for takeover cleanup", "runner", runner.Name, "error", destroyErr)
+				_ = r.cfg.LeaseStore.ExpireRunnerLease(releaseCtx, workspaceKey, r.cfg.PlatformInstanceID, generation)
+			} else {
+				// 释放 lease: 下次 acquire 以 generation+1 重建, 防旧容器复活。
+				// 带 generation 条件, 旧 cleanup 无法释放新 generation 的 lease(审查 C6)。
+				_ = r.cfg.LeaseStore.ReleaseRunnerLease(releaseCtx, workspaceKey, r.cfg.PlatformInstanceID, generation)
+			}
 			releaseCancel()
 		})
 	}

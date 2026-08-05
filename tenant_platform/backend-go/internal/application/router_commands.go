@@ -240,6 +240,10 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		importedRefs = currentRefs
 		recentRefs, err := r.sessionFiles.Recent(sessionKey, 8)
 		if err != nil {
+			// round13 审查(X3): 附件已导入成功而 Recent 失败时, 必须回滚本次
+			// 导入——否则附件残留且无 manifest 归属(消息整体失败, Poller 重试
+			// 会再次导入)。
+			r.rollbackImportedAttachments(ctx, sessionKey, importedRefs)
 			return nil, RouterResult{}, fmt.Errorf("list session files: %w", err)
 		}
 		if hint := sessionFilesPrompt(currentRefs, recentRefs); hint != "" {

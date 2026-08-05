@@ -347,6 +347,7 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	// 同一 DB 事务内(SubmitTaskWithInboundMessage), 消除二段写入的崩溃/
 	// 并发窗口。失败返回 error 且不标记幂等, Poller 按 webhook 契约重试。
 	inboundSessionKey := personalSessionKey(ownerID)
+	personalContext := true
 	if r.teams != nil {
 		ac, err := r.teams.GetActiveContext(ctx, ownerID)
 		if err != nil {
@@ -359,8 +360,12 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 			return RouterResult{}, fmt.Errorf("resolve active context: %w", err)
 		}
 		inboundSessionKey = ac.SessionKey(ownerID)
+		personalContext = ac.IsPersonal()
 	}
-	result, msgRow, err := r.routeBoundMessage(ctx, msg, bot, inboundSessionKey)
+	// round13 审查(D2): 路由决策全部基于这一次解析结果——relay 判定与任务/
+	// 消息行落库共用同一上下文, 不再二次解析 active context(修复前 relay
+	// 分支独立重查, 并发切换团队/个人时团队消息可能被误转发)。
+	result, msgRow, err := r.routeBoundMessage(ctx, msg, bot, inboundSessionKey, personalContext)
 	if err != nil {
 		return RouterResult{}, err
 	}
@@ -393,7 +398,7 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 //
 // The command set is admin-configurable via the platform_commands table
 // (migration 0004). If CommandRegistry is nil (tests), falls back to defaults.
-func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, inboundSessionKey string) (RouterResult, *domain.Message, error) {
+func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, inboundSessionKey string, personalContext bool) (RouterResult, *domain.Message, error) {
 	text := strings.TrimSpace(msg.Text)
 	// Relay intercept: "@<username> <body>" is forwarded directly to the
 	// named user's WeChat, bypassing the LLM/Worker. Checked before command
@@ -404,7 +409,8 @@ func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot
 	// round10 审查(B7): relay 是副作用(转发消息), 先 claim 消息行再执行——
 	// 并发重复被唯一键短路, 崩溃窗口内残留行只导致转发丢失(用户可重发),
 	// 不再重复转发。
-	if strings.HasPrefix(text, relayAtPrefix) && r.isPersonalContext(ctx, bot.OwnerID) {
+	// round13 审查(D2): personalContext 来自入口单次解析, 不再二次查询。
+	if strings.HasPrefix(text, relayAtPrefix) && personalContext {
 		if r.relay == nil {
 			// 功能禁用: @mention 按普通任务处理(消息行与任务同事务), 避免
 			// 外层 claim 与事务内消息行插入冲突。

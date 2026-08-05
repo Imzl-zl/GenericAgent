@@ -6586,9 +6586,12 @@ class GenericAgentTUI(App[None]):
                         except Exception: self._refresh_messages()
                     else:
                         self._refresh_messages()
-                    if refresh_chrome:
-                        self._refresh_sidebar()
-                        self._refresh_topbar()
+                    # round13 审查(X4): 修复前此处引用未定义的 refresh_chrome
+                    # (方法签名无此参数)触发 NameError; 旧任务 done 事件到达
+                    # 时总是刷新 chrome, 与当前任务路径(refresh_chrome=True)
+                    # 一致。
+                    self._refresh_sidebar()
+                    self._refresh_topbar()
                     self._ensure_spinner()
             return
         s.buffer = text

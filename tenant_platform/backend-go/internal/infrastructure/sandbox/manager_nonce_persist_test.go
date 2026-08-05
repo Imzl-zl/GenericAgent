@@ -80,6 +80,39 @@ func TestManagerControlAPIRejectsReplayAcrossRestart(t *testing.T) {
 	}
 }
 
+// round13 审查(X1): nonce 过期基准必须绑定签名时间戳。服务允许未来 5
+// 分钟的签名——若 nonce 按接收时刻记过期(6 分钟), 合法签名(now+5m)的
+// 使用窗口可达 10 分钟, 第 6~10 分钟可原样重放。用未来时间戳签名验证:
+// 首次放行后, 在该签名的合法窗口内重放必须被拒。
+func TestManagerControlAPIFutureTimestampNonceCoversFullReplayWindow(t *testing.T) {
+	stateDir := t.TempDir()
+	manager := func() *Manager {
+		return NewManager(ManagerConfig{CLI: &fakeCLI2{}, WorkspaceRoot: t.TempDir(), ContainerNamePrefix: "ga-runner"})
+	}
+	server, err := NewManagerServerWithNonceState(manager(), replaySecret, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	// 未来 5 分钟的时间戳(签名窗口上限), 首次请求必须放行。
+	future := strconv.FormatInt(time.Now().Add(5*time.Minute).Unix(), 10)
+	const nonce = "futuretimestampnonce0000000001"
+	req := signedRequest(t, ts.URL, "GET", "/v1/runners", future, nonce, "")
+	if code := doSigned(t, req); code != http.StatusOK {
+		t.Fatalf("first future-ts request = %d, want 200", code)
+	}
+
+	// 修复前 nonce 按接收时刻记过期(6 分钟), 该签名的合法窗口可达 10
+	// 分钟——第 6~10 分钟重放会被放行。现在过期绑定 ts, 窗口内重放必须
+	// 被拒(同一 nonce 同进程内重复消费即等价断言)。
+	req2 := signedRequest(t, ts.URL, "GET", "/v1/runners", future, nonce, "")
+	if code := doSigned(t, req2); code != http.StatusUnauthorized {
+		t.Fatalf("replayed future-ts request = %d, want 401", code)
+	}
+}
+
 // TestManagerControlAPIFreshNonceAcceptedAfterRestart: 重启后新 nonce 正常
 // 放行(持久化未把"整个窗口"锁死, 只锁已消费的 nonce)。
 func TestManagerControlAPIFreshNonceAcceptedAfterRestart(t *testing.T) {

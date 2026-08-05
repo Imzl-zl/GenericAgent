@@ -253,9 +253,38 @@ WHERE runner_key = $1
 	return nil
 }
 
+// ExpireRunnerLease 仅归还容量(把 expires_at 置为过去), 保留
+// container_id/stale_container_id/control_endpoint 等容器追踪字段。
+// 语义: 本实例不再持有该 lease, 但容器可能仍挂载 workspace——下一轮
+// acquire 必然走 takeover(generation+1), 把 container_id 移入
+// stale_container_id 并先销毁旧容器再创建, 形成完整 fencing 链。
+// 失败路径(销毁旧容器失败/拨号失败/attach 失败)必须调用本方法而非
+// ReleaseRunnerLease: 清空引用会让旧容器失去定向追踪, 新 generation 可
+// 直接创建造成双写。generation 条件防止旧 cleanup 影响新 generation。
+func (s *Store) ExpireRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64) error {
+	if generation == 0 {
+		return fmt.Errorf("runner generation must be positive")
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE runner_leases
+SET expires_at = timezone('utc', now()) - interval '1 second',
+    updated_at = timezone('utc', now())
+WHERE runner_key = $1 AND owner = $2 AND generation = $3
+`, runnerKey, owner, generation)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("runner lease %s not owned by %s at generation %d", runnerKey, owner, generation)
+	}
+	return nil
+}
+
 // ReleaseRunnerLease marks the lease immediately expired so the next acquire
 // takes over with generation + 1. The generation condition (审查 C6) prevents
 // a stale cleanup from releasing a newer generation's lease.
+// 调用方必须已确认容器销毁成功(Manager.Destroy 返回 nil)才可调用本方法;
+// 销毁失败或未销毁时使用 ExpireRunnerLease 保留容器引用供接管定向清理。
 // round10 审查(B1): release 语义是"容器已销毁、lease 归还"——必须同时清空
 // container_id/stale_container_id/control_endpoint, 否则接管事务会把已删除的
 // 容器 ID 移入 stale_container_id, 下次 Start 对不存在的容器销毁失败

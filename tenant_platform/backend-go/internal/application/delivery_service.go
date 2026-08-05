@@ -574,6 +574,9 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 			tmpPath := filepath.Join(dir, fmt.Sprintf("%s_%s", deliveryFileMarkerKey(f.Marker), deliverableSnapshotBase(f.RelPath)))
 			if err := os.WriteFile(tmpPath, f.Content, 0o640); err != nil {
 				// round12 审查(I6): 中途失败必须清理已写入的前序快照。
+				// round13 审查(X2): 本次 WriteFile 的残片也要清理——tmpPath 尚
+				// 未加入 out.Files, removePayloadFiles 覆盖不到。
+				_ = os.Remove(tmpPath)
 				removePayloadFiles(out)
 				return deliveryPayload{}, fmt.Errorf("write delivery file snapshot %q: %w", f.Marker, err)
 			}

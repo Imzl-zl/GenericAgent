@@ -24,6 +24,7 @@ type fakeLeaseStore struct {
 	mu            sync.Mutex
 	acquired      []string
 	released      []string
+	expired       []string
 	renewed       []string
 	attached      []string
 	acquireErr    error
@@ -80,6 +81,13 @@ func (f *fakeLeaseStore) ReleaseRunnerLease(ctx context.Context, runnerKey, owne
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.released = append(f.released, runnerKey)
+	return nil
+}
+
+func (f *fakeLeaseStore) ExpireRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.expired = append(f.expired, runnerKey)
 	return nil
 }
 
@@ -146,7 +154,8 @@ func newSandboxRuntimeForTest(t *testing.T, leases *fakeLeaseStore, manager *fak
 }
 
 // TestStartReleasesLeaseWhenEnsureRunnerFails: acquire 成功后 Manager 创建
-// 失败, lease 必须立即释放(fail-closed, 审查), 不能占容量到 TTL。
+// 失败, lease 必须立即归还容量(fail-closed, 审查), 不能占容量到 TTL。
+// round13 审查(D3): 失败路径只归还容量(expire), 不清空容器引用(release)。
 func TestStartReleasesLeaseWhenEnsureRunnerFails(t *testing.T) {
 	leases := &fakeLeaseStore{}
 	manager := &fakeManagerCLI{ensureErr: os.ErrPermission}
@@ -157,8 +166,11 @@ func TestStartReleasesLeaseWhenEnsureRunnerFails(t *testing.T) {
 	}
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
-	if len(leases.released) != 1 || leases.released[0] != "personal:1" {
-		t.Fatalf("lease must be released on failure, released=%v", leases.released)
+	if len(leases.expired) != 1 || leases.expired[0] != "personal:1" {
+		t.Fatalf("capacity must be returned on failure, expired=%v", leases.expired)
+	}
+	if len(leases.released) != 0 {
+		t.Fatalf("container refs must be retained on failure, released=%v", leases.released)
 	}
 }
 
@@ -185,8 +197,13 @@ func TestStartFailsClosedWhenStaleContainerDestroyFails(t *testing.T) {
 	}
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
-	if len(leases.released) != 1 {
-		t.Fatalf("lease must be released on stale-destroy failure, released=%v", leases.released)
+	// round13 审查(D3): 销毁失败只归还容量并保留容器引用——旧容器仍挂载
+	// workspace, 引用必须保留供下一轮接管定向销毁, 否则新 generation 双写。
+	if len(leases.expired) != 1 {
+		t.Fatalf("capacity must be returned on stale-destroy failure, expired=%v", leases.expired)
+	}
+	if len(leases.released) != 0 {
+		t.Fatalf("container ref must be retained on stale-destroy failure, released=%v", leases.released)
 	}
 }
 
@@ -202,8 +219,8 @@ func TestStartReleasesLeaseWhenDialFails(t *testing.T) {
 	}
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
-	if len(leases.released) != 1 {
-		t.Fatalf("lease must be released on dial failure, released=%v", leases.released)
+	if len(leases.expired) != 1 {
+		t.Fatalf("capacity must be returned on dial failure, expired=%v", leases.expired)
 	}
 	if len(manager.destroyed) != 1 {
 		t.Fatalf("runner container must be destroyed on dial failure, destroyed=%v", manager.destroyed)
@@ -226,8 +243,8 @@ func TestStartFailClosedWhenAttachFails(t *testing.T) {
 	if len(leases.attached) != 1 {
 		t.Fatalf("attach must be attempted, attached=%v", leases.attached)
 	}
-	if len(leases.released) != 1 {
-		t.Fatalf("lease must be released on attach failure, released=%v", leases.released)
+	if len(leases.expired) != 1 {
+		t.Fatalf("capacity must be returned on attach failure, expired=%v", leases.expired)
 	}
 	if len(manager.destroyed) != 1 {
 		t.Fatalf("runner container must be destroyed on attach failure, destroyed=%v", manager.destroyed)
@@ -247,8 +264,8 @@ func TestStartCleanupReleasesLeaseExactlyOnce(t *testing.T) {
 	}
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
-	if got := len(leases.released); got != 1 {
-		t.Fatalf("expected exactly one release, got %d", got)
+	if got := len(leases.expired); got != 1 {
+		t.Fatalf("expected exactly one capacity return, got %d", got)
 	}
 }
 
@@ -272,11 +289,11 @@ func TestStartDestroysStaleContainerEvenWhenLeaseNotCreated(t *testing.T) {
 	if len(manager.destroyed) == 0 || manager.destroyed[0] != "old-cid-456" {
 		t.Fatalf("stale container must be destroyed first regardless of created flag, destroyed=%v", manager.destroyed)
 	}
-	// 销毁后失败路径还释放 lease。
+	// 销毁后失败路径还归还容量(不清引用)。
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
-	if len(leases.released) != 1 {
-		t.Fatalf("lease must be released, released=%v", leases.released)
+	if len(leases.expired) != 1 {
+		t.Fatalf("capacity must be returned, expired=%v", leases.expired)
 	}
 }
 
@@ -328,6 +345,44 @@ func TestCleanupUnblocksWhenRenewerStuck(t *testing.T) {
 	defer leases.mu.Unlock()
 	if len(leases.released) != 1 {
 		t.Fatalf("lease must be released after cleanup, released=%v", leases.released)
+	}
+}
+
+// round13 审查(D3): cleanup 中 Manager.Destroy 失败时不得清空容器引用——
+// 旧容器仍挂载 workspace, 引用保留(ExpireRunnerLease)供下一轮接管定向
+// 销毁; 只有销毁成功才 ReleaseRunnerLease 清空引用。
+func TestCleanupRetainsContainerRefWhenDestroyFails(t *testing.T) {
+	leases := &fakeLeaseStore{}
+	manager := &fakeManagerCLI{}
+
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer()
+	workerv1.RegisterWorkerServiceServer(srv, &stubControlWorker{})
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+
+	r := newSandboxRuntimeForTest(t, leases, manager)
+	r.cfg.DialControl = func(ctx context.Context, _ string, _ CertMaterial) (*grpc.ClientConn, error) {
+		return grpc.DialContext(ctx, "bufnet",
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	inst, err := r.Start(context.Background(), StartRequest{SessionKey: "personal:8"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// 置位销毁失败后执行 cleanup。
+	manager.destroyErr = errors.New("docker daemon unreachable")
+	inst.Cleanup("")
+
+	leases.mu.Lock()
+	defer leases.mu.Unlock()
+	if len(leases.expired) != 1 {
+		t.Fatalf("capacity must be returned after failed destroy, expired=%v", leases.expired)
+	}
+	if len(leases.released) != 0 {
+		t.Fatalf("container ref must be retained after failed destroy, released=%v", leases.released)
 	}
 }
 

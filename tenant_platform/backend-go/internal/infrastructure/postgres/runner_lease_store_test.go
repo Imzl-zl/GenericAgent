@@ -136,6 +136,74 @@ WHERE id=$1
 	}
 }
 
+// round13 审查(D3): ExpireRunnerLease 只归还容量(expires_at 置过去),
+// 必须保留 container_id/stale_container_id/control_endpoint——失败路径上
+// 容器仍可能挂载 workspace, 引用留给下一轮接管定向销毁, 防止双写。
+func TestExpireRunnerLeaseRetainsContainerRefs(t *testing.T) {
+	ctx := context.Background()
+	store := newChannelBindingTestStore(t)
+
+	lease, _, err := store.AcquireRunnerLease(ctx, "personal:expire", "platform-a", 30*time.Minute, 0)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := store.AttachRunnerContainer(ctx, lease.RunnerKey, "container-keep", lease.Generation, lease.Owner); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if err := store.ExpireRunnerLease(ctx, lease.RunnerKey, "platform-a", lease.Generation); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	expired, err := store.GetRunnerLease(ctx, lease.RunnerKey)
+	if err != nil {
+		t.Fatalf("get expired lease: %v", err)
+	}
+	if !expired.IsExpired(time.Now().UTC()) {
+		t.Fatal("lease must be expired after ExpireRunnerLease")
+	}
+	if expired.ContainerID != "container-keep" {
+		t.Fatalf("container_id must be retained: %q", expired.ContainerID)
+	}
+
+	// 下一轮 acquire 必须走接管(generation+1)并把 container_id 移入
+	// stale_container_id, 供 Start 定向销毁旧容器。
+	taken, created, err := store.AcquireRunnerLease(ctx, "personal:expire", "platform-b", 30*time.Minute, 0)
+	if err != nil {
+		t.Fatalf("re-acquire: %v", err)
+	}
+	if !created {
+		t.Fatal("expired lease must be taken over, not refreshed")
+	}
+	if taken.Generation != lease.Generation+1 {
+		t.Fatalf("generation = %d, want %d", taken.Generation, lease.Generation+1)
+	}
+	if taken.StaleContainerID != "container-keep" {
+		t.Fatalf("stale_container_id must carry the retained container ref: %q", taken.StaleContainerID)
+	}
+}
+
+// round13 审查(D3): ExpireRunnerLease 的 generation 条件——旧 generation
+// 的失败清理不得影响新 generation 的 lease 行。
+func TestExpireRunnerLeaseRejectsStaleGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := newChannelBindingTestStore(t)
+
+	lease, _, err := store.AcquireRunnerLease(ctx, "personal:expire-stale", "platform-a", 30*time.Minute, 0)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := store.ExpireRunnerLease(ctx, lease.RunnerKey, "platform-a", lease.Generation+1); err == nil {
+		t.Fatal("expire with wrong generation must fail")
+	}
+	live, err := store.GetRunnerLease(ctx, lease.RunnerKey)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if live.IsExpired(time.Now().UTC()) {
+		t.Fatal("stale-generation expire must not touch the live lease")
+	}
+}
+
 func TestRunnerLeaseGenerationIncrementsAfterRelease(t *testing.T) {
 	ctx := context.Background()
 	store := newChannelBindingTestStore(t)
