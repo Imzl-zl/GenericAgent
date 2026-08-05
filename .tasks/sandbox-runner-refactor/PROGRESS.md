@@ -127,3 +127,9 @@
 - 新问题同步修复: 门禁测试卷白名单新增 manager_state(设计变更的一部分)
 - 验证: Go 18 包 -p 1(DB 套件)全绿 + race 5 关键包(application/sandbox/postgres/worker/checkpoint)全绿 + vet + GOOS=linux build; worker-python 109 passed/2 skipped; tests/ 全套 47 passed; bot_poller 16; compose config; git diff --check
 - 新增测试: dispatch teardown 6 / pendingFinalize 3 / heartbeat Stop 1 / renewer cleanup 1 / Manager nonce 4 / ImportInbound 2 / delivery spool 4 / router 2 / cancelOnce 1 / staging 3 = 27
+# Round 12 补充(2026-08-05, 独立审查发现修复)
+- 独立 reviewer 审查 fd60fa3: 2 Important 已修复 + 验证:
+  - Important-1 替换窗口泄漏(预先存在, I1 补充): destroyTaskWorkerEntry/Locked 身份不匹配时仍清理旧 entry——completeSuccess 终态提交与销毁之间 map 被同 session 新任务替换时, 旧容器/凭据不再泄漏(只不触碰新 entry); 测试断言增强
+  - Important-2 弱测试: TestFinalizeRetryDropsIntentWhenClaimLost 改 GetTask 包装真实覆盖 ClaimOwner 分支, 断言 drain 不再调用 CompleteFailedTerminal
+  - Minor: Manager nonce 状态目录单写者前提文档化(多实例共享卷 last-writer-wins)
+- 验证: Go 18 包全量 + race 5 关键包 + vet + linux build + tests 47 + worker-python 109 + compose config + diff check 全绿
