@@ -1,0 +1,100 @@
+# CI 门禁(round13 审查 D5): 分支/PR 级测试矩阵。
+# 此前仓库唯一的 workflow 只在 tag/手动触发且仅构建桌面包, 回归全靠人工。
+# 覆盖: Go(含 PostgreSQL 集成测试与 race) / Python(根、平台、worker、bot
+# poller) / Web(lint + build)。触发: 推送到 main 与任意 PR。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go (vet, build, tests, race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: genericagent_test
+          POSTGRES_PASSWORD: genericagent_test
+          POSTGRES_DB: genericagent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U genericagent_test -d genericagent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # 集成测试依赖真实 PostgreSQL; 缺失时必须显式失败(项目契约)。
+      TEST_DATABASE_URL: postgres://genericagent_test:genericagent_test@localhost:5432/genericagent_test?sslmode=disable
+    defaults:
+      run:
+        working-directory: tenant_platform/backend-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tenant_platform/backend-go/go.mod
+          cache-dependency-path: tenant_platform/backend-go/go.sum
+      - run: go vet ./...
+      - run: go build ./...
+      # 测试共享同一 PostgreSQL 实例: -p 1 串行化包间执行, 避免 truncate
+      # 互踩(死锁/唯一键冲突均为共享库并发干扰的已知表现)。
+      - run: go test -p 1 -count=1 -timeout 300s ./...
+      # race 关键并发包(调度/租约/checkpoint), 同样串行化。
+      - run: go test -race -p 1 -count=1 -timeout 600s ./internal/application/... ./internal/infrastructure/worker/... ./internal/infrastructure/sandbox/... ./internal/infrastructure/checkpoint/... ./internal/infrastructure/postgres/...
+
+  python:
+    name: Python (core, platform, worker, bot poller)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install core deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          pip install -e .
+      - name: Core tests (root)
+        run: python -m pytest tests -q
+      - name: Platform contract/security/smoke
+        # integration 目录需要本地进程编排与 DB, 由 Go job 的集成测试覆盖,
+        # 此处不纳入门禁。
+        run: python -m pytest tenant_platform/tests/contract tenant_platform/tests/security tenant_platform/tests/smoke -q
+      - name: Bot poller
+        run: python -m pytest tenant_platform/bot_poller -q
+      - name: Worker
+        working-directory: tenant_platform/worker-python
+        run: |
+          pip install -e '.[test]'
+          python -m pytest -q
+
+  web:
+    name: Web (lint, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tenant_platform/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: tenant_platform/web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build

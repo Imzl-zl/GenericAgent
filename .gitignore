@@ -164,9 +164,15 @@ frontends/conductor_im_plugins/*
 # Beta 渠道：订阅门户插件（仅 beta 分发携带，不入库）
 plugins/subscription_portal.py
 
-# Tenant platform runtime data (checkpoints, overlays, staging, results).
-# runtime/config/mykey.py is already covered by the global mykey.py rule above.
-tenant_platform/runtime/runtime_data/
+# Tenant platform runtime data (checkpoints, overlays, staging, results,
+# committed history, session files). 整目录不入库(round13 审查 D1): 其中
+# 包含真实用户会话/附件元数据; runtime/config/mykey.py 已由全局 mykey.py
+# 规则覆盖。
+tenant_platform/runtime/
+
+# 审查/agent 运行产物: 含真实对话 transcript 与配置草稿, 不入库(round13 审查 D1)
+.pi-subagents/
+.pi-review-*.md
 
 # ga-runner memory 模板基线已入库(由 scripts/build-memory-template.sh 生成,
 # 与上游 9355c22d7 对齐; 重新生成后必须与 git 基线 diff 校验)

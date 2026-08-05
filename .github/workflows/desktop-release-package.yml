@@ -120,6 +120,8 @@ jobs:
             --exclude='./assets/demo' --exclude='./assets/images' \
             --exclude='./assets/GenericAgent_Technical_Report.pdf' \
             --exclude='./artifacts' \
+            --exclude='./.pi-subagents' --exclude='./.pi-review-*.md' --exclude='./.tasks' \
+            --exclude='./tenant_platform/runtime' \
             --exclude='*/node_modules' --exclude='*/target' \
             --exclude='*/.venv' --exclude='./.venv' \
             --exclude='*/__pycache__' --exclude='*.pyc' \
@@ -336,6 +338,8 @@ jobs:
             --exclude='./assets/demo' --exclude='./assets/images' \
             --exclude='./assets/GenericAgent_Technical_Report.pdf' \
             --exclude='./artifacts' \
+            --exclude='./.pi-subagents' --exclude='./.pi-review-*.md' --exclude='./.tasks' \
+            --exclude='./tenant_platform/runtime' \
             --exclude='*/node_modules' --exclude='*/target' \
             --exclude='*/.venv' --exclude='./.venv' \
             --exclude='*/__pycache__' --exclude='*.pyc' \
@@ -543,6 +547,8 @@ jobs:
             --exclude='assets/demo' --exclude='assets/images' \
             --exclude='assets/GenericAgent_Technical_Report.pdf' \
             --exclude='artifacts' \
+            --exclude='.pi-subagents' --exclude='.pi-review-*.md' --exclude='.tasks' \
+            --exclude='tenant_platform/runtime' \
             --exclude='*/node_modules' --exclude='*/target' \
             --exclude='*/.venv' --exclude='.venv' \
             --exclude='*/__pycache__' --exclude='*.pyc' \
