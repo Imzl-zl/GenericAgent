@@ -54,9 +54,25 @@ jobs:
       - run: go test -race -p 1 -count=1 -timeout 600s ./internal/application/... ./internal/infrastructure/worker/... ./internal/infrastructure/sandbox/... ./internal/infrastructure/checkpoint/... ./internal/infrastructure/postgres/...
 
   python:
-    name: Python (core, platform, worker, bot poller)
+    name: Python (core, platform, worker, bot poller, E2E)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: genericagent_test
+          POSTGRES_PASSWORD: genericagent_test
+          POSTGRES_DB: genericagent_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U genericagent_test -d genericagent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://genericagent_test:genericagent_test@localhost:5433/genericagent_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -76,9 +92,11 @@ jobs:
       - name: Core tests (root)
         run: python -m pytest tests -q
       - name: Platform contract/security/smoke
-        # integration 目录需要本地进程编排与 DB, 由 Go job 的集成测试覆盖,
-        # 此处不纳入门禁。
         run: python -m pytest tenant_platform/tests/contract tenant_platform/tests/security tenant_platform/tests/smoke -q
+      - name: Foundation vertical E2E (real Postgres + platform subprocess + Worker)
+        # 启动 platform --dev-loopback + 本地 LLM fixture, 提交任务→轮询→
+        # 取消→读结果, 验证"项目真的能运行"(round13 CI 补全)。
+        run: python -m pytest tenant_platform/tests/integration -q
       - name: Bot poller
         run: python -m pytest tenant_platform/bot_poller -q
       - name: Worker
