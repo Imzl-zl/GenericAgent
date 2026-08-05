@@ -89,6 +89,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pyyaml pycryptodome
           pip install -e .
+          # contract 绑定测试 import worker-python 生成代码(需要 protobuf/grpcio)
+          pip install -e 'tenant_platform/worker-python[test]'
+          # E2E 重启恢复场景用 psycopg 直连 Postgres 播种旧实例数据
+          pip install 'psycopg[binary]'
       - name: Core tests (root)
         run: python -m pytest tests -q
       - name: Platform contract/security/smoke
