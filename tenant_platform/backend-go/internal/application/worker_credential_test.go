@@ -263,8 +263,12 @@ func TestIssueProviderCapabilitiesBuildsDefaultFirstMixin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(set.JTIs) != 2 || set.Generation != 1 || set.Checksum != files.Checksum {
+	// round11 I4: 2 个 LLM capability + 1 个独立 control capability。
+	if len(set.JTIs) != 3 || set.Generation != 1 || set.Checksum != files.Checksum {
 		t.Fatalf("credential set=%+v", set)
+	}
+	if set.ControlJTI == "" {
+		t.Fatal("control capability JTI must be issued")
 	}
 	if strings.Contains(string(files.JSON), defaultProvider.APIKey) {
 		t.Fatal("upstream API key leaked into Worker runtime JSON")
@@ -590,8 +594,8 @@ func TestEnsureWorkerAppliesProviderChangesOnlyAtNextTaskBoundary(t *testing.T) 
 	if replacement.credentials.Snapshot.Providers[0].Revision != 2 {
 		t.Fatalf("replacement snapshot=%+v", replacement.credentials.Snapshot)
 	}
-	if len(capabilities.revoked) != 1 {
-		t.Fatalf("old capability revocations=%d", len(capabilities.revoked))
+	if len(capabilities.revoked) != 2 {
+		t.Fatalf("old capability revocations=%d want 2 (llm + control)", len(capabilities.revoked))
 	}
 }
 

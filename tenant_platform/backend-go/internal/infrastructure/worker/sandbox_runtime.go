@@ -18,6 +18,12 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
 
+// minRunnerCertTTL 是 Runner mTLS 证书的最短有效期(round11 审查 M1):
+// lease TTL 可能只有几十秒且无限续租, 证书签发后不轮换——长会话一旦
+// gRPC 重连会因证书过期失败。mTLS 短期性由容器销毁重建 + generation 递增
+// 保证, 证书 TTL 只需覆盖会话最长寿命(24h 足够覆盖任何受支持任务时长)。
+const minRunnerCertTTL = 24 * time.Hour
+
 // RunnerLeaseStore 是 Platform 侧持久 Runner lease 的最小接口
 // (实现: postgres.Store; 方案 §7: generation fencing 与重启恢复)。
 type RunnerLeaseStore interface {
@@ -134,13 +140,21 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 
 	// 3. 证书与容器名: 容器名由 workspace hash + generation 确定性推导,
 	//    服务端证书 SAN 绑定该 DNS 名(runner-control 网络内拨号地址)。
+	// round11 审查(M1): 证书 TTL 不得等于 lease TTL——lease 无限续租, 而
+	// 证书签发后不轮换; 长会话(>lease TTL)一旦 gRPC 重连会因证书过期失败。
+	// mTLS 的短期性由"容器销毁重建 + generation 递增"保证, 证书 TTL 只需
+	// 覆盖会话最长寿命。
 	runnerName := r.runnerName(workspaceKey, generation)
-	serverCert, err := r.cfg.CA.IssueRunnerCert(workspaceKey, generation, r.cfg.RunnerLeaseTTL, runnerName)
+	certTTL := r.cfg.RunnerLeaseTTL
+	if certTTL < minRunnerCertTTL {
+		certTTL = minRunnerCertTTL
+	}
+	serverCert, err := r.cfg.CA.IssueRunnerCert(workspaceKey, generation, certTTL, runnerName)
 	if err != nil {
 		releaseOnFailure()
 		return nil, fmt.Errorf("issue runner cert: %w", err)
 	}
-	clientCert, err := r.cfg.CA.IssuePlatformClientCert(r.cfg.RunnerLeaseTTL)
+	clientCert, err := r.cfg.CA.IssuePlatformClientCert(certTTL)
 	if err != nil {
 		releaseOnFailure()
 		return nil, fmt.Errorf("issue platform client cert: %w", err)

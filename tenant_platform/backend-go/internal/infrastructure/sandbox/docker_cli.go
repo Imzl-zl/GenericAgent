@@ -434,7 +434,7 @@ func (d *DockerCLI) ListRunnerContainers(ctx context.Context, namePrefix string)
 		args = append(args, "--filter", f)
 	}
 	args = append(args,
-		"--format", "{{.Names}}\t{{.State}}\t{{.Label \"com.genericagent.runner.created\"}}")
+		"--format", "{{.Names}}\t{{.State}}\t{{.Label \"com.genericagent.runner.created\"}}\t{{.Label \"com.genericagent.runner.hash\"}}\t{{.Label \"com.genericagent.runner.generation\"}}")
 	stdout, stderr, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, args...)
 	if err != nil {
 		return nil, fmt.Errorf("docker ps runners: %w", err)
@@ -454,6 +454,16 @@ func (d *DockerCLI) ListRunnerContainers(ctx context.Context, namePrefix string)
 				info.CreatedAt = time.Unix(secs, 0)
 			}
 		}
+		// round11 审查(I6): 附带 workspace hash 与 generation label, 供
+		// 孤儿 config 目录对账(容器已销毁的 config/g<gen> 短期凭据清理)。
+		if len(parts) > 3 {
+			info.WorkspaceHash = strings.TrimSpace(parts[3])
+		}
+		if len(parts) > 4 {
+			if g, parseErr := strconv.ParseUint(strings.TrimSpace(parts[4]), 10, 64); parseErr == nil {
+				info.Generation = g
+			}
+		}
 		infos = append(infos, info)
 	}
 	return infos, nil
@@ -464,4 +474,8 @@ type RunnerInfo struct {
 	Name      string
 	Running   bool
 	CreatedAt time.Time
+	// WorkspaceHash/Generation 是容器 label 中的工作区与 lease generation
+	// (round11 审查 I6): 供孤儿 config 目录对账判定容器归属。
+	WorkspaceHash string
+	Generation    uint64
 }

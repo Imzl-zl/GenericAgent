@@ -157,6 +157,13 @@ func main() {
 				// 审查 R5-I7: 清理错误聚合后统一记录, 不得逐条丢弃。
 				slog.ErrorContext(ctx, "sandbox-manager: orphan sweep completed with errors", "error", err)
 			}
+			// round11 审查(I6): 对账回收无容器对应的 workspace config/g<gen>
+			// 目录(销毁/创建失败路径清理失败或进程崩溃的残留短期凭据)。
+			if n, err := manager.ReconcileOrphanWorkspaceConfigs(ctx, *prefix); err != nil {
+				slog.ErrorContext(ctx, "sandbox-manager: reconcile orphan workspace configs failed", "error", err)
+			} else if n > 0 {
+				slog.InfoContext(ctx, "sandbox-manager: removed orphan workspace config dirs", "count", n)
+			}
 		}
 	}
 }
@@ -166,9 +173,11 @@ func main() {
 //   - 运行中但超过绝对 TTL 的容器(round9 审查: 兜底 Platform 停机场景——
 //     Platform lease 续租/回收全部失效后, 若无此上限, Runner 可无限运行并
 //     持续写工作区。absTTL 默认 24h, 正常 Platform 存活时 lease 续租不受
-//     影响, 误杀窗口极小; 超过 24h 的活跃会话被回收后由 checkpoint 恢复)。
-// 统一经 Manager.DestroyRunner 执行(归属校验 + workspace config/ 清理,
-// 审查 R5-I7: 绕过 Manager 直接 CLI.Destroy 会让短期私钥残留)。
+//     影响; 超过 24h 的活跃会话被回收后由 checkpoint 恢复)。
+// 统一经 Manager.DestroyRunnerIf 执行(归属校验 + workspace config/ 清理 +
+// 锁内 re-inspect, 审查 R5-I7/I3: 绕过 Manager 直接 CLI.Destroy 会让短期
+// 私钥残留; 扫描快照与销毁之间的 created→running 竞态由锁内最新状态
+// 消除——容器已启动且未超 TTL 时不会被误杀)。
 func sweepOrphans(ctx context.Context, m *sandbox.Manager, prefix string, absTTL time.Duration) error {
 	containers, err := m.ListRunnerContainers(ctx, prefix)
 	if err != nil {
@@ -178,19 +187,26 @@ func sweepOrphans(ctx context.Context, m *sandbox.Manager, prefix string, absTTL
 	destroyed := 0
 	now := time.Now().UTC()
 	for _, c := range containers {
-		if c.Running {
-			// round9 审查: 运行中容器超过绝对 TTL 也回收(Platform 停机兜底),
-			// 否则 lease 失效后容器无限存活。
-			if absTTL > 0 && !c.CreatedAt.IsZero() && now.Sub(c.CreatedAt) < absTTL {
-				continue
+		// round11 审查(I3): 判定与销毁在同一 workspace 锁内完成, 基于
+		// 销毁时刻的最新容器状态(created→running 竞态在此捕获)。
+		reaped, err := m.DestroyRunnerIf(ctx, c.Name, func(info sandbox.RunnerInfo) bool {
+			if !info.Running {
+				// 非 running(退出/从未启动)的容器无条件清理, 与绝对 TTL 无关。
+				return true
+			}
+			// 运行中容器超过绝对 TTL 也回收(Platform 停机兜底); 未超则保留。
+			if absTTL > 0 && !info.CreatedAt.IsZero() && now.Sub(info.CreatedAt) < absTTL {
+				return false
 			}
 			slog.WarnContext(ctx, "sandbox-manager: reaping runner beyond absolute TTL",
-				"name", c.Name, "created_at", c.CreatedAt.UTC().Format(time.RFC3339))
-		} else {
-			// 非 running(退出/从未启动)的容器无条件清理, 与绝对 TTL 无关。
-		}
-		if err := m.DestroyRunner(ctx, c.Name); err != nil {
+				"name", c.Name, "created_at", info.CreatedAt.UTC().Format(time.RFC3339))
+			return true
+		})
+		if err != nil {
 			sweepErr = errors.Join(sweepErr, fmt.Errorf("destroy orphan runner %s: %w", c.Name, err))
+			continue
+		}
+		if !reaped {
 			continue
 		}
 		destroyed++

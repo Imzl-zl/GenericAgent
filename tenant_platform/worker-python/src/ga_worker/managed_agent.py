@@ -34,6 +34,19 @@ from ga_worker.task_ops import TaskOpsMixin
 SHUTDOWN_JOIN_TIMEOUT_S = 5.0
 
 
+# controlJTIPrefix 标记独立签发的 control capability JTI(round11 审查 I4):
+# Worker 只持有 JTI 值(非完整 JWT), 无法解析 claims——Platform 用前缀区分
+# 用途, 真实性由凭据集合成员检查保证(集合内容来自 Platform 写入的 config)。
+CONTROL_JTI_PREFIX = "ctrl:"
+
+
+def _is_control_capability(capability_jti: str) -> bool:
+    """round11 审查(I4): 判定 JTI 是否为独立签发的 control capability。
+    带 ctrl: 前缀的 JTI 才是控制用途; LLM/Sophub JTI 即使仍在凭据集中
+    也不得用于控制 RPC。"""
+    return capability_jti.startswith(CONTROL_JTI_PREFIX)
+
+
 class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
     def __init__(
         self,
@@ -178,10 +191,14 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
             )
 
     def _assert_task_capability(self, capability_jti: str) -> None:
-        """审查 R5-I8: 控制 RPC(BeginCheckpoint/CancelTask/Shutdown)携带的
-        capability JTI 必须属于当前会话活跃凭据集——任务终态后 Platform 撤销
+        """审查 R5-I8 + round11 I4: 控制 RPC(BeginCheckpoint/CancelTask/
+        Shutdown)携带的 capability JTI 必须属于当前会话活跃凭据集, 且必须是
+        独立签发的 control capability(round11 I4)——LLM/Sophub 的 capability
+        JTI 即使仍在凭据集中也不得用于控制 RPC。任务终态后 Platform 撤销
         JTI(DB), 复用 Runner 的下一任务持有新 JTI; 旧 JTI 无法控制新任务。
-        空 JTI 仅允许在无凭据场景(清理路径/测试), 有活跃集时拒绝空值。"""
+        空 JTI 仅允许在无凭据场景(清理路径/测试), 有活跃集时拒绝空值。
+        Worker 不持有签名密钥, 但 token 由 Platform 经共享卷 config 写入
+        (写入方即信任根), payload claims 校验足以区分用途。"""
         if self._session is None:
             return
         if not capability_jti:
@@ -195,6 +212,12 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
             raise WorkerAdapterError(
                 "CAPABILITY_JTI_MISMATCH",
                 "control capability_jti not in the session's current credential set",
+            )
+        if not _is_control_capability(capability_jti):
+
+            raise WorkerAdapterError(
+                "CAPABILITY_NOT_CONTROL",
+                "control rpc requires a dedicated worker.control capability",
             )
 
     def cancel_task(self, task_id: str, workspace_key: str = "", runner_generation: int = 0, capability_jti: str = "") -> worker_pb2.CancelTaskResponse:

@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -69,7 +70,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		RunnerGeneration: entry.runnerGeneration,
 		// 审查 R5-I8: 绑定当前 task 的 capability JTI, Worker 校验其在会话
 		// 活跃凭据集中——终态撤销后旧 JTI 无法再发起 checkpoint。
-		CapabilityJti: firstJTI(entry.credentials),
+		CapabilityJti: controlJTIFor(entry.credentials),
 	})
 	if err != nil {
 		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
@@ -141,11 +142,20 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		}
 		// round10 审查(B9a): 提交失败且任务未终态——已物化的 committed/result
 		// 文件不被任何恢复指针引用, 必须清理, 否则重复故障永久占用宿主磁盘。
-		if s.cfg.Coordinator != nil {
-			if cleanupErr := s.cfg.Coordinator.CleanupCommittedFiles(ctx, committed); cleanupErr != nil {
-				slog.ErrorContext(ctx, "scheduler: cleanup orphan committed files failed",
-					"task_id", task.ID, "snapshot_id", committed.SnapshotID, "error", cleanupErr)
+		// round11 审查(C2)收紧: 仅当错误证明事务确定回滚(非
+		// ErrCommitOutcomeUnknown)时才能删除文件——提交结果不确定
+		// (网络/超时/重读失败)时, 文件可能已被 DB 引用, 删除会破坏恢复点;
+		// 此时保留文件并交给 ReconcileOrphanCommittedFiles 按 DB 引用对账回收。
+		if !errors.Is(err, postgres.ErrCommitOutcomeUnknown) {
+			if s.cfg.Coordinator != nil {
+				if cleanupErr := s.cfg.Coordinator.CleanupCommittedFiles(ctx, committed); cleanupErr != nil {
+					slog.ErrorContext(ctx, "scheduler: cleanup orphan committed files failed",
+						"task_id", task.ID, "snapshot_id", committed.SnapshotID, "error", cleanupErr)
+				}
 			}
+		} else {
+			slog.WarnContext(ctx, "scheduler: commit outcome unknown; deferring committed file cleanup to reconciliation",
+				"task_id", task.ID, "snapshot_id", committed.SnapshotID, "error", err)
 		}
 		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,

@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ContainerCLI 是 Manager 内部依赖的容器原语(docker create/start/rm/inspect)。
@@ -210,7 +210,11 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 		// ——清理不能依赖进程内 map(下次创建会重建),
 		// 否则残留私钥随卷快照长期保存(审查 C1/I6:
 		// 按 generation 清理, 不影响已创建的新一代 config)。
-		m.cleanupWorkspaceConfig(hash, req.Generation)
+		// round11 审查(I6): 清理失败返回组合错误, 残留由
+		// ReconcileOrphanWorkspaceConfigs 兜底。
+		if cleanupErr := m.cleanupWorkspaceConfig(hash, req.Generation); cleanupErr != nil {
+			return Runner{}, false, errors.Join(err, fmt.Errorf("cleanup workspace config: %w", cleanupErr))
+		}
 		return Runner{}, false, err
 	}
 	if err := m.cfg.CLI.Inspect(ctx, runner.Name); err != nil {
@@ -271,63 +275,127 @@ func (m *Manager) Destroy(ctx context.Context, name string) error {
 	return m.DestroyRunner(ctx, name)
 }
 
-// DestroyRunner removes a Runner container by name or container ID.
-// 归属校验(审查 F7): 命名模式匹配后仍须通过 manager label 校验——容器名
-// 模式可被其他部署复用, 只有 label 才能证明是本 Manager 实例创建; 容器已
-// 不存在时幂等成功(审查 F6)。
-func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
-	if m.IsRunnerName(name) {
-		if checker, ok := m.cfg.CLI.(interface {
-			IsManagerRunner(ctx context.Context, idOrName string) (bool, error)
-			ContainerExists(ctx context.Context, idOrName string) (bool, error)
-		}); ok {
-			managed, err := checker.IsManagerRunner(ctx, name)
-			if err != nil {
-				return fmt.Errorf("refusing to destroy %q: manager label check failed: %w", name, err)
-			}
-			if !managed {
-				exists, existsErr := checker.ContainerExists(ctx, name)
-				if existsErr != nil {
-					return fmt.Errorf("refusing to destroy %q: existence check failed: %w", name, existsErr)
-				}
-				if !exists {
-					return nil // 已不存在: 幂等成功
-				}
-				return fmt.Errorf("refusing to destroy %q: not created by this manager instance", name)
-			}
-		}
-	} else {
-		// 审查 R5-I6: 容器 ID 路径(非 RunnerName 模式)同样必须通过 manager
-		// label 归属校验——只有 runner=true 标签不能证明是本 Manager 创建,
-		// 其他部署/宿主任意容器的 runner=true 标签不得被销毁。
-		// round10 审查(B1): 容器已不存在时幂等成功(与名称路径一致)——
-		// idle 回收后 lease 记录的 container_id 可能在 Destroy 与 release
-		// 之间已被其他路径删除, 若把"不存在"当作拒绝, stale_container_id
-		// 清理会永久失败, 该工作区无法重建 Runner。
-		if checker, ok := m.cfg.CLI.(interface {
-			IsManagerRunner(ctx context.Context, idOrName string) (bool, error)
-			ContainerExists(ctx context.Context, idOrName string) (bool, error)
-		}); ok {
-			managed, err := checker.IsManagerRunner(ctx, name)
-			if err != nil {
-				return fmt.Errorf("refusing to destroy %q: manager label check failed: %w", name, err)
-			}
-			if !managed {
-				exists, existsErr := checker.ContainerExists(ctx, name)
-				if existsErr != nil {
-					return fmt.Errorf("refusing to destroy %q: existence check failed: %w", name, existsErr)
-				}
-				if !exists {
-					return nil // 已不存在: 幂等成功
-				}
-				return fmt.Errorf("refusing to destroy %q: not created by this manager instance", name)
-			}
-		} else {
+// assertManagedRunner 校验 name/ID 属于本 Manager 的 Runner(方案 §7:
+// 控制面凭据泄露后不得任意删除宿主任意容器; 容器已不存在时幂等成功)。
+func (m *Manager) assertManagedRunner(ctx context.Context, name string) error {
+	checker, ok := m.cfg.CLI.(interface {
+		IsManagerRunner(ctx context.Context, idOrName string) (bool, error)
+		ContainerExists(ctx context.Context, idOrName string) (bool, error)
+	})
+	if !ok {
+		if !m.IsRunnerName(name) {
 			ok, err := m.cfg.CLI.IsRunnerContainer(ctx, name)
 			if err != nil || !ok {
 				return fmt.Errorf("refusing to destroy %q: not a managed runner (label check failed: %v)", name, err)
 			}
 		}
+		return nil
+	}
+	managed, err := checker.IsManagerRunner(ctx, name)
+	if err != nil {
+		return fmt.Errorf("refusing to destroy %q: manager label check failed: %w", name, err)
+	}
+	if managed {
+		return nil
+	}
+	exists, existsErr := checker.ContainerExists(ctx, name)
+	if existsErr != nil {
+		return fmt.Errorf("refusing to destroy %q: existence check failed: %w", name, existsErr)
+	}
+	if !exists {
+		return nil // 已不存在: 幂等成功(round10 B1)
+	}
+	return fmt.Errorf("refusing to destroy %q: not created by this manager instance", name)
+}
+
+// runnerLabels 在容器被删除**之前**读取 label 中的 workspace hash 与
+// generation(审查 F11/R5-C6): 进程内 map 无记录(Manager 重启后按名/ID
+// 销毁)时, 从 label 恢复清理目标; 容器被 rm 后 label 不可读。
+func (m *Manager) runnerLabels(ctx context.Context, name string) (hash string, generation uint64) {
+	if getter, ok := m.cfg.CLI.(interface {
+		RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error)
+	}); ok {
+		if h, found, err := getter.RunnerWorkspaceHash(context.WithoutCancel(ctx), name); err == nil && found {
+			hash = h
+		}
+	}
+	if genGetter, ok := m.cfg.CLI.(interface {
+		RunnerGenerationLabel(ctx context.Context, idOrName string) (uint64, bool, error)
+	}); ok {
+		if g, found, err := genGetter.RunnerGenerationLabel(context.WithoutCancel(ctx), name); err == nil && found {
+			generation = g
+		}
+	}
+	return hash, generation
+}
+
+// runnerInfo 查询单个 Runner 容器的当前状态(锁内使用, round11 审查 I3:
+// 孤儿回收的"是否可回收"判定必须基于销毁时刻的最新状态, 而非扫描快照)。
+func (m *Manager) runnerInfo(ctx context.Context, name string) (RunnerInfo, bool, error) {
+	infos, err := m.ListRunnerContainers(ctx, name)
+	if err != nil {
+		return RunnerInfo{}, false, err
+	}
+	for _, i := range infos {
+		if i.Name == name {
+			return i, true, nil
+		}
+	}
+	return RunnerInfo{}, false, nil
+}
+
+// DestroyRunnerIf 在 workspace 锁内重新读取容器当前状态, 仅当
+// stillOrphan(基于最新状态)判定为真时销毁(round11 审查 I3):
+//   - 消除扫描快照与销毁之间 created→running 的竞态(容器已启动时
+//     最新状态为 running, stillOrphan 可拒绝回收);
+//   - 活跃 Runner 的 absTTL 强杀同样以锁内状态与判定为准。
+// 容器已不存在视为已满足条件(幂等成功)。返回是否销毁。
+func (m *Manager) DestroyRunnerIf(ctx context.Context, name string, stillOrphan func(info RunnerInfo) bool) (bool, error) {
+	if err := m.assertManagedRunner(ctx, name); err != nil {
+		return false, err
+	}
+	hash, generation := m.runnerLabels(ctx, name)
+	m.mu.Lock()
+	for h, n := range m.runners {
+		if n == name {
+			hash = h
+			break
+		}
+	}
+	m.mu.Unlock()
+	var lock *sync.Mutex
+	if hash != "" {
+		lock = m.workspaceLock(hash)
+	}
+	if lock != nil {
+		lock.Lock()
+		defer lock.Unlock()
+	}
+	if generation == 0 {
+		if gen, err := m.runnerGenerationOf(name); err == nil {
+			generation = gen
+		}
+	}
+	info, found, err := m.runnerInfo(ctx, name)
+	if err != nil {
+		return false, fmt.Errorf("re-inspect runner %q before destroy: %w", name, err)
+	}
+	if !found {
+		return true, nil // 已不存在: 幂等成功
+	}
+	if !stillOrphan(info) {
+		return false, nil
+	}
+	return true, m.destroyRunnerLocked(ctx, name, hash, generation)
+}
+
+// DestroyRunner removes a Runner container by name or container ID.
+// 归属校验(审查 F7): 命名模式匹配后仍须通过 manager label 校验——容器名
+// 模式可被其他部署复用, 只有 label 才能证明是本 Manager 实例创建; 容器已
+// 不存在时幂等成功(审查 F6)。
+func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
+	if err := m.assertManagedRunner(ctx, name); err != nil {
+		return err
 	}
 	// 审查 F11/R5-C6: 短期 mTLS 私钥/证书/token 不跨容器生命周期残留——销毁
 	// 容器后清理 workspace config/g<generation> 目录(下次创建由
@@ -335,22 +403,7 @@ func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
 	// 销毁)时, 从容器 label 恢复 workspace hash 定位清理目标。
 	// 注意: 必须在 Destroy **之前**读取 label——容器被 rm 后
 	// inspect 无法再返回任何信息。
-	var hashFromLabel string
-	var genFromLabel uint64
-	if getter, ok := m.cfg.CLI.(interface {
-		RunnerWorkspaceHash(ctx context.Context, idOrName string) (string, bool, error)
-	}); ok {
-		if h, found, err := getter.RunnerWorkspaceHash(context.WithoutCancel(ctx), name); err == nil && found {
-			hashFromLabel = h
-		}
-	}
-	if genGetter, ok := m.cfg.CLI.(interface {
-		RunnerGenerationLabel(ctx context.Context, idOrName string) (uint64, bool, error)
-	}); ok {
-		if g, found, err := genGetter.RunnerGenerationLabel(context.WithoutCancel(ctx), name); err == nil && found {
-			genFromLabel = g
-		}
-	}
+	hashFromLabel, genFromLabel := m.runnerLabels(ctx, name)
 	// 审查 C1/I6: 与 EnsureRunner 共享 per-workspace 锁——同一工作区的
 	// 创建/销毁串行, 旧 generation 销毁的 config 清理不得与新创建写入
 	// 交错(否则可删掉新一代的 mTLS 材料)。
@@ -391,6 +444,8 @@ func (m *Manager) DestroyRunner(ctx context.Context, name string) error {
 // EnsureRunner 持锁期间销毁容器必须走本变体——公开 DestroyRunner 会再次
 // 获取同一把非重入锁, 造成确定性死锁; 同时统一保证所有销毁路径清理
 // workspace config/g<generation> 的短期 mTLS 材料。
+// round11 审查(I6): config 清理失败不再静默——销毁返回组合错误, 残留由
+// ReconcileOrphanWorkspaceConfigs 兜底回收。
 func (m *Manager) destroyRunnerLocked(ctx context.Context, name, hash string, generation uint64) error {
 	if err := m.cfg.CLI.Destroy(ctx, name); err != nil {
 		return err
@@ -404,29 +459,101 @@ func (m *Manager) destroyRunnerLocked(ctx context.Context, name, hash string, ge
 	}
 	m.mu.Unlock()
 	if hash != "" {
-		m.cleanupWorkspaceConfig(hash, generation)
+		if err := m.cleanupWorkspaceConfig(hash, generation); err != nil {
+			return fmt.Errorf("destroy runner %s: container removed but config cleanup failed: %w", name, err)
+		}
 	}
 	return nil
 }
 
 // cleanupWorkspaceConfig 删除工作区 config/g<generation> 目录
-// (best-effort, 审查 C1/I6: 按 generation 隔离, 不影响已创建的新一代
-// 配置)。目录结构由下次 CreateAndStart 的 writeConfigFiles
-// 重建; 失败仅记日志, 不阻断销毁路径。
-func (m *Manager) cleanupWorkspaceConfig(hash string, generation uint64) {
+// (审查 C1/I6: 按 generation 隔离, 不影响已创建的新一代配置)。目录结构由
+// 下次 CreateAndStart 的 writeConfigFiles 重建。round11 审查(I6): 失败
+// 返回 error 而非仅日志——短期私钥/证书/token 不得因清理失败永久残留,
+// 残留由 ReconcileOrphanWorkspaceConfigs 对账回收。
+func (m *Manager) cleanupWorkspaceConfig(hash string, generation uint64) error {
 	if m.cfg.WorkspaceRoot == "" {
-		return
+		return nil
 	}
 	if generation == 0 {
 		// 无法定位 generation(名称/label 都不可用): 不删除,
-		// 防止误删新一代配置。残留由下次创建覆盖。
-		return
+		// 防止误删新一代配置。残留由下次创建覆盖 + 对账兜底。
+		return nil
 	}
 	dir := filepath.Join(m.cfg.WorkspaceRoot, hash, "config", fmt.Sprintf("g%d", generation))
 	if err := os.RemoveAll(dir); err != nil {
-		slog.Warn("sandbox manager: cleanup workspace config dir failed",
-			"workspace_hash", hash, "generation", generation, "error", err)
+		return fmt.Errorf("remove config dir %s: %w", dir, err)
 	}
+	return nil
+}
+
+// orphanConfigReconcileAge 是孤儿 config 目录回收的最小年龄: 覆盖
+// writeConfigFiles→CreateAndStart 的窗口, 防止对账器与进行中的创建竞态
+// 删掉即将被容器挂载的短期凭据。
+const orphanConfigReconcileAge = time.Hour
+
+// ReconcileOrphanWorkspaceConfigs 对账回收没有对应 Runner 容器的
+// workspace config/g<generation> 目录(round11 审查 I6): 销毁/创建失败路径
+// 的清理失败(或进程崩溃)会留下含短期私钥/证书/token 的目录, 必须兜底
+// 删除。判定基于容器 label(workspace hash + generation)与目录 mtime 年龄。
+func (m *Manager) ReconcileOrphanWorkspaceConfigs(ctx context.Context, namePrefix string) (int, error) {
+	if m.cfg.WorkspaceRoot == "" {
+		return 0, nil
+	}
+	containers, err := m.ListRunnerContainers(ctx, namePrefix)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile configs: list runners: %w", err)
+	}
+	active := make(map[string]struct{}, len(containers))
+	for _, c := range containers {
+		if c.WorkspaceHash != "" && c.Generation > 0 {
+			active[fmt.Sprintf("%s/g%d", c.WorkspaceHash, c.Generation)] = struct{}{}
+		}
+	}
+	now := time.Now()
+	removed := 0
+	workspaceDirs, err := os.ReadDir(m.cfg.WorkspaceRoot)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile configs: list workspaces root: %w", err)
+	}
+	for _, ws := range workspaceDirs {
+		if !ws.IsDir() || !workspaceHashPattern.MatchString(ws.Name()) {
+			continue
+		}
+		configRoot := filepath.Join(m.cfg.WorkspaceRoot, ws.Name(), "config")
+		configDirs, err := os.ReadDir(configRoot)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return removed, fmt.Errorf("reconcile configs: list %s: %w", configRoot, err)
+		}
+		for _, g := range configDirs {
+			if !g.IsDir() || !strings.HasPrefix(g.Name(), "g") {
+				continue
+			}
+			gen, err := strconv.ParseUint(strings.TrimPrefix(g.Name(), "g"), 10, 64)
+			if err != nil || gen == 0 {
+				continue
+			}
+			key := fmt.Sprintf("%s/g%d", ws.Name(), gen)
+			if _, ok := active[key]; ok {
+				continue // 容器存活: 配置是活跃凭据
+			}
+			info, err := g.Info()
+			if err != nil {
+				return removed, fmt.Errorf("reconcile configs: stat %s: %w", g.Name(), err)
+			}
+			if now.Sub(info.ModTime()) < orphanConfigReconcileAge {
+				continue // 创建中窗口: 保留
+			}
+			if err := os.RemoveAll(filepath.Join(configRoot, g.Name())); err != nil {
+				return removed, fmt.Errorf("reconcile configs: remove %s: %w", g.Name(), err)
+			}
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 // RunnerWorkspaceHash 从容器 label 读取 workspace hash(审查 R5-C6:

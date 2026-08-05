@@ -95,6 +95,9 @@ type controlledWorker struct {
 	beginCheckpointEntered chan struct{}
 	releaseBeginCheckpoint chan struct{}
 	beginCheckpointErr     error
+	cancelTaskErr          error
+	cancelTaskEntered      chan struct{}
+	releaseCancelTask      chan struct{}
 	reloadErr              error
 	reloadRequests         []*workerv1.ReloadCredentialsRequest
 	reloadEntered          chan struct{}
@@ -172,8 +175,21 @@ func (w *controlledWorker) BeginCheckpoint(ctx context.Context, _ *workerv1.Begi
 	return w.checkpointReady, nil
 }
 
-func (w *controlledWorker) CancelTask(context.Context, string, string, uint64, string) error {
+func (w *controlledWorker) CancelTask(ctx context.Context, _ string, _ string, _ uint64, _ string) error {
 	w.cancelCalls.Add(1)
+	if w.cancelTaskEntered != nil {
+		close(w.cancelTaskEntered)
+	}
+	if w.releaseCancelTask != nil {
+		select {
+		case <-w.releaseCancelTask:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if w.cancelTaskErr != nil {
+		return w.cancelTaskErr
+	}
 	select {
 	case <-w.streamDone:
 		w.cancelObserved <- false
@@ -289,6 +305,10 @@ func (c *successfulCoordinator) CleanupCommittedFiles(context.Context, checkpoin
 	return nil
 }
 
+func (c *successfulCoordinator) ReconcileOrphanCommittedFiles(context.Context) (int, error) {
+	return 0, nil
+}
+
 type readFailCoordinator struct {
 	store *postgres.Store
 	owner string
@@ -335,6 +355,10 @@ func (c *readFailCoordinator) SweepExpiredCheckpoints(context.Context) (int, err
 
 func (c *readFailCoordinator) CleanupCommittedFiles(context.Context, checkpoint.CommittedCheckpoint) error {
 	return nil
+}
+
+func (c *readFailCoordinator) ReconcileOrphanCommittedFiles(context.Context) (int, error) {
+	return 0, nil
 }
 
 func testPolicyRegistry(t *testing.T) policy.Registry {

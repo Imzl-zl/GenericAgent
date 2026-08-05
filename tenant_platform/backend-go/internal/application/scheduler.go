@@ -78,6 +78,11 @@ type SchedulerConfig struct {
 	MaxTaskWallClock time.Duration
 	// MaxBundleBytes for checkpoint prepare.
 	MaxBundleBytes uint64
+	// StartSessionTimeout 是 StartSession RPC 的独立超时(round11 审查 C3):
+	// Worker 冷启动/快照恢复慢或 RPC 卡住时, 只终止本 session 的派发,
+	// 不阻塞其他工作区(StartSession/CancelTask 互斥已收窄到 per-entry 锁)。
+	// 零值使用 DefaultStartSessionTimeout。
+	StartSessionTimeout time.Duration
 
 	// MaxRunningTasks caps the global number of simultaneously starting/running
 	// tasks. Zero disables the check (dev/test only). Production should set
@@ -147,7 +152,13 @@ const (
 	DefaultTokenRefreshSkew          = 5 * time.Minute
 	DefaultMaxTaskWallClock          = 45 * time.Minute
 	defaultRevocationCleanupInterval = time.Minute
-	workerShutdownTimeout            = defaultWorkerShutdownSecs * time.Second
+	// DefaultStartSessionTimeout 覆盖 Worker 冷启动 + 恢复快照读取的最慢
+	// 合法场景; 超过即视为 Worker 不可用, 由后续重试/重建兜底。
+	DefaultStartSessionTimeout = 90 * time.Second
+	// workerControlTimeout 是控制 RPC(CancelTask/Shutdown)的单次超时:
+	// 卡住的控制调用不得长期占用 per-entry 锁阻塞同 session 后续派发。
+	workerControlTimeout = 30 * time.Second
+	workerShutdownTimeout = defaultWorkerShutdownSecs * time.Second
 )
 
 // ErrLeaseExpired is re-exported from domain for callers in the application
@@ -155,12 +166,11 @@ const (
 var ErrLeaseExpired = domain.ErrLeaseExpired
 
 type scheduler struct {
-	cfg                   SchedulerConfig
-	mu                    sync.Mutex
-	workerCallMu          sync.Mutex
-	wake                  chan struct{}
-	workers               map[string]*workerEntry // session_key -> dedicated worker
-	cancelOnce            sync.Map                // taskID -> *cancelCall
+	cfg    SchedulerConfig
+	mu     sync.Mutex
+	wake   chan struct{}
+	workers map[string]*workerEntry // session_key -> dedicated worker
+	cancelOnce sync.Map            // taskID -> *cancelCall
 	// lastCheckpointSweep 记录上次 checkpoint 残留清理时间(节流, 审查 R4-I12)。
 	lastCheckpointSweep time.Time
 	// dispatchInFlight 是 dispatch goroutine 的进程内 in-flight gate
@@ -320,6 +330,14 @@ func (s *scheduler) tick(ctx context.Context) error {
 			slog.ErrorContext(ctx, "scheduler: sweep expired checkpoints failed", "error", err)
 		} else if n > 0 {
 			slog.InfoContext(ctx, "scheduler: quarantined expired checkpoint snapshots", "count", n)
+		}
+		// round11 审查(C2): 对账回收确定孤儿 committed/result 文件——提交结果
+		// 不确定时保留的文件最终在此按 DB 引用回收, 避免不确定窗口误删恢复点
+		// 与磁盘永久泄漏两个方向的契约破坏。
+		if n, err := s.cfg.Coordinator.ReconcileOrphanCommittedFiles(ctx); err != nil {
+			slog.ErrorContext(ctx, "scheduler: reconcile orphan committed files failed", "error", err)
+		} else if n > 0 {
+			slog.InfoContext(ctx, "scheduler: removed orphan committed files", "count", n)
 		}
 	}
 	// Recover newly expired foreign-owner work opportunistically.

@@ -169,7 +169,8 @@ def _setup_runtime(
     adapter: Any, task: worker_pb2.TaskEnvelope, pending: PendingTask, tool_policy: Any,
 ) -> TaskRunState:
     from ga_worker.legacy_instrument import (
-        apply_tool_policy, install_dispatch_guard, install_global_mcp_tools,
+        apply_tool_policy, install_dispatch_guard, install_export_docx_tool,
+        install_global_mcp_tools,
         install_handler_print_counter, install_max_turns, install_session_file_sandbox,
         install_sophub_tools, prepare_handler_seed,
     )
@@ -186,6 +187,7 @@ def _setup_runtime(
         adapter._session.generated_output_files = []
     try:
         state.sandbox_unwrap = install_session_file_sandbox(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
+        state.export_unwrap = install_export_docx_tool(adapter._session, adapter._legacy_mods)
         state.sophub_unwrap = install_sophub_tools(adapter._session, adapter._legacy_mods)
         state.mcp_unwrap = install_global_mcp_tools(adapter._session, adapter._legacy_mods)
         state.previous_schema = apply_tool_policy(tool_policy, adapter._legacy_mods)
@@ -214,6 +216,7 @@ def _rollback_runtime_setup(adapter: Any, state: TaskRunState) -> None:
     for unwrap in (
         state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap,
         state.seed_unwrap, state.mcp_unwrap, getattr(state, "sophub_unwrap", None),
+        getattr(state, "export_unwrap", None),
         sandbox_unwrap,
     ):
         if unwrap is not None:

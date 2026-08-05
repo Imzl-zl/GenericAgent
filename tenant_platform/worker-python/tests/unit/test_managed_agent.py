@@ -76,6 +76,12 @@ def _runtime_policy(
     )
 
 
+def _control_jwt(jti: str) -> str:
+    """构造 control capability JTI 值(round11 I4 测试辅助: Worker 只持有
+    JTI 值, 前缀 ctrl: 标记控制用途)。"""
+    return f"ctrl:{jti}"
+
+
 def _start_req(
     session_key: str = "personal:1",
     *,
@@ -109,8 +115,10 @@ def _task(
     persona: list[str] | None = None,
     tool_policy_version: str = "foundation.no-host-tools.v1",
     runner_generation: int = 1,
-    capability_jti: str = "test-jti",
+    capability_jti: str | None = None,
 ) -> worker_pb2.ExecuteTaskRequest:
+    if capability_jti is None:
+        capability_jti = _control_jwt("test-jti")
     return worker_pb2.ExecuteTaskRequest(
         task=worker_pb2.TaskEnvelope(
             task_id=task_id,
@@ -1578,15 +1586,20 @@ def test_agent_thread_crash_marks_session_failed_and_health_not_ready(roots, fou
 def test_control_rpcs_reject_stale_task_capability(roots, foundation_registry):
     adapter = _make_adapter(roots, foundation_registry, ScriptedAgent)
     adapter.start_session(_start_req())
-    adapter._session.capability_jtis = ["jti-active"]
+    active = _control_jwt("jti-active")
+    adapter._session.capability_jtis = [active]
 
-    # cancel: 错误/空 JTI 拒绝(accepted=False), 正确 JTI 进入正常流程。
+    # cancel: 错误/空 JTI 拒绝(accepted=False), 正确 control JTI 进入正常流程。
     assert adapter.cancel_task("t-x", "personal:1", 1, "jti-stale").accepted is False
     assert adapter.cancel_task("t-x", "personal:1", 1, "").accepted is False
+    # LLM capability JTI(在集合内但非 control 前缀)必须被拒绝(round11 I4)。
+    llm_jti = "jti-llm-no-prefix"
+    adapter._session.capability_jtis = [active, llm_jti]
+    assert adapter.cancel_task("t-x", "personal:1", 1, llm_jti).accepted is False
     # 正确 JTI: 任务未知返回 accepted=False, 但不再因 capability 被拒——
     # 用 shutdown 区分(正确 JTI 正常接受)。
     assert adapter.shutdown("done", "personal:1", 1, "jti-stale").accepted is False
-    assert adapter.shutdown("done", "personal:1", 1, "jti-active").accepted is True
+    assert adapter.shutdown("done", "personal:1", 1, active).accepted is True
 
     # begin_checkpoint: 错误 JTI 直接抛错(即使任务/世代正确)。
     req = worker_pb2.BeginCheckpointRequest(
@@ -1816,9 +1829,9 @@ def test_emit_final_terminal_fails_closed_when_cleanup_incomplete(roots, foundat
 # ---------- Round 7 I7: 内部 timeout 携带 capability JTI ----------
 
 def test_task_deadline_timeout_carries_capability_jti(roots, foundation_registry):
-    """审查 C1(I7): 生产会话(有活跃 JTI 集)下任务超时的内部 cancel 必须携带
-    当前任务的 capability_jti, 否则 _assert_task_capability 拒绝、agent 无法
-    被 abort, 任务超时形同虚设。"""
+    """审查 C1(I7) + round11 I4: 生产会话(有活跃 JTI 集)下任务超时的内部
+    cancel 必须携带当前任务的 control capability_jti, 否则 _assert_task_
+    capability 拒绝、agent 无法被 abort, 任务超时形同虚设。"""
     class HangAgent(ScriptedAgent):
         def __init__(self):
             super().__init__(hang_on={"deadline-jti"})
@@ -1826,8 +1839,9 @@ def test_task_deadline_timeout_carries_capability_jti(roots, foundation_registry
     adapter = _make_adapter(roots, foundation_registry, HangAgent)
     adapter.start_session(_start_req(runtime_policy=_runtime_policy(task_timeout_seconds=1)))
     # 模拟生产会话: ReloadCredentials 后持有活跃 JTI 集(空 JTI 会被拒绝)。
-    adapter._session.capability_jtis = ["test-jti"]
-    events = _events(adapter, _task("dl-jti", "deadline-jti", capability_jti="test-jti"))
+    control = _control_jwt("test-jti")
+    adapter._session.capability_jtis = [control]
+    events = _events(adapter, _task("dl-jti", "deadline-jti", capability_jti=control))
     term = _terminal(events)
     assert term.status == worker_pb2.TASK_INTERRUPTED
     assert term.error.code == "TASK_TIMEOUT"

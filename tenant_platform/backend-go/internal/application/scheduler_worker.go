@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -27,6 +28,16 @@ type workerEntry struct {
 	pendingRefresh     *pendingCredentialRefresh
 	pendingRevocations []workerCredentialSet
 	lifecycleMu        sync.Mutex
+	// startMu 只串行 StartSession 与 CancelWorker(round11 审查 C3): 原全局
+	// workerCallMu 让一个卡住的 StartSession 阻塞所有工作区; 收窄到
+	// per-entry 后, 同一 session 的取消仍等待 StartSession 完成
+	// (cancel-during-StartSession 由 dispatch 的 durable cancel 检查处理),
+	// 而 checkpoint 收尾(completeSuccess 持 lifecycleMu)不被取消阻塞。
+	startMu sync.Mutex
+	// executing 标记 ExecuteTask 流进行中(round11 C3): CancelWorker 只在
+	// 任务实际执行时向 Worker 发取消 RPC; StartSession 刚完成但尚未执行
+	// 时跳过——dispatch 会检测 durable cancel_requested_at 并 evict 重建。
+	executing atomic.Bool
 	startOnce          sync.Once
 	startErr           error
 	started            bool
@@ -63,22 +74,83 @@ func (s *scheduler) maybeCancelWorker(ctx context.Context, task domain.Task) {
 func (s *scheduler) CancelWorker(ctx context.Context, task domain.Task) error {
 	value, _ := s.cancelOnce.LoadOrStore(task.ID, &cancelCall{})
 	call := value.(*cancelCall)
-	call.once.Do(func() {
-		s.workerCallMu.Lock()
-		defer s.workerCallMu.Unlock()
-		s.mu.Lock()
-		entry := s.workers[task.SessionKey]
-		s.mu.Unlock()
-		if entry == nil {
-			// worker 已不存在 = 已被 dispatch 销毁重建/evict, 取消已生效,
-			// 视为成功而不是向用户报错(否则 CancelTask API 在
-			// cancel-during-StartSession 竞态下返回 500, 尽管任务已中断)。
-			call.err = nil
-			return
+	call.mu.Lock()
+	if call.done {
+		err := call.err
+		call.mu.Unlock()
+		return err
+	}
+	if call.inflight {
+		// 已有并发取消在途: 同步合并等待其结果(保持旧 once.Do 语义)。
+		notify := call.notify
+		if notify == nil {
+			notify = make(chan struct{})
+			call.notify = notify
 		}
-		call.err = entry.client.CancelTask(ctx, entry.sessionKey, task.ID, entry.runnerGeneration, firstJTI(entry.credentials))
-	})
-	return call.err
+		call.mu.Unlock()
+		select {
+		case <-notify:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		call.mu.Lock()
+		err := call.err
+		call.mu.Unlock()
+		return err
+	}
+	call.inflight = true
+	call.mu.Unlock()
+
+	err := s.cancelWorkerRPC(ctx, task)
+
+	call.mu.Lock()
+	call.inflight = false
+	// round11 审查(I2): 失败不再永久缓存——任务仍是 running 且
+	// cancel_requested_at 已持久, 下一次 tick 的 maybeCancelWorker 会重试;
+	// 只有成功(含"无需 RPC"的幂等成功)才终态缓存。
+	if err == nil {
+		call.done = true
+		call.err = nil
+	} else {
+		call.done = false
+		call.err = err
+	}
+	notify := call.notify
+	call.notify = nil
+	call.mu.Unlock()
+	if notify != nil {
+		close(notify)
+	}
+	return err
+}
+
+// cancelWorkerRPC 执行一次取消 RPC(带 per-entry 锁与超时)。
+func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error {
+	s.mu.Lock()
+	entry := s.workers[task.SessionKey]
+	s.mu.Unlock()
+	if entry == nil {
+		// worker 已不存在 = 已被 dispatch 销毁重建/evict, 取消已生效,
+		// 视为成功而不是向用户报错(否则 CancelTask API 在
+		// cancel-during-StartSession 竞态下返回 500, 尽管任务已中断)。
+		return nil
+	}
+	// round11 审查(C3): 取消与同 session 的 StartSession 互斥用 per-entry
+	// startMu(原全局 workerCallMu 会让一个卡住的 StartSession 阻塞所有
+	// 工作区的派发与取消); 与 checkpoint 收尾(lifecycleMu)不互斥。
+	// 任务尚未进入执行阶段时跳过 RPC——dispatch 会检测 durable
+	// cancel_requested_at 并 evict 重建, 无需向 Worker 发取消。
+	entry.startMu.Lock()
+	defer entry.startMu.Unlock()
+	if !s.workerEntryIsCurrent(task.SessionKey, entry) {
+		return nil
+	}
+	if !entry.executing.Load() {
+		return nil
+	}
+	cancelCtx, cancel := context.WithTimeout(ctx, workerControlTimeout)
+	defer cancel()
+	return entry.client.CancelTask(cancelCtx, entry.sessionKey, task.ID, entry.runnerGeneration, controlJTIFor(entry.credentials))
 }
 
 // ensureWorker returns the dedicated Worker for task.SessionKey, creating a new
@@ -288,7 +360,7 @@ func (s *scheduler) cleanupWorkerEntryBestEffort(ctx context.Context, entry *wor
 		// 审查 C1/I7: 清理/关闭携带当前凭据集 JTI, Worker 校验通过后
 		// 才能优雅停止; 任务终态后 credentials 可能已被撤销, 但 Worker
 		// 内存 session 的 JTI 集在 Reload 时更新, firstJTI 仍在集合内。
-		entry.cleanup(firstJTI(entry.credentials))
+		entry.cleanup(controlJTIFor(entry.credentials))
 	}
 	if entry.pendingRefresh != nil {
 		s.revokeCredentialSetBestEffort(ctx, entry.pendingRefresh.Next)
@@ -324,6 +396,9 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	if entry == nil {
 		return fmt.Errorf("no worker for session %s", task.SessionKey)
 	}
+	// round11 审查(C3): 与 CancelWorker 互斥(同 session), 跨 session 并行。
+	entry.startMu.Lock()
+	defer entry.startMu.Unlock()
 	entry.lifecycleMu.Lock()
 	defer entry.lifecycleMu.Unlock()
 	if !s.workerEntryIsCurrent(task.SessionKey, entry) {
@@ -364,7 +439,16 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 		startReq.SnapshotId = task.SnapshotID
 		startReq.SnapshotChecksum = task.SnapshotChecksum
 	}
-	if err := entry.startSession(ctx, startReq); err != nil {
+	// round11 审查(C3): StartSession 使用独立超时——RPC 卡住时本 session
+	// 派发失败并销毁 Worker(后续 tick 重建), 但不再阻塞其他工作区
+	// (per-entry lifecycleMu 已释放)。
+	startTimeout := s.cfg.StartSessionTimeout
+	if startTimeout <= 0 {
+		startTimeout = DefaultStartSessionTimeout
+	}
+	startCtx, cancelStart := context.WithTimeout(ctx, startTimeout)
+	defer cancelStart()
+	if err := entry.startSession(startCtx, startReq); err != nil {
 		s.removeWorkerEntry(task.SessionKey, entry)
 		s.cleanupWorkerEntryBestEffort(context.Background(), entry)
 		return err

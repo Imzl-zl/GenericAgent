@@ -46,6 +46,11 @@ type SessionFileRef struct {
 // SessionFiles manages per-session file sandboxes for inbound attachments and generated outputs.
 type SessionFiles interface {
 	ImportInbound(sessionKey string, sourcePaths []string) ([]SessionFileRef, error)
+	// RemoveInbound 回滚一次 ImportInbound(round11 审查 I1): 附件在任务
+	// 授权/幂等事务之前写入团队 workspace, 提交失败(成员被移除/重复消息/
+	// DB 错误)时必须删除本次导入的文件并从 manifest 移除, 防止未授权
+	// 附件残留。幂等: 文件/条目不存在视为成功。
+	RemoveInbound(sessionKey string, refs []SessionFileRef) error
 	Recent(sessionKey string, limit int) ([]SessionFileRef, error)
 	ResolveMarker(sessionKey, marker string) (absPath string, relPath string, err error)
 	RecordOutbound(sessionKey, marker string) (SessionFileRef, error)
@@ -209,6 +214,47 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 		return nil, err
 	}
 	return imported, nil
+}
+
+// RemoveInbound 回滚一次导入(round11 审查 I1): 删除 refs 指向的附件文件
+// 并从 manifest 移除对应条目。只删除本次导入产生的文件——按 RelativePath
+// 精确匹配, 不触碰其他消息导入的附件。幂等: 文件或条目不存在视为成功。
+func (m *sessionFilesManager) RemoveInbound(sessionKey string, refs []SessionFileRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	lock := m.lockFor(sessionKey)
+	lock.Lock()
+	defer lock.Unlock()
+
+	root := m.SandboxRoot(sessionKey)
+	manifest, err := m.loadManifest(root)
+	if err != nil {
+		return fmt.Errorf("rollback inbound: load manifest: %w", err)
+	}
+	removed := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.RelativePath == "" {
+			continue
+		}
+		rel := filepath.FromSlash(ref.RelativePath)
+		if err := safefs.RemoveBeneath(root, rel); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("rollback inbound: remove %q: %w", ref.RelativePath, err)
+		}
+		removed[ref.RelativePath] = struct{}{}
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	kept := manifest.Files[:0]
+	for _, e := range manifest.Files {
+		if _, drop := removed[e.RelativePath]; drop {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	manifest.Files = kept
+	return m.saveManifest(root, manifest)
 }
 
 func (m *sessionFilesManager) Recent(sessionKey string, limit int) ([]SessionFileRef, error) {

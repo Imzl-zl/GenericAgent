@@ -155,6 +155,53 @@ def test_compose_starts_six_services_and_only_sandbox_manager_receives_docker_so
         assert "llm-egress" not in services[other].get("networks", []), other
 
 
+def test_unix_socket_api_path_is_fully_wired() -> None:
+    """round11 审查(C1)门禁: Platform 主 API 的 unix socket 通道必须全链路
+    接通——platform 挂载共享卷、web 加入 socket 属组、nginx 代理 socket、镜像
+    CMD 启用 unix listen。任一环节缺失, 部署即阻断(platform 无法建 socket /
+    nginx 13 Permission denied)。"""
+    services = _compose()["services"]
+    platform = services["platform"]
+    web = services["web"]
+
+    # 1. Platform 可写挂载 platform_sock(创建 socket 文件)。
+    platform_mounts = [str(v) for v in platform.get("volumes", [])]
+    assert any("platform_sock:/var/run/ga" == m and not m.endswith(":ro") for m in platform_mounts), (
+        "platform must mount platform_sock at /var/run/ga (rw) to create the API socket"
+    )
+    # 2. web 以 group 10001 附加组读取 0660 socket(nginx 容器 user 101:101)。
+    assert "10001" in [str(g) for g in web.get("group_add", [])], (
+        "web must join gid 10001 to read the 0660 platform socket"
+    )
+    web_mounts = [str(v) for v in web.get("volumes", [])]
+    assert any("platform_sock:/var/run/ga:ro" == m for m in web_mounts), (
+        "web must mount platform_sock at /var/run/ga (ro)"
+    )
+    # 3. nginx 经 unix socket 代理 /v1/ 与 /healthz。
+    nginx = (COMPOSE_DIR / "nginx.conf").read_text(encoding="utf-8")
+    assert "proxy_pass http://unix:/var/run/ga/api.sock" in nginx
+    # 4. 镜像 CMD 启用 unix listen(缺省关闭, 缺参数时 socket 通道静默不存在)。
+    dockerfile = (COMPOSE_DIR / "platform.Dockerfile").read_text(encoding="utf-8")
+    assert "--unix-listen=/var/run/ga/api.sock" in dockerfile
+
+
+def test_shared_volume_and_network_names_are_project_scoped_and_consistent() -> None:
+    """round11 审查(M2)门禁: 共享卷/内部网络带项目名前缀, 且 Manager 创建
+    Runner 时使用的卷名(GA_WORKSPACES_VOLUME)与卷定义/环境模板三处一致——
+    不一致时 Manager 会把 Runner 挂到错误的卷上(多部署共享工作区 /
+    platform 与 runner 各见各的目录)。"""
+    compose = _compose()
+    expected_volume = "${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces"
+    assert compose["volumes"]["runner_workspaces"] == {"name": expected_volume}
+    expected_network = "${COMPOSE_PROJECT_NAME:-ga}_runner-control"
+    assert compose["networks"]["runner-control"]["name"] == expected_network
+    assert compose["networks"]["runner-control"].get("internal") is True
+    manager_env = compose["services"]["sandbox-manager"]["environment"]
+    assert manager_env["GA_WORKSPACES_VOLUME"] == "${GA_WORKSPACES_VOLUME:-${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces}"
+    values = _env_values()
+    assert values["GA_WORKSPACES_VOLUME"] == "genericagent_runner_workspaces"
+
+
 def test_application_configuration_uses_named_volumes() -> None:
     volumes = _compose()["volumes"]
     assert set(volumes) == {
@@ -165,10 +212,11 @@ def test_application_configuration_uses_named_volumes() -> None:
         "platform_sock",
     }
     # runner_workspaces 显式 name: sandbox-manager 需以 daemon 可解析的卷名
-    # 做 volume-subpath 挂载(方案 §7); 其余卷保持默认声明。
+    # 做 volume-subpath 挂载(方案 §7); round11 审查(M2): 卷名带 Compose
+    # 项目名前缀, 避免多套部署共享工作区卷。其余卷保持默认声明。
     for name, value in volumes.items():
         if name == "runner_workspaces":
-            assert value == {"name": "runner_workspaces"}
+            assert value == {"name": "${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces"}
         else:
             assert not value
 

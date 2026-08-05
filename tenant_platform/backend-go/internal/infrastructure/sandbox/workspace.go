@@ -22,6 +22,11 @@ type WorkspaceDirs struct {
 // 使 Runner 新建文件继承共享组, Platform 才能读回交付文件(方案 §7 共享卷)。
 const (
 	workspaceDirsMode  = 0o2770
+	// memoryInitMarkerName 标记 memory 已完成首次模板初始化(round11 审查
+	// I7): 空目录不再是"首次初始化"的判据——用户主动清空 memory 后不得
+	// 重新灌入模板。标记位于工作区根, 不在 Runner 挂载(memory/temp/state)
+	// 内, Runner/用户无法删除。
+	memoryInitMarkerName = ".ga-memory-init"
 	workspaceFilesMode = 0o640
 )
 
@@ -132,15 +137,22 @@ func prepareWorkspaceDirs(root, workspaceHash, memoryTemplate string, uid, gid, 
 		return WorkspaceDirs{}, err
 	}
 
-	// 首次创建(memory 为空)时从镜像内只读模板初始化基线。
+	// 首次初始化判定(round11 审查 I7): 使用 Runner 不可见的初始化标记,
+	// 而非 memory 目录是否为空——用户主动清空 memory 后不得重新灌入模板。
 	if memoryTemplate != "" {
+		markerPath := filepath.Join(ws, memoryInitMarkerName)
+		_, markerErr := os.Stat(markerPath)
+		markerExists := markerErr == nil
+		if markerErr != nil && !os.IsNotExist(markerErr) {
+			return WorkspaceDirs{}, fmt.Errorf("stat memory init marker: %w", markerErr)
+		}
 		entries, err := os.ReadDir(dirs.Memory)
 		if err != nil {
 			return WorkspaceDirs{}, fmt.Errorf("read memory dir: %w", err)
 		}
-		if len(entries) == 0 {
+		if len(entries) == 0 && !markerExists {
 			// 原子初始化(审查): 先复制到同文件系统临时目录再整体 rename。
-			// 复制中途失败/崩溃不会留下“目录非空但内容残缺”的半成品基线,
+			// 复制中途失败/崩溃不会留下"目录非空但内容残缺"的半成品基线,
 			// 否则下次因目录非空直接跳过初始化, 用户得到不完整模板。
 			tmpDir, err := os.MkdirTemp(ws, ".memory-init-*")
 			if err != nil {
@@ -169,7 +181,18 @@ func prepareWorkspaceDirs(root, workspaceHash, memoryTemplate string, uid, gid, 
 				_ = os.RemoveAll(tmpDir)
 				return WorkspaceDirs{}, fmt.Errorf("activate memory template: %w", err)
 			}
+			// 初始化成功后写标记(模板已灌入); 写失败返回错误, 下次以
+			// "memory 非空 + 无标记"路径补标记, 不会重灌模板。
+			if err := writeMemoryInitMarker(ws); err != nil {
+				return WorkspaceDirs{}, err
+			}
+		} else if len(entries) > 0 && !markerExists {
+			// 老版本已初始化(模板已灌但无标记): 只补标记, 不重灌。
+			if err := writeMemoryInitMarker(ws); err != nil {
+				return WorkspaceDirs{}, err
+			}
 		}
+		// marker 存在: 已初始化; 用户清空 memory 也不再重灌。
 	}
 	return dirs, nil
 }
@@ -289,6 +312,15 @@ func writeConfigFiles(root, workspaceHash string, generation uint64, files map[s
 			return fmt.Errorf("rename %s: %w", name, err)
 		}
 		cleanup = false
+	}
+	return nil
+}
+
+// writeMemoryInitMarker 写入 memory 初始化标记(round11 审查 I7)。
+func writeMemoryInitMarker(ws string) error {
+	marker := filepath.Join(ws, memoryInitMarkerName)
+	if err := os.WriteFile(marker, []byte("initialized\n"), 0o600); err != nil {
+		return fmt.Errorf("write memory init marker: %w", err)
 	}
 	return nil
 }

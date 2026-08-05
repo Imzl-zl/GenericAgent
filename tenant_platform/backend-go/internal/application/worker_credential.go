@@ -25,6 +25,11 @@ type workerCredentialSet struct {
 	Checksum         string
 	ExpiresAt        time.Time
 	JTIs             []string
+	// ControlJTI 是独立签发的控制 capability JTI(round11 审查 I4): 控制
+	// RPC(CancelTask/Shutdown/BeginCheckpoint/ReloadCredentials)必须使用它,
+	// 不得复用 LLM/Sophub capability——LLM token 随调用发给 llm-proxy,
+	// 暴露面更大; 独立 control token 只在容器内传递。
+	ControlJTI      string
 	Snapshot         routingSnapshot
 	MCPSnapshot      RuntimeMCPSnapshot
 }
@@ -136,6 +141,25 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 			}
 		}
 		sophub = &RuntimeSophubProxy{BaseURL: s.cfg.SophubProxyBaseURL, CapabilityToken: sophubToken}
+	}
+	// round11 审查(I4): 独立签发的 control capability——控制 RPC
+	// (CancelTask/Shutdown/BeginCheckpoint/ReloadCredentials)使用它而不是
+	// 任意 LLM/Sophub JTI。JTI 纳入同一持久化/撤销集合。
+	// Worker 侧只持有 JTI 值(非完整 JWT), 无法解析 claims——用 "ctrl:" 前缀
+	// 标记 control JTI, 成员检查(集合)仍保证真实性; llm-proxy 只接受
+	// LLM audience 的 token, control token 不会到达 proxy, 前缀不影响校验。
+	_, controlClaims, err := s.cfg.TokenIssuer.IssueControlToken(sessionKey, taskID, runnerGeneration, llmproxy.DefaultTokenTTL)
+	if err != nil {
+		s.revokeCredentialSetBestEffort(ctx, set)
+		return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("issue control capability: %w", err)
+	}
+	set.ControlJTI = controlJTIPrefix + controlClaims.ID
+	set.JTIs = append(set.JTIs, set.ControlJTI)
+	if controlClaims.ExpiresAt != nil {
+		expiresAt := controlClaims.ExpiresAt.Time.UTC()
+		if set.ExpiresAt.IsZero() || expiresAt.Before(set.ExpiresAt) {
+			set.ExpiresAt = expiresAt
+		}
 	}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
 		Generation: credGeneration, ProxyBaseURL: s.cfg.LLMProxyAddr,

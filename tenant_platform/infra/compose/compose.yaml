@@ -154,6 +154,9 @@ services:
       - platform_runtime:/var/lib/ga/runtime
       - session_files:/var/lib/ga/runtime/session_files
       - platform_config:/etc/ga/config
+      # round10 审查(B1c)接线修复: Platform 必须把 unix socket 所在目录挂到
+      # 与 web 共享的 platform_sock 卷, 否则只读根下 /var/run/ga 无法创建 socket。
+      - platform_sock:/var/run/ga
       - bot_media:/var/lib/ga/bot-media:ro
       # 共享工作区卷: 附件/输出经 temp/ 与 Runner 互通(方案 §6)。
       - runner_workspaces:/var/lib/ga/workspaces
@@ -271,7 +274,7 @@ services:
       GA_RUNNER_CPU_QUOTA: ${GA_RUNNER_CPU_QUOTA:-100000}
       GA_RUNNER_PIDS_LIMIT: ${GA_RUNNER_PIDS_LIMIT:-128}
       GA_WORKSPACES_ROOT: ${GA_WORKSPACES_ROOT:-/var/lib/ga/workspaces}
-      GA_WORKSPACES_VOLUME: ${GA_WORKSPACES_VOLUME:-runner_workspaces}
+      GA_WORKSPACES_VOLUME: ${GA_WORKSPACES_VOLUME:-${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces}
       GA_MANAGER_SECRET: ${GA_MANAGER_SECRET}
       GA_MANAGER_ID: ${GA_MANAGER_ID:-sandbox-manager-1}
       GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
@@ -303,6 +306,10 @@ services:
       dockerfile: tenant_platform/infra/compose/web.Dockerfile
     restart: unless-stopped
     user: "101:101"
+    # round10 审查(B1c)接线修复: socket 文件权限 0660 属组 10001, nginx 进程
+    # 必须加入该组才能经 /var/run/ga/api.sock 代理(缺失时 nginx 13: Permission denied)。
+    group_add:
+      - "10001"
     # round10 审查(B1c): web 独立网络命名空间; nginx 经共享卷上的 unix
     # socket 代理 Platform 主 API(/v1/, /healthz)——API 面不绑定 TCP 端口,
     # runner-control 网络中的 Runner 无法访问完整用户/管理 API。Platform 容器
@@ -363,8 +370,10 @@ volumes:
   # round9 审查: 交付 spool 卷(Platform rw / Poller ro), 文件快照跨容器可见。
   delivery_spool:
   # 显式卷名: sandbox-manager 用 volume-subpath 挂载子目录到 Runner(daemon 可解析)。
+  # round11 审查(M2): 共享卷/内部网络加项目名前缀, 避免多套 Compose 部署
+  # 在同一宿主机互相挂载对方的工作区卷与 runner-control 网络(隔离失败)。
   runner_workspaces:
-    name: runner_workspaces
+    name: ${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces
 
 networks:
   application:
@@ -372,7 +381,7 @@ networks:
     internal: true
   runner-control:
     internal: true
-    name: runner-control
+    name: ${COMPOSE_PROJECT_NAME:-ga}_runner-control
   # llm-proxy 专有的出站网络(审查 C2): 非 internal, 供代理访问上游
   # LLM Provider; Runner 不接入, 保持 internal-only。
   llm-egress:

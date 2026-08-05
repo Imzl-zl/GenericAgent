@@ -201,15 +201,10 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	// 早期终态路径同样需要撤销已签发的 token)。任务执行期间 Worker 拒绝
 	// reload, entry.credentials 在 ExecuteTask 期间不会变化。
 	taskCredentialSet = entry.credentials
-	s.workerCallMu.Lock()
-	workerCallLocked := true
-	releaseWorkerCall := func() {
-		if workerCallLocked {
-			workerCallLocked = false
-			s.workerCallMu.Unlock()
-		}
-	}
-	defer releaseWorkerCall()
+	// round11 审查(C3): 移除全局 workerCallMu。StartSession 与 CancelTask 的
+	// 互斥由 per-entry lifecycleMu 提供(同 session), 跨 session 完全并行;
+	// 一个卡住的 StartSession 不再阻塞其他工作区的派发与取消。MarkDispatch
+	// Started/MarkRunning 是 DB 原子操作, 无需进程内全局串行。
 	// Record dispatch intent BEFORE StartSession so cancel-during-StartSession
 	// sees WorkerDispatchStartedAt != nil and records a durable cancel request
 	// instead of finalizing immediately. fresh_session 在此事务内写回任务行
@@ -275,13 +270,16 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
-	req := &workerv1.ExecuteTaskRequest{Task: workerTaskEnvelope(taskRow, entry.runnerGeneration, firstJTI(entry.credentials))}
+	req := &workerv1.ExecuteTaskRequest{Task: workerTaskEnvelope(taskRow, entry.runnerGeneration, controlJTIFor(entry.credentials))}
 
 	taskDeadline := time.Now().Add(s.cfg.MaxTaskWallClock)
 	executeCtx, cancelExecute := context.WithTimeout(ctx, s.cfg.MaxTaskWallClock)
 	defer cancelExecute()
+	// round11 审查(C3): 标记执行中, CancelWorker 据此决定是否发取消 RPC;
+	// dispatch 结束(任意路径)后复位。
+	entry.executing.Store(true)
+	defer entry.executing.Store(false)
 	events, errs := client.ExecuteTask(executeCtx, req)
-	releaseWorkerCall()
 	recordChunkWindow := func(byteCount int, digest string) error {
 		if byteCount == 0 {
 			return nil
@@ -475,4 +473,19 @@ func firstJTI(set workerCredentialSet) string {
 		return ""
 	}
 	return set.JTIs[0]
+}
+
+// controlJTIPrefix 标记 control capability 的 JTI 值(round11 审查 I4):
+// Worker 只持有 JTI 值(无完整 JWT, 无法解析 claims), 用前缀区分用途;
+// 真实性仍由凭据集合成员检查保证。
+const controlJTIPrefix = "ctrl:"
+
+// controlJTIFor 返回控制 RPC 使用的 capability JTI(round11 审查 I4):
+// 优先独立签发的 control token; loopback/测试无 control token 时回退
+// firstJTI(空凭据集下为空, Worker 端空 JTI 仅限无凭据清理路径)。
+func controlJTIFor(set workerCredentialSet) string {
+	if set.ControlJTI != "" {
+		return set.ControlJTI
+	}
+	return firstJTI(set)
 }

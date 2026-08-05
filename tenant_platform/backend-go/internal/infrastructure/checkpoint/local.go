@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -278,6 +279,51 @@ func (c *LocalCoordinator) SweepExpiredCheckpoints(ctx context.Context) (int, er
 		}
 	}
 	return len(expired), nil
+}
+
+// ReconcileOrphanCommittedFiles 与 WorkspaceCoordinator 同语义(round11 审查
+// C2): 遍历 loopback runtimeRoot/committed, 删除 DB 无对应 committed 行且
+// 文件超过孤儿年龄的 bundle/result/index 文件。
+func (c *LocalCoordinator) ReconcileOrphanCommittedFiles(ctx context.Context) (int, error) {
+	now := time.Now()
+	entries, err := os.ReadDir(filepath.Join(c.runtimeRoot, "committed"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	removed := 0
+	for _, f := range entries {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".bundle.json") {
+			continue
+		}
+		snapshotID := strings.TrimSuffix(f.Name(), ".bundle.json")
+		if !looksLikeSnapshotID(snapshotID) {
+			continue
+		}
+		info, err := f.Info()
+		if err != nil {
+			return removed, err
+		}
+		if now.Sub(info.ModTime()) < orphanReconcileAge {
+			continue
+		}
+		state, err := c.store.SnapshotState(ctx, snapshotID)
+		if err != nil {
+			if !errors.Is(err, postgres.ErrSnapshotNotFound) {
+				return removed, err
+			}
+		} else if state == "committed" {
+			continue
+		}
+		_ = os.Remove(filepath.Join(c.runtimeRoot, "committed", f.Name()))
+		_ = os.Remove(filepath.Join(c.runtimeRoot, "results", snapshotID+".result"))
+		_ = os.Remove(filepath.Join(c.runtimeRoot, "index", strings.ReplaceAll(opaqueFilePrefix+snapshotID, ":", "_")+".path"))
+		_ = os.Remove(filepath.Join(c.runtimeRoot, "index", strings.ReplaceAll(opaqueResultPrefix+snapshotID, ":", "_")+".path"))
+		removed++
+	}
+	return removed, nil
 }
 
 // CleanupCommittedFiles 删除 Commit 已物化但 DB 提交失败的 committed/result

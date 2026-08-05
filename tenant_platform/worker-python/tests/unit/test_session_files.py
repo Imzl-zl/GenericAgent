@@ -7,6 +7,7 @@ from genericagent.worker.v1 import worker_pb2
 from ga_worker.legacy_instrument import (
     apply_tool_policy,
     install_dispatch_guard,
+    install_export_docx_tool,
     install_global_mcp_tools,
     install_session_file_sandbox,
     restore_tool_schema,
@@ -75,12 +76,24 @@ def test_emit_final_terminal_appends_generated_output_markers():
 
 
 
-def test_session_sandbox_does_not_inject_local_export_docx(tmp_path: Path):
+def test_export_docx_tool_injected_and_generates_real_docx(tmp_path: Path, monkeypatch):
+    """round11 审查 I5: export_docx 必须真实注入(policy 允许 + 提示引导),
+    且能生成可解析的 .docx 文件, 路径逃逸被拒绝。"""
+    import sys
+    import zipfile
+
+    class StepOutcome:
+        def __init__(self, data, next_prompt=None, should_exit=False):
+            self.data = data
+            self.next_prompt = next_prompt
+            self.should_exit = should_exit
+
+    monkeypatch.setitem(sys.modules, "agent_loop", types.SimpleNamespace(StepOutcome=StepOutcome))
+
     class FakeHandler:
         def __init__(self, *args, **kwargs):
             self.cwd = "./temp"
 
-        # 原生语义(ga.py): 相对路径基于 cwd 解析, 不做沙箱重定向。
         def _get_abs_path(self, path):
             import os as _os
             return _os.path.abspath(_os.path.join(self.cwd, path))
@@ -88,7 +101,6 @@ def test_session_sandbox_does_not_inject_local_export_docx(tmp_path: Path):
     ga_mod = types.SimpleNamespace(GenericAgentHandler=FakeHandler)
     agentmain_mod = types.SimpleNamespace(TOOLS_SCHEMA=[
         {"type": "function", "function": {"name": "file_read"}},
-        {"type": "function", "function": {"name": "update_working_checkpoint"}},
     ])
     session = types.SimpleNamespace(
         overlay_dir=tmp_path / "runtime" / "s-1" / "legacy-overlay",
@@ -98,21 +110,87 @@ def test_session_sandbox_does_not_inject_local_export_docx(tmp_path: Path):
     )
     session.overlay_dir.mkdir(parents=True, exist_ok=True)
 
-    unwrap = install_session_file_sandbox(session, {"ga": ga_mod, "agentmain": agentmain_mod})
+    unwrap = install_export_docx_tool(session, {"ga": ga_mod, "agentmain": agentmain_mod})
     previous = apply_tool_policy(
         ToolPolicy(version="foundation.session-files.v1", allowed_tools=frozenset({"file_read", "export_docx"})),
         {"ga": ga_mod, "agentmain": agentmain_mod},
     )
     try:
         names = [t["function"]["name"] for t in agentmain_mod.TOOLS_SCHEMA]
-        assert names == ["file_read"]
+        assert "export_docx" in names
 
         handler = ga_mod.GenericAgentHandler(None)
-        # 审查: 不再重定向 cwd——GA 原生相对路径语义(./temp、../memory)保持。
-        assert handler.cwd == "./temp"
-        assert not hasattr(ga_mod.GenericAgentHandler, "do_export_docx")
+        out = list(handler.do_export_docx(
+            {"path": "outputs/resume.docx", "title": "简历", "content": "第一段\n第二段"},
+            "",
+        ))
+        assert len(out) >= 1
+        target = tmp_path / "runtime" / "session_files" / "personal:1" / "outputs" / "resume.docx"
+        # session_sandbox_root 使用 session_key digest 布局(无 GA_WORKSPACE_TEMP)。
+        from ga_worker.session_files import session_key_digest
+        target = tmp_path / "runtime" / "session_files" / session_key_digest("personal:1") / "outputs" / "resume.docx"
+        assert target.exists(), f"docx not generated at {target}"
+        with zipfile.ZipFile(target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        assert "简历" in xml
+        assert "第一段" in xml
+        assert "outputs/resume.docx" in session.generated_output_files
+
+        # 路径逃逸拒绝: 不生成文件且返回错误 outcome。
+        out_escape = list(handler.do_export_docx(
+            {"path": "../../escape.docx", "content": "x"},
+            "",
+        ))
+        assert not (tmp_path / "escape.docx").exists()
+        assert len(out_escape) >= 1
     finally:
         restore_tool_schema(previous, {"ga": ga_mod, "agentmain": agentmain_mod})
+        unwrap()
+
+    # unwrap 后工具不再存在。
+    assert not hasattr(ga_mod.GenericAgentHandler, "do_export_docx")
+
+
+def test_export_docx_tool_reads_source_path(tmp_path: Path, monkeypatch):
+    import sys
+
+    class StepOutcome:
+        def __init__(self, data, next_prompt=None, should_exit=False):
+            self.data = data
+            self.next_prompt = next_prompt
+            self.should_exit = should_exit
+
+    monkeypatch.setitem(sys.modules, "agent_loop", types.SimpleNamespace(StepOutcome=StepOutcome))
+
+    class FakeHandler:
+        def __init__(self, *args, **kwargs):
+            self.cwd = "./temp"
+
+    ga_mod = types.SimpleNamespace(GenericAgentHandler=FakeHandler)
+    agentmain_mod = types.SimpleNamespace(TOOLS_SCHEMA=[])
+    session = types.SimpleNamespace(
+        overlay_dir=tmp_path / "runtime" / "s-1" / "legacy-overlay",
+        session_key="personal:1",
+        generated_output_files=[],
+    )
+    session.overlay_dir.mkdir(parents=True, exist_ok=True)
+
+    from ga_worker.session_files import session_key_digest, session_sandbox_root
+    root = session_sandbox_root(tmp_path / "runtime", "personal:1")
+    src = root / "temp_notes.txt"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("源文件内容", encoding="utf-8")
+
+    unwrap = install_export_docx_tool(session, {"ga": ga_mod, "agentmain": agentmain_mod})
+    try:
+        handler = ga_mod.GenericAgentHandler(None)
+        list(handler.do_export_docx(
+            {"path": "outputs/from_source.docx", "source_path": "temp_notes.txt"},
+            "",
+        ))
+        target = root / "outputs" / "from_source.docx"
+        assert target.exists()
+    finally:
         unwrap()
 
 

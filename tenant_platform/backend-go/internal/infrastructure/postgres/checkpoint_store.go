@@ -159,6 +159,23 @@ SELECT max_bundle_bytes FROM workspace_snapshots WHERE id = $1::uuid
 	return maxBytes, err
 }
 
+// ErrSnapshotNotFound 表示 workspace_snapshots 中不存在对应行(供对账流程
+// 区分"DB 无行 = 孤儿文件"与"DB 错误")。
+var ErrSnapshotNotFound = errors.New("workspace snapshot not found")
+
+// SnapshotState 返回 snapshot 的当前 state; 行不存在时返回 ErrSnapshotNotFound。
+func (s *Store) SnapshotState(ctx context.Context, snapshotID string) (string, error) {
+	var state string
+	err := s.pool.QueryRow(ctx, `SELECT state FROM workspace_snapshots WHERE id = $1::uuid`, snapshotID).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrSnapshotNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("load snapshot state %s: %w", snapshotID, err)
+	}
+	return state, nil
+}
+
 // QuarantinedWriting 是 SweepExpiredCheckpoints 返回的过期 writing snapshot
 // (staging_ref 保留供调用方删除宿主 staging 文件)。
 type QuarantinedWriting struct {

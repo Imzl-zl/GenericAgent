@@ -22,32 +22,6 @@ type updateAgentRuntimeSettingsBody struct {
 	MaxTurns int `json:"max_turns"`
 }
 
-const (
-	documentPoolApplyApplied      = "applied"
-	documentPoolApplyPendingRetry = "pending_retry"
-)
-
-type documentPoolSettingsReply struct {
-	domain.DocumentPoolSettings
-	DeploymentMaxActive int    `json:"deployment_max_active"`
-	ApplyStatus         string `json:"apply_status,omitempty"`
-}
-
-type updateDocumentPoolSettingsBody struct {
-	Enabled               bool   `json:"enabled"`
-	MaxActive             int    `json:"max_active"`
-	MinReady              int    `json:"min_ready"`
-	JobIdleTTLSeconds     int    `json:"job_idle_ttl_seconds"`
-	ReadyIdleTTLSeconds   int    `json:"ready_idle_ttl_seconds"`
-	GlobalQueueLimit      int    `json:"global_queue_limit"`
-	PerTenantQueueLimit   int    `json:"per_tenant_queue_limit"`
-	PerTenantActiveLimit  int    `json:"per_tenant_active_limit"`
-	JobTimeoutSeconds     int    `json:"job_timeout_seconds"`
-	CommandTimeoutSeconds int    `json:"command_timeout_seconds"`
-	ExpectedVersion       int64  `json:"expected_version"`
-	Reason                string `json:"reason"`
-}
-
 func (s *Server) handleGetIMAggregationSettings(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	windowMS, err := s.runtimeSettings.GetIMInboundCoalesceWindowMS(r.Context())

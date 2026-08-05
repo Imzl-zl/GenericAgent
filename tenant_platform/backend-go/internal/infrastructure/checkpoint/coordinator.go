@@ -72,6 +72,11 @@ type Coordinator interface {
 	// 事务不是原子的, 事务失败后这些文件不被任何恢复指针引用, 必须清理,
 	// 否则重复故障会永久占用宿主磁盘。
 	CleanupCommittedFiles(ctx context.Context, committed CommittedCheckpoint) error
+	// ReconcileOrphanCommittedFiles 对账回收确定孤儿的 committed/result 文件
+	// (round11 审查 C2): 提交结果不确定(ErrCommitOutcomeUnknown)时调用方
+	// 必须保留文件防止误删已生效恢复点; 本方法周期性删除"DB 无对应
+	// committed snapshot 且文件已超过孤儿年龄阈值"的文件, 兜底回收磁盘。
+	ReconcileOrphanCommittedFiles(ctx context.Context) (int, error)
 	// RunnerStagingRef 映射宿主 staging 路径为容器内路径(方案 §7:
 	// Worker 只接受 runtime root 内的 staging_ref)。Local 实现原样返回。
 	RunnerStagingRef(hostRef string) (string, error)

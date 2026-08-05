@@ -130,6 +130,135 @@ _EXPORT_DOCX_TOOL = {
     },
 }
 
+def install_export_docx_tool(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
+    """Expose export_docx(round11 审查 I5): GA 原生没有 docx 生成工具, 而
+    foundation.session-files.v1 policy 允许 export_docx 且提示语引导 Agent
+    调用它——必须提供真实实现(python-docx, 镜像已装), 否则 Agent 会调用
+    一个不存在的工具。写入会话 outputs/ 沙箱, 路径逃逸拒绝。"""
+    if legacy_mods is None or session is None:
+        return lambda: None
+    ga_mod = legacy_mods.get("ga")
+    agentmain = legacy_mods.get("agentmain")
+    if ga_mod is None or agentmain is None:
+        return lambda: None
+    handler_cls = getattr(ga_mod, "GenericAgentHandler", None)
+    if handler_cls is None:
+        return lambda: None
+    if hasattr(handler_cls, "do_export_docx"):
+        raise ValueError("export_docx conflicts with existing handler method")
+
+    from ga_worker.session_files import (
+        session_sandbox_root,
+        normalize_output_name,
+        resolve_under_root,
+    )
+
+    runtime_root = Path(session.overlay_dir).parents[1]
+    sandbox_root = session_sandbox_root(runtime_root, session.session_key)
+    try:
+        ensure_session_sandbox(runtime_root, session.session_key)
+    except Exception:
+        pass
+
+    previous_custom_schema = getattr(agentmain, "_tenant_custom_tools_schema", None)
+    custom = list(previous_custom_schema or [])
+    for tool in custom:
+        if isinstance(tool, dict) and tool.get("function", {}).get("name") == "export_docx":
+            raise ValueError("duplicate custom tool name: export_docx")
+
+    def do_export_docx(self: Any, args: dict[str, Any], response: Any) -> Any:
+        import re
+
+        try:
+            from docx import Document
+        except ImportError as exc:
+            yield "[Status] ❌ export_docx 不可用: 缺少 python-docx\n"
+            step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
+            if step_outcome_cls is None:
+                raise
+            return step_outcome_cls(
+                {"status": "error", "message": "python-docx not installed"},
+                next_prompt="export_docx unavailable; report the explicit error instead of assuming success.\n",
+                should_exit=False,
+            )
+        try:
+            raw_path = str(args.get("path") or "")
+            if not raw_path.strip():
+                raise ValueError("path is required (e.g. outputs/<name>.docx)")
+            normalized = normalize_output_name(raw_path)
+            target = resolve_under_root(sandbox_root, normalized)
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            content = str(args.get("content") or "")
+            source_path = str(args.get("source_path") or "")
+            if not content and source_path:
+                src = resolve_under_root(sandbox_root, source_path)
+                content = src.read_text(encoding="utf-8", errors="replace")
+            if not content:
+                body = ""
+                try:
+                    body = str(response)
+                except Exception:
+                    body = ""
+                m = re.search(r"<file_content>(.*?)</file_content>", body, re.S)
+                if m:
+                    content = m.group(1).strip()
+            if not content.strip():
+                raise ValueError(
+                    "no content to export: pass content, source_path, or <file_content>"
+                )
+
+            doc = Document()
+            title = str(args.get("title") or "").strip()
+            if title:
+                doc.add_heading(title, level=0)
+            for line in content.splitlines():
+                if not line.strip():
+                    continue
+                doc.add_paragraph(line.rstrip())
+            doc.save(str(target))
+
+            generated = getattr(session, "generated_output_files", None)
+            if generated is not None:
+                rel = str(target.relative_to(sandbox_root)).replace("\\", "/")
+                if rel not in generated:
+                    generated.append(rel)
+            yield f"[Status] ✅ 已生成 Word 文档: {normalized}\n"
+        except Exception as exc:
+            yield f"[Status] ❌ export_docx 失败: {exc}\n"
+            step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
+            if step_outcome_cls is None:
+                raise
+            return step_outcome_cls(
+                {"status": "error", "message": str(exc)},
+                next_prompt="export_docx failed; report the explicit error instead of assuming success.\n",
+                should_exit=False,
+            )
+        step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
+        if step_outcome_cls is None:
+            return
+        return step_outcome_cls(None, next_prompt="\n")
+
+    original_method = getattr(handler_cls, "do_export_docx", None)
+    setattr(handler_cls, "do_export_docx", do_export_docx)
+    custom.append(_EXPORT_DOCX_TOOL)
+    agentmain._tenant_custom_tools_schema = custom
+
+    def unwrap() -> None:
+        if getattr(handler_cls, "do_export_docx", None) is do_export_docx:
+            if original_method is None:
+                delattr(handler_cls, "do_export_docx")
+            else:
+                setattr(handler_cls, "do_export_docx", original_method)
+        if previous_custom_schema is None:
+            if hasattr(agentmain, "_tenant_custom_tools_schema"):
+                delattr(agentmain, "_tenant_custom_tools_schema")
+        else:
+            agentmain._tenant_custom_tools_schema = previous_custom_schema
+
+    return unwrap
+
+
 _SOPHUB_SEARCH_TOOL = {
     "type": "function",
     "function": {

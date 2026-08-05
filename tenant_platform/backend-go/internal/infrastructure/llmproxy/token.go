@@ -15,6 +15,15 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
+// ControlAudience 是 Runner 控制 RPC(CancelTask/Shutdown/BeginCheckpoint/
+// ReloadCredentials)专用 capability 的 audience(round11 审查 I4): 控制 RPC
+// 不得复用 LLM/Sophub 的 capability JTI——LLM token 随每次调用发给
+// llm-proxy, 暴露面更大; 独立签发的 control token 只在容器内传递。
+const ControlAudience = "ga-worker-control"
+
+// ControlOperation 是 control capability 的 operation claim。
+const ControlOperation = "worker.control"
+
 const (
 	CapabilityIssuer   = "ga-platform"
 	CapabilityAudience = "ga-llm-proxy"
@@ -358,6 +367,45 @@ func effectiveAudience(audience string) string {
 		return CapabilityAudience
 	}
 	return audience
+}
+
+// IssueControlToken 签发 Runner 控制 RPC 专用 capability(round11 审查 I4):
+// audience=ga-worker-control, operation=worker.control, 与 LLM/Sophub
+// capability 完全隔离。taskID/generation 绑定与撤销语义同其他 capability。
+func (i *Issuer) IssueControlToken(sessionKey, taskID string, runnerGeneration uint64, ttl time.Duration) (string, CapabilityClaims, error) {
+	if strings.TrimSpace(sessionKey) == "" {
+		return "", CapabilityClaims{}, fmt.Errorf("session key is required")
+	}
+	if ttl <= 0 {
+		ttl = i.ttl
+	}
+	jti, err := newJTI()
+	if err != nil {
+		return "", CapabilityClaims{}, err
+	}
+	now := i.clock().UTC()
+	claims := CapabilityClaims{
+		TaskID:           taskID,
+		RunnerGeneration: runnerGeneration,
+		Operation:        ControlOperation,
+		Budget:           "{}",
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    CapabilityIssuer,
+			Subject:   sessionKey,
+			Audience:  jwt.ClaimStrings{ControlAudience},
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			NotBefore: jwt.NewNumericDate(now),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        jti,
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["typ"] = CapabilityType
+	signed, err := token.SignedString(i.signingKey)
+	if err != nil {
+		return "", CapabilityClaims{}, fmt.Errorf("sign control capability token: %w", err)
+	}
+	return signed, claims, nil
 }
 
 // IssueSophubToken 签发 Runner → Platform Sophub proxy 的短期 capability

@@ -3,6 +3,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -71,5 +72,26 @@ func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	if err := fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return classifyCommitError(tx.Commit(ctx))
+}
+
+// ErrCommitOutcomeUnknown 标记事务提交结果不确定(网络中断/超时/连接关闭等
+// 非 rollback 提交错误)。与 pgx.ErrTxCommitRollback(确定回滚)相对:
+// 只有确定回滚时才允许调用方清理已物化但未被 DB 引用的外部文件;
+// 结果不确定时必须保留文件并交给对账流程, 防止误删已生效的恢复点
+// (round11 审查 C2)。
+var ErrCommitOutcomeUnknown = errors.New("transaction commit outcome unknown")
+
+// classifyCommitError 把 tx.Commit 的错误分为"确定回滚"与"结果不确定"两类。
+// 依据 pgx v5 Commit 文档: commit 处于 rollback 状态时返回
+// ErrTxCommitRollback(确定回滚); 其余错误(网络、超时、连接已关闭)无法
+// 证明事务未提交, 一律归为不确定。
+func classifyCommitError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, pgx.ErrTxCommitRollback) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrCommitOutcomeUnknown, err)
 }

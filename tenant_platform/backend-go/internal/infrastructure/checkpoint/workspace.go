@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -353,6 +354,80 @@ func (c *WorkspaceCoordinator) CleanupCommittedFiles(ctx context.Context, commit
 	}
 	c.removeCommittedArtifacts(hash, id)
 	return nil
+}
+
+// orphanReconcileAge 是孤儿 committed 文件回收的最小年龄: 覆盖 Commit
+// 物化文件→DB 提交的毫秒级窗口, 防止对账器与进行中的提交竞态误删。
+const orphanReconcileAge = time.Hour
+
+// ReconcileOrphanCommittedFiles 遍历共享卷全部工作区的 committed/ 目录,
+// 删除"DB 中已不存在对应 committed snapshot 且文件超过 orphanReconcileAge"
+// 的 bundle/result 文件(round11 审查 C2)。提交结果不确定时 scheduler 保留
+// 文件, 本方法按 DB 引用对账兜底回收, 避免不确定窗口误删恢复点。
+// 返回删除的文件数(一个 snapshot 计 1)。
+func (c *WorkspaceCoordinator) ReconcileOrphanCommittedFiles(ctx context.Context) (int, error) {
+	now := time.Now()
+	workspaceDirs, err := os.ReadDir(c.workspacesRoot)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile: list workspaces root: %w", err)
+	}
+	removed := 0
+	for _, ws := range workspaceDirs {
+		if !ws.IsDir() {
+			continue
+		}
+		committedDir := filepath.Join(c.workspacesRoot, ws.Name(), "state", "committed")
+		committedEntries, err := os.ReadDir(committedDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return removed, fmt.Errorf("reconcile: list committed dir %s: %w", ws.Name(), err)
+		}
+		for _, f := range committedEntries {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".bundle.json") {
+				continue
+			}
+			snapshotID := strings.TrimSuffix(f.Name(), ".bundle.json")
+			if !looksLikeSnapshotID(snapshotID) {
+				// 非 UUID 文件名不是本系统产物(防御: 不触碰也不报错)。
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				return removed, fmt.Errorf("reconcile: stat %s: %w", f.Name(), err)
+			}
+			if now.Sub(info.ModTime()) < orphanReconcileAge {
+				continue
+			}
+			state, err := c.store.SnapshotState(ctx, snapshotID)
+			if err != nil {
+				if !errors.Is(err, postgres.ErrSnapshotNotFound) {
+					return removed, fmt.Errorf("reconcile: snapshot state %s: %w", snapshotID, err)
+				}
+			} else if state == "committed" {
+				continue // 被当前恢复指针引用
+			}
+			// DB 无行或非 committed(writing/quarantined): 文件不是恢复点。
+			c.removeCommittedArtifacts(ws.Name(), snapshotID)
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+// looksLikeSnapshotID 校验 snapshot 文件名形态(UUID v4 36 字符), 防止
+// 对账器触碰目录中不属于本系统的文件。
+func looksLikeSnapshotID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // CurrentRestorePoint resolves the workspace's committed snapshot. The

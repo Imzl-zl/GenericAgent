@@ -228,11 +228,15 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	if err != nil {
 		return nil, RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
+	// round11 审查(I1): importedRefs 记录本次导入的附件, 任务提交失败时
+	// 回滚(附件写入先于授权/幂等事务, 失败必须清理防止未授权残留)。
+	var importedRefs []SessionFileRef
 	if r.sessionFiles != nil {
 		currentRefs, err := r.sessionFiles.ImportInbound(sessionKey, msg.MediaPaths)
 		if err != nil {
 			return nil, RouterResult{}, fmt.Errorf("stage session files: %w", err)
 		}
+		importedRefs = currentRefs
 		recentRefs, err := r.sessionFiles.Recent(sessionKey, 8)
 		if err != nil {
 			return nil, RouterResult{}, fmt.Errorf("list session files: %w", err)
@@ -278,6 +282,9 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 			// Round8 审查: 提交失败必须返回 error(而非 Rejected 200)——Poller
 			// 收到 5xx 后重试; 同事务内消息行随任务一起回滚, 重试可完整重放,
 			// 任务由唯一键兜底不重复。
+			// round11 审查(I1): 附件写入先于本事务(授权/幂等检查在其中),
+			// 提交失败必须回滚本次导入的附件, 防止未授权或重复消息残留文件。
+			r.rollbackImportedAttachments(ctx, sessionKey, importedRefs)
 			return nil, RouterResult{}, fmt.Errorf("submit task: %w", err)
 		}
 		msgRow = &row
@@ -293,6 +300,7 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 			PersonaSnapshot:   []string{},
 			ToolPolicyVersion: userPolicy,
 		}); err != nil {
+			r.rollbackImportedAttachments(ctx, sessionKey, importedRefs)
 			return nil, RouterResult{}, fmt.Errorf("submit task: %w", err)
 		}
 	}
@@ -301,4 +309,18 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	// "收到" plus an async "正在处理" duplicate.
 	reply := "✓ 收到，正在处理您的任务..."
 	return msgRow, RouterResult{Action: ActionTaskCreated, Reply: reply, UserID: bot.OwnerID}, nil
+}
+
+// rollbackImportedAttachments 回滚本次消息导入的附件(best-effort,
+// round11 审查 I1): 附件写入先于任务授权/幂等事务, 提交失败(成员被移除/
+// 重复消息/DB 错误)时删除本次导入的文件, 防止团队 workspace 残留未授权
+// 附件。失败只记日志, 不掩盖原始提交错误。
+func (r *router) rollbackImportedAttachments(ctx context.Context, sessionKey string, refs []SessionFileRef) {
+	if len(refs) == 0 || r.sessionFiles == nil {
+		return
+	}
+	if err := r.sessionFiles.RemoveInbound(sessionKey, refs); err != nil {
+		slog.ErrorContext(ctx, "router: rollback imported attachments failed",
+			"session_key", sessionKey, "error", err)
+	}
 }
