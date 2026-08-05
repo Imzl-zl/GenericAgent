@@ -33,6 +33,14 @@ func realDockerAvailable(t *testing.T) (string, bool) {
 		t.Logf("docker daemon unavailable: %v (%s)", err, strings.TrimSpace(string(out)))
 		return "", false
 	}
+	// round13 审查(CI): 真实测试依赖本地构建的 ga-runner:local 镜像——
+	// GitHub runner 有 docker daemon 但没有该镜像, 修复前测试直接失败
+	// (pull access denied)而非跳过。镜像缺失时视为前置条件不满足。
+	img := exec.Command(dockerBin, "image", "inspect", "ga-runner:local")
+	if out, err := img.CombinedOutput(); err != nil {
+		t.Logf("ga-runner:local image unavailable: %v (%s)", err, strings.TrimSpace(string(out)))
+		return "", false
+	}
 	return dockerBin, true
 }
 

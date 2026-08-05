@@ -173,6 +173,13 @@ func RemoveBeneath(root, rel string) error {
 	}
 	defer unix.Close(dirFD)
 	if err := unix.Unlinkat(dirFD, base, 0); err != nil {
+		// round13 审查(CI): 幂等语义内置——目标不存在视为删除成功。
+		// 修复前这里包装 ENOENT 返回, 调用方的 os.IsNotExist 对
+		// fmt.Errorf(%w) 包装错误返回 false(不遍历 Unwrap 链), 破坏
+		// 幂等契约; Windows 版直接返回 *PathError 恰好不受影响。
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
 		return fmt.Errorf("remove %s under %s: %w", rel, root, err)
 	}
 	return nil

@@ -43,10 +43,15 @@ func ensureWorkspaceDirsBeneath(root string, dirs []string, uid, shareGID int) e
 			}
 			child, openErr := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 			if openErr != nil {
-				if !errors.Is(openErr, unix.ELOOP) {
+				// round13 审查(CI): O_DIRECTORY|O_NOFOLLOW 打开符号链接时
+				// Linux 返回 ENOTDIR(而非 ELOOP)——修复前只识别 ELOOP,
+				// symlink 恢复分支永远走不到, 该回归测试在 Linux 上必失败
+				// (Windows 用路径式实现, 不受影响)。非目录组件同样按
+				// "删除重建为目录"处理(mkdir -p 语义)。
+				if !errors.Is(openErr, unix.ELOOP) && !errors.Is(openErr, unix.ENOTDIR) {
 					return fmt.Errorf("openat %s: %w", part, openErr)
 				}
-				// symlink 组件: 只 unlink 链接本身, 重建为目录。
+				// symlink 或非目录组件: 只 unlink 链接本身, 重建为目录。
 				if err := unix.Unlinkat(fd, part, 0); err != nil {
 					return fmt.Errorf("remove symlink %s: %w", part, err)
 				}

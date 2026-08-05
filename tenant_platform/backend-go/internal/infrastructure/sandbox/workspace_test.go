@@ -241,7 +241,9 @@ func TestWriteConfigFilesGroupReadable(t *testing.T) {
 		t.Log("non-root: ownership not asserted, mode still checked")
 	}
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:perm")
+	// round13 审查(CI): 修复前用 "personal:perm"——非数字 personal id,
+	// ValidateWorkspaceKey 拒绝; Windows 上本测试整体 skip 掩盖了该问题。
+	hash, err := WorkspaceDirHash("personal:10001")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
@@ -259,7 +261,9 @@ func TestWriteConfigFilesGroupReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	perm := info.Mode().Perm()
-	if perm&0o004 == 0 {
+	// round13 审查(CI): 修复前断言条件写反(perm&0o004 == 0 时报错)——
+	// world 不可读是期望状态; Windows 上本测试整体 skip 掩盖了该问题。
+	if perm&0o004 != 0 {
 		t.Fatalf("config file mode %o: world must not be readable", perm)
 	}
 	if perm&0o040 == 0 {

@@ -3,11 +3,20 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+// TestMain 预置测试固定的 workspace root(validConfig 的 WorkspacesRoot):
+// unix 实现要求 root 已存在(openat O_DIRECTORY), Windows 实现不检查——
+// 修复前这些测试只在 Linux 上失败(round13 审查 CI)。
+func TestMain(m *testing.M) {
+	_ = os.MkdirAll("/tmp/ws-root", 0o755)
+	os.Exit(m.Run())
+}
 
 // fakeRunner 记录 docker 调用并返回预设输出。scripted 非空时按调用顺序
 // 依次弹出(create 成功、start 失败等时序场景)。

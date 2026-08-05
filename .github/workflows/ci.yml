@@ -62,10 +62,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # security 测试(test_no_real_key_leak)子进程调用 go test 验证
+      # Worker 环境/运行时配置不含真实密钥——需要 Go 工具链。
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tenant_platform/backend-go/go.mod
+          cache-dependency-path: tenant_platform/backend-go/go.sum
       - name: Install core deps
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          pip install pytest pyyaml pycryptodome
           pip install -e .
       - name: Core tests (root)
         run: python -m pytest tests -q
