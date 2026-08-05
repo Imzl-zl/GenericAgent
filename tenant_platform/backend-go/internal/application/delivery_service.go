@@ -261,6 +261,16 @@ func (s *deliveryService) tick(ctx context.Context) error {
 // 直接死信 MEMBER_REMOVED, 不重试(成员移除是永久状态)。
 var errDeliveryMemberRemoved = errors.New("requester is no longer an approved team member")
 
+// removePayloadFiles 删除 buildPayload 物化的全部 spool 快照与空子目录
+// (round12 审查 I6): 幂等, 文件不存在视为成功。process 在 buildPayload
+// 成功后立即 defer 调用——文本/前序文件发送失败时其余快照同样清理。
+func removePayloadFiles(payload deliveryPayload) {
+	for _, f := range payload.Files {
+		_ = os.Remove(f.absPath)
+		_ = os.Remove(filepath.Dir(f.absPath))
+	}
+}
+
 func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now time.Time) error {
 	task, err := s.cfg.Tasks.GetTask(ctx, d.TaskID)
 	if err != nil {
@@ -308,6 +318,10 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 	if err != nil {
 		return s.deadLetter(ctx, d, "PAYLOAD_BUILD_FAILED", err.Error(), now)
 	}
+	// round12 审查(I6): 清理所有权覆盖整个 process——buildPayload 成功后
+	// 立即注册统一清理, 文本发送失败/前序文件发送失败时其余 spool 快照
+	// 不会残留(旧实现只在逐文件循环内注册 defer)。
+	defer removePayloadFiles(payload)
 	sendCtx, cancel := context.WithTimeout(ctx, deliverySendTimeout)
 	defer cancel()
 	if payload.Text != "" {
@@ -341,12 +355,6 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 		}
 	}
 	for _, file := range payload.Files {
-		// 审查 R5-I3: 发送结束后删除 buildPayload 写入的私有临时文件
-		// (顺带清理空子目录)。
-		defer func() {
-			_ = os.Remove(file.absPath)
-			_ = os.Remove(filepath.Dir(file.absPath))
-		}()
 		partKey := d.DeliveryID + ":file:" + file.auditPath
 		msgRow, alreadySent, partErr := s.sendAndJournalPart(ctx, deliveryPart{
 			key: partKey,
@@ -560,10 +568,13 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 			// sanitizeDeliverableDisplayName 清洗。
 			dir := filepath.Join(s.snapshotDir, deliveryFileKey(d.DeliveryID))
 			if err := os.MkdirAll(dir, 0o2770); err != nil {
+				removePayloadFiles(out)
 				return deliveryPayload{}, fmt.Errorf("create delivery file dir: %w", err)
 			}
 			tmpPath := filepath.Join(dir, fmt.Sprintf("%s_%s", deliveryFileMarkerKey(f.Marker), deliverableSnapshotBase(f.RelPath)))
 			if err := os.WriteFile(tmpPath, f.Content, 0o640); err != nil {
+				// round12 审查(I6): 中途失败必须清理已写入的前序快照。
+				removePayloadFiles(out)
 				return deliveryPayload{}, fmt.Errorf("write delivery file snapshot %q: %w", f.Marker, err)
 			}
 			out.Files = append(out.Files, deliveryFile{

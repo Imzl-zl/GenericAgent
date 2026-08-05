@@ -176,6 +176,25 @@ func (s *Store) SnapshotState(ctx context.Context, snapshotID string) (string, e
 	return state, nil
 }
 
+// StagingTokenIsWriting 返回指定 staging token 是否仍被 writing 状态的
+// snapshot 行引用(round12 审查 M2): ReconcileOrphanStagingFiles 据此判断
+// staging 文件是否孤儿——writing 行存在时文件是进行中/未完成提交的一部分,
+// 不得删除。
+func (s *Store) StagingTokenIsWriting(ctx context.Context, token string) (bool, error) {
+	if token == "" {
+		return false, fmt.Errorf("staging token is required")
+	}
+	var one int
+	err := s.pool.QueryRow(ctx, `SELECT 1 FROM workspace_snapshots WHERE token = $1 AND state = 'writing'`, token).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check staging token %s: %w", token, err)
+	}
+	return true, nil
+}
+
 // QuarantinedWriting 是 SweepExpiredCheckpoints 返回的过期 writing snapshot
 // (staging_ref 保留供调用方删除宿主 staging 文件)。
 type QuarantinedWriting struct {

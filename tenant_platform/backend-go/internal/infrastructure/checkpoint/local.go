@@ -326,6 +326,49 @@ func (c *LocalCoordinator) ReconcileOrphanCommittedFiles(ctx context.Context) (i
 	return removed, nil
 }
 
+// ReconcileOrphanStagingFiles 与 WorkspaceCoordinator 同语义(round12 审查
+// M2): 遍历 loopback runtimeRoot/staging, 删除无 writing 引用且超过孤儿
+// 年龄的 bundle 文件。
+func (c *LocalCoordinator) ReconcileOrphanStagingFiles(ctx context.Context) (int, error) {
+	now := time.Now()
+	entries, err := os.ReadDir(filepath.Join(c.runtimeRoot, "staging"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	removed := 0
+	for _, f := range entries {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".bundle.json") {
+			continue
+		}
+		token := strings.TrimSuffix(f.Name(), ".bundle.json")
+		if !looksLikeStagingToken(token) {
+			continue
+		}
+		info, err := f.Info()
+		if err != nil {
+			return removed, err
+		}
+		if now.Sub(info.ModTime()) < orphanReconcileAge {
+			continue
+		}
+		live, err := c.store.StagingTokenIsWriting(ctx, token)
+		if err != nil {
+			return removed, err
+		}
+		if live {
+			continue
+		}
+		if err := os.Remove(filepath.Join(c.runtimeRoot, "staging", f.Name())); err != nil && !os.IsNotExist(err) {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 // CleanupCommittedFiles 删除 Commit 已物化但 DB 提交失败的 committed/result
 // 文件(round10 审查 B9a, loopback 实现)。
 func (c *LocalCoordinator) CleanupCommittedFiles(ctx context.Context, committed CommittedCheckpoint) error {

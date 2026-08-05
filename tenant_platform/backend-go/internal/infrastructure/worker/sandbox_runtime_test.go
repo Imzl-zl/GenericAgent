@@ -3,12 +3,18 @@ package worker
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+
+	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/sandbox"
 )
@@ -26,6 +32,10 @@ type fakeLeaseStore struct {
 	acquireCalls  int
 	created       bool // AcquireRunnerLease 的接管创建标记(接管路径测试)
 	lease         domain.RunnerLease
+	// round12 审查(I3): 续租阻塞模拟——renewBlock 置位后 RenewRunnerLease
+	// 阻塞到 ctx 取消(验证 cleanup 的可取消等待)。
+	renewBlock   bool
+	renewEntered chan struct{}
 }
 
 func (f *fakeLeaseStore) AcquireRunnerLease(ctx context.Context, runnerKey, owner string, leaseTTL time.Duration, maxActive int64) (domain.RunnerLease, bool, error) {
@@ -41,8 +51,21 @@ func (f *fakeLeaseStore) AcquireRunnerLease(ctx context.Context, runnerKey, owne
 
 func (f *fakeLeaseStore) RenewRunnerLease(ctx context.Context, runnerKey, owner string, generation uint64, leaseTTL time.Duration) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.renewed = append(f.renewed, runnerKey)
+	block := f.renewBlock
+	entered := f.renewEntered
+	f.mu.Unlock()
+	if block {
+		if entered != nil {
+			close(entered)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+			return errors.New("renew never unblocked")
+		}
+	}
 	return f.renewErr
 }
 
@@ -255,4 +278,64 @@ func TestStartDestroysStaleContainerEvenWhenLeaseNotCreated(t *testing.T) {
 	if len(leases.released) != 1 {
 		t.Fatalf("lease must be released, released=%v", leases.released)
 	}
+}
+
+// round12 审查(I3): cleanup 必须可取消等待卡住的续租——renewer 卡在
+// RenewRunnerLease(DB 半开)时, cleanup 不得无限阻塞任务收尾/关闭流程。
+// 需要 Start 成功拿到 cleanup: 经 DialControl 注入 bufconn gRPC 服务端。
+func TestCleanupUnblocksWhenRenewerStuck(t *testing.T) {
+	leases := &fakeLeaseStore{renewEntered: make(chan struct{})}
+	manager := &fakeManagerCLI{}
+
+	// bufconn gRPC 服务端(Shutdown 足够, cleanup 只调用 Shutdown)。
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer()
+	workerv1.RegisterWorkerServiceServer(srv, &stubControlWorker{})
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+
+	r := newSandboxRuntimeForTest(t, leases, manager)
+	r.cfg.RunnerLeaseTTL = 300 * time.Millisecond
+	r.cfg.DialControl = func(ctx context.Context, _ string, _ CertMaterial) (*grpc.ClientConn, error) {
+		return grpc.DialContext(ctx, "bufnet",
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	inst, err := r.Start(context.Background(), StartRequest{SessionKey: "personal:7"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// 让续租进入阻塞调用。
+	leases.mu.Lock()
+	leases.renewBlock = true
+	leases.mu.Unlock()
+	select {
+	case <-leases.renewEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("renewer never entered blocked renew")
+	}
+
+	// cleanup 必须在其等待窗口内返回, 不能无限阻塞。
+	done := make(chan struct{})
+	go func() { inst.Cleanup(""); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cleanup blocked forever while renewer stuck")
+	}
+	leases.mu.Lock()
+	defer leases.mu.Unlock()
+	if len(leases.released) != 1 {
+		t.Fatalf("lease must be released after cleanup, released=%v", leases.released)
+	}
+}
+
+// stubControlWorker 是 sandbox_runtime 测试的最小 Worker 服务端。
+type stubControlWorker struct {
+	workerv1.UnimplementedWorkerServiceServer
+}
+
+func (s *stubControlWorker) Shutdown(ctx context.Context, req *workerv1.ShutdownRequest) (*workerv1.ShutdownResponse, error) {
+	return &workerv1.ShutdownResponse{}, nil
 }

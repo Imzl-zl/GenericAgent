@@ -224,10 +224,11 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	if userPolicy == "" {
 		userPolicy = r.toolPolicy // fallback to global default
 	}
-	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
-	if err != nil {
-		return nil, RouterResult{}, fmt.Errorf("resolve session: %w", err)
-	}
+	// round12 审查(I7): 会话 key 在路由入口唯一解析一次并贯穿本消息——任务
+	// 行、消息行与附件 staging 共用同一 key, 不再二次解析(并发切换/瞬时
+	// 错误下两次独立解析会分叉, 团队任务消息可能落入个人历史)。命令处理器
+	// 各自 resolveSessionKey 操作"当前上下文"最新语义, 与消息审计归属无关。
+	sessionKey := inboundSessionKey
 	// round11 审查(I1): importedRefs 记录本次导入的附件, 任务提交失败时
 	// 回滚(附件写入先于授权/幂等事务, 失败必须清理防止未授权残留)。
 	var importedRefs []SessionFileRef

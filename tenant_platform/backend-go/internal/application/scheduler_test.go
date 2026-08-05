@@ -240,6 +240,10 @@ func (c *successfulCoordinator) ReconcileOrphanCommittedFiles(context.Context) (
 	return 0, nil
 }
 
+func (c *successfulCoordinator) ReconcileOrphanStagingFiles(context.Context) (int, error) {
+	return 0, nil
+}
+
 type readFailCoordinator struct {
 	store *postgres.Store
 	owner string
@@ -289,6 +293,10 @@ func (c *readFailCoordinator) CleanupCommittedFiles(context.Context, checkpoint.
 }
 
 func (c *readFailCoordinator) ReconcileOrphanCommittedFiles(context.Context) (int, error) {
+	return 0, nil
+}
+
+func (c *readFailCoordinator) ReconcileOrphanStagingFiles(context.Context) (int, error) {
 	return 0, nil
 }
 

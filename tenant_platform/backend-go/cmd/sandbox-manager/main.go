@@ -48,6 +48,9 @@ func main() {
 		controlAddr        = flag.String("control-addr", envOr("GA_MANAGER_CONTROL_ADDR", "0.0.0.0:8091"), "Platform control API listen address")
 		controlSecret      = flag.String("control-secret", envOr("GA_MANAGER_SECRET", ""), "HMAC secret for the Platform control API (required)")
 		managerID          = flag.String("manager-id", envOr("GA_MANAGER_ID", ""), "manager instance id stamped on Runner labels")
+		// round12 审查(I4): nonce 防重放状态持久化目录(必需)——仅进程内实现
+		// 无法覆盖"签名窗口内重启后重放"(GA_MANAGER_SECRET 稳定不复位)。
+		nonceState = flag.String("nonce-state", envOr("GA_MANAGER_NONCE_STATE", ""), "writable state dir for consumed-nonce persistence (required)")
 	)
 	flag.Parse()
 
@@ -61,6 +64,10 @@ func main() {
 	}
 	if strings.TrimSpace(*managerID) == "" {
 		slog.Error("manager-id (GA_MANAGER_ID) is required")
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*nonceState) == "" {
+		slog.Error("nonce-state (GA_MANAGER_NONCE_STATE) is required: consumed nonces must survive restart to close the replay window")
 		os.Exit(2)
 	}
 
@@ -103,7 +110,7 @@ func main() {
 	defer stop()
 
 	// Platform 控制面: 认证的 HTTP API(唯一入口)。
-	server, err := sandbox.NewManagerServer(manager, *controlSecret)
+	server, err := sandbox.NewManagerServerWithNonceState(manager, *controlSecret, *nonceState)
 	if err != nil {
 		slog.Error("manager control server", "error", err)
 		os.Exit(2)

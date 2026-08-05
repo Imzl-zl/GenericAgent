@@ -94,7 +94,7 @@ Sandbox Manager 拒绝启动(fail-closed, 不会静默降级)。
 ## Runner 工作区与动态容器
 
 - 用户首次发消息时，Platform 将渠道身份解析为 `personal:<user_id>`（或授权团队的 `team:<team_id>`），Sandbox Manager 创建该工作区的 Runner 容器并挂载其 `memory/`、`temp/`、`state/`。
-- 同一工作区的后续消息复用该 Runner；空闲超过 `GA_RUNNER_IDLE_TTL` 后回收，下次消息重建干净 Runner。工作区数据始终保留。
+- 任务即进程（决策 D1）：每个 task 创建全新 Runner 容器，任务终态（成功/失败/取消/超时）即销毁；会话连续性由 checkpoint 快照恢复，工作区数据始终保留。`GA_RUNNER_IDLE_TTL` 是 Runner lease 的 TTL（续租周期与异常兜底回收的参考值），不是空闲复用阈值。
 - `GA_RUNNER_MAX_ACTIVE` 是全局并发 Runner 上限；满载时新任务保持排队，不失败。
 - Runner 只加入内部 `runner-control` 网络，只能访问 Platform 控制端点与内部 LLM Proxy；不挂载 Docker socket、不暴露任何宿主机路径。
 

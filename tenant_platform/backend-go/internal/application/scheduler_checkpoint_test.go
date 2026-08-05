@@ -103,6 +103,10 @@ func (c *cleanupRecordingCoordinator) ReconcileOrphanCommittedFiles(ctx context.
 	return 0, nil
 }
 
+func (c *cleanupRecordingCoordinator) ReconcileOrphanStagingFiles(context.Context) (int, error) {
+	return 0, nil
+}
+
 func (c *cleanupRecordingCoordinator) RunnerStagingRef(hostRef string) (string, error) {
 	return hostRef, nil
 }

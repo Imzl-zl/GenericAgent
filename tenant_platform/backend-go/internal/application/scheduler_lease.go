@@ -55,12 +55,23 @@ func (h *dispatchHeartbeat) setError(err error) {
 
 func (h *dispatchHeartbeat) Stop() error {
 	h.stopOnce.Do(func() { close(h.stop) })
-	<-h.done
+	// round12 审查(I3): 先取消再等待——heartbeat 可能在 DB 调用中阻塞,
+	// 先等 done 后 cancel 会让 Stop 无限等待; ctx 取消后所有 DB 调用返回,
+	// goroutine 经 select 的 ctx.Done 分支退出。等待带超时兜底。
 	h.cancel()
+	select {
+	case <-h.done:
+	case <-time.After(heartbeatStopTimeout):
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.err
 }
+
+// heartbeatStopTimeout 是 Stop 等待 heartbeat goroutine 退出的上限
+// (round12 审查 I3): 正常情况下 ctx 取消后 goroutine 立即退出, 超时仅
+// 防止极端情况(goroutine 不响应取消)无限阻塞任务收尾。
+const heartbeatStopTimeout = 5 * time.Second
 
 // startDispatchHeartbeat issues an immediate heartbeat (to verify the claim is
 // still owned) then spawns a goroutine that extends the lease on an interval.

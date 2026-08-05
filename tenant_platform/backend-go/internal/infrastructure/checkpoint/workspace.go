@@ -306,7 +306,13 @@ func (c *WorkspaceCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint
 		return CommittedCheckpoint{}, err
 	}
 	// 删除 staging 前先持久化 committed(不可变重命名语义)。
-	_ = safefs.RemoveBeneath(c.workspacesRoot, rel)
+	// round12 审查(M2): 删除失败不再吞掉——记录日志; 文件由
+	// ReconcileOrphanStagingFiles 按无 writing 引用兜底回收, 不阻断提交
+	// (可用性优先: 遗留副本不影响恢复点正确性)。
+	if err := safefs.RemoveBeneath(c.workspacesRoot, rel); err != nil && !os.IsNotExist(err) {
+		slog.WarnContext(ctx, "checkpoint commit: remove staging file failed; deferred to reconciliation",
+			"snapshot_id", ready.SnapshotID, "staging_rel", rel, "error", err)
+	}
 
 	resultRel := filepath.Join(hash, "state", "results", ready.SnapshotID+".result")
 	if err := safefs.MkdirAllBeneath(c.workspacesRoot, filepath.Join(hash, "state", "results"), 0o770); err != nil {
@@ -410,6 +416,74 @@ func (c *WorkspaceCoordinator) ReconcileOrphanCommittedFiles(ctx context.Context
 			}
 			// DB 无行或非 committed(writing/quarantined): 文件不是恢复点。
 			c.removeCommittedArtifacts(ws.Name(), snapshotID)
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+// looksLikeStagingToken 校验 staging 文件名的 token 形态(PrepareCheckpoint
+// 生成: ckpt-<taskID>-g<gen>-<uuid>), 防止对账器触碰目录中非本系统文件。
+func looksLikeStagingToken(s string) bool {
+	if !strings.HasPrefix(s, "ckpt-") {
+		return false
+	}
+	// 任务 UUID + g + 数字 + uuid: 至少含 3 个 '-' 且非空段。
+	parts := strings.Split(s, "-")
+	return len(parts) >= 5
+}
+
+// ReconcileOrphanStagingFiles 对账回收无 writing 引用且超过孤儿年龄的
+// staging 文件(round12 审查 M2): Commit 成功后删除 staging 失败、或提交
+// 期间崩溃时, 文件既无 DB 引用也不被 SweepExpiredCheckpoints 覆盖(lease
+// 已消费), 本方法按 DB 引用 + 年龄阈值兜底回收。返回删除的文件数。
+func (c *WorkspaceCoordinator) ReconcileOrphanStagingFiles(ctx context.Context) (int, error) {
+	now := time.Now()
+	workspaceDirs, err := os.ReadDir(c.workspacesRoot)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile staging: list workspaces root: %w", err)
+	}
+	removed := 0
+	for _, ws := range workspaceDirs {
+		if !ws.IsDir() {
+			continue
+		}
+		stagingDir := filepath.Join(c.workspacesRoot, ws.Name(), "state", "staging")
+		entries, err := os.ReadDir(stagingDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return removed, fmt.Errorf("reconcile staging: list staging dir %s: %w", ws.Name(), err)
+		}
+		for _, f := range entries {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".bundle.json") {
+				continue
+			}
+			token := strings.TrimSuffix(f.Name(), ".bundle.json")
+			if !looksLikeStagingToken(token) {
+				// 非本系统产物(防御: 不触碰也不报错)。
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				return removed, fmt.Errorf("reconcile staging: stat %s: %w", f.Name(), err)
+			}
+			if now.Sub(info.ModTime()) < orphanReconcileAge {
+				continue
+			}
+			live, err := c.store.StagingTokenIsWriting(ctx, token)
+			if err != nil {
+				return removed, fmt.Errorf("reconcile staging: token check %s: %w", token, err)
+			}
+			if live {
+				continue
+			}
+			if err := safefs.RemoveBeneath(c.workspacesRoot, filepath.Join(ws.Name(), "state", "staging", f.Name())); err != nil && !os.IsNotExist(err) {
+				slog.WarnContext(ctx, "checkpoint reconcile: remove orphan staging file failed",
+					"workspace", ws.Name(), "token", token, "error", err)
+				continue
+			}
 			removed++
 		}
 	}

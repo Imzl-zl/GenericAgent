@@ -173,6 +173,11 @@ type scheduler struct {
 	// 两个副本互相销毁 Worker 或重复创建 Runner(审查 R4-C1)。
 	dispatchInFlight      sync.Map
 	lastRevocationCleanup time.Time
+	// pendingFinalize 是终态化写库失败的任务意图(taskID -> finalizeIntent,
+	// round12 审查 I2): tick 每轮重试 CompleteFailedTerminal, 防止任务因
+	// 瞬时 DB 错误永久卡在 starting/running。进程崩溃时由 claim 过期 +
+	// RecoverAfterRestart 兜底。
+	pendingFinalize sync.Map
 }
 
 // NewScheduler validates config and constructs the scheduler.
@@ -332,6 +337,13 @@ func (s *scheduler) tick(ctx context.Context) error {
 		} else if n > 0 {
 			slog.InfoContext(ctx, "scheduler: removed orphan committed files", "count", n)
 		}
+		// round12 审查(M2): 对账回收无 writing 引用的孤儿 staging 文件
+		// (Commit 后删除失败/提交期间崩溃的残留)。
+		if n, err := s.cfg.Coordinator.ReconcileOrphanStagingFiles(ctx); err != nil {
+			slog.ErrorContext(ctx, "scheduler: reconcile orphan staging files failed", "error", err)
+		} else if n > 0 {
+			slog.InfoContext(ctx, "scheduler: removed orphan staging files", "count", n)
+		}
 	}
 	// Recover newly expired foreign-owner work opportunistically.
 	if _, err := s.cfg.Store.RecoverAfterRestart(ctx, s.cfg.PlatformInstanceID); err != nil {
@@ -395,6 +407,8 @@ func (s *scheduler) tick(ctx context.Context) error {
 	// 已 owned 的 starting 任务: 异步派发(允许多 Runner 并发, 方案 §7
 	// GA_RUNNER_MAX_ACTIVE); running 任务由各自的 dispatch goroutine 持有,
 	// tick 不再阻塞等待单个任务完成。
+	// round12 审查(I2): 心跳续租之后重试未落库的终态化意图。
+	s.drainPendingFinalize(ctx)
 	for _, t := range owned {
 		if t.Status == domain.TaskStarting && t.WorkerDispatchStartedAt == nil {
 			go s.dispatch(ctx, t)

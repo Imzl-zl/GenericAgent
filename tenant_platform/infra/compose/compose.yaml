@@ -277,12 +277,15 @@ services:
       GA_MANAGER_SECRET: ${GA_MANAGER_SECRET}
       GA_MANAGER_ID: ${GA_MANAGER_ID:-sandbox-manager-1}
       GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
+      # round12 审查(I4): nonce 防重放状态持久化目录(必需, 见 volumes)。
+      GA_MANAGER_NONCE_STATE: /var/lib/ga/manager-state
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=0700
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner_workspaces:/var/lib/ga/workspaces
+      - manager_state:/var/lib/ga/manager-state
     # 审查 F11: 持 Docker socket(=宿主 root)的 Manager 不接入 runner-control
     # 内部网络, 与不可信 Runner 保持网络隔离——Manager 经 docker.sock 控制
     # 容器, 不需要也无法拨号 Runner 的 mTLS 端点(拨号由 Platform 完成)。
@@ -368,6 +371,8 @@ volumes:
   bot_media:
   # round9 审查: 交付 spool 卷(Platform rw / Poller ro), 文件快照跨容器可见。
   delivery_spool:
+  # round12 审查(I4): Manager 控制面 nonce 防重放状态卷(跨重启持久化)。
+  manager_state:
   # 显式卷名: sandbox-manager 用 volume-subpath 挂载子目录到 Runner(daemon 可解析)。
   # round11 审查(M2): 共享卷/内部网络加项目名前缀, 避免多套 Compose 部署
   # 在同一宿主机互相挂载对方的工作区卷与 runner-control 网络(隔离失败)。

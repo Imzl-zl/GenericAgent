@@ -77,6 +77,10 @@ type Coordinator interface {
 	// 必须保留文件防止误删已生效恢复点; 本方法周期性删除"DB 无对应
 	// committed snapshot 且文件已超过孤儿年龄阈值"的文件, 兜底回收磁盘。
 	ReconcileOrphanCommittedFiles(ctx context.Context) (int, error)
+	// ReconcileOrphanStagingFiles 对账回收无 writing 引用且超过孤儿年龄的
+	// staging 文件(round12 审查 M2): Commit 成功后删除 staging 失败或提交
+	// 期间崩溃时, 文件既无 DB 引用也不被 SweepExpiredCheckpoints 覆盖。
+	ReconcileOrphanStagingFiles(ctx context.Context) (int, error)
 	// RunnerStagingRef 映射宿主 staging 路径为容器内路径(方案 §7:
 	// Worker 只接受 runtime root 内的 staging_ref)。Local 实现原样返回。
 	RunnerStagingRef(hostRef string) (string, error)

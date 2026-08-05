@@ -1,11 +1,13 @@
 package application
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -166,6 +168,20 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 		return nil, err
 	}
 	imported := make([]SessionFileRef, 0, len(sourcePaths))
+	// round12 审查(I5): 导入必须原子——后续文件复制失败或 manifest 保存失败
+	// 时, 删除本次已复制的文件(manifest 最后才保存, 磁盘 manifest 无需恢复),
+	// 防止无 manifest 归属的附件残留团队工作区。
+	rollbackImported := func() {
+		for _, ref := range imported {
+			if ref.RelativePath == "" {
+				continue
+			}
+			if err := safefs.RemoveBeneath(root, filepath.FromSlash(ref.RelativePath)); err != nil && !os.IsNotExist(err) {
+				slog.WarnContext(context.Background(), "session files: rollback imported attachment failed",
+					"session_key", sessionKey, "rel", ref.RelativePath, "error", err)
+			}
+		}
+	}
 	for _, src := range sourcePaths {
 		if strings.TrimSpace(src) == "" {
 			continue
@@ -182,21 +198,26 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 			// 完成"不逃逸根 + 无符号链接"校验, 消除预检-复制 TOCTOU 窗口。
 			srcRel, err := filepath.Rel(m.mediaRoot, src)
 			if err != nil || srcRel == ".." || strings.HasPrefix(srcRel, ".."+string(filepath.Separator)) || filepath.IsAbs(srcRel) {
+				rollbackImported()
 				return nil, fmt.Errorf("source attachment %q escapes media root %q", src, m.mediaRoot)
 			}
 			if err := safefs.CopyFileFromBeneath(m.mediaRoot, srcRel, root, filepath.FromSlash(rel), m.fileMode(), maxInboundMediaBytes); err != nil {
+				rollbackImported()
 				return nil, fmt.Errorf("copy attachment %q: %w", src, err)
 			}
 		} else {
 			// 无媒体根(loopback/dev): 保持旧语义(路径式源, 调用方已校验)。
 			info, err := os.Stat(src)
 			if err != nil {
+				rollbackImported()
 				return nil, fmt.Errorf("stat source attachment %q: %w", src, err)
 			}
 			if info.IsDir() {
+				rollbackImported()
 				return nil, fmt.Errorf("source attachment %q is a directory", src)
 			}
 			if err := safefs.CopyFileBeneath(root, filepath.FromSlash(rel), src, m.fileMode(), maxInboundMediaBytes); err != nil {
+				rollbackImported()
 				return nil, fmt.Errorf("copy attachment %q: %w", src, err)
 			}
 		}
@@ -211,6 +232,7 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 		imported = append(imported, ref)
 	}
 	if err := m.saveManifest(root, manifest); err != nil {
+		rollbackImported()
 		return nil, err
 	}
 	return imported, nil

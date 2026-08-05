@@ -20,6 +20,17 @@ func isTransientRunnerError(err error) bool {
 	return errors.Is(err, postgres.ErrRunnerLeaseCapacity) || errors.Is(err, postgres.ErrRunnerLeaseOwned)
 }
 
+// finalizeIntent 记录一次未能落库的终态化意图(round12 审查 I2): dispatch/
+// reaper 等路径终态化写库失败时, 由 tick 的 drainPendingFinalize 每轮重试,
+// 任务不会因瞬时 DB 错误永久卡在 starting/running。
+type finalizeIntent struct {
+	status       domain.TaskStatus
+	deliveryType domain.DeliveryType
+	code         string
+	message      string
+	traceID      string
+}
+
 // finalizeOrFail records a terminal task state + delivery and surfaces any
 // persistence failure via log instead of silently dropping it (global rule:
 // No Silent Fallbacks). The returned task is the updated row on success, or
@@ -27,6 +38,8 @@ func isTransientRunnerError(err error) bool {
 // 审查 R5-Critical-2: 终态化必须由当前 claim owner 在 lease 有效期内执行——
 // lease 已被接管/过期时(ErrTaskNotOwned)任务由 RecoverAfterRestart 或新
 // owner 处理, 此处仅记 Warn 不得覆盖其状态。
+// round12 审查(I2): 非 ErrTaskNotOwned 的写库失败注册到 pendingFinalize,
+// 由 tick 每轮重试直至成功——任务不会再因 dispatch 退出而永久卡住。
 func (s *scheduler) finalizeOrFail(ctx context.Context, task domain.Task, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) domain.Task {
 	t, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, s.cfg.PlatformInstanceID, status, deliveryType, code, message, traceID)
 	if err != nil {
@@ -37,14 +50,58 @@ func (s *scheduler) finalizeOrFail(ctx context.Context, task domain.Task, status
 				"target_status", string(status))
 			return task
 		}
-		slog.ErrorContext(ctx, "scheduler: CompleteFailedTerminal failed",
+		slog.ErrorContext(ctx, "scheduler: CompleteFailedTerminal failed; scheduling retry",
 			"task_id", task.ID,
 			"session_key", task.SessionKey,
 			"target_status", string(status),
 			"error", err)
+		s.pendingFinalize.Store(task.ID, finalizeIntent{
+			status:       status,
+			deliveryType: deliveryType,
+			code:         code,
+			message:      boundMsg(message),
+			traceID:      traceID,
+		})
 		return task
 	}
 	return t
+}
+
+// drainPendingFinalize 每 tick 重试未落库的终态化意图(round12 审查 I2):
+// 任务已终态/claim 已不属于本实例 → 删除意图(他方已处理);
+// CompleteFailedTerminal 成功或 ErrTaskNotOwned → 删除意图;
+// 其余 DB 错误保留, 下轮重试。必须在 tick 的 claim heartbeat 之后调用
+// (重试依赖有效 lease)。
+func (s *scheduler) drainPendingFinalize(ctx context.Context) {
+	var pending []string
+	s.pendingFinalize.Range(func(key, _ any) bool {
+		pending = append(pending, key.(string))
+		return true
+	})
+	for _, taskID := range pending {
+		v, ok := s.pendingFinalize.Load(taskID)
+		if !ok {
+			continue
+		}
+		intent := v.(finalizeIntent)
+		latest, err := s.cfg.Store.GetTask(ctx, taskID)
+		if err != nil {
+			// DB 不可用: 下轮重试。
+			continue
+		}
+		if latest.Status.IsTerminal() || latest.ClaimOwner != s.cfg.PlatformInstanceID {
+			s.pendingFinalize.Delete(taskID)
+			continue
+		}
+		if _, err := s.cfg.Store.CompleteFailedTerminal(ctx, taskID, s.cfg.PlatformInstanceID,
+			intent.status, intent.deliveryType, intent.code, intent.message, intent.traceID); err != nil {
+			if errors.Is(err, postgres.ErrTaskNotOwned) {
+				s.pendingFinalize.Delete(taskID)
+			}
+			continue
+		}
+		s.pendingFinalize.Delete(taskID)
+	}
 }
 
 func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) error {
@@ -92,7 +149,12 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			returnErr = fmt.Errorf("dispatch panic: %v", r)
 			slog.ErrorContext(ctx, "scheduler: dispatch panic",
 				"task_id", task.ID, "panic", r)
-			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+			// round12 审查(I1 连带): 心跳 defer 先于本闭包执行并已取消
+			// heartbeat.ctx, 直接用 ctx 终态化必然失败——panic 路径必须用
+			// 独立有界上下文(与 heartbeat 丢失 fallback 同模式)。
+			fbCtx, fbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer fbCancel()
+			_ = s.finalizeOrFail(fbCtx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"DISPATCH_PANIC", fmt.Sprintf("%v", r), "")
 		}
 	}()
@@ -195,6 +257,11 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	// 早期终态路径同样需要撤销已签发的 token)。任务执行期间 Worker 拒绝
 	// reload, entry.credentials 在 ExecuteTask 期间不会变化。
 	taskCredentialSet = entry.credentials
+	// round12 审查(I1): dispatch 是任务 Worker 的唯一 owner——createTaskWorker
+	// 成功后立即注册统一 teardown, 任何退出路径(含 panic/并发终态/策略失败/
+	// startSession 错误/无 coordinator)恒销毁 Worker。身份校验变体保证旧任务
+	// 收尾不会误毁同 session 新任务的进程(下一任务只能在上一任务终态后 claim)。
+	defer s.destroyTaskWorkerEntry(task.SessionKey, entry)
 	// round11 审查(C3): 移除全局 workerCallMu。StartSession 与 CancelTask 的
 	// 互斥由 per-entry lifecycleMu 提供(同 session), 跨 session 完全并行;
 	// 一个卡住的 StartSession 不再阻塞其他工作区的派发与取消。MarkDispatch

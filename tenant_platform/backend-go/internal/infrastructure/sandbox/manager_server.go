@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,7 +20,13 @@ import (
 // ManagerServer 是 sandbox-manager 暴露给 Platform 控制面的 HTTP API
 // (方案 §7: Platform 不持有 Docker socket)。所有请求都必须携带
 // HMAC-SHA256 签名(共享 secret + 时间戳 + nonce), 防重放窗口 ±5 分钟;
-// nonce 一次性消费(进程内去重 + TTL), 同一签名请求不能重放两次。
+// nonce 一次性消费, 同一签名请求不能重放两次。
+//
+// round12 审查(I4): nonce 状态默认仅进程内(测试), 生产必须经
+// NewManagerServerWithNonceState 持久化到 Manager 自有状态卷——Compose 的
+// GA_MANAGER_SECRET 稳定不复位, 进程内实现无法覆盖"窗口内重启后重放"。
+// 持久化开启时每次消费先落盘(fsync + 原子 rename)再放行, 落盘失败
+// fail-closed 拒绝请求。
 //
 // 端点:
 //
@@ -32,28 +40,50 @@ type ManagerServer struct {
 	now     func() time.Time
 
 	// seenNonces 是已消费 nonce 的一次性集合(nonce -> 过期时间)。
-	// 进程内实现: Manager 单实例持有全部容器生命周期, 重启后窗口内
-	// 旧 nonce 因进程丢失而不再存在, 但 HMAC secret 轮换可覆盖重启场景。
+	// stateDir 非空时经 nonces.json 持久化(round12 审查 I4)。
 	seenNoncesMu sync.Mutex
 	seenNonces   map[string]time.Time
+	stateDir     string
+	nonceFile    string
 }
 
 const managerAuthWindow = 5 * time.Minute
 
-// NewManagerServer 构建 Manager 控制面。
+// NewManagerServer 构建 Manager 控制面(nonce 状态仅进程内, 测试/开发用;
+// 生产必须使用 NewManagerServerWithNonceState 持久化, round12 审查 I4)。
 func NewManagerServer(manager *Manager, secret string) (*ManagerServer, error) {
+	return NewManagerServerWithNonceState(manager, secret, "")
+}
+
+// NewManagerServerWithNonceState 构建 Manager 控制面并持久化已消费 nonce:
+// 每次消费先原子落盘(fsync + rename)再放行, 落盘失败拒绝请求(fail-closed);
+// 启动时加载既有 nonces.json 并丢弃过期项。stateDir 为空时退化为进程内
+// 实现(仅测试/开发, 不覆盖重启窗口)。
+func NewManagerServerWithNonceState(manager *Manager, secret, stateDir string) (*ManagerServer, error) {
 	if manager == nil {
 		return nil, fmt.Errorf("manager is required")
 	}
 	if len(secret) < 16 {
 		return nil, fmt.Errorf("manager control secret must be at least 16 bytes")
 	}
-	return &ManagerServer{
+	s := &ManagerServer{
 		manager:    manager,
 		secret:     []byte(secret),
 		now:        time.Now,
 		seenNonces: make(map[string]time.Time),
-	}, nil
+	}
+	if strings.TrimSpace(stateDir) == "" {
+		return s, nil
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create manager nonce state dir %q: %w", stateDir, err)
+	}
+	s.stateDir = stateDir
+	s.nonceFile = filepath.Join(stateDir, "nonces.json")
+	if err := s.loadNoncesLocked(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // Handler 返回带认证中间件的路由。
@@ -223,7 +253,14 @@ func (s *ManagerServer) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		// nonce 一次性消费: 同一 nonce 在窗口内只能使用一次(防重放)。
-		if !s.consumeNonce(nonce) {
+		// round12 审查(I4): 持久化失败 fail-closed——已消费 nonce 未落盘时
+		// 放行会让重启窗口重新打开。
+		ok, err := s.consumeNonce(nonce)
+		if err != nil {
+			writeManagerError(w, http.StatusServiceUnavailable, "NONCE_PERSIST_FAILED", "could not persist consumed nonce")
+			return
+		}
+		if !ok {
 			writeManagerError(w, http.StatusUnauthorized, "AUTH_REPLAY", "nonce already used")
 			return
 		}
@@ -233,7 +270,9 @@ func (s *ManagerServer) authenticate(next http.Handler) http.Handler {
 }
 
 // consumeNonce 记录并消费 nonce; 重复使用返回 false。顺带惰性清理过期项。
-func (s *ManagerServer) consumeNonce(nonce string) bool {
+// stateDir 配置时先原子持久化再返回 true, 持久化失败返回错误(调用方
+// fail-closed 拒绝请求)。
+func (s *ManagerServer) consumeNonce(nonce string) (bool, error) {
 	s.seenNoncesMu.Lock()
 	defer s.seenNoncesMu.Unlock()
 	now := s.now()
@@ -243,10 +282,71 @@ func (s *ManagerServer) consumeNonce(nonce string) bool {
 		}
 	}
 	if _, seen := s.seenNonces[nonce]; seen {
-		return false
+		return false, nil
 	}
 	s.seenNonces[nonce] = now.Add(managerAuthWindow + time.Minute)
-	return true
+	if s.nonceFile != "" {
+		if err := s.persistNoncesLocked(); err != nil {
+			// 未落盘前不放行: 该 nonce 仍可被重启后的实例接受。
+			delete(s.seenNonces, nonce)
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// persistNoncesLocked 把已消费 nonce 集合原子写入状态文件
+// (临时文件 + fsync + rename, 调用方必须持有 seenNoncesMu)。
+func (s *ManagerServer) persistNoncesLocked() error {
+	data, err := json.Marshal(s.seenNonces)
+	if err != nil {
+		return fmt.Errorf("marshal nonces: %w", err)
+	}
+	tmp := filepath.Join(s.stateDir, ".nonces.tmp")
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open nonce state tmp: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("write nonce state: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync nonce state: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close nonce state: %w", err)
+	}
+	if err := os.Rename(tmp, s.nonceFile); err != nil {
+		return fmt.Errorf("commit nonce state: %w", err)
+	}
+	return nil
+}
+
+// loadNoncesLocked 启动时加载已持久化的 nonce 集合, 丢弃过期项
+// (调用方必须持有 seenNoncesMu)。文件不存在视为空状态; 文件损坏 fail-closed
+// 拒绝启动(部署需修复或删除状态文件)。
+func (s *ManagerServer) loadNoncesLocked() error {
+	data, err := os.ReadFile(s.nonceFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read nonce state %q: %w", s.nonceFile, err)
+	}
+	var loaded map[string]time.Time
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return fmt.Errorf("parse nonce state %q: %w", s.nonceFile, err)
+	}
+	now := s.now()
+	for n, expires := range loaded {
+		if now.After(expires) {
+			delete(loaded, n)
+		}
+	}
+	s.seenNonces = loaded
+	return nil
 }
 
 func writeManagerJSON(w http.ResponseWriter, status int, v any) {

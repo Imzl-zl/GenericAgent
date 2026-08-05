@@ -210,6 +210,8 @@ def test_application_configuration_uses_named_volumes() -> None:
         "delivery_spool",
         # round10 审查(B1c): 主 API unix socket 共享卷(nginx 只读挂载代理)。
         "platform_sock",
+        # round12 审查(I4): Manager 控制面 nonce 防重放状态卷(跨重启持久化)。
+        "manager_state",
     }
     # runner_workspaces 显式 name: sandbox-manager 需以 daemon 可解析的卷名
     # 做 volume-subpath 挂载(方案 §7); round11 审查(M2): 卷名带 Compose

@@ -83,12 +83,12 @@ Platform 按 `runner_key` 维护唯一 lease、任务顺序和全局 Runner 容�
 - 同一 `runner_key` 的后到 task 等待前一个 task 完成；
 - 同一 `runner_key` 最多一个活跃 Runner；
 - Runner 销毁后，下一次 task 只会为相同 `runner_key` 创建干净 Runner；
-- `GA_RUNNER_MAX_ACTIVE` 是全局上限，不按用户另设 Runner 数量上限；容量已满时 task 保持 `queued`，等待空闲 Runner 回收或容量释放后按既有顺序继续，不能因为容量不足被终态化为失败；
+- `GA_RUNNER_MAX_ACTIVE` 是全局上限，不按用户另设 Runner 数量上限；容量已满时 task 保持 `queued`，等待 lease 到期/异常兜底回收或容量释放后按既有顺序继续，不能因为容量不足被终态化为失败；
 - 不同工作区的 Runner、进程、网络身份、工作区和恢复状态完全隔离。
 
 Runner lease 是持久控制面记录，而不是进程内缓存：记录 `runner_key`、lease owner、单调递增的 `runner_generation`、不可变 container ID、健康控制端点与到期时间。创建、复用、回收、孤儿清理和 Platform/Manager 重启都必须以该 generation fencing；旧 generation 即使进程仍存活，也不能再接收 task 或提交 state。
 
-现有按 `session_key` 缓存 Worker 和按 session 顺序调度 task 的模型应保留；本次只将 Platform 内 Python 子进程换成工作区 Runner，禁止退化为每 task 一个容器。
+现有按 `session_key` 串行调度 task 的模型应保留；任务即进程（决策 D1）：每个 task 请求 Manager 创建全新 Runner，任务终态即销毁，会话连续性由 checkpoint 快照恢复保证，不再有常驻/复用 Worker。
 
 ## 4. 原生用户工作区
 
@@ -180,7 +180,7 @@ SOPHub 使用一个由部署管理员维护的平台账号，不要求每个 GA 
 | 组件 | 职责 | 明确禁止 |
 | --- | --- | --- |
 | Platform | 渠道身份绑定、用户工作区、记忆恢复、任务串行、Runner lease、文件交付、Sophub proxy、LLM capability、经认证的 Worker RPC 控制 | Docker socket、Docker exec 或修改 Runner 进程、跨用户读写工作区 |
-| Sandbox Manager | 以固定 profile 创建、检查、销毁用户 Runner；空闲回收和孤儿清理；挂载已确定的用户 subpath | 业务调度、文件字节中转、Sophub 调用、任意 Docker 参数、宿主路径或业务命令 |
+| Sandbox Manager | 以固定 profile 创建、检查、销毁任务 Runner；lease 到期/异常的孤儿清理兜底；挂载已确定的用户 subpath | 业务调度、文件字节中转、Sophub 调用、任意 Docker 参数、宿主路径或业务命令 |
 | GA Runner | 运行当前工作区的 GA 与镜像内工具，直接读写自己的 `memory/`、`temp/` 和 `state/` | Docker socket、数据库网络、其他工作区目录、Platform/Sophub/Provider 原始 Key、调用其他 Runner 的控制接口 |
 | LLM Proxy | 复用现有透明 LLM Proxy：校验 task capability 后调用上游 Provider，并仅在自身进程内注入真实 API Key | 向 Runner 暴露上游 API Key、直接暴露公网 |
 | Sophub proxy | 以 Platform 的 Sophub 账号搜索和获取可下载 SOP | 返回 API Key、全局加载用户下载的 SOP、越权访问私有内容 |
@@ -242,7 +242,7 @@ GA_WORKER_EXECUTION_MODE=user_workspace_runner
 GA_RUNNER_SECURITY_PROFILE=runsc
 GA_RUNNER_IMAGE=registry.example/ga-runner@sha256:...
 GA_RUNNER_MAX_ACTIVE=4
-GA_RUNNER_IDLE_TTL=30m
+GA_RUNNER_IDLE_TTL=30m  # Runner lease TTL: 任务期续租时长/异常兜底回收参考, 非空闲复用阈值
 GA_RUNNER_MEMORY_BYTES=1073741824
 GA_RUNNER_CPU_QUOTA=100000
 GA_RUNNER_PIDS_LIMIT=128
@@ -272,7 +272,7 @@ GA_LLM_PROXY_ADDR=http://llm-proxy:8081
 - 同一已绑定用户从微信和第二个渠道提交消息，均命中同一个 `personal:<canonical_user_id>`、个人工作区、记忆和活跃 Runner；未绑定身份不能共享它们；
 - 已授权团队成员提交消息均命中同一个 `team:<team_id>` 工作区和活跃 Runner；团队成员可见团队数据，但不能读取任一成员的个人工作区；
 - 新用户的初始 memory 必须与记录的上游 commit 的已跟踪 `memory/` 基线一致；本机 Git ignored 的 `global_mem*`、文件访问统计、私有配置和下载内容均不能进入模板或新用户工作区；
-- 同一 `runner_key` 的 task 串行执行，后到消息排队，不产生第二个 Runner；`GA_RUNNER_MAX_ACTIVE` 已满时 task 保持 queued，空闲 Runner 回收或容量释放后按既有顺序继续；不同工作区不能访问彼此的 memory、temp、SOP、文件、history 或 Runner；
+- 同一 `runner_key` 的 task 串行执行，后到消息排队，不产生第二个 Runner；`GA_RUNNER_MAX_ACTIVE` 已满时 task 保持 queued，lease 到期/异常兜底回收或容量释放后按既有顺序继续；不同工作区不能访问彼此的 memory、temp、SOP、文件、history 或 Runner；
 - Runner 可直接读取工作区附件、生成并交付 DOCX；每个成功 task 后的 state 快照必须可被独立校验。强制杀死 Runner 后重建，必须恢复该工作区最近一个成功 task 的 L1/L2、项目记忆、history 和 working state，且不能读取部分写入或损坏的快照；取消、租约丢失或数据库提交失败后创建的 staging state 不得成为恢复点。`memory/`、`temp/` 的原生写穿修改仍保留，不要求回滚；
 - Manager 只能挂载当前工作区的 `memory/`、`temp/`、`state/` subpath；创建后 `docker inspect` 必须与 server-side 推导的 source/destination、读写模式完全一致。工作区 A 在这些目录写入测试文件后，工作区 B 的 Runner 通过相对路径、绝对路径、`..`、符号链接或 shell 遍历均不能读取、修改或列出该文件；挂载全局卷、其他工作区目录、任意 host path 或任意 profile 必须失败；
 - Platform 能交付正常 DOCX、PDF、XLSX 普通文件；对符号链接、特殊文件、路径逃逸、越界文件、超大文件或检查后被替换的文件必须拒绝，并且不能读取链接目标；

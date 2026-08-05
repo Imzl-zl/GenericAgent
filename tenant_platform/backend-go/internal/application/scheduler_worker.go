@@ -23,6 +23,9 @@ type workerEntry struct {
 	cleanup     func(capabilityJTI string)
 	instID      string
 	sessionKey  string
+	// taskID 是本 entry 绑定的任务(round12 审查 M1): 销毁时清理 cancelOnce
+	// 条目, 防止按任务数无界增长。
+	taskID      string
 	credentials workerCredentialSet
 	lifecycleMu sync.Mutex
 	// startMu 只串行 StartSession 与 CancelWorker(round11 审查 C3): 同一
@@ -132,7 +135,7 @@ func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error
 // 追踪。
 func (s *scheduler) createTaskWorker(ctx context.Context, task domain.Task) (workerclient.WorkerClient, *workerEntry, error) {
 	s.mu.Lock()
-	entry := &workerEntry{sessionKey: task.SessionKey}
+	entry := &workerEntry{sessionKey: task.SessionKey, taskID: task.ID}
 	s.workers[task.SessionKey] = entry
 	s.mu.Unlock()
 	entry.lifecycleMu.Lock()
@@ -358,6 +361,32 @@ func (s *scheduler) shutdownAllWorkers(ctx context.Context) {
 	}
 }
 
+// destroyTaskWorkerEntry 按身份销毁指定 entry(round12 审查 I1): 仅当
+// s.workers[sessionKey] 仍指向该 entry 时删除并清理——旧任务收尾不得误毁
+// 同 session 新任务的 Worker(dispatch 的 deferred teardown 与并发派发之间的
+// 竞争窗口由身份校验闭合)。内部获取 lifecycleMu。
+func (s *scheduler) destroyTaskWorkerEntry(sessionKey string, entry *workerEntry) {
+	if entry == nil {
+		return
+	}
+	s.mu.Lock()
+	current := s.workers[sessionKey] == entry
+	if current {
+		delete(s.workers, sessionKey)
+	}
+	s.mu.Unlock()
+	if !current {
+		return
+	}
+	// round12 审查(M1): 任务终态即清理 cancel 合并缓存, 防止按任务数增长。
+	if entry.taskID != "" {
+		s.cancelOnce.Delete(entry.taskID)
+	}
+	entry.lifecycleMu.Lock()
+	defer entry.lifecycleMu.Unlock()
+	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+}
+
 // destroyTaskWorker 销毁任务 Worker(决策 D2.1: 任务终态即销毁): 优雅停止
 // 进程(带 capability JTI)并撤销凭证集。任务终态(成功/失败/取消/超时)后
 // 调用——下一任务冷启动全新进程, 不继承未提交内存状态。
@@ -368,9 +397,7 @@ func (s *scheduler) destroyTaskWorker(sessionKey string) {
 	if entry == nil {
 		return
 	}
-	entry.lifecycleMu.Lock()
-	defer entry.lifecycleMu.Unlock()
-	s.destroyTaskWorkerLocked(sessionKey, entry)
+	s.destroyTaskWorkerEntry(sessionKey, entry)
 }
 
 // destroyTaskWorkerLocked 是 destroyTaskWorker 的持锁变体: 调用方必须已
@@ -387,6 +414,10 @@ func (s *scheduler) destroyTaskWorkerLocked(sessionKey string, entry *workerEntr
 	s.mu.Unlock()
 	if !current {
 		return
+	}
+	// round12 审查(M1): 任务终态即清理 cancel 合并缓存。
+	if entry.taskID != "" {
+		s.cancelOnce.Delete(entry.taskID)
 	}
 	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
 }

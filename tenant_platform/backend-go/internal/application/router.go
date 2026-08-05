@@ -348,9 +348,17 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	// 并发窗口。失败返回 error 且不标记幂等, Poller 按 webhook 契约重试。
 	inboundSessionKey := personalSessionKey(ownerID)
 	if r.teams != nil {
-		if ac, err := r.teams.GetActiveContext(ctx, ownerID); err == nil {
-			inboundSessionKey = ac.SessionKey(ownerID)
+		ac, err := r.teams.GetActiveContext(ctx, ownerID)
+		if err != nil {
+			// round12 审查(I7): 上下文解析错误不得静默降级个人——团队消息可能
+			// 被写入个人工作区(审计/隐私分叉)。fail-closed 拒绝消息, Poller
+			// 按 webhook 契约重试; "无 active_contexts 行"由 GetActiveContext
+			// 返回个人上下文(TeamID nil), 不视为错误。
+			slog.ErrorContext(ctx, "router: resolve active context failed; rejecting message",
+				"bot_uuid", msg.BotUUID, "message_id", msg.MessageID, "error", err)
+			return RouterResult{}, fmt.Errorf("resolve active context: %w", err)
 		}
+		inboundSessionKey = ac.SessionKey(ownerID)
 	}
 	result, msgRow, err := r.routeBoundMessage(ctx, msg, bot, inboundSessionKey)
 	if err != nil {

@@ -24,6 +24,10 @@ import (
 // generation 递增保证, 证书签发后不轮换。
 const minRunnerCertTTL = 24 * time.Hour
 
+// managerControlTimeout 是 cleanup 中 Manager 控制面调用与 lease 释放的
+// 单次超时(round12 审查 I3): 半开连接不得让任务收尾/Platform 关闭无限阻塞。
+const managerControlTimeout = 10 * time.Second
+
 // RunnerLeaseStore 是 Platform 侧持久 Runner lease 的最小接口
 // (实现: postgres.Store; 方案 §7: generation fencing 与重启恢复)。
 type RunnerLeaseStore interface {
@@ -54,6 +58,9 @@ type SandboxConfig struct {
 	MaxActiveRunners int64
 	// ControlDialTimeout bounds waiting for the Runner gRPC endpoint.
 	ControlDialTimeout time.Duration
+	// DialControl 覆盖控制面拨号(round12 审查 I3 测试注入): 为空时使用
+	// mTLS 拨号(生产); 测试注入 bufconn 使 Start 成功路径可测。
+	DialControl func(ctx context.Context, endpoint string, clientCert CertMaterial) (*grpc.ClientConn, error)
 }
 
 // SandboxWorkerRuntime creates a workspace Runner via the Sandbox Manager and
@@ -209,7 +216,12 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 
 	// 5. 拨号控制面 mTLS(容器名:9443, runner-control 网络内 DNS)。
 	endpoint := fmt.Sprintf("%s:%d", runner.Name, sandbox.RunnerControlPort)
-	conn, err := r.dialMTLS(ctx, endpoint, clientCert)
+	var conn *grpc.ClientConn
+	if r.cfg.DialControl != nil {
+		conn, err = r.cfg.DialControl(ctx, endpoint, clientCert)
+	} else {
+		conn, err = r.dialMTLS(ctx, endpoint, clientCert)
+	}
 	if err != nil {
 		_ = r.cfg.Manager.Destroy(ctx, runner.Name)
 		releaseOnFailure()
@@ -227,8 +239,12 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 	// reaper 或其他实例接管; cleanup 时停止并等待退出。续租失败视为 lease
 	// 丢失: 立即 fence(停止 Runner 并释放 lease), 防止已过期 Runner 继续
 	// 执行任务(方案 §7 generation fencing; checkpoint 提交另有 lease 期限校验)。
+	// round12 审查(I3): renewCtx 使 cleanup 能取消在途续租调用——修复前
+	// RenewRunnerLease 用 context.Background(), 卡在 DB 调用时 cleanup 的
+	// <-renewDone 无限阻塞任务收尾与 Platform 关闭。
 	renewStop := make(chan struct{})
 	renewDone := make(chan struct{})
+	renewCtx, renewCancel := context.WithCancel(context.Background())
 	var cleanupOnce sync.Once
 	// round9 审查: cleanup 无条件销毁容器(不再依赖 created)——复用容器在
 	// 续租失败/取消/idle 回收时同样必须销毁, 否则 lease 已释放但容器继续
@@ -237,8 +253,16 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 	// 或下次接管兜底清理)。
 	cleanup := func(capabilityJTI string) {
 		cleanupOnce.Do(func() {
+			renewCancel()
 			close(renewStop)
-			<-renewDone
+			// round12 审查(I3): 带超时等待续租 goroutine 退出; 超时只记录
+			// 日志, 收尾继续(容器销毁与 lease 释放是确定性动作, 不依赖
+			// 续租 goroutine 是否已退出)。
+			select {
+			case <-renewDone:
+			case <-time.After(workerShutdownTimeout):
+				slogWarn("sandbox runtime: renewer did not stop in time; continuing shutdown", "runner_key", workspaceKey)
+			}
 			shutCtx, cancel := context.WithTimeout(context.Background(), workerShutdownTimeout)
 			// 控制面身份 fencing(方案 §7): Shutdown 绑定 workspace/generation,
 			// 并携带当前凭据集 JTI(审查 C1/I7: 生产会话有活跃 JTI 集时,
@@ -246,12 +270,18 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 			_ = client.Shutdown(shutCtx, workspaceKey, "scheduler-stop", generation, capabilityJTI)
 			cancel()
 			_ = conn.Close()
-			if err := r.cfg.Manager.Destroy(context.Background(), runner.Name); err != nil {
+			// round12 审查(I3): 控制面与 DB 调用带明确超时, 防止半开连接
+			// 让清理无限阻塞。
+			destroyCtx, destroyCancel := context.WithTimeout(context.Background(), managerControlTimeout)
+			if err := r.cfg.Manager.Destroy(destroyCtx, runner.Name); err != nil {
 				slogWarn("sandbox runtime: destroy runner on cleanup failed", "runner", runner.Name, "error", err)
 			}
+			destroyCancel()
 			// 释放 lease: 下次 acquire 以 generation+1 重建, 防旧容器复活。
 			// 带 generation 条件, 旧 cleanup 无法释放新 generation 的 lease(审查 C6)。
-			_ = r.cfg.LeaseStore.ReleaseRunnerLease(context.Background(), workspaceKey, r.cfg.PlatformInstanceID, generation)
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), managerControlTimeout)
+			_ = r.cfg.LeaseStore.ReleaseRunnerLease(releaseCtx, workspaceKey, r.cfg.PlatformInstanceID, generation)
+			releaseCancel()
 		})
 	}
 	go func() {
@@ -262,8 +292,10 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 			select {
 			case <-renewStop:
 				return
+			case <-renewCtx.Done():
+				return
 			case <-ticker.C:
-				if err := r.cfg.LeaseStore.RenewRunnerLease(context.Background(), workspaceKey, r.cfg.PlatformInstanceID, generation, r.cfg.RunnerLeaseTTL); err != nil {
+				if err := r.cfg.LeaseStore.RenewRunnerLease(renewCtx, workspaceKey, r.cfg.PlatformInstanceID, generation, r.cfg.RunnerLeaseTTL); err != nil {
 					slogWarn("sandbox runtime: renew runner lease failed; fencing runner", "runner_key", workspaceKey, "error", err)
 					go cleanup("")
 					return
