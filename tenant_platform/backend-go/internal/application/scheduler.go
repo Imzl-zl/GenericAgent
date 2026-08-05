@@ -112,13 +112,6 @@ type SchedulerConfig struct {
 	// a stalled agent stops refreshing last_activity_at and gets reaped.
 	// Zero disables idle reaping (dev/test only).
 	IdleTimeout time.Duration
-	// WorkerIdleTTL sets how long a Worker process can stay resident after its
-	// session becomes idle (no queued/starting/running task). When > 0, the
-	// scheduler evicts idle Workers to reclaim memory. Pattern: Kubernetes pod
-	// eviction + AWS Lambda container reuse window. Real deployments should
-	// set 5-15 minutes to balance cold-start overhead vs memory pressure.
-	// Zero keeps Workers resident indefinitely (dev/test or tiny fleets).
-	WorkerIdleTTL time.Duration
 }
 
 // LLMProviderSource resolves active routing order and individual live revisions.
@@ -368,7 +361,7 @@ func (s *scheduler) tick(ctx context.Context) error {
 				"LEASE_EXPIRED", "claim lease expired or lost during heartbeat", "")
 			// 审查: lease 丢失意味着旧 Worker 已与持久 lease 脱节(可能被其他
 			// 实例接管/销毁), 立即销毁本地 entry, 防止复用已 fence 的进程。
-			s.evictWorkerAfterFailure(t.SessionKey)
+			s.destroyTaskWorker(t.SessionKey)
 			_ = s.KickSession(ctx, t.SessionKey)
 			continue
 		default:
@@ -403,7 +396,6 @@ func (s *scheduler) tick(ctx context.Context) error {
 	// (architecture §8.3 WORKER_IDLE_TIMEOUT). Sessions with active owned
 	// tasks are never touched; the next task cold-starts from the last
 	// committed snapshot.
-	s.evictIdleWorkers(owned)
 	// 已 owned 的 starting 任务: 异步派发(允许多 Runner 并发, 方案 §7
 	// GA_RUNNER_MAX_ACTIVE); running 任务由各自的 dispatch goroutine 持有,
 	// tick 不再阻塞等待单个任务完成。

@@ -54,14 +54,3 @@ func (s *scheduler) resolveMCPSnapshot(ctx context.Context) (RuntimeMCPSnapshot,
 func disabledMCPSnapshot() RuntimeMCPSnapshot {
 	return RuntimeMCPSnapshot{Servers: []RuntimeMCPServer{}}
 }
-
-func (s *scheduler) mcpSnapshotRequiresReplacement(ctx context.Context, currentID string) (bool, error) {
-	if s.cfg.MCPServer == nil {
-		return currentID != "", nil
-	}
-	snapshot, err := s.resolveMCPSnapshot(ctx)
-	if err != nil {
-		return false, err
-	}
-	return snapshot.ID != currentID, nil
-}

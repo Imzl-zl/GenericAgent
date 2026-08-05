@@ -18,7 +18,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
 
-// capacityTaskStore 是最小 TaskStore fake, 只实现 dispatch→ensureWorker 失败
+// capacityTaskStore 是最小 TaskStore fake, 只实现 dispatch→createTaskWorker 失败
 // 路径实际用到的方法; 其余方法 panic 以暴露意外调用。
 type capacityTaskStore struct {
 	mu             sync.Mutex

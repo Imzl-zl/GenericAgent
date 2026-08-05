@@ -38,10 +38,6 @@ func TestResolveMCPSnapshotChangesWithRevision(t *testing.T) {
 	if first.ID == second.ID {
 		t.Fatalf("snapshot ID did not change: %s", first.ID)
 	}
-	replace, err := s.mcpSnapshotRequiresReplacement(context.Background(), first.ID)
-	if err != nil || !replace {
-		t.Fatalf("replace=%v err=%v", replace, err)
-	}
 }
 
 func TestDisabledMCPSnapshotIsStableWithoutSource(t *testing.T) {
@@ -67,13 +63,5 @@ func TestResolveMCPSnapshotTreatsNoEnabledServersAsDisabled(t *testing.T) {
 	}
 	if snapshot.ID != "" || len(snapshot.Servers) != 0 {
 		t.Fatalf("snapshot=%+v", snapshot)
-	}
-}
-
-func TestMCPSnapshotRequiresReplacementWhenSourceIsDisabled(t *testing.T) {
-	s := &scheduler{}
-	replace, err := s.mcpSnapshotRequiresReplacement(context.Background(), "sha256:old")
-	if err != nil || !replace {
-		t.Fatalf("replace=%v err=%v", replace, err)
 	}
 }

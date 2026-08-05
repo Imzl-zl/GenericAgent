@@ -30,13 +30,6 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 	}
 	entry.lifecycleMu.Lock()
 	defer entry.lifecycleMu.Unlock()
-	if !s.workerEntryIsCurrent(task.SessionKey, entry) {
-		err := fmt.Errorf("worker replaced for session %s", task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-			"CHECKPOINT_WORKER_MISSING", err.Error(), "")
-		_ = s.KickSession(ctx, task.SessionKey)
-		return err
-	}
 	// Runner generation fencing(审查 I7): 签发 checkpoint lease 时绑定当前
 	// Runner lease generation, Commit 时逐项校验, 旧 generation Runner 无法
 	// 提交恢复点。
@@ -50,14 +43,14 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 	if err != nil {
 		// checkpoint 失败: Worker 内存状态已推进但未持久化, 销毁重建(审查:
 		// 失败后不复用已变更 Worker)。
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"CHECKPOINT_PREPARE_FAILED", err.Error(), "")
 		return err
 	}
 	runnerStagingRef, err := s.cfg.Coordinator.RunnerStagingRef(lease.StagingRef)
 	if err != nil {
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"CHECKPOINT_PREPARE_FAILED", err.Error(), "")
 		return err
@@ -73,14 +66,14 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		CapabilityJti: controlJTIFor(entry.credentials),
 	})
 	if err != nil {
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"BEGIN_CHECKPOINT_FAILED", err.Error(), "")
 		return err
 	}
 	hostStagingRef, err := s.cfg.Coordinator.HostStagingRef(ready.GetStagingRef(), lease.StagingRef)
 	if err != nil {
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"BEGIN_CHECKPOINT_FAILED", err.Error(), "")
 		return err
@@ -95,20 +88,20 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		RunnerGeneration: ready.GetRunnerGeneration(),
 	})
 	if err != nil {
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"CHECKPOINT_COMMIT_FAILED", err.Error(), "")
 		return err
 	}
 	if terminal.GetResultDigest() != "" && committed.ResultDigest != "" && terminal.GetResultDigest() != committed.ResultDigest {
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"RESULT_DIGEST_MISMATCH", "terminal and checkpoint result digests differ", "")
 		return fmt.Errorf("result digest mismatch")
 	}
 	payload, err := s.cfg.Coordinator.ReadResult(ctx, committed.ResultRef, committed.ResultDigest)
 	if err != nil {
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"RESULT_READ_FAILED", err.Error(), "")
 		return err
@@ -120,7 +113,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 	// fail-closed: 声明了文件却无法交付的任务不得标记成功。
 	deliveryFiles, err := captureTaskDeliverableFiles(ctx, s.cfg.SessionFiles, task.SessionKey, string(payload.Body))
 	if err != nil {
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"DELIVERY_FILE_CAPTURE_FAILED", err.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -136,7 +129,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		latest, getErr := s.cfg.Store.GetTask(ctx, task.ID)
 		if getErr == nil && latest.Status.IsTerminal() {
 			// 事务实际已提交: committed/result 文件是恢复点, 不得删除。
-			s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+			s.destroyTaskWorkerLocked(task.SessionKey, entry)
 			_ = s.KickSession(ctx, task.SessionKey)
 			return nil
 		}
@@ -157,7 +150,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 			slog.WarnContext(ctx, "scheduler: commit outcome unknown; deferring committed file cleanup to reconciliation",
 				"task_id", task.ID, "snapshot_id", committed.SnapshotID, "error", err)
 		}
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"CHECKPOINT_COMMIT_FAILED", err.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -168,10 +161,13 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 	// 否则下一任务会继承取消任务的脏状态(审查: 成功 checkpoint 与任务成功
 	// 原子提交, 取消路径不得复用 Worker)。
 	if committedTask.Status != domain.TaskSucceeded {
-		s.evictWorkerAfterFailureLocked(task.SessionKey, entry)
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.KickSession(ctx, task.SessionKey)
 		return nil
 	}
+	// 决策 D2.1: 任务终态即销毁 Worker——成功任务同样不保留进程, 下一
+	// 任务从 checkpoint 冷启动全新 Worker。
+	s.destroyTaskWorkerLocked(task.SessionKey, entry)
 	_ = s.KickSession(ctx, task.SessionKey)
 	return nil
 }

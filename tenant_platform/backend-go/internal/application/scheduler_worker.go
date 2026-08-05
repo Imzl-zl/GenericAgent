@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	workerv1 "github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/gen/worker/v1"
@@ -17,52 +16,27 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
 
-// workerEntry holds a dedicated Worker process bound to one session_key.
+// workerEntry holds the Worker process bound to ONE task(决策 D2.1: 任务即
+// 进程)。任务终态由 destroyTaskWorker 销毁, 进程内不复用。
 type workerEntry struct {
-	client             workerclient.WorkerClient
-	cleanup            func(capabilityJTI string)
-	instID             string
-	sessionKey         string
-	taskID             string // 当前已下发 capability 的 task(方案 §7 per-task capability)
-	credentials        workerCredentialSet
-	lifecycleMu        sync.Mutex
-	// startMu 只串行 StartSession 与 CancelWorker(round11 审查 C3): 原全局
-	// workerCallMu 让一个卡住的 StartSession 阻塞所有工作区; 收窄到
-	// per-entry 后, 同一 session 的取消仍等待 StartSession 完成
-	// (cancel-during-StartSession 由 dispatch 的 durable cancel 检查处理),
-	// 而 checkpoint 收尾(completeSuccess 持 lifecycleMu)不被取消阻塞。
+	client      workerclient.WorkerClient
+	cleanup     func(capabilityJTI string)
+	instID      string
+	sessionKey  string
+	taskID      string // 本 Worker 绑定的 task(方案 §7 per-task capability)
+	credentials workerCredentialSet
+	lifecycleMu sync.Mutex
+	// startMu 只串行 StartSession 与 CancelWorker(round11 审查 C3): 同一
+	// 任务的取消等待 StartSession 完成; 而 checkpoint 收尾(completeSuccess
+	// 持 lifecycleMu)不被取消阻塞。
 	startMu sync.Mutex
 	// executing 标记 ExecuteTask 流进行中(round11 C3): CancelWorker 只在
 	// 任务实际执行时向 Worker 发取消 RPC; StartSession 刚完成但尚未执行
-	// 时跳过——dispatch 会检测 durable cancel_requested_at 并 evict 重建。
+	// 时跳过——dispatch 会检测 durable cancel_requested_at 并销毁。
 	executing atomic.Bool
-	startOnce          sync.Once
-	startErr           error
-	started            bool
-	runtimeMaxTurns    uint32
-	// lastUsedAt is updated every time a task is dispatched to this Worker.
-	// Used by the idle eviction reaper to reclaim memory from long-idle
-	// sessions (pattern: Kubernetes pod eviction, AWS Lambda container TTL).
-	lastUsedAt time.Time
 	// runnerGeneration 是该 Worker 的 Runner lease generation(方案 §7 fencing)。
 	// loopback 路径恒为 1; Sandbox 路径由持久 lease 提供。
 	runnerGeneration uint64
-}
-
-// startSession invokes StartSession on the worker exactly once. Subsequent
-// calls return the cached result. This is called AFTER MarkDispatchStarted so
-// that cancel-during-StartSession sees WorkerDispatchStartedAt != nil and
-// records a durable cancel request instead of finalizing immediately.
-func (e *workerEntry) startSession(ctx context.Context, req *workerv1.StartSessionRequest) error {
-	e.startOnce.Do(func() {
-		if _, err := e.client.StartSession(ctx, req); err != nil {
-			e.startErr = err
-			return
-		}
-		e.runtimeMaxTurns = req.GetRuntimePolicy().GetMaxTurns()
-		e.started = true
-	})
-	return e.startErr
 }
 
 func (s *scheduler) maybeCancelWorker(ctx context.Context, task domain.Task) {
@@ -128,21 +102,17 @@ func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error
 	entry := s.workers[task.SessionKey]
 	s.mu.Unlock()
 	if entry == nil {
-		// worker 已不存在 = 已被 dispatch 销毁重建/evict, 取消已生效,
+		// worker 已不存在 = 任务已终态销毁, 取消已生效,
 		// 视为成功而不是向用户报错(否则 CancelTask API 在
 		// cancel-during-StartSession 竞态下返回 500, 尽管任务已中断)。
 		return nil
 	}
 	// round11 审查(C3): 取消与同 session 的 StartSession 互斥用 per-entry
-	// startMu(原全局 workerCallMu 会让一个卡住的 StartSession 阻塞所有
-	// 工作区的派发与取消); 与 checkpoint 收尾(lifecycleMu)不互斥。
+	// startMu; 与 checkpoint 收尾(lifecycleMu)不互斥。
 	// 任务尚未进入执行阶段时跳过 RPC——dispatch 会检测 durable
-	// cancel_requested_at 并 evict 重建, 无需向 Worker 发取消。
+	// cancel_requested_at 并销毁 Worker, 无需向 Worker 发取消。
 	entry.startMu.Lock()
 	defer entry.startMu.Unlock()
-	if !s.workerEntryIsCurrent(task.SessionKey, entry) {
-		return nil
-	}
 	if !entry.executing.Load() {
 		return nil
 	}
@@ -151,104 +121,20 @@ func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error
 	return entry.client.CancelTask(cancelCtx, entry.sessionKey, task.ID, entry.runnerGeneration, controlJTIFor(entry.credentials))
 }
 
-// ensureWorker returns the dedicated Worker for task.SessionKey, creating a new
-// Worker process on first use. StartSession is NOT called here; it is invoked
-// later by dispatch after MarkDispatchStarted so that cancel-during-StartSession
-// sees WorkerDispatchStartedAt != nil and records a durable cancel request.
+// createTaskWorker 为任务创建全新 Worker 进程(决策 D2.1: 任务即进程, 不复用)。
+// StartSession 不在本函数调用; 由 dispatch 在 MarkDispatchStarted 之后调用
+// (cancel-during-StartSession 可见 durable cancel 并记录, 而非立即终态化)。
 //
-// On first use, one capability token per routed Provider is written to the
-// session-scoped runtime JSON. The real upstream keys never enter the Worker.
-// Credential sets remain tracked until their JTIs are durably revoked.
-func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerclient.WorkerClient, *workerEntry, error) {
-	for {
-		s.mu.Lock()
-		entry := s.workers[task.SessionKey]
-		if entry == nil {
-			entry = &workerEntry{sessionKey: task.SessionKey}
-			entry.lifecycleMu.Lock()
-			s.workers[task.SessionKey] = entry
-			s.mu.Unlock()
-			return s.initializeWorkerEntry(ctx, task, entry)
-		}
-		s.mu.Unlock()
-
-		entry.lifecycleMu.Lock()
-		if !s.workerEntryIsCurrent(task.SessionKey, entry) {
-			entry.lifecycleMu.Unlock()
-			continue
-		}
-		// 审查 R5-I2: 先把 entry.taskID 切换到当前任务, 再执行
-		// prepareWorkerEntry——prepare 内部(MCP/路由快照替换)触发的任务边界
-		// 凭证轮换以 entry.taskID 签发 token 并持久化 JTI。若仍指向已终态旧
-		// 任务, 新 token 会挂到无法被撤销的行上(旧任务终态事务已提交撤销旧
-		// 集, 恢复扫描只处理未终态任务), 崩溃窗口内无人撤销。
-		taskChanged := entry.taskID != task.ID
-		entry.taskID = task.ID
-		replace, err := s.prepareWorkerEntry(ctx, entry)
-		if err != nil {
-			entry.lifecycleMu.Unlock()
-			return nil, entry, err
-		}
-		if !replace {
-			entry.lastUsedAt = time.Now().UTC()
-			// per-task capability(方案 §7, 决策 D1): 复用 Worker 时新任务必须
-			// 签发绑定新 task 的 token——轮换 = 签发 + 原子写配置(touch loader
-			// 驱动 GA 原生 reload_mykeys) + 撤销旧集, 无 RPC 刷新协议。
-			if taskChanged && s.cfg.TokenIssuer != nil {
-				if err := s.rotateWorkerCredentials(ctx, entry); err != nil {
-					entry.lifecycleMu.Unlock()
-					return nil, entry, err
-				}
-			}
-			client := entry.client
-			entry.lifecycleMu.Unlock()
-			return client, entry, nil
-		}
-
-		s.removeWorkerEntry(task.SessionKey, entry)
-		s.cleanupWorkerEntryBestEffort(context.Background(), entry)
-		entry.lifecycleMu.Unlock()
-	}
-}
-
-func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) (bool, error) {
-	// 审查(review I4): 复用路径必须确认持久 lease generation 未被接管
-	// (异主接管/重启恢复会 generation+1)。ResolveGeneration 同时刷新 lease
-	// 到期时间(防 idle 过期); 不一致说明旧容器已 fence, 强制替换 Worker。
-	if entry.runnerGeneration > 0 && s.cfg.Runtime != nil {
-		generation, err := s.cfg.Runtime.ResolveGeneration(ctx, entry.sessionKey)
-		if err != nil {
-			return false, fmt.Errorf("resolve runner generation on reuse: %w", err)
-		}
-		if generation != entry.runnerGeneration {
-			slog.InfoContext(ctx, "scheduler: runner lease generation changed; replacing worker",
-				"session_key", entry.sessionKey,
-				"old_generation", entry.runnerGeneration,
-				"new_generation", generation)
-			return true, nil
-		}
-	}
-	if entry.started && entry.runtimeMaxTurns > 0 {
-		maxTurns, err := s.agentMaxTurns(ctx)
-		if err != nil {
-			return false, err
-		}
-		if entry.runtimeMaxTurns != maxTurns {
-			return true, nil
-		}
-	}
-	mcpReplace, err := s.mcpSnapshotRequiresReplacement(ctx, entry.credentials.MCPSnapshot.ID)
-	if err != nil || mcpReplace {
-		return mcpReplace, err
-	}
-	if s.cfg.TokenIssuer == nil {
-		return false, nil
-	}
-	replace, err := s.routingSnapshotRequiresReplacement(ctx, entry.credentials.Snapshot)
-	if err != nil || replace {
-		return replace, err
-	}
-	return false, nil
+// 每任务签发: 一个 capability token per routed Provider 写入 session 级
+// runtime JSON。真实上游密钥永不进入 Worker。凭证集在 JTI 持久撤销前保持
+// 追踪。
+func (s *scheduler) createTaskWorker(ctx context.Context, task domain.Task) (workerclient.WorkerClient, *workerEntry, error) {
+	s.mu.Lock()
+	entry := &workerEntry{sessionKey: task.SessionKey, taskID: task.ID}
+	s.workers[task.SessionKey] = entry
+	s.mu.Unlock()
+	entry.lifecycleMu.Lock()
+	return s.initializeWorkerEntry(ctx, task, entry)
 }
 
 func (s *scheduler) initializeWorkerEntry(
@@ -289,7 +175,6 @@ func (s *scheduler) initializeWorkerEntry(
 	entry.runnerGeneration = gen
 	entry.credentials = credentials
 	entry.taskID = task.ID
-	entry.lastUsedAt = time.Now().UTC()
 	entry.lifecycleMu.Unlock()
 	return client, entry, nil
 }
@@ -301,12 +186,6 @@ func (s *scheduler) startGeneration(ctx context.Context, sessionKey string) (uin
 		return 0, fmt.Errorf("runtime is not configured")
 	}
 	return s.cfg.Runtime.ResolveGeneration(ctx, sessionKey)
-}
-
-func (s *scheduler) workerEntryIsCurrent(sessionKey string, entry *workerEntry) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.workers[sessionKey] == entry
 }
 
 func (s *scheduler) removeWorkerEntry(sessionKey string, entry *workerEntry) {
@@ -379,9 +258,6 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	defer entry.startMu.Unlock()
 	entry.lifecycleMu.Lock()
 	defer entry.lifecycleMu.Unlock()
-	if !s.workerEntryIsCurrent(task.SessionKey, entry) {
-		return fmt.Errorf("worker replaced for session %s", task.SessionKey)
-	}
 	maxTurns, err := s.agentMaxTurns(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve agent max turns: %w", err)
@@ -398,7 +274,7 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 			CapabilityVersion:  CapabilityVersion, PolicyDigest: s.cfg.Registry.Digest(),
 		},
 	}
-	if !entry.started && !task.FreshSession && s.cfg.Coordinator != nil {
+	if !task.FreshSession && s.cfg.Coordinator != nil {
 		restore, ok, err := s.cfg.Coordinator.CurrentRestorePoint(ctx, task.WorkspaceID)
 		if err != nil {
 			s.removeWorkerEntry(task.SessionKey, entry)
@@ -426,9 +302,9 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	}
 	startCtx, cancelStart := context.WithTimeout(ctx, startTimeout)
 	defer cancelStart()
-	if err := entry.startSession(startCtx, startReq); err != nil {
-		s.removeWorkerEntry(task.SessionKey, entry)
-		s.cleanupWorkerEntryBestEffort(context.Background(), entry)
+	// 决策 D2.1: 每任务新 Worker, StartSession 恰好调用一次。
+	if _, err := entry.client.StartSession(startCtx, startReq); err != nil {
+		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		return err
 	}
 	return nil
@@ -481,11 +357,10 @@ func (s *scheduler) shutdownAllWorkers(ctx context.Context) {
 	}
 }
 
-// evictWorkerAfterFailure 在任务失败/取消/异常终止后移除并销毁该 session
-// 的 Worker(审查): 失败任务的内存历史与 working 未持久化, 复用会让下一
-// 任务继承未提交状态, 违反"只有成功 task 推进 state"不变量。下一任务从
-// 最后一个已提交 checkpoint 冷启动(generation+1 重建容器)。
-func (s *scheduler) evictWorkerAfterFailure(sessionKey string) {
+// destroyTaskWorker 销毁任务 Worker(决策 D2.1: 任务终态即销毁): 优雅停止
+// 进程(带 capability JTI)并撤销凭证集。任务终态(成功/失败/取消/超时)后
+// 调用——下一任务冷启动全新进程, 不继承未提交内存状态。
+func (s *scheduler) destroyTaskWorker(sessionKey string) {
 	s.mu.Lock()
 	entry := s.workers[sessionKey]
 	s.mu.Unlock()
@@ -494,34 +369,14 @@ func (s *scheduler) evictWorkerAfterFailure(sessionKey string) {
 	}
 	entry.lifecycleMu.Lock()
 	defer entry.lifecycleMu.Unlock()
-	s.evictWorkerAfterFailureLocked(sessionKey, entry)
+	s.destroyTaskWorkerLocked(sessionKey, entry)
 }
 
-// evictWorkerAfterFailureLocked 是 evictWorkerAfterFailure 的持锁变体:
-// 调用方必须已持有 entry.lifecycleMu(如 completeSuccess 的错误分支)。
-// 内部只获取 s.mu(workerEntryIsCurrent/removeWorkerEntry)与执行清理,
-// 不再获取 lifecycleMu, 避免持锁重入自死锁(审查: checkpoint 失败路径
-// 在锁内调用公开版会永久卡死该工作区)。
-func (s *scheduler) evictWorkerAfterFailureLocked(sessionKey string, entry *workerEntry) {
-	if !s.workerEntryIsCurrent(sessionKey, entry) {
-		return
-	}
-	s.removeWorkerEntry(sessionKey, entry)
-	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
-}
-
-// stopSessionWorker evicts the Worker for a session without cancelling any
-// task. Used by /new to force a fresh Worker on the next dispatch.
-func (s *scheduler) stopSessionWorker(sessionKey string) {
-	s.mu.Lock()
-	entry := s.workers[sessionKey]
-	s.mu.Unlock()
-	if entry == nil {
-		return
-	}
-	entry.lifecycleMu.Lock()
-	defer entry.lifecycleMu.Unlock()
-	if !s.workerEntryIsCurrent(sessionKey, entry) {
+// destroyTaskWorkerLocked 是 destroyTaskWorker 的持锁变体: 调用方必须已
+// 持有 entry.lifecycleMu(如 completeSuccess 的错误分支)。内部只获取 s.mu
+// (removeWorkerEntry)与执行清理, 不再获取 lifecycleMu, 避免持锁重入死锁。
+func (s *scheduler) destroyTaskWorkerLocked(sessionKey string, entry *workerEntry) {
+	if s.workers[sessionKey] != entry {
 		return
 	}
 	s.removeWorkerEntry(sessionKey, entry)

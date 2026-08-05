@@ -19,14 +19,14 @@ func TestEvictWorkerAfterFailureLockedNoDeadlock(t *testing.T) {
 		// 模拟 completeSuccess: 先持锁, 再在锁内 evict。
 		entry.lifecycleMu.Lock()
 		defer entry.lifecycleMu.Unlock()
-		s.evictWorkerAfterFailureLocked("session-a", entry)
+		s.destroyTaskWorkerLocked("session-a", entry)
 		close(done)
 	}()
 
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("evictWorkerAfterFailureLocked deadlocked while holding lifecycleMu")
+		t.Fatal("destroyTaskWorkerLocked deadlocked while holding lifecycleMu")
 	}
 	s.mu.Lock()
 	_, stillPresent := s.workers["session-a"]
@@ -43,12 +43,12 @@ func TestEvictWorkerAfterFailurePublicUncontended(t *testing.T) {
 	}}
 	done := make(chan struct{})
 	go func() {
-		s.evictWorkerAfterFailure("session-b")
+		s.destroyTaskWorker("session-b")
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("evictWorkerAfterFailure deadlocked")
+		t.Fatal("destroyTaskWorker deadlocked")
 	}
 }

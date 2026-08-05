@@ -18,7 +18,7 @@ import (
 func newCancelHarness(worker *controlledWorker) *scheduler {
 	entry := &workerEntry{
 		client: worker, sessionKey: "personal:1",
-		started: true, credentials: workerCredentialSet{},
+		credentials: workerCredentialSet{},
 	}
 	entry.executing.Store(true)
 	return &scheduler{
@@ -111,7 +111,7 @@ func TestCancelWorkerMergesConcurrentCalls(t *testing.T) {
 // handle the durable cancel request itself).
 func TestCancelWorkerSkipsRPCWhenTaskNotExecuting(t *testing.T) {
 	worker := newControlledWorker()
-	entry := &workerEntry{client: worker, sessionKey: "personal:1", started: true}
+	entry := &workerEntry{client: worker, sessionKey: "personal:1"}
 	s := &scheduler{
 		cfg:     SchedulerConfig{},
 		workers: map[string]*workerEntry{"personal:1": entry},

@@ -472,7 +472,6 @@ func run() error {
 		taskTimeoutSeconds    = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
 		maxTaskWallClockSec   = flag.Int("max-task-wall-clock-seconds", envInt("MAX_TASK_WALL_CLOCK_SECONDS", 2700), "hard task wall-clock limit; capability TTL must cover this plus refresh skew")
 		taskIdleTimeoutSec    = flag.Int("task-idle-timeout-seconds", envInt("TASK_IDLE_TIMEOUT_SECONDS", 300), "Idle reaper threshold (or TASK_IDLE_TIMEOUT_SECONDS). Default 300s (5min). A running task whose last_activity_at is older than this is finalized as WORKER_IDLE. Covers 'Worker alive but deadlocked' (GIL/hung I/O) — the scenario stream errors + lease loss cannot catch. Worker keeps last_activity_at fresh via chunk events + 30s heartbeats. 0 = disabled (dev/test only).")
-		workerIdleTTLSec      = flag.Int("worker-idle-ttl-seconds", envInt("WORKER_IDLE_TTL_SECONDS", 600), "Worker eviction threshold (or WORKER_IDLE_TTL_SECONDS). Default 600s (10min). Idle Worker processes (no active task) older than this are torn down to reclaim memory (pattern: Kubernetes pod eviction + AWS Lambda container reuse window). Next task cold-starts from last snapshot. 0 = keep Workers resident indefinitely (dev/test or tiny fleets).")
 	)
 	flag.Parse()
 
@@ -564,11 +563,11 @@ func run() error {
 	// Resource quotas: enforced by scheduler (global running cap) and store
 	// (per-user queued cap). Zero disables (dev/test).
 	store.SetPerUserQueueLimit(*perUserQueueLimit)
-	if *maxRunningTasks > 0 || *taskTimeoutSeconds > 0 || *taskIdleTimeoutSec > 0 || *workerIdleTTLSec > 0 {
-		fmt.Fprintf(os.Stderr, "platform: quota max_running_tasks=%d per_user_queue_limit=%d worker_task_timeout=%ds idle_reaper=%ds worker_idle_ttl=%ds\n",
-			*maxRunningTasks, *perUserQueueLimit, *taskTimeoutSeconds, *taskIdleTimeoutSec, *workerIdleTTLSec)
+	if *maxRunningTasks > 0 || *taskTimeoutSeconds > 0 || *taskIdleTimeoutSec > 0 {
+		fmt.Fprintf(os.Stderr, "platform: quota max_running_tasks=%d per_user_queue_limit=%d worker_task_timeout=%ds idle_reaper=%ds\n",
+			*maxRunningTasks, *perUserQueueLimit, *taskTimeoutSeconds, *taskIdleTimeoutSec)
 	} else {
-		fmt.Fprintf(os.Stderr, "platform: quotas disabled (max_running_tasks=0 per_user_queue_limit=0 worker_task_timeout=0 idle_reaper=0 worker_idle_ttl=0); stuck detection via gRPC stream errors + heartbeat lease loss\n")
+		fmt.Fprintf(os.Stderr, "platform: quotas disabled (max_running_tasks=0 per_user_queue_limit=0 worker_task_timeout=0 idle_reaper=0); stuck detection via gRPC stream errors + heartbeat lease loss\n")
 	}
 
 	boot, err := application.LoadDevBootstrapFromEnv()
@@ -764,7 +763,6 @@ func run() error {
 		TaskTimeoutSeconds:    *taskTimeoutSeconds,
 		RuntimeSettings:       store,
 		IdleTimeout:           time.Duration(*taskIdleTimeoutSec) * time.Second,
-		WorkerIdleTTL:         time.Duration(*workerIdleTTLSec) * time.Second,
 	})
 	if err != nil {
 		return err
@@ -963,7 +961,6 @@ func run() error {
 			MaxTaskWallClockSeconds:   *maxTaskWallClockSec,
 			TaskTimeoutSeconds:        *taskTimeoutSeconds,
 			TaskIdleTimeoutSeconds:    *taskIdleTimeoutSec,
-			WorkerIdleTTLSeconds:      *workerIdleTTLSec,
 			MaxRunningTasks:           *maxRunningTasks,
 			PerTenantRunningLimit:     *perTenantRunningLimit,
 			PerUserQueueLimit:         *perUserQueueLimit,

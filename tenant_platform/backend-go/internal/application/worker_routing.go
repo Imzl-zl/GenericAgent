@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"reflect"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
@@ -84,36 +83,6 @@ func newRoutingProvider(provider domain.LLMProvider) routingProvider {
 		Model: provider.Model, RuntimeName: runtimeProviderName(provider.ID),
 		SessionConfig: provider.SessionConfig,
 	}
-}
-
-func routingProvidersEqual(left, right routingProvider) bool {
-	return left.ID == right.ID &&
-		left.Revision == right.Revision &&
-		left.ProviderType == right.ProviderType &&
-		left.Model == right.Model &&
-		left.RuntimeName == right.RuntimeName &&
-		reflect.DeepEqual(left.SessionConfig, right.SessionConfig)
-}
-
-func (s *scheduler) routingSnapshotRequiresReplacement(ctx context.Context, snapshot routingSnapshot) (bool, error) {
-	providers, err := s.cfg.LLMProvider.ListActiveProviders(ctx)
-	if err != nil {
-		return false, fmt.Errorf("list active LLM providers: %w", err)
-	}
-	if len(providers) != len(snapshot.Providers) {
-		return true, nil
-	}
-	currentByID := make(map[int64]domain.LLMProvider, len(providers))
-	for _, provider := range providers {
-		currentByID[provider.ID] = provider
-	}
-	for _, bound := range snapshot.Providers {
-		current, active := currentByID[bound.ID]
-		if !active || !routingProvidersEqual(newRoutingProvider(current), bound) {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 type routingAuditDetail struct {

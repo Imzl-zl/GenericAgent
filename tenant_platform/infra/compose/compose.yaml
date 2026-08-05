@@ -126,7 +126,6 @@ services:
       TASK_IDLE_TIMEOUT_SECONDS: ${TASK_IDLE_TIMEOUT_SECONDS}
       # 单任务硬性时长上限(原 GA_RUNNER_TASK_TIMEOUT, 审查 M12: 语义属 Platform)
       TASK_TIMEOUT_SECONDS: ${GA_RUNNER_TASK_TIMEOUT:-300}
-      WORKER_IDLE_TTL_SECONDS: ${WORKER_IDLE_TTL_SECONDS}
       # 生产 Runner 控制面(方案 §7): Platform 经认证 Manager API 操作容器。
       GA_WORKSPACES_ROOT: /var/lib/ga/workspaces
       GA_MANAGER_ADDR: ${GA_MANAGER_ADDR:-http://sandbox-manager:8091}

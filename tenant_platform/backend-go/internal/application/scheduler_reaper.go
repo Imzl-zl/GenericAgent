@@ -52,9 +52,8 @@ func (s *scheduler) reapIdleTasks(ctx context.Context, owned []domain.Task, idle
 		cancel()
 		_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_IDLE", "Worker heartbeat went silent; possible deadlock or hung I/O", "")
-		// 审查: idle 任务被收割后 Worker 内存状态未提交, 不复用——销毁重建,
-		// 否则下一任务会继承未提交的 history/working 或与仍在运行的旧任务重叠。
-		s.evictWorkerAfterFailure(t.SessionKey)
+		// 任务终态即销毁 Worker(决策 D2.1): 内存状态未提交, 下一任务冷启动。
+		s.destroyTaskWorker(t.SessionKey)
 		_ = s.KickSession(ctx, t.SessionKey)
 	}
 	return nil
@@ -95,51 +94,4 @@ func formatActivityTime(lastActivity time.Time, dispatchStarted *time.Time) stri
 		return "dispatch:" + dispatchStarted.UTC().Format(time.RFC3339)
 	}
 	return "unknown"
-}
-
-// evictIdleWorkers tears down resident Worker processes whose session has no
-// active owned task and whose lastUsedAt is older than WorkerIdleTTL. This is
-// the WORKER_IDLE_TIMEOUT behavior from architecture §8.3: idle Workers hold
-// memory (Python process + GA history) but no model concurrency, so they are
-// reclaimed after a grace window. Session continuity is preserved because the
-// next task cold-starts a Worker from the last committed snapshot
-// (StartSessionRequest.SnapshotId).
-//
-// Safety: sessions present in `owned` (starting/running on this instance) are
-// never evicted. The lastUsedAt freshness check additionally protects the
-// microsecond window between ensureWorker and MarkDispatchStarted in dispatch,
-// since TTL is minutes while that window is not.
-func (s *scheduler) evictIdleWorkers(owned []domain.Task) {
-	if s.cfg.WorkerIdleTTL <= 0 {
-		return
-	}
-	cutoff := time.Now().UTC().Add(-s.cfg.WorkerIdleTTL)
-	active := make(map[string]struct{}, len(owned))
-	for _, task := range owned {
-		active[task.SessionKey] = struct{}{}
-	}
-	s.mu.Lock()
-	candidates := make([]*workerEntry, 0, len(s.workers))
-	for sessionKey, entry := range s.workers {
-		if _, busy := active[sessionKey]; !busy {
-			candidates = append(candidates, entry)
-		}
-	}
-	s.mu.Unlock()
-
-	for _, entry := range candidates {
-		entry.lifecycleMu.Lock()
-		if !s.workerEntryIsCurrent(entry.sessionKey, entry) || entry.lastUsedAt.After(cutoff) {
-			entry.lifecycleMu.Unlock()
-			continue
-		}
-		s.removeWorkerEntry(entry.sessionKey, entry)
-		slog.Info("scheduler: evicting idle worker",
-			"session_key", entry.sessionKey,
-			"worker_instance_id", entry.instID,
-			"idle_ttl_seconds", int(s.cfg.WorkerIdleTTL.Seconds()),
-			"last_used_at", entry.lastUsedAt.UTC().Format(time.RFC3339))
-		s.cleanupWorkerEntryBestEffort(context.Background(), entry)
-		entry.lifecycleMu.Unlock()
-	}
 }

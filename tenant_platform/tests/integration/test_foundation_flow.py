@@ -978,6 +978,21 @@ def _assert_capability_rejections(proxy_base: str, token: str, provider: dict) -
         assert (status, body.get("code")) == (expected_status, expected_code), body
 
 
+def _list_python_pids() -> list[int]:
+    """tasklist 快速枚举 python 解释器 PID(毫秒级, 适合短命 Worker 采样)。"""
+    import subprocess
+    out = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True, timeout=10,
+    ).stdout
+    pids: list[int] = []
+    for line in out.splitlines():
+        parts = [p.strip().strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[1].isdigit():
+            pids.append(int(parts[1]))
+    return pids
+
+
 def _assert_worker_process_isolated(
     platform_pid: int,
     config_root: Path,
@@ -992,12 +1007,16 @@ def _assert_worker_process_isolated(
     while time.time() < deadline:
         workers.clear()
         candidates.clear()
-        for process in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        # 决策 D2.1: 任务即进程——Worker 只存活于任务执行期(秒级), psutil
+        # 全系统枚举一次可达数秒会错过短命进程。tasklist 毫秒级返回所有
+        # python 进程 PID, 再只对候选读取 cmdline(1-3 个进程)。
+        for pid in _list_python_pids():
             try:
+                process = psutil.Process(pid)
                 command = process.cmdline()
                 if "ga_worker.entrypoint" not in " ".join(command):
                     continue
-                candidates.append((process.pid, process.ppid(), command))
+                candidates.append((pid, process.ppid(), command))
                 environment = process.environ()
                 worker_root = Path(environment.get("GA_CONFIG_ROOT", "")).resolve()
                 if worker_root == expected_root or expected_root in worker_root.parents:
@@ -1131,22 +1150,26 @@ def _exercise_initial_oai_binding(
         pass
     started = _submit_started(base, "ga-chat-primary", "ga-chat-primary")
     token, proxy_base = _wait_runtime_token(config_root, primary, prev_signature)
+    # 决策 D2.1: 任务即进程——任务终态即销毁 Worker, 进程隔离断言必须在
+    # 任务执行早期采样(token 刚签发, 进程必然活跃; psutil 已预热保证首次
+    # 扫描毫秒级)。能力拒绝/流式测试随后仍在活跃窗口内。
+    _assert_worker_process_isolated(proc.pid, config_root, REAL_KEY_SENTINELS)
     _assert_capability_rejections(proxy_base, token, primary)
     _assert_stream_first_chunk_unbuffered(proxy_base, token, primary["model"])
     final = _poll_status(base, started["task_id"], {"succeeded", "failed"}, timeout=150)
     assert final["status"] == "succeeded", final
     first_request = _captured_request(fixture, "ga-chat-primary", OAI_TOKEN)
     assert first_request["path"] == "/v1/chat/completions"
-    _assert_worker_process_isolated(proc.pid, config_root, REAL_KEY_SENTINELS)
 
     document = _runtime_document(config_root)
     signature = _runtime_signature(document)
     _set_default_provider(base, secondary["provider_id"])
     _submit_success(base, "ga-existing-after-default", "ga-existing-after-default")
-    _captured_request(fixture, "ga-existing-after-default", OAI_TOKEN)
-    # 每任务 capability(方案 §7): 复用 Worker 时每个新任务都签发绑定自身
-    # task_id 的新 token, 终态后旧 token 撤销——runtime 文档必然推进。
-    # 路由快照不变由"任务仍用 OAI_TOKEN(primary)"断言覆盖。
+    # 决策 D2.1(任务即进程): 每个任务都是新 Worker, 重新解析路由快照——
+    # 默认切换后新任务跟随新默认(secondary 第一)。
+    _captured_request(fixture, "ga-existing-after-default", SECONDARY_OAI_TOKEN)
+    # 每任务 capability(方案 §7): 每个新任务都签发绑定自身 task_id 的新
+    # token, 终态后旧 token 撤销——runtime 文档必然推进。
     new_signature = _runtime_signature(_runtime_document(config_root))
     assert new_signature != signature
 
@@ -1246,10 +1269,12 @@ def _exercise_responses_and_claude_default(
     _submit_success(
         base, "ga-existing-oai-after-claude", "ga-existing-oai-after-claude"
     )
+    # 决策 D2.1(任务即进程): 每任务重新解析路由快照——默认切到 claude 后
+    # 新任务跟随 claude(不再复用旧 Worker 的旧快照)。
     request = _captured_request(
-        fixture, "ga-existing-oai-after-claude", ROTATED_OAI_TOKEN
+        fixture, "ga-existing-oai-after-claude", CLAUDE_TOKEN
     )
-    assert request["path"] == "/v1/responses"
+    assert request["path"] == "/v1/messages"
     return claude
 
 
@@ -1274,7 +1299,6 @@ def _exercise_new_claude_worker(
     assert len(mixin_names) == 3
     provider_keys = [key for key in document if key.startswith("platform_native_")]
     assert len(provider_keys) == 3
-    _assert_worker_process_isolated(proc.pid, config_root, REAL_KEY_SENTINELS)
 
 
 def _exercise_provider_disable(
@@ -1348,7 +1372,6 @@ def test_real_ga_protocol_routing_rotation_and_security_contract(tmp_path: Path)
         claude = _exercise_responses_and_claude_default(
             base, config_root, fixture, primary
         )
-        _assert_worker_process_isolated(proc.pid, config_root, REAL_KEY_SENTINELS)
         logs.append(_stop(proc, log_path))
         proc = None
 

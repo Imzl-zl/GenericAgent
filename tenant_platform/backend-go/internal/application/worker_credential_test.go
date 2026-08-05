@@ -2,7 +2,6 @@ package application
 
 import (
 	"context"
-	"sync"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -185,7 +184,7 @@ func TestWriteRuntimeConfigOverwritesExistingMyKey(t *testing.T) {
 	}
 }
 
-func TestRoutingSnapshotIgnoresDefaultSwitchAndDetectsBoundProviderChange(t *testing.T) {
+func TestRoutingSnapshotFollowsDefaultSwitch(t *testing.T) {
 	defaultProvider := testProvider(2, 4, domain.ProviderNativeClaude, true)
 	stream := true
 	defaultProvider.SessionConfig.Stream = &stream
@@ -204,37 +203,44 @@ func TestRoutingSnapshotIgnoresDefaultSwitchAndDetectsBoundProviderChange(t *tes
 		t.Fatalf("invalid snapshot=%+v", snapshot)
 	}
 
+	// 决策 D2.1(任务即进程): 每次任务都重新解析快照——默认切换后新任务
+	// 跟随新默认(默认 provider 恒第一); provider 集/内容不变时其余顺序稳定。
 	source.providers = []domain.LLMProvider{secondary, defaultProvider}
 	source.providers[0].IsDefault = true
 	source.providers[1].IsDefault = false
 	sameStream := true
 	source.providers[1].SessionConfig.Stream = &sameStream
-	replace, err := s.routingSnapshotRequiresReplacement(context.Background(), snapshot)
+	afterSwitch, err := s.resolveRoutingSnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replace || snapshot.Providers[0].ID != defaultProvider.ID {
-		t.Fatal("default switch must not change an already-bound Worker snapshot")
+	if afterSwitch.Providers[0].ID != secondary.ID {
+		t.Fatal("default switch must move the new default first for fresh workers")
+	}
+	if afterSwitch.ID == snapshot.ID {
+		t.Fatal("default switch must change the snapshot for fresh workers")
 	}
 
+	// 新 provider 加入必须改变 snapshot。
 	newFallback := testProvider(3, 1, domain.ProviderNativeOAI, false)
 	source.providers = append(source.providers, newFallback)
-	replace, err = s.routingSnapshotRequiresReplacement(context.Background(), snapshot)
+	withNew, err := s.resolveRoutingSnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !replace {
-		t.Fatal("new active provider must replace the Worker")
+	if withNew.ID == afterSwitch.ID || len(withNew.Providers) != 3 {
+		t.Fatal("new active provider must change the snapshot")
 	}
 	source.providers = source.providers[:2]
 
+	// 绑定 provider 修订变化必须改变 snapshot。
 	source.providers[0].Revision++
-	replace, err = s.routingSnapshotRequiresReplacement(context.Background(), snapshot)
+	withRev, err := s.resolveRoutingSnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !replace {
-		t.Fatal("bound provider revision change must replace the Worker")
+	if withRev.ID == afterSwitch.ID {
+		t.Fatal("bound provider revision change must change the snapshot")
 	}
 }
 
@@ -309,7 +315,7 @@ func TestIssueProviderCapabilitiesAcceptsExactLifetimeCoverage(t *testing.T) {
 	}
 }
 
-func TestEnsureWorkerAppliesProviderChangesOnlyAtNextTaskBoundary(t *testing.T) {
+func TestCreateTaskWorkerAlwaysStartsFreshWorker(t *testing.T) {
 	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
 	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
 	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
@@ -333,39 +339,34 @@ func TestEnsureWorkerAppliesProviderChangesOnlyAtNextTaskBoundary(t *testing.T) 
 		},
 		workers: make(map[string]*workerEntry),
 	}
-	task := domain.Task{SessionKey: "personal:1"}
-	_, first, err := s.ensureWorker(context.Background(), task)
+	taskA := domain.Task{ID: "task-A", SessionKey: "personal:1"}
+	_, first, err := s.createTaskWorker(context.Background(), taskA)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// A key-only rotation preserves revision and must not disturb the bound Worker.
-	source.providers[0].APIKey = "rotated-key"
-	_, same, err := s.ensureWorker(context.Background(), task)
-	if err != nil {
-		t.Fatal(err)
+	if len(started) != 1 {
+		t.Fatalf("starts=%d want 1", len(started))
 	}
-	if same != first || cleanupCalls != 0 {
-		t.Fatal("key-only rotation replaced the current Worker snapshot")
+	// 决策 D2.1: 任务终态销毁 Worker。
+	s.destroyTaskWorker(taskA.SessionKey)
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanup=%d want 1", cleanupCalls)
 	}
-
-	// The currently bound entry remains immutable until the next ensureWorker call.
+	// 下一任务冷启动全新进程, 且每次解析最新路由快照。
 	source.providers[0].Revision = 2
-	if first.credentials.Snapshot.Providers[0].Revision != 1 {
-		t.Fatal("mid-task provider edit mutated the current routing snapshot")
-	}
-	_, replacement, err := s.ensureWorker(context.Background(), task)
+	taskB := domain.Task{ID: "task-B", SessionKey: "personal:1"}
+	_, second, err := s.createTaskWorker(context.Background(), taskB)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replacement == first || cleanupCalls != 1 || len(started) != 2 {
-		t.Fatalf("replacement=%t cleanup=%d starts=%d", replacement != first, cleanupCalls, len(started))
+	if second == first || len(started) != 2 {
+		t.Fatalf("fresh worker expected: same=%t starts=%d", second == first, len(started))
 	}
-	if replacement.credentials.Snapshot.Providers[0].Revision != 2 {
-		t.Fatalf("replacement snapshot=%+v", replacement.credentials.Snapshot)
+	if second.credentials.Snapshot.Providers[0].Revision != 2 {
+		t.Fatalf("fresh snapshot=%+v", second.credentials.Snapshot)
 	}
-	if len(capabilities.revoked) != 2 {
-		t.Fatalf("old capability revocations=%d want 2 (llm + control)", len(capabilities.revoked))
+	if second.taskID != "task-B" {
+		t.Fatalf("entry.taskID=%q want task-B", second.taskID)
 	}
 }
 
@@ -529,11 +530,9 @@ func TestIssueCredentialsPersistsJTIsBeforeReturn(t *testing.T) {
 	}
 }
 
-// TestEnsureWorkerSwitchesTaskBeforePrepareRefresh 验证审查 R5-I2: 复用
-// Worker 时 entry.taskID 必须先切换到新任务再执行 prepareWorkerEntry——
-// prepare 内部因凭据到期触发的 credential 刷新以 entry.taskID 签发并持久化
-// JTI; 若仍指向已终态旧任务, 新 token 会挂到无法被撤销的行上(旧任务终态
-// 事务已提交, 恢复扫描只处理未终态任务), 崩溃窗口内无人撤销。
+// TestCleanupWorkerEntryPassesFirstJTI 验证审查 C1/I7: Worker 清理/关闭时
+// 必须携带当前凭据集的首个 JTI(生产会话有活跃 JTI 集, 空 JTI 的 Shutdown
+// 会被 Worker 拒绝, 优雅关闭必然失败)。
 func TestCleanupWorkerEntryPassesFirstJTI(t *testing.T) {
 	s := &scheduler{}
 	var got string
@@ -584,85 +583,5 @@ func TestIssueInitialCredentialsWritesGenerationScopedConfigDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(gotDir, runtimeConfigFilename)); err != nil {
 		t.Fatalf("runtime config must be written under config/g2 (err=%v)", err)
-	}
-}
-
-// TestRotateWorkerCredentialsAtTaskBoundary 验证决策 D1: 复用 Worker 的任务
-// 边界轮换凭证——签发绑定新任务的新集并原子写入 runtime config, 撤销旧集,
-// 且不调用 ReloadCredentials RPC(热刷新协议已删除)。
-func TestRotateWorkerCredentialsAtTaskBoundary(t *testing.T) {
-	dir := t.TempDir()
-	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
-	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
-		ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
-		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
-		JTIs:      []string{"old-jti"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
-		t.Fatal(err)
-	}
-	worker := newControlledWorker()
-	capabilities := &routingCapabilityStore{}
-	pstore := &jtiPersistingStore{}
-	entry := &workerEntry{
-		client: worker, sessionKey: "personal:r", taskID: "old-task",
-		credentials: workerCredentialSet{
-			ExpiresAt: time.Now().UTC().Add(time.Minute),
-			JTIs:      []string{"old-jti"}, Snapshot: snapshot,
-		},
-		runnerGeneration: 1,
-	}
-	s := &scheduler{cfg: SchedulerConfig{
-		PlatformInstanceID: "p1",
-		TokenIssuer:        issuer,
-		CapabilityStore:    capabilities,
-		LLMProvider:        source,
-		LLMProxyAddr:       "http://127.0.0.1:9999",
-		ConfigRoot:         dir,
-		ModelPolicyVersion: "test.v1",
-		TokenTTL:           time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
-		Store: pstore,
-	},
-	workers: map[string]*workerEntry{"personal:r": entry},
-	mu:      sync.Mutex{},
-}
-
-	newTask := domain.Task{ID: "new-task", SessionKey: "personal:r", Status: domain.TaskStarting}
-	if _, _, err := s.ensureWorker(context.Background(), newTask); err != nil {
-		t.Fatalf("ensureWorker: %v", err)
-	}
-	// 新集 JTI 必须持久化到新任务(终态撤销依据), 绝不挂旧任务。
-	if len(pstore.calls) == 0 {
-		t.Fatal("no SetTaskCapabilityJTIs call from task-boundary rotation")
-	}
-	for _, call := range pstore.calls {
-		if strings.HasPrefix(call, "old-task:") {
-			t.Fatalf("rotation must not persist JTI under terminal old task, got %q", call)
-		}
-	}
-	if entry.taskID != "new-task" {
-		t.Fatalf("entry.taskID = %q, want new-task", entry.taskID)
-	}
-	// 热刷新协议已删除: WorkerClient 接口已无 ReloadCredentials(编译期保证),
-	// 轮换仅靠签发 + 写配置 + 撤销。
-	// 旧集必须撤销(测试旧集手工构造 1 个 JTI)。
-	if len(capabilities.revoked) < 1 {
-		t.Fatalf("old credential revocations=%d, want >= 1", len(capabilities.revoked))
-	}
-	// 新配置必须原子写入 config 目录。
-	if _, err := os.Stat(filepath.Join(dir, runtimeConfigFilename)); err != nil {
-		t.Fatalf("rotated runtime config not written: %v", err)
 	}
 }

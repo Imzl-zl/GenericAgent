@@ -123,7 +123,6 @@ type RuntimeProfile struct {
 	MaxTaskWallClockSeconds   int `json:"max_task_wall_clock_seconds"`
 	TaskTimeoutSeconds        int `json:"task_timeout_seconds"`
 	TaskIdleTimeoutSeconds    int `json:"task_idle_timeout_seconds"`
-	WorkerIdleTTLSeconds      int `json:"worker_idle_ttl_seconds"`
 	MaxRunningTasks           int `json:"max_running_tasks"`
 	PerTenantRunningLimit     int `json:"per_tenant_running_limit"`
 	PerUserQueueLimit         int `json:"per_user_queue_limit"`

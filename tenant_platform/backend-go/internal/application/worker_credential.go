@@ -204,31 +204,6 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	return set, files, nil
 }
 
-// rotateWorkerCredentials 在复用 Worker 的任务边界签发绑定新任务的凭证集
-// (决策 D1): 签发 → 原子写入 runtime config(touch loader 驱动 GA 原生
-// reload_mykeys) → 撤销旧集。无 ReloadCredentials RPC/ack/rollback 状态机。
-// 旧集撤销失败返回错误由 dispatch 处理(与刷新失败同语义); 终态撤销仍由
-// dispatch 负责, 此处兜底任务边界仍活跃的旧集。
-func (s *scheduler) rotateWorkerCredentials(ctx context.Context, entry *workerEntry) error {
-	newSet, files, err := s.issueProviderCapabilitiesWithRuntime(
-		ctx, entry.sessionKey, entry.credentials.Snapshot,
-		entry.credentials.MCPSnapshot, entry.runnerGeneration, entry.taskID,
-	)
-	if err != nil {
-		return err
-	}
-	if err := WriteRuntimeConfigAtomic(s.runtimeConfigDir(entry.sessionKey, entry.runnerGeneration), files); err != nil {
-		s.revokeCredentialSetBestEffort(ctx, newSet)
-		return fmt.Errorf("write per-task runtime config: %w", err)
-	}
-	oldSet := entry.credentials
-	entry.credentials = newSet
-	if err := s.revokeCredentialSet(ctx, oldSet); err != nil {
-		return fmt.Errorf("revoke previous Worker credentials: %w", err)
-	}
-	return nil
-}
-
 func (s *scheduler) revokeCredentialSet(ctx context.Context, set workerCredentialSet) error {
 	if s.cfg.CapabilityStore == nil || len(set.JTIs) == 0 {
 		return nil

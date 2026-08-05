@@ -352,38 +352,6 @@ func TestStartSessionOnWorkerUsesConfiguredAgentMaxTurns(t *testing.T) {
 	}
 }
 
-func TestPrepareWorkerEntryReplacesWorkerAfterAgentMaxTurnsChanges(t *testing.T) {
-	settings := &fakeAgentRuntimeSettings{maxTurns: 120}
-	entry := &workerEntry{started: true, runtimeMaxTurns: 80}
-	s := &scheduler{cfg: SchedulerConfig{RuntimeSettings: settings}}
-
-	replace, err := s.prepareWorkerEntry(context.Background(), entry)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !replace {
-		t.Fatal("expected worker with stale max turns to be replaced")
-	}
-}
-
-func TestPrepareWorkerEntryReplacesWorkerAfterMCPSnapshotChanges(t *testing.T) {
-	entry := &workerEntry{credentials: workerCredentialSet{
-		MCPSnapshot: RuntimeMCPSnapshot{ID: "sha256:old"},
-	}}
-	s := &scheduler{cfg: SchedulerConfig{MCPServer: &fakeMCPSource{servers: []domain.MCPServer{{
-		ID: 1, ServerKey: "exa", Name: "Exa", URL: "https://mcp.exa.ai/mcp",
-		TimeoutSeconds: 30, Enabled: true, Revision: 2,
-	}}}}}
-
-	replace, err := s.prepareWorkerEntry(context.Background(), entry)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !replace {
-		t.Fatal("expected worker with stale MCP snapshot to be replaced")
-	}
-}
-
 func TestScheduler_AcceptedRunningCancelReachesWorkerBeforeStreamCompletionAndWinsSuccessRace(t *testing.T) {
 	_, store, reg, dev := serviceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

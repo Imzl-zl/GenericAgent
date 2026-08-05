@@ -54,7 +54,7 @@ func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) 
 		slog.WarnContext(ctx, "scheduler: deadline cancel failed", "task_id", task.ID, "error", err)
 	}
 	// 超时后 Worker 内存状态不确定, 不复用(审查: 失败后不复用)。
-	s.evictWorkerAfterFailure(task.SessionKey)
+	s.destroyTaskWorker(task.SessionKey)
 	s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 		"TASK_DEADLINE_EXCEEDED", "task exceeded maximum wall-clock duration", "")
 	_ = s.KickSession(ctx, task.SessionKey)
@@ -156,7 +156,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			latest, getErr := s.cfg.Store.GetTask(fbCtx, task.ID)
 			if getErr == nil && !latest.Status.IsTerminal() {
 				_ = s.CancelWorker(fbCtx, latest)
-				s.evictWorkerAfterFailure(task.SessionKey)
+				s.destroyTaskWorker(task.SessionKey)
 				_ = s.finalizeOrFail(fbCtx, latest, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 					"CLAIM_LEASE_LOST", err.Error(), "")
 				_ = s.KickSession(fbCtx, task.SessionKey)
@@ -166,13 +166,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}()
 	ctx = heartbeat.ctx
 
-	// /new was issued: stop any existing Worker for this session so the
-	// next task starts with cleared history and working state.
-	if task.FreshSession {
-		s.stopSessionWorker(task.SessionKey)
-	}
-
-	client, entry, err := s.ensureWorker(ctx, task)
+	client, entry, err := s.createTaskWorker(ctx, task)
 	if err != nil {
 		// Runner 容量满或 lease 被其他实例持有: 不是任务失败, 退回 queued
 		// 等下一轮 tick 重试(审查 C3: 满载保持 queued, 绝不终态化)。
@@ -216,7 +210,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		// 审查 R4-C2: 派发无法继续且任务未终态——本地 Worker 已创建但可能
 		// 绑定错误归属(claim 被接管), 销毁防脏复用; 任务保持 starting 由
 		// 下一轮 tick 重新派发(WorkerDispatchStartedAt 仍为 NULL)。
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		return nil
 	}
 	// 注意: 任务签发的 JTI 已在 issueProviderCapabilitiesWithRuntime 内、
@@ -241,7 +235,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		// 审查 R4-C2: dispatch 无法继续且任务未终态。销毁本地 Worker 防脏
 		// 复用(任务可能已被接管/终态化, 本地进程不得留给下一任务), 并尽力
 		// 终态化防任务卡死; 失败时由 lease 过期恢复路径兜底, 无副作用。
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"MARK_RUNNING_FAILED", err.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -252,7 +246,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	taskRow, err := s.cfg.Store.GetTask(ctx, task.ID)
 	if err != nil {
 		// 审查 R4-C2: 同 MarkRunning 失败路径——销毁 Worker + 尽力终态化。
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_STATE_READ_FAILED", err.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -264,7 +258,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	if taskRow.CancelRequestedAt != nil {
 		// 审查: StartSession 已执行但任务在 ExecuteTask 前被取消, Worker
 		// 内存状态未提交, 销毁重建而非复用。
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, s.cfg.PlatformInstanceID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", "task interrupted before worker execution", "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -288,7 +282,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			cancelExecute()
 			// chunk 元数据无法持久化: 复用 Worker 会让下一任务的 chunk 序列
 			// 出现缺口, 销毁重建(审查: 失败后不复用)。
-			s.evictWorkerAfterFailure(task.SessionKey)
+			s.destroyTaskWorker(task.SessionKey)
 			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"CHUNK_EVENT_FAILED", err.Error(), "")
 			_ = s.KickSession(ctx, task.SessionKey)
@@ -321,7 +315,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			cancelCtx, cancelRPC := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = s.CancelWorker(cancelCtx, task)
 			cancelRPC()
-			s.evictWorkerAfterFailure(task.SessionKey)
+			s.destroyTaskWorker(task.SessionKey)
 			return executeCtx.Err()
 		case ev, ok := <-events:
 			if !ok {
@@ -377,14 +371,14 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			return nil
 		}
 		// 流错误: Worker 状态已推进但未提交, 销毁重建(审查: 失败后不复用)。
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_STREAM_ERROR", streamErr.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return streamErr
 	}
 	if terminal == nil {
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"MISSING_TERMINAL", "worker stream ended without terminal", "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -395,14 +389,14 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	if err != nil {
 		// 审查 R4-C2: 任务已执行完毕但终态读失败——Worker 内存状态已推进,
 		// 销毁防脏复用, 尽力终态化由恢复路径兜底。
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_STATE_READ_FAILED", err.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	if current.CancelRequestedAt != nil {
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, s.cfg.PlatformInstanceID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", "task interrupted after accepted cancellation", "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -415,11 +409,11 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	case workerv1.TerminalStatus_TASK_SUCCEEDED:
 		return s.completeSuccess(ctx, task, terminal)
 	case workerv1.TerminalStatus_TASK_CANCELLED:
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskCancelled, domain.DeliveryTaskCancelled,
 			"TASK_CANCELLED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	case workerv1.TerminalStatus_TASK_INTERRUPTED:
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	default:
@@ -427,7 +421,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		if terminal.GetError() != nil && terminal.GetError().GetCode() != "" {
 			code = terminal.GetError().GetCode()
 		}
-		s.evictWorkerAfterFailure(task.SessionKey)
+		s.destroyTaskWorker(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			code, boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	}
@@ -436,7 +430,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 }
 
 // revokeSessionCredentialsIfTerminal 在任务终态后立即撤销该任务实际使用
-// 的 credential 集的全部 JTI(审查 I9)。set 在 ensureWorker 成功后立即捕获
+// 的 credential 集的全部 JTI(审查 I9)。set 在 createTaskWorker 成功后立即捕获
 // (覆盖 StartSession/Policy 等早期终态路径), 不读 entry 当前集合, 避免误
 // 撤销新任务轮换后的凭证。撤销失败记录日志——恢复路径
 // (RecoverAfterRestart 按 tasks.capability_jtis)与 TTL 过期兜底, 不静默丢弃。
