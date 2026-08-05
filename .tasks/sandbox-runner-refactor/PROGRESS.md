@@ -105,3 +105,9 @@
 - 前置: round11 未提交改动(36 文件)需先提交, 再开重构分支。
 - 验证基线: TEST_DATABASE_URL=postgres://ga_r11_test:REDACTED@127.0.0.1:5432/genericagent_test?sslmode=disable
   Go 18 包 -p 1 + race; worker-python 116; contract+security+integration 45(integration 6 条全链路); compose config; GOOS=linux build。
+# 架构决策 D1 执行完成(2026-08-05, 合并 main)
+- P1(11d5510) 删凭证热刷新协议 / P2(98b2cfe) 删常驻 Worker 生命周期 / P3(2d2a741) 任务容器语义
+- 独立架构审查: 任务即进程架构适配性通过(删除的 ~1000 行均为常驻 Worker 时代机制, 剩余机制一一对应真实不变量); 1 Important(map 竞争)+5 Minor 全部修复(0af8228)
+- 净删除 ~1600 行(56 文件 +858/-2424); 每阶段全量验证绿
+- 分支 refactor/task-per-process 已合并 main(fast-forward)并删除
+- 遗留: 无; push 未执行(用户未要求)
