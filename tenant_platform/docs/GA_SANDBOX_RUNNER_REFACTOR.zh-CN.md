@@ -201,19 +201,19 @@ Sandbox Manager 为每个 Runner 使用固定、部署时审核的 profile，并
 - Runner 只加入 `runner-control` 网络，只能访问 Platform 的受控 Worker/恢复/Sophub 端点和内部 LLM Proxy；不加入 `application`、`database` 或公网网络。
 - Worker RPC 不能把共享网络当作身份边界：Runner 仅接受 Platform control identity 的 mTLS 请求；每个 Runner 使用绑定 `runner_key` hash 与 `runner_generation` 的短期服务证书，Platform 使用独立客户端身份。Runner 不持有可调用其他 Runner 的客户端凭据；mTLS、generation 和 task capability 任一不匹配均拒绝 StartSession、ExecuteTask、CancelTask、Checkpoint 与 Shutdown。
 
-即使 Runner 在工作区活跃期间复用，LLM、Sophub 和控制 capability 仍按 task 签发，绑定 `workspace_key`、`runner_key`、操作、预算和过期时间。过期 token 不能被下一条 task 继续使用。
+LLM、Sophub 和控制 capability 按 task 签发，绑定 `workspace_key`、`runner_key`、操作、预算和过期时间；任务终态后撤销，过期 token 不能被下一条 task 继续使用。
 
 内部 LLM Proxy 复用现有 `cmd/llm-proxy`：它仅加入 `runner-control` 与 `database` 网络，不映射宿主机端口；Runner 只能访问其内部地址，Proxy 从加密 Provider store 读取真实 Key 和 capability 吊销记录。
 
 ```text
 1. 渠道消息到达；Platform 将渠道身份解析为个人 `canonical_user_id`，或解析为已授权的团队上下文。
 2. Platform 得到 `workspace_key` 与 `runner_key`，并按 `runner_key` 串行入队；全局 Runner 容量已满时保持 queued。
-3. Scheduler 为可启动 task 获取该工作区 lease；已有健康 Runner 则复用，否则请求 Manager 创建。
+3. Scheduler 为可启动 task 获取该工作区 lease(generation fencing)；任务即进程(决策 D1)：每个 task 请求 Manager 创建全新 Runner。
 4. Manager 用固定 profile 创建 Runner，仅挂载该工作区 memory/、temp/ 和 state/，生成新的 Runner generation，等待经 mTLS 认证的 Worker 就绪。
 5. Platform 为当前 task 签发控制、LLM 和必要的 Sophub capability，通过经认证的 Worker RPC 调用 Runner ExecuteTask。
 6. Runner 原生读写工作区；SOPHub SOP 下载后保存到该工作区 `memory/sops/`。
-7. 成功 task 的 Worker state 经过 token/generation 校验并与任务成功原子提交；Runner 保持可复用。
-8. idle TTL、Runner 异常或部署替换时，Manager 销毁 Runner；工作区保留。已有的新会话命令沿用当前行为：不恢复 history/working state，但不删除 memory/、temp/、SOP 或项目文件。
+7. 成功 task 的 Worker state 经过 token/generation 校验并与任务成功原子提交；任务终态(成功/失败/取消/超时)即销毁 Runner 并释放 lease，下一任务以 generation+1 冷启动全新容器，会话连续性由 checkpoint 快照恢复保证。
+8. Runner 异常或部署替换时 Manager 销毁容器(孤儿清理兜底)；工作区保留。已有的新会话命令沿用当前行为：不恢复 history/working state，但不删除 memory/、temp/、SOP 或项目文件。
 ```
 
 持有共享 Docker daemon 的普通 `docker.sock` 的 Manager 等价于宿主级受信组件。固定模板只能限制 task 输入，不能隔离 Manager 自身被攻破后的影响。高安全部署应使用专用 Runner daemon、受限 runtime proxy 或独立 Runner 主机，且该控制面不得管理 Platform、PostgreSQL、其卷或其他 Compose 服务。
@@ -289,7 +289,7 @@ GA_LLM_PROXY_ADDR=http://llm-proxy:8081
 
 | 决策 | 推荐 | 影响 |
 | --- | --- | --- |
-| 运行粒度 | 每个个人或团队 `workspace_key` 一个活跃 Runner | 保留个人或团队原生记忆，避免每条消息冷启动 |
+| 运行粒度 | 任务即进程(决策 D1)：每个 task 一个全新 Runner 容器 | 会话连续性由 checkpoint 快照恢复保证；冷启动成本远低于状态机复杂度 |
 | 团队 | `team:<team_id>` 是共享租户 | 已授权成员共享团队工作区；个人与团队数据隔离 |
 | Runner 容量 | `GA_RUNNER_MAX_ACTIVE` 为全局上限，满载保持 queued | 不增加每用户 Runner 上限；容量不足不使 task 失败 |
 | 用户状态 | 每工作区完整原生 `memory/`、`temp/` 与 `state/` | 最大限度复用 GA 路径；`memory/`、`temp/` 写穿，只有成功 state 可恢复 |
@@ -302,7 +302,7 @@ GA_LLM_PROXY_ADDR=http://llm-proxy:8081
 | 存储配额 | V1 不做每工作区硬配额 | 保持原生写入；依赖单文件限制与宿主全局磁盘监控 |
 | 开发期切换 | 删除旧 PostgreSQL 数据卷和 Document 相关运行卷后启动新 schema | 无旧数据兼容、迁移排空或回滚成本 |
 | 不可信生产运行时 | `gVisor/runsc` | 需要 Linux Docker host 一次性安装 runtime |
-| Runner 回收 | idle TTL、异常、部署替换 | 保持活跃体验，同时限制残留进程 |
+| Runner 回收 | 任务终态即销毁；异常/部署替换/孤儿由 Manager 兜底清理 | 任务容器无 idle 驻留，残留进程只来自异常路径 |
 | 浏览器能力 | V1 禁用 | 宿主浏览器不能用于多租户；后续需每用户独立浏览器 |
 | 高安全部署 | 专用 Runner daemon 或独立 Runner 主机 | 避免共享 Docker daemon 的宿主级控制面风险 |
 

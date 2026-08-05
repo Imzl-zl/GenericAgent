@@ -19,9 +19,9 @@ import (
 )
 
 // minRunnerCertTTL 是 Runner mTLS 证书的最短有效期(round11 审查 M1):
-// lease TTL 可能只有几十秒且无限续租, 证书签发后不轮换——长会话一旦
-// gRPC 重连会因证书过期失败。mTLS 短期性由容器销毁重建 + generation 递增
-// 保证, 证书 TTL 只需覆盖会话最长寿命(24h 足够覆盖任何受支持任务时长)。
+// 任务即进程(决策 D1)下容器只活一个任务, 证书 TTL 只需覆盖任务时长;
+// 24h 为保守上限(覆盖任何受支持任务墙钟), 短期性由任务终态容器销毁 +
+// generation 递增保证, 证书签发后不轮换。
 const minRunnerCertTTL = 24 * time.Hour
 
 // RunnerLeaseStore 是 Platform 侧持久 Runner lease 的最小接口
@@ -95,10 +95,10 @@ func NewSandbox(cfg SandboxConfig) (*SandboxWorkerRuntime, error) {
 	return &SandboxWorkerRuntime{cfg: cfg}, nil
 }
 
-// Start creates (or reuses) the Runner for the session's workspace and dials
-// its mTLS control endpoint. Generation fencing: the Runner lease generation
-// is persisted in runner_leases and monotonically increases on recreation;
-// the workerEntry cache keyed by session_key keeps one Runner per workspace.
+// Start 为任务创建全新 Runner 容器并拨号其 mTLS 控制端点(任务即进程,
+// 决策 D1)。Generation fencing: Runner lease generation 持久化于
+// runner_leases 并随重建单调递增; 崩溃恢复路径(Platform 重启/接管)按
+// stale_container_id 销毁旧 generation 容器, 防旧容器复活。
 func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	workspaceKey := req.SessionKey // personal:<uid> / team:<tid> (spec §3)
 
@@ -176,7 +176,10 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 		configFiles[name] = data
 	}
 
-	// 4. 创建/复用 Runner(Manager 独占 Docker)。
+	// 4. 创建 Runner(Manager 独占 Docker)。任务即进程语义下正常路径每次
+	//    都是新 generation 新容器; EnsureRunner 的"已存在同 generation 容器"
+	//    分支只出现在崩溃恢复场景(Platform 重启后同 lease 续租), 此时复用
+	//    是幂等安全的。
 	runner, created, err := r.cfg.Manager.EnsureRunner(ctx, sandbox.EnsureRunnerRequest{
 		WorkspaceKey: workspaceKey,
 		Generation:   generation,
