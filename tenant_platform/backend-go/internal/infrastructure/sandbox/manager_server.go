@@ -59,6 +59,9 @@ func NewManagerServer(manager *Manager, secret string) (*ManagerServer, error) {
 // 每次消费先原子落盘(fsync + rename)再放行, 落盘失败拒绝请求(fail-closed);
 // 启动时加载既有 nonces.json 并丢弃过期项。stateDir 为空时退化为进程内
 // 实现(仅测试/开发, 不覆盖重启窗口)。
+//
+// 前提: 状态目录是单写者(单 Manager 实例)——多实例共享同一状态卷时
+// last-writer-wins 会破坏 nonce 去重, 部署必须为每个 Manager 提供独立目录。
 func NewManagerServerWithNonceState(manager *Manager, secret, stateDir string) (*ManagerServer, error) {
 	if manager == nil {
 		return nil, fmt.Errorf("manager is required")

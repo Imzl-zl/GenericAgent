@@ -244,18 +244,19 @@ func TestDispatchSuccessWithoutCoordinatorDestroysWorker(t *testing.T) {
 }
 
 // TestDestroyTaskWorkerEntryDoesNotTouchReplacedEntry: 身份校验——旧任务收尾
-// 不得误毁同 session 新任务的 Worker(0af8228 竞争修复的延续)。
+// 不得误毁同 session 新任务的 Worker(0af8228 竞争修复的延续); 同时旧 entry
+// 本身必须被清理(round12 审查 I1 补充: 终态任务不得因 map 被替换而泄漏容器/
+// 凭据——completeSuccess 终态提交与销毁之间的替换窗口)。
 func TestDestroyTaskWorkerEntryDoesNotTouchReplacedEntry(t *testing.T) {
 	_, store, _, dev := serviceFixture(t)
 	cleanup := &cleanWorkerCleanup{worker: newControlledWorker()}
 	sched := newLeakTestScheduler(t, store, cleanup, "leak-identity", nil)
 
 	oldEntry := &workerEntry{sessionKey: dev.SessionKey}
-	oldCleanup := func(_ string) {}
+	oldCleaned := atomic.Bool{}
+	oldEntry.cleanup = func(_ string) { oldCleaned.Store(true) }
 	newEntry := &workerEntry{sessionKey: dev.SessionKey}
-	newCleanup := func(_ string) { cleanup.cleaned.Store(true) }
-	oldEntry.cleanup = oldCleanup
-	newEntry.cleanup = newCleanup
+	newEntry.cleanup = func(_ string) { cleanup.cleaned.Store(true) }
 
 	sched.mu.Lock()
 	sched.workers[dev.SessionKey] = newEntry // 新任务已替换旧 entry
@@ -271,5 +272,8 @@ func TestDestroyTaskWorkerEntryDoesNotTouchReplacedEntry(t *testing.T) {
 	}
 	if cleanup.cleaned.Load() {
 		t.Fatal("destroyTaskWorkerEntry cleaned the replaced (new) entry")
+	}
+	if !oldCleaned.Load() {
+		t.Fatal("old (replaced) entry must still be cleaned up; its container would leak otherwise")
 	}
 }

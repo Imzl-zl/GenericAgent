@@ -375,10 +375,10 @@ func (s *scheduler) destroyTaskWorkerEntry(sessionKey string, entry *workerEntry
 		delete(s.workers, sessionKey)
 	}
 	s.mu.Unlock()
-	if !current {
-		return
-	}
-	// round12 审查(M1): 任务终态即清理 cancel 合并缓存, 防止按任务数增长。
+	// round12 审查(I1 补充/独立审查): 身份不匹配(同 session 新任务已替换
+	// map entry)时仍必须清理旧 entry——旧任务已终态, 其容器/凭据不得因被
+	// 替换而泄漏(completeSuccess 终态提交与销毁之间的替换窗口); 只是不
+	// 触碰 map 中的新 entry。
 	if entry.taskID != "" {
 		s.cancelOnce.Delete(entry.taskID)
 	}
@@ -412,10 +412,9 @@ func (s *scheduler) destroyTaskWorkerLocked(sessionKey string, entry *workerEntr
 		delete(s.workers, sessionKey)
 	}
 	s.mu.Unlock()
-	if !current {
-		return
-	}
-	// round12 审查(M1): 任务终态即清理 cancel 合并缓存。
+	// round12 审查(I1 补充/独立审查): 身份不匹配时同样清理旧 entry(终态
+	// 任务不得因 map 被替换而泄漏容器/凭据), 只是不触碰 map 中的新 entry。
+	// 调用方必须已持有 entry.lifecycleMu。
 	if entry.taskID != "" {
 		s.cancelOnce.Delete(entry.taskID)
 	}

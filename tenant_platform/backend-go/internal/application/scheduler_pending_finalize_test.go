@@ -20,9 +20,12 @@ import (
 type flakyTerminalStore struct {
 	*postgres.Store
 	fail atomic.Bool
+	// terminalCalls 记录 CompleteFailedTerminal 调用次数(claim-lost 分支断言)。
+	terminalCalls atomic.Int32
 }
 
 func (s *flakyTerminalStore) CompleteFailedTerminal(ctx context.Context, taskID, owner string, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) (domain.Task, error) {
+	s.terminalCalls.Add(1)
 	if s.fail.Load() {
 		return domain.Task{}, errors.New("database unavailable")
 	}
@@ -110,7 +113,9 @@ func TestFinalizeRetryDropsIntentWhenClaimLost(t *testing.T) {
 	cleanup := &cleanWorkerCleanup{worker: newControlledWorker()}
 	flaky := &flakyTerminalStore{Store: store}
 	flaky.fail.Store(true)
-	sched := newLeakTestScheduler(t, flaky, cleanup, "pending-lost", nil)
+	// claim 被另一实例接管: GetTask 返回 foreign claim owner。
+	foreign := &foreignClaimStore{flaky}
+	sched := newLeakTestScheduler(t, foreign, cleanup, "pending-lost", nil)
 	claimed := claimedTaskFor(t, store, dev.SessionKey, "no-such-policy.v1", "pending-lost")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -118,15 +123,31 @@ func TestFinalizeRetryDropsIntentWhenClaimLost(t *testing.T) {
 	if err := sched.dispatch(ctx, claimed); err == nil {
 		t.Fatal("expected policy resolve error")
 	}
-	// 把 claim 移交给"另一个实例"(直接改 owner 模拟接管): drain 应删除
-	// 意图, 由新 owner 负责终态化。
 	flaky.fail.Store(false)
-	if _, err := store.CompleteFailedTerminal(ctx, claimed.ID, "other-owner",
-		domain.TaskFailed, domain.DeliveryTaskFailed, "TAKEN_OVER", "taken over", ""); err == nil {
-		t.Fatal("expected ErrTaskNotOwned for foreign owner")
-	}
+	callsBeforeDrain := flaky.terminalCalls.Load()
+	// drain 必须删除意图, 由新 owner 负责终态化——且不得对 foreign 任务
+	// 再调用 CompleteFailedTerminal。
 	sched.drainPendingFinalize(ctx)
 	if _, ok := sched.pendingFinalize.Load(claimed.ID); ok {
 		t.Fatal("finalize intent not dropped after claim lost")
 	}
+	if got := flaky.terminalCalls.Load(); got != callsBeforeDrain {
+		t.Fatalf("CompleteFailedTerminal must not be called again for foreign task: before=%d after=%d", callsBeforeDrain, got)
+	}
+}
+
+// foreignClaimStore 模拟 claim 被另一实例接管: GetTask 返回 foreign
+// claim owner(真实 SQL fencing 在 CompleteFailedTerminal 内部, 此处模拟
+// drain 的 ClaimOwner 分支输入)。
+type foreignClaimStore struct {
+	*flakyTerminalStore
+}
+
+func (s *foreignClaimStore) GetTask(ctx context.Context, taskID string) (domain.Task, error) {
+	t, err := s.Store.GetTask(ctx, taskID)
+	if err != nil {
+		return t, err
+	}
+	t.ClaimOwner = "new-owner"
+	return t, nil
 }
