@@ -236,9 +236,6 @@ class _NoopAgent:
         # agent_failed 干扰 execute_task 的身份校验路径。
         self._stop.wait()
 
-    def load_llm_sessions(self):
-        return None
-
 
 def _started_session_adapter(roots, registry, jtis: list[str], generation: int = 1):
     _write_runtime_config_with_jtis(roots["config_root"], 1, jtis)
@@ -307,37 +304,6 @@ def test_execute_task_accepts_jti_from_credential_set(roots, foundation_registry
     events = list(adapter.execute_task(_task("t3", "hi", runner_generation=1, capability_jti="jti-2")))
     terminals = [e.terminal for e in events if e.WhichOneof("payload") == "terminal"]
     assert len(terminals) == 1, f"expected terminal, got {events!r}"
-
-
-def test_task_boundary_refresh_updates_capability_jtis(roots, foundation_registry):
-    _write_runtime_config_with_jtis(roots["config_root"], 1, ["jti-old"])
-    agent = _NoopAgent()
-    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
-    adapter.start_session(_start_req(runner_generation=1))
-    assert adapter._session.capability_jtis == frozenset({"jti-old"})
-    # 决策 D1: 任务边界从磁盘重载, 新 JTI 集合生效。
-    _write_runtime_config_with_jtis(roots["config_root"], 2, ["jti-new"])
-    adapter._refresh_task_credentials()
-    assert adapter._session.capability_jtis == frozenset({"jti-new"})
-    assert adapter._session.routing_snapshot_id == "snapshot-2"
-
-
-def test_task_boundary_refresh_refreshes_sophub_proxy(roots, foundation_registry):
-    """决策 D1: 复用 Runner 的任务边界必须刷新 session.sophub_proxy,
-    否则第二个 task 仍使用首个 task 已撤销的 capability token。"""
-    _write_runtime_config_with_jtis(roots["config_root"], 1, ["jti-1"])
-    agent = _NoopAgent()
-    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
-    adapter.start_session(_start_req(runner_generation=1))
-    assert adapter._session.sophub_proxy is None  # 初始配置无 sophub 段
-
-    # 刷新配置: 增加 _platform_sophub(新 token)。
-    _write_runtime_config_with_sophub(roots["config_root"], 2, ["jti-2"], "http://platform:8088", "sophub-token-2")
-    adapter._refresh_task_credentials()
-    proxy = adapter._session.sophub_proxy
-    assert proxy is not None
-    assert proxy.base_url == "http://platform:8088"
-    assert proxy.capability_token == "sophub-token-2"
 
 
 def test_checkpoint_staging_file_is_group_readable(tmp_path):

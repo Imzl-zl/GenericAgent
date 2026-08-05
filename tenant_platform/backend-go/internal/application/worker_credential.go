@@ -18,7 +18,7 @@ type workerCredentialSet struct {
 	ExpiresAt        time.Time
 	JTIs             []string
 	// ControlJTI 是独立签发的控制 capability JTI(round11 审查 I4): 控制
-	// RPC(CancelTask/Shutdown/BeginCheckpoint/ReloadCredentials)必须使用它,
+	// RPC(CancelTask/Shutdown/BeginCheckpoint)必须使用它,
 	// 不得复用 LLM/Sophub capability——LLM token 随调用发给 llm-proxy,
 	// 暴露面更大; 独立 control token 只在容器内传递。
 	ControlJTI      string
@@ -27,39 +27,6 @@ type workerCredentialSet struct {
 }
 
 const credentialRevokeTimeout = 5 * time.Second
-
-type pendingCredentialRefresh struct {
-	Previous      workerCredentialSet
-	Next          workerCredentialSet
-	PreviousJSON  []byte
-	RollbackCause error
-	// taskID 记录签发 Next 时的任务(审查 R5-I3): pending 跨任务边界必须
-	// 丢弃而非 ack 提升——Next 绑定旧任务, 旧任务终态已撤销其 JTI。
-	TaskID string
-}
-
-func (s *scheduler) issueProviderCapabilities(
-	ctx context.Context,
-	sessionKey string,
-	snapshot routingSnapshot,
-	generation uint64,
-) (workerCredentialSet, RuntimeConfigFiles, error) {
-	mcpSnapshot, err := s.resolveMCPSnapshot(ctx)
-	if err != nil {
-		return workerCredentialSet{}, RuntimeConfigFiles{}, err
-	}
-	return s.issueProviderCapabilitiesWithRuntime(ctx, sessionKey, snapshot, mcpSnapshot, generation, "")
-}
-
-func (s *scheduler) issueProviderCapabilitiesWithMCP(
-	ctx context.Context,
-	sessionKey string,
-	snapshot routingSnapshot,
-	mcpSnapshot RuntimeMCPSnapshot,
-	generation uint64,
-) (workerCredentialSet, RuntimeConfigFiles, error) {
-	return s.issueProviderCapabilitiesWithRuntime(ctx, sessionKey, snapshot, mcpSnapshot, generation, "")
-}
 
 func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 	ctx context.Context,

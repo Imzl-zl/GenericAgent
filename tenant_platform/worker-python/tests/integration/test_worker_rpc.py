@@ -374,43 +374,8 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 assert s1.session_key == "personal:1"
                 assert s1.worker_instance_id
 
-                # 决策 D1: 凭证热刷新协议已删除——配置更新后无 ReloadCredentials
-                # RPC; 任务边界(ExecuteTask 入口)从磁盘重载新配置。
-                _write_mykey(config_root, apibase, generation=2)
-
-                # 损坏/不完整配置在任务边界显式失败(与 StartSession 一致, fail-closed)。
-                broken = {
-                    "_platform_runtime": {
-                        "routing_snapshot_id": "integration-broken-3",
-                    },
-                    "platform_native_oai_provider_1_config": {
-                        "name": "provider-1",
-                        "apibase": apibase,
-                        "model": "gpt-test",
-                    },
-                }
-                _write_runtime_document(config_root, broken)
-                with pytest.raises(grpc.RpcError) as task_error:
-                    list(
-                        stub.ExecuteTask(
-                            worker_pb2.ExecuteTaskRequest(
-                                task=worker_pb2.TaskEnvelope(
-                                    task_id="t-broken",
-                                    session_key="personal:1",
-                                    requester_user_id=1,
-                                    source="integration",
-                                    source_instance_id="itest",
-                                    message_id="m-t-broken",
-                                    prompt="hi",
-                                    runner_generation=1,
-                                    capability_jti="itest-jti",
-                                )
-                            )
-                        )
-                    )
-                assert "CREDENTIAL_CONFIG" in task_error.value.details()
-
-                # 恢复有效配置: 后续任务正常执行。
+                # 决策 D1: 凭证热刷新协议已删除——配置由 StartSession 全量加载
+                # (每任务新进程), 无 ReloadCredentials RPC 与任务边界重载。
                 _write_mykey(config_root, apibase, generation=2)
 
                 h1 = stub.Health(worker_pb2.HealthRequest())

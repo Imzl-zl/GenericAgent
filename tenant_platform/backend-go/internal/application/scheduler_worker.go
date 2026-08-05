@@ -23,7 +23,6 @@ type workerEntry struct {
 	cleanup     func(capabilityJTI string)
 	instID      string
 	sessionKey  string
-	taskID      string // 本 Worker 绑定的 task(方案 §7 per-task capability)
 	credentials workerCredentialSet
 	lifecycleMu sync.Mutex
 	// startMu 只串行 StartSession 与 CancelWorker(round11 审查 C3): 同一
@@ -111,6 +110,9 @@ func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error
 	// startMu; 与 checkpoint 收尾(lifecycleMu)不互斥。
 	// 任务尚未进入执行阶段时跳过 RPC——dispatch 会检测 durable
 	// cancel_requested_at 并销毁 Worker, 无需向 Worker 发取消。
+	// 决策 D2.1(任务即进程): entry 只服务一个任务, 无需 currentness 复核——
+	// 迟到的取消若命中已终态任务的旧 entry, 最多向新任务的 Worker 发一次
+	// no-op CancelTask(task_id 不匹配, Worker 侧拒绝, accepted=false)。
 	entry.startMu.Lock()
 	defer entry.startMu.Unlock()
 	if !entry.executing.Load() {
@@ -130,7 +132,7 @@ func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error
 // 追踪。
 func (s *scheduler) createTaskWorker(ctx context.Context, task domain.Task) (workerclient.WorkerClient, *workerEntry, error) {
 	s.mu.Lock()
-	entry := &workerEntry{sessionKey: task.SessionKey, taskID: task.ID}
+	entry := &workerEntry{sessionKey: task.SessionKey}
 	s.workers[task.SessionKey] = entry
 	s.mu.Unlock()
 	entry.lifecycleMu.Lock()
@@ -174,7 +176,6 @@ func (s *scheduler) initializeWorkerEntry(
 	entry.instID = instID
 	entry.runnerGeneration = gen
 	entry.credentials = credentials
-	entry.taskID = task.ID
 	entry.lifecycleMu.Unlock()
 	return client, entry, nil
 }
@@ -373,12 +374,19 @@ func (s *scheduler) destroyTaskWorker(sessionKey string) {
 }
 
 // destroyTaskWorkerLocked 是 destroyTaskWorker 的持锁变体: 调用方必须已
-// 持有 entry.lifecycleMu(如 completeSuccess 的错误分支)。内部只获取 s.mu
-// (removeWorkerEntry)与执行清理, 不再获取 lifecycleMu, 避免持锁重入死锁。
+// 持有 entry.lifecycleMu(如 completeSuccess 的错误分支)。检查与删除在
+// s.mu 下原子完成(审查: 无锁读 s.workers 与 createTaskWorker 写入并发会
+// 触发 Go map 读写竞争; 且同 session 下一任务在终态提交与销毁之间派发时
+// 可能误跳过销毁)。内部不再获取 lifecycleMu, 避免持锁重入死锁。
 func (s *scheduler) destroyTaskWorkerLocked(sessionKey string, entry *workerEntry) {
-	if s.workers[sessionKey] != entry {
+	s.mu.Lock()
+	current := s.workers[sessionKey] == entry
+	if current {
+		delete(s.workers, sessionKey)
+	}
+	s.mu.Unlock()
+	if !current {
 		return
 	}
-	s.removeWorkerEntry(sessionKey, entry)
 	s.cleanupWorkerEntryBestEffort(context.Background(), entry)
 }

@@ -101,48 +101,7 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
                 )
             return self._create_session(request)
 
-    def _refresh_task_credentials(self) -> None:
-        """任务边界从磁盘重载最新 runtime 配置(决策 D1): Platform 每任务签发
-        新凭证并原子写配置(touch loader), GA 原生 reload_mykeys 已按 mtime
-        重载 LLM mykeys; 此处同步 session 级 capability JTI 集与 Sophub
-        proxy——复用 Worker 的下一任务依赖它获得绑定新 task 的 JTI 集合。
-        配置损坏时与 StartSession 一致地显式失败。"""
-        if self._session is None:
-            return
-        try:
-            metadata = load_runtime_metadata(self.config_root)
-        except CredentialConfigError as exc:
-            raise WorkerAdapterError("CREDENTIAL_CONFIG_ERROR", str(exc)) from exc
-        agent = self._session.agent
-        had_clients = hasattr(agent, "llmclients")
-        previous_clients = getattr(agent, "llmclients", None)
-        try:
-            agent.load_llm_sessions()
-        except Exception as exc:
-            if had_clients:
-                agent.llmclients = previous_clients
-            raise WorkerAdapterError("CREDENTIAL_RELOAD_FAILED", str(exc)) from exc
-        llm_clients = getattr(agent, "llmclients", None)
-        if isinstance(llm_clients, list) and not llm_clients:
-            if had_clients:
-                agent.llmclients = previous_clients
-            raise WorkerAdapterError("CREDENTIAL_CONFIG_EMPTY", "no GA sessions loaded")
-        self._session.routing_snapshot_id = metadata.routing_snapshot_id
-        self._session.capability_jtis = metadata.jtis
-        from ga_worker.sop_tool import SopToolError, load_runtime_sophub_proxy
-        try:
-            self._session.sophub_proxy = load_runtime_sophub_proxy(self.config_root)
-        except SopToolError as exc:
-            raise WorkerAdapterError("SOPHUB_CONFIG_ERROR", str(exc)) from exc
-        if self._session.sophub_proxy is not None:
-            mem_env = os.environ.get("GA_WORKSPACE_MEMORY", "").strip()
-            self._session.workspace_memory = (
-                Path(mem_env) if mem_env else Path(self.legacy_root) / "memory"
-            )
-
     def execute_task(self, request: worker_pb2.ExecuteTaskRequest) -> Iterator[worker_pb2.WorkerEvent]:
-        # 决策 D1: 任务边界从磁盘重载最新凭证集(每任务签发, 无 RPC 刷新)。
-        self._refresh_task_credentials()
         from ga_worker.task_runner import run_task
         yield from run_task(self, request)
 

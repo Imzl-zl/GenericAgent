@@ -255,14 +255,12 @@ func TestIssueProviderCapabilitiesBuildsDefaultFirstMixin(t *testing.T) {
 	}
 	s := &scheduler{cfg: SchedulerConfig{
 		LLMProvider: source, TokenIssuer: issuer, LLMProxyAddr: "http://127.0.0.1:9999",
+		ConfigRoot: t.TempDir(),
 		ModelPolicyVersion: "test.v1", MaxTaskWallClock: 45 * time.Minute,
 		TokenRefreshSkew: 5 * time.Minute,
 	}}
-	snapshot, err := s.resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	set, files, err := s.issueProviderCapabilities(context.Background(), "personal:1", snapshot, 1)
+	task := domain.Task{ID: "task-mixin", SessionKey: "personal:1"}
+	set, files, err := s.issueInitialWorkerCredentials(context.Background(), task, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,13 +302,11 @@ func TestIssueProviderCapabilitiesAcceptsExactLifetimeCoverage(t *testing.T) {
 	}
 	s := &scheduler{cfg: SchedulerConfig{
 		LLMProvider: source, TokenIssuer: issuer, LLMProxyAddr: "http://127.0.0.1:9999",
+		ConfigRoot: t.TempDir(),
 		ModelPolicyVersion: "test.v1", MaxTaskWallClock: taskWallClock, TokenRefreshSkew: refreshSkew,
 	}}
-	snapshot, err := s.resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.issueProviderCapabilities(context.Background(), "personal:1", snapshot, 1); err != nil {
+	task := domain.Task{ID: "task-lifetime", SessionKey: "personal:1"}
+	if _, _, err := s.issueInitialWorkerCredentials(context.Background(), task, 1); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -364,9 +360,6 @@ func TestCreateTaskWorkerAlwaysStartsFreshWorker(t *testing.T) {
 	}
 	if second.credentials.Snapshot.Providers[0].Revision != 2 {
 		t.Fatalf("fresh snapshot=%+v", second.credentials.Snapshot)
-	}
-	if second.taskID != "task-B" {
-		t.Fatalf("entry.taskID=%q want task-B", second.taskID)
 	}
 }
 

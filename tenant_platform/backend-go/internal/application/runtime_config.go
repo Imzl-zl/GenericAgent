@@ -160,11 +160,9 @@ func WriteRuntimeConfigAtomic(configRoot string, files RuntimeConfigFiles) error
 	}
 	loaderPath := filepath.Join(configRoot, myKeyLoaderFilename)
 	if current, err := os.ReadFile(loaderPath); err == nil && bytes.Equal(current, files.Loader) {
-		// loader 内容固定不变, 但 Worker 的 reload_mykeys(llmcore.py)以 loader
-		// 文件 mtime 判断配置是否变化——每任务凭证轮换后必须 touch, 否则复用
-		// Worker 的下一个任务继续持有旧 capability token, 被 LLM Proxy 以
-		// CAPABILITY_REVOKED 拒绝(决策 D1: 无 ReloadCredentials RPC, 应用
-		// 新配置完全依赖 GA 原生 reload_mykeys 的 mtime 检测)。
+		// loader 内容固定不变; 任务即进程下每任务冷启动必读新配置, touch
+		// 保证 GA 原生 reload_mykeys 的 mtime 检测看到最新写入(与写配置
+		// 原子性配合, 防止陈旧 mtime 缓存)。
 		now := time.Now()
 		if err := os.Chtimes(loaderPath, now, now); err != nil {
 			return fmt.Errorf("touch mykey loader: %w", err)

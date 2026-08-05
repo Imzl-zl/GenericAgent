@@ -392,10 +392,6 @@ func (s *scheduler) tick(ctx context.Context) error {
 			slog.ErrorContext(ctx, "scheduler: reap idle tasks failed", "error", err)
 		}
 	}
-	// Reclaim memory from Workers whose session has been idle past the TTL
-	// (architecture §8.3 WORKER_IDLE_TIMEOUT). Sessions with active owned
-	// tasks are never touched; the next task cold-starts from the last
-	// committed snapshot.
 	// 已 owned 的 starting 任务: 异步派发(允许多 Runner 并发, 方案 §7
 	// GA_RUNNER_MAX_ACTIVE); running 任务由各自的 dispatch goroutine 持有,
 	// tick 不再阻塞等待单个任务完成。

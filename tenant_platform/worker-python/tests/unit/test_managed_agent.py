@@ -172,16 +172,11 @@ class ScriptedAgent:
         self.history: list[Any] = []
         self.handler: Any = None
         self.backend_history: list[Any] = []
-        self.llmclients: list[Any] = []
         self._started = threading.Event()
         self._release = threading.Event()
         self._lock = threading.Lock()
         self._running = False
         ScriptedAgent.instances.append(self)
-
-    def load_llm_sessions(self) -> None:
-        """GA 原生接口: 从 mykeys 重建 llmclients(任务边界刷新调用)。"""
-        self.llmclients = ["session-1"]
 
     def put_task(self, query, source="user", images=None):
         display_queue: queue.Queue = queue.Queue()
@@ -345,85 +340,6 @@ def _write_runtime_config(
         json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n",
         encoding="utf-8",
     )
-
-
-def test_task_boundary_refresh_reloads_ga_sessions_and_jtis(roots, foundation_registry):
-    agent = ScriptedAgent()
-    reloads: list[int] = []
-    agent.load_llm_sessions = lambda: (reloads.append(1), setattr(agent, "llmclients", ["session-1"]))
-    _write_runtime_config(roots["config_root"], 1, jtis=["jti-1"])
-    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
-    adapter.start_session(_start_req())
-    assert adapter._session is not None
-    assert adapter._session.capability_jtis == frozenset({"jti-1"})
-    mcp_client = object()
-    mcp_tools = {"exa__search": {"client": mcp_client}}
-    adapter._session.mcp_snapshot_id = "sha256:mcp"
-    adapter._session.mcp_clients = [mcp_client]
-    adapter._session.mcp_tools = mcp_tools
-
-    # 决策 D1: 复用 Worker 的任务边界从磁盘重载新凭证集(每任务签发)。
-    _write_runtime_config(roots["config_root"], 2, jtis=["jti-2", "ctrl:jti-2"])
-    adapter._refresh_task_credentials()
-    assert reloads == [1]
-    assert adapter._session.capability_jtis == frozenset({"jti-2", "ctrl:jti-2"})
-    assert adapter._session.routing_snapshot_id == "snapshot-2"
-    # MCP 目录任务边界不重载(Worker 替换才生效, 方案 §7 不变式)。
-    assert adapter._session.mcp_snapshot_id == "sha256:mcp"
-    assert adapter._session.mcp_clients == [mcp_client]
-    assert adapter._session.mcp_tools is mcp_tools
-
-
-def test_task_boundary_refresh_rejects_corrupt_config(roots, foundation_registry):
-    agent = ScriptedAgent()
-    agent.load_llm_sessions = lambda: None
-    _write_runtime_config(roots["config_root"], 1)
-    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
-    adapter.start_session(_start_req())
-    (roots["config_root"] / "mykey.runtime.json").write_text("{broken", encoding="utf-8")
-    with pytest.raises(WorkerAdapterError) as config_error:
-        adapter._refresh_task_credentials()
-    assert config_error.value.code == "CREDENTIAL_CONFIG_ERROR"
-
-
-def test_task_boundary_refresh_restores_previous_clients_on_failure(roots, foundation_registry):
-    agent = ScriptedAgent()
-    original_clients = [object()]
-    agent.llmclients = original_clients
-
-    def fail_reload():
-        agent.llmclients = []
-        raise RuntimeError("reload failed")
-
-    agent.load_llm_sessions = fail_reload
-    _write_runtime_config(roots["config_root"], 1)
-    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
-    adapter.start_session(_start_req())
-
-    with pytest.raises(WorkerAdapterError) as reload_error:
-        adapter._refresh_task_credentials()
-    assert reload_error.value.code == "CREDENTIAL_RELOAD_FAILED"
-    assert agent.llmclients is original_clients
-
-
-def test_task_boundary_refresh_restores_previous_clients_when_new_config_is_empty(roots, foundation_registry):
-    agent = ScriptedAgent()
-    original_clients = [object()]
-    agent.llmclients = original_clients
-    agent.load_llm_sessions = lambda: setattr(agent, "llmclients", [])
-    _write_runtime_config(roots["config_root"], 1)
-    adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
-    adapter.start_session(_start_req())
-
-    with pytest.raises(WorkerAdapterError) as reload_error:
-        adapter._refresh_task_credentials()
-    assert reload_error.value.code == "CREDENTIAL_CONFIG_EMPTY"
-    assert agent.llmclients is original_clients
-
-
-def test_task_boundary_refresh_without_session_is_noop(roots, foundation_registry):
-    adapter = _make_adapter(roots, foundation_registry, factory=lambda: ScriptedAgent())
-    adapter._refresh_task_credentials()  # 无会话: 静默跳过
 
 
 def test_capability_registry_load_and_resolve(foundation_registry: CapabilityRegistry):
