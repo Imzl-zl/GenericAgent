@@ -117,11 +117,10 @@ func (s *scheduler) routingSnapshotRequiresReplacement(ctx context.Context, snap
 }
 
 type routingAuditDetail struct {
-	ProviderIDs          []int64 `json:"provider_ids"`
-	RoutingSnapshotID    string  `json:"routing_snapshot_id,omitempty"`
-	CredentialGeneration uint64  `json:"credential_generation,omitempty"`
-	Result               string  `json:"result"`
-	ErrorCode            string  `json:"error_code,omitempty"`
+	ProviderIDs       []int64 `json:"provider_ids"`
+	RoutingSnapshotID string  `json:"routing_snapshot_id,omitempty"`
+	Result            string  `json:"result"`
+	ErrorCode         string  `json:"error_code,omitempty"`
 }
 
 func (s *scheduler) auditRoutingBinding(
@@ -138,7 +137,6 @@ func (s *scheduler) auditRoutingBinding(
 	if entry != nil {
 		entry.lifecycleMu.Lock()
 		detail.RoutingSnapshotID = entry.credentials.Snapshot.ID
-		detail.CredentialGeneration = entry.credentials.Generation
 		for _, provider := range entry.credentials.Snapshot.Providers {
 			detail.ProviderIDs = append(detail.ProviderIDs, provider.ID)
 		}

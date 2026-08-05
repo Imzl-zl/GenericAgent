@@ -172,11 +172,16 @@ class ScriptedAgent:
         self.history: list[Any] = []
         self.handler: Any = None
         self.backend_history: list[Any] = []
+        self.llmclients: list[Any] = []
         self._started = threading.Event()
         self._release = threading.Event()
         self._lock = threading.Lock()
         self._running = False
         ScriptedAgent.instances.append(self)
+
+    def load_llm_sessions(self) -> None:
+        """GA 原生接口: 从 mykeys 重建 llmclients(任务边界刷新调用)。"""
+        self.llmclients = ["session-1"]
 
     def put_task(self, query, source="user", images=None):
         display_queue: queue.Queue = queue.Queue()
@@ -317,13 +322,15 @@ def _make_adapter(roots, registry, factory=None) -> ManagedAgentAdapter:
         agent_factory=factory,
     )
 
-def _write_runtime_config(config_root: Path, generation: int, checksum: str = "", *, document_gateway: dict[str, Any] | None = None) -> str:
-    placeholder = "0" * 64
+def _write_runtime_config(
+    config_root: Path, generation: int, *, document_gateway: dict[str, Any] | None = None,
+    jtis: list[str] | None = None,
+) -> None:
+    """写最小 runtime 配置(决策 D1: 无 credential_generation/config_checksum)。"""
     document: dict[str, Any] = {
         "_platform_runtime": {
-            "credential_generation": generation,
-            "config_checksum": placeholder,
             "routing_snapshot_id": f"snapshot-{generation}",
+            "jtis": jtis or [],
         },
         "platform_native_oai_provider_1_config": {
             "name": "provider-1",
@@ -334,90 +341,52 @@ def _write_runtime_config(config_root: Path, generation: int, checksum: str = ""
     }
     if document_gateway is not None:
         document["_platform_document"] = document_gateway
-    canonical = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-    calculated = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    active_checksum = checksum or calculated
-    encoded = canonical.replace(placeholder, active_checksum, 1)
-    (config_root / "mykey.runtime.json").write_bytes(encoded.encode("utf-8"))
-    return active_checksum
+    (config_root / "mykey.runtime.json").write_text(
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
-
-
-def test_reload_credentials_reloads_ga_sessions_and_advances_generation(roots, foundation_registry):
+def test_task_boundary_refresh_reloads_ga_sessions_and_jtis(roots, foundation_registry):
     agent = ScriptedAgent()
     reloads: list[int] = []
-    agent.load_llm_sessions = lambda: reloads.append(1)
-    checksum1 = _write_runtime_config(roots["config_root"], 1)
+    agent.load_llm_sessions = lambda: (reloads.append(1), setattr(agent, "llmclients", ["session-1"]))
+    _write_runtime_config(roots["config_root"], 1, jtis=["jti-1"])
     adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
     adapter.start_session(_start_req())
     assert adapter._session is not None
-    assert adapter._session.credential_generation == 1
-    assert adapter._session.credential_checksum == checksum1
+    assert adapter._session.capability_jtis == frozenset({"jti-1"})
     mcp_client = object()
     mcp_tools = {"exa__search": {"client": mcp_client}}
     adapter._session.mcp_snapshot_id = "sha256:mcp"
     adapter._session.mcp_clients = [mcp_client]
     adapter._session.mcp_tools = mcp_tools
 
-    checksum2 = _write_runtime_config(roots["config_root"], 2)
-    response = adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
-        workspace_key="personal:1",
-        runner_generation=1,
-        credential_generation=2,
-        config_checksum=checksum2,
-    ))
-    assert response.credential_generation == 2
-    assert response.config_checksum == checksum2
+    # 决策 D1: 复用 Worker 的任务边界从磁盘重载新凭证集(每任务签发)。
+    _write_runtime_config(roots["config_root"], 2, jtis=["jti-2", "ctrl:jti-2"])
+    adapter._refresh_task_credentials()
     assert reloads == [1]
-    assert adapter._session.credential_generation == 2
+    assert adapter._session.capability_jtis == frozenset({"jti-2", "ctrl:jti-2"})
+    assert adapter._session.routing_snapshot_id == "snapshot-2"
+    # MCP 目录任务边界不重载(Worker 替换才生效, 方案 §7 不变式)。
     assert adapter._session.mcp_snapshot_id == "sha256:mcp"
     assert adapter._session.mcp_clients == [mcp_client]
     assert adapter._session.mcp_tools is mcp_tools
 
-    repeated = adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
-        workspace_key="personal:1",
-        runner_generation=1,
-        credential_generation=2,
-        config_checksum=checksum2,
-    ))
-    assert repeated.credential_generation == 2
-    assert repeated.config_checksum == checksum2
-    assert reloads == [1]
 
-
-def test_reload_credentials_rejects_stale_checksum_and_active_task(roots, foundation_registry):
+def test_task_boundary_refresh_rejects_corrupt_config(roots, foundation_registry):
     agent = ScriptedAgent()
     agent.load_llm_sessions = lambda: None
     _write_runtime_config(roots["config_root"], 1)
     adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
     adapter.start_session(_start_req())
-
-    checksum2 = _write_runtime_config(roots["config_root"], 2)
-    with pytest.raises(WorkerAdapterError) as checksum_error:
-        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
-        workspace_key="personal:1",
-        runner_generation=1,
-            credential_generation=2,
-            config_checksum="wrong-checksum",
-        ))
-    assert checksum_error.value.code == "CONFIG_CHECKSUM_MISMATCH"
-    assert adapter._session is not None
-    assert adapter._session.credential_generation == 1
-
-    adapter._session.active_task_id = "task-active"
-    with pytest.raises(WorkerAdapterError) as task_error:
-        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
-        workspace_key="personal:1",
-        runner_generation=1,
-            credential_generation=2,
-            config_checksum=checksum2,
-        ))
-    assert task_error.value.code == "TASK_ACTIVE"
-    assert adapter._session.credential_generation == 1
+    (roots["config_root"] / "mykey.runtime.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(WorkerAdapterError) as config_error:
+        adapter._refresh_task_credentials()
+    assert config_error.value.code == "CREDENTIAL_CONFIG_ERROR"
 
 
-def test_reload_credentials_restores_previous_clients_on_failure(roots, foundation_registry):
+def test_task_boundary_refresh_restores_previous_clients_on_failure(roots, foundation_registry):
     agent = ScriptedAgent()
     original_clients = [object()]
     agent.llmclients = original_clients
@@ -430,22 +399,14 @@ def test_reload_credentials_restores_previous_clients_on_failure(roots, foundati
     _write_runtime_config(roots["config_root"], 1)
     adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
     adapter.start_session(_start_req())
-    checksum2 = _write_runtime_config(roots["config_root"], 2)
 
     with pytest.raises(WorkerAdapterError) as reload_error:
-        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
-        workspace_key="personal:1",
-        runner_generation=1,
-            credential_generation=2,
-            config_checksum=checksum2,
-        ))
+        adapter._refresh_task_credentials()
     assert reload_error.value.code == "CREDENTIAL_RELOAD_FAILED"
     assert agent.llmclients is original_clients
-    assert adapter._session is not None
-    assert adapter._session.credential_generation == 1
 
 
-def test_reload_credentials_restores_previous_clients_when_new_config_is_empty(roots, foundation_registry):
+def test_task_boundary_refresh_restores_previous_clients_when_new_config_is_empty(roots, foundation_registry):
     agent = ScriptedAgent()
     original_clients = [object()]
     agent.llmclients = original_clients
@@ -453,31 +414,16 @@ def test_reload_credentials_restores_previous_clients_when_new_config_is_empty(r
     _write_runtime_config(roots["config_root"], 1)
     adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
     adapter.start_session(_start_req())
-    checksum2 = _write_runtime_config(roots["config_root"], 2)
 
     with pytest.raises(WorkerAdapterError) as reload_error:
-        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
-        workspace_key="personal:1",
-        runner_generation=1,
-            credential_generation=2,
-            config_checksum=checksum2,
-        ))
+        adapter._refresh_task_credentials()
     assert reload_error.value.code == "CREDENTIAL_CONFIG_EMPTY"
     assert agent.llmclients is original_clients
-    assert adapter._session is not None
-    assert adapter._session.credential_generation == 1
 
 
-def test_reload_credentials_requires_started_session(roots, foundation_registry):
-    adapter = _make_adapter(roots, foundation_registry, factory=ScriptedAgent)
-    with pytest.raises(WorkerAdapterError) as session_error:
-        adapter.reload_credentials(worker_pb2.ReloadCredentialsRequest(
-        workspace_key="personal:1",
-        runner_generation=1,
-            credential_generation=2,
-            config_checksum="checksum",
-        ))
-    assert session_error.value.code == "SESSION_NOT_STARTED"
+def test_task_boundary_refresh_without_session_is_noop(roots, foundation_registry):
+    adapter = _make_adapter(roots, foundation_registry, factory=lambda: ScriptedAgent())
+    adapter._refresh_task_credentials()  # 无会话: 静默跳过
 
 
 def test_capability_registry_load_and_resolve(foundation_registry: CapabilityRegistry):

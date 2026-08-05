@@ -1,15 +1,14 @@
 package application
 
 import (
-	"bytes"
 	"context"
+	"sync"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -17,8 +16,6 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/worker"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 type fakeLLMProviderSource struct {
@@ -134,7 +131,7 @@ func TestWriteTokenOnlyRuntimeConfigContainsTokenAndProxyNotRealKey(t *testing.T
 		Model: "gpt-test", APIKey: realKey,
 	}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: proxyAddr, RoutingSnapshotID: "snapshot",
+		ProxyBaseURL: proxyAddr, RoutingSnapshotID: "snapshot",
 		Providers: []RuntimeProviderBinding{{Provider: provider, Token: token}},
 	})
 	if err != nil {
@@ -170,7 +167,7 @@ func TestWriteRuntimeConfigOverwritesExistingMyKey(t *testing.T) {
 	}
 	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081", RoutingSnapshotID: "snapshot",
+		ProxyBaseURL: "http://127.0.0.1:8081", RoutingSnapshotID: "snapshot",
 		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "cap-token-overwrite"}},
 	})
 	if err != nil {
@@ -264,7 +261,7 @@ func TestIssueProviderCapabilitiesBuildsDefaultFirstMixin(t *testing.T) {
 		t.Fatal(err)
 	}
 	// round11 I4: 2 个 LLM capability + 1 个独立 control capability。
-	if len(set.JTIs) != 3 || set.Generation != 1 || set.Checksum != files.Checksum {
+	if len(set.JTIs) != 3 {
 		t.Fatalf("credential set=%+v", set)
 	}
 	if set.ControlJTI == "" {
@@ -309,233 +306,6 @@ func TestIssueProviderCapabilitiesAcceptsExactLifetimeCoverage(t *testing.T) {
 	}
 	if _, _, err := s.issueProviderCapabilities(context.Background(), "personal:1", snapshot, 1); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestRefreshWorkerCredentialsRollsBackDefinitiveReloadRejection(t *testing.T) {
-	dir := t.TempDir()
-	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
-	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
-		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
-		t.Fatal(err)
-	}
-	worker := newControlledWorker()
-	worker.reloadErr = status.Error(codes.FailedPrecondition, "reload failed")
-	capabilities := &routingCapabilityStore{}
-	oldExpiry := time.Now().UTC().Add(time.Minute)
-	entry := &workerEntry{client: worker, sessionKey: "personal:1", credentials: workerCredentialSet{
-		Generation: 1, Checksum: oldFiles.Checksum, ExpiresAt: oldExpiry,
-		JTIs: []string{"old-jti"}, Snapshot: snapshot,
-	}}
-	s := &scheduler{cfg: SchedulerConfig{
-		TokenIssuer: issuer, CapabilityStore: capabilities, LLMProvider: source,
-		LLMProxyAddr: "http://127.0.0.1:9999", ConfigRoot: dir,
-		ModelPolicyVersion: "test.v1",
-		TokenTTL:           time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
-	}}
-
-	err = s.refreshWorkerCredentials(context.Background(), entry)
-	if err == nil {
-		t.Fatal("expected reload error")
-	}
-	if entry.credentials.Generation != 1 || entry.credentials.JTIs[0] != "old-jti" {
-		t.Fatalf("old credentials changed: %+v", entry.credentials)
-	}
-	gotJSON, readErr := os.ReadFile(filepath.Join(dir, runtimeConfigFilename))
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if !bytes.Equal(gotJSON, oldFiles.JSON) {
-		t.Fatal("previous runtime JSON was not restored byte-for-byte")
-	}
-	if len(capabilities.revoked) == 0 {
-		t.Fatal("new JTIs were not revoked after failed reload")
-	}
-	for _, revoked := range capabilities.revoked {
-		if revoked.jti == "old-jti" {
-			t.Fatal("old JTI revoked before Worker acknowledgment")
-		}
-	}
-	worker.reloadErr = nil
-	if err := s.refreshWorkerCredentials(context.Background(), entry); err != nil {
-		t.Fatal(err)
-	}
-	if len(worker.reloadRequests) != 2 ||
-		worker.reloadRequests[0].GetCredentialGeneration() != 2 ||
-		worker.reloadRequests[1].GetCredentialGeneration() != 2 {
-		t.Fatalf("reload generations=%+v", worker.reloadRequests)
-	}
-	if entry.credentials.Generation != 2 {
-		t.Fatalf("credential generation=%d", entry.credentials.Generation)
-	}
-}
-
-func TestRefreshWorkerCredentialsRetriesAmbiguousOutcomeIdempotently(t *testing.T) {
-	dir := t.TempDir()
-	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
-	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
-		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
-		t.Fatal(err)
-	}
-	worker := newControlledWorker()
-	worker.reloadErr = status.Error(codes.Unavailable, "response lost")
-	capabilities := &routingCapabilityStore{}
-	entry := &workerEntry{client: worker, sessionKey: "personal:1", credentials: workerCredentialSet{
-		Generation: 1, Checksum: oldFiles.Checksum, ExpiresAt: time.Now().UTC().Add(time.Minute),
-		JTIs: []string{"old-jti"}, Snapshot: snapshot,
-	}}
-	s := &scheduler{cfg: SchedulerConfig{
-		TokenIssuer: issuer, CapabilityStore: capabilities, LLMProvider: source,
-		LLMProxyAddr: "http://127.0.0.1:9999", ConfigRoot: dir, ModelPolicyVersion: "test.v1",
-		TokenTTL: time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
-	}}
-
-	if err := s.refreshWorkerCredentials(context.Background(), entry); err == nil {
-		t.Fatal("expected ambiguous reload error")
-	}
-	if entry.credentials.Generation != 1 || entry.pendingRefresh == nil {
-		t.Fatalf("entry state=%+v pending=%+v", entry.credentials, entry.pendingRefresh)
-	}
-	currentJSON, err := os.ReadFile(filepath.Join(dir, runtimeConfigFilename))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Equal(currentJSON, oldFiles.JSON) {
-		t.Fatal("ambiguous reload restored old JSON")
-	}
-	if len(capabilities.revoked) != 0 {
-		t.Fatalf("ambiguous reload revoked credentials: %+v", capabilities.revoked)
-	}
-
-	worker.reloadErr = nil
-	if err := s.refreshWorkerCredentials(context.Background(), entry); err != nil {
-		t.Fatal(err)
-	}
-	if len(worker.reloadRequests) != 2 ||
-		worker.reloadRequests[0].GetCredentialGeneration() != 2 ||
-		worker.reloadRequests[1].GetCredentialGeneration() != 2 {
-		t.Fatalf("reload generations=%+v", worker.reloadRequests)
-	}
-	if entry.credentials.Generation != 2 || entry.pendingRefresh != nil {
-		t.Fatalf("entry state=%+v pending=%+v", entry.credentials, entry.pendingRefresh)
-	}
-	if len(capabilities.revoked) != 1 || capabilities.revoked[0].jti != "old-jti" {
-		t.Fatalf("revoked=%+v", capabilities.revoked)
-	}
-}
-
-func TestRefreshWorkerCredentialsRevokesOldJTIOnlyAfterAcknowledgment(t *testing.T) {
-	dir := t.TempDir()
-	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
-	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
-		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
-		t.Fatal(err)
-	}
-	worker := newControlledWorker()
-	capabilities := &routingCapabilityStore{}
-	capabilities.beforeRevoke = func() {
-		if len(worker.reloadRequests) == 0 {
-			t.Fatal("JTI revoked before ReloadCredentials acknowledgment")
-		}
-	}
-	entry := &workerEntry{client: worker, sessionKey: "personal:1", credentials: workerCredentialSet{
-		Generation: 1, Checksum: oldFiles.Checksum, ExpiresAt: time.Now().UTC().Add(time.Minute),
-		JTIs: []string{"old-jti"}, Snapshot: snapshot,
-	}}
-	s := &scheduler{cfg: SchedulerConfig{
-		TokenIssuer: issuer, CapabilityStore: capabilities, LLMProvider: source,
-		LLMProxyAddr: "http://127.0.0.1:9999", ConfigRoot: dir,
-		ModelPolicyVersion: "test.v1",
-		TokenTTL:           time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
-	}}
-
-	if err := s.refreshWorkerCredentials(context.Background(), entry); err != nil {
-		t.Fatal(err)
-	}
-	if entry.credentials.Generation != 2 || len(worker.reloadRequests) != 1 {
-		t.Fatalf("entry=%+v reloads=%d", entry.credentials, len(worker.reloadRequests))
-	}
-	if len(capabilities.revoked) != 1 || capabilities.revoked[0].jti != "old-jti" {
-		t.Fatalf("revoked=%+v", capabilities.revoked)
-	}
-}
-
-func TestCredentialRefreshRetainsOldJTIsUntilRevocationSucceeds(t *testing.T) {
-	worker := newControlledWorker()
-	storeErr := errors.New("revocation store unavailable")
-	capabilities := &routingCapabilityStore{err: storeErr}
-	oldSet := workerCredentialSet{
-		Generation: 1, Checksum: "old", ExpiresAt: time.Now().UTC().Add(time.Hour),
-		JTIs: []string{"old-jti"}, Snapshot: routingSnapshot{ID: "snapshot"},
-	}
-	newSet := workerCredentialSet{
-		Generation: 2, Checksum: "new", ExpiresAt: time.Now().UTC().Add(time.Hour),
-		JTIs: []string{"new-jti"}, Snapshot: oldSet.Snapshot,
-	}
-	entry := &workerEntry{
-		client: worker, credentials: oldSet,
-		pendingRefresh: &pendingCredentialRefresh{Previous: oldSet, Next: newSet},
-	}
-	s := &scheduler{cfg: SchedulerConfig{CapabilityStore: capabilities}}
-
-	err := s.acknowledgePendingCredentialRefresh(context.Background(), entry)
-	if !errors.Is(err, storeErr) {
-		t.Fatalf("ack error=%v", err)
-	}
-	if entry.credentials.Generation != 2 || len(entry.pendingRevocations) != 1 {
-		t.Fatalf("entry=%+v pending revocations=%+v", entry.credentials, entry.pendingRevocations)
-	}
-	capabilities.err = nil
-	if err := s.flushPendingCredentialRevocations(context.Background(), entry); err != nil {
-		t.Fatal(err)
-	}
-	if len(entry.pendingRevocations) != 0 || len(capabilities.revoked) != 1 || capabilities.revoked[0].jti != "old-jti" {
-		t.Fatalf("pending=%+v revoked=%+v", entry.pendingRevocations, capabilities.revoked)
 	}
 }
 
@@ -603,8 +373,7 @@ func TestRoutingAuditContainsMetadataWithoutCredentialMaterial(t *testing.T) {
 	recorder := &routingAuditRecorder{}
 	s := &scheduler{cfg: SchedulerConfig{Audit: recorder, ModelPolicyVersion: "policy.v1"}}
 	entry := &workerEntry{credentials: workerCredentialSet{
-		Generation: 3,
-		JTIs:       []string{"sensitive-jti-must-not-appear"},
+		JTIs: []string{"sensitive-jti-must-not-appear"},
 		Snapshot: routingSnapshot{ID: "sha256:snapshot", Providers: []routingProvider{{
 			ID: 42, Revision: 7, ProviderType: domain.ProviderNativeOAI, Model: "model",
 		}}},
@@ -621,73 +390,14 @@ func TestRoutingAuditContainsMetadataWithoutCredentialMaterial(t *testing.T) {
 		}
 	}
 	if !strings.Contains(detail, `"provider_ids":[42]`) ||
-		!strings.Contains(detail, `"routing_snapshot_id":"sha256:snapshot"`) ||
-		!strings.Contains(detail, `"credential_generation":3`) {
+		!strings.Contains(detail, `"routing_snapshot_id":"sha256:snapshot"`) {
 		t.Fatalf("audit metadata incomplete: %s", detail)
 	}
 }
 
-// TestRefreshWorkerCredentialsKeepsRunnerGeneration 验证 credential 刷新只递增
-// credential 版本(JSON/reload 协议), token 绑定的 RunnerGeneration 保持不变
-// (审查 C4: generation 分离, 复用 Runner 的第二个 task 不会被 Worker 拒绝)。
-func TestRefreshWorkerCredentialsKeepsRunnerGeneration(t *testing.T) {
-	dir := t.TempDir()
-	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
-	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
-		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
-		t.Fatal(err)
-	}
-	worker := newControlledWorker()
-	capabilities := &routingCapabilityStore{}
-	entry := &workerEntry{
-		client: worker, sessionKey: "personal:1",
-		runnerGeneration: 7, // 复用 Runner 的真实 lease generation
-		credentials: workerCredentialSet{
-			Generation: 1, RunnerGeneration: 7, Checksum: oldFiles.Checksum,
-			ExpiresAt: time.Now().UTC().Add(time.Minute),
-			JTIs:      []string{"old-jti"}, Snapshot: snapshot,
-		},
-	}
-	s := &scheduler{cfg: SchedulerConfig{
-		TokenIssuer: issuer, CapabilityStore: capabilities, LLMProvider: source,
-		LLMProxyAddr: "http://127.0.0.1:9999", ConfigRoot: dir,
-		ModelPolicyVersion: "test.v1",
-		TokenTTL:           time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
-	}}
-
-	if err := s.refreshWorkerCredentials(context.Background(), entry); err != nil {
-		t.Fatal(err)
-	}
-	if entry.credentials.Generation != 2 {
-		t.Fatalf("credential generation = %d, want 2", entry.credentials.Generation)
-	}
-	if entry.credentials.RunnerGeneration != 7 {
-		t.Fatalf("runner generation = %d, want 7 (must not change on refresh)", entry.credentials.RunnerGeneration)
-	}
-	if len(worker.reloadRequests) != 1 ||
-		worker.reloadRequests[0].GetCredentialGeneration() != 2 {
-		t.Fatalf("reload requests = %+v", worker.reloadRequests)
-	}
-}
-
-// TestIssueInitialWorkerCredentialsSetsBothGenerations 验证首次签发时
-// credential generation 与 runner generation 都等于 Runner lease generation。
-func TestIssueInitialWorkerCredentialsSetsBothGenerations(t *testing.T) {
+// TestIssueInitialWorkerCredentialsBindsRunnerGeneration 验证初始签发绑定
+// Runner lease generation(方案 §7), 决策 D1 后无独立 credential generation。
+func TestIssueInitialWorkerCredentialsBindsRunnerGeneration(t *testing.T) {
 	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
 	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
 	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
@@ -705,8 +415,9 @@ func TestIssueInitialWorkerCredentialsSetsBothGenerations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if set.Generation != 3 || set.RunnerGeneration != 3 {
-		t.Fatalf("set = %+v, want Generation=3 RunnerGeneration=3", set)
+	// 决策 D1: 凭证 generation 已删除, 只保留 Runner lease generation 绑定。
+	if set.RunnerGeneration != 3 {
+		t.Fatalf("set = %+v, want RunnerGeneration=3", set)
 	}
 }
 
@@ -823,156 +534,6 @@ func TestIssueCredentialsPersistsJTIsBeforeReturn(t *testing.T) {
 // prepare 内部因凭据到期触发的 credential 刷新以 entry.taskID 签发并持久化
 // JTI; 若仍指向已终态旧任务, 新 token 会挂到无法被撤销的行上(旧任务终态
 // 事务已提交, 恢复扫描只处理未终态任务), 崩溃窗口内无人撤销。
-func TestEnsureWorkerSwitchesTaskBeforePrepareRefresh(t *testing.T) {
-	dir := t.TempDir()
-	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
-	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 旧 runtime config(刷新会读取作为 rollback 基线)。
-	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
-		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
-		JTIs:      []string{"old-jti"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
-		t.Fatal(err)
-	}
-	worker := newControlledWorker()
-	pstore := &jtiPersistingStore{}
-	entry := &workerEntry{
-		client: worker, sessionKey: "personal:r5", taskID: "old-task",
-		credentials: workerCredentialSet{
-			Generation: 1, Checksum: oldFiles.Checksum,
-			ExpiresAt: time.Now().UTC().Add(time.Second), // 立即触发 needRefresh
-			JTIs:      []string{"old-jti"}, Snapshot: snapshot,
-		},
-		runnerGeneration: 1,
-	}
-	s := &scheduler{
-		cfg: SchedulerConfig{
-			PlatformInstanceID: "p1",
-			TokenIssuer:        issuer,
-			CapabilityStore:    &routingCapabilityStore{},
-			LLMProvider:        source,
-			LLMProxyAddr:       "http://127.0.0.1:9999",
-			ConfigRoot:         dir,
-			ModelPolicyVersion: "test.v1",
-			TokenTTL:           time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
-			Runtime: &capacityRuntime{}, // ResolveGeneration=1
-			Store:   pstore,
-		},
-		workers: map[string]*workerEntry{"personal:r5": entry},
-		mu:      sync.Mutex{},
-	}
-
-	newTask := domain.Task{ID: "new-task", SessionKey: "personal:r5", Status: domain.TaskStarting}
-	if _, _, err := s.ensureWorker(context.Background(), newTask); err != nil {
-		t.Fatalf("ensureWorker: %v", err)
-	}
-	if len(pstore.calls) == 0 {
-		t.Fatal("no SetTaskCapabilityJTIs call from refresh")
-	}
-	// 任何刷新签发的 JTI 都不得挂到已终态旧任务下(泄漏窗口内无人撤销)。
-	for _, call := range pstore.calls {
-		if strings.HasPrefix(call, "old-task:") {
-			t.Fatalf("refresh must not persist JTI under terminal old task, got %q", call)
-		}
-	}
-	if entry.taskID != "new-task" {
-		t.Fatalf("entry.taskID = %q, want new-task", entry.taskID)
-	}
-}
-
-// 审查 R5-I3: 上一任务 ambiguous reload 留下的 pendingRefresh 绑定旧 task_id,
-// 不得在下一任务边界被 ack 提升——否则下一任务使用已终态撤销的旧 token。
-// 修复行为: pending.taskID != entry.taskID 时丢弃 pending(撤销 Next)并按
-// 新任务重新签发。
-func TestRefreshWorkerCredentialsDiscardsPendingBoundToPreviousTask(t *testing.T) {
-	dir := t.TempDir()
-	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
-	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
-	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
-		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
-		t.Fatal(err)
-	}
-	worker := newControlledWorker()
-	worker.reloadErr = status.Error(codes.Unavailable, "response lost")
-	capabilities := &routingCapabilityStore{}
-	entry := &workerEntry{client: worker, sessionKey: "personal:1", taskID: "task-A",
-		credentials: workerCredentialSet{
-			Generation: 1, Checksum: oldFiles.Checksum, ExpiresAt: time.Now().UTC().Add(time.Minute),
-			JTIs: []string{"old-jti"}, Snapshot: snapshot,
-		}}
-	s := &scheduler{cfg: SchedulerConfig{
-		TokenIssuer: issuer, CapabilityStore: capabilities, LLMProvider: source,
-		LLMProxyAddr: "http://127.0.0.1:9999", ConfigRoot: dir, ModelPolicyVersion: "test.v1",
-		TokenTTL: time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
-	}}
-
-	// 第一次: 任务 A 的刷新响应丢失 → pending 绑定 task-A(gen2)。
-	if err := s.refreshWorkerCredentials(context.Background(), entry); err == nil {
-		t.Fatal("expected ambiguous reload error for task A")
-	}
-	if entry.pendingRefresh == nil || entry.pendingRefresh.TaskID != "task-A" {
-		t.Fatalf("pendingRefresh = %+v, want taskID=task-A", entry.pendingRefresh)
-	}
-	revokedBefore := len(capabilities.revoked)
-
-	// 任务 A 终态撤销; 下一任务 B 复用 Worker。
-	worker.reloadErr = nil
-	entry.taskID = "task-B"
-
-	if err := s.refreshWorkerCredentials(context.Background(), entry); err != nil {
-		t.Fatalf("refresh for task B: %v", err)
-	}
-	// 绑定 A 的 pending.Next 必须被撤销(丢弃), 而不是提升为当前凭据。
-	if len(capabilities.revoked) <= revokedBefore {
-		t.Fatal("task-A pending.Next JTIs must be revoked when discarded")
-	}
-	// 必须为 B 重新签发: A 的 pending(gen2)被丢弃后, 从当前凭据(gen1)
-	// 重新签发 gen2 绑定 B——A 的 gen2 从未被 ack, 不产生 generation 空洞。
-	if entry.credentials.Generation != 2 {
-		t.Fatalf("credential generation = %d, want 2 (re-issued for task B)", entry.credentials.Generation)
-	}
-	if entry.credentials.JTIs[0] == "old-jti" {
-		t.Fatal("credentials must be re-issued for task B, not stale")
-	}
-	if entry.pendingRefresh != nil {
-		t.Fatalf("pendingRefresh must be cleared after successful ack, got %+v", entry.pendingRefresh)
-	}
-	// Worker 最终 ack 的是绑定 B 的新 gen2; 序列 [A 的失败 ack, B 的成功 ack]。
-	if n := len(worker.reloadRequests); n != 2 || worker.reloadRequests[n-1].GetCredentialGeneration() != 2 {
-		t.Fatalf("reload generations = %+v, want [2, 2]", worker.reloadRequests)
-	}
-}
-
-// TestCleanupWorkerEntryPassesFirstJTI 验证审查 C1/I7: Worker 清理/关闭时
-// 必须携带当前凭据集的首个 JTI(生产会话有活跃 JTI 集, 空 JTI 的 Shutdown
-// 会被 Worker 拒绝, 优雅关闭必然失败)。
 func TestCleanupWorkerEntryPassesFirstJTI(t *testing.T) {
 	s := &scheduler{}
 	var got string
@@ -1023,5 +584,85 @@ func TestIssueInitialCredentialsWritesGenerationScopedConfigDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(gotDir, runtimeConfigFilename)); err != nil {
 		t.Fatalf("runtime config must be written under config/g2 (err=%v)", err)
+	}
+}
+
+// TestRotateWorkerCredentialsAtTaskBoundary 验证决策 D1: 复用 Worker 的任务
+// 边界轮换凭证——签发绑定新任务的新集并原子写入 runtime config, 撤销旧集,
+// 且不调用 ReloadCredentials RPC(热刷新协议已删除)。
+func TestRotateWorkerCredentialsAtTaskBoundary(t *testing.T) {
+	dir := t.TempDir()
+	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
+	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
+	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := (&scheduler{cfg: SchedulerConfig{LLMProvider: source}}).resolveRoutingSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFiles, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL: "http://127.0.0.1:9999", RoutingSnapshotID: snapshot.ID,
+		Providers: []RuntimeProviderBinding{{Provider: provider, Token: "old-token"}},
+		JTIs:      []string{"old-jti"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRuntimeConfigAtomic(dir, oldFiles); err != nil {
+		t.Fatal(err)
+	}
+	worker := newControlledWorker()
+	capabilities := &routingCapabilityStore{}
+	pstore := &jtiPersistingStore{}
+	entry := &workerEntry{
+		client: worker, sessionKey: "personal:r", taskID: "old-task",
+		credentials: workerCredentialSet{
+			ExpiresAt: time.Now().UTC().Add(time.Minute),
+			JTIs:      []string{"old-jti"}, Snapshot: snapshot,
+		},
+		runnerGeneration: 1,
+	}
+	s := &scheduler{cfg: SchedulerConfig{
+		PlatformInstanceID: "p1",
+		TokenIssuer:        issuer,
+		CapabilityStore:    capabilities,
+		LLMProvider:        source,
+		LLMProxyAddr:       "http://127.0.0.1:9999",
+		ConfigRoot:         dir,
+		ModelPolicyVersion: "test.v1",
+		TokenTTL:           time.Hour, TokenRefreshSkew: 5 * time.Minute, MaxTaskWallClock: 45 * time.Minute,
+		Store: pstore,
+	},
+	workers: map[string]*workerEntry{"personal:r": entry},
+	mu:      sync.Mutex{},
+}
+
+	newTask := domain.Task{ID: "new-task", SessionKey: "personal:r", Status: domain.TaskStarting}
+	if _, _, err := s.ensureWorker(context.Background(), newTask); err != nil {
+		t.Fatalf("ensureWorker: %v", err)
+	}
+	// 新集 JTI 必须持久化到新任务(终态撤销依据), 绝不挂旧任务。
+	if len(pstore.calls) == 0 {
+		t.Fatal("no SetTaskCapabilityJTIs call from task-boundary rotation")
+	}
+	for _, call := range pstore.calls {
+		if strings.HasPrefix(call, "old-task:") {
+			t.Fatalf("rotation must not persist JTI under terminal old task, got %q", call)
+		}
+	}
+	if entry.taskID != "new-task" {
+		t.Fatalf("entry.taskID = %q, want new-task", entry.taskID)
+	}
+	// 热刷新协议已删除: WorkerClient 接口已无 ReloadCredentials(编译期保证),
+	// 轮换仅靠签发 + 写配置 + 撤销。
+	// 旧集必须撤销(测试旧集手工构造 1 个 JTI)。
+	if len(capabilities.revoked) < 1 {
+		t.Fatalf("old credential revocations=%d, want >= 1", len(capabilities.revoked))
+	}
+	// 新配置必须原子写入 config 目录。
+	if _, err := os.Stat(filepath.Join(dir, runtimeConfigFilename)); err != nil {
+		t.Fatalf("rotated runtime config not written: %v", err)
 	}
 }

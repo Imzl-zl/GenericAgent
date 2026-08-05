@@ -2,8 +2,6 @@ package application
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -18,9 +16,8 @@ import (
 )
 
 const (
-	runtimeConfigFilename      = "mykey.runtime.json"
-	myKeyLoaderFilename        = "mykey.py"
-	runtimeChecksumPlaceholder = "0000000000000000000000000000000000000000000000000000000000000000"
+	runtimeConfigFilename = "mykey.runtime.json"
+	myKeyLoaderFilename   = "mykey.py"
 )
 
 const MyKeyLoader = `import json as _json
@@ -48,7 +45,6 @@ type RuntimeMCPSnapshot struct {
 }
 
 type RuntimeConfigInput struct {
-	Generation        uint64
 	ProxyBaseURL      string
 	RoutingSnapshotID string
 	Providers         []RuntimeProviderBinding
@@ -67,9 +63,7 @@ type RuntimeSophubProxy struct {
 }
 
 type RuntimeConfigMetadata struct {
-	CredentialGeneration uint64   `json:"credential_generation"`
-	ConfigChecksum       string   `json:"config_checksum"`
-	RoutingSnapshotID    string   `json:"routing_snapshot_id"`
+	RoutingSnapshotID string `json:"routing_snapshot_id"`
 	// JTIs 是本凭证集签发的全部 capability token JTI(方案 §7 per-task
 	// capability): Worker 校验 ExecuteTask 的 capability_jti 必须属于当前
 	// 集合, 防止任意非空 JTI 通过(审查: Worker 身份与 capability 校验)。
@@ -79,15 +73,10 @@ type RuntimeConfigMetadata struct {
 type RuntimeConfigFiles struct {
 	JSON       []byte
 	Loader     []byte
-	Generation uint64
-	Checksum   string
 	SnapshotID string
 }
 
 func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
-	if input.Generation == 0 {
-		return RuntimeConfigFiles{}, fmt.Errorf("credential generation must be positive")
-	}
 	if strings.TrimSpace(input.RoutingSnapshotID) == "" {
 		return RuntimeConfigFiles{}, fmt.Errorf("routing snapshot id is required")
 	}
@@ -101,10 +90,8 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 
 	document := make(map[string]any, len(input.Providers)+3)
 	metadata := RuntimeConfigMetadata{
-		CredentialGeneration: input.Generation,
-		ConfigChecksum:       runtimeChecksumPlaceholder,
-		RoutingSnapshotID:    input.RoutingSnapshotID,
-		JTIs:                 append([]string(nil), input.JTIs...),
+		RoutingSnapshotID: input.RoutingSnapshotID,
+		JTIs:              append([]string(nil), input.JTIs...),
 	}
 	document["_platform_runtime"] = metadata
 	if strings.TrimSpace(input.MCP.ID) != "" {
@@ -146,16 +133,12 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 		document["mixin_config"] = map[string]any{"llm_nos": mixinNames}
 	}
 
-	encodedWithPlaceholder, err := marshalRuntimeDocument(document)
+	encoded, err := marshalRuntimeDocument(document)
 	if err != nil {
 		return RuntimeConfigFiles{}, err
 	}
-	digest := sha256.Sum256(encodedWithPlaceholder)
-	checksum := hex.EncodeToString(digest[:])
-	encoded := bytes.Replace(encodedWithPlaceholder, []byte(runtimeChecksumPlaceholder), []byte(checksum), 1)
 	return RuntimeConfigFiles{
-		JSON: encoded, Loader: []byte(MyKeyLoader), Generation: input.Generation,
-		Checksum: checksum, SnapshotID: input.RoutingSnapshotID,
+		JSON: encoded, Loader: []byte(MyKeyLoader), SnapshotID: input.RoutingSnapshotID,
 	}, nil
 }
 
@@ -178,9 +161,10 @@ func WriteRuntimeConfigAtomic(configRoot string, files RuntimeConfigFiles) error
 	loaderPath := filepath.Join(configRoot, myKeyLoaderFilename)
 	if current, err := os.ReadFile(loaderPath); err == nil && bytes.Equal(current, files.Loader) {
 		// loader 内容固定不变, 但 Worker 的 reload_mykeys(llmcore.py)以 loader
-		// 文件 mtime 判断配置是否变化——凭证刷新后必须 touch, 否则复用 Worker
-		// 的下一个任务继续持有旧 capability token, 被 LLM Proxy 以
-		// CAPABILITY_REVOKED 拒绝(审查: 终态撤销 + 刷新联动的契约断层)。
+		// 文件 mtime 判断配置是否变化——每任务凭证轮换后必须 touch, 否则复用
+		// Worker 的下一个任务继续持有旧 capability token, 被 LLM Proxy 以
+		// CAPABILITY_REVOKED 拒绝(决策 D1: 无 ReloadCredentials RPC, 应用
+		// 新配置完全依赖 GA 原生 reload_mykeys 的 mtime 检测)。
 		now := time.Now()
 		if err := os.Chtimes(loaderPath, now, now); err != nil {
 			return fmt.Errorf("touch mykey loader: %w", err)
@@ -293,18 +277,6 @@ func buildRuntimeProviderConfig(proxyBase *url.URL, binding RuntimeProviderBindi
 	config["apibase"] = apibase
 	config["model"] = provider.Model
 	return config, nil
-}
-
-func checksumRuntimeJSON(encoded []byte, checksum string) (string, error) {
-	if len(checksum) != len(runtimeChecksumPlaceholder) {
-		return "", fmt.Errorf("runtime checksum must be 64 hexadecimal characters")
-	}
-	placeholderBytes := bytes.Replace(encoded, []byte(checksum), []byte(runtimeChecksumPlaceholder), 1)
-	if bytes.Equal(placeholderBytes, encoded) {
-		return "", fmt.Errorf("runtime checksum not present in document")
-	}
-	digest := sha256.Sum256(placeholderBytes)
-	return hex.EncodeToString(digest[:]), nil
 }
 
 func marshalRuntimeDocument(document map[string]any) ([]byte, error) {

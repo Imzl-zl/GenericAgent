@@ -161,16 +161,11 @@ def oai_fixture():
 
 def _write_runtime_document(config_root: Path, document: dict) -> str:
     config_root.mkdir(parents=True, exist_ok=True)
-    placeholder = "0" * 64
-    document["_platform_runtime"]["config_checksum"] = placeholder
     canonical = (
         json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         + "\n"
     )
-    checksum = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    (config_root / "mykey.runtime.json").write_bytes(
-        canonical.replace(placeholder, checksum, 1).encode("utf-8")
-    )
+    (config_root / "mykey.runtime.json").write_text(canonical, encoding="utf-8")
     (config_root / "mykey.py").write_text(
         "import json as _json\n"
         "from pathlib import Path as _Path\n"
@@ -179,14 +174,12 @@ def _write_runtime_document(config_root: Path, document: dict) -> str:
         "del _config\n",
         encoding="utf-8",
     )
-    return checksum
+    return ""
 
 
 def _write_mykey(config_root: Path, apibase: str, generation: int = 1) -> str:
     document = {
         "_platform_runtime": {
-            "credential_generation": generation,
-            "config_checksum": "",
             "routing_snapshot_id": f"integration-{generation}",
         },
         "platform_native_oai_provider_1_config": {
@@ -381,33 +374,13 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                 assert s1.session_key == "personal:1"
                 assert s1.worker_instance_id
 
-                checksum2 = _write_mykey(config_root, apibase, generation=2)
-                reloaded = stub.ReloadCredentials(
-                    worker_pb2.ReloadCredentialsRequest(
-                        credential_generation=2,
-                        config_checksum=checksum2,
-                        workspace_key="personal:1",
-                        runner_generation=1,
-                    )
-                )
-                assert reloaded.credential_generation == 2
-                assert reloaded.config_checksum == checksum2
+                # 决策 D1: 凭证热刷新协议已删除——配置更新后无 ReloadCredentials
+                # RPC; 任务边界(ExecuteTask 入口)从磁盘重载新配置。
+                _write_mykey(config_root, apibase, generation=2)
 
-                repeated_reload = stub.ReloadCredentials(
-                    worker_pb2.ReloadCredentialsRequest(
-                        credential_generation=2,
-                        config_checksum=checksum2,
-                        workspace_key="personal:1",
-                        runner_generation=1,
-                    )
-                )
-                assert repeated_reload.credential_generation == 2
-                assert repeated_reload.config_checksum == checksum2
-
+                # 损坏/不完整配置在任务边界显式失败(与 StartSession 一致, fail-closed)。
                 broken = {
                     "_platform_runtime": {
-                        "credential_generation": 3,
-                        "config_checksum": "",
                         "routing_snapshot_id": "integration-broken-3",
                     },
                     "platform_native_oai_provider_1_config": {
@@ -416,30 +389,29 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
                         "model": "gpt-test",
                     },
                 }
-                broken_checksum = _write_runtime_document(config_root, broken)
-                with pytest.raises(grpc.RpcError) as reload_error:
-                    stub.ReloadCredentials(
-                        worker_pb2.ReloadCredentialsRequest(
-                            credential_generation=3,
-                            config_checksum=broken_checksum,
-                            workspace_key="personal:1",
-                            runner_generation=1,
+                _write_runtime_document(config_root, broken)
+                with pytest.raises(grpc.RpcError) as task_error:
+                    list(
+                        stub.ExecuteTask(
+                            worker_pb2.ExecuteTaskRequest(
+                                task=worker_pb2.TaskEnvelope(
+                                    task_id="t-broken",
+                                    session_key="personal:1",
+                                    requester_user_id=1,
+                                    source="integration",
+                                    source_instance_id="itest",
+                                    message_id="m-t-broken",
+                                    prompt="hi",
+                                    runner_generation=1,
+                                    capability_jti="itest-jti",
+                                )
+                            )
                         )
                     )
-                assert "CREDENTIAL_CONFIG_EMPTY" in reload_error.value.details()
+                assert "CREDENTIAL_CONFIG" in task_error.value.details()
 
-                restored_checksum = _write_mykey(config_root, apibase, generation=2)
-                assert restored_checksum == checksum2
-                retained = stub.ReloadCredentials(
-                    worker_pb2.ReloadCredentialsRequest(
-                        credential_generation=2,
-                        config_checksum=checksum2,
-                        workspace_key="personal:1",
-                        runner_generation=1,
-                    )
-                )
-                assert retained.credential_generation == 2
-                assert retained.config_checksum == checksum2
+                # 恢复有效配置: 后续任务正常执行。
+                _write_mykey(config_root, apibase, generation=2)
 
                 h1 = stub.Health(worker_pb2.HealthRequest())
                 assert h1.ready is True

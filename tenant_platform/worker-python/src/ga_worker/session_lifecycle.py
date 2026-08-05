@@ -171,8 +171,6 @@ class SessionLifecycleMixin:
             manifest=manifest,
             agent=agent,
             runner_thread=runner,
-            credential_generation=credential_metadata.generation,
-            credential_checksum=credential_metadata.checksum,
             routing_snapshot_id=credential_metadata.routing_snapshot_id,
             capability_jtis=credential_metadata.jtis,
             sophub_proxy=sophub_proxy,

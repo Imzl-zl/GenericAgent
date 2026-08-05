@@ -18,10 +18,6 @@ func (blockedShutdownClient) StartSession(context.Context, *workerv1.StartSessio
 	return nil, nil
 }
 
-func (blockedShutdownClient) ReloadCredentials(context.Context, *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
-	return nil, nil
-}
-
 func (blockedShutdownClient) ExecuteTask(context.Context, *workerv1.ExecuteTaskRequest) (<-chan workerclient.WorkerEvent, <-chan error) {
 	return nil, nil
 }

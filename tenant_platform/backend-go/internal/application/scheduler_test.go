@@ -28,50 +28,6 @@ func TestSchedulerConfigValidation(t *testing.T) {
 	_ = time.Second
 }
 
-func TestCredentialReloadDoesNotHoldGlobalWorkersLock(t *testing.T) {
-	reloadingWorker := newControlledWorker()
-	reloadingWorker.reloadEntered = make(chan struct{})
-	reloadingWorker.releaseReload = make(chan struct{})
-	otherWorker := newControlledWorker()
-	oldSet := workerCredentialSet{Generation: 1, Checksum: "old", JTIs: []string{"old"}}
-	newSet := workerCredentialSet{Generation: 2, Checksum: "new", JTIs: []string{"new"}}
-	reloadingEntry := &workerEntry{
-		client: reloadingWorker, sessionKey: "personal:1", credentials: oldSet,
-		pendingRefresh: &pendingCredentialRefresh{Previous: oldSet, Next: newSet},
-	}
-	otherEntry := &workerEntry{client: otherWorker, sessionKey: "personal:2"}
-	s := &scheduler{
-		workers: map[string]*workerEntry{"personal:1": reloadingEntry, "personal:2": otherEntry},
-		cfg:     SchedulerConfig{},
-	}
-	reloadDone := make(chan error, 1)
-	go func() {
-		_, _, err := s.ensureWorker(context.Background(), domain.Task{SessionKey: "personal:1"})
-		reloadDone <- err
-	}()
-	select {
-	case <-reloadingWorker.reloadEntered:
-	case <-time.After(time.Second):
-		t.Fatal("credential reload did not start")
-	}
-	cancelDone := make(chan error, 1)
-	go func() {
-		cancelDone <- s.CancelWorker(context.Background(), domain.Task{ID: "task-2", SessionKey: "personal:2"})
-	}()
-	select {
-	case err := <-cancelDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("unrelated session cancellation blocked behind credential reload")
-	}
-	close(reloadingWorker.releaseReload)
-	if err := <-reloadDone; err != nil {
-		t.Fatal(err)
-	}
-}
-
 type fakeAgentRuntimeSettings struct {
 	maxTurns int
 }
@@ -98,10 +54,6 @@ type controlledWorker struct {
 	cancelTaskErr          error
 	cancelTaskEntered      chan struct{}
 	releaseCancelTask      chan struct{}
-	reloadErr              error
-	reloadRequests         []*workerv1.ReloadCredentialsRequest
-	reloadEntered          chan struct{}
-	releaseReload          chan struct{}
 }
 
 func newControlledWorker() *controlledWorker {
@@ -127,27 +79,6 @@ func (w *controlledWorker) StartSession(ctx context.Context, request *workerv1.S
 		}
 	}
 	return &workerv1.StartSessionResponse{}, nil
-}
-
-func (w *controlledWorker) ReloadCredentials(ctx context.Context, request *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
-	w.reloadRequests = append(w.reloadRequests, request)
-	if w.reloadEntered != nil {
-		close(w.reloadEntered)
-	}
-	if w.releaseReload != nil {
-		select {
-		case <-w.releaseReload:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	if w.reloadErr != nil {
-		return nil, w.reloadErr
-	}
-	return &workerv1.ReloadCredentialsResponse{
-		CredentialGeneration: request.GetCredentialGeneration(),
-		ConfigChecksum:       request.GetConfigChecksum(),
-	}, nil
 }
 
 func (w *controlledWorker) ExecuteTask(context.Context, *workerv1.ExecuteTaskRequest) (<-chan workerclient.WorkerEvent, <-chan error) {

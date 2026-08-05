@@ -25,7 +25,7 @@ func TestBuildRuntimeConfigPreservesZeroAndLoadsActualGA(t *testing.T) {
 		},
 	}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 4, ProxyBaseURL: "http://127.0.0.1:8081",
+		ProxyBaseURL: "http://127.0.0.1:8081",
 		RoutingSnapshotID: "snapshot-4",
 		Providers:         []RuntimeProviderBinding{{Provider: provider, Token: "capability-token-only"}},
 	})
@@ -69,7 +69,7 @@ func TestBuildRuntimeConfigCreatesStableMixin(t *testing.T) {
 		{Provider: domain.LLMProvider{ID: 2, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}, Token: "oai-token"},
 	}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
+		ProxyBaseURL: "http://127.0.0.1:8081",
 		RoutingSnapshotID: "snapshot-mixin", Providers: providers,
 	})
 	if err != nil {
@@ -94,7 +94,7 @@ func TestBuildRuntimeConfigCreatesStableMixin(t *testing.T) {
 func TestBuildRuntimeConfigIncludesGlobalMCPSnapshot(t *testing.T) {
 	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
+		ProxyBaseURL: "http://127.0.0.1:8081",
 		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
 		MCP: RuntimeMCPSnapshot{ID: "sha256:mcp", Servers: []RuntimeMCPServer{{
 			ServerID: "exa", Name: "Exa", URL: "https://mcp.exa.ai/mcp", TimeoutSeconds: 30,
@@ -132,7 +132,7 @@ func TestBuildRuntimeConfigRejectsDuplicateProviderAndMissingToken(t *testing.T)
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := BuildRuntimeConfig(RuntimeConfigInput{
-				Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
+				ProxyBaseURL: "http://127.0.0.1:8081",
 				RoutingSnapshotID: "snapshot", Providers: providers,
 			})
 			if err == nil {
@@ -191,7 +191,7 @@ print(json.dumps({
 func TestBuildRuntimeConfigIncludesSophubProxyCapability(t *testing.T) {
 	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
+		ProxyBaseURL: "http://127.0.0.1:8081",
 		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
 		Sophub: &RuntimeSophubProxy{BaseURL: "http://127.0.0.1:8080", CapabilityToken: "sophub-cap"},
 	})
@@ -218,7 +218,7 @@ func TestBuildRuntimeConfigIncludesSophubProxyCapability(t *testing.T) {
 func TestBuildRuntimeConfigRejectsEmptySophubProxy(t *testing.T) {
 	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
 	_, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:8081",
+		ProxyBaseURL: "http://127.0.0.1:8081",
 		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
 		Sophub: &RuntimeSophubProxy{BaseURL: "", CapabilityToken: "x"},
 	})
@@ -233,7 +233,7 @@ func TestWriteRuntimeConfigAtomicGroupReadableMode(t *testing.T) {
 	dir := t.TempDir()
 	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		Generation: 1, ProxyBaseURL: "http://127.0.0.1:9999",
+		ProxyBaseURL: "http://127.0.0.1:9999",
 		RoutingSnapshotID: "snapshot",
 		Providers:         []RuntimeProviderBinding{{Provider: provider, Token: "tok"}},
 	})

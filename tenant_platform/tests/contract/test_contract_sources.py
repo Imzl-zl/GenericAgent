@@ -16,9 +16,10 @@ def test_worker_contract_declares_versioned_service_and_terminal_states():
     assert "source_instance_id" in text
     assert "snapshot_checksum" in text
     assert "policy_digest" in text
-    assert "rpc ReloadCredentials" in text
-    assert "credential_generation" in text
-    assert "config_checksum" in text
+    # 决策 D1: 凭证热刷新协议已删除, 契约不得重新引入。
+    assert "rpc ReloadCredentials" not in text
+    assert "credential_generation" not in text
+    assert "config_checksum" not in text
     assert "api_key" not in text.lower()
     assert "string delivery_id" not in text
     assert "string result_ref" not in text

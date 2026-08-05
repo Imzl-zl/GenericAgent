@@ -117,10 +117,6 @@ func (w *checkpointTestWorker) StartSession(ctx context.Context, req *workerv1.S
 	return &workerv1.StartSessionResponse{}, nil
 }
 
-func (w *checkpointTestWorker) ReloadCredentials(ctx context.Context, req *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
-	return &workerv1.ReloadCredentialsResponse{}, nil
-}
-
 func (w *checkpointTestWorker) ExecuteTask(ctx context.Context, req *workerv1.ExecuteTaskRequest) (<-chan workerclient.WorkerEvent, <-chan error) {
 	return make(chan workerclient.WorkerEvent), make(chan error)
 }

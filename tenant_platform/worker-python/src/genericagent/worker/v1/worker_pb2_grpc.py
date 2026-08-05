@@ -39,11 +39,6 @@ class WorkerServiceStub:
                 request_serializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.StartSessionRequest.SerializeToString,
                 response_deserializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.StartSessionResponse.FromString,
                 _registered_method=True)
-        self.ReloadCredentials = channel.unary_unary(
-                '/genericagent.worker.v1.WorkerService/ReloadCredentials',
-                request_serializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.ReloadCredentialsRequest.SerializeToString,
-                response_deserializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.ReloadCredentialsResponse.FromString,
-                _registered_method=True)
         self.ExecuteTask = channel.unary_stream(
                 '/genericagent.worker.v1.WorkerService/ExecuteTask',
                 request_serializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.ExecuteTaskRequest.SerializeToString,
@@ -75,12 +70,6 @@ class WorkerServiceServicer:
     """Missing associated documentation comment in .proto file."""
 
     def StartSession(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ReloadCredentials(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -123,11 +112,6 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.StartSession,
                     request_deserializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.StartSessionRequest.FromString,
                     response_serializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.StartSessionResponse.SerializeToString,
-            ),
-            'ReloadCredentials': grpc.unary_unary_rpc_method_handler(
-                    servicer.ReloadCredentials,
-                    request_deserializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.ReloadCredentialsRequest.FromString,
-                    response_serializer=genericagent_dot_worker_dot_v1_dot_worker__pb2.ReloadCredentialsResponse.SerializeToString,
             ),
             'ExecuteTask': grpc.unary_stream_rpc_method_handler(
                     servicer.ExecuteTask,
@@ -182,33 +166,6 @@ class WorkerService:
             '/genericagent.worker.v1.WorkerService/StartSession',
             genericagent_dot_worker_dot_v1_dot_worker__pb2.StartSessionRequest.SerializeToString,
             genericagent_dot_worker_dot_v1_dot_worker__pb2.StartSessionResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ReloadCredentials(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/genericagent.worker.v1.WorkerService/ReloadCredentials',
-            genericagent_dot_worker_dot_v1_dot_worker__pb2.ReloadCredentialsRequest.SerializeToString,
-            genericagent_dot_worker_dot_v1_dot_worker__pb2.ReloadCredentialsResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -321,7 +321,7 @@ func TestRevokeSessionCredentialsIfTerminalOnlyWhenTerminal(t *testing.T) {
 			"personal:6": {
 				sessionKey: "personal:6",
 				credentials: workerCredentialSet{
-					Generation: 1, Checksum: "c", ExpiresAt: time.Now().UTC().Add(time.Hour),
+					ExpiresAt: time.Now().UTC().Add(time.Hour),
 					JTIs: []string{"jti-queued"},
 				},
 			},
@@ -333,7 +333,7 @@ func TestRevokeSessionCredentialsIfTerminalOnlyWhenTerminal(t *testing.T) {
 	queued := domain.Task{ID: "q1", SessionKey: "personal:6", Status: domain.TaskQueued}
 	store.getTask[queued.ID] = queued
 	sched.revokeSessionCredentialsIfTerminal(context.Background(), queued.ID, queued.SessionKey, workerCredentialSet{
-		Generation: 1, Checksum: "c", ExpiresAt: time.Now().UTC().Add(time.Hour),
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
 		JTIs: []string{"jti-queued"},
 	})
 	if got := len(capabilities.revoked); got != 0 {
@@ -344,7 +344,7 @@ func TestRevokeSessionCredentialsIfTerminalOnlyWhenTerminal(t *testing.T) {
 	done := domain.Task{ID: "d1", SessionKey: "personal:6", Status: domain.TaskFailed}
 	store.getTask[done.ID] = done
 	sched.revokeSessionCredentialsIfTerminal(context.Background(), done.ID, done.SessionKey, workerCredentialSet{
-		Generation: 1, Checksum: "c", ExpiresAt: time.Now().UTC().Add(time.Hour),
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
 		JTIs: []string{"jti-done"},
 	})
 	if got := len(capabilities.revoked); got != 1 || capabilities.revoked[0].jti != "jti-done" {
@@ -359,9 +359,6 @@ type fakeRevokeWorker struct{}
 
 func (w *fakeRevokeWorker) StartSession(context.Context, *workerv1.StartSessionRequest) (*workerv1.StartSessionResponse, error) {
 	return &workerv1.StartSessionResponse{SessionKey: "personal:1", WorkerInstanceId: "revoke-worker"}, nil
-}
-func (w *fakeRevokeWorker) ReloadCredentials(context.Context, *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
-	return &workerv1.ReloadCredentialsResponse{}, nil
 }
 func (w *fakeRevokeWorker) ExecuteTask(_ context.Context, req *workerv1.ExecuteTaskRequest) (<-chan workerclient.WorkerEvent, <-chan error) {
 	events := make(chan workerclient.WorkerEvent, 1)

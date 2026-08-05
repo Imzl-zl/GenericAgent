@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -123,11 +124,8 @@ def _write_runtime_config_with_jtis(config_root: Path, generation: int, jtis: li
 
 
 def _write_runtime_config_with_sophub(config_root: Path, generation: int, jtis: list[str], base_url: str, token: str) -> None:
-    placeholder = "0" * 64
     document = {
         "_platform_runtime": {
-            "credential_generation": generation,
-            "config_checksum": placeholder,
             "routing_snapshot_id": f"snapshot-{generation}",
             "jtis": jtis,
         },
@@ -142,10 +140,10 @@ def _write_runtime_config_with_sophub(config_root: Path, generation: int, jtis: 
             "capability_token": token,
         },
     }
-    canonical = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-    calculated = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    encoded = canonical.replace(placeholder, calculated, 1)
-    (config_root / "mykey.runtime.json").write_bytes(encoded.encode("utf-8"))
+    (config_root / "mykey.runtime.json").write_text(
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _make_adapter(roots, registry, factory=None) -> ManagedAgentAdapter:
@@ -230,7 +228,13 @@ class _NoopAgent:
         self.extra_sys_prompts: list[str] = []
         self.history: list[Any] = []
         self.handler: Any = None
+        self._stop = threading.Event()
         _NoopAgent.instances.append(self)
+
+    def run(self):
+        # GA 主循环替身: 挂起直到测试结束, 避免 agent 线程崩溃置位
+        # agent_failed 干扰 execute_task 的身份校验路径。
+        self._stop.wait()
 
     def load_llm_sessions(self):
         return None
@@ -305,28 +309,21 @@ def test_execute_task_accepts_jti_from_credential_set(roots, foundation_registry
     assert len(terminals) == 1, f"expected terminal, got {events!r}"
 
 
-def test_reload_credentials_updates_capability_jtis(roots, foundation_registry):
+def test_task_boundary_refresh_updates_capability_jtis(roots, foundation_registry):
     _write_runtime_config_with_jtis(roots["config_root"], 1, ["jti-old"])
     agent = _NoopAgent()
     adapter = _make_adapter(roots, foundation_registry, factory=lambda: agent)
     adapter.start_session(_start_req(runner_generation=1))
     assert adapter._session.capability_jtis == frozenset({"jti-old"})
-    # 刷新到 generation 2: 新 JTI 集合生效(checksum 必须取新文件的)。
-    from ga_worker.credential_config import load_runtime_metadata
+    # 决策 D1: 任务边界从磁盘重载, 新 JTI 集合生效。
     _write_runtime_config_with_jtis(roots["config_root"], 2, ["jti-new"])
-    new_metadata = load_runtime_metadata(roots["config_root"])
-    resp = adapter.reload_credentials(
-        worker_pb2.ReloadCredentialsRequest(
-            credential_generation=2, config_checksum=new_metadata.checksum,
-            workspace_key="personal:1", runner_generation=1,
-        )
-    )
-    assert resp.credential_generation == 2
+    adapter._refresh_task_credentials()
     assert adapter._session.capability_jtis == frozenset({"jti-new"})
+    assert adapter._session.routing_snapshot_id == "snapshot-2"
 
 
-def test_reload_credentials_refreshes_sophub_proxy(roots, foundation_registry):
-    """审查: 复用 Runner 的 reload 必须刷新 session.sophub_proxy,
+def test_task_boundary_refresh_refreshes_sophub_proxy(roots, foundation_registry):
+    """决策 D1: 复用 Runner 的任务边界必须刷新 session.sophub_proxy,
     否则第二个 task 仍使用首个 task 已撤销的 capability token。"""
     _write_runtime_config_with_jtis(roots["config_root"], 1, ["jti-1"])
     agent = _NoopAgent()
@@ -336,14 +333,7 @@ def test_reload_credentials_refreshes_sophub_proxy(roots, foundation_registry):
 
     # 刷新配置: 增加 _platform_sophub(新 token)。
     _write_runtime_config_with_sophub(roots["config_root"], 2, ["jti-2"], "http://platform:8088", "sophub-token-2")
-    from ga_worker.credential_config import load_runtime_metadata
-    new_metadata = load_runtime_metadata(roots["config_root"])
-    adapter.reload_credentials(
-        worker_pb2.ReloadCredentialsRequest(
-            credential_generation=2, config_checksum=new_metadata.checksum,
-            workspace_key="personal:1", runner_generation=1,
-        )
-    )
+    adapter._refresh_task_credentials()
     proxy = adapter._session.sophub_proxy
     assert proxy is not None
     assert proxy.base_url == "http://platform:8088"

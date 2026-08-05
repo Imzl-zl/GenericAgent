@@ -10,7 +10,6 @@ Public API only; internals split into:
 
 from __future__ import annotations
 
-import hmac
 import os
 import threading
 import uuid
@@ -19,7 +18,7 @@ from typing import Any, Iterator
 
 from genericagent.worker.v1 import worker_pb2
 
-from ga_worker.credential_config import CredentialConfigError, load_runtime_metadata, validate_reload_request
+from ga_worker.credential_config import CredentialConfigError, load_runtime_metadata
 from ga_worker.limits import CapabilityRegistry
 from ga_worker.session_lifecycle import SessionLifecycleMixin
 from ga_worker.state import (
@@ -102,79 +101,53 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
                 )
             return self._create_session(request)
 
-    def reload_credentials(
-        self, request: worker_pb2.ReloadCredentialsRequest,
-    ) -> worker_pb2.ReloadCredentialsResponse:
-        with self._lock:
-            if self._session is None:
-                raise WorkerAdapterError("SESSION_NOT_STARTED", "session not started")
-            # 控制面身份 fencing(方案 §7, 审查): 迟到的 reload 请求必须绑定
-            # 当前 workspace 与 Runner generation。
-            self._assert_control_identity(request.workspace_key, request.runner_generation)
-            if self._pending is not None or self._session.active_task_id:
-                raise WorkerAdapterError("TASK_ACTIVE", "cannot reload credentials during a task")
-            if request.credential_generation == self._session.credential_generation:
-                if not hmac.compare_digest(request.config_checksum, self._session.credential_checksum):
-                    raise WorkerAdapterError("CONFIG_CHECKSUM_MISMATCH", "CONFIG_CHECKSUM_MISMATCH")
-                return worker_pb2.ReloadCredentialsResponse(
-                    credential_generation=self._session.credential_generation,
-                    config_checksum=self._session.credential_checksum,
-                )
-            if request.credential_generation < self._session.credential_generation:
-                raise WorkerAdapterError("CREDENTIAL_GENERATION_STALE", "credential generation must increase")
-            try:
-                metadata = load_runtime_metadata(self.config_root)
-                validate_reload_request(
-                    metadata,
-                    int(request.credential_generation),
-                    request.config_checksum,
-                )
-            except CredentialConfigError as exc:
-                code = "CONFIG_CHECKSUM_MISMATCH" if "CONFIG_CHECKSUM_MISMATCH" in str(exc) else "CREDENTIAL_CONFIG_ERROR"
-                raise WorkerAdapterError(code, str(exc)) from exc
-            agent = self._session.agent
-            had_clients = hasattr(agent, "llmclients")
-            previous_clients = getattr(agent, "llmclients", None)
-            try:
-                agent.load_llm_sessions()
-            except Exception as exc:
-                if had_clients:
-                    agent.llmclients = previous_clients
-                raise WorkerAdapterError("CREDENTIAL_RELOAD_FAILED", str(exc)) from exc
-            llm_clients = getattr(agent, "llmclients", None)
-            if isinstance(llm_clients, list) and not llm_clients:
-                if had_clients:
-                    agent.llmclients = previous_clients
-                raise WorkerAdapterError("CREDENTIAL_CONFIG_EMPTY", "no GA sessions loaded")
-            self._session.credential_generation = metadata.generation
-            self._session.credential_checksum = metadata.checksum
-            self._session.routing_snapshot_id = metadata.routing_snapshot_id
-            self._session.capability_jtis = metadata.jtis
-            # 审查: reload 必须同步刷新 SOPHub proxy——复用 Runner 的第二个
-            # task 不能继续使用首个 task 已撤销的 capability token。配置被
-            # 移除时 proxy 清空(下一任务不再安装 sophub 工具); 配置损坏时
-            # 与 StartSession 一致地显式失败。
-            from ga_worker.sop_tool import SopToolError, load_runtime_sophub_proxy
-            try:
-                self._session.sophub_proxy = load_runtime_sophub_proxy(self.config_root)
-            except SopToolError as exc:
-                raise WorkerAdapterError("SOPHUB_CONFIG_ERROR", str(exc)) from exc
-            if self._session.sophub_proxy is not None:
-                mem_env = os.environ.get("GA_WORKSPACE_MEMORY", "").strip()
-                self._session.workspace_memory = (
-                    Path(mem_env) if mem_env else Path(self.legacy_root) / "memory"
-                )
-            return worker_pb2.ReloadCredentialsResponse(
-                credential_generation=metadata.generation,
-                config_checksum=metadata.checksum,
+    def _refresh_task_credentials(self) -> None:
+        """任务边界从磁盘重载最新 runtime 配置(决策 D1): Platform 每任务签发
+        新凭证并原子写配置(touch loader), GA 原生 reload_mykeys 已按 mtime
+        重载 LLM mykeys; 此处同步 session 级 capability JTI 集与 Sophub
+        proxy——复用 Worker 的下一任务依赖它获得绑定新 task 的 JTI 集合。
+        配置损坏时与 StartSession 一致地显式失败。"""
+        if self._session is None:
+            return
+        try:
+            metadata = load_runtime_metadata(self.config_root)
+        except CredentialConfigError as exc:
+            raise WorkerAdapterError("CREDENTIAL_CONFIG_ERROR", str(exc)) from exc
+        agent = self._session.agent
+        had_clients = hasattr(agent, "llmclients")
+        previous_clients = getattr(agent, "llmclients", None)
+        try:
+            agent.load_llm_sessions()
+        except Exception as exc:
+            if had_clients:
+                agent.llmclients = previous_clients
+            raise WorkerAdapterError("CREDENTIAL_RELOAD_FAILED", str(exc)) from exc
+        llm_clients = getattr(agent, "llmclients", None)
+        if isinstance(llm_clients, list) and not llm_clients:
+            if had_clients:
+                agent.llmclients = previous_clients
+            raise WorkerAdapterError("CREDENTIAL_CONFIG_EMPTY", "no GA sessions loaded")
+        self._session.routing_snapshot_id = metadata.routing_snapshot_id
+        self._session.capability_jtis = metadata.jtis
+        from ga_worker.sop_tool import SopToolError, load_runtime_sophub_proxy
+        try:
+            self._session.sophub_proxy = load_runtime_sophub_proxy(self.config_root)
+        except SopToolError as exc:
+            raise WorkerAdapterError("SOPHUB_CONFIG_ERROR", str(exc)) from exc
+        if self._session.sophub_proxy is not None:
+            mem_env = os.environ.get("GA_WORKSPACE_MEMORY", "").strip()
+            self._session.workspace_memory = (
+                Path(mem_env) if mem_env else Path(self.legacy_root) / "memory"
             )
 
     def execute_task(self, request: worker_pb2.ExecuteTaskRequest) -> Iterator[worker_pb2.WorkerEvent]:
+        # 决策 D1: 任务边界从磁盘重载最新凭证集(每任务签发, 无 RPC 刷新)。
+        self._refresh_task_credentials()
         from ga_worker.task_runner import run_task
         yield from run_task(self, request)
 
     def _assert_control_identity(self, workspace_key: str, runner_generation: int) -> None:
-        """控制 RPC(Reload/Cancel/Shutdown)的身份 fencing(方案 §7, 审查):
+        """控制 RPC(Cancel/Shutdown)的身份 fencing(方案 §7, 审查):
         请求必须携带并与当前会话的 workspace/generation 精确匹配, 拒绝迟到
         或跨工作区的控制请求。"""
         if self._session is None:

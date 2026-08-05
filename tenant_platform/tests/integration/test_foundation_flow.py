@@ -1087,8 +1087,15 @@ def _submit_started(base: str, message_id: str, prompt: str) -> dict:
     return body
 
 
+def _runtime_signature(document: dict) -> str:
+    """决策 D1: 无 config_checksum, 用文档序列化签名检测配置推进。"""
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def _wait_runtime_token(
-    config_root: Path, primary: dict, prev_checksum: str, timeout: float = 40.0
+    config_root: Path, primary: dict, prev_signature: str, timeout: float = 40.0
 ) -> tuple[str, str]:
     """轮询 runtime JSON 直到出现新的真实 capability token(任务执行期间
     签发, 尚未终态撤销)。round9 审查: 已终态任务的 token 会被在线校验与
@@ -1096,7 +1103,7 @@ def _wait_runtime_token(
     deadline = time.time() + timeout
     while time.time() < deadline:
         document = _runtime_document(config_root)
-        if document["_platform_runtime"]["config_checksum"] != prev_checksum:
+        if _runtime_signature(document) != prev_signature:
             runtime_primary = _runtime_provider(document, primary)
             if runtime_primary["apikey"] not in REAL_KEY_SENTINELS:
                 return runtime_primary["apikey"], runtime_primary["apibase"].removesuffix("/v1")
@@ -1115,15 +1122,15 @@ def _exercise_initial_oai_binding(
     # round9 审查: capability 语义变体测试(MODEL_MISMATCH/PROVIDER_TYPE_
     # MISMATCH/stream)必须在任务活跃窗口内取样 token——任务终态后 JTI 被
     # 撤销且在线校验拒绝, 401 CAPABILITY_REVOKED 会正确抢先于 409/404。
-    # runtime JSON 可能在首个任务前尚未生成: 空 checksum 使任何新签发都匹配。
-    prev_checksum = ""
+    # runtime JSON 可能在首个任务前尚未生成: 空签名使任何新签发都匹配。
+    prev_signature = ""
     try:
         prev_doc = _runtime_document(config_root)
-        prev_checksum = prev_doc["_platform_runtime"]["config_checksum"]
+        prev_signature = _runtime_signature(prev_doc)
     except AssertionError:
         pass
     started = _submit_started(base, "ga-chat-primary", "ga-chat-primary")
-    token, proxy_base = _wait_runtime_token(config_root, primary, prev_checksum)
+    token, proxy_base = _wait_runtime_token(config_root, primary, prev_signature)
     _assert_capability_rejections(proxy_base, token, primary)
     _assert_stream_first_chunk_unbuffered(proxy_base, token, primary["model"])
     final = _poll_status(base, started["task_id"], {"succeeded", "failed"}, timeout=150)
@@ -1133,17 +1140,15 @@ def _exercise_initial_oai_binding(
     _assert_worker_process_isolated(proc.pid, config_root, REAL_KEY_SENTINELS)
 
     document = _runtime_document(config_root)
-    checksum = document["_platform_runtime"]["config_checksum"]
+    signature = _runtime_signature(document)
     _set_default_provider(base, secondary["provider_id"])
     _submit_success(base, "ga-existing-after-default", "ga-existing-after-default")
     _captured_request(fixture, "ga-existing-after-default", OAI_TOKEN)
     # 每任务 capability(方案 §7): 复用 Worker 时每个新任务都签发绑定自身
-    # task_id 的新 token, 终态后旧 token 撤销——config_checksum 必然推进。
+    # task_id 的新 token, 终态后旧 token 撤销——runtime 文档必然推进。
     # 路由快照不变由"任务仍用 OAI_TOKEN(primary)"断言覆盖。
-    new_checksum = _runtime_document(config_root)["_platform_runtime"][
-        "config_checksum"
-    ]
-    assert new_checksum != checksum
+    new_signature = _runtime_signature(_runtime_document(config_root))
+    assert new_signature != signature
 
 
 def _exercise_new_worker_mixin_and_key_rotation(
@@ -1164,18 +1169,16 @@ def _exercise_new_worker_mixin_and_key_rotation(
     _captured_request(fixture, "ga-mixin-fallback", SECONDARY_OAI_TOKEN)
     _captured_request(fixture, "ga-mixin-fallback", OAI_TOKEN)
 
-    checksum = document["_platform_runtime"]["config_checksum"]
+    signature = _runtime_signature(document)
     rotated = _update_provider(base, primary, api_key=ROTATED_OAI_TOKEN)
     assert rotated["revision"] == primary["revision"]
     fixture.server.replace_credential(OAI_TOKEN, ROTATED_OAI_TOKEN)
     _submit_success(base, "ga-key-rotation", "ga-key-rotation")
     request = _captured_request(fixture, "ga-key-rotation", ROTATED_OAI_TOKEN)
     assert "ga-mixin-fallback" in json.dumps(request["payload"])
-    # 同 session 新任务同样推进 credential generation(每任务 token 绑定)。
-    new_checksum = _runtime_document(config_root)["_platform_runtime"][
-        "config_checksum"
-    ]
-    assert new_checksum != checksum
+    # 同 session 新任务同样推进 runtime 文档(每任务 token 绑定)。
+    new_signature = _runtime_signature(_runtime_document(config_root))
+    assert new_signature != signature
     return rotated
 
 

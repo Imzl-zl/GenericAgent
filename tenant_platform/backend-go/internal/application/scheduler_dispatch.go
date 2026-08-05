@@ -438,8 +438,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 // revokeSessionCredentialsIfTerminal 在任务终态后立即撤销该任务实际使用
 // 的 credential 集的全部 JTI(审查 I9)。set 在 ensureWorker 成功后立即捕获
 // (覆盖 StartSession/Policy 等早期终态路径), 不读 entry 当前集合, 避免误
-// 撤销新任务刷新后的凭证。撤销失败时入 pendingRevocations 由后续
-// prepareWorkerEntry/cleanup 重试, 不静默丢弃。
+// 撤销新任务轮换后的凭证。撤销失败记录日志——恢复路径
+// (RecoverAfterRestart 按 tasks.capability_jtis)与 TTL 过期兜底, 不静默丢弃。
 func (s *scheduler) revokeSessionCredentialsIfTerminal(ctx context.Context, taskID, sessionKey string, set workerCredentialSet) {
 	latest, err := s.cfg.Store.GetTask(ctx, taskID)
 	if err != nil || !latest.Status.IsTerminal() {
@@ -451,18 +451,8 @@ func (s *scheduler) revokeSessionCredentialsIfTerminal(ctx context.Context, task
 	revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialRevokeTimeout)
 	defer cancel()
 	if err := s.revokeCredentialSet(revokeCtx, set); err != nil {
-		slog.WarnContext(ctx, "scheduler: capability revocation failed; queued for retry",
+		slog.WarnContext(ctx, "scheduler: capability revocation failed",
 			"task_id", taskID, "count", len(set.JTIs), "error", err)
-		s.mu.Lock()
-		entry := s.workers[sessionKey]
-		s.mu.Unlock()
-		if entry != nil {
-			entry.lifecycleMu.Lock()
-			if s.workerEntryIsCurrent(sessionKey, entry) {
-				entry.pendingRevocations = append(entry.pendingRevocations, set)
-			}
-			entry.lifecycleMu.Unlock()
-		}
 	}
 }
 

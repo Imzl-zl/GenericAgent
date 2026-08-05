@@ -58,8 +58,6 @@ class SessionState:
     manifest: dict[str, Any]
     agent: Any
     runner_thread: threading.Thread
-    credential_generation: int
-    credential_checksum: str
     routing_snapshot_id: str
     capability_jtis: frozenset[str] = frozenset()
     sophub_proxy: Any | None = None

@@ -30,7 +30,6 @@ const (
 // One gRPC connection per Worker process; no retries in this layer.
 type WorkerClient interface {
 	StartSession(ctx context.Context, req *workerv1.StartSessionRequest) (*workerv1.StartSessionResponse, error)
-	ReloadCredentials(ctx context.Context, req *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error)
 	ExecuteTask(ctx context.Context, req *workerv1.ExecuteTaskRequest) (<-chan WorkerEvent, <-chan error)
 	BeginCheckpoint(ctx context.Context, req *workerv1.BeginCheckpointRequest) (*workerv1.CheckpointReady, error)
 	// CancelTask/Shutdown 携带 workspace_key + runner_generation(方案 §7,
@@ -82,25 +81,6 @@ func (c *Client) StartSession(ctx context.Context, req *workerv1.StartSessionReq
 		return nil, wrapRPC("StartSession", err)
 	}
 	return resp, nil
-}
-
-func (c *Client) ReloadCredentials(ctx context.Context, req *workerv1.ReloadCredentialsRequest) (*workerv1.ReloadCredentialsResponse, error) {
-	if req == nil {
-		return nil, errors.New("workerclient: nil ReloadCredentialsRequest")
-	}
-	if req.GetCredentialGeneration() == 0 {
-		return nil, errors.New("workerclient: credential generation must be positive")
-	}
-	if req.GetConfigChecksum() == "" {
-		return nil, errors.New("workerclient: config checksum is required")
-	}
-	callCtx, cancel := withDeadline(ctx, defaultUnaryTimeout)
-	defer cancel()
-	response, err := c.raw.ReloadCredentials(callCtx, req)
-	if err != nil {
-		return nil, wrapRPC("ReloadCredentials", err)
-	}
-	return response, nil
 }
 
 // ExecuteTask starts a server-streaming task and returns:

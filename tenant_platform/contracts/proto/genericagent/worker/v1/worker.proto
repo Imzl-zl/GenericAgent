@@ -44,20 +44,6 @@ message StartSessionResponse {
   string worker_instance_id = 2;
 }
 
-message ReloadCredentialsRequest {
-  uint64 credential_generation = 1;
-  string config_checksum = 2;
-  // 控制面身份 fencing(方案 §7, 审查): 迟到的 reload 请求必须绑定当前
-  // workspace 与 Runner generation, Worker 侧拒绝不匹配的控制请求。
-  string workspace_key = 3;
-  uint64 runner_generation = 4;
-}
-
-message ReloadCredentialsResponse {
-  uint64 credential_generation = 1;
-  string config_checksum = 2;
-}
-
 message TaskEnvelope {
   string task_id = 1;
   string session_key = 2;
@@ -135,7 +121,7 @@ message WorkerEvent {
 
 message CancelTaskRequest {
   string task_id = 1;
-  // 控制面身份 fencing(方案 §7, 审查): 与 ReloadCredentialsRequest 相同。
+  // 控制面身份 fencing(方案 §7, 审查): 绑定当前 workspace 与 Runner generation。
   string workspace_key = 2;
   uint64 runner_generation = 3;
   // 审查 R5-I8: 当前 task 的 capability JTI(与 ExecuteTask 同源), Worker
@@ -151,7 +137,7 @@ message HealthResponse {
 }
 message ShutdownRequest {
   string reason = 1;
-  // 控制面身份 fencing(方案 §7, 审查): 与 ReloadCredentialsRequest 相同。
+  // 控制面身份 fencing(方案 §7, 审查): 绑定当前 workspace 与 Runner generation。
   string workspace_key = 2;
   uint64 runner_generation = 3;
   // 审查 R5-I8: 当前 task 的 capability JTI, Worker 校验其在会话活跃凭据集中。
@@ -161,7 +147,6 @@ message ShutdownResponse { bool accepted = 1; }
 
 service WorkerService {
   rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
-  rpc ReloadCredentials(ReloadCredentialsRequest) returns (ReloadCredentialsResponse);
   rpc ExecuteTask(ExecuteTaskRequest) returns (stream WorkerEvent);
   rpc BeginCheckpoint(BeginCheckpointRequest) returns (CheckpointReady);
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);

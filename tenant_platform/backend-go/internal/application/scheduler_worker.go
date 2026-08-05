@@ -25,8 +25,6 @@ type workerEntry struct {
 	sessionKey         string
 	taskID             string // 当前已下发 capability 的 task(方案 §7 per-task capability)
 	credentials        workerCredentialSet
-	pendingRefresh     *pendingCredentialRefresh
-	pendingRevocations []workerCredentialSet
 	lifecycleMu        sync.Mutex
 	// startMu 只串行 StartSession 与 CancelWorker(round11 审查 C3): 原全局
 	// workerCallMu 让一个卡住的 StartSession 阻塞所有工作区; 收窄到
@@ -180,12 +178,11 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 			continue
 		}
 		// 审查 R5-I2: 先把 entry.taskID 切换到当前任务, 再执行
-		// prepareWorkerEntry——prepare 内部(凭据到期/待刷新)触发的
-		// credential 刷新以 entry.taskID 签发 token 并持久化 JTI。若仍指向
-		// 已终态旧任务, 新 token 会挂到无法被撤销的行上(旧任务终态事务已
-		// 提交撤销旧集, 恢复扫描只处理未终态任务), 崩溃窗口内无人撤销。
+		// prepareWorkerEntry——prepare 内部(MCP/路由快照替换)触发的任务边界
+		// 凭证轮换以 entry.taskID 签发 token 并持久化 JTI。若仍指向已终态旧
+		// 任务, 新 token 会挂到无法被撤销的行上(旧任务终态事务已提交撤销旧
+		// 集, 恢复扫描只处理未终态任务), 崩溃窗口内无人撤销。
 		taskChanged := entry.taskID != task.ID
-		generationBefore := entry.credentials.Generation
 		entry.taskID = task.ID
 		replace, err := s.prepareWorkerEntry(ctx, entry)
 		if err != nil {
@@ -194,11 +191,11 @@ func (s *scheduler) ensureWorker(ctx context.Context, task domain.Task) (workerc
 		}
 		if !replace {
 			entry.lastUsedAt = time.Now().UTC()
-			// per-task capability(方案 §7): 复用 Worker 时新任务必须签发
-			// 新 token(绑定 task_id/generation); prepare 已因到期/待刷新签发
-			// 过(Generation 已递增)则跳过, 避免重复签发。
-			if taskChanged && s.cfg.TokenIssuer != nil && entry.credentials.Generation == generationBefore {
-				if err := s.refreshWorkerCredentials(ctx, entry); err != nil {
+			// per-task capability(方案 §7, 决策 D1): 复用 Worker 时新任务必须
+			// 签发绑定新 task 的 token——轮换 = 签发 + 原子写配置(touch loader
+			// 驱动 GA 原生 reload_mykeys) + 撤销旧集, 无 RPC 刷新协议。
+			if taskChanged && s.cfg.TokenIssuer != nil {
+				if err := s.rotateWorkerCredentials(ctx, entry); err != nil {
 					entry.lifecycleMu.Unlock()
 					return nil, entry, err
 				}
@@ -240,14 +237,6 @@ func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) 
 			return true, nil
 		}
 	}
-	if err := s.flushPendingCredentialRevocations(ctx, entry); err != nil {
-		return false, fmt.Errorf("flush pending credential revocations: %w", err)
-	}
-	if entry.pendingRefresh != nil {
-		if err := s.refreshWorkerCredentials(ctx, entry); err != nil {
-			return false, err
-		}
-	}
 	mcpReplace, err := s.mcpSnapshotRequiresReplacement(ctx, entry.credentials.MCPSnapshot.ID)
 	if err != nil || mcpReplace {
 		return mcpReplace, err
@@ -258,11 +247,6 @@ func (s *scheduler) prepareWorkerEntry(ctx context.Context, entry *workerEntry) 
 	replace, err := s.routingSnapshotRequiresReplacement(ctx, entry.credentials.Snapshot)
 	if err != nil || replace {
 		return replace, err
-	}
-	if s.credentialsNeedRefresh(entry.credentials) {
-		if err := s.refreshWorkerCredentials(ctx, entry); err != nil {
-			return false, err
-		}
 	}
 	return false, nil
 }
@@ -359,14 +343,8 @@ func (s *scheduler) cleanupWorkerEntryBestEffort(ctx context.Context, entry *wor
 	if entry.cleanup != nil {
 		// 审查 C1/I7: 清理/关闭携带当前凭据集 JTI, Worker 校验通过后
 		// 才能优雅停止; 任务终态后 credentials 可能已被撤销, 但 Worker
-		// 内存 session 的 JTI 集在 Reload 时更新, firstJTI 仍在集合内。
+		// 内存 session 的 JTI 集随配置重载更新, firstJTI 仍在集合内。
 		entry.cleanup(controlJTIFor(entry.credentials))
-	}
-	if entry.pendingRefresh != nil {
-		s.revokeCredentialSetBestEffort(ctx, entry.pendingRefresh.Next)
-	}
-	for _, set := range entry.pendingRevocations {
-		s.revokeCredentialSetBestEffort(ctx, set)
 	}
 	s.revokeCredentialSetBestEffort(ctx, entry.credentials)
 }

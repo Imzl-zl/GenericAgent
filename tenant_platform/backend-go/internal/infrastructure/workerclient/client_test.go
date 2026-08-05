@@ -390,47 +390,6 @@ func TestWorkerClient_StartSession(t *testing.T) {
 	}
 }
 
-func TestWorkerClientReloadCredentials(t *testing.T) {
-	srv := &scriptedWorker{}
-	client, closeFn := newClient(t, srv)
-	defer closeFn()
-
-	response, err := client.ReloadCredentials(context.Background(), &workerv1.ReloadCredentialsRequest{
-		CredentialGeneration: 4,
-		ConfigChecksum:       "checksum-4",
-		WorkspaceKey:         "personal:9",
-		RunnerGeneration:     3,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.GetCredentialGeneration() != 4 || response.GetConfigChecksum() != "checksum-4" {
-		t.Fatalf("response = %+v", response)
-	}
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if srv.lastReload == nil || srv.lastReload.GetCredentialGeneration() != 4 || srv.lastReload.GetConfigChecksum() != "checksum-4" {
-		t.Fatalf("request = %+v", srv.lastReload)
-	}
-}
-
-func TestWorkerClientReloadCredentialsRejectsInvalidRequest(t *testing.T) {
-	srv := &scriptedWorker{}
-	client, closeFn := newClient(t, srv)
-	defer closeFn()
-	for name, request := range map[string]*workerv1.ReloadCredentialsRequest{
-		"nil":             nil,
-		"zero generation": {ConfigChecksum: "checksum"},
-		"empty checksum":  {CredentialGeneration: 1},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := client.ReloadCredentials(context.Background(), request); err == nil {
-				t.Fatal("expected validation error")
-			}
-		})
-	}
-}
-
 func TestWorkerClient_ExecuteTask_NoCheckpointOnDisplayStream(t *testing.T) {
 	// Explicitly assert the typed wrapper has no checkpoint field path that
 	// a scheduler could mistake for BeginCheckpoint results.

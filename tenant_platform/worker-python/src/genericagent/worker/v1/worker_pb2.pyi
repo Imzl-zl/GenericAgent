@@ -69,26 +69,6 @@ class StartSessionResponse(_message.Message):
     worker_instance_id: str
     def __init__(self, session_key: _Optional[str] = ..., worker_instance_id: _Optional[str] = ...) -> None: ...
 
-class ReloadCredentialsRequest(_message.Message):
-    __slots__ = ("credential_generation", "config_checksum", "workspace_key", "runner_generation")
-    CREDENTIAL_GENERATION_FIELD_NUMBER: _ClassVar[int]
-    CONFIG_CHECKSUM_FIELD_NUMBER: _ClassVar[int]
-    WORKSPACE_KEY_FIELD_NUMBER: _ClassVar[int]
-    RUNNER_GENERATION_FIELD_NUMBER: _ClassVar[int]
-    credential_generation: int
-    config_checksum: str
-    workspace_key: str
-    runner_generation: int
-    def __init__(self, credential_generation: _Optional[int] = ..., config_checksum: _Optional[str] = ..., workspace_key: _Optional[str] = ..., runner_generation: _Optional[int] = ...) -> None: ...
-
-class ReloadCredentialsResponse(_message.Message):
-    __slots__ = ("credential_generation", "config_checksum")
-    CREDENTIAL_GENERATION_FIELD_NUMBER: _ClassVar[int]
-    CONFIG_CHECKSUM_FIELD_NUMBER: _ClassVar[int]
-    credential_generation: int
-    config_checksum: str
-    def __init__(self, credential_generation: _Optional[int] = ..., config_checksum: _Optional[str] = ...) -> None: ...
-
 class TaskEnvelope(_message.Message):
     __slots__ = ("task_id", "session_key", "requester_user_id", "source", "source_instance_id", "message_id", "prompt", "persona_snapshot", "tool_policy_version", "created_at", "runner_generation", "capability_jti")
     TASK_ID_FIELD_NUMBER: _ClassVar[int]
