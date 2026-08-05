@@ -50,10 +50,8 @@ func (s *scheduler) reapIdleTasks(ctx context.Context, owned []domain.Task, idle
 			slog.WarnContext(ctx, "scheduler: idle reap cancel failed", "task_id", t.ID, "error", err)
 		}
 		cancel()
-		_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.terminateTask(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_IDLE", "Worker heartbeat went silent; possible deadlock or hung I/O", "")
-		// 任务终态即销毁 Worker(决策 D2.1): 内存状态未提交, 下一任务冷启动。
-		s.destroyTaskWorker(t.SessionKey)
 		_ = s.KickSession(ctx, t.SessionKey)
 	}
 	return nil

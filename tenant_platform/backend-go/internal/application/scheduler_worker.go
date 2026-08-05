@@ -25,7 +25,11 @@ type workerEntry struct {
 	sessionKey  string
 	// taskID 是本 entry 绑定的任务(round12 审查 M1): 销毁时清理 cancelOnce
 	// 条目, 防止按任务数无界增长。
-	taskID      string
+	taskID string
+	// destroyed 标记 entry 已被销毁(round13 L2): CAS 保证"销毁恰好一次"
+	// 从 map 身份检查升级为对象自身状态——销毁与 map 归属解耦, 替换窗口
+	// 类问题从结构上不可能再出现。
+	destroyed atomic.Bool
 	credentials workerCredentialSet
 	lifecycleMu sync.Mutex
 	// startMu 只串行 StartSession 与 CancelWorker(round11 审查 C3): 同一
@@ -107,6 +111,11 @@ func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error
 		// worker 已不存在 = 任务已终态销毁, 取消已生效,
 		// 视为成功而不是向用户报错(否则 CancelTask API 在
 		// cancel-during-StartSession 竞态下返回 500, 尽管任务已中断)。
+		return nil
+	}
+	// round13 L2: 已销毁的 entry 不再向容器发取消 RPC(容器已停, RPC 只会
+	// 超时浪费; 任务状态由终态化路径负责)。
+	if entry.destroyed.Load() {
 		return nil
 	}
 	// round11 审查(C3): 取消与同 session 的 StartSession 互斥用 per-entry
@@ -379,6 +388,10 @@ func (s *scheduler) destroyTaskWorkerEntry(sessionKey string, entry *workerEntry
 	// map entry)时仍必须清理旧 entry——旧任务已终态, 其容器/凭据不得因被
 	// 替换而泄漏(completeSuccess 终态提交与销毁之间的替换窗口); 只是不
 	// 触碰 map 中的新 entry。
+	// round13 L2: destroyed CAS 保证同一 entry 恰好清理一次。
+	if !entry.destroyed.CompareAndSwap(false, true) {
+		return
+	}
 	if entry.taskID != "" {
 		s.cancelOnce.Delete(entry.taskID)
 	}
@@ -415,6 +428,10 @@ func (s *scheduler) destroyTaskWorkerLocked(sessionKey string, entry *workerEntr
 	// round12 审查(I1 补充/独立审查): 身份不匹配时同样清理旧 entry(终态
 	// 任务不得因 map 被替换而泄漏容器/凭据), 只是不触碰 map 中的新 entry。
 	// 调用方必须已持有 entry.lifecycleMu。
+	// round13 L2: destroyed CAS 保证同一 entry 恰好清理一次。
+	if !entry.destroyed.CompareAndSwap(false, true) {
+		return
+	}
 	if entry.taskID != "" {
 		s.cancelOnce.Delete(entry.taskID)
 	}

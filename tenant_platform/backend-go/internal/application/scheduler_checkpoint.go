@@ -14,7 +14,7 @@ import (
 
 func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, terminal *workerv1.Terminal) error {
 	if s.cfg.Coordinator == nil {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"NO_COORDINATOR", "checkpoint coordinator not configured", "")
 		return fmt.Errorf("no coordinator")
 	}

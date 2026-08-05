@@ -369,12 +369,8 @@ func (s *scheduler) tick(ctx context.Context) error {
 				"task_id", t.ID,
 				"session_key", t.SessionKey,
 				"status", string(t.Status))
-			_ = s.finalizeOrFail(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
+			_ = s.terminateTask(ctx, t, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"LEASE_EXPIRED", "claim lease expired or lost during heartbeat", "")
-			// 审查: lease 丢失意味着旧 Worker 已与持久 lease 脱节(可能被其他
-			// 实例接管/销毁), 立即销毁本地 entry, 防止复用已 fence 的进程。
-			s.destroyTaskWorker(t.SessionKey)
-			_ = s.KickSession(ctx, t.SessionKey)
 			continue
 		default:
 			// DB connectivity error; don't finalize — retry next tick.

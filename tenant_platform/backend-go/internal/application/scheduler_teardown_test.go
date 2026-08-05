@@ -89,6 +89,7 @@ func TestDispatchPolicyResolveFailureDestroysWorker(t *testing.T) {
 	if !final.Status.IsTerminal() || final.TerminalErrorCode != "POLICY_RESOLVE_FAILED" {
 		t.Fatalf("task status=%s code=%s want terminal POLICY_RESOLVE_FAILED", final.Status, final.TerminalErrorCode)
 	}
+	assertNoWorkerLeaks(t, sched)
 }
 
 func TestDispatchAgentMaxTurnsErrorDestroysWorker(t *testing.T) {
@@ -116,6 +117,7 @@ func TestDispatchAgentMaxTurnsErrorDestroysWorker(t *testing.T) {
 	if !final.Status.IsTerminal() || final.TerminalErrorCode != "WORKER_START_FAILED" {
 		t.Fatalf("task status=%s code=%s want terminal WORKER_START_FAILED", final.Status, final.TerminalErrorCode)
 	}
+	assertNoWorkerLeaks(t, sched)
 }
 
 // errRuntimeSettings 让 agentMaxTurns 解析失败。
@@ -170,6 +172,7 @@ func TestDispatchConcurrentTerminalAfterMarkRunningDestroysWorker(t *testing.T) 
 	if final.TerminalErrorCode != "CONCURRENT_TERMINAL" {
 		t.Fatalf("task code=%s want CONCURRENT_TERMINAL", final.TerminalErrorCode)
 	}
+	assertNoWorkerLeaks(t, sched)
 }
 
 // panicAfterDispatchStartedStore 在 MarkDispatchStarted 成功后注入 panic,
@@ -213,6 +216,7 @@ func TestDispatchPanicDestroysWorker(t *testing.T) {
 	if !final.Status.IsTerminal() {
 		t.Fatalf("task status=%s want terminal after panic", final.Status)
 	}
+	assertNoWorkerLeaks(t, sched)
 }
 
 func TestDispatchSuccessWithoutCoordinatorDestroysWorker(t *testing.T) {
@@ -241,6 +245,7 @@ func TestDispatchSuccessWithoutCoordinatorDestroysWorker(t *testing.T) {
 	if final.TerminalErrorCode != "NO_COORDINATOR" {
 		t.Fatalf("task code=%s want NO_COORDINATOR", final.TerminalErrorCode)
 	}
+	assertNoWorkerLeaks(t, sched)
 }
 
 // TestDestroyTaskWorkerEntryDoesNotTouchReplacedEntry: 身份校验——旧任务收尾

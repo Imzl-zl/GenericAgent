@@ -31,6 +31,24 @@ type finalizeIntent struct {
 	traceID      string
 }
 
+// terminateTask 是任务非成功终态收尾的唯一入口(round13 L1 根本性收拢):
+// 按固定顺序完成 Worker 销毁(幂等) + 终态化(失败自动注册 pendingFinalize
+// 重试) + 会话唤醒。所有非成功终态路径必须经本方法收尾——"终态即销毁"
+// 从 20+ 处手写三件套收敛为单一定义, 新分支漏销毁变为不可能。
+//
+// 顺序约束: destroy 先于 finalize——终态提交前资源(容器/lease/凭据)已释放,
+// 同 session 下一任务只能在终态提交后 claim, 替换窗口从结构上不可能出现。
+//
+// 例外: completeSuccess 成功路径必须两段式(captureTaskDeliverableFiles 依赖
+// Worker 存活), 且其失败分支持 entry.lifecycleMu 不可经本方法(锁重入),
+// 保持显式 destroyTaskWorkerLocked + finalizeOrFail(顺序同样 destroy 先行)。
+func (s *scheduler) terminateTask(ctx context.Context, task domain.Task, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) domain.Task {
+	s.destroyTaskWorker(task.SessionKey)
+	t := s.finalizeOrFail(ctx, task, status, deliveryType, code, message, traceID)
+	_ = s.KickSession(ctx, task.SessionKey)
+	return t
+}
+
 // finalizeOrFail records a terminal task state + delivery and surfaces any
 // persistence failure via log instead of silently dropping it (global rule:
 // No Silent Fallbacks). The returned task is the updated row on success, or
@@ -111,10 +129,8 @@ func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) 
 		slog.WarnContext(ctx, "scheduler: deadline cancel failed", "task_id", task.ID, "error", err)
 	}
 	// 超时后 Worker 内存状态不确定, 不复用(审查: 失败后不复用)。
-	s.destroyTaskWorker(task.SessionKey)
-	s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+	s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 		"TASK_DEADLINE_EXCEEDED", "task exceeded maximum wall-clock duration", "")
-	_ = s.KickSession(ctx, task.SessionKey)
 	return context.DeadlineExceeded
 }
 
@@ -154,7 +170,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			// 独立有界上下文(与 heartbeat 丢失 fallback 同模式)。
 			fbCtx, fbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer fbCancel()
-			_ = s.finalizeOrFail(fbCtx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+			_ = s.terminateTask(fbCtx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"DISPATCH_PANIC", fmt.Sprintf("%v", r), "")
 		}
 	}()
@@ -218,10 +234,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			latest, getErr := s.cfg.Store.GetTask(fbCtx, task.ID)
 			if getErr == nil && !latest.Status.IsTerminal() {
 				_ = s.CancelWorker(fbCtx, latest)
-				s.destroyTaskWorker(task.SessionKey)
-				_ = s.finalizeOrFail(fbCtx, latest, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+				_ = s.terminateTask(fbCtx, latest, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 					"CLAIM_LEASE_LOST", err.Error(), "")
-				_ = s.KickSession(fbCtx, task.SessionKey)
 			}
 			returnErr = fmt.Errorf("claim heartbeat: %w", err)
 		}
@@ -246,9 +260,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			return nil
 		}
 		s.auditRoutingBinding(ctx, task, entry, "error", "WORKER_CREDENTIAL_PREPARE_FAILED")
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_START_FAILED", err.Error(), "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	s.auditRoutingBinding(ctx, task, entry, "success", "")
@@ -284,7 +297,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	// token 暴露给 Runner 之前持久化(审查 F1), 此处不再重复写入。
 
 	if _, err := s.cfg.Registry.Resolve(CapabilityVersion, task.ToolPolicyVersion); err != nil {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"POLICY_RESOLVE_FAILED", err.Error(), "")
 		return err
 	}
@@ -292,9 +305,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	// StartSession happens after MarkDispatchStarted so the durable cancel path
 	// can observe and record CancelRequestedAt while StartSession is in flight.
 	if err := s.startSessionOnWorker(ctx, task); err != nil {
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_START_FAILED", err.Error(), "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 
@@ -302,10 +314,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		// 审查 R4-C2: dispatch 无法继续且任务未终态。销毁本地 Worker 防脏
 		// 复用(任务可能已被接管/终态化, 本地进程不得留给下一任务), 并尽力
 		// 终态化防任务卡死; 失败时由 lease 过期恢复路径兜底, 无副作用。
-		s.destroyTaskWorker(task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_ = s.terminateTask(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"MARK_RUNNING_FAILED", err.Error(), "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 
@@ -313,10 +323,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	taskRow, err := s.cfg.Store.GetTask(ctx, task.ID)
 	if err != nil {
 		// 审查 R4-C2: 同 MarkRunning 失败路径——销毁 Worker + 尽力终态化。
-		s.destroyTaskWorker(task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_ = s.terminateTask(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_STATE_READ_FAILED", err.Error(), "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	if taskRow.Status.IsTerminal() {
@@ -325,10 +333,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	if taskRow.CancelRequestedAt != nil {
 		// 审查: StartSession 已执行但任务在 ExecuteTask 前被取消, Worker
 		// 内存状态未提交, 销毁重建而非复用。
-		s.destroyTaskWorker(task.SessionKey)
-		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, s.cfg.PlatformInstanceID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_ = s.terminateTask(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", "task interrupted before worker execution", "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	req := &workerv1.ExecuteTaskRequest{Task: workerTaskEnvelope(taskRow, entry.runnerGeneration, controlJTIFor(entry.credentials))}
@@ -349,10 +355,8 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			cancelExecute()
 			// chunk 元数据无法持久化: 复用 Worker 会让下一任务的 chunk 序列
 			// 出现缺口, 销毁重建(审查: 失败后不复用)。
-			s.destroyTaskWorker(task.SessionKey)
-			_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+			_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 				"CHUNK_EVENT_FAILED", err.Error(), "")
-			_ = s.KickSession(ctx, task.SessionKey)
 			return fmt.Errorf("record chunk event: %w", err)
 		}
 		return nil
@@ -438,17 +442,13 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 			return nil
 		}
 		// 流错误: Worker 状态已推进但未提交, 销毁重建(审查: 失败后不复用)。
-		s.destroyTaskWorker(task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"WORKER_STREAM_ERROR", streamErr.Error(), "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return streamErr
 	}
 	if terminal == nil {
-		s.destroyTaskWorker(task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"MISSING_TERMINAL", "worker stream ended without terminal", "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return fmt.Errorf("missing terminal")
 	}
 
@@ -456,17 +456,13 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	if err != nil {
 		// 审查 R4-C2: 任务已执行完毕但终态读失败——Worker 内存状态已推进,
 		// 销毁防脏复用, 尽力终态化由恢复路径兜底。
-		s.destroyTaskWorker(task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_ = s.terminateTask(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_STATE_READ_FAILED", err.Error(), "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	if current.CancelRequestedAt != nil {
-		s.destroyTaskWorker(task.SessionKey)
-		_, err := s.cfg.Store.CompleteFailedTerminal(ctx, task.ID, s.cfg.PlatformInstanceID, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_ = s.terminateTask(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", "task interrupted after accepted cancellation", "")
-		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
 	if !time.Now().Before(taskDeadline) {
@@ -476,23 +472,19 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	case workerv1.TerminalStatus_TASK_SUCCEEDED:
 		return s.completeSuccess(ctx, task, terminal)
 	case workerv1.TerminalStatus_TASK_CANCELLED:
-		s.destroyTaskWorker(task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskCancelled, domain.DeliveryTaskCancelled,
+		_ = s.terminateTask(ctx, task, domain.TaskCancelled, domain.DeliveryTaskCancelled,
 			"TASK_CANCELLED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	case workerv1.TerminalStatus_TASK_INTERRUPTED:
-		s.destroyTaskWorker(task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
+		_ = s.terminateTask(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
 			"TASK_INTERRUPTED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	default:
 		code := "TASK_FAILED"
 		if terminal.GetError() != nil && terminal.GetError().GetCode() != "" {
 			code = terminal.GetError().GetCode()
 		}
-		s.destroyTaskWorker(task.SessionKey)
-		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
+		_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			code, boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
 	}
-	_ = s.KickSession(ctx, task.SessionKey)
 	return nil
 }
 
