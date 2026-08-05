@@ -133,3 +133,11 @@
   - Important-2 弱测试: TestFinalizeRetryDropsIntentWhenClaimLost 改 GetTask 包装真实覆盖 ClaimOwner 分支, 断言 drain 不再调用 CompleteFailedTerminal
   - Minor: Manager nonce 状态目录单写者前提文档化(多实例共享卷 last-writer-wins)
 - 验证: Go 18 包全量 + race 5 关键包 + vet + linux build + tests 47 + worker-python 109 + compose config + diff check 全绿
+# Round 13 根本性收拢(2026-08-05, 生命周期不变量结构强制)
+- Truth: tasks/25-lifecycle-invariants/DESIGN.md + SUBTASKS.csv id=25
+- 决策(用户): "直接从根源优化, 不是打补丁"——三层结构强制全做
+- L1 terminateTask 单一收尾 API: destroy(幂等)→finalize(失败自动注册 pendingFinalize 重试)→kick; destroy 先于 finalize 结构性消除替换窗口; 替换 dispatch 约 14 处 + tick LEASE_EXPIRED + reaper WORKER_IDLE + completeSuccess NO_COORDINATOR
+- L2 workerEntry.destroyed CAS: 销毁恰好一次从 map 身份检查升级为对象自身状态; cancelRPC 跳过已销毁 entry
+- L3 assertNoWorkerLeaks 测试强制: 5 个 dispatch 终态路径测试 + 新 terminate 测试统一挂载
+- 例外(文档化): completeSuccess 成功路径两段式(capture 依赖 Worker 存活) + 持锁分支不收拢(锁重入)
+- 验证: application 34 测试全绿; Go 18 包 -p 1 + race 5 关键包 + vet + linux build; tests 47; worker-python 109; bot_poller 16; compose config; diff check
