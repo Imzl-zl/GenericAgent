@@ -70,3 +70,38 @@
 - B8( Minor): delivery claim 排除同 task 未完成 task_started, 完成消息不再先于"正在处理"。
 - B9a( Minor): checkpoint Commit 失败清理已物化 committed/result 文件。
 - B1c( Critical): Compose 主 API 改 unix socket(nginx 经 platform_sock 卷代理 /v1/ 与 /healthz), webhook 指向 web:8088, API 面不暴露 runner-control。
+# Round 11 fixes (2026-08-05, 独立审查第四轮 3C/7I 修复批次)
+- Truth: SUBTASKS.csv id=20 (tasks/20-fix-round11)
+- 目标: 修复审查确认的 3 Critical + 7 Important + 3 Minor, 全部先测试后实现
+- C1 Compose socket 接线: platform 挂 platform_sock 卷 + web group_add 10001(compose config 渲染验证)
+- C2 checkpoint 不确定删除窗口: classifyCommitError 区分确定回滚/ErrCommitOutcomeUnknown; 不确定时保留文件 + ReconcileOrphanCommittedFiles(DB 引用对账, 1h 孤儿年龄) 5 分钟节流接线; 4 分支单测 + 4 集成测试
+- C3 全局 workerCallMu → per-entry startMu(StartSession/CancelTask 同 session 串行, 跨 session 并行) + executing 原子标记(未执行不发取消 RPC) + StartSessionTimeout 独立超时(默认 90s) + CancelTask RPC 30s 超时
+- I1 附件先写后授权: ImportInbound 失败/提交失败回滚 RemoveInbound(manifest 同步清理, 幂等); router 提交失败自动回滚
+- I2 CancelTask 失败重试: cancelCall 改 inflight/done/notify 状态机, 瞬时失败不缓存, 并发合并单 RPC
+- I3 sweep 双路径: DestroyRunnerIf 锁内 re-inspect(created→running 竞态) + absTTL 判定基于最新状态; assertManagedRunner/runnerLabels 提取复用
+- I4 control capability: IssueControlToken(aud=ga-worker-control, op=worker.control) 独立签发; ControlJTI 带 ctrl: 前缀(Worker 只持有 JTI 值)进同一撤销集合; 控制 RPC 全部改用 controlJTIFor; Worker 校验前缀+集合成员(LLM JTI 拒绝); 集成测试修复(真实 Go JWT aud 数组→前缀方案)
+- I5 DOCX: install_export_docx_tool 真实实现(python-docx, 镜像已装), outputs/ 沙箱+逃逸拒绝+source_path/<file_content> 支持; 注入 TOOLS_SCHEMA 经 policy 过滤; 原"不注入"测试反转
+- I6 config 清理强制化: cleanupWorkspaceConfig 返回 error + destroy/创建失败路径组合错误 + ReconcileOrphanWorkspaceConfigs(label 对账, 1h 年龄) 周期接线
+- I7 memory 模板标记: .ga-memory-init 工作区根标记(不在 Runner 挂载), 用户清空 memory 不重灌; 老布局补标记不重灌
+- M1 证书 TTL: minRunnerCertTTL 24h(lease 无限续租但证书不轮换, 长会话重连失败)
+- M2 compose 卷/网络名项目前缀: ${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces / _runner-control, GA_WORKSPACES_VOLUME 同步
+- M3 死代码: DocumentPoolSettings 类型/校验/测试删除; settings_http documentPool 死类型删除; README 更新(不再提 Document Manager)
+- 验证: Go 18 包全量(-p 1, DB 套件 genericagent_test)+ race 3 关键包; worker-python 116; bot_poller 16; 契约+安全+集成+冒烟 45(integration 6 连续两轮); GOOS=linux build; compose config; git diff --check; 全部通过
+- 新增测试: classifyCommitError 2 / Reconcile 4 / completeSuccess 4 / 锁并发 3 / cancel 重试 3 / DestroyRunnerIf 6 / ReconcileConfig 2 / memory marker 2 / control JTI 2+1 / export_docx 2 / RemoveInbound 3+2 router 2
+- 数据库: dbx 超级用户 admin 建 ga_r11_test 测试角色(genericagent_test), TEST_DATABASE_URL 可用
+- 残余(仓库已声明): runsc/mTLS 端到端、真实六服务 compose 冒烟、真实 Sophub 需部署主机; integration 进程扫描测试偶发 flaky(Windows 进程枚举时机, 与改动无关)
+# 架构决策 D1: "任务即进程"重构(2026-08-05, 用户确认开新会话执行)
+- 背景: 11 轮审查修复后仍反复出现阻塞问题, 根因是封装层协议面过度设计——凭证热刷新协议
+  (ReloadCredentials/generation/pendingRefresh/rollback) 与常驻 Worker 生命周期为"省冷启动"而存在,
+  但 worker 冷启动实测 0.24s(Windows; Linux 容器预计 1-3s), 收益趋近于零, 成本是数百行状态机 + 每轮竞态。
+- 用户决策: 该重新设计就重新设计; 架构要匹配项目实际(核心=GA 原生, 封装只做多租户管理)。
+- 目标架构: 任务即进程——每任务全新 Worker(容器内) + checkpoint 快照恢复; 任务终态销毁。
+- 砍掉: 凭证热刷新协议(ReloadCredentials/pendingRefresh/rollback/credentialsNeedRefresh/凭证 generation/checksum 校验);
+  Worker 常驻生命周期(ensureWorker 复用逻辑/idle eviction/startOnce/executing 状态机)。
+- 保留: checkpoint Prepare/Commit/恢复; capability JTI 签发/撤销(含 ctrl: 前缀 control JTI);
+  Runner lease + generation fencing(简化语义); 消息/任务/交付事务链; Manager 控制面; 政策/session files/交付安全。
+- 凭证新语义: 每任务签发(LLM+sophub+control), TTL 覆盖任务墙钟上限(默认 45min, 上限可配), 任务终态撤销, 无刷新。
+- 阶段: P1 删热刷新协议 → P2 删常驻生命周期 → P3 容器生命周期简化; 每阶段 TDD + DB 集成测试 + 全量验证。
+- 前置: round11 未提交改动(36 文件)需先提交, 再开重构分支。
+- 验证基线: TEST_DATABASE_URL=postgres://ga_r11_test:REDACTED@127.0.0.1:5432/genericagent_test?sslmode=disable
+  Go 18 包 -p 1 + race; worker-python 116; contract+security+integration 45(integration 6 条全链路); compose config; GOOS=linux build。
