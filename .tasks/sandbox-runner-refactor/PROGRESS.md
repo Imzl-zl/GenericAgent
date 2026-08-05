@@ -111,3 +111,19 @@
 - 净删除 ~1600 行(56 文件 +858/-2424); 每阶段全量验证绿
 - 分支 refactor/task-per-process 已合并 main(fast-forward)并删除
 - 遗留: 无; push 未执行(用户未要求)
+# Round 12 fixes (2026-08-05, 审查第十二轮 7I/3M 修复批次)
+- Truth: tasks/24-fix-round12/DESIGN.md + SUBTASKS.csv id=24
+- 目标: 修复 Round 12 审查的 7 Important + 3 Minor, 全部先测试后实现(TDD 红绿闭环)
+- I1 dispatch 单出口 teardown: createTaskWorker 成功后统一 deferred 销毁(身份校验变体 destroyTaskWorkerEntry 防误毁同 session 新任务), 覆盖 panic/policy/并发终态/startSession 错误/无 coordinator 5 类泄漏出口; panic recovery 改用独立有界 ctx(心跳 defer 先取消 ctx 的连带缺陷); 6 新测试
+- I2 pendingFinalize: finalizeOrFail 写库失败注册意图, tick 每轮 drain 重试(claim 由 tick heartbeat 续租保持有效; 进程崩溃由 claim 过期 + RecoverAfterRestart 兜底); 3 新测试
+- I3 可取消等待: dispatchHeartbeat.Stop 改 cancel 先行 + 5s 超时等待; sandbox_runtime 续租改 renewCtx 可取消, cleanup 先 cancel 再带超时等待, Shutdown/Destroy/Release 全部 bounded timeout; DialControl 测试注入点; 2 新测试
+- I4 Manager nonce 持久化: NewManagerServerWithNonceState 每次消费先原子落盘(fsync+rename)再放行, 失败 fail-closed 503; cmd 必填 GA_MANAGER_NONCE_STATE; compose 新增 manager_state 卷; 4 新测试(跨重启重放/重启后新 nonce/启动失败/途中失败)
+- I5 ImportInbound 原子回滚: 复制失败/manifest 保存失败删除已复制文件; 2 新测试
+- I6 delivery spool 统一清理: removePayloadFiles 单一清理所有权, process 成功 build 后立即 defer, buildPayload 中途失败自清理, 删除逐文件 defer; 4 新测试
+- I7 路由单次解析 + fail-closed: 入口唯一解析, GetActiveContext 真实错误拒绝消息(不再静默降级个人), handleNormalMessage 复用 inboundSessionKey(任务/消息行/附件同 key); 2 新测试
+- M1 cancelOnce 清理: workerEntry.taskID + 销毁时 Delete; 1 新测试
+- M2 staging 对账: Commit 删除失败记 Warn(不阻断提交), ReconcileOrphanStagingFiles(无 writing 引用 + 1h 孤儿年龄)接线 5 分钟对账; 3 新测试
+- M3 文档矛盾: 主设计 91/86/183/275/245 行 + compose README 97 行改任务即进程语义
+- 新问题同步修复: 门禁测试卷白名单新增 manager_state(设计变更的一部分)
+- 验证: Go 18 包 -p 1(DB 套件)全绿 + race 5 关键包(application/sandbox/postgres/worker/checkpoint)全绿 + vet + GOOS=linux build; worker-python 109 passed/2 skipped; tests/ 全套 47 passed; bot_poller 16; compose config; git diff --check
+- 新增测试: dispatch teardown 6 / pendingFinalize 3 / heartbeat Stop 1 / renewer cleanup 1 / Manager nonce 4 / ImportInbound 2 / delivery spool 4 / router 2 / cancelOnce 1 / staging 3 = 27
