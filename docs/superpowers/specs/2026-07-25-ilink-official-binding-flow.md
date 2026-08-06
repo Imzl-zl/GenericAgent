@@ -1,4 +1,10 @@
 # iLink / 微信 ClawBot 官方绑定流程
+> [!IMPORTANT] 历史设计文档（2026-07 实施期产物，非当前真值）
+> 其中部分命名/设计已随后续重构变更（如 DevToken→AdminToken、
+> PER_TENANT→PER_REQUESTER、工具分级→静态 policy manifest、
+> 常驻 Worker→任务即进程）。当前设计真值以
+> `tenant_platform/docs/` 与 `tenant_platform/contracts/` 为准。
+
 
 **日期：** 2026-07-25  
 **来源：** 微信官方 iLink Bot Protocol（`https://ilinkai.weixin.qq.com`）  

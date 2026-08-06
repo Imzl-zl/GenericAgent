@@ -116,7 +116,7 @@ curl http://127.0.0.1:8090/health
 | --- | --- | --- | --- |
 | `/health` | GET | 无 | 健康检查(监控需要) |
 | `/start` `/stop` `/send` | POST | `X-API-Signature` | 机器人生命周期与消息下发 |
-| `/config` | GET/POST | `X-API-Signature` | 动态配置入站聚合窗口(`inbound_coalesce_window_ms`), 见 `poller_server.py:671`; Go 侧经 `poller.Client.ConfigureInboundCoalescing` 调用 |
+| `/config` | POST | `X-API-Signature` | 动态配置入站聚合窗口(`inbound_coalesce_window_ms`), 见 `poller_server.py` 的 `configure_inbound_coalescing`; Go 侧经 `poller.Client.ConfigureInboundCoalescing` 调用; GET 仅 `/health` |
 
 > 行号随代码演进可能漂移，以函数名为准（`grep -n "def _verify_request_signature"`）。
 

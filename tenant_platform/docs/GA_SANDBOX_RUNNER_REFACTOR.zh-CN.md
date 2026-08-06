@@ -9,7 +9,7 @@
 
 ## 1. 重构目标
 
-GA 原生是单人本地 Agent。它将模型对话、工作记忆、L1-L4 长期记忆、SOP、项目文件、附件、输出和任务日志放在同一个本地根目录。当前 Platform 一方面在自身容器内启动 Python Worker，另一方面又通过 Document Gateway、Document Manager 和 `ga-document-tool` 处理 DOCX，拆成两条执行路径。
+GA 原生是单人本地 Agent。它将模型对话、工作记忆、L1-L4 长期记忆、SOP、项目文件、附件、输出和任务日志放在同一个本地根目录。**重构前**：Platform 一方面在自身容器内启动 Python Worker，另一方面又通过 Document Gateway、Document Manager 和 `ga-document-tool` 处理 DOCX，拆成两条执行路径（该双路径已随本方案实施而删除，见 §9 阶段 3/8）。
 
 目标不是重新设计 GA 的个人工作区，而是将它按用户虚拟化并放入隔离 Runner：
 
@@ -253,6 +253,12 @@ GA_LLM_PROXY_ADDR=http://llm-proxy:8081
 具体字段以实现阶段的配置契约为准。`GA_RUNNER_MAX_ACTIVE` 是全局容量：Scheduler 在 Runner capacity 不足时不将 task 标记失败，而是保留 queued 并在容量释放后重新调度。发布配置以固定 digest 和 allowlist 定义 profile；渠道消息、用户设置和 Agent 输入均不能选择镜像、挂载、Docker 参数、网络或 Sophub 权限。
 
 ## 9. 代码改造范围
+
+> 全部阶段已实施完成（2025-08，仓库 main 分支）。阶段 3/8 中提及的
+> Document Gateway、Document Manager、document job 队列与全局 SOP Registry
+> 已按计划删除（`internal/infrastructure/document/`、`cmd/document-manager`
+> 不复存在）；Sophub proxy + 工作区 `memory/sops/` 已落地。下表保留为
+> 实施记录，非当前现状。
 
 | 阶段 | 改造内容 | 主要位置 |
 | --- | --- | --- |

@@ -93,7 +93,7 @@ PROGRESS_WINDOW_S (worker, 150s) > defaultResponseHeaderTimeout (llm-proxy, 120s
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/admin/llm-providers \
-  -H "Authorization: Bearer <admin_token>" \
+  -H "X-Platform-Admin-Token: <admin_token>" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "my-gpt",
@@ -202,8 +202,8 @@ curl -X POST http://127.0.0.1:8080/v1/admin/llm-providers \
 
 ### 文档
 
-- `docs/LLM_PROVIDER_ARCHITECTURE.md` — 边界与数据流
-- `docs/IMPLEMENTATION_SUMMARY.md` — 本文件
+- `LLM_PROVIDER_ARCHITECTURE.md` — 边界与数据流
+- `IMPLEMENTATION_SUMMARY.md` — 本文件（同目录）
 
 ## 验证清单（概念）
 

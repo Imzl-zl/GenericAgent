@@ -1,4 +1,10 @@
 # LLM Provider 配置补全实施计划
+> [!IMPORTANT] 历史设计文档（2026-07 实施期产物，非当前真值）
+> 其中部分命名/设计已随后续重构变更（如 DevToken→AdminToken、
+> PER_TENANT→PER_REQUESTER、工具分级→静态 policy manifest、
+> 常驻 Worker→任务即进程）。当前设计真值以
+> `tenant_platform/docs/` 与 `tenant_platform/contracts/` 为准。
+
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

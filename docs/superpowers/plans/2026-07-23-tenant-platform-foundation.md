@@ -1,4 +1,10 @@
 # Multi-Tenant Platform Foundation Implementation Plan
+> [!IMPORTANT] 历史设计文档（2026-07 实施期产物，非当前真值）
+> 其中部分命名/设计已随后续重构变更（如 DevToken→AdminToken、
+> PER_TENANT→PER_REQUESTER、工具分级→静态 policy manifest、
+> 常驻 Worker→任务即进程）。当前设计真值以
+> `tenant_platform/docs/` 与 `tenant_platform/contracts/` 为准。
+
 
 > **Status (updated 2026-07-24):** Foundation slice IMPLEMENTED. All 6 tasks / 37 steps complete and verified by Go + Python test suites and live API smoke testing (single session, 3-way personal-session concurrency, minimal team workspace, non-member rejection). Checkbox state below has been reconciled with the codebase.
 >
