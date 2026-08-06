@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // ---------------------------------------------------------------------------
@@ -16,7 +17,7 @@ import (
 // in memory/; a later prepare must NOT re-seed the template.
 func TestPrepareWorkspaceDirsDoesNotReseedAfterUserClearsMemory(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:4")
+	hash, err := domain.WorkspaceDirHash("personal:4")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +56,7 @@ func TestPrepareWorkspaceDirsDoesNotReseedAfterUserClearsMemory(t *testing.T) {
 // marker existed) — backfill the marker without re-seeding or overwriting.
 func TestPrepareWorkspaceDirsBackfillsMarkerWithoutReseed(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:5")
+	hash, err := domain.WorkspaceDirHash("personal:5")
 	if err != nil {
 		t.Fatal(err)
 	}

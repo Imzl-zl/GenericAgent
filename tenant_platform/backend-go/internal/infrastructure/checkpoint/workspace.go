@@ -2,7 +2,6 @@ package checkpoint
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -76,16 +75,6 @@ func NewWorkspaceCoordinator(cfg WorkspaceConfig) (*WorkspaceCoordinator, error)
 	}, nil
 }
 
-// workspaceHashFor 由 session key(== workspace key)推导确定性 hash。
-// 与 sandbox.WorkspaceDirHash 同构(SHA-256), 保证 checkpoint 与容器挂载一致。
-func workspaceHashFor(sessionKey string) string {
-	if sessionKey == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(sessionKey))
-	return hex.EncodeToString(sum[:])
-}
-
 // sessionKeyFor 从 DB workspaces 表解析 workspace UUID → session key。
 func (c *WorkspaceCoordinator) sessionKeyFor(ctx context.Context, workspaceID string) (string, error) {
 	key, err := c.store.WorkspaceKeyByID(ctx, workspaceID)
@@ -98,10 +87,13 @@ func (c *WorkspaceCoordinator) sessionKeyFor(ctx context.Context, workspaceID st
 	return key, nil
 }
 
+// stateRoot 返回 workspaces/<hash(workspace_key)>/state。hash 推导与容器
+// 挂载/沙箱共用 domain.WorkspaceDirHash 唯一实现(审查 B1 收敛), 保证
+// checkpoint 与容器挂载一致。
 func (c *WorkspaceCoordinator) stateRoot(workspaceKey string) (string, string, error) {
-	hash := workspaceHashFor(workspaceKey)
-	if hash == "" {
-		return "", "", fmt.Errorf("invalid session key for workspace dir")
+	hash, err := domain.WorkspaceDirHash(workspaceKey)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid session key for workspace dir: %w", err)
 	}
 	state := filepath.Join(c.workspacesRoot, hash, "state")
 	return state, hash, nil
@@ -176,12 +168,12 @@ func (c *WorkspaceCoordinator) Prepare(ctx context.Context, request CheckpointPr
 			return CheckpointLease{}, fmt.Errorf("resolve workspace key: %w", err)
 		}
 	}
-	stateRoot, _, err := c.stateRoot(workspaceKey)
+	stateRoot, hash, err := c.stateRoot(workspaceKey)
 	if err != nil {
 		return CheckpointLease{}, err
 	}
 	stagingDir := filepath.Join(stateRoot, "staging")
-	if err := safefs.MkdirAllBeneath(c.workspacesRoot, filepath.Join(workspaceHashFor(workspaceKey), "state", "staging"), 0o770); err != nil {
+	if err := safefs.MkdirAllBeneath(c.workspacesRoot, filepath.Join(hash, "state", "staging"), 0o770); err != nil {
 		return CheckpointLease{}, fmt.Errorf("create staging dir: %w", err)
 	}
 	maxB := request.MaxBundleBytes

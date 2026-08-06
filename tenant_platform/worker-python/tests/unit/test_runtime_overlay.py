@@ -28,7 +28,6 @@ def roots(tmp_path):
     assets.mkdir()
     for name in (
         "tools_schema.json",
-        "tools_schema_cn.json",
         "sys_prompt.txt",
         "sys_prompt_en.txt",
         "global_mem_insight_template.txt",

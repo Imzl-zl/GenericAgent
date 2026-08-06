@@ -36,7 +36,7 @@ func TestImportInboundRollsBackCopiedFilesOnLaterFailure(t *testing.T) {
 		t.Fatal("expected import failure for source escaping media root")
 	}
 
-	attachmentsDir := filepath.Join(files.SandboxRoot("personal:1"), sessionAttachmentsDir)
+	attachmentsDir := filepath.Join(mustSandboxRoot(t, files, "personal:1"), sessionAttachmentsDir)
 	entries, err := os.ReadDir(attachmentsDir)
 	if err != nil {
 		t.Fatalf("read attachments dir: %v", err)
@@ -81,7 +81,7 @@ func TestImportInboundSuccessKeepsAllFiles(t *testing.T) {
 	if len(refs) != 2 {
 		t.Fatalf("imported refs = %d, want 2", len(refs))
 	}
-	attachmentsDir := filepath.Join(files.SandboxRoot("personal:1"), sessionAttachmentsDir)
+	attachmentsDir := filepath.Join(mustSandboxRoot(t, files, "personal:1"), sessionAttachmentsDir)
 	entries, err := os.ReadDir(attachmentsDir)
 	if err != nil {
 		t.Fatal(err)

@@ -99,7 +99,7 @@ func (f *capacityTaskStore) CompleteFailedTerminal(ctx context.Context, taskID, 
 	return t, nil
 }
 
-func (f *capacityTaskStore) ListClaimableSessionKeys(ctx context.Context, limit, perUserRunningLimit int) ([]string, error) {
+func (f *capacityTaskStore) ListClaimableSessionKeys(ctx context.Context, limit, perRequesterRunningLimit int) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.claimableKeys...), nil

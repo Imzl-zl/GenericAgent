@@ -13,3 +13,9 @@ id,status,description,notes
 12,DONE,F7 契约测试升级: 路由清单 vs OpenAPI 自动比对+已知缺口清单, 正向验证拦截有效
 13,DONE,验证: Go 18 包全绿(隔离库)+vet+build, Python 5+42+16+109, 集成 6, web lint+build
 14,DONE,CreateUser scan bug 修复+测试; memory.md/tools 更新+归档; 隔离库已清理
+15,DONE,"P2-1 workspace hash 收敛(B1): domain.WorkspaceDirHash 唯一实现, 删 sandbox/profile 重复版+checkpoint/workspaceHashFor+application/sessionKeyDigest 与隐藏第5处 scheduler configDirFor; SandboxRoot 接口改返回 error; lockFor 直用 sessionKey; 含 4 个 sandbox 测试文件+5 个 application 测试文件同步",Go 全量 18 包全绿(真实 Postgres)+vet+build
+16,DONE,"P2-5 活跃 claim SQL 谓词收敛(C1): postgres/task_helpers.go 定义 activeTaskStatusesSQL(domain 状态常量拼接)+activeClaimLeaseSQL, 18 处字面量替换; runner_leases 有 status 列故多表查询保留别名前缀",postgres 包测试全绿(真实 Postgres)
+17,DONE,"P2-2 ctrl: 控制 JTI 约定写进 worker.proto(A3): TaskEnvelope.capability_jti 完整约定(ctrl: 前缀/控制用途/ExecuteTask 不对称有意), BeginCheckpoint/CancelTask/Shutdown 三处引用; 统一 managed_agent.py 注释(去'复用 Runner'过时表述)+scheduler_dispatch.go 加契约引用; 重新生成 Go/Python 绑定",契约测试 22 passed + go build/vet
+18,DONE,"P2-3 配额命名统一 per-requester(B2): PerTenantRunningLimit→PerRequesterRunningLimit, perUserRunningLimit→perRequesterRunningLimit, flag/env PER_REQUESTER_RUNNING_LIMIT, JSON per_requester_running_limit; compose 双 env 模板+web stats.ts/AdminDashboardPage 同步",go build/vet+api/application 测试+web tsc/lint/build
+19,DONE,"P2-4 决策编号统一(B7): 代码注释 D2.1→D1(8 处, 与 GA_SANDBOX_RUNNER_REFACTOR 文档真值一致)",go vet
+20,DONE,"P2-6 tools_schema_cn.json 去留(G1): 实证两文件 9 工具描述全不同且 GA 只加载 tools_schema.json; runtime_overlay LEGACY_ASSETS 删 cn 副本+4 个 worker 测试同步; GA 根资产不动",worker-python 109 passed

@@ -417,8 +417,8 @@ func (s *Store) CompleteFailedTerminal(ctx context.Context, taskID, owner string
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `SELECT `+taskSelectColumns+` FROM tasks
 WHERE id = $1 AND claim_owner = $2
-  AND claim_lease_until > timezone('utc', now())
-  AND status IN ('starting','running')
+  AND `+activeClaimLeaseSQL+`
+  AND status IN `+activeTaskStatusesSQL+`
 FOR UPDATE`, taskID, owner)
 		t, err := scanTask(row)
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -1,13 +1,12 @@
 package application
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 )
 
@@ -30,8 +29,8 @@ func TestSchedulerConfigDirFor(t *testing.T) {
 			name:    "session-scoped container config",
 			scoped:  true,
 			root:    "/ga/config",
-			session: "session-1",
-			want:    filepath.Join("/ga/config", hashSessionKey("session-1")),
+			session: "personal:1",
+			want:    mustWorkspaceDirHash(t, "personal:1"),
 		},
 	}
 
@@ -78,7 +77,11 @@ func TestValidateSchedulerCredentialTiming(t *testing.T) {
 	}
 }
 
-func hashSessionKey(sessionKey string) string {
-	digest := sha256.Sum256([]byte(sessionKey))
-	return hex.EncodeToString(digest[:])
+func mustWorkspaceDirHash(t *testing.T, key string) string {
+	t.Helper()
+	hash, err := domain.WorkspaceDirHash(key)
+	if err != nil {
+		t.Fatalf("WorkspaceDirHash(%q): %v", key, err)
+	}
+	return filepath.Join("/ga/config", hash)
 }

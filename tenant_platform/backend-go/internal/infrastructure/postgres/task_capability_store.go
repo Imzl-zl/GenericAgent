@@ -25,8 +25,8 @@ func (s *Store) IsTaskCapabilityActive(ctx context.Context, taskID string, runne
 	var active bool
 	err := s.pool.QueryRow(ctx, `
 SELECT
-  t.status IN ('starting','running')
-  AND t.claim_lease_until > timezone('utc', now())
+  t.status IN `+activeTaskStatusesSQL+`
+  AND t.`+activeClaimLeaseSQL+`
   AND (
     NOT EXISTS (SELECT 1 FROM runner_leases rl0 WHERE rl0.runner_key = t.session_key)
     OR EXISTS (

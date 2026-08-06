@@ -6,13 +6,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // prepareWorkspaceDirs(root, hash) 创建 root/hash/{memory,temp,state}。
 // 首次创建且 memory 为空时从 template 初始化。
 func TestPrepareWorkspaceDirsCreatesSubdirs(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:1")
+	hash, err := domain.WorkspaceDirHash("personal:1")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
@@ -34,7 +35,7 @@ func TestPrepareWorkspaceDirsCreatesSubdirs(t *testing.T) {
 
 func TestPrepareWorkspaceDirsSeedsMemoryFromTemplate(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:2")
+	hash, err := domain.WorkspaceDirHash("personal:2")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
@@ -74,7 +75,7 @@ func TestPrepareWorkspaceDirsSeedsMemoryFromTemplate(t *testing.T) {
 
 func TestPrepareWorkspaceDirsDoesNotOverwriteExistingMemory(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:3")
+	hash, err := domain.WorkspaceDirHash("personal:3")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
@@ -118,7 +119,7 @@ func TestPrepareWorkspaceDirsRejectsTraversalHash(t *testing.T) {
 // 必须删除链接并用目录重建, 而不是跟随链接修改外部目标。
 func TestPrepareWorkspaceDirsReplacesSymlinkDirs(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:9")
+	hash, err := domain.WorkspaceDirHash("personal:9")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestPrepareWorkspaceDirsReplacesSymlinkDirs(t *testing.T) {
 // 穿过的中间目录。
 func TestPrepareWorkspaceDirsFixesAncestorPermissions(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:10")
+	hash, err := domain.WorkspaceDirHash("personal:10")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
@@ -189,7 +190,7 @@ func TestPrepareWorkspaceDirsFixesAncestorPermissions(t *testing.T) {
 // 不得残留 .memory-init-* 临时目录(审查 I13)。
 func TestPrepareWorkspaceDirsSeedsMemoryAtomically(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:3")
+	hash, err := domain.WorkspaceDirHash("personal:3")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
@@ -243,7 +244,7 @@ func TestWriteConfigFilesGroupReadable(t *testing.T) {
 	root := t.TempDir()
 	// round13 审查(CI): 修复前用 "personal:perm"——非数字 personal id,
 	// ValidateWorkspaceKey 拒绝; Windows 上本测试整体 skip 掩盖了该问题。
-	hash, err := WorkspaceDirHash("personal:10001")
+	hash, err := domain.WorkspaceDirHash("personal:10001")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}
@@ -280,7 +281,7 @@ func TestWriteConfigFilesGroupReadable(t *testing.T) {
 // 清理只删自己的子目录, 不得影响已创建的新 generation 配置(mTLS 材料)。
 func TestWriteConfigFilesGenerationIsolation(t *testing.T) {
 	root := t.TempDir()
-	hash, err := WorkspaceDirHash("personal:777")
+	hash, err := domain.WorkspaceDirHash("personal:777")
 	if err != nil {
 		t.Fatalf("workspace hash: %v", err)
 	}

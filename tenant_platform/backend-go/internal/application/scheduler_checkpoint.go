@@ -173,7 +173,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		_ = s.KickSession(ctx, task.SessionKey)
 		return nil
 	}
-	// 决策 D2.1: 任务终态即销毁 Worker——成功任务同样不保留进程, 下一
+	// 决策 D1: 任务终态即销毁 Worker——成功任务同样不保留进程, 下一
 	// 任务从 checkpoint 冷启动全新 Worker。
 	s.destroyTaskWorkerLocked(task.SessionKey, entry)
 	s.sessionDraining.Delete(task.SessionKey)

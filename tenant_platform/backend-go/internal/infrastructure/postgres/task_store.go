@@ -258,7 +258,7 @@ UPDATE tasks SET
   ),
   updated_at = timezone('utc', now())
 WHERE id = $1
-  AND status IN ('starting','running')
+  AND status IN `+activeTaskStatusesSQL+`
   AND claim_owner = $3
   AND claim_lease_until > timezone('utc', now())
 `, taskID, jtis, platformInstanceID)
@@ -328,7 +328,7 @@ FOR UPDATE
 		// 已派发的 starting/running: 写入 durable cancel request(仅一次)。
 		rows2, err := tx.Query(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
-WHERE session_key = $1 AND status IN ('starting','running')
+WHERE session_key = $1 AND status IN `+activeTaskStatusesSQL+`
   AND worker_dispatch_started_at IS NOT NULL AND cancel_requested_at IS NULL
 FOR UPDATE
 `, sessionKey)
@@ -384,9 +384,9 @@ SELECT COALESCE(reset_at IS NOT NULL, false) FROM workspaces WHERE session_key =
 // claim, ordered by cross-tenant round-robin fairness: each requester's oldest
 // queued task gets a ROW_NUMBER, and sessions are ordered by (rn, oldest) so
 // every requester rotates through instead of one user monopolizing the queue.
-// When perUserRunningLimit > 0, sessions whose next-task requester already has
-// >= perUserRunningLimit starting/running tasks are excluded.
-func (s *Store) ListClaimableSessionKeys(ctx context.Context, limit, perUserRunningLimit int) ([]string, error) {
+// When perRequesterRunningLimit > 0, sessions whose next-task requester already has
+// >= perRequesterRunningLimit starting/running tasks are excluded.
+func (s *Store) ListClaimableSessionKeys(ctx context.Context, limit, perRequesterRunningLimit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 32
 	}
@@ -400,13 +400,13 @@ SELECT session_key FROM (
   WHERE t.status = 'queued'
   AND NOT EXISTS (
     SELECT 1 FROM tasks t2
-    WHERE t2.session_key = t.session_key AND t2.status IN ('starting','running')
+    WHERE t2.session_key = t.session_key AND t2.status IN `+activeTaskStatusesSQL+`
   )
   AND (
     $2 = 0 OR NOT EXISTS (
       SELECT 1 FROM tasks t3
       WHERE t3.requester_user_id = t.requester_user_id
-      AND t3.status IN ('starting','running')
+      AND t3.status IN `+activeTaskStatusesSQL+`
       HAVING COUNT(*) >= $2
     )
   )
@@ -414,7 +414,7 @@ SELECT session_key FROM (
 ) ranked
 ORDER BY ranked.rn, ranked.oldest
 LIMIT $1
-`, limit, perUserRunningLimit)
+`, limit, perRequesterRunningLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +435,7 @@ LIMIT $1
 func (s *Store) CountRunningTasks(ctx context.Context) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx, `
-SELECT COUNT(*) FROM tasks WHERE status IN ('starting','running')
+SELECT COUNT(*) FROM tasks WHERE status IN `+activeTaskStatusesSQL+`
 `).Scan(&n)
 	if err != nil {
 		return 0, err
@@ -481,7 +481,7 @@ SELECT COUNT(*) FROM tasks WHERE requester_user_id = $1 AND status = 'queued'
 func (s *Store) ListOwnedActiveTasks(ctx context.Context, platformInstanceID string) ([]domain.Task, error) {
 	rows, err := s.pool.Query(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
-WHERE claim_owner = $1 AND status IN ('starting','running')
+WHERE claim_owner = $1 AND status IN `+activeTaskStatusesSQL+`
 ORDER BY claimed_at ASC NULLS LAST
 `, platformInstanceID)
 	if err != nil {

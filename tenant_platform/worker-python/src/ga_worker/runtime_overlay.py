@@ -27,7 +27,6 @@ LEGACY_PLUGINS = (
 )
 LEGACY_ASSETS = (
     "assets/tools_schema.json",
-    "assets/tools_schema_cn.json",
     "assets/sys_prompt.txt",
     "assets/sys_prompt_en.txt",
     "assets/global_mem_insight_template.txt",

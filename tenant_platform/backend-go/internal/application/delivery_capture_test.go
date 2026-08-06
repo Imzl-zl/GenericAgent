@@ -18,7 +18,7 @@ func TestCaptureTaskDeliverableFilesSnapshotsMarkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	outDir := filepath.Join(files.SandboxRoot("personal:1"), "outputs")
+	outDir := filepath.Join(mustSandboxRoot(t, files, "personal:1"), "outputs")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestCaptureTaskDeliverableFilesFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sandbox := files.SandboxRoot("personal:2")
+	sandbox := mustSandboxRoot(t, files, "personal:2")
 	// 缺失文件。
 	if _, err := captureTaskDeliverableFiles(context.Background(), files, "personal:2", "[FILE:outputs/missing.docx]"); err == nil {
 		t.Fatal("missing marker file must fail capture")
@@ -100,7 +100,7 @@ func TestCaptureTaskDeliverableFilesRejectsAggregateOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sandbox := files.SandboxRoot("personal:3")
+	sandbox := mustSandboxRoot(t, files, "personal:3")
 	outDir := filepath.Join(sandbox, "outputs")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		t.Fatal(err)

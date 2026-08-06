@@ -521,6 +521,7 @@ func firstJTI(set workerCredentialSet) string {
 // controlJTIPrefix 标记 control capability 的 JTI 值(round11 审查 I4):
 // Worker 只持有 JTI 值(无完整 JWT, 无法解析 claims), 用前缀区分用途;
 // 真实性仍由凭据集合成员检查保证。
+// 契约约定(跨语言单一真值源): worker.proto TaskEnvelope.capability_jti。
 const controlJTIPrefix = "ctrl:"
 
 // controlJTIFor 返回控制 RPC 使用的 capability JTI(round11 审查 I4):

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // ---------------------------------------------------------------------------
@@ -46,11 +47,11 @@ func uint64String(v uint64) string {
 
 func TestReconcileOrphanWorkspaceConfigsRemovesOrphansKeepsActive(t *testing.T) {
 	root := t.TempDir()
-	hash1, err := WorkspaceDirHash("personal:1")
+	hash1, err := domain.WorkspaceDirHash("personal:1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash2, err := WorkspaceDirHash("personal:2")
+	hash2, err := domain.WorkspaceDirHash("personal:2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +89,7 @@ func TestReconcileOrphanWorkspaceConfigsRemovesOrphansKeepsActive(t *testing.T) 
 
 func TestReconcileOrphanWorkspaceConfigsSkipsFreshDirs(t *testing.T) {
 	root := t.TempDir()
-	hash1, err := WorkspaceDirHash("personal:1")
+	hash1, err := domain.WorkspaceDirHash("personal:1")
 	if err != nil {
 		t.Fatal(err)
 	}

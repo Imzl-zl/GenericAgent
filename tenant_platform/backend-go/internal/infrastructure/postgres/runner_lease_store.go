@@ -159,8 +159,8 @@ func (s *Store) ownerHasActiveTaskClaims(ctx context.Context, tx pgx.Tx, runnerK
 SELECT EXISTS(
   SELECT 1 FROM tasks
   WHERE session_key = $1 AND claim_owner = $2
-    AND status IN ('starting','running')
-    AND claim_lease_until > timezone('utc', now())
+    AND status IN `+activeTaskStatusesSQL+`
+    AND `+activeClaimLeaseSQL+`
 )
 `, runnerKey, owner).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check owner active task claims: %w", err)

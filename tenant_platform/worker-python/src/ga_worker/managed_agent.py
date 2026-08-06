@@ -124,7 +124,7 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
         Shutdown)携带的 capability JTI 必须属于当前会话活跃凭据集, 且必须是
         独立签发的 control capability(round11 I4)——LLM/Sophub 的 capability
         JTI 即使仍在凭据集中也不得用于控制 RPC。任务终态后 Platform 撤销
-        JTI(DB), 复用 Runner 的下一任务持有新 JTI; 旧 JTI 无法控制新任务。
+        JTI(DB), 下一任务持有新 JTI; 旧 JTI 无法控制新任务。
         空 JTI 仅允许在无凭据场景(清理路径/测试), 有活跃集时拒绝空值。
         Worker 不持有签名密钥, 但 token 由 Platform 经共享卷 config 写入
         (写入方即信任根), payload claims 校验足以区分用途。"""

@@ -5,7 +5,30 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
+
+// mustSandboxRoot 断言 SandboxRoot 成功并返回根路径(签名带 error 后测试
+// 便捷入口, 审查 B1: 非法 sessionKey 显式失败)。
+func mustSandboxRoot(t *testing.T, sf SessionFiles, sessionKey string) string {
+	t.Helper()
+	root, err := sf.SandboxRoot(sessionKey)
+	if err != nil {
+		t.Fatalf("SandboxRoot(%q): %v", sessionKey, err)
+	}
+	return root
+}
+
+// mustSessionDirHash 与 domain.WorkspaceDirHash 同源, 供测试构造预期目录。
+func mustSessionDirHash(t *testing.T, sessionKey string) string {
+	t.Helper()
+	hash, err := domain.WorkspaceDirHash(sessionKey)
+	if err != nil {
+		t.Fatalf("WorkspaceDirHash(%q): %v", sessionKey, err)
+	}
+	return hash
+}
 
 // TestWorkspaceSessionFilesFreshWorkspaceImportInbound 验证 fresh workspace
 // (目录布局尚不存在) 的首条带附件消息: ImportInbound 必须先调用 ensure
@@ -16,8 +39,8 @@ func TestWorkspaceSessionFilesFreshWorkspaceImportInbound(t *testing.T) {
 	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
 		ensured = append(ensured, sessionKey)
 		// 模拟 Manager 预置布局: 创建 SandboxRoot 链路。
-		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp",
-			sessionFilesDirName, sessionKeyDigest(sessionKey)), 0o770)
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp",
+			sessionFilesDirName, mustSessionDirHash(t, sessionKey)), 0o770)
 	})
 	if err != nil {
 		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
@@ -37,7 +60,7 @@ func TestWorkspaceSessionFilesFreshWorkspaceImportInbound(t *testing.T) {
 	if len(refs) != 1 {
 		t.Fatalf("imported refs = %d, want 1", len(refs))
 	}
-	abs := filepath.Join(files.SandboxRoot("personal:1"), filepath.FromSlash(refs[0].RelativePath))
+	abs := filepath.Join(mustSandboxRoot(t, files, "personal:1"), filepath.FromSlash(refs[0].RelativePath))
 	body, err := os.ReadFile(abs)
 	if err != nil {
 		t.Fatalf("read imported attachment: %v", err)
@@ -72,13 +95,13 @@ func TestWorkspaceSessionFilesEnsureFailureFailsImport(t *testing.T) {
 func TestRecordOutboundRejectsNonOutputsEvenIfInManifest(t *testing.T) {
 	root := t.TempDir()
 	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
-		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
 		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
 	}
 	const sessionKey = "personal:3"
-	sandbox := files.SandboxRoot(sessionKey)
+	sandbox := mustSandboxRoot(t, files, sessionKey)
 	if err := os.MkdirAll(filepath.Join(sandbox, sessionAttachmentsDir), 0o770); err != nil {
 		t.Fatal(err)
 	}
@@ -108,13 +131,13 @@ func TestRecordOutboundRejectsNonOutputsEvenIfInManifest(t *testing.T) {
 func TestRecordOutboundAcceptsOutputsFile(t *testing.T) {
 	root := t.TempDir()
 	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
-		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
 		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
 	}
 	const sessionKey = "personal:4"
-	sandbox := files.SandboxRoot(sessionKey)
+	sandbox := mustSandboxRoot(t, files, sessionKey)
 	if err := os.MkdirAll(filepath.Join(sandbox, sessionOutputsDir), 0o770); err != nil {
 		t.Fatal(err)
 	}
@@ -139,13 +162,13 @@ func TestRecordOutboundAcceptsOutputsFile(t *testing.T) {
 func TestLoadManifestRejectsOversize(t *testing.T) {
 	root := t.TempDir()
 	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
-		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
 		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
 	}
 	const sessionKey = "personal:5"
-	sandbox := files.SandboxRoot(sessionKey)
+	sandbox := mustSandboxRoot(t, files, sessionKey)
 	if err := os.MkdirAll(sandbox, 0o770); err != nil {
 		t.Fatal(err)
 	}
@@ -167,13 +190,13 @@ func TestLoadManifestRejectsOversize(t *testing.T) {
 func TestLoadManifestRejectsUnsafeOriginalName(t *testing.T) {
 	root := t.TempDir()
 	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
-		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
 		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
 	}
 	const sessionKey = "personal:7"
-	sandbox := files.SandboxRoot(sessionKey)
+	sandbox := mustSandboxRoot(t, files, sessionKey)
 	if err := os.MkdirAll(filepath.Join(sandbox, sessionOutputsDir), 0o770); err != nil {
 		t.Fatal(err)
 	}
@@ -197,13 +220,13 @@ func TestLoadManifestRejectsUnsafeOriginalName(t *testing.T) {
 func TestLoadManifestRejectsEscapingRelativePath(t *testing.T) {
 	root := t.TempDir()
 	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
-		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
 		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
 	}
 	const sessionKey = "personal:8"
-	sandbox := files.SandboxRoot(sessionKey)
+	sandbox := mustSandboxRoot(t, files, sessionKey)
 	if err := os.MkdirAll(filepath.Join(sandbox, sessionOutputsDir), 0o770); err != nil {
 		t.Fatal(err)
 	}
@@ -224,13 +247,13 @@ func TestLoadManifestRejectsEscapingRelativePath(t *testing.T) {
 func TestLoadManifestRejectsMidPathDotDot(t *testing.T) {
 	root := t.TempDir()
 	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
-		return os.MkdirAll(filepath.Join(root, sessionKeyDigest(sessionKey), "temp"), 0o770)
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp"), 0o770)
 	})
 	if err != nil {
 		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
 	}
 	const sessionKey = "personal:9"
-	sandbox := files.SandboxRoot(sessionKey)
+	sandbox := mustSandboxRoot(t, files, sessionKey)
 	if err := os.MkdirAll(filepath.Join(sandbox, sessionOutputsDir), 0o770); err != nil {
 		t.Fatal(err)
 	}

@@ -25,6 +25,16 @@ COALESCE(terminal_error_code,''), COALESCE(terminal_error_message,''), COALESCE(
 created_at, updated_at, started_at, succeeded_at, terminal_at, last_activity_at, fresh_session
 `
 
+// activeTaskStatusesSQL 是"任务处于活跃执行状态"的状态值列表(审查 C1 收敛):
+// 容量门禁/claim 判定/终态转移/对账等多处共用, 新增活跃状态或调整语义
+// 只改此处。状态枚举真值见 domain.TaskStatus 常量。多表查询(如 tasks 自
+// 连接、runner_leases 联查)必须显式限定表别名, 否则 status 列歧义。
+const activeTaskStatusesSQL = "('" + string(domain.TaskStarting) + "','" + string(domain.TaskRunning) + "')"
+
+// activeClaimLeaseSQL 是 claim lease 未过期的谓词片段(审查 C1 收敛;
+// round9: 时钟统一用 DB 时钟, 与 claim_lease_until 同源)。
+const activeClaimLeaseSQL = "claim_lease_until > timezone('utc', now())"
+
 type scannable interface {
 	Scan(dest ...any) error
 }

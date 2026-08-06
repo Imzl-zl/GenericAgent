@@ -31,7 +31,7 @@ type TaskStore interface {
 	CompleteFailedTerminal(ctx context.Context, taskID, owner string, status domain.TaskStatus, deliveryType domain.DeliveryType, code, message, traceID string) (domain.Task, error)
 	ListOwnedActiveTasks(ctx context.Context, platformInstanceID string) ([]domain.Task, error)
 	HeartbeatClaim(ctx context.Context, taskID, platformInstanceID string, claimLease time.Duration) error
-	ListClaimableSessionKeys(ctx context.Context, limit, perUserRunningLimit int) ([]string, error)
+	ListClaimableSessionKeys(ctx context.Context, limit, perRequesterRunningLimit int) ([]string, error)
 	MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string, freshSession bool) (domain.Task, error)
 	MarkRunning(ctx context.Context, taskID, platformInstanceID string) (domain.Task, error)
 	RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error

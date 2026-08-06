@@ -88,9 +88,9 @@ type SchedulerConfig struct {
 	// tasks. Zero disables the check (dev/test only). Production should set
 	// this to a value derived from host capacity testing.
 	MaxRunningTasks int
-	// PerTenantRunningLimit caps the number of simultaneously starting/running
+	// PerRequesterRunningLimit caps the number of simultaneously starting/running
 	// tasks per requester (across all their sessions). Zero disables the check.
-	PerTenantRunningLimit int
+	PerRequesterRunningLimit int
 	// TaskTimeoutSeconds is passed to the Worker as RuntimePolicy.TaskTimeoutSeconds
 	// for its internal soft timer (e.g. cancelling a single hung LLM call). The
 	// platform does NOT use it as a hard wall-clock kill switch — legitimate
@@ -433,7 +433,7 @@ func (s *scheduler) tick(ctx context.Context) error {
 				return nil
 			}
 		}
-		keys, err := s.cfg.Store.ListClaimableSessionKeys(ctx, 16, s.cfg.PerTenantRunningLimit)
+		keys, err := s.cfg.Store.ListClaimableSessionKeys(ctx, 16, s.cfg.PerRequesterRunningLimit)
 		if err != nil {
 			return err
 		}

@@ -203,7 +203,7 @@ func TestRoutingSnapshotFollowsDefaultSwitch(t *testing.T) {
 		t.Fatalf("invalid snapshot=%+v", snapshot)
 	}
 
-	// 决策 D2.1(任务即进程): 每次任务都重新解析快照——默认切换后新任务
+	// 决策 D1(任务即进程): 每次任务都重新解析快照——默认切换后新任务
 	// 跟随新默认(默认 provider 恒第一); provider 集/内容不变时其余顺序稳定。
 	source.providers = []domain.LLMProvider{secondary, defaultProvider}
 	source.providers[0].IsDefault = true
@@ -343,7 +343,7 @@ func TestCreateTaskWorkerAlwaysStartsFreshWorker(t *testing.T) {
 	if len(started) != 1 {
 		t.Fatalf("starts=%d want 1", len(started))
 	}
-	// 决策 D2.1: 任务终态销毁 Worker。
+	// 决策 D1: 任务终态销毁 Worker。
 	s.destroyTaskWorker(taskA.SessionKey)
 	if cleanupCalls != 1 {
 		t.Fatalf("cleanup=%d want 1", cleanupCalls)
@@ -471,7 +471,7 @@ func (f *jtiPersistingStore) ListOwnedActiveTasks(ctx context.Context, platformI
 func (f *jtiPersistingStore) HeartbeatClaim(ctx context.Context, taskID, platformInstanceID string, claimLease time.Duration) error {
 	panic("unexpected")
 }
-func (f *jtiPersistingStore) ListClaimableSessionKeys(ctx context.Context, limit, perUserRunningLimit int) ([]string, error) {
+func (f *jtiPersistingStore) ListClaimableSessionKeys(ctx context.Context, limit, perRequesterRunningLimit int) ([]string, error) {
 	panic("unexpected")
 }
 func (f *jtiPersistingStore) MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string, freshSession bool) (domain.Task, error) {

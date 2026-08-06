@@ -351,7 +351,14 @@ type TaskEnvelope struct {
 	CreatedAt         *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	// 每 task capability 的 generation 墙(方案 §7): 终态后不可用于下一 task。
 	RunnerGeneration uint64 `protobuf:"varint,12,opt,name=runner_generation,json=runnerGeneration,proto3" json:"runner_generation,omitempty"`
-	CapabilityJti    string `protobuf:"bytes,13,opt,name=capability_jti,json=capabilityJti,proto3" json:"capability_jti,omitempty"`
+	// capability_jti 是控制 RPC 的任务身份绑定(round11 审查 I4): Platform 签发
+	// per-task capability 时放入 TaskEnvelope, Worker 校验其属于会话活跃凭据集
+	// (任务终态撤销后旧 JTI 无法再发起 checkpoint/cancel/shutdown)。
+	// 约定: 独立签发的 control capability 的 JTI 带 "ctrl:" 前缀, 才是控制用途;
+	// LLM/Sophub capability 的 JTI 即使仍在凭据集中也不能用于控制 RPC。
+	// ExecuteTask 执行路径只校验集合成员(不强制 ctrl: 前缀)——loopback/无
+	// control token 时 Platform 回退 firstJTI(可能无前缀), 该不对称是有意的。
+	CapabilityJti string `protobuf:"bytes,13,opt,name=capability_jti,json=capabilityJti,proto3" json:"capability_jti,omitempty"`
 }
 
 func (x *TaskEnvelope) Reset() {
@@ -656,7 +663,7 @@ type BeginCheckpointRequest struct {
 	// (方案 §7 fencing): Worker 回显, Platform 提交时校验, 防止旧 generation
 	// Runner 在 lease 被接管后提交恢复点(审查 I7)。
 	RunnerGeneration uint64 `protobuf:"varint,5,opt,name=runner_generation,json=runnerGeneration,proto3" json:"runner_generation,omitempty"`
-	// 审查 R5-I8: 当前 task 的 capability JTI(与 ExecuteTask 同源)。Worker
+	// 控制 JTI(约定见 TaskEnvelope.capability_jti): 与 ExecuteTask 同源, Worker
 	// 校验其在会话活跃凭据集中——终态撤销后旧 JTI 无法再发起 checkpoint。
 	CapabilityJti string `protobuf:"bytes,6,opt,name=capability_jti,json=capabilityJti,proto3" json:"capability_jti,omitempty"`
 }
@@ -1068,7 +1075,7 @@ type CancelTaskRequest struct {
 	// 控制面身份 fencing(方案 §7, 审查): 绑定当前 workspace 与 Runner generation。
 	WorkspaceKey     string `protobuf:"bytes,2,opt,name=workspace_key,json=workspaceKey,proto3" json:"workspace_key,omitempty"`
 	RunnerGeneration uint64 `protobuf:"varint,3,opt,name=runner_generation,json=runnerGeneration,proto3" json:"runner_generation,omitempty"`
-	// 审查 R5-I8: 当前 task 的 capability JTI(与 ExecuteTask 同源), Worker
+	// 控制 JTI(约定见 TaskEnvelope.capability_jti): 与 ExecuteTask 同源, Worker
 	// 校验其在会话活跃凭据集中——终态撤销后旧 JTI 无法取消新任务。
 	CapabilityJti string `protobuf:"bytes,4,opt,name=capability_jti,json=capabilityJti,proto3" json:"capability_jti,omitempty"`
 }
@@ -1290,7 +1297,7 @@ type ShutdownRequest struct {
 	// 控制面身份 fencing(方案 §7, 审查): 绑定当前 workspace 与 Runner generation。
 	WorkspaceKey     string `protobuf:"bytes,2,opt,name=workspace_key,json=workspaceKey,proto3" json:"workspace_key,omitempty"`
 	RunnerGeneration uint64 `protobuf:"varint,3,opt,name=runner_generation,json=runnerGeneration,proto3" json:"runner_generation,omitempty"`
-	// 审查 R5-I8: 当前 task 的 capability JTI, Worker 校验其在会话活跃凭据集中。
+	// 控制 JTI(约定见 TaskEnvelope.capability_jti): Worker 校验其在会话活跃凭据集中。
 	CapabilityJti string `protobuf:"bytes,4,opt,name=capability_jti,json=capabilityJti,proto3" json:"capability_jti,omitempty"`
 }
 

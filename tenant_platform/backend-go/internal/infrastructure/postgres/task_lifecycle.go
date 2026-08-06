@@ -40,7 +40,7 @@ func (s *Store) ClaimNextTask(ctx context.Context, sessionKey, platformInstanceI
 			}
 			var running int
 			if err := tx.QueryRow(ctx, `
-SELECT COUNT(*) FROM tasks WHERE status IN ('starting','running')
+SELECT COUNT(*) FROM tasks WHERE status IN `+activeTaskStatusesSQL+`
 `).Scan(&running); err != nil {
 				return err
 			}
@@ -62,7 +62,7 @@ SELECT id FROM workspaces WHERE session_key = $1 FOR UPDATE
 		var busy int
 		if err := tx.QueryRow(ctx, `
 SELECT COUNT(*) FROM tasks
-WHERE session_key = $1 AND status IN ('starting','running')
+WHERE session_key = $1 AND status IN `+activeTaskStatusesSQL+`
 `, sessionKey).Scan(&busy); err != nil {
 			return err
 		}
@@ -122,7 +122,7 @@ func (s *Store) HeartbeatClaim(ctx context.Context, taskID, platformInstanceID s
 UPDATE tasks SET
   claim_lease_until = timezone('utc', now()) + $3 * interval '1 microsecond',
   updated_at = timezone('utc', now())
-WHERE id = $1 AND claim_owner = $2 AND status IN ('starting','running')
+WHERE id = $1 AND claim_owner = $2 AND status IN `+activeTaskStatusesSQL+`
   AND claim_lease_until > timezone('utc', now())
 `, taskID, platformInstanceID, leaseMicros)
 	if err != nil {
@@ -273,7 +273,7 @@ RETURNING `+taskSelectColumns, taskID, platformInstanceID)
 func (s *Store) RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		var lockedTaskID string
-		if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 AND status IN ('starting','running') FOR UPDATE`, taskID).Scan(&lockedTaskID); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 AND status IN `+activeTaskStatusesSQL+` FOR UPDATE`, taskID).Scan(&lockedTaskID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
@@ -291,7 +291,7 @@ func (s *Store) RecordChunkEvent(ctx context.Context, taskID string, byteCount i
 // RecordHeartbeat updates last_activity_at without writing a chunk event.
 // Called when Worker drain_display_queue polls empty (LLM still thinking).
 func (s *Store) RecordHeartbeat(ctx context.Context, taskID string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE tasks SET last_activity_at = timezone('utc', now()) WHERE id = $1 AND status IN ('starting','running')`, taskID)
+	_, err := s.pool.Exec(ctx, `UPDATE tasks SET last_activity_at = timezone('utc', now()) WHERE id = $1 AND status IN `+activeTaskStatusesSQL+``, taskID)
 	return err
 }
 
@@ -391,7 +391,7 @@ func (s *Store) RecoverAfterRestart(ctx context.Context, platformInstanceID stri
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
-WHERE status IN ('starting','running')
+WHERE status IN `+activeTaskStatusesSQL+`
   AND claim_owner IS NOT NULL
   AND claim_lease_until IS NOT NULL
   AND claim_lease_until < timezone('utc', now())

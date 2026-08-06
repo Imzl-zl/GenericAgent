@@ -325,7 +325,7 @@ func (r *SandboxWorkerRuntime) Start(ctx context.Context, req StartRequest) (*In
 
 // runnerName 与 Manager 的容器名推导保持一致。
 func (r *SandboxWorkerRuntime) runnerName(workspaceKey string, generation uint64) string {
-	hash, err := sandbox.WorkspaceDirHash(workspaceKey)
+	hash, err := domain.WorkspaceDirHash(workspaceKey)
 	if err != nil {
 		// 调用方已用同一校验通过（Start 入口），此处兜底：空 hash 生成的名字
 		// 不会匹配任何合法容器，后续 dial/attach 会失败并 fail-closed。

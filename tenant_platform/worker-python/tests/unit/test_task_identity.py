@@ -34,7 +34,6 @@ LEGACY_MODULES = ("agentmain.py", "ga.py", "llmcore.py", "agent_loop.py", "simph
 LEGACY_PLUGINS = ("plugins/__init__.py", "plugins/hooks.py", "plugins/project_mode.py")
 LEGACY_ASSETS = (
     "assets/tools_schema.json",
-    "assets/tools_schema_cn.json",
     "assets/sys_prompt.txt",
     "assets/sys_prompt_en.txt",
     "assets/global_mem_insight_template.txt",

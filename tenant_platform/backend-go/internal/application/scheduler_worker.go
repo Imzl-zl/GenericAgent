@@ -2,8 +2,6 @@ package application
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -16,7 +14,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
 
-// workerEntry holds the Worker process bound to ONE task(决策 D2.1: 任务即
+// workerEntry holds the Worker process bound to ONE task(决策 D1: 任务即
 // 进程)。任务终态由 destroyTaskWorker 销毁, 进程内不复用。
 type workerEntry struct {
 	client      workerclient.WorkerClient
@@ -122,7 +120,7 @@ func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error
 	// startMu; 与 checkpoint 收尾(lifecycleMu)不互斥。
 	// 任务尚未进入执行阶段时跳过 RPC——dispatch 会检测 durable
 	// cancel_requested_at 并销毁 Worker, 无需向 Worker 发取消。
-	// 决策 D2.1(任务即进程): entry 只服务一个任务, 无需 currentness 复核——
+	// 决策 D1(任务即进程): entry 只服务一个任务, 无需 currentness 复核——
 	// 迟到的取消若命中已终态任务的旧 entry, 最多向新任务的 Worker 发一次
 	// no-op CancelTask(task_id 不匹配, Worker 侧拒绝, accepted=false)。
 	entry.startMu.Lock()
@@ -135,7 +133,7 @@ func (s *scheduler) cancelWorkerRPC(ctx context.Context, task domain.Task) error
 	return entry.client.CancelTask(cancelCtx, entry.sessionKey, task.ID, entry.runnerGeneration, controlJTIFor(entry.credentials))
 }
 
-// createTaskWorker 为任务创建全新 Worker 进程(决策 D2.1: 任务即进程, 不复用)。
+// createTaskWorker 为任务创建全新 Worker 进程(决策 D1: 任务即进程, 不复用)。
 // StartSession 不在本函数调用; 由 dispatch 在 MarkDispatchStarted 之后调用
 // (cancel-during-StartSession 可见 durable cancel 并记录, 而非立即终态化)。
 //
@@ -214,12 +212,20 @@ func (s *scheduler) removeWorkerEntry(sessionKey string, entry *workerEntry) {
 
 // configDirFor returns the directory that holds mykey.py for the session.
 // When SessionScopedConfig is false the global ConfigRoot is used.
+// hash 推导与容器挂载/checkpoint 共用 domain.WorkspaceDirHash 唯一实现
+// (审查 B1 收敛): 目录名同源, 改算法不会局部漂移。
 func (s *scheduler) configDirFor(sessionKey string) string {
 	if !s.cfg.SessionScopedConfig {
 		return s.cfg.ConfigRoot
 	}
-	digest := sha256.Sum256([]byte(sessionKey))
-	return filepath.Join(s.cfg.ConfigRoot, hex.EncodeToString(digest[:]))
+	digest, err := domain.WorkspaceDirHash(sessionKey)
+	if err != nil {
+		// loopback/测试的 key 均为合法格式; 非法 key 显式暴露并隔离到
+		// 固定目录, 后续写配置失败会继续显式报错(fail-closed)。
+		slog.Warn("configDirFor: invalid workspace key", "session_key", sessionKey, "error", err)
+		return filepath.Join(s.cfg.ConfigRoot, "invalid-session")
+	}
+	return filepath.Join(s.cfg.ConfigRoot, digest)
 }
 
 // runtimeConfigDir 返回 credential 刷新读写的配置目录(审查 C4):
@@ -321,7 +327,7 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 	}
 	startCtx, cancelStart := context.WithTimeout(ctx, startTimeout)
 	defer cancelStart()
-	// 决策 D2.1: 每任务新 Worker, StartSession 恰好调用一次。
+	// 决策 D1: 每任务新 Worker, StartSession 恰好调用一次。
 	if _, err := entry.client.StartSession(startCtx, startReq); err != nil {
 		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		return err
@@ -424,7 +430,7 @@ func (s *scheduler) destroyTaskWorkerEntry(sessionKey string, entry *workerEntry
 	s.disposeWorkerEntry(context.Background(), sessionKey, entry)
 }
 
-// destroyTaskWorker 销毁任务 Worker(决策 D2.1: 任务终态即销毁): 优雅停止
+// destroyTaskWorker 销毁任务 Worker(决策 D1: 任务终态即销毁): 优雅停止
 // 进程(带 capability JTI)并撤销凭证集。任务终态(成功/失败/取消/超时)后
 // 调用——下一任务冷启动全新进程, 不继承未提交内存状态。
 func (s *scheduler) destroyTaskWorker(sessionKey string) {

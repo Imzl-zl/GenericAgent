@@ -21,6 +21,7 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/api"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
@@ -203,7 +204,7 @@ func runtimeConfigDirFor(boot application.AdminBootstrapConfig) func(sessionKey 
 		return nil
 	}
 	return func(sessionKey string, generation uint64) string {
-		hash, err := sandbox.WorkspaceDirHash(sessionKey)
+		hash, err := domain.WorkspaceDirHash(sessionKey)
 		if err != nil {
 			// key 来自 DB（personal:<uid>/team:<uuid>），正常不会失败；
 			// 返回空目录会在写 runtime config 时失败并显式暴露，不静默。
@@ -481,7 +482,7 @@ func run() error {
 		webhookSecret         = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
 		maxBodyBytes          = envInt64("PLATFORM_MAX_BODY_BYTES", api.DefaultMaxRequestBodyBytes)
 		maxRunningTasks       = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test). Independent of Runner capacity GA_RUNNER_MAX_ACTIVE: task concurrency is a scheduler gate, Runner capacity is enforced in the lease transaction.")
-		perTenantRunningLimit = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
+		perRequesterRunningLimit = flag.Int("per-requester-running-limit", envInt("PER_REQUESTER_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_REQUESTER_RUNNING_LIMIT); 0 = disabled (dev/test)")
 		perUserQueueLimit     = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
 		taskTimeoutSeconds    = flag.Int("task-timeout-seconds", envInt("TASK_TIMEOUT_SECONDS", 0), "Worker-side wall-clock deadline for a whole task (or TASK_TIMEOUT_SECONDS); 0 = disabled (recommended; stuck detection uses gRPC stream errors + heartbeat lease loss instead). Set only when you want a hard task cap.")
 		maxTaskWallClockSec   = flag.Int("max-task-wall-clock-seconds", envInt("MAX_TASK_WALL_CLOCK_SECONDS", 2700), "hard task wall-clock limit; capability TTL must cover this plus refresh skew")
@@ -777,7 +778,7 @@ func run() error {
 		TokenRefreshSkew:      application.DefaultTokenRefreshSkew,
 		MaxTaskWallClock:      time.Duration(*maxTaskWallClockSec) * time.Second,
 		MaxRunningTasks:       *maxRunningTasks,
-		PerTenantRunningLimit: *perTenantRunningLimit,
+		PerRequesterRunningLimit: *perRequesterRunningLimit,
 		TaskTimeoutSeconds:    *taskTimeoutSeconds,
 		RuntimeSettings:       store,
 		IdleTimeout:           time.Duration(*taskIdleTimeoutSec) * time.Second,
@@ -979,7 +980,7 @@ func run() error {
 			TaskTimeoutSeconds:        *taskTimeoutSeconds,
 			TaskIdleTimeoutSeconds:    *taskIdleTimeoutSec,
 			MaxRunningTasks:           *maxRunningTasks,
-			PerTenantRunningLimit:     *perTenantRunningLimit,
+			PerRequesterRunningLimit:     *perRequesterRunningLimit,
 			PerUserQueueLimit:         *perUserQueueLimit,
 			IMInboundCoalesceWindowMS: imInboundCoalesceWindowMS,
 			AgentMaxTurns:             agentMaxTurns,

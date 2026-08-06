@@ -40,7 +40,6 @@ LEGACY_PLUGINS = (
 )
 LEGACY_ASSETS = (
     "assets/tools_schema.json",
-    "assets/tools_schema_cn.json",
     "assets/sys_prompt.txt",
     "assets/sys_prompt_en.txt",
     "assets/global_mem_insight_template.txt",
@@ -1336,7 +1335,7 @@ def test_overlay_memory_temp_link_to_workspace(monkeypatch, tmp_path):
     (legacy / "plugins" / "project_mode.py").write_text("")
     (legacy / "assets").mkdir()
     for name in (
-        "tools_schema.json", "tools_schema_cn.json", "sys_prompt.txt",
+        "tools_schema.json", "sys_prompt.txt",
         "sys_prompt_en.txt", "global_mem_insight_template.txt",
         "global_mem_insight_template_en.txt", "insight_fixed_structure.txt",
         "insight_fixed_structure_en.txt", "code_run_header.py",

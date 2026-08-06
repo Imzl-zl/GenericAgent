@@ -2,8 +2,6 @@ package application
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -15,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/safefs"
 )
 
@@ -55,7 +54,10 @@ type SessionFiles interface {
 	Recent(sessionKey string, limit int) ([]SessionFileRef, error)
 	ResolveMarker(sessionKey, marker string) (absPath string, relPath string, err error)
 	RecordOutbound(sessionKey, marker string) (SessionFileRef, error)
-	SandboxRoot(sessionKey string) string
+	// SandboxRoot 返回会话沙箱根路径(workspace 布局: workspaces/<hash>/temp)。
+	// hash 推导与容器挂载共用 domain.WorkspaceDirHash 唯一实现(审查 B1 收敛),
+	// sessionKey 非法时返回错误——调用方必须显式处理, 不得静默落盘垃圾目录。
+	SandboxRoot(sessionKey string) (string, error)
 }
 
 type sessionFilesManager struct {
@@ -118,14 +120,17 @@ func NewWorkspaceSessionFiles(workspacesRoot, mediaRoot string, ensureWorkspace 
 	}, nil
 }
 
-func (m *sessionFilesManager) SandboxRoot(sessionKey string) string {
+func (m *sessionFilesManager) SandboxRoot(sessionKey string) (string, error) {
+	hash, err := domain.WorkspaceDirHash(sessionKey)
+	if err != nil {
+		return "", err
+	}
 	if m.workspaceLayout {
-		hash := sessionKeyDigest(sessionKey)
 		// 审查: 附件/输出统一到工作区 temp/ 根(方案 §6), 与 GA 原生 cwd
 		// 语义一致; 不再使用 session_files/<digest> 中间层。
-		return filepath.Join(m.root, hash, "temp")
+		return filepath.Join(m.root, hash, "temp"), nil
 	}
-	return filepath.Join(m.root, sessionKeyDigest(sessionKey))
+	return filepath.Join(m.root, hash), nil
 }
 
 // maxInboundMediaBytes 限制入站附件复制上限(对齐 Bot Poller 下载器的
@@ -148,7 +153,10 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 		}
 	}
 
-	root := m.SandboxRoot(sessionKey)
+	root, err := m.SandboxRoot(sessionKey)
+	if err != nil {
+		return nil, err
+	}
 	dirMode := m.dirMode()
 	// Round8(发现): MkdirAllBeneath 要求 root 已存在(unix.Open O_DIRECTORY);
 	// ensureWorkspace 为 nil 的路径(dev loopback)必须先创建 root, 否则
@@ -248,7 +256,10 @@ func (m *sessionFilesManager) RemoveInbound(sessionKey string, refs []SessionFil
 	lock.Lock()
 	defer lock.Unlock()
 
-	root := m.SandboxRoot(sessionKey)
+	root, err := m.SandboxRoot(sessionKey)
+	if err != nil {
+		return fmt.Errorf("rollback inbound: %w", err)
+	}
 	manifest, err := m.loadManifest(root)
 	if err != nil {
 		return fmt.Errorf("rollback inbound: load manifest: %w", err)
@@ -285,7 +296,11 @@ func (m *sessionFilesManager) Recent(sessionKey string, limit int) ([]SessionFil
 	lock := m.lockFor(sessionKey)
 	lock.Lock()
 	defer lock.Unlock()
-	manifest, err := m.loadManifest(m.SandboxRoot(sessionKey))
+	root, err := m.SandboxRoot(sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := m.loadManifest(root)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +318,10 @@ func (m *sessionFilesManager) ResolveMarker(sessionKey, marker string) (string, 
 	if strings.TrimSpace(marker) == "" {
 		return "", "", fmt.Errorf("file marker is empty")
 	}
-	root := m.SandboxRoot(sessionKey)
+	root, err := m.SandboxRoot(sessionKey)
+	if err != nil {
+		return "", "", err
+	}
 	resolved, rel, err := resolveUnderRoot(root, marker)
 	if err != nil {
 		return "", "", err
@@ -327,7 +345,10 @@ func (m *sessionFilesManager) RecordOutbound(sessionKey, marker string) (Session
 	lock.Lock()
 	defer lock.Unlock()
 
-	root := m.SandboxRoot(sessionKey)
+	root, err := m.SandboxRoot(sessionKey)
+	if err != nil {
+		return SessionFileRef{}, err
+	}
 	resolved, rel, err := resolveUnderRoot(root, marker)
 	if err != nil {
 		return SessionFileRef{}, err
@@ -422,11 +443,6 @@ func sessionFilesPrompt(current []SessionFileRef, recent []SessionFileRef) strin
 	return strings.TrimSpace(b.String())
 }
 
-func sessionKeyDigest(sessionKey string) string {
-	sum := sha256.Sum256([]byte(sessionKey))
-	return hex.EncodeToString(sum[:])
-}
-
 func sanitizeFileName(name string) string {
 	name = strings.TrimSpace(name)
 	name = strings.ReplaceAll(name, "/", "_")
@@ -502,8 +518,7 @@ func resolveUnderRoot(root, marker string) (string, string, error) {
 }
 
 func (m *sessionFilesManager) lockFor(sessionKey string) *sync.Mutex {
-	digest := sessionKeyDigest(sessionKey)
-	lock, _ := m.mu.LoadOrStore(digest, &sync.Mutex{})
+	lock, _ := m.mu.LoadOrStore(sessionKey, &sync.Mutex{})
 	return lock.(*sync.Mutex)
 }
 

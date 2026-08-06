@@ -77,7 +77,7 @@ type RuntimeProfile struct {
 	TaskTimeoutSeconds        int `json:"task_timeout_seconds"`
 	TaskIdleTimeoutSeconds    int `json:"task_idle_timeout_seconds"`
 	MaxRunningTasks           int `json:"max_running_tasks"`
-	PerTenantRunningLimit     int `json:"per_tenant_running_limit"`
+	PerRequesterRunningLimit     int `json:"per_requester_running_limit"`
 	PerUserQueueLimit         int `json:"per_user_queue_limit"`
 	IMInboundCoalesceWindowMS int `json:"im_inbound_coalesce_window_ms"`
 	AgentMaxTurns             int `json:"agent_max_turns"`

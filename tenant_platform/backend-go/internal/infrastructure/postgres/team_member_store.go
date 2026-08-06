@@ -153,7 +153,7 @@ WHERE user_id = $1 AND team_id = $3::uuid
 		rows, err := tx.Query(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
 WHERE requester_user_id = $1 AND session_key = $2
-  AND status IN ('starting','running')
+  AND status IN `+activeTaskStatusesSQL+`
   AND worker_dispatch_started_at IS NOT NULL
   AND cancel_requested_at IS NULL
 FOR UPDATE

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // ContainerCLI 是 Manager 内部依赖的容器原语(docker create/start/rm/inspect)。
@@ -85,7 +87,7 @@ func (m *Manager) EnsureRunner(ctx context.Context, req EnsureRunnerRequest) (Ru
 	if strings.TrimSpace(req.WorkspaceKey) == "" {
 		return Runner{}, false, fmt.Errorf("workspace key is required")
 	}
-	hash, err := WorkspaceDirHash(req.WorkspaceKey)
+	hash, err := domain.WorkspaceDirHash(req.WorkspaceKey)
 	if err != nil {
 		return Runner{}, false, fmt.Errorf("invalid workspace key: %w", err)
 	}
@@ -238,7 +240,7 @@ func (m *Manager) EnsureWorkspace(ctx context.Context, workspaceKey string) erro
 	if workspaceKey == "" {
 		return fmt.Errorf("workspace key is required")
 	}
-	hash, err := WorkspaceDirHash(workspaceKey)
+	hash, err := domain.WorkspaceDirHash(workspaceKey)
 	if err != nil {
 		return fmt.Errorf("invalid workspace key: %w", err)
 	}

@@ -128,7 +128,7 @@ RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_m
 		rows, err := tx.Query(ctx, `
 UPDATE tasks
 SET cancel_requested_at = $2, updated_at = $2
-WHERE requester_user_id = $1 AND status IN ('starting', 'running') AND cancel_requested_at IS NULL
+WHERE requester_user_id = $1 AND status IN `+activeTaskStatusesSQL+` AND cancel_requested_at IS NULL
 RETURNING `+taskSelectColumns, userID, now)
 		if err != nil {
 			return err
@@ -263,7 +263,7 @@ func (s *Store) FindRunningTaskBySession(ctx context.Context, sessionKey string)
 	}
 	row := s.pool.QueryRow(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
-WHERE session_key = $1 AND status IN ('starting', 'running')
+WHERE session_key = $1 AND status IN `+activeTaskStatusesSQL+`
 `, sessionKey)
 	return scanTask(row)
 }

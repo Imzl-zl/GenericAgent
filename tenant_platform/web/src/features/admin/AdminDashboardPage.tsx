@@ -139,7 +139,7 @@ export function AdminDashboardPage() {
                 <span className="settings-row-title">单租户并发上限</span>
                 <span className="settings-row-desc">单 requester 同时 starting / running 的上限</span>
               </div>
-              <span className="admin-chip-value">{isLoading ? '...' : formatLimit(stats?.runtime_profile.per_tenant_running_limit ?? 0)}</span>
+              <span className="admin-chip-value">{isLoading ? '...' : formatLimit(stats?.runtime_profile.per_requester_running_limit ?? 0)}</span>
             </div>
             <div className="settings-row">
               <div className="settings-row-info">

@@ -38,7 +38,10 @@ func captureTaskDeliverableFiles(ctx context.Context, sf SessionFiles, sessionKe
 	if len(markers) == 0 {
 		return nil, nil
 	}
-	root := sf.SandboxRoot(sessionKey)
+	root, err := sf.SandboxRoot(sessionKey)
+	if err != nil {
+		return nil, err
+	}
 	files := make([]domain.DeliveryFile, 0, len(markers))
 	var totalBytes int64
 	for _, marker := range markers {

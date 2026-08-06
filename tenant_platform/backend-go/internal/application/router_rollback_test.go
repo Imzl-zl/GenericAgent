@@ -34,7 +34,7 @@ func TestRemoveInboundRemovesFilesAndManifestEntries(t *testing.T) {
 	if len(refs) != 1 {
 		t.Fatalf("imported %d refs, want 1", len(refs))
 	}
-	abs := filepath.Join(files.SandboxRoot("personal:1"), filepath.FromSlash(refs[0].RelativePath))
+	abs := filepath.Join(mustSandboxRoot(t, files, "personal:1"), filepath.FromSlash(refs[0].RelativePath))
 	if _, err := os.Stat(abs); err != nil {
 		t.Fatalf("attachment must exist before rollback: %v", err)
 	}

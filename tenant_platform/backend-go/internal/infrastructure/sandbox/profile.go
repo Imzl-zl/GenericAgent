@@ -8,14 +8,10 @@
 package sandbox
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
-
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // RunnerNetwork is the only network a Runner joins.
@@ -170,18 +166,6 @@ func (p Profile) Validate() error {
 		}
 	}
 	return nil
-}
-
-// WorkspaceDirHash returns the stable directory hash for a workspace key
-// (spec §4: workspaces/<hash(workspace_key)>/). 与 domain.WorkspaceDirHash
-// 共用 domain.ValidateWorkspaceKey 校验（审查 Minor-1：team 使用 UUID 主键，
-// 旧整数 helper 无法覆盖真实 team:<uuid> key；sandbox 不再维护第二套宽松 hash）。
-func WorkspaceDirHash(workspaceKey string) (string, error) {
-	if err := domain.ValidateWorkspaceKey(workspaceKey); err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256([]byte(workspaceKey))
-	return hex.EncodeToString(sum[:]), nil
 }
 
 func containsExactly(values []string, want string) bool {

@@ -7,11 +7,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // mustWorkspaceHash 测试辅助: 忽略校验错误的 hash(测试 key 均为合法格式)。
 func mustWorkspaceHash(key string) string {
-	h, _ := WorkspaceDirHash(key)
+	h, _ := domain.WorkspaceDirHash(key)
 	return h
 }
 
@@ -169,7 +170,7 @@ func TestManagerEnsureRunnerReplacesOnGenerationBump(t *testing.T) {
 // 清理 config/ 目录(审查 R5-C6: 短期私钥不得因 map 丢失而残留)。
 func TestManagerDestroyRunnerCleansConfigAfterRestart(t *testing.T) {
 	ctx := context.Background()
-	hash, _ := WorkspaceDirHash("personal:88")
+	hash, _ := domain.WorkspaceDirHash("personal:88")
 	root := t.TempDir()
 	configDir := filepath.Join(root, hash, "config", "g1")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -229,7 +230,7 @@ func TestManagerEnsureRunnerRejectsGenerationRegression(t *testing.T) {
 // TestManagerIsRunnerName 验证命名模式校验。
 func TestManagerIsRunnerName(t *testing.T) {
 	m := NewManager(ManagerConfig{ContainerNamePrefix: "ga-runner"})
-	hash, _ := WorkspaceDirHash("personal:1")
+	hash, _ := domain.WorkspaceDirHash("personal:1")
 	hash12 := hash[:12]
 	for _, name := range []string{
 		"ga-runner-" + hash12 + "-g1",
@@ -260,7 +261,7 @@ func TestManagerEnsureWorkspaceDerivesHashAndDelegates(t *testing.T) {
 	if err := m.EnsureWorkspace(ctx, "personal:42"); err != nil {
 		t.Fatalf("EnsureWorkspace: %v", err)
 	}
-	want, _ := WorkspaceDirHash("personal:42")
+	want, _ := domain.WorkspaceDirHash("personal:42")
 	if len(cli.ensureCalls) != 1 || cli.ensureCalls[0] != want {
 		t.Fatalf("EnsureWorkspace hash = %v, want [%s]", cli.ensureCalls, want)
 	}
@@ -275,7 +276,7 @@ func TestManagerEnsureWorkspaceDerivesHashAndDelegates(t *testing.T) {
 // (审查: 否则旧容器继续存活挂载同一工作区, 与新容器并发读写破坏串行。)
 func TestManagerEnsureRunnerScansExistingContainersAfterRestart(t *testing.T) {
 	ctx := context.Background()
-	hash, _ := WorkspaceDirHash("personal:1")
+	hash, _ := domain.WorkspaceDirHash("personal:1")
 	prefix := "ga-runner-" + hash[:12] + "-"
 	cli := &fakeCLI{
 		containers: []RunnerInfo{
@@ -306,7 +307,7 @@ func TestManagerEnsureRunnerScansExistingContainersAfterRestart(t *testing.T) {
 // R5-C3): 旧容器仍挂载同一 workspace, 继续创建新容器会让两代并发写。
 func TestManagerEnsureRunnerFailsClosedWhenStaleDestroyFails(t *testing.T) {
 	ctx := context.Background()
-	hash, _ := WorkspaceDirHash("personal:77")
+	hash, _ := domain.WorkspaceDirHash("personal:77")
 	prefix := "ga-runner-" + hash[:12] + "-"
 	cli := &fakeCLI{
 		containers: []RunnerInfo{{Name: prefix + "g1", Running: true}},
@@ -324,7 +325,7 @@ func TestManagerEnsureRunnerFailsClosedWhenStaleDestroyFails(t *testing.T) {
 
 func TestManagerEnsureRunnerReusesExistingSameGenerationAfterRestart(t *testing.T) {
 	ctx := context.Background()
-	hash, _ := WorkspaceDirHash("personal:1")
+	hash, _ := domain.WorkspaceDirHash("personal:1")
 	prefix := "ga-runner-" + hash[:12] + "-"
 	cli := &fakeCLI{
 		containers: []RunnerInfo{{Name: prefix + "g2", Running: true}},
@@ -347,7 +348,7 @@ func TestManagerEnsureRunnerReusesExistingSameGenerationAfterRestart(t *testing.
 
 func TestManagerEnsureRunnerRejectsNewerExistingGeneration(t *testing.T) {
 	ctx := context.Background()
-	hash, _ := WorkspaceDirHash("personal:1")
+	hash, _ := domain.WorkspaceDirHash("personal:1")
 	prefix := "ga-runner-" + hash[:12] + "-"
 	cli := &fakeCLI{containers: []RunnerInfo{{Name: prefix + "g5", Running: true}}}
 	m := NewManager(ManagerConfig{CLI: cli, WorkspaceRoot: t.TempDir(), ContainerNamePrefix: "ga-runner"})
@@ -383,7 +384,7 @@ func TestManagerDestroyRunnerIdempotentWhenMissing(t *testing.T) {
 func TestManagerDestroyRunnerClearsCacheAndConfig(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	hash, _ := WorkspaceDirHash("personal:1")
+	hash, _ := domain.WorkspaceDirHash("personal:1")
 	configDir := root + "/" + hash + "/config/g1"
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
