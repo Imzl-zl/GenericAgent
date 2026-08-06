@@ -56,7 +56,9 @@ jobs:
   python:
     name: Python (core, platform, worker, bot poller, E2E)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # E2E 在免费 runner(2 核)上需现场编译 platform + 跑真实 agent 循环,
+    # 实测约 30-40 分钟(本地 ~12 分钟); 25 分钟会被超时取消(2026-08-06 实证)。
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16
