@@ -274,12 +274,12 @@ func validateSchedulerCredentialTiming(cfg SchedulerConfig) error {
 	return nil
 }
 
-// countActiveRunners 返回当前任务并发占用(starting+running 任务数)。
+// countActiveTasks 返回当前任务并发占用(starting+running 任务数)。
 // 任务并发(MaxRunningTasks)与 Runner 容量(GA_RUNNER_MAX_ACTIVE)是
 // 两个独立不变量(审查 C3): Runner 容量只在新建 lease 时由 DB 原子校验
 // (AcquireRunnerLease), 已有活跃 lease 的 runner_key 复用不占新容量;
 // 调度 tick 只按任务并发门控 claim, 绝不以活跃 lease 数饿死复用 Runner。
-func (s *scheduler) countActiveRunners(ctx context.Context) (int64, error) {
+func (s *scheduler) countActiveTasks(ctx context.Context) (int64, error) {
 	count, err := s.cfg.Store.CountRunningTasks(ctx)
 	return int64(count), err
 }
@@ -425,7 +425,7 @@ func (s *scheduler) tick(ctx context.Context) error {
 	// 同 session key 的串行由 store 的活跃任务约束保证。
 	for {
 		if s.cfg.MaxRunningTasks > 0 {
-			running, err := s.countActiveRunners(ctx)
+			running, err := s.countActiveTasks(ctx)
 			if err != nil {
 				return err
 			}

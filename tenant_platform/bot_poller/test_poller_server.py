@@ -28,58 +28,70 @@ def _body(mid: str, text: str = "", *, user: str = "u1", token: str = "", at_ms:
 
 
 def test_coalesces_multi_part_text_without_context_token():
-    merged = coalesce_webhook_bodies([
+    # 审查 C2: 跨批次窗口合并由生产实现 InboundCoalescingBuffer 承担;
+    # coalesce_webhook_bodies 已收敛为恒等路径。
+    buffer = poller_server.InboundCoalescingBuffer(window_ms=1500)
+    ready = buffer.push([
         _body("m1", "把这个文件"),
         _body("m2", "整理成 Word", at_ms=1600),
         _body("m3", "发给我", at_ms=2100),
-    ], window_ms=1500)
+    ], now_ms=1000)
+    ready += buffer.flush_due(now_ms=10000)
 
-    assert len(merged) == 1
-    assert merged[0]["text"] == "把这个文件\n整理成 Word\n发给我"
-    assert merged[0]["source_message_ids"] == ["m1", "m2", "m3"]
-    assert merged[0]["message_id"].startswith("coalesced:")
-    assert "_received_at_ms" not in merged[0]
+    assert len(ready) == 1
+    assert ready[0]["text"] == "把这个文件\n整理成 Word\n发给我"
+    assert ready[0]["source_message_ids"] == ["m1", "m2", "m3"]
+    assert ready[0]["message_id"].startswith("coalesced:")
+    assert "_received_at_ms" not in ready[0]
 
 
 def test_coalesces_text_and_file_with_same_context_token():
-    merged = coalesce_webhook_bodies([
+    buffer = poller_server.InboundCoalescingBuffer(window_ms=2500)
+    ready = buffer.push([
         _body("m1", "整理一下", token="ctx-1"),
         _body("m2", token="ctx-1", at_ms=1800, media="b1/resume.txt"),
-    ], window_ms=2500)
+    ], now_ms=1000)
+    ready += buffer.flush_due(now_ms=10000)
 
-    assert len(merged) == 1
-    assert merged[0]["text"] == "整理一下"
-    assert merged[0]["media_paths"] == ["b1/resume.txt"]
-    assert merged[0]["context_token"] == "ctx-1"
+    assert len(ready) == 1
+    assert ready[0]["text"] == "整理一下"
+    assert ready[0]["media_paths"] == ["b1/resume.txt"]
+    assert ready[0]["context_token"] == "ctx-1"
 
 
 def test_different_context_tokens_merge_and_keep_latest_reply_token():
-    merged = coalesce_webhook_bodies([
+    buffer = poller_server.InboundCoalescingBuffer(window_ms=2500)
+    ready = buffer.push([
         _body("m1", "第一件事", token="ctx-1"),
         _body("m2", "第二件事", token="ctx-2", at_ms=1100),
-    ], window_ms=2500)
+    ], now_ms=1000)
+    ready += buffer.flush_due(now_ms=10000)
 
-    assert len(merged) == 1
-    assert merged[0]["text"] == "第一件事\n第二件事"
-    assert merged[0]["context_token"] == "ctx-2"
+    assert len(ready) == 1
+    assert ready[0]["text"] == "第一件事\n第二件事"
+    assert ready[0]["context_token"] == "ctx-2"
 
 
 def test_commands_bypass_aggregation():
-    merged = coalesce_webhook_bodies([
+    buffer = poller_server.InboundCoalescingBuffer(window_ms=2500)
+    ready = buffer.push([
         _body("m1", "/stop"),
         _body("m2", "后续文字", at_ms=1100),
-    ], window_ms=2500)
+    ], now_ms=1000)
+    ready += buffer.flush_due(now_ms=10000)
 
-    assert [item["message_id"] for item in merged] == ["m1", "m2"]
+    assert [item["message_id"] for item in ready] == ["m1", "m2"]
 
 
 def test_messages_outside_window_do_not_merge():
-    merged = coalesce_webhook_bodies([
+    buffer = poller_server.InboundCoalescingBuffer(window_ms=1500)
+    ready = buffer.push([
         _body("m1", "第一段", at_ms=1000),
         _body("m2", "第二段", at_ms=4000),
-    ], window_ms=1500)
+    ], now_ms=1000)
+    ready += buffer.flush_due(now_ms=10000)
 
-    assert [item["message_id"] for item in merged] == ["m1", "m2"]
+    assert [item["message_id"] for item in ready] == ["m1", "m2"]
 
 
 def test_coalescing_buffer_merges_text_and_file_across_poll_batches():
@@ -284,7 +296,7 @@ def test_zero_window_disables_aggregation():
     merged = coalesce_webhook_bodies([
         _body("m1", "第一段"),
         _body("m2", "第二段", at_ms=1001),
-    ], window_ms=0)
+    ])
 
     assert [item["message_id"] for item in merged] == ["m1", "m2"]
 

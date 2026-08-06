@@ -345,7 +345,7 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	// (失败删除 claim 行, 允许 Poller 重试重新执行); 任务提交与消息行在
 	// 同一 DB 事务内(SubmitTaskWithInboundMessage), 消除二段写入的崩溃/
 	// 并发窗口。失败返回 error 且不标记幂等, Poller 按 webhook 契约重试。
-	inboundSessionKey := personalSessionKey(ownerID)
+	inboundSessionKey := domain.PersonalSessionKey(ownerID)
 	personalContext := true
 	if r.teams != nil {
 		ac, err := r.teams.GetActiveContext(ctx, ownerID)

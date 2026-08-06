@@ -10,16 +10,6 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
-// cancelCall serializes a single cancel RPC per task so concurrent cancel
-// requests (e.g. /stop + scheduler tick) don't fire multiple Worker calls.
-type cancelCall struct {
-	mu       sync.Mutex
-	inflight bool       // 是否有取消 RPC 执行中(并发合并)
-	done     bool       // 已成功(终态缓存, 不再重试)
-	err      error      // 最近一次结果
-	notify   chan struct{} // inflight 完成通知(等待者)
-}
-
 // dispatchHeartbeat drives the claim lease heartbeat for one in-flight dispatch.
 // The heartbeat extends claim_lease_until on an interval; if the lease is lost
 // (ErrLeaseExpired) or the dispatch ctx is cancelled, the heartbeat stops and

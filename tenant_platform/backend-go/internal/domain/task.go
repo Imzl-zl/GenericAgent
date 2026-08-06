@@ -113,6 +113,17 @@ func (s TaskStatus) IsTerminal() bool {
 // can return/test against the same sentinel without import cycles.
 var ErrPerUserQueueFull = errors.New("per-user queue limit reached")
 
+// ErrSessionAccessDenied signals that a requester may not submit to the
+// session (personal mismatch / not an approved team member / unapproved
+// user / malformed session key). Defined in domain so the application layer
+// can wrap it and the API layer can map it to 403 without import cycles.
+var ErrSessionAccessDenied = errors.New("session access denied")
+
+// ErrWorkspaceNotFound signals that no workspace row exists for the session
+// key. Defined in domain so the postgres store can wrap it and the API layer
+// can map it to 404 without import cycles.
+var ErrWorkspaceNotFound = errors.New("workspace not found")
+
 // ErrLeaseExpired signals that a claim heartbeat updated 0 rows because the
 // caller no longer owns the task (lease expired or was stolen by recovery).
 // Defined in domain so both the application (scheduler tick) and the postgres

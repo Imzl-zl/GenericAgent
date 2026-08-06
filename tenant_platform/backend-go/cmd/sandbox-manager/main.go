@@ -35,7 +35,7 @@ func main() {
 		workspacesVolume   = flag.String("workspaces-volume", envOr("GA_WORKSPACES_VOLUME", ""), "named volume for workspaces (Compose); empty = bind mount from workspaces-root")
 		memoryTmpl         = flag.String("memory-template", envOr("GA_MEMORY_TEMPLATE", "/ga/memory-template"), "read-only memory template path inside the manager image")
 		idleTTL            = flag.Duration("idle-ttl", 30*time.Minute, "Runner idle TTL(日志参考; 实际空闲回收由 Platform lease 驱动, 见 GA_RUNNER_IDLE_TTL)")
-		absTTL             = flag.Duration("reap-abs-ttl", 24*time.Hour, "legacy flag kept for CLI compatibility; running containers are never reaped by age (review I5: active runners are managed by Platform lease lifecycle)")
+		absTTL             = flag.Duration("reap-abs-ttl", 24*time.Hour, "absolute orphan TTL: running containers older than this are reaped too (platform-down fallback; active runners under Platform lease are not touched)")
 		prefix             = flag.String("container-prefix", "ga-runner", "Runner container name prefix")
 		profileName        = flag.String("security-profile", envOr("GA_RUNNER_SECURITY_PROFILE", ""), "container runtime (runsc for untrusted production; empty = docker, requires --allow-runc)")
 		allowRunc          = flag.Bool("allow-runc", envOrBool("GA_RUNNER_ALLOW_RUNC", false), "explicitly allow the default docker runtime (trusted local dev only; production must use runsc)")

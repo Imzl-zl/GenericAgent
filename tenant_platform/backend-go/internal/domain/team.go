@@ -103,7 +103,7 @@ func (c ActiveContext) SessionKey(userID int64) string {
 	if c.TeamID != nil {
 		return "team:" + *c.TeamID
 	}
-	return personalSessionKeyFor(userID)
+	return PersonalSessionKey(userID)
 }
 
 // IsPersonal reports whether the user is currently in personal context.
@@ -155,8 +155,9 @@ var (
 	ErrActiveContextBlocked = errors.New("user is not an approved member of this team")
 )
 
-// personalSessionKeyFor is the personal session_key formatter.
-// Kept here so domain types can reference it without importing application.
-func personalSessionKeyFor(userID int64) string {
+// PersonalSessionKey is the personal session_key formatter.
+// 审查 B5 收敛: 唯一真值源——application 层的重复实现已删除,
+// router/api/store 统一引用本函数, 避免一处改格式另一处静默漂移。
+func PersonalSessionKey(userID int64) string {
 	return fmt.Sprintf("personal:%d", userID)
 }

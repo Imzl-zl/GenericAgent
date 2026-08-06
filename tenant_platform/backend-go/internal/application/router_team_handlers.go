@@ -14,7 +14,7 @@ import (
 // context, returns personal:{userID}. Otherwise returns team:{teamID}.
 func (r *router) resolveSessionKey(ctx context.Context, userID int64) (string, error) {
 	if r.teams == nil {
-		return personalSessionKey(userID), nil
+		return domain.PersonalSessionKey(userID), nil
 	}
 	ac, err := r.teams.GetActiveContext(ctx, userID)
 	if err != nil {

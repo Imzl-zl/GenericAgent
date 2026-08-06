@@ -63,7 +63,18 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		ToolPolicyVersion: application.DefaultToolPolicyVersion,
 	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "SUBMIT_FAILED", err.Error(), tid)
+		// Round16-P1: 错误语义分级——队列满 429 / 越权或非法会话 403 /
+		// 会话不存在 404; 旧实现全 500, 客户端无法区分可恢复与配置错误。
+		switch {
+		case errors.Is(err, domain.ErrPerUserQueueFull):
+			writeErr(w, http.StatusTooManyRequests, "QUEUE_FULL", err.Error(), tid)
+		case errors.Is(err, domain.ErrSessionAccessDenied):
+			writeErr(w, http.StatusForbidden, "ACCESS_DENIED", err.Error(), tid)
+		case errors.Is(err, domain.ErrWorkspaceNotFound):
+			writeErr(w, http.StatusNotFound, "WORKSPACE_NOT_FOUND", err.Error(), tid)
+		default:
+			writeErr(w, http.StatusInternalServerError, "SUBMIT_FAILED", err.Error(), tid)
+		}
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{

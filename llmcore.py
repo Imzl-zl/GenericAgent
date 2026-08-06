@@ -938,7 +938,10 @@ Follow these steps to think and act:
             user += f"=== {role} ===\n"
             for tr in m.get('tool_results', []): user += f'<tool_result>{tr["content"]}</tool_result>\n'
             user += str(m['content']) + "\n"
-            self.total_cd_tokens += len(user) // 3
+            # Round16-G2: 只累计本条消息增量(原实现把累积拼接的整个 user
+            # 字符串重复相加, O(n²) 虚高——10 条 1000 字符消息即越过 9000
+            # 阈值, 导致 last_tools 频繁重置、工具描述每轮重新注入)。
+            self.total_cd_tokens += len(str(m['content'])) // 3
         if self.total_cd_tokens > 9000: self.last_tools = ''
         user += "=== ASSISTANT ===\n" 
         return system + user

@@ -190,33 +190,14 @@ def _finalize_coalesced_group(group):
     return out
 
 
-def coalesce_webhook_bodies(bodies, window_ms):
-    """Merge adjacent ordinary messages supplied as one sequence.
+def coalesce_webhook_bodies(bodies):
+    """Finalize each webhook body as its own group (恒等路径, 审查 C2)。
 
-    Same-user messages inside the configured window may carry different
-    per-message context tokens. They still belong to the same user action;
-    the finalized webhook keeps the newest token for subsequent replies.
-    Commands always remain standalone. The hard part cap prevents one burst
-    from collapsing into an unbounded prompt.
+    跨批次窗口合并由 InboundCoalescingBuffer 承担(window>0 时)——旧版
+    window>0 分组分支是生产不可达死代码(唯一调用点走恒等路径), 却由
+    7 个测试驱动, 维护两套合并语义; 已删除, 测试改挂到生产实现。
     """
-    if window_ms <= 0:
-        return [_finalize_coalesced_group([body]) for body in bodies]
-    groups = []
-    current = []
-    for body in bodies:
-        if current and (
-            len(current) >= MAX_COALESCED_MESSAGES
-            or not _can_coalesce(current[-1], body, window_ms)
-        ):
-            groups.append(current)
-            current = []
-        current.append(body)
-        if _is_command_body(body):
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
-    return [_finalize_coalesced_group(group) for group in groups]
+    return [_finalize_coalesced_group([body]) for body in bodies]
 
 
 class InboundCoalescingBuffer:
@@ -233,7 +214,7 @@ class InboundCoalescingBuffer:
     def push(self, bodies, now_ms):
         if self._window_ms <= 0:
             ready = self.flush_all()
-            ready.extend(coalesce_webhook_bodies(bodies, 0))
+            ready.extend(coalesce_webhook_bodies(bodies))
             return ready
 
         ready = []

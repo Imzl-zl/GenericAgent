@@ -16,6 +16,17 @@ import (
 
 // workerEntry holds the Worker process bound to ONE task(决策 D1: 任务即
 // 进程)。任务终态由 destroyTaskWorker 销毁, 进程内不复用。
+//
+// cancelCall(Round16-B8): 取消 RPC 的进程内串行器, 从 scheduler_lease.go
+// 移入本文件——它与 claim lease 心跳无关, 只属于 CancelWorker 路径。
+type cancelCall struct {
+	mu       sync.Mutex
+	inflight bool         // 是否有取消 RPC 执行中(并发合并)
+	done     bool         // 已成功(终态缓存, 不再重试)
+	err      error        // 最近一次结果
+	notify   chan struct{} // inflight 完成通知(等待者)
+}
+
 type workerEntry struct {
 	client      workerclient.WorkerClient
 	cleanup     func(capabilityJTI string)

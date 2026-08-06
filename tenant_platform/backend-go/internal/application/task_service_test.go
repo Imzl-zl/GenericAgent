@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -147,6 +148,28 @@ VALUES (gen_random_uuid(), 'personal:4242', 4242, 'personal', 'test-vol')
 	cmd.RequesterUserID = dev.UserID
 	if _, err := svc.SubmitTask(ctx, cmd); err == nil {
 		t.Fatal("unsupported session key must be rejected")
+	}
+	// Round16-P2 回归: personal:<uid> 带 trailing garbage 必须拒绝——旧实现
+	// 用 fmt.Sscanf 宽松解析, `personal:4242abc` 会被解析为 uid=4242 且
+	// err=nil 通过归属校验(Sscanf 吞掉 garbage), 与 domain.ValidateWorkspaceKey
+	// 严格解析(Personal 分支 ParseInt)语义分裂。
+	cmd = base
+	cmd.SessionKey = "personal:4242abc"
+	cmd.RequesterUserID = dev.UserID
+	if _, err := svc.SubmitTask(ctx, cmd); err == nil {
+		t.Fatal("personal key with trailing garbage must be rejected")
+	} else if !errors.Is(err, domain.ErrSessionAccessDenied) {
+		t.Fatalf("expected ErrSessionAccessDenied, got %v", err)
+	}
+	// Round16-P2 回归: team:<非uuid> 拒绝, 且不得触发 store 层 $1::uuid cast
+	// SQL 错误(旧实现直接 cast 整数/非 uuid 报 500 语义)。
+	cmd = base
+	cmd.SessionKey = "team:not-a-uuid"
+	cmd.RequesterUserID = dev.UserID
+	if _, err := svc.SubmitTask(ctx, cmd); err == nil {
+		t.Fatal("team key with non-uuid id must be rejected")
+	} else if !errors.Is(err, domain.ErrSessionAccessDenied) {
+		t.Fatalf("expected ErrSessionAccessDenied, got %v", err)
 	}
 	// approved 用户向自己会话提交 → 接受。
 	cmd = base

@@ -3,7 +3,6 @@ package application
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -12,11 +11,6 @@ import (
 
 // nowFunc is overridable for tests.
 var nowFunc = func() time.Time { return time.Now().UTC() }
-
-// personalSessionKey returns the session key for a user's personal workspace.
-func personalSessionKey(userID int64) string {
-	return fmt.Sprintf("personal:%d", userID)
-}
 
 // persistInboundMedia 为已持久化的入站消息行补插 media_assets 审计
 // (round10 审查 B7): 消息行本身已在路由时持久化(任务同事务 / 命令-relay

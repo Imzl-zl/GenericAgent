@@ -104,6 +104,12 @@ class TaskRunState:
     mcp_unwrap: Callable[[], None] | None = None
     sophub_unwrap: Callable[[], None] | None = None
     seed_unwrap: Callable[[], None] | None = None
+    # Round16-F6: sandbox/export/print_counter unwrap 此前为运行期动态属性
+    # (task_runner._setup_runtime 赋值、_rollback_runtime_setup getattr 读取),
+    # 与 dataclass 声明不一致——补为显式字段, 类型检查可见。
+    sandbox_unwrap: Callable[[], None] | None = None
+    export_unwrap: Callable[[], None] | None = None
+    print_counter_unwrap: Callable[[], None] | None = None
     previous_persona: list[str] = field(default_factory=list)
     previous_schema: Any = None
     final_body: str = ""

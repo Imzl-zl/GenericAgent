@@ -7,7 +7,9 @@ tool schema filtering, dispatch guard, print byte counter, max_turns, handler se
 Fixes applied during extraction:
 - P-M2: dispatch guard and handler seed now return unwrap callables that restore
   originals, preventing leaks across sessions/tasks.
-- P-M5: no hard imports inside function bodies; sys imported at module level.
+- P-M5 修正(Round16-F5): 模块级 import 保持在外层; 函数体内 import 仅用于
+  打破循环依赖(session_files/sop_tool 反向引用本模块)或按需惰性加载,
+  不构成重复导入负担。
 """
 
 from __future__ import annotations
@@ -387,8 +389,10 @@ def install_sophub_tools(session: Any, legacy_mods: dict[str, Any] | None) -> Ca
 
 
 
-def install_session_file_sandbox(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
-    """确保会话文件目录(attachments/outputs)存在。
+def ensure_session_dirs(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
+    """确保会话文件目录(attachments/outputs)存在(Round16-F7 改名:
+    原 install_session_file_sandbox 名不副实——它不重定向 cwd 也不装
+    sandbox, 只建目录)。
 
     审查: 不再重定向 handler.cwd 或重写 _get_abs_path——那会破坏 GA 原生
     相对路径语义(./temp、../memory、temp/projects)。容器中 GA handler.cwd

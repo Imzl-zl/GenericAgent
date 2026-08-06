@@ -161,7 +161,7 @@ def _setup_runtime(
     from ga_worker.legacy_instrument import (
         apply_tool_policy, install_dispatch_guard, install_export_docx_tool,
         install_global_mcp_tools,
-        install_handler_print_counter, install_max_turns, install_session_file_sandbox,
+        install_handler_print_counter, install_max_turns, ensure_session_dirs,
         install_sophub_tools, prepare_handler_seed,
     )
     agent = adapter._session.agent
@@ -181,7 +181,7 @@ def _setup_runtime(
     if adapter._session is not None:
         adapter._session.generated_output_files = []
     try:
-        state.sandbox_unwrap = install_session_file_sandbox(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
+        state.sandbox_unwrap = ensure_session_dirs(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
         state.export_unwrap = install_export_docx_tool(adapter._session, adapter._legacy_mods)
         state.sophub_unwrap = install_sophub_tools(adapter._session, adapter._legacy_mods)
         state.mcp_unwrap = install_global_mcp_tools(adapter._session, adapter._legacy_mods)

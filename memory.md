@@ -7,7 +7,7 @@
 
 - CI 门禁（分支/PR 级）：Go（vet/build/test -p 1/race 4 关键包）、Python（根 + 平台 contract/security/smoke/integration + bot_poller + worker）、Web（lint/build）全绿
 - 集成测试依赖真实 PostgreSQL（`TEST_DATABASE_URL`），缺失显式失败
-- **Round15 P2/P3/P4 完成（2026-08-06，已提交 0cead883 + cb30f21d）**：真值源收敛（workspace hash 唯一实现、ctrl: JTI 进 proto、per-requester 命名、活跃 claim 谓词常量、tools_schema_cn 删除）+ 文档校准 + 分层/边界修复
+- **Round16 完成（2026-08-06，待提交）**：GA 根项目首轮深度审查（Round14 黑盒）——G1 空响应 3 次统一标记 LLM_FAILED（原 fail-open 被当成功提交）+ G2 total_cd_tokens O(n²) 修复；平台侧 SubmitTask 错误分级（429/403/404/500）+ validateSessionAccess 严格解析（Sscanf 宽松入口收口）+ team uuid 收紧；遗留清理（C3 终态构造收敛 / C6 help 文本 / F5-F7 / B5 personalSessionKey 收敛 / B8 cancelCall 归位 / C2 poller 死代码删除）
 - 最后更新：2026-08-06
 
 ## 已完成能力
@@ -19,7 +19,8 @@
 
 ## 进行中 / 未完成
 
-- Round15 全部待办已交付（P2 真值源收敛 + P3/P4 文档校准/分层修复/残余风险确认）；Round14 报告残余项仅剩真实 Linux 主机验证类（runsc/mTLS/compose 冒烟）
+- Round16 全部修复已交付（G1/G2 + P1/P2 + 遗留清理 C2/C3/C6/F5-F7/B5/B8）；待提交
+- 有意遗留（不产生功能缺陷，已评估）：B3 wechat/ilink 命名债（`ilink_user_id` 是 API 契约字段，改名需联动 openapi/web，等契约变更窗口）；C5 delivery_service 834 行未拆（纯结构债，等 delivery 实质改动时顺手拆）
 - 残余验证（需真实 Linux 主机 + Docker/runsc）：runsc 运行时、mTLS 注入、六服务 compose 冒烟、共享卷跨 UID
 
 ## 关键决策（仍有效）
@@ -27,6 +28,8 @@
 - CI 门禁分支/PR 级矩阵；集成测试必须真实 Postgres（`-p 1` 串行化规避 flaky）
 - 生命周期不变量以结构强制（文件拆分）；跨语言契约（proto/openapi）为单一真值源
 - 身份模型只有一类主体——用户（Bearer）；AdminToken（`PLATFORM_ADMIN_TOKEN`）仅管理面 + `/v1/router/messages` 服务入口
+- **2026-08-06（Round16）**：GA 侧故障语义统一——`_retry_or_exit` 无 fatal 分支，3 次空响应/流异常/max_tokens 统一 LLM_FAILED；`total_cd_tokens` 只累计本条消息增量（勿改回累积拼接）；API 错误契约：队列满 429 / 越权 403 / 会话不存在 404（domain 哨兵 `ErrSessionAccessDenied`/`ErrWorkspaceNotFound`）；session key 解析唯一入口 `domain.ValidateWorkspaceKey`（Sscanf 宽松解析已删，勿恢复）；team id 只接受 uuid（`teamSessionKey`/`validateSessionAccess` 一致）
+- **2026-08-06（Round16）**：poller 合并语义唯一实现在 `InboundCoalescingBuffer`——`coalesce_webhook_bodies` 已收敛为恒等 finalize（无 window 参数），新增合并逻辑必须改 buffer 而非该函数
 - **2026-08-06（Round15）**：workspace hash 推导/校验唯一实现在 `domain.WorkspaceDirHash`（改算法只动一处）；`ctrl:` 控制 JTI 约定真值在 worker.proto TaskEnvelope.capability_jti（ExecuteTask 不强制 ctrl: 前缀是**有意不对称**，勿"修复"）；配额命名统一 per-requester（env `PER_REQUESTER_RUNNING_LIMIT`，旧名失效）；活跃任务状态集合/claim lease 谓词真值在 postgres 包常量（状态值来自 domain.TaskStatus）
 - **2026-08-06（Round15）**：上限常量真值在 `domain/limits.go`（postgres/api 引用）；UTF-8 安全截断唯一实现在 `domain.TruncateUTF8`；心跳部署契约 `PROGRESS_WINDOW_S(150) > llm-proxy 120s < TASK_IDLE_TIMEOUT_SECONDS(300)`；provider routing 竞争窗口（409→TASK_FAILED）是**有意的 fail-closed 设计**，勿放宽 revision 校验（LLM_PROVIDER_ARCHITECTURE.md 已记录）
 - **2026-08-06（Round15）**：tools_schema_cn.json 是 GA 永不加载的过时副本（平台 overlay 已删），GA 根资产文件不动（黑盒）
@@ -50,6 +53,7 @@
 
 ## 最近活跃窗口
 
+- 2026-08-06：Round16 修复（G1/G2 GA 侧语义 + SubmitTask 错误分级 + session key 严格解析 + C2/C3/C6/F5-F7/B5/B8 遗留清理）
 - 2026-08-06：Round15 P3/P4（E 组文档校准 + F 组分层/UTF-8 截断/心跳基线 + routing 竞争窗口确认）
 - 2026-08-06：Round15 P2 真值源收敛（workspace hash 唯一实现 + ctrl: JTI 进 proto + per-requester 命名 + 决策编号 D1 + SQL 谓词常量 + tools_schema_cn 删除）
 - 2026-08-06：审查 I-4 鉴权统一（语义改名、任务端点 userAuth + owner 校验、pending 用户门禁、OpenAPI 32 条 gap 补齐）

@@ -18,6 +18,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/google/uuid"
+
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/transport"
 )
@@ -641,13 +643,16 @@ func deliveryClientID(partKey string) string {
 	return "ga-" + hex.EncodeToString(sum[:8])
 }
 
-// teamSessionKey 解析 team:<uuid> 形式的 session key; 非团队 key 返回 ok=false。
+// teamSessionKey 解析 team:<uuid> 形式的 session key; 非团队 key 或
+// 非 uuid 的 team id 返回 ok=false(Round16-P2: 与 validateSessionAccess
+// 一致, team 表 id 为 UUID 列, 旧整数/任意字符串在 $1::uuid cast 处
+// SQL 报错而非干净拒绝)。
 func teamSessionKey(sessionKey string) (string, bool) {
 	if !strings.HasPrefix(sessionKey, "team:") {
 		return "", false
 	}
 	id := strings.TrimPrefix(sessionKey, "team:")
-	if id == "" || strings.ContainsAny(id, ":/\\\x00") {
+	if _, err := uuid.Parse(id); err != nil {
 		return "", false
 	}
 	return id, true

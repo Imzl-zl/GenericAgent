@@ -9,7 +9,7 @@ from ga_worker.legacy_instrument import (
     install_dispatch_guard,
     install_export_docx_tool,
     install_global_mcp_tools,
-    install_session_file_sandbox,
+    ensure_session_dirs,
     restore_tool_schema,
 )
 from ga_worker.limits import ToolPolicy
@@ -249,7 +249,7 @@ def test_global_mcp_tool_runs_when_tenant_policy_allows_it(tmp_path: Path, monke
     session.overlay_dir.mkdir(parents=True, exist_ok=True)
     mods = {"ga": ga_mod, "agentmain": agentmain_mod, "agent_loop": sys.modules["agent_loop"]}
 
-    sandbox_unwrap = install_session_file_sandbox(session, mods)
+    sandbox_unwrap = ensure_session_dirs(session, mods)
     mcp_unwrap = install_global_mcp_tools(session, mods)
     policy = ToolPolicy(
         version="foundation.session-files.v1",
@@ -374,7 +374,7 @@ def test_global_mcp_tools_must_intersect_with_tenant_policy(tmp_path: Path, monk
     session.overlay_dir.mkdir(parents=True, exist_ok=True)
     mods = {"ga": ga_mod, "agentmain": agentmain_mod, "agent_loop": agent_loop_mod}
 
-    sandbox_unwrap = install_session_file_sandbox(session, mods)
+    sandbox_unwrap = ensure_session_dirs(session, mods)
     mcp_unwrap = install_global_mcp_tools(session, mods)
     policy = ToolPolicy(
         version="foundation.session-files.v1",

@@ -115,18 +115,29 @@ def emit_output_exceeded_terminal(
     state.terminal_emitted = True
 
 
-def emit_cancel_or_timeout_terminal(
-    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
-) -> Iterator[worker_pb2.WorkerEvent]:
+def _cancel_or_timeout_terminal(adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState, result_body: str | None = None) -> worker_pb2.Terminal:
+    """构造 cancel/timeout 终态(status/code/message 三元组唯一实现, 审查 C3)。
+
+    result_body 仅参与 result_digest 计算(proto Terminal 无该字段,
+    digest 语义与 emit_final_terminal 成功路径一致)。
+    """
     is_timeout = state.timed_out["v"]
     status = worker_pb2.TASK_INTERRUPTED if is_timeout else worker_pb2.TASK_CANCELLED
     code = "TASK_TIMEOUT" if is_timeout else "TASK_CANCELLED"
     message = "task timeout" if is_timeout else "cancelled"
-    term = adapter._terminal(
+    return adapter._terminal(
         task.task_id, status,
         user_message=message[:ERROR_MSG_MAX_LEN],
-        error_code=code,
+        error_code=code, result_body=result_body,
     )
+
+
+def emit_cancel_or_timeout_terminal(
+    adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState,
+) -> Iterator[worker_pb2.WorkerEvent]:
+    if state.terminal_emitted:
+        return
+    term = _cancel_or_timeout_terminal(adapter, task, state)
     cleanup_legacy_subprocesses(adapter)
     adapter._record_completed(task, term, state.final_body, state.display_history, state.agent)
     yield worker_pb2.WorkerEvent(terminal=term)
@@ -139,15 +150,12 @@ def emit_final_terminal(
     session = getattr(adapter, "_session", None)
     generated = list(getattr(session, "generated_output_files", []) or [])
     if state.pending.cancel_requested or state.timed_out["v"]:
-        is_timeout = state.timed_out["v"]
-        status = worker_pb2.TASK_INTERRUPTED if is_timeout else worker_pb2.TASK_CANCELLED
-        code = "TASK_TIMEOUT" if is_timeout else "TASK_CANCELLED"
-        message = state.final_body or ("timeout" if is_timeout else "cancelled")
-        term = adapter._terminal(
-            task.task_id, status,
-            user_message=message[:ERROR_MSG_MAX_LEN],
-            error_code=code, result_body=state.final_body,
-        )
+        # 取消/超时路径复用统一终态构造(审查 C3), 避免 status/code/message
+        # 三元组第二份定义漂移; final_body 参与 digest 计算。user_message
+        # 保留任务已产出文本(与旧实现 final_body 优先语义一致)。
+        term = _cancel_or_timeout_terminal(adapter, task, state, result_body=state.final_body)
+        if state.final_body:
+            term.user_message = state.final_body[:ERROR_MSG_MAX_LEN]
         # 取消/超时路径同样清理残留(cancel/timeout 终态由 Platform evict
         # Runner, 清理失败由容器销毁兜底, 无需 fail-closed)。
         cleanup_legacy_subprocesses(adapter)

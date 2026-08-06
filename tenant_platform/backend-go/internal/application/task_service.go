@@ -3,8 +3,11 @@ package application
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -160,44 +163,58 @@ func (s *taskService) SubmitTaskWithInboundMessage(ctx context.Context, cmd doma
 // validateSessionAccess 校验 requesterUserID 是否有权向 sessionKey 提交任务
 // (审查 I-4): personal:<uid> 必须等于本人; team:<tid> 必须是已批准成员;
 // 其余格式一律拒绝。requester 缺失(<=0)视为未认证, 拒绝。
+// Round16-P2: 统一用 domain.ValidateWorkspaceKey 严格解析——旧实现用
+// fmt.Sscanf 宽松解析, `personal:123abc` 会被误解析为 uid=123 通过归属
+// 校验(Sscanf 吞掉 trailing garbage 且 err=nil), 与 domain 严格校验
+// (ParseInt 拒绝)语义分裂; team 整数 id 在 store 的 $1::uuid cast 处
+// SQL 报错而非干净拒绝。
 func (s *taskService) validateSessionAccess(ctx context.Context, sessionKey string, requesterUserID int64) error {
 	if requesterUserID <= 0 {
-		return fmt.Errorf("session access denied: requester identity required")
+		return fmt.Errorf("%w: requester identity required", domain.ErrSessionAccessDenied)
+	}
+	// Round16-P2: 入口统一严格校验, 与 WorkspaceDirHash/checkpoint 同源。
+	// team:<旧整数格式> 由 ValidateWorkspaceKey 放行, 但 team 表 id 为 UUID,
+	// 整数 id 的 workspace 行不可能存在——提交必因 workspace not found 失败,
+	// 这里直接拒绝避免 store 层 $1::uuid cast 500。
+	if err := domain.ValidateWorkspaceKey(sessionKey); err != nil {
+		return fmt.Errorf("%w: invalid session key %q: %v", domain.ErrSessionAccessDenied, sessionKey, err)
 	}
 	// 审查 I-4: 提交门禁与 capability 在线校验一致——pending 用户的任务
 	// 执行时会被 llmproxy 拒绝(IsTaskCapabilityActive 要求 approved),
 	// 提交即拒绝, 避免产生必然失败的任务。
 	approved, err := s.store.IsApprovedUser(ctx, requesterUserID)
 	if err != nil {
-		return fmt.Errorf("session access denied: user status check: %w", err)
+		return fmt.Errorf("%w: user status check: %v", domain.ErrSessionAccessDenied, err)
 	}
 	if !approved {
-		return fmt.Errorf("session access denied: requester %d is not approved", requesterUserID)
+		return fmt.Errorf("%w: requester %d is not approved", domain.ErrSessionAccessDenied, requesterUserID)
 	}
 	const personalPrefix = "personal:"
 	const teamPrefix = "team:"
 	switch {
 	case strings.HasPrefix(sessionKey, personalPrefix):
-		var uid int64
-		if _, err := fmt.Sscanf(strings.TrimPrefix(sessionKey, personalPrefix), "%d", &uid); err != nil || uid != requesterUserID {
-			return fmt.Errorf("session access denied: personal session %q does not belong to requester %d", sessionKey, requesterUserID)
+		// ValidateWorkspaceKey 已保证 personal:<positive-int>, 此处用
+		// ParseInt 严格解析(与 domain 同实现), 不再容忍 trailing garbage。
+		uid, err := strconv.ParseInt(strings.TrimPrefix(sessionKey, personalPrefix), 10, 64)
+		if err != nil || uid != requesterUserID {
+			return fmt.Errorf("%w: personal session %q does not belong to requester %d", domain.ErrSessionAccessDenied, sessionKey, requesterUserID)
 		}
 		return nil
 	case strings.HasPrefix(sessionKey, teamPrefix):
 		teamID := strings.TrimPrefix(sessionKey, teamPrefix)
-		if strings.TrimSpace(teamID) == "" {
-			return fmt.Errorf("session access denied: empty team id")
+		if _, err := uuid.Parse(teamID); err != nil {
+			return fmt.Errorf("%w: team session %q has invalid team id", domain.ErrSessionAccessDenied, sessionKey)
 		}
 		member, err := s.store.IsApprovedTeamMember(ctx, teamID, requesterUserID)
 		if err != nil {
-			return fmt.Errorf("session access denied: team membership check: %w", err)
+			return fmt.Errorf("%w: team membership check: %v", domain.ErrSessionAccessDenied, err)
 		}
 		if !member {
-			return fmt.Errorf("session access denied: requester %d is not an approved member of team %q", requesterUserID, teamID)
+			return fmt.Errorf("%w: requester %d is not an approved member of team %q", domain.ErrSessionAccessDenied, requesterUserID, teamID)
 		}
 		return nil
 	default:
-		return fmt.Errorf("session access denied: unsupported session key %q", sessionKey)
+		return fmt.Errorf("%w: unsupported session key %q", domain.ErrSessionAccessDenied, sessionKey)
 	}
 }
 

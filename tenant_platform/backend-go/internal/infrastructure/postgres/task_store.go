@@ -115,7 +115,8 @@ SELECT id, owner_user_id, kind, COALESCE(team_id::text, ''), reset_at FROM works
 `, cmd.SessionKey).Scan(&workspaceID, &ownerID, &kind, &teamID, &resetAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("workspace not found for session_key %q", cmd.SessionKey)
+				// Round16-P1: 哨兵化, api 层据此映射 404(而非全 500)。
+				return fmt.Errorf("%w: %q", domain.ErrWorkspaceNotFound, cmd.SessionKey)
 			}
 			return err
 		}
