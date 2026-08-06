@@ -75,9 +75,3 @@ func (s *Store) ConsumeCapabilityCall(ctx context.Context, jtiHash [32]byte, max
 	return true, nil
 }
 
-// DeleteCapabilityUsage 删除 JTI 的计量行(终态撤销时同步清理, 防止
-// capability_usage 无限增长)。
-func (s *Store) DeleteCapabilityUsage(ctx context.Context, jtiHash [32]byte) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM capability_usage WHERE jti_hash = $1`, jtiHash[:])
-	return err
-}

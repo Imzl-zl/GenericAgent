@@ -506,6 +506,9 @@ func waitHealth(ctx context.Context, client workerclient.WorkerClient, wantReady
 	}
 }
 
+// isLoopbackAddr duplicates internal/infrastructure/worker/runtime.go on purpose:
+// this is a standalone dev-loopback harness that must not import the worker
+// runtime package (which pulls in sandbox/cert dependencies). Keep in sync.
 func isLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {

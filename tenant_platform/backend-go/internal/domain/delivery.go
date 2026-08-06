@@ -15,10 +15,8 @@ const (
 type DeliveryStatus string
 
 const (
-	DeliveryPending    DeliveryStatus = "pending"
-	DeliverySending    DeliveryStatus = "sending"
-	DeliveryAcked      DeliveryStatus = "acked"
-	DeliveryDeadLetter DeliveryStatus = "dead_letter"
+	DeliverySending DeliveryStatus = "sending"
+	DeliveryAcked   DeliveryStatus = "acked"
 )
 
 // StableDeliveryID is platform-owned: task_id:delivery_type.

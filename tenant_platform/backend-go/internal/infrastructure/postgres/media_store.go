@@ -55,43 +55,6 @@ RETURNING id, user_id, bot_id, COALESCE(message_id, 0), file_name, storage_path,
 	return out, nil
 }
 
-// ListMediaByUser returns the most recent media assets for a user, newest first.
-func (s *Store) ListMediaByUser(ctx context.Context, userID int64, limit, offset int) ([]domain.MediaAsset, error) {
-	if userID <= 0 {
-		return nil, fmt.Errorf("user id must be positive")
-	}
-	if limit <= 0 || limit > 200 {
-		limit = 50
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	rows, err := s.pool.Query(ctx, `
-SELECT id, user_id, bot_id, COALESCE(message_id, 0), file_name, storage_path,
-       content_type, size_bytes, COALESCE(sha256, ''), direction, created_at
-FROM media_assets
-WHERE user_id = $1
-ORDER BY created_at DESC
-LIMIT $2 OFFSET $3
-`, userID, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("list media: %w", err)
-	}
-	defer rows.Close()
-	var out []domain.MediaAsset
-	for rows.Next() {
-		var a domain.MediaAsset
-		var direction string
-		if err := rows.Scan(&a.ID, &a.UserID, &a.BotID, &a.MessageID, &a.FileName,
-			&a.StoragePath, &a.ContentType, &a.SizeBytes, &a.SHA256,
-			&direction, &a.CreatedAt); err != nil {
-			return nil, err
-		}
-		a.Direction = domain.MessageDirection(direction)
-		out = append(out, a)
-	}
-	return out, rows.Err()
-}
 
 func scanMediaAsset(row pgx.Row, m *domain.MediaAsset) error {
 	var direction string

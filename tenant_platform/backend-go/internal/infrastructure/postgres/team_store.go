@@ -174,32 +174,4 @@ SELECT COUNT(*) FROM team_members WHERE team_id = $1::uuid AND user_id = $2 AND 
 	}
 }
 
-// IsTeamMember reports whether userID is a member of teamID. Used by the HTTP
-// layer for cancel authorization on team tasks.
-func (s *Store) IsTeamMember(ctx context.Context, teamID string, userID int64) (bool, error) {
-	if userID <= 0 {
-		return false, nil
-	}
-	var count int
-	err := s.pool.QueryRow(ctx, `
-SELECT COUNT(*) FROM team_members WHERE team_id = $1::uuid AND user_id = $2 AND status = 'approved'
-`, teamID, userID).Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
 
-// WorkspaceOwnerForSession returns the owner_user_id for a session_key. Used
-// by the HTTP cancel path to authorize team task cancellation by the owner.
-func (s *Store) WorkspaceOwnerForSession(ctx context.Context, sessionKey string) (int64, string, error) {
-	var ownerID int64
-	var kind string
-	err := s.pool.QueryRow(ctx, `
-SELECT owner_user_id, kind FROM workspaces WHERE session_key = $1
-`, sessionKey).Scan(&ownerID, &kind)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, "", fmt.Errorf("workspace not found for session %s", sessionKey)
-	}
-	return ownerID, kind, err
-}

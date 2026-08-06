@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -244,15 +243,6 @@ func scanUser(row pgx.Row, u *domain.User) error {
 	return row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Status, &u.BootstrapMarker, &u.CreatedAt, &u.ApprovedAt)
 }
 
-// EnsureUserExists returns nil if the user exists; otherwise pgx.ErrNoRows.
-func (s *Store) EnsureUserExists(ctx context.Context, userID int64) error {
-	var dummy int
-	err := s.pool.QueryRow(ctx, `SELECT 1 FROM users WHERE id = $1`, userID).Scan(&dummy)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("user %d not found", userID)
-	}
-	return err
-}
 
 // FindRunningTaskBySession returns the single starting/running task for the
 // given session_key, or pgx.ErrNoRows if none. Relies on the

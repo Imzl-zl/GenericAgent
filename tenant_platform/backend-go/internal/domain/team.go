@@ -29,14 +29,6 @@ const (
 	MemberRemoved TeamMemberStatus = "removed"
 )
 
-// IsValidTeamMemberStatus reports whether s is an allowed membership status.
-func IsValidTeamMemberStatus(s TeamMemberStatus) bool {
-	switch s {
-	case MemberPendingMember, MemberPendingOwner, MemberApproved, MemberRejected, MemberRemoved:
-		return true
-	}
-	return false
-}
 
 // IsPending reports whether the status is awaiting a state transition.
 func (s TeamMemberStatus) IsPending() bool {

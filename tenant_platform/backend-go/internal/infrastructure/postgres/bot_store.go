@@ -116,25 +116,6 @@ WHERE ilink_user_id = $1 AND state = 'active'
 	return b, err
 }
 
-// BindBotIlinkUserTx pairs a bot with an ilink_user_id inside a transaction.
-// Called by the binding consume flow so the binding state change and the bot
-// pairing are atomic.
-func (s *Store) BindBotIlinkUserTx(ctx context.Context, tx pgx.Tx, botUUID, ilinkUserID string) error {
-	if botUUID == "" || ilinkUserID == "" {
-		return fmt.Errorf("bot uuid and ilink user id are required")
-	}
-	tag, err := tx.Exec(ctx, `
-UPDATE bots SET ilink_user_id = $2, updated_at = $3
-WHERE bot_uuid = $1::uuid AND state = 'active'
-`, botUUID, ilinkUserID, time.Now().UTC())
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("no active bot found for uuid %s", botUUID)
-	}
-	return nil
-}
 
 // UpdateBotState transitions a bot's state.
 func (s *Store) UpdateBotState(ctx context.Context, botUUID string, state domain.BotState) error {

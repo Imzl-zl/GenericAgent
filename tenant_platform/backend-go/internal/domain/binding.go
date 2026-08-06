@@ -16,10 +16,6 @@ const (
 	UserBlocked  UserStatus = "blocked"
 )
 
-// IsValidUserStatus reports whether s is an allowed user status.
-func IsValidUserStatus(s UserStatus) bool {
-	return s == UserPending || s == UserApproved || s == UserBlocked
-}
 
 // User is the platform user record (spec §5: users).
 type User struct {

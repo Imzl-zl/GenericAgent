@@ -188,8 +188,3 @@ WHERE token_hash = $1 AND expires_at > timezone('utc', now())
 	return sess, err
 }
 
-// DeleteUserSession removes a session.
-func (s *Store) DeleteUserSession(ctx context.Context, tokenHash string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM user_sessions WHERE token_hash = $1`, tokenHash)
-	return err
-}

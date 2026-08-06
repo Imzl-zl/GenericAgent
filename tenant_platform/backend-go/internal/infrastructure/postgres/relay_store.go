@@ -77,18 +77,3 @@ SET opt_out = EXCLUDED.opt_out,
 	return nil
 }
 
-// GetRelayOptOut returns the user's current relay opt-out flag. Users without
-// a relay_preferences row are treated as opted-in (false).
-func (s *Store) GetRelayOptOut(ctx context.Context, userID int64) (bool, error) {
-	if userID <= 0 {
-		return false, fmt.Errorf("user id must be positive")
-	}
-	var optOut bool
-	err := s.pool.QueryRow(ctx, `
-SELECT COALESCE((SELECT opt_out FROM relay_preferences WHERE user_id = $1), FALSE)
-`, userID).Scan(&optOut)
-	if err != nil {
-		return false, fmt.Errorf("get relay opt out: %w", err)
-	}
-	return optOut, nil
-}

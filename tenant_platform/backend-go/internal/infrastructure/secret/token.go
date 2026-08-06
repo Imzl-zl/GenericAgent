@@ -7,8 +7,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/subtle"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -125,14 +123,4 @@ func hexValue(c byte) (byte, bool) {
 	return 0, false
 }
 
-// ConstantTimeEqual compares two byte slices in constant time.
-func ConstantTimeEqual(a, b []byte) bool {
-	return subtle.ConstantTimeCompare(a, b) == 1
-}
 
-// IntToBytes returns a little-endian 8-byte representation of v.
-func IntToBytes(v int64) []byte {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], uint64(v))
-	return b[:]
-}

@@ -145,33 +145,6 @@ SELECT EXISTS (
 	return exists, nil
 }
 
-// ListMessagesByUser returns the most recent messages for a user, newest first.
-// limit is capped at 200 to bound query cost; callers wanting more should paginate.
-func (s *Store) ListMessagesByUser(ctx context.Context, userID int64, limit, offset int) ([]domain.Message, error) {
-	if userID <= 0 {
-		return nil, fmt.Errorf("user id must be positive")
-	}
-	if limit <= 0 || limit > 200 {
-		limit = 50
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	rows, err := s.pool.Query(ctx, `
-SELECT id, user_id, bot_id, session_key, direction, COALESCE(message_id, ''),
-       message_type, COALESCE(content, ''), COALESCE(media_path, ''),
-       COALESCE(task_id, ''), created_at
-FROM messages
-WHERE user_id = $1
-ORDER BY created_at DESC
-LIMIT $2 OFFSET $3
-`, userID, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("list messages: %w", err)
-	}
-	defer rows.Close()
-	return scanMessages(rows)
-}
 
 func scanMessage(row pgx.Row, m *domain.Message) error {
 	var direction string

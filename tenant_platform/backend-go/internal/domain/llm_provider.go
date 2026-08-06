@@ -1,7 +1,6 @@
 package domain
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -196,14 +195,6 @@ type LLMProvider struct {
 }
 
 func (p LLMProvider) IsActive() bool { return p.State == ProviderActive }
-
-func (p LLMProvider) SessionConfigJSON() ([]byte, error) {
-	return json.Marshal(p.SessionConfig)
-}
-
-func (p LLMProvider) TransportConfigJSON() ([]byte, error) {
-	return json.Marshal(p.TransportConfig)
-}
 
 func validateOptionalEnum(field string, value *string, allowed ...string) error {
 	if value == nil {
