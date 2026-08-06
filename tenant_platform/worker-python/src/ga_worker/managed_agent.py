@@ -6,6 +6,11 @@ Public API only; internals split into:
 - session_lifecycle.py: SessionLifecycleMixin (session creation, snapshot, checkpoint write)
 - task_ops.py: TaskOpsMixin (terminal, abort, record_completed, cleanup)
 - task_runner.py + task_drain.py + task_terminal.py: execute_task generator logic
+- credential_config.py: runtime credential materialization
+- checkpoint.py: snapshot bundle write/checksum helpers
+- limits.py: CapabilityRegistry (per-task budget limits)
+- legacy_import.py: legacy module import sandbox
+- mcp_config.py / runtime_overlay.py / session_files.py / sop_tool.py: overlay/assets/session/sop tooling
 """
 
 from __future__ import annotations

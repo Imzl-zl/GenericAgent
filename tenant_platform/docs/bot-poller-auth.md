@@ -106,9 +106,19 @@ curl http://127.0.0.1:8090/health
 
 ## 实现文件
 
-- **Python 服务端**：`tenant_platform/bot_poller/poller_server.py:296-350` (`PollerHandler._verify_request_signature`)
-- **Go 客户端**：`tenant_platform/backend-go/internal/infrastructure/poller/client.go:185-205` (`Client.post`)
-- **平台配置**：`tenant_platform/backend-go/cmd/platform/main.go:265` (`--bot-poller-api-secret` flag)
+- **Python 服务端**：`tenant_platform/bot_poller/poller_server.py:625` (`PollerHandler._verify_request_signature`)
+- **Go 客户端**：`tenant_platform/backend-go/internal/infrastructure/poller/client.go:204` (`Client.post`)
+- **平台配置**：`tenant_platform/backend-go/cmd/platform/main.go:479` (`--bot-poller-api-secret` flag)
+
+## API 清单
+
+| 端点 | 方法 | 认证 | 用途 |
+| --- | --- | --- | --- |
+| `/health` | GET | 无 | 健康检查(监控需要) |
+| `/start` `/stop` `/send` | POST | `X-API-Signature` | 机器人生命周期与消息下发 |
+| `/config` | GET/POST | `X-API-Signature` | 动态配置入站聚合窗口(`inbound_coalesce_window_ms`), 见 `poller_server.py:671`; Go 侧经 `poller.Client.ConfigureInboundCoalescing` 调用 |
+
+> 行号随代码演进可能漂移，以函数名为准（`grep -n "def _verify_request_signature"`）。
 
 ## 向后兼容
 

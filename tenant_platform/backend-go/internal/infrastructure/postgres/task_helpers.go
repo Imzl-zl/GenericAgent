@@ -91,8 +91,8 @@ func finalizeTerminal(
 	if !status.IsTerminal() {
 		return domain.Task{}, fmt.Errorf("not terminal: %s", status)
 	}
-	if len(message) > MaxTerminalErrorBytes {
-		message = message[:MaxTerminalErrorBytes]
+	if len(message) > domain.MaxTerminalErrorBytes {
+		message = message[:domain.MaxTerminalErrorBytes]
 	}
 	row := tx.QueryRow(ctx, `
 UPDATE tasks SET
@@ -196,23 +196,23 @@ func validateSubmit(cmd domain.SubmitTaskCommand) error {
 	if strings.TrimSpace(cmd.SessionKey) == "" {
 		return fmt.Errorf("session_key is required")
 	}
-	if strings.TrimSpace(cmd.Source) == "" || len(cmd.Source) > MaxSourceLen {
-		return fmt.Errorf("source is required and must be <= %d", MaxSourceLen)
+	if strings.TrimSpace(cmd.Source) == "" || len(cmd.Source) > domain.MaxSourceLen {
+		return fmt.Errorf("source is required and must be <= %d", domain.MaxSourceLen)
 	}
 	if !domain.IsValidSource(cmd.Source) {
 		return fmt.Errorf("source must be one of %s|%s", domain.SourceWechat, domain.SourceWeb)
 	}
-	if strings.TrimSpace(cmd.SourceInstanceID) == "" || len(cmd.SourceInstanceID) > MaxSourceInstanceLen {
-		return fmt.Errorf("source_instance_id is required and must be <= %d", MaxSourceInstanceLen)
+	if strings.TrimSpace(cmd.SourceInstanceID) == "" || len(cmd.SourceInstanceID) > domain.MaxSourceInstanceLen {
+		return fmt.Errorf("source_instance_id is required and must be <= %d", domain.MaxSourceInstanceLen)
 	}
-	if strings.TrimSpace(cmd.MessageID) == "" || len(cmd.MessageID) > MaxMessageIDLen {
-		return fmt.Errorf("message_id is required and must be <= %d", MaxMessageIDLen)
+	if strings.TrimSpace(cmd.MessageID) == "" || len(cmd.MessageID) > domain.MaxMessageIDLen {
+		return fmt.Errorf("message_id is required and must be <= %d", domain.MaxMessageIDLen)
 	}
 	if strings.TrimSpace(cmd.Prompt) == "" {
 		return fmt.Errorf("prompt is required")
 	}
-	if strings.TrimSpace(cmd.ToolPolicyVersion) == "" || len(cmd.ToolPolicyVersion) > MaxToolPolicyVersionLen {
-		return fmt.Errorf("tool_policy_version is required and must be <= %d", MaxToolPolicyVersionLen)
+	if strings.TrimSpace(cmd.ToolPolicyVersion) == "" || len(cmd.ToolPolicyVersion) > domain.MaxToolPolicyVersionLen {
+		return fmt.Errorf("tool_policy_version is required and must be <= %d", domain.MaxToolPolicyVersionLen)
 	}
 	if cmd.PersonaSnapshot == nil {
 		return fmt.Errorf("persona_snapshot is required")

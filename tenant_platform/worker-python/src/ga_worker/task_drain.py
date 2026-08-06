@@ -37,6 +37,10 @@ HEARTBEAT_INTERVAL_S = 30.0
 # last_activity_at 收割(默认 idle 300s > 窗口)。长 LLM 思考由 llm-proxy
 # 响应头超时(默认 120s)兜底: 思考超时必然返回/报错, agent 恢复推进,
 # 不会误收割。
+# 部署契约(审查 F4): 必须保持 PROGRESS_WINDOW_S(150s) > llm-proxy
+# defaultResponseHeaderTimeout(120s) < TASK_IDLE_TIMEOUT_SECONDS(默认 300s)。
+# 违反任一侧: 窗口 <= 代理超时 → 思考恰好超窗但代理未返回时心跳停发;
+# 代理超时 >= idle 阈值 → 长思考任务被 idle reaper 误收割。
 PROGRESS_WINDOW_S = 150.0
 
 

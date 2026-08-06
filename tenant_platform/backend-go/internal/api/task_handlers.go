@@ -9,7 +9,6 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 )
 
 // handleHealthz is the unauthenticated liveness probe.
@@ -175,14 +174,14 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 // validateCreate enforces non-empty + length limits on createTaskBody fields.
 // Limits match the postgres constants used by the store layer.
 func validateCreate(b createTaskBody) error {
-	if strings.TrimSpace(b.MessageID) == "" || len(b.MessageID) > postgres.MaxMessageIDLen {
-		return fmt.Errorf("message_id is required and must be <= %d bytes", postgres.MaxMessageIDLen)
+	if strings.TrimSpace(b.MessageID) == "" || len(b.MessageID) > domain.MaxMessageIDLen {
+		return fmt.Errorf("message_id is required and must be <= %d bytes", domain.MaxMessageIDLen)
 	}
-	if strings.TrimSpace(b.SourceInstanceID) == "" || len(b.SourceInstanceID) > postgres.MaxSourceInstanceLen {
-		return fmt.Errorf("source_instance_id is required and must be <= %d bytes", postgres.MaxSourceInstanceLen)
+	if strings.TrimSpace(b.SourceInstanceID) == "" || len(b.SourceInstanceID) > domain.MaxSourceInstanceLen {
+		return fmt.Errorf("source_instance_id is required and must be <= %d bytes", domain.MaxSourceInstanceLen)
 	}
-	if strings.TrimSpace(b.Prompt) == "" || len([]byte(b.Prompt)) > postgres.MaxPromptBytes {
-		return fmt.Errorf("prompt is required and must be <= %d bytes", postgres.MaxPromptBytes)
+	if strings.TrimSpace(b.Prompt) == "" || len([]byte(b.Prompt)) > domain.MaxPromptBytes {
+		return fmt.Errorf("prompt is required and must be <= %d bytes", domain.MaxPromptBytes)
 	}
 	if strings.TrimSpace(b.Source) == "" || !domain.IsValidSource(b.Source) {
 		return fmt.Errorf("source must be one of %s|%s", domain.SourceWechat, domain.SourceWeb)

@@ -535,7 +535,7 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 		body := userVisibleTaskResult(string(payload.Body))
 		markers := extractFileMarkers(body)
 		cleaned := stripFileMarkers(body)
-		cleaned = truncateBytes(cleaned, maxDeliveryTextBytes)
+		cleaned = domain.TruncateUTF8(cleaned, maxDeliveryTextBytes)
 		out := deliveryPayload{}
 		if cleaned != "" {
 			out.Text = fmt.Sprintf("任务完成：\n%s", cleaned)
@@ -587,11 +587,11 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 		}
 		return out, nil
 	case domain.DeliveryTaskFailed:
-		return deliveryPayload{Text: fmt.Sprintf("任务失败：%s\n%s", d.ErrorCode, truncateBytes(d.ErrorMessage, maxDeliveryTextBytes))}, nil
+		return deliveryPayload{Text: fmt.Sprintf("任务失败：%s\n%s", d.ErrorCode, domain.TruncateUTF8(d.ErrorMessage, maxDeliveryTextBytes))}, nil
 	case domain.DeliveryTaskCancelled:
-		return deliveryPayload{Text: fmt.Sprintf("任务已取消：%s", truncateBytes(d.ErrorMessage, maxDeliveryTextBytes))}, nil
+		return deliveryPayload{Text: fmt.Sprintf("任务已取消：%s", domain.TruncateUTF8(d.ErrorMessage, maxDeliveryTextBytes))}, nil
 	case domain.DeliveryTaskInterrupted:
-		return deliveryPayload{Text: fmt.Sprintf("任务中断：%s", truncateBytes(d.ErrorMessage, maxDeliveryTextBytes))}, nil
+		return deliveryPayload{Text: fmt.Sprintf("任务中断：%s", domain.TruncateUTF8(d.ErrorMessage, maxDeliveryTextBytes))}, nil
 	default:
 		return deliveryPayload{}, fmt.Errorf("unknown delivery type %s", d.DeliveryType)
 	}
@@ -653,12 +653,6 @@ func teamSessionKey(sessionKey string) (string, bool) {
 	return id, true
 }
 
-func truncateBytes(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
-	return s[:limit]
-}
 
 // deliveryFileKey 把 delivery_id(含 ':' 等非文件名字符)转为安全文件名前缀。
 func deliveryFileKey(deliveryID string) string {

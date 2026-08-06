@@ -58,6 +58,14 @@ Provider 记录（概念字段）：
 - `revision` — 路由/能力绑定版本；名称或密钥-only 更新保持不变，type/base/model/session/transport/state 变化递增
 - `is_default` / `state`
 
+### 已知行为：routing 变更与在途任务（残余风险确认，Round15）
+
+capability JWT 的 `provider_revision` 绑定签发时刻的 provider 配置快照；llm-proxy 在每次调用时校验 `provider.Revision == claims.ProviderRevision`（`handler.go`，不匹配返回 409 `PROVIDER_REVISION_MISMATCH`）。
+
+因此 **provider routing 变更（PUT/disable/enable，revision 递增）与 scheduler 并发 dispatch 存在竞争窗口**：capability 签发（rev=N）之后、任务实际调用 LLM 之前发生变更（rev=N+1）→ 在途任务的旧 capability 被 409 拒绝 → GA `LLM_FAILED` → 任务以 TASK_FAILED 结束。
+
+这是**有意的安全设计，不是缺陷**：revision 绑定保证 routing 变更立即生效，旧配置不会被继续使用；失败方向为 fail-closed（409 → 任务失败可重试），不产生静默错误或越权。生产影响小（routing 变更低频），**不要**为消除竞争窗口而放宽 revision 校验。
+
 ## Admin API
 
 基路径：`/v1/admin/llm-providers`（需管理员认证）。

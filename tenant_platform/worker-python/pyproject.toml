@@ -17,7 +17,6 @@ dependencies = [
 test = [
   "pytest",
   "grpcio-tools",
-  "psutil",
   # round13 审查(CI): test_session_files 断言 export_docx 生成真实 docx;
   # 运行时缺失 python-docx 时工具走显式降级路径, 但测试必须验证完整行为。
   "python-docx",

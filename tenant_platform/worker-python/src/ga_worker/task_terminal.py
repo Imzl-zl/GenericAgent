@@ -23,12 +23,13 @@ def cleanup_legacy_subprocesses(adapter: Any) -> bool:
     """任务终态前清理 legacy code_run 遗留进程组(审查 C2)。
 
     code_run 以独立进程组运行(ga.py), 正常返回后可能仍有派生的后台子进程
-    (如 nohup ... &)。Runner 按 workspace 复用, 这些进程若跨任务存活可窃取
-    下一任务的 capability 凭据或继续写工作区。经 adapter._legacy_mods 调用
-    ga.kill_all_code_run_processes; 无 ga 模块(测试/无凭据环境)时静默跳过。
+    (如 nohup ... &)。任务即进程(决策 D1)下 Runner 终态即销毁, 但这些进程
+    若在销毁前窗口存活仍可能干扰终态提交或污染快照; 清理保持 fail-closed。
+    经 adapter._legacy_mods 调用 ga.kill_all_code_run_processes; 无 ga 模块
+    (测试/无凭据环境)时静默跳过。
     round10 审查(B4): 返回 False 表示清理不干净(fail-closed)——调用方必须
     把任务标记为失败(error_code=SUBPROCESS_CLEANUP_FAILED), Platform 对失败
-    任务销毁 Runner, 残留进程无法跨任务存活。
+    任务销毁 Runner, 残留进程不随快照持久化。
     """
     mods = getattr(adapter, "_legacy_mods", None) or {}
     ga_mod = mods.get("ga")

@@ -59,6 +59,20 @@ Tenant Platform 已完成 **透明 LLM 凭证代理** 切分：
 - Provider 表单：类型下拉、`session_config` / `transport_config`
 - 列表支持设默认、enable/disable、编辑与删除；不展示明文 key
 
+## 心跳/超时部署契约（审查 F4）
+
+Worker 心跳（推进信号）、llm-proxy 响应头超时与平台 idle reaper 的取值必须保持：
+
+```
+PROGRESS_WINDOW_S (worker, 150s) > defaultResponseHeaderTimeout (llm-proxy, 120s)
+                                     < TASK_IDLE_TIMEOUT_SECONDS (platform, 默认 300s)
+```
+
+- **窗口 > 代理超时**：LLM 长思考由代理超时兜底（必然返回/报错），agent 恢复推进，心跳不停；
+- **代理超时 < idle 阈值**：健康长任务不会被 idle reaper 误收割；
+- worker 心跳间隔 `HEARTBEAT_INTERVAL_S=30s`，平台侧 RecordHeartbeat 刷新 `tasks.last_activity_at`；
+- `last_progress_at` 以 put_task 时刻为基线（任务启动到首个 display 事件之间也在推进窗口内）。
+
 ## 核心优势
 
 1. **密钥边界清晰** — 明文 Key 只在加密存储与 Proxy 内存路径

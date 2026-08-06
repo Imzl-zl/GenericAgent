@@ -20,6 +20,10 @@ import (
 
 const (
 	defaultConnectTimeout        = 10 * time.Second
+	// defaultResponseHeaderTimeout 是单次 LLM 流式调用的响应头超时(默认 120s)。
+	// 部署契约(审查 F4): 必须小于 worker 心跳推进窗口 PROGRESS_WINDOW_S(150s)
+	// 且小于平台 TASK_IDLE_TIMEOUT_SECONDS(默认 300s)——超时保证长思考必然
+	// 返回/报错让 agent 恢复推进, 心跳窗口与 idle 阈值保证健康任务不被误收割。
 	defaultResponseHeaderTimeout = 120 * time.Second
 	maxCachedTransports          = 64
 )

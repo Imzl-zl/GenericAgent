@@ -77,7 +77,7 @@ func (s *scheduler) finalizeOrFail(ctx context.Context, task domain.Task, status
 			status:       status,
 			deliveryType: deliveryType,
 			code:         code,
-			message:      boundMsg(message),
+			message:      domain.TruncateUTF8(message, domain.MaxTerminalErrorBytes),
 			traceID:      traceID,
 		})
 		return task
@@ -473,17 +473,17 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		return s.completeSuccess(ctx, task, terminal)
 	case workerv1.TerminalStatus_TASK_CANCELLED:
 		_ = s.terminateTask(ctx, task, domain.TaskCancelled, domain.DeliveryTaskCancelled,
-			"TASK_CANCELLED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
+			"TASK_CANCELLED", domain.TruncateUTF8(terminal.GetUserMessage(), domain.MaxTerminalErrorBytes), terminal.GetError().GetTraceId())
 	case workerv1.TerminalStatus_TASK_INTERRUPTED:
 		_ = s.terminateTask(ctx, task, domain.TaskInterrupted, domain.DeliveryTaskInterrupted,
-			"TASK_INTERRUPTED", boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
+			"TASK_INTERRUPTED", domain.TruncateUTF8(terminal.GetUserMessage(), domain.MaxTerminalErrorBytes), terminal.GetError().GetTraceId())
 	default:
 		code := "TASK_FAILED"
 		if terminal.GetError() != nil && terminal.GetError().GetCode() != "" {
 			code = terminal.GetError().GetCode()
 		}
 		_ = s.terminateTask(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
-			code, boundMsg(terminal.GetUserMessage()), terminal.GetError().GetTraceId())
+			code, domain.TruncateUTF8(terminal.GetUserMessage(), domain.MaxTerminalErrorBytes), terminal.GetError().GetTraceId())
 	}
 	return nil
 }

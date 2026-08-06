@@ -117,6 +117,8 @@ class TaskRunState:
     # see task_drain.PROGRESS_WINDOW_S). 审查 C1/I8: 心跳只允许在推进窗口
     # 内发出——agent 卡死(无 display 事件)时停止心跳, 平台 idle reaper
     # 才能按 last_activity_at 收割死锁任务。
+    # 审查 F4: 初值由 task_runner 构造时以 put_task 时刻为基线(非 0.0),
+    # 保证任务启动到首个 display 事件之间的健康长思考也在推进窗口内。
     last_progress_at: float = 0.0
 
 

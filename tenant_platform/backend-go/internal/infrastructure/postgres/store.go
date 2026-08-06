@@ -10,16 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Application-enforced limits (not volatile DB now() checks).
-const (
-	MaxPromptBytes          = 64 * 1024
-	MaxPersonaBytes         = 16 * 1024
-	MaxTerminalErrorBytes   = 4 * 1024
-	MaxToolPolicyVersionLen = 128
-	MaxSourceLen            = 64
-	MaxSourceInstanceLen    = 128
-	MaxMessageIDLen         = 256
-)
+// 应用级上限常量已上移 domain(审查 F1): 见 domain/limits.go。
 
 // AdminContext is the approved loopback user/workspace pair.
 type AdminContext struct {

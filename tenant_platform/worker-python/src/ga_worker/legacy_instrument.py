@@ -678,8 +678,9 @@ def install_handler_print_counter(
 
     Returns an unwrap callable that restores the original agent class, the
     original GenericAgentHandler class, and each wrapped handler's print, so
-    the same agent can be reused across tasks without counter leakage
-    (P-M2 pattern, matching install_dispatch_guard/install_max_turns).
+    counter state does not leak between task runs (P-M2 pattern, matching
+    install_dispatch_guard/install_max_turns). 任务即进程(决策 D1)下每任务
+    全新 agent, 但 restore 仍必须在同一任务内成对调用, 保证隔离与可重入。
     """
     wrapped: list[tuple[Any, Any]] = []
     wrap_handler = _make_handler_wrapper(count_fn, wrapped)

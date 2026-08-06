@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import Any, Callable, Iterator
 
 from genericagent.worker.v1 import worker_pb2
@@ -164,12 +165,17 @@ def _setup_runtime(
         install_sophub_tools, prepare_handler_seed,
     )
     agent = adapter._session.agent
+    # 审查 F4: last_progress_at 以 put_task 时刻为基线(而非 0.0)——否则
+    # 任务启动后、首个 display 事件前(LLM 首轮长思考/首轮前处理)心跳被
+    # 抑制(monotonic 时钟已远大于窗口), 健康任务会被平台 idle reaper
+    # 误收割(llm-proxy 120s 响应头超时兜底只在代理超时被调大时失效)。
     state = TaskRunState(
         pending=pending,
         agent=agent,
         max_output=int(adapter._session.runtime_policy.max_output_bytes),
         max_turns=int(adapter._session.runtime_policy.max_turns),
         previous_persona=list(getattr(agent, "extra_sys_prompts", []) or []),
+        last_progress_at=time.monotonic(),
     )
     agent.extra_sys_prompts = list(task.persona_snapshot)
     if adapter._session is not None:

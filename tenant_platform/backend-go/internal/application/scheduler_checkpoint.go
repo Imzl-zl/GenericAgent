@@ -181,12 +181,6 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 	return nil
 }
 
-func boundMsg(message string) string {
-	if len(message) > postgres.MaxTerminalErrorBytes {
-		return message[:postgres.MaxTerminalErrorBytes]
-	}
-	return message
-}
 
 func firstNonEmpty(first, second string) string {
 	if first != "" {

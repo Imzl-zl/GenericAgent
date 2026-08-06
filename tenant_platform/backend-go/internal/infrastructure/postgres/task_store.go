@@ -88,11 +88,11 @@ func (s *Store) submitTaskTx(ctx context.Context, tx pgx.Tx, cmd domain.SubmitTa
 	if err != nil {
 		return domain.Task{}, err
 	}
-	if promptBytes > MaxPromptBytes {
-		return domain.Task{}, fmt.Errorf("prompt exceeds max bytes (%d > %d)", promptBytes, MaxPromptBytes)
+	if promptBytes > domain.MaxPromptBytes {
+		return domain.Task{}, fmt.Errorf("prompt exceeds max bytes (%d > %d)", promptBytes, domain.MaxPromptBytes)
 	}
-	if personaBytes > MaxPersonaBytes {
-		return domain.Task{}, fmt.Errorf("persona_snapshot exceeds max bytes (%d > %d)", personaBytes, MaxPersonaBytes)
+	if personaBytes > domain.MaxPersonaBytes {
+		return domain.Task{}, fmt.Errorf("persona_snapshot exceeds max bytes (%d > %d)", personaBytes, domain.MaxPersonaBytes)
 	}
 
 	var task domain.Task
