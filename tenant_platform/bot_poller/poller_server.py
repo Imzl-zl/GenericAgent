@@ -687,7 +687,7 @@ class PollerHandler(BaseHTTPRequestHandler):
             self._reply(500, {'error': 'internal error'})
 
 
-def serve(listen, grace_seconds=10.0, media_root=None, webhook_secret='', api_secret=''):
+def serve(listen, media_root=None, webhook_secret='', api_secret=''):
     PollerHandler.manager = BotManager(media_root=media_root, webhook_secret=webhook_secret)
     PollerHandler.api_secret = api_secret or ''
     host, port = _parse_listen_addr(listen)
@@ -722,7 +722,6 @@ def serve(listen, grace_seconds=10.0, media_root=None, webhook_secret='', api_se
 def main(argv=None):
     parser = argparse.ArgumentParser(description='GenericAgent Bot Poller')
     parser.add_argument('--listen', default=os.environ.get('BOT_POLLER_LISTEN', '127.0.0.1:8090'))
-    parser.add_argument('--grace-seconds', type=float, default=10.0)
     parser.add_argument('--media-dir', default=os.environ.get('BOT_POLLER_MEDIA_DIR', ''),
                         help='Root directory for inbound media files. Empty disables media download.')
     parser.add_argument('--webhook-secret', default=os.environ.get('PLATFORM_WEBHOOK_SECRET', ''),
@@ -730,7 +729,7 @@ def main(argv=None):
     parser.add_argument('--api-secret', default=os.environ.get('BOT_POLLER_API_SECRET', ''),
                         help='HMAC-SHA256 secret for authenticating inbound /start /stop /send requests (or BOT_POLLER_API_SECRET). Empty = unauthenticated (INSECURE - dev/test only).')
     args = parser.parse_args(argv)
-    serve(args.listen, args.grace_seconds,
+    serve(args.listen,
           media_root=args.media_dir or None,
           webhook_secret=args.webhook_secret or '',
           api_secret=args.api_secret or '')

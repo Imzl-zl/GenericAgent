@@ -34,7 +34,7 @@ class RuntimeSophubProxy:
 
 
 def load_runtime_sophub_proxy(config_root: Path) -> RuntimeSophubProxy | None:
-    """从签名 runtime config 读取 Sophub proxy capability(与 document gateway 同模式)。"""
+    """从签名 runtime config 读取 Sophub proxy capability。"""
     root = Path(config_root)
     try:
         _, document = load_runtime_document(root)

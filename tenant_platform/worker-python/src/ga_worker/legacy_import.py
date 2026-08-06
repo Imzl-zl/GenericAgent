@@ -106,12 +106,7 @@ def import_legacy_runtime(
     _validate_config_root(config_root)
     _assert_no_preloaded_legacy()
 
-    # Never fall back to CWD.
-    cwd = Path.cwd().resolve()
-    if str(cwd) in sys.path:
-        # Keep cwd out of import path for this boundary by moving it to the end and preferring overlay/config.
-        pass
-
+    # Never fall back to CWD: purge legacy root + prefer overlay/config paths.
     _purge_legacy_from_sys_path(legacy_root)
     _ensure_path_front(overlay_dir)
     _ensure_path_front(config_root)
