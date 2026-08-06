@@ -7,7 +7,7 @@
 
 - CI 门禁（分支/PR 级）：Go（vet/build/test -p 1/race 4 关键包）、Python（根 + 平台 contract/security/smoke/integration + bot_poller + worker）、Web（lint/build）全绿
 - 集成测试依赖真实 PostgreSQL（`TEST_DATABASE_URL`），缺失显式失败
-- **Round16 完成（2026-08-06，待提交）**：GA 根项目首轮深度审查（Round14 黑盒）——G1 空响应 3 次统一标记 LLM_FAILED（原 fail-open 被当成功提交）+ G2 total_cd_tokens O(n²) 修复；平台侧 SubmitTask 错误分级（429/403/404/500）+ validateSessionAccess 严格解析（Sscanf 宽松入口收口）+ team uuid 收紧；遗留清理（C3 终态构造收敛 / C6 help 文本 / F5-F7 / B5 personalSessionKey 收敛 / B8 cancelCall 归位 / C2 poller 死代码删除）
+- **Round17 完成（2026-08-06，已提交 4 commit）**：全项目健康清理——backend-go 死代码（token_revoker 整文件 / 12 死 store 方法 / domain 死符号 / migrations 残留 / 一次性脚本）+ worker/web 废弃源码（旧 Dockerfile / grace_seconds / 空块 / 4 无引用资源）+ 平台文档校准（认证头 / 方法表 / 方案口径 / superpowers 历史标注）+ .tasks 进度真值刷新；范围按用户决策收敛：GA 根项目黑盒一律不动、fudankw.cn（sophub）保留
 - 最后更新：2026-08-06
 
 ## 已完成能力
@@ -19,8 +19,8 @@
 
 ## 进行中 / 未完成
 
-- Round16 全部修复已交付（G1/G2 + P1/P2 + 遗留清理 C2/C3/C6/F5-F7/B5/B8）；待提交
-- 有意遗留（不产生功能缺陷，已评估）：B3 wechat/ilink 命名债（`ilink_user_id` 是 API 契约字段，改名需联动 openapi/web，等契约变更窗口）；C5 delivery_service 834 行未拆（纯结构债，等 delivery 实质改动时顺手拆）
+- Round16/17 全部修复已交付并提交（Round16: e6fce4ad 之前；Round17: 4 commit）；遗留仅部署主机残余验证
+- 有意遗留（不产生功能缺陷，已评估）：B3 wechat/ilink 命名债（`ilink_user_id` 是 API 契约字段，改名需联动 openapi/web，等契约变更窗口）；C5 delivery_service 834 行未拆（纯结构债，等 delivery 实质改动时顺手拆）；bundle 多文件 SOP 平台侧不支持（sophub 平台已上线 bundle，平台 proxy 有意收窄为 single-file，若需用要加支持）
 - 残余验证（需真实 Linux 主机 + Docker/runsc）：runsc 运行时、mTLS 注入、六服务 compose 冒烟、共享卷跨 UID
 
 ## 关键决策（仍有效）
@@ -53,6 +53,8 @@
 
 ## 最近活跃窗口
 
+- 2026-08-06：Round17 健康清理完成并提交 4 commit（backend-go/worker/web 死代码 + 平台文档校准 + .tasks 刷新）；范围决策：GA 根项目黑盒不动、fudankw.cn(sophub)保留
+- 2026-08-06：Sophub 集成全链路梳理（单路径 proxy 架构确认；bundle SOP 缺口；README badge 无尾斜杠超时）——详见 memory/archive/2026-08.md
 - 2026-08-06：Round16 修复（G1/G2 GA 侧语义 + SubmitTask 错误分级 + session key 严格解析 + C2/C3/C6/F5-F7/B5/B8 遗留清理）
 - 2026-08-06：Round15 P3/P4（E 组文档校准 + F 组分层/UTF-8 截断/心跳基线 + routing 竞争窗口确认）
 - 2026-08-06：Round15 P2 真值源收敛（workspace hash 唯一实现 + ctrl: JTI 进 proto + per-requester 命名 + 决策编号 D1 + SQL 谓词常量 + tools_schema_cn 删除）
