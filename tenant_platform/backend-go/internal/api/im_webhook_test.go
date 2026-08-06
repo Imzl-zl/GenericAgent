@@ -189,8 +189,8 @@ func newTestServerWithRouterAndLifecycle(t *testing.T, router application.Router
 		Registry:     &fakeRegistry{},
 		Router:       router,
 		BotLifecycle: lc,
-		DevToken:     "dev-token",
-		DevUserID:    1,
+		AdminToken:     "admin token",
+		AdminUserID:    1,
 		SessionKey:   "personal:1",
 		WebhookSecret: "test-secret",
 	})
@@ -215,7 +215,7 @@ func (s *fakeTaskService) SubmitTask(_ context.Context, _ domain.SubmitTaskComma
 func (s *fakeTaskService) SubmitTaskWithInboundMessage(_ context.Context, _ domain.SubmitTaskCommand, _ domain.Message) (domain.Task, domain.Message, error) {
 	return domain.Task{}, domain.Message{}, nil
 }
-func (s *fakeTaskService) GetTask(_ context.Context, _ string) (domain.Task, error) {
+func (s *fakeTaskService) GetTask(_ context.Context, _ string, _ int64) (domain.Task, error) {
 	return domain.Task{}, nil
 }
 func (s *fakeTaskService) CancelTask(_ context.Context, _ string, _ int64) (domain.Task, error) {
@@ -225,7 +225,7 @@ func (s *fakeTaskService) ClaimNextTask(_ context.Context, _, _ string) (domain.
 	return domain.Task{}, false, nil
 }
 func (s *fakeTaskService) RecoverAfterRestart(_ context.Context, _ string) error { return nil }
-func (s *fakeTaskService) ReadResult(_ context.Context, _ string) (domain.ResultPayload, error) {
+func (s *fakeTaskService) ReadResult(_ context.Context, _ string, _ int64) (domain.ResultPayload, error) {
 	return domain.ResultPayload{}, nil
 }
 

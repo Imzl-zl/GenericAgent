@@ -29,7 +29,7 @@ class TaskOpsMixin:
     """Terminal construction, completion recording, abort, and active-task cleanup.
 
     Depends on instance attributes set by ManagedAgentAdapter.__init__:
-    _lock, _session, _pending, _event_queues.
+    _lock, _session, _pending.
     """
 
     def _file_pre_dispatch_barrier(self, task_id: str, pending: PendingTask) -> None:
@@ -144,4 +144,3 @@ class TaskOpsMixin:
             self._pending = None
         if self._session and self._session.active_task_id == task_id:
             self._session.active_task_id = None
-        self._event_queues.pop(task_id, None)

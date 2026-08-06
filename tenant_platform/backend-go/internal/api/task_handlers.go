@@ -1,10 +1,10 @@
 package api
 
 import (
+	"errors"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
@@ -19,12 +19,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // createTaskBody is the JSON body for POST /v1/sessions/{session_key}/tasks.
 type createTaskBody struct {
-	MessageID         string   `json:"message_id"`
-	SourceInstanceID  string   `json:"source_instance_id"`
-	Prompt            string   `json:"prompt"`
-	Source            string   `json:"source"`
-	PersonaSnapshot   []string `json:"persona_snapshot"`
-	ToolPolicyVersion string   `json:"tool_policy_version"`
+	MessageID        string   `json:"message_id"`
+	SourceInstanceID string   `json:"source_instance_id"`
+	Prompt           string   `json:"prompt"`
+	Source           string   `json:"source"`
+	PersonaSnapshot  []string `json:"persona_snapshot"`
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -45,18 +44,14 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
 		return
 	}
-	if _, err := s.registry.Resolve(application.CapabilityVersion, body.ToolPolicyVersion); err != nil {
-		writeErr(w, http.StatusBadRequest, "POLICY_REJECTED", err.Error(), tid)
-		return
-	}
 	// RequesterUserID is taken from the authenticated principal, never from the
-	// request body. In dev-token mode (s.auth) this is the configured devUserID;
-	// when this endpoint moves to userAuth (P1 production hardening), it will
-	// come from userIDFromContext. Allowing the body to override it would let
-	// any dev-token holder impersonate arbitrary users.
-	requester := s.devUserID
-	if uid, ok := userIDFromContext(r.Context()); ok {
-		requester = uid
+	// request body. The endpoint runs under userAuth (审查 I-4), so the
+	// principal is always present; allowing the body to override it would let
+	// any caller impersonate arbitrary users.
+	requester, ok := userIDFromContext(r.Context())
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "NO_PRINCIPAL", "authenticated user missing from context", tid)
+		return
 	}
 	task, err := s.svc.SubmitTask(r.Context(), domain.SubmitTaskCommand{
 		SessionKey:        sessionKey,
@@ -66,7 +61,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		MessageID:         body.MessageID,
 		Prompt:            body.Prompt,
 		PersonaSnapshot:   body.PersonaSnapshot,
-		ToolPolicyVersion: body.ToolPolicyVersion,
+		ToolPolicyVersion: application.DefaultToolPolicyVersion,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "SUBMIT_FAILED", err.Error(), tid)
@@ -78,10 +73,17 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// requesterID 返回认证主体 userID(审查 I-4: 任务端点运行于 userAuth,
+// principal 必存在; 缺失时返回 0, 由 service 层归属校验统一拒绝)。
+func requesterID(r *http.Request) int64 {
+	uid, _ := userIDFromContext(r.Context())
+	return uid
+}
+
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	taskID := r.PathValue("task_id")
-	task, err := s.svc.GetTask(r.Context(), taskID)
+	task, err := s.svc.GetTask(r.Context(), taskID, requesterID(r))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "NOT_FOUND", err.Error(), tid)
 		return
@@ -123,8 +125,13 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	payload, err := s.svc.ReadResult(r.Context(), taskID)
+	payload, err := s.svc.ReadResult(r.Context(), taskID, requesterID(r))
 	if err != nil {
+		// 审查 I-4: 归属校验失败统一 404(ErrTaskNotFound), 与 get/cancel 一致。
+		if errors.Is(err, application.ErrTaskNotFound) {
+			writeErr(w, http.StatusNotFound, "NOT_FOUND", err.Error(), tid)
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "RESULT_UNAVAILABLE", err.Error(), tid)
 		return
 	}
@@ -145,14 +152,17 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	taskID := r.PathValue("task_id")
-	requester := s.devUserID
-	if q := r.URL.Query().Get("requester_user_id"); q != "" {
-		if v, err := strconv.ParseInt(q, 10, 64); err == nil && v > 0 {
-			requester = v
-		}
-	}
+	// 审查 I-2: 请求者身份只取认证主体, 绝不允许 query/body 覆盖——
+	// 否则任意调用方可传他人 user_id 取消他人任务(IDOR)。
+	// 审查 I-4: 端点运行于 userAuth, requester 恒为认证用户;
+	// 归属校验失败统一 404(ErrTaskNotFound), 与 get/result 一致。
+	requester := requesterID(r)
 	task, err := s.svc.CancelTask(r.Context(), taskID, requester)
 	if err != nil {
+		if errors.Is(err, application.ErrTaskNotFound) {
+			writeErr(w, http.StatusNotFound, "NOT_FOUND", err.Error(), tid)
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "CANCEL_FAILED", err.Error(), tid)
 		return
 	}
@@ -179,9 +189,6 @@ func validateCreate(b createTaskBody) error {
 	}
 	if b.PersonaSnapshot == nil {
 		return fmt.Errorf("persona_snapshot is required")
-	}
-	if strings.TrimSpace(b.ToolPolicyVersion) == "" || len(b.ToolPolicyVersion) > postgres.MaxToolPolicyVersionLen {
-		return fmt.Errorf("tool_policy_version is required and must be <= %d bytes", postgres.MaxToolPolicyVersionLen)
 	}
 	return nil
 }

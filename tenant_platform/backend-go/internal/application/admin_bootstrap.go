@@ -12,12 +12,12 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 )
 
-// DevBootstrapConfig is required for --dev-loopback startup.
-type DevBootstrapConfig struct {
+// AdminBootstrapConfig is required for --dev-loopback startup.
+type AdminBootstrapConfig struct {
 	Enabled      bool
 	UserID       int64
 	Username     string
-	DevToken     string
+	AdminToken     string
 	DatabaseURL  string
 	PolicyFile   string
 	ClaimLease   string // parsed by main
@@ -43,12 +43,12 @@ type DevTeamConfig struct {
 	MemberIDs []int64
 }
 
-// LoadDevBootstrapFromEnv reads PLATFORM_DEV_* and related env for loopback mode.
-func LoadDevBootstrapFromEnv() (DevBootstrapConfig, error) {
-	cfg := DevBootstrapConfig{
+// LoadAdminBootstrapFromEnv reads PLATFORM_ADMIN_* and related env for loopback mode.
+func LoadAdminBootstrapFromEnv() (AdminBootstrapConfig, error) {
+	cfg := AdminBootstrapConfig{
 		DatabaseURL:  strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		DevToken:     strings.TrimSpace(os.Getenv("PLATFORM_DEV_TOKEN")),
-		Username:     strings.TrimSpace(os.Getenv("PLATFORM_DEV_USERNAME")),
+		AdminToken:     strings.TrimSpace(os.Getenv("PLATFORM_ADMIN_TOKEN")),
+		Username:     strings.TrimSpace(os.Getenv("PLATFORM_ADMIN_USERNAME")),
 		RuntimeRoot:  strings.TrimSpace(os.Getenv("GA_RUNTIME_DIR")),
 		ConfigRoot:   strings.TrimSpace(os.Getenv("GA_CONFIG_ROOT")),
 		LegacyRoot:   strings.TrimSpace(os.Getenv("GA_LEGACY_ROOT")),
@@ -56,31 +56,31 @@ func LoadDevBootstrapFromEnv() (DevBootstrapConfig, error) {
 		WorkerSrc:    strings.TrimSpace(os.Getenv("GA_WORKER_SRC")),
 		ListenAddr:   "127.0.0.1:8080",
 	}
-	if v := strings.TrimSpace(os.Getenv("PLATFORM_DEV_USER_ID")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("PLATFORM_ADMIN_USER_ID")); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || id <= 0 {
-			return DevBootstrapConfig{}, fmt.Errorf("PLATFORM_DEV_USER_ID must be a positive int64")
+			return AdminBootstrapConfig{}, fmt.Errorf("PLATFORM_ADMIN_USER_ID must be a positive int64")
 		}
 		cfg.UserID = id
 	}
 	return cfg, nil
 }
 
-// EnsureDevelopmentContext is the only foundation bootstrap mutation and is gated by Enabled.
-func EnsureDevelopmentContext(ctx context.Context, store *postgres.Store, cfg DevBootstrapConfig) (postgres.DevelopmentContext, error) {
+// EnsureAdminContext is the only foundation bootstrap mutation and is gated by Enabled.
+func EnsureAdminContext(ctx context.Context, store *postgres.Store, cfg AdminBootstrapConfig) (postgres.AdminContext, error) {
 	if !cfg.Enabled {
-		return postgres.DevelopmentContext{}, fmt.Errorf("development bootstrap requires --dev-loopback")
+		return postgres.AdminContext{}, fmt.Errorf("development bootstrap requires --dev-loopback")
 	}
 	if store == nil {
-		return postgres.DevelopmentContext{}, fmt.Errorf("store is nil")
+		return postgres.AdminContext{}, fmt.Errorf("store is nil")
 	}
 	if cfg.UserID <= 0 {
-		return postgres.DevelopmentContext{}, fmt.Errorf("PLATFORM_DEV_USER_ID is required for --dev-loopback")
+		return postgres.AdminContext{}, fmt.Errorf("PLATFORM_ADMIN_USER_ID is required for --dev-loopback")
 	}
-	if strings.TrimSpace(cfg.DevToken) == "" {
-		return postgres.DevelopmentContext{}, fmt.Errorf("PLATFORM_DEV_TOKEN is required for --dev-loopback")
+	if strings.TrimSpace(cfg.AdminToken) == "" {
+		return postgres.AdminContext{}, fmt.Errorf("PLATFORM_ADMIN_TOKEN is required for --dev-loopback")
 	}
-	return store.EnsureDevelopmentContext(ctx, cfg.UserID, cfg.Username)
+	return store.EnsureAdminContext(ctx, cfg.UserID, cfg.Username)
 }
 
 // EnsureDevTeam bootstraps a minimal team workspace for testing. The owner and

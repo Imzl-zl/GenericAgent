@@ -52,7 +52,7 @@ func (s *Server) handleAdminBindSophub(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
 		return
 	}
-	status, err := s.sophub.Bind(r.Context(), body.APIKey, s.devUserID)
+	status, err := s.sophub.Bind(r.Context(), body.APIKey, s.adminUserID)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "SOPHUB_BIND_FAILED", err.Error(), tid)
 		return

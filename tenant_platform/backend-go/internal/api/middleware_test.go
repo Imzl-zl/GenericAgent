@@ -29,7 +29,7 @@ func TestServeUnixContextServesAndCleansUp(t *testing.T) {
 	go func() {
 		done <- ServeUnixContext(ctx, sock, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "ok")
-		}))
+		}), 0)
 	}()
 	// 等待 socket 出现。
 	deadline := time.Now().Add(5 * time.Second)

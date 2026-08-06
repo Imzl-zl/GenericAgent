@@ -173,6 +173,14 @@ class GenericAgent:
                 raw_query = f'Long user prompt saved to {task_file}. Read and execute.'
             rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
             self.history.append(f"[USER]: {rquery}")
+            if self.llmclient is None:
+                # 审查 F4: 无可用模型配置时不得让 runner 线程在任务级 try 外
+                # 访问 None.backend 崩溃——调用方(CLI/前端)会永久等待终态。
+                # 显式发送结构化错误终态, 保持任务语义完整。
+                display_queue.put({'done': '', 'error': 'No LLM backend configured; check mykey.py', 'error_code': 'NO_LLM_CONFIG', 'source': source, 'turn': 0, 'outputs': []})
+                self.task_queue.task_done()
+                self.is_running = False
+                continue
             sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
             if self.peer_hint: sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
             handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
@@ -215,6 +223,19 @@ class GenericAgent:
                     done_item.update({
                         'error': f'agent reached configured turn limit ({curr_turn}) before completing the task',
                         'error_code': 'MAX_TURNS_EXCEEDED',
+                    })
+                elif isinstance(runner_result.get('data'), dict) and runner_result.get('data', {}).get('result') == 'LLM_FAILED':
+                    # 审查 D5: LLM 传输/HTTP/解析故障连续发生(重试耗尽)后
+                    # 结构化标记失败——Worker 据此映射 TASK_FAILED, 而不是把
+                    # 故障文本当作成功结果提交。
+                    # agent_loop 将 should_exit 的 outcome.data 包装为
+                    # {'result':'EXITED','data':...}, LLM_FAILED 嵌套在 data 内;
+                    # data 也可能是任意对象(如正常完成时 do_no_tool 的 response),
+                    # 故必须先用 isinstance 判定再读取(勿改回顶层判定)。
+                    _llm_fail = runner_result.get('data') or {}
+                    done_item.update({
+                        'error': _llm_fail.get('msg') or 'LLM repeatedly failed to produce a valid response',
+                        'error_code': 'LLM_FAILED',
                     })
                 display_queue.put(done_item)
                 self.history = handler.history_info

@@ -438,6 +438,15 @@ func (f *jtiPersistingStore) SubmitTaskWithInboundMessage(ctx context.Context, c
 func (f *jtiPersistingStore) SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error) {
 	panic("unexpected")
 }
+
+
+func (s *jtiPersistingStore) IsApprovedUser(_ context.Context, _ int64) (bool, error) {
+	return true, nil
+}
+func (f *jtiPersistingStore) IsApprovedTeamMember(_ context.Context, _ string, _ int64) (bool, error) {
+	return true, nil
+}
+
 func (f *jtiPersistingStore) GetTask(ctx context.Context, taskID string) (domain.Task, error) {
 	panic("unexpected")
 }

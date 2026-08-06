@@ -14,14 +14,14 @@ import (
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
-	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
 )
 
-// MaxRequestBodyBytes caps JSON bodies on user-facing endpoints to prevent
+// DefaultMaxRequestBodyBytes caps JSON bodies on user-facing endpoints to prevent
 // memory exhaustion from oversized payloads (Slowloris-style).
-const MaxRequestBodyBytes int64 = 1 << 20 // 1 MiB
+// 审查: 部署可经 ServerConfig.MaxBodyBytes / PLATFORM_MAX_BODY_BYTES 覆盖。
+const DefaultMaxRequestBodyBytes int64 = 1 << 20 // 1 MiB
 
 // Server is the loopback HTTP API.
 type Server struct {
@@ -33,21 +33,21 @@ type Server struct {
 	personas                        application.PersonaService
 	router                          application.Router
 	registry                        policy.Registry
-	policies                        PolicyStore
-	bots                            BotStore
-	llmProviders                    LLMProviderStore
-	mcpServers                      MCPServerStore
+	policies                        application.AdminCommandPort
+	runtimeSettings                 application.RuntimeSettingsPort
+	llmProviders                    application.LLMProviderPort
+	mcpServers                      application.MCPServerPort
 	botLifecycle                    application.BotLifecycleService
-	taskStats                       TaskStoreStats
+	taskStats                       application.TaskStatsPort
+	maxBodyBytes                    int64
 	runtimeProfileMu                sync.RWMutex
 	runtimeProfile                  RuntimeProfile
-	runtimeSettings                 RuntimeSettingsStore
 	imAggregationRuntime            IMAggregationRuntime
 	sophub                          application.SophubService
 	sophubProxy                     *WorkerSophubProxy
 	cipher                          secret.TokenCipher
-	devToken                        string
-	devUserID                       int64
+	adminToken                        string
+	adminUserID                       int64
 	sessionKey                      string
 	// webhookSecret is the HMAC-SHA256 key shared with the Bot Poller. When
 	// non-empty, /v1/im/webhook rejects requests whose X-Webhook-Signature
@@ -56,57 +56,10 @@ type Server struct {
 	mux           *http.ServeMux
 }
 
-// PolicyStore is the admin-facing port for command/policy management.
-type PolicyStore interface {
-	ListAllCommands(ctx context.Context) ([]domain.PlatformCommand, error)
-	UpdateCommand(ctx context.Context, id int64, action domain.CommandAction,
-		helpText string, enabled bool, sortOrder int, updatedBy int64) (domain.PlatformCommand, error)
-	ListToolPolicies(ctx context.Context) ([]domain.ToolPolicy, error)
-	CreateToolPolicy(ctx context.Context, version, description string,
-		allowedTools []string, createdBy int64) (domain.ToolPolicy, error)
-	UpdateUserToolPolicy(ctx context.Context, userID int64, version string, updatedBy int64) error
-}
-
-// RuntimeSettingsStore is the admin-facing port for small runtime-tunable
-// platform settings that must take effect without a rebuild.
-type RuntimeSettingsStore interface {
-	GetIMInboundCoalesceWindowMS(ctx context.Context) (int, error)
-	UpdateIMInboundCoalesceWindowMS(ctx context.Context, windowMS int, updatedBy int64) (int, error)
-	GetAgentMaxTurns(ctx context.Context) (int, error)
-	UpdateAgentMaxTurns(ctx context.Context, maxTurns int, updatedBy int64) (int, error)
-}
-
 // IMAggregationRuntime applies persisted aggregation settings to the live bot
 // transport. The Python Poller implements this port.
 type IMAggregationRuntime interface {
 	ConfigureInboundCoalescing(ctx context.Context, windowMS int) error
-}
-
-// BotStore creates and resolves bot records with encrypted tokens.
-type BotStore interface {
-	CreateBot(ctx context.Context, ilinkBotID string, ownerID int64, tokenCiphertext []byte) (domain.Bot, error)
-	GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error)
-	GetBotByIlinkBotID(ctx context.Context, ilinkBotID string) (domain.Bot, error)
-}
-
-// LLMProviderStore is the admin-facing port for configuring upstream LLMs.
-type LLMProviderStore interface {
-	CreateProvider(ctx context.Context, input domain.LLMProviderCreate) (domain.LLMProvider, error)
-	GetProvider(ctx context.Context, id int64) (domain.LLMProvider, error)
-	ListProviders(ctx context.Context) ([]domain.LLMProvider, error)
-	UpdateProvider(ctx context.Context, id int64, input domain.LLMProviderUpdate) (domain.LLMProvider, error)
-	SetProviderState(ctx context.Context, id int64, state domain.LLMProviderState) (domain.LLMProvider, error)
-	SetDefaultProvider(ctx context.Context, id int64) error
-	DeleteProvider(ctx context.Context, id int64) error
-}
-
-// MCPServerStore is the admin-facing port for globally shared MCP servers.
-type MCPServerStore interface {
-	CreateMCPServer(ctx context.Context, input domain.MCPServerCreate) (domain.MCPServer, error)
-	ListMCPServers(ctx context.Context) ([]domain.MCPServer, error)
-	UpdateMCPServer(ctx context.Context, id int64, input domain.MCPServerUpdate) (domain.MCPServer, error)
-	SetMCPServerEnabled(ctx context.Context, id int64, enabled bool) (domain.MCPServer, error)
-	DeleteMCPServer(ctx context.Context, id int64) error
 }
 
 // Cipher is the interface for encrypting/decrypting sensitive data.
@@ -139,13 +92,12 @@ type ServerConfig struct {
 	Personas                        application.PersonaService
 	Router                          application.Router
 	Registry                        policy.Registry
-	Policies                        PolicyStore
-	RuntimeSettings                 RuntimeSettingsStore
-	Bots                            BotStore
-	LLMProviders                    LLMProviderStore
-	MCPServers                      MCPServerStore
+	Policies                        application.AdminCommandPort
+	RuntimeSettings                 application.RuntimeSettingsPort
+	LLMProviders                    application.LLMProviderPort
+	MCPServers                      application.MCPServerPort
 	BotLifecycle                    application.BotLifecycleService
-	TaskStats                       TaskStoreStats
+	TaskStats                       application.TaskStatsPort
 	RuntimeProfile                  RuntimeProfile
 	IMAggregationRuntime            IMAggregationRuntime
 	Sophub                          application.SophubService
@@ -158,12 +110,15 @@ type ServerConfig struct {
 	// /v1/worker/sophub/* 端点。
 	SophubProxy                     *WorkerSophubProxy
 	Cipher                          secret.TokenCipher
-	DevToken                        string
-	DevUserID                       int64
+	AdminToken                        string
+	AdminUserID                       int64
 	SessionKey                      string
 	// WebhookSecret, when set, requires Bot Poller requests to /v1/im/webhook
 	// to carry a valid X-Webhook-Signature header (HMAC-SHA256 over body).
 	WebhookSecret string
+	// MaxBodyBytes caps request bodies on user-facing endpoints; 0 uses
+	// DefaultMaxRequestBodyBytes (1 MiB).
+	MaxBodyBytes int64
 }
 
 // NewServer constructs handlers. Bind address enforcement is the caller's responsibility (127.0.0.1).
@@ -171,14 +126,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Service == nil || cfg.Registry == nil {
 		return nil, fmt.Errorf("service and registry required")
 	}
-	if strings.TrimSpace(cfg.DevToken) == "" {
-		return nil, fmt.Errorf("dev token required")
+	if strings.TrimSpace(cfg.AdminToken) == "" {
+		return nil, fmt.Errorf("admin token required")
 	}
-	if cfg.DevUserID <= 0 {
+	if cfg.AdminUserID <= 0 {
 		return nil, fmt.Errorf("dev user id required")
 	}
 	if strings.TrimSpace(cfg.SessionKey) == "" {
-		cfg.SessionKey = fmt.Sprintf("personal:%d", cfg.DevUserID)
+		cfg.SessionKey = fmt.Sprintf("personal:%d", cfg.AdminUserID)
 	}
 	// Worker Sophub proxy: 提供 SophubService + capability 校验器时自动接线。
 	if cfg.Sophub != nil && cfg.SophubValidator != nil && cfg.SophubProxy == nil {
@@ -204,7 +159,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		registry:                        cfg.Registry,
 		policies:                        cfg.Policies,
 		runtimeSettings:                 cfg.RuntimeSettings,
-		bots:                            cfg.Bots,
 		llmProviders:                    cfg.LLMProviders,
 		mcpServers:                      cfg.MCPServers,
 		botLifecycle:                    cfg.BotLifecycle,
@@ -214,17 +168,18 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		sophub:                          cfg.Sophub,
 		sophubProxy:                     cfg.SophubProxy,
 		cipher:                          cfg.Cipher,
-		devToken:                        cfg.DevToken,
-		devUserID:                       cfg.DevUserID,
+		adminToken:                        cfg.AdminToken,
+		adminUserID:                       cfg.AdminUserID,
 		sessionKey:                      cfg.SessionKey,
 		webhookSecret:                   cfg.WebhookSecret,
+		maxBodyBytes:                    cfg.MaxBodyBytes,
 		mux:                             http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
-	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.auth(s.handleCreateTask))
-	s.mux.HandleFunc("GET /v1/tasks/{task_id}", s.auth(s.handleGetTask))
-	s.mux.HandleFunc("GET /v1/tasks/{task_id}/result", s.auth(s.handleGetResult))
-	s.mux.HandleFunc("POST /v1/tasks/{task_id}/cancel", s.auth(s.handleCancel))
+	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.userAuth(s.handleCreateTask))
+	s.mux.HandleFunc("GET /v1/tasks/{task_id}", s.userAuth(s.handleGetTask))
+	s.mux.HandleFunc("GET /v1/tasks/{task_id}/result", s.userAuth(s.handleGetResult))
+	s.mux.HandleFunc("POST /v1/tasks/{task_id}/cancel", s.userAuth(s.handleCancel))
 	s.registerLifecycleRoutes()
 	return s, nil
 }
@@ -257,7 +212,11 @@ func (s *Server) ListenAndServe(addr string) error {
 	if ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("platform API must bind loopback, got %s", addr)
 	}
-	return http.ListenAndServe(addr, s.mux)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return serveListener(context.Background(), ln, s.mux, s.maxBodyBytes)
 }
 
 // writeJSON encodes v as JSON and writes it with the given status.

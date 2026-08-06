@@ -68,7 +68,7 @@ def test_one_env_template_contains_every_compose_value() -> None:
         "BOT_TOKEN_KEY",
         "BOT_POLLER_API_SECRET",
         "PLATFORM_WEBHOOK_SECRET",
-        "PLATFORM_DEV_TOKEN",
+        "PLATFORM_ADMIN_TOKEN",
         "LLM_PROXY_CAPABILITY_SIGNING_KEY",
         "GA_WORKER_EXECUTION_MODE",
         "GA_RUNNER_IMAGE",

@@ -40,8 +40,7 @@ export function RegisterPage() {
 
     try {
       const res = await register(username.trim(), password, inviteCode.trim());
-      localStorage.setItem('ga_user_id', String(res.user_id));
-      login(res.username, res.token, false);
+      login(res.username, res.token, false, { userId: res.user_id, status: res.status });
       navigate('/app', { replace: true });
     } catch (err) {
       if (err instanceof ApiClientError) {

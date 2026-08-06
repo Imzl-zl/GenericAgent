@@ -25,18 +25,17 @@ BACKEND_GO = REPO_ROOT / "tenant_platform" / "backend-go"
 WORKER_SRC = REPO_ROOT / "tenant_platform" / "worker-python" / "src"
 REQUIRED_ENV = (
     "TEST_DATABASE_URL",
-    "PLATFORM_DEV_USER_ID",
+    "PLATFORM_ADMIN_USER_ID",
     "GA_LEGACY_ROOT",
     "GA_POLICY_FILE",
 )
-DEV_TOKEN = "foundation-smoke-dev-token-not-real"
+ADMIN_TOKEN = "foundation-smoke-admin-token-not-real"
 OAI_TOKEN = "foundation-smoke-oai-token-not-real"
 # The fixture key is submitted through the Admin Provider API. The Worker only
 # receives a short-lived capability token; the signing key authenticates it to
 # the Proxy (>= 32 bytes per llmproxy.MinSigningKeyLen).
 CAPABILITY_SIGNING_KEY = "foundation-smoke-signing-key-not-real"
 BOT_TOKEN_KEY = "0" * 64
-POLICY_VERSION = "foundation.no-host-tools.v1"
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 CHILD_ENV_ALLOWLIST = frozenset(
     {
@@ -313,11 +312,11 @@ def _required_environment() -> dict[str, str]:
             "missing required environment variable(s): " + ", ".join(missing)
         )
     try:
-        user_id = int(values["PLATFORM_DEV_USER_ID"])
+        user_id = int(values["PLATFORM_ADMIN_USER_ID"])
     except ValueError as exc:
-        raise SmokeError("PLATFORM_DEV_USER_ID must be a positive integer") from exc
-    _require(user_id > 0, "PLATFORM_DEV_USER_ID must be a positive integer")
-    values["PLATFORM_DEV_USER_ID"] = str(user_id)
+        raise SmokeError("PLATFORM_ADMIN_USER_ID must be a positive integer") from exc
+    _require(user_id > 0, "PLATFORM_ADMIN_USER_ID must be a positive integer")
+    values["PLATFORM_ADMIN_USER_ID"] = str(user_id)
     return values
 
 
@@ -371,7 +370,7 @@ def _platform_request(
         method,
         base + path,
         body,
-        headers={"X-Platform-Dev-Token": DEV_TOKEN},
+        headers={"X-Platform-Admin-Token": ADMIN_TOKEN},
     )
 
 
@@ -436,9 +435,9 @@ def _child_environment(
     env.update(
         {
             "DATABASE_URL": values["TEST_DATABASE_URL"],
-            "PLATFORM_DEV_USER_ID": values["PLATFORM_DEV_USER_ID"],
-            "PLATFORM_DEV_USERNAME": f"foundation-smoke-{values['PLATFORM_DEV_USER_ID']}",
-            "PLATFORM_DEV_TOKEN": DEV_TOKEN,
+            "PLATFORM_ADMIN_USER_ID": values["PLATFORM_ADMIN_USER_ID"],
+            "PLATFORM_ADMIN_USERNAME": f"foundation-smoke-{values['PLATFORM_ADMIN_USER_ID']}",
+            "PLATFORM_ADMIN_TOKEN": ADMIN_TOKEN,
             "GA_CONFIG_ROOT": str(config_root),
             "GA_RUNTIME_DIR": str(runtime_root),
             "GA_LEGACY_ROOT": str(legacy_root),
@@ -804,7 +803,6 @@ def _submit_deduped_success(
         "prompt": "Produce the deterministic foundation smoke response.",
         "source": "web",
         "persona_snapshot": ["Use the deterministic local fixture response."],
-        "tool_policy_version": POLICY_VERSION,
     }
     started = time.monotonic()
     submitted = _submit(base, session, payload)
@@ -837,7 +835,6 @@ def _cancel_queued_task(base: str, session: str, unique: str) -> dict[str, Any]:
             "prompt": "This queued task must be cancelled before Worker dispatch.",
             "source": "web",
             "persona_snapshot": ["Cancellation smoke task."],
-            "tool_policy_version": POLICY_VERSION,
         },
     )
     code, response = _platform_request(
@@ -988,7 +985,7 @@ def _exercise(
     proc, base, runtime_root = _launch_stack(
         values, legacy_root, policy_file, tmp, fixture, state
     )
-    session = f"personal:{values['PLATFORM_DEV_USER_ID']}"
+    session = f"personal:{values['PLATFORM_ADMIN_USER_ID']}"
     unique = uuid.uuid4().hex
     success = _submit_deduped_success(base, session, unique, fixture)
     cancelled = _cancel_queued_task(base, session, unique)

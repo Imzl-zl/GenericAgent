@@ -26,14 +26,6 @@ export interface InviteCode {
   created_at: string;
 }
 
-export interface BindingCode {
-  code: string;
-  binding_id: number;
-  user_id: number;
-  state: string;
-  expires_at: string;
-}
-
 export interface WechatQRCode {
   qrcode_token: string;
   qrcode_url: string;

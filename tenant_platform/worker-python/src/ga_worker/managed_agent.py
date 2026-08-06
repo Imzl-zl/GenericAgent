@@ -10,7 +10,6 @@ Public API only; internals split into:
 
 from __future__ import annotations
 
-import os
 import threading
 import uuid
 from pathlib import Path
@@ -18,7 +17,6 @@ from typing import Any, Iterator
 
 from genericagent.worker.v1 import worker_pb2
 
-from ga_worker.credential_config import CredentialConfigError, load_runtime_metadata
 from ga_worker.limits import CapabilityRegistry
 from ga_worker.session_lifecycle import SessionLifecycleMixin
 from ga_worker.state import (
@@ -66,7 +64,6 @@ class ManagedAgentAdapter(SessionLifecycleMixin, TaskOpsMixin):
         self._lock = threading.Lock()
         self._session: SessionState | None = None
         self._pending: PendingTask | None = None
-        self._event_queues: dict[str, Any] = {}
         self._test_pre_dispatch_barrier: tuple[threading.Event, threading.Event] | None = None
         self._legacy_mods: dict[str, Any] | None = None
 

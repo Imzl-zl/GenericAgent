@@ -186,6 +186,11 @@ func (s *inviteService) Login(ctx context.Context, username, password string) (d
 	if err := CheckPassword(password, user.PasswordHash); err != nil {
 		return domain.User{}, "", fmt.Errorf("invalid username or password")
 	}
+	// 审查 D3(用户生命周期): blocked 用户不得登录。封禁在 BlockUser 中
+	// 已撤销全部会话, 此处拒绝再次登录, 防止封禁被登录绕过。
+	if user.Status == domain.UserBlocked {
+		return domain.User{}, "", fmt.Errorf("account is blocked")
+	}
 	now := time.Now().UTC()
 	token, err := createSessionToken()
 	if err != nil {
@@ -204,6 +209,16 @@ func (s *inviteService) ValidateSession(ctx context.Context, token string) (int6
 	sess, err := s.store.GetUserSession(ctx, hashToken(token))
 	if err != nil {
 		return 0, fmt.Errorf("invalid or expired session")
+	}
+	// 审查 D3(用户生命周期): 会话存在不等于用户可用——blocked 用户
+	// 的旧会话(封禁前签发、封禁后未被清理的极端情况)以及已变更状态
+	// 的用户必须在鉴权时拒绝。
+	_, _, status, err := s.users.GetUserByID(ctx, sess.UserID)
+	if err != nil {
+		return 0, fmt.Errorf("invalid session user")
+	}
+	if status == domain.UserBlocked {
+		return 0, fmt.Errorf("account is blocked")
 	}
 	return sess.UserID, nil
 }

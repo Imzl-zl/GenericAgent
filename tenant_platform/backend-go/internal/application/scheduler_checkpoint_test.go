@@ -41,6 +41,15 @@ func (s *commitFailureStore) CompleteSucceeded(ctx context.Context, taskID, plat
 	return domain.Task{}, s.completeErr
 }
 
+
+
+func (s *commitFailureStore) IsApprovedUser(_ context.Context, _ int64) (bool, error) {
+	return true, nil
+}
+func (f *commitFailureStore) IsApprovedTeamMember(_ context.Context, _ string, _ int64) (bool, error) {
+	return true, nil
+}
+
 func (s *commitFailureStore) GetTask(ctx context.Context, taskID string) (domain.Task, error) {
 	if s.getTaskErr != nil {
 		return domain.Task{}, s.getTaskErr

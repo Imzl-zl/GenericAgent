@@ -66,15 +66,14 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("POST /v1/admin/me/default-persona", s.auth(s.handleAdminSetDefaultPersona))
 	}
 	if s.router != nil {
+		// 审查 I-4: /v1/router/messages 是 bot 集成服务间入口(无浏览器会话),
+		// 保留 Admin token 凭证; 用户任务端点已全部迁移到 userAuth(Bearer)。
 		s.mux.HandleFunc("POST /v1/router/messages", s.auth(s.handleRouterMessage))
 		s.mux.HandleFunc("POST /v1/im/webhook", s.handleIMWebhook)
 	}
 	if s.policies != nil {
 		s.mux.HandleFunc("GET /v1/admin/commands", s.auth(s.handleListCommands))
 		s.mux.HandleFunc("PUT /v1/admin/commands/{command_id}", s.auth(s.handleUpdateCommand))
-		s.mux.HandleFunc("GET /v1/admin/tool-policies", s.auth(s.handleListToolPolicies))
-		s.mux.HandleFunc("POST /v1/admin/tool-policies", s.auth(s.handleCreateToolPolicy))
-		s.mux.HandleFunc("PUT /v1/admin/users/{user_id}/tool-policy", s.auth(s.handleUpdateUserToolPolicy))
 	}
 	if s.runtimeSettings != nil {
 		s.mux.HandleFunc("GET /v1/admin/settings/im-aggregation", s.auth(s.handleGetIMAggregationSettings))
@@ -124,7 +123,6 @@ type dashboardStatsResponse struct {
 	PendingUsers   int            `json:"pending_users"`
 	ApprovedUsers  int            `json:"approved_users"`
 	RunningTasks   int            `json:"running_tasks"`
-	ActiveWorkers  int            `json:"active_workers"`
 	RuntimeProfile RuntimeProfile `json:"runtime_profile"`
 }
 
@@ -147,10 +145,6 @@ func (s *Server) handleAdminDashboardStats(w http.ResponseWriter, r *http.Reques
 			stats.RunningTasks = running
 		}
 	}
-
-	// TODO: 活跃 Worker 数统计（需要实现 Worker 心跳机制）
-	// 目前暂时返回 0
-	stats.ActiveWorkers = 0
 
 	writeJSON(w, http.StatusOK, stats)
 }

@@ -37,8 +37,6 @@ func (s *Store) AcquireRunnerLease(ctx context.Context, runnerKey, owner string,
 	if leaseTTL <= 0 {
 		return domain.RunnerLease{}, false, fmt.Errorf("lease ttl must be positive")
 	}
-	expiresAt := time.Now().UTC().Add(leaseTTL)
-
 	var lease domain.RunnerLease
 	created := true
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
@@ -58,7 +56,13 @@ FROM runner_leases WHERE runner_key = $1
 		}
 
 		if rowErr == nil {
-			if current.IsExpired(time.Now().UTC()) {
+			// 审查 F3: 过期判定使用 DB 时钟(SQL 内比较), 不信任主机时钟——
+			// 主机时钟偏差可导致提前接管/延后回收活 lease。
+			var expired bool
+			if err := tx.QueryRow(ctx, `SELECT expires_at <= timezone('utc', now()) FROM runner_leases WHERE runner_key = $1`, runnerKey).Scan(&expired); err != nil {
+				return err
+			}
+			if expired {
 				if maxActive > 0 {
 					active, err := s.countActiveRunnerLeases(ctx, tx)
 					if err != nil {
@@ -70,7 +74,7 @@ FROM runner_leases WHERE runner_key = $1
 				}
 				// 过期或已释放:以新 owner 接管,generation 单调 +1,清空容器与端点。
 				created = true
-				taken, takeErr := s.takeoverRunnerLease(ctx, tx, runnerKey, owner, expiresAt)
+				taken, takeErr := s.takeoverRunnerLease(ctx, tx, runnerKey, owner, leaseTTL.Seconds())
 				if takeErr != nil {
 					return takeErr
 				}
@@ -89,7 +93,7 @@ FROM runner_leases WHERE runner_key = $1
 					return fmt.Errorf("%w: %s", ErrRunnerLeaseOwned, current.Owner)
 				}
 				created = true
-				taken, takeErr := s.takeoverRunnerLease(ctx, tx, runnerKey, owner, expiresAt)
+				taken, takeErr := s.takeoverRunnerLease(ctx, tx, runnerKey, owner, leaseTTL.Seconds())
 				if takeErr != nil {
 					return takeErr
 				}
@@ -100,10 +104,10 @@ FROM runner_leases WHERE runner_key = $1
 			created = false
 			return scanRunnerLease(tx.QueryRow(ctx, `
 UPDATE runner_leases
-SET expires_at = $2, updated_at = timezone('utc', now())
+SET expires_at = timezone('utc', now()) + make_interval(secs => $2), updated_at = timezone('utc', now())
 WHERE runner_key = $1
 RETURNING runner_key, owner, generation, container_id, stale_container_id, control_endpoint, status, expires_at, created_at, updated_at
-`, runnerKey, expiresAt), &lease)
+`, runnerKey, leaseTTL.Seconds()), &lease)
 		}
 
 		if maxActive > 0 {
@@ -117,9 +121,9 @@ RETURNING runner_key, owner, generation, container_id, stale_container_id, contr
 		}
 		return scanRunnerLease(tx.QueryRow(ctx, `
 INSERT INTO runner_leases (runner_key, owner, generation, status, expires_at)
-VALUES ($1, $2, 1, 'active', $3)
+VALUES ($1, $2, 1, 'active', timezone('utc', now()) + make_interval(secs => $3))
 RETURNING runner_key, owner, generation, container_id, stale_container_id, control_endpoint, status, expires_at, created_at, updated_at
-`, runnerKey, owner, expiresAt), &lease)
+`, runnerKey, owner, leaseTTL.Seconds()), &lease)
 	})
 	if err != nil {
 		return domain.RunnerLease{}, false, err
@@ -131,17 +135,18 @@ RETURNING runner_key, owner, generation, container_id, stale_container_id, contr
 // 移入 stale_container_id 供定向清理)并返回接管后的完整 lease 行。
 // 过期接管与异主陈旧接管共用; 返回值必须回传给调用方, 否则调用方拿到
 // 的是零值 lease(generation=0), 后续签发/续租会丢失 generation 绑定。
-func (s *Store) takeoverRunnerLease(ctx context.Context, tx pgx.Tx, runnerKey, owner string, expiresAt time.Time) (domain.RunnerLease, error) {
+func (s *Store) takeoverRunnerLease(ctx context.Context, tx pgx.Tx, runnerKey, owner string, ttlSeconds float64) (domain.RunnerLease, error) {
 	var lease domain.RunnerLease
 	err := scanRunnerLease(tx.QueryRow(ctx, `
 UPDATE runner_leases
 SET owner = $2, generation = generation + 1, container_id = '',
     stale_container_id = CASE WHEN container_id <> '' THEN container_id ELSE stale_container_id END,
     control_endpoint = '',
-    status = 'active', expires_at = $3, updated_at = timezone('utc', now())
+    status = 'active', expires_at = timezone('utc', now()) + make_interval(secs => $3),
+    updated_at = timezone('utc', now())
 WHERE runner_key = $1
 RETURNING runner_key, owner, generation, container_id, stale_container_id, control_endpoint, status, expires_at, created_at, updated_at
-`, runnerKey, owner, expiresAt), &lease)
+`, runnerKey, owner, ttlSeconds), &lease)
 	return lease, err
 }
 
@@ -176,12 +181,13 @@ SELECT count(*) FROM runner_leases WHERE expires_at > timezone('utc', now())
 }
 
 // CountActiveRunnerLeases returns the number of non-expired Runner leases
-// (scheduler capacity check for GA_RUNNER_MAX_ACTIVE).
-func (s *Store) CountActiveRunnerLeases(ctx context.Context, now time.Time) (int64, error) {
+// (scheduler capacity check for GA_RUNNER_MAX_ACTIVE). 审查 F3: 过期判定
+// 使用 DB 时钟, 不信任主机时钟。
+func (s *Store) CountActiveRunnerLeases(ctx context.Context) (int64, error) {
 	var count int64
 	if err := s.pool.QueryRow(ctx, `
-SELECT count(*) FROM runner_leases WHERE expires_at > $1
-`, now.UTC()).Scan(&count); err != nil {
+SELECT count(*) FROM runner_leases WHERE expires_at > timezone('utc', now())
+`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count active runner leases: %w", err)
 	}
 	return count, nil
@@ -197,11 +203,12 @@ func (s *Store) RenewRunnerLease(ctx context.Context, runnerKey, owner string, g
 	if generation == 0 {
 		return fmt.Errorf("runner generation must be positive")
 	}
-	expiresAt := time.Now().UTC().Add(leaseTTL)
 	tag, err := s.pool.Exec(ctx, `
-UPDATE runner_leases SET expires_at = $4, updated_at = timezone('utc', now())
+UPDATE runner_leases
+SET expires_at = timezone('utc', now()) + make_interval(secs => $4),
+    updated_at = timezone('utc', now())
 WHERE runner_key = $1 AND owner = $2 AND generation = $3 AND expires_at > timezone('utc', now())
-`, runnerKey, owner, generation, expiresAt)
+`, runnerKey, owner, generation, leaseTTL.Seconds())
 	if err != nil {
 		return err
 	}
@@ -324,13 +331,15 @@ FROM runner_leases WHERE runner_key = $1
 	return lease, err
 }
 
-// ListExpiredRunnerLeases returns leases past the given time (orphan cleanup).
-func (s *Store) ListExpiredRunnerLeases(ctx context.Context, now time.Time) ([]domain.RunnerLease, error) {
+// ListExpiredRunnerLeases returns leases past the DB clock (orphan cleanup).
+// 审查 F3: 过期判定使用 DB 时钟(now() 与 expires_at 同一时间源), 不信任
+// 主机时钟——主机时钟偏差可导致活 lease 被提前销毁。
+func (s *Store) ListExpiredRunnerLeases(ctx context.Context) ([]domain.RunnerLease, error) {
 	rows, err := s.pool.Query(ctx, `
 SELECT runner_key, owner, generation, container_id, stale_container_id, control_endpoint, status, expires_at, created_at, updated_at
-FROM runner_leases WHERE expires_at <= $1
+FROM runner_leases WHERE expires_at <= timezone('utc', now())
 ORDER BY expires_at
-`, now.UTC())
+`)
 	if err != nil {
 		return nil, err
 	}

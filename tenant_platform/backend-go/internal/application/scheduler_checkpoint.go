@@ -119,6 +119,11 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		_ = s.KickSession(ctx, task.SessionKey)
 		return err
 	}
+	// 审查 D2: 成功事务提交(释放串行槽)到 Worker 销毁之间存在窗口——
+	// 同 session 下一任务可能被 claim 并复用同 generation 容器, 随后本
+	// entry 的 cleanup 会销毁该容器杀死新任务。提交前标记 session
+	// draining, tick 跳过该 session 的 claim; 销毁完成后清除。
+	s.sessionDraining.Store(task.SessionKey, struct{}{})
 	committedTask, err := s.cfg.Store.CompleteSucceeded(ctx, task.ID, s.cfg.PlatformInstanceID,
 		committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, resultBytes, deliveryFiles)
 	if err != nil {
@@ -130,6 +135,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		if getErr == nil && latest.Status.IsTerminal() {
 			// 事务实际已提交: committed/result 文件是恢复点, 不得删除。
 			s.destroyTaskWorkerLocked(task.SessionKey, entry)
+			s.sessionDraining.Delete(task.SessionKey)
 			_ = s.KickSession(ctx, task.SessionKey)
 			return nil
 		}
@@ -151,6 +157,7 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 				"task_id", task.ID, "snapshot_id", committed.SnapshotID, "error", err)
 		}
 		s.destroyTaskWorkerLocked(task.SessionKey, entry)
+		s.sessionDraining.Delete(task.SessionKey)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,
 			"CHECKPOINT_COMMIT_FAILED", err.Error(), "")
 		_ = s.KickSession(ctx, task.SessionKey)
@@ -162,12 +169,14 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 	// 原子提交, 取消路径不得复用 Worker)。
 	if committedTask.Status != domain.TaskSucceeded {
 		s.destroyTaskWorkerLocked(task.SessionKey, entry)
+		s.sessionDraining.Delete(task.SessionKey)
 		_ = s.KickSession(ctx, task.SessionKey)
 		return nil
 	}
 	// 决策 D2.1: 任务终态即销毁 Worker——成功任务同样不保留进程, 下一
 	// 任务从 checkpoint 冷启动全新 Worker。
 	s.destroyTaskWorkerLocked(task.SessionKey, entry)
+	s.sessionDraining.Delete(task.SessionKey)
 	_ = s.KickSession(ctx, task.SessionKey)
 	return nil
 }

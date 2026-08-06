@@ -222,6 +222,14 @@ class MCPHTTPClient:
             raise
         outcomes: queue.Queue[tuple[dict[str, Any] | None, Exception | None]] = queue.Queue(maxsize=1)
 
+        def _deliver(result=None, error=None):
+            # 审查: 主线程可能已因 deadline 超时离开——maxsize=1 的 put 在满时
+            # 永久阻塞会泄漏 daemon 线程; put_nowait 在满时立即丢弃, 线程退出。
+            try:
+                outcomes.put_nowait((result, error))
+            except queue.Full:
+                pass
+
         def perform() -> None:
             try:
                 result = self._perform_http_request(
@@ -232,9 +240,9 @@ class MCPHTTPClient:
                     notification=notification,
                     deadline=active_deadline,
                 )
-                outcomes.put((result, None))
+                _deliver(result=result)
             except Exception as exc:
-                outcomes.put((None, exc))
+                _deliver(error=exc)
 
         request_thread = threading.Thread(
             target=perform,

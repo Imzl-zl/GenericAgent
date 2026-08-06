@@ -45,7 +45,7 @@ def test_child_environment_uses_allowlist_and_drops_parent_secrets(
         monkeypatch.setenv(name, value)
     values = {
         "TEST_DATABASE_URL": "postgresql://test.invalid/db",
-        "PLATFORM_DEV_USER_ID": "7",
+        "PLATFORM_ADMIN_USER_ID": "7",
         "LLM_PROXY_CAPABILITY_SIGNING_KEY": "signing-key-sentinel",
         "LLM_PROXY_ALLOWED_UPSTREAM_CIDRS": "127.0.0.0/8",
         "LLM_PROXY_ALLOW_HTTP_HOSTS": "127.0.0.1:1",
@@ -62,10 +62,10 @@ def test_child_environment_uses_allowlist_and_drops_parent_secrets(
     assert not set(sentinels.values()) & set(env.values())
     explicit = {
         "DATABASE_URL",
-        "PLATFORM_DEV_USER_ID",
+        "PLATFORM_ADMIN_USER_ID",
         "BOT_TOKEN_KEY",
-        "PLATFORM_DEV_USERNAME",
-        "PLATFORM_DEV_TOKEN",
+        "PLATFORM_ADMIN_USERNAME",
+        "PLATFORM_ADMIN_TOKEN",
         "GA_CONFIG_ROOT",
         "GA_RUNTIME_DIR",
         "GA_LEGACY_ROOT",

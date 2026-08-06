@@ -1,0 +1,65 @@
+# GenericAgent Tools
+
+## Concepts
+
+- 本文件记录项目协作知识，不替代正式设计文档或当前代码。
+- 真值优先级：`tenant_platform/contracts/`（proto/openapi/policy）与 `tenant_platform/docs/` > 当前代码 > README/docs 安装文档 > 协作文件。
+- 主链路：根项目 = `agent_loop.py`（核心循环）→ 9 原子工具 → `memory/` 分层记忆；租户平台 = backend-go ⇄ worker-python（proto 契约），web 经 openapi。
+
+## Read First
+
+- `README.md`（双语文档，含架构/快速开始/评测）
+- `docs/GETTING_STARTED.md`（新手上手）、`docs/installation*.md`、`docs/SETUP_FEISHU.md`
+- `tenant_platform/docs/`：`GA_SANDBOX_RUNNER_REFACTOR.zh-CN.md`、`LLM_PROVIDER_ARCHITECTURE.md`、`IMPLEMENTATION_SUMMARY.md`、`bot-poller-auth.md`
+- `.tasks/<epic>/PROGRESS.md` + `SUBTASKS.csv`（进行中 epic 的进度真值）
+
+## Tools
+
+标准验证命令（与 `.github/workflows/ci.yml` 对齐）：
+- Go（`tenant_platform/backend-go`）：`go vet ./...`；`go build ./...`；`go test -p 1 -count=1 -timeout 300s ./...`；race：`go test -race -p 1 -count=1 -timeout 600s ./internal/application/... ./internal/infrastructure/worker/... ./internal/infrastructure/sandbox/... ./internal/infrastructure/checkpoint/... ./internal/infrastructure/postgres/...`
+- Python：根 `python -m pytest tests -q`；平台 `python -m pytest tenant_platform/tests/contract tenant_platform/tests/security tenant_platform/tests/smoke -q`、`python -m pytest tenant_platform/tests/integration -q`、`python -m pytest tenant_platform/bot_poller -q`；worker（`tenant_platform/worker-python`）`pip install -e '.[test]'` 后 `python -m pytest -q`
+- Web（`tenant_platform/web`）：`npm ci`；`npm run lint`；`npm run build`；本地 `npm run dev`
+
+定向验证：
+- 集成测试前先设 `TEST_DATABASE_URL`（真实 PostgreSQL）；缺失时集成测试显式失败
+- 契约绑定测试：`tenant_platform/tests/contract`（import worker-python 生成代码，需 protobuf/grpcio）
+- 安全测试：`tenant_platform/tests/security`（子进程调用 go test 验证 Worker 无真实密钥）
+- 本地安装根包：`pip install -e .`（按需 `pip install -e '.[ui]'` 或 `.[all-frontends]`）
+
+关键入口：
+- CLI：`ga`（`ga_cli.cli:main`）；主程序 `agentmain.py`；核心循环 `agent_loop.py`；LLM 核心 `llmcore.py`；密钥 `mykey.py`
+- 前端：`frontends/tui_v3.py`（推荐 TUI）、`frontends/stapp.py`（Streamlit）、`frontends/desktop/`
+- 平台：`tenant_platform/backend-go/cmd/`；`tenant_platform/worker-python/src/`；`tenant_platform/web`
+
+关键目录：
+- 配置：`tenant_platform/config/`、`tenant_platform/infra/`（compose）
+- 契约：`tenant_platform/contracts/{proto,openapi,policy}`
+- 应用运行时记忆：`memory/`（L0-L4 + SOP，.gitignore 逐文件白名单；勿与协作 `memory.md` 混淆）
+- 任务追踪：`.tasks/<epic>/`（PROGRESS.md + SUBTASKS.csv）
+
+## Patterns
+
+- 生命周期不变量结构强制：scheduler 按 dispatch/checkpoint/reaper/worker/terminate 拆分文件，不变量由结构保证，不靠分支绕过（Round13 确立）。
+- 契约先行：改 proto/openapi → 生成 Go `gen` + worker-python 代码 → 跑契约绑定测试，再实现业务。
+- 共享 PostgreSQL 测试实例：Go 包间 `-p 1` 串行，避免 truncate 互踩。
+- CI 门禁：分支/PR 级矩阵（Go/Python/Web）先于合并；集成测试需真实 Postgres service。
+- 沙箱实证：真实 Docker 行为（如 volume-subpath inspect 格式）以集成测试实证为准，不凭文档假设。
+
+## Pitfalls
+
+- Python 3.14 与 pywebview 等依赖不兼容；推荐 3.11/3.12（CI 用 3.11）。
+- `TEST_DATABASE_URL` 缺失时集成测试显式失败；本地先起 Postgres 并设环境变量。
+- 两包并行跑共享测试库有既有 flaky（死锁/唯一键冲突），用 `go test -p 1` 规避，不要当代码 bug 修。
+- runsc 运行时、mTLS 证书注入、六服务 compose 冒烟、共享卷跨 UID 读写只能在真实 Linux 主机验证（方案 §10 声明），CI/Windows 本地不可覆盖。
+- `memory/` 下新增需入库文件必须补 `.gitignore` 白名单（`!memory/...`），否则被 `memory/*` 吞掉。
+- worker-python 测试前必须 `pip install -e '.[test]'`（pythonpath 指向 `src`，缺 python-docx 时 docx 相关测试会失败）。
+- 平台产物（platform.exe 等）是构建产物，不要提交改动；契约/策略变更要同步 `contracts/` 与各端实现。
+
+## 2026-08-06 补充坑点
+
+- `postgres.OpenTestPool(t)` 持有全局 `testDBMu`（t.Cleanup 释放）——同一测试内二次调用必然死锁；测试直插数据用 `pgx.Connect(TEST_DATABASE_URL)` 单连接。
+- `contracts/openapi/platform.yaml` 严禁 `yaml.safe_dump` 整体重写（丢中文注释 + 破坏 test_contract_sources 的文本断言）；补路径用文本插入（`insert_security`/追加 blocks），改完跑 `python -c "import yaml; yaml.safe_load(...)"` 验证。
+- 契约测试 `test_route_contract.py`：KNOWN_SPEC_GAPS 已清空，新增后端路由必须同步 OpenAPI spec，否则测试失败。
+- 改名全链路清单（DevToken→AdminToken 类）：Go 标识符 → env 变量 → HTTP header → OpenAPI scheme → web client → 测试常量 → compose/.env 模板 → 部署文档；`--dev-loopback` flag 与 DB `bootstrap_marker` 存量值是部署形态标记，不在改名范围。
+- 集成测试 seed 用户会话：`token_hash = base64.urlsafe_b64encode(sha256(token).digest()).rstrip(b"=").decode()`（与 Go `hashToken` 一致）。
+- 用户侧任务能力链路：注册(pending) → 管理员批准(approved) → 提交任务；pending 用户提交会被 service 门禁拒绝。

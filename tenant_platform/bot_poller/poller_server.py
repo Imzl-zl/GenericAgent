@@ -49,6 +49,28 @@ from wxbot_media import download_media  # noqa: E402
 
 POLL_TIMEOUT = 30
 WEBHOOK_TIMEOUT = 10
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"WARNING: {name}={raw!r} is not an integer; using default {default}", flush=True)
+        return default
+
+
+# 控制面 HTTP 请求体上限(审查: 此前无限流, 与 Go 侧 bodyLimitMiddleware 不对称)。
+# 默认 1 MiB 与 Go 侧 DefaultMaxRequestBodyBytes 一致; 控制面只传 JSON
+# (bot_token/webhook_url/file_path 路径字符串), 不传文件内容本身——部署可按需
+# 经 BOT_POLLER_MAX_BODY_BYTES 调大(与 PLATFORM_MAX_BODY_BYTES 对齐)。
+MAX_BODY_BYTES = _env_int("BOT_POLLER_MAX_BODY_BYTES", 1024 * 1024)
+# ThreadingHTTPServer 每连接一线程且默认无 socket 超时——慢速/死连接会无限占线
+# 程。设置读超时让空闲连接被回收(审查 I-1)。
+HTTP_READ_TIMEOUT = 30.0
+HTTP_REQUEST_QUEUE_SIZE = 64
 # Webhook delivery retry: exponential backoff base/cap. Retrying blocks the
 # bot's dispatch loop on purpose — that is the backpressure that stops the
 # cursor from advancing past an undelivered message (same model as a Kafka
@@ -281,7 +303,6 @@ class BotEntry:
         self.bot_uuid = bot_uuid
         self.stop_event = threading.Event()
         self.thread = None
-        self.auth_expired = False
         self.committed_updates_buf = getattr(client, 'updates_buf', '') or ''
         self.webhook_idle = threading.Event()
         self.webhook_idle.set()
@@ -347,8 +368,8 @@ class BotManager:
         """Long-poll loop for one bot. Exits on stop_event or AuthExpired."""
         # Bounded FIFO dedup window, local to this bot's thread (no sharing).
         # The old implementation trimmed with `seen = set(list(seen)[-2000:])`
-        # inside _dispatch, which only rebound the local parameter — the
-        # caller's set was never trimmed, so memory grew without bound.
+        # which only rebound the local parameter — the caller's set was never
+        # trimmed, so memory grew without bound.
         # set gives O(1) lookup; deque(maxlen) evicts oldest ids in FIFO order.
         # The platform's (bot_id, message_id) idempotency key remains the
         # final defense; this window only avoids redundant webhook POSTs.
@@ -365,7 +386,6 @@ class BotManager:
                 )
                 self._dispatch_batch(entry, messages, seen)
             except AuthExpired:
-                entry.auth_expired = True
                 self._notify_expired(entry)
                 break
             except Exception as exc:  # network jitter: back off and retry
@@ -384,12 +404,6 @@ class BotManager:
         ready.extend(entry.coalescer.flush_due(received_at_ms))
         for body in ready:
             self._post_webhook_body(entry, body)
-
-    def _dispatch(self, entry, msg, seen):
-        """Compatibility wrapper for a single inbound message."""
-        body = self._prepare_webhook_body(entry, msg, seen, int(time.time() * 1000))
-        if body is not None:
-            self._post_webhook_body(entry, _finalize_coalesced_group([body]))
 
     def _prepare_webhook_body(self, entry, msg, seen, fallback_time_ms):
         """Download media and build one platform webhook body."""
@@ -459,19 +473,6 @@ class BotManager:
                 'size': size,
             })
         return items
-
-    def _post_webhook(self, entry, uid, mid, text, ctx, media_paths, media_items):
-        body = {
-            'bot_uuid': entry.bot_uuid,
-            'ilink_user_id': uid,
-            'message_id': mid,
-            'text': text,
-            'context_token': ctx,
-            'updates_buf': entry.client.updates_buf,
-            'media_paths': media_paths or [],
-            'media_items': media_items or [],
-        }
-        self._post_webhook_body(entry, body)
 
     def _notify_expired(self, entry):
         body = {'bot_uuid': entry.bot_uuid, 'auth_expired': True}
@@ -612,18 +613,25 @@ class PollerHandler(BaseHTTPRequestHandler):
 
     def _read_json(self):
         length = int(self.headers.get('Content-Length', 0))
+        if length > MAX_BODY_BYTES:
+            raise ValueError(f'Content-Length {length} exceeds limit {MAX_BODY_BYTES}')
         if length == 0:
             return {}
-        return json.loads(self.rfile.read(length))
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError('request body truncated')
+        return json.loads(body)
 
     def _verify_request_signature(self, body_bytes):
         """Verify X-API-Signature header against HMAC-SHA256(body_bytes, api_secret).
 
-        Returns True if valid or api_secret is empty (dev/test mode).
+        Returns True if valid or api_secret is empty (loopback dev mode —
+        serve() refuses to start with empty secret on non-loopback binds,
+        so an empty secret here implies loopback dev only).
         Returns False if signature is missing or mismatched.
         """
         if not self.api_secret:
-            return True  # no auth configured, allow (dev/test only)
+            return True  # loopback dev only: serve() enforces non-loopback fail-closed
 
         received_sig = self.headers.get('X-API-Signature', '')
         if not received_sig:
@@ -645,7 +653,13 @@ class PollerHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             length = int(self.headers.get('Content-Length', 0))
+            if length > MAX_BODY_BYTES:
+                self._reply(413, {'error': 'request body too large'})
+                return
             body_bytes = self.rfile.read(length) if length > 0 else b'{}'
+            if len(body_bytes) != length:
+                self._reply(400, {'error': 'request body truncated'})
+                return
 
             # Verify signature before processing (except /health is GET-only)
             if not self._verify_request_signature(body_bytes):
@@ -683,16 +697,34 @@ class PollerHandler(BaseHTTPRequestHandler):
                 self._reply(404, {'error': 'not found'})
         except KeyError as exc:
             self._reply(400, {'error': f'missing field: {exc}'})
+        except ValueError as exc:
+            # 请求体解析/格式错误(含超限), 不区分内部细节。
+            self._reply(400, {'error': str(exc) if 'exceeds limit' in str(exc) or 'truncated' in str(exc) else 'invalid request body'})
         except Exception as exc:
-            self._reply(500, {'error': str(exc)})
+            # 审查: 不把内部异常细节(含路径)透出给调用方。
+            print(f'[poller] internal error handling {self.path}: {exc!r}', flush=True)
+            self._reply(500, {'error': 'internal error'})
 
 
 def serve(listen, grace_seconds=10.0, media_root=None, webhook_secret='', api_secret=''):
     PollerHandler.manager = BotManager(media_root=media_root, webhook_secret=webhook_secret)
     PollerHandler.api_secret = api_secret or ''
     host, port = _parse_listen_addr(listen)
+    loopback = host in ('127.0.0.1', '::1', 'localhost')
+    if not api_secret and not loopback:
+        # 审查: 非回环绑定 + 空 secret 即完全裸奔(/start 可注入 bot_token、
+        # /send 可代发消息)——fail-closed 拒绝启动, 与 Go 侧 im_webhook 一致。
+        raise SystemExit(
+            f'bot_poller refuses to listen on {host}:{port} without --api-secret '
+            '(non-loopback bind requires API auth; pass a shared secret)'
+        )
+    if not api_secret:
+        print('WARNING: bot_poller running WITHOUT --api-secret (loopback dev only; ' + \
+              'any local process can control bots)', flush=True)
     server = ThreadingHTTPServer((host, port), PollerHandler)
-    auth_status = 'on' if api_secret else 'off (INSECURE - dev/test only)'
+    server.timeout = HTTP_READ_TIMEOUT  # 空闲连接读超时, 防慢速/死连接占线程
+    server.request_queue_size = HTTP_REQUEST_QUEUE_SIZE
+    auth_status = 'on' if api_secret else 'off (INSECURE - loopback dev only)'
     print(f'bot_poller listening on {host}:{port} (media_root={media_root or "disabled"}, api_auth={auth_status}, webhook_auth={"on" if webhook_secret else "off"})', flush=True)
 
     # serve_forever() blocks the main thread; SIGINT/SIGTERM raise KeyboardInterrupt

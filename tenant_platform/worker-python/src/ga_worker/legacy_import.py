@@ -9,7 +9,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from ga_worker.runtime_overlay import OVERLAY_MANIFEST_ENTRIES, OverlayError
+from ga_worker.runtime_overlay import OVERLAY_MANIFEST_ENTRIES
 
 # Modules that must never be preloaded/imported from outside the overlay manifest.
 LEGACY_MODULE_NAMES = frozenset(
@@ -172,25 +172,3 @@ def import_legacy_runtime(
 
     _purge_legacy_from_sys_path(legacy_root)
     return imported
-
-
-def ensure_legacy_available_for_factory(
-    *,
-    config_root: Path,
-    legacy_root: Path,
-    overlay_dir: Path,
-    manifest: dict[str, Any],
-    agent_factory,
-) -> dict[str, ModuleType] | None:
-    """
-    When agent_factory is injected (unit tests), skip real legacy import.
-    Otherwise import from overlay.
-    """
-    if agent_factory is not None:
-        return None
-    return import_legacy_runtime(
-        config_root=config_root,
-        legacy_root=legacy_root,
-        overlay_dir=overlay_dir,
-        manifest=manifest,
-    )

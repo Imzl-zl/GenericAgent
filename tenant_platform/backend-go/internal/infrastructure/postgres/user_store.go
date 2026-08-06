@@ -18,10 +18,12 @@ func (s *Store) CreateUser(ctx context.Context, username, passwordHash string) (
 	}
 	var u domain.User
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		// 审查: password_hash 为 NULL(空密码)时 COALESCE 成空串,
+		// 否则 scanUser 扫 NULL 进 string 崩溃。
 		return scanUser(tx.QueryRow(ctx, `
 INSERT INTO users (username, status, password_hash)
 VALUES ($1, 'pending', $2)
-RETURNING id, username, password_hash, status, COALESCE(bootstrap_marker,''), created_at, approved_at
+RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 `, username, nullString(passwordHash)), &u)
 	})
 	return u, err
@@ -139,7 +141,16 @@ RETURNING `+taskSelectColumns, userID, now)
 			}
 			affected = append(affected, t)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// 审查 D3(用户生命周期): 封禁必须立即撤销该用户全部登录会话——
+		// 否则 blocked 用户可持旧 token 继续调用用户控制面 API。与状态
+		// 变更同一事务提交, 失败即整体回滚(封禁不生效)。
+		if _, err := tx.Exec(ctx, `DELETE FROM user_sessions WHERE user_id = $1`, userID); err != nil {
+			return fmt.Errorf("revoke user sessions: %w", err)
+		}
+		return nil
 	})
 	if err != nil {
 		return domain.User{}, nil, err
@@ -228,6 +239,8 @@ func (s *Store) CountApprovedUsers(ctx context.Context) (int, error) {
 }
 
 func scanUser(row pgx.Row, u *domain.User) error {
+	// 审查: password_hash 可空(admin 创建的测试账号无密码)——NULL 必须
+	// 扫成空串而非报错, 否则 CreateUser("", "") 直接崩溃。
 	return row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Status, &u.BootstrapMarker, &u.CreatedAt, &u.ApprovedAt)
 }
 

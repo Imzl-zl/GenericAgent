@@ -24,7 +24,6 @@ var (
 
 var testSeedTables = []string{
 	"platform_commands",
-	"tool_policies",
 	"platform_runtime_settings",
 }
 

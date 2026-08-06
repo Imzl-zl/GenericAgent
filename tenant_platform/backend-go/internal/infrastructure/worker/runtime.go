@@ -52,6 +52,12 @@ type WorkerRuntime interface {
 	// 时归还容量)。Sandbox 路径委托持久 lease store; Loopback/Static 无
 	// 持久 lease, 返回 nil。generation 条件防止释放新 generation。
 	ReleaseRunnerLease(ctx context.Context, sessionKey string, generation uint64) error
+	// ExpireRunnerLease 归还会话工作区的 Runner 容量但保留容器引用
+	// (审查 F1): 与 ReleaseRunnerLease 不同, 不清空 container_id/
+	// stale_container_id——初始化失败时旧容器可能仍挂载 workspace,
+	// 引用必须保留给下一轮接管定向销毁。Sandbox 路径委托持久 lease
+	// store; Loopback/Static 无持久 lease, 返回 nil。
+	ExpireRunnerLease(ctx context.Context, sessionKey string, generation uint64) error
 }
 
 // LoopbackConfig carries the host paths needed to launch the Python Worker as a
@@ -76,6 +82,11 @@ func (r *LoopbackWorkerRuntime) ResolveGeneration(context.Context, string) (uint
 
 // ReleaseRunnerLease is a no-op for loopback (no persistent lease).
 func (r *LoopbackWorkerRuntime) ReleaseRunnerLease(context.Context, string, uint64) error {
+	return nil
+}
+
+// ExpireRunnerLease is a no-op for loopback (no persistent lease).
+func (r *LoopbackWorkerRuntime) ExpireRunnerLease(context.Context, string, uint64) error {
 	return nil
 }
 
@@ -189,6 +200,11 @@ func (s *StaticRuntime) ResolveGeneration(context.Context, string) (uint64, erro
 
 // ReleaseRunnerLease is a no-op for the static test runtime.
 func (s *StaticRuntime) ReleaseRunnerLease(context.Context, string, uint64) error {
+	return nil
+}
+
+// ExpireRunnerLease is a no-op for the static test runtime.
+func (s *StaticRuntime) ExpireRunnerLease(context.Context, string, uint64) error {
 	return nil
 }
 

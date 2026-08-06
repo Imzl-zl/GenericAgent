@@ -56,8 +56,8 @@ func inviteDeleteServer(t *testing.T, invite *inviteDeleteService) *Server {
 		Service:   dashboardFakeTaskService{},
 		Registry:  dashboardFakeRegistry{},
 		Invite:    invite,
-		DevToken:  "test-dev-token",
-		DevUserID: 9,
+		AdminToken:  "test-admin token",
+		AdminUserID: 9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestAdminDeleteInviteCodes(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"codes": []string{"CODE-A", "CODE-B"}})
 	req := httptest.NewRequest(http.MethodDelete, "/v1/admin/invite-codes", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rr, req)
@@ -98,7 +98,7 @@ func TestAdminDeleteInviteCodesRejectsUnknownFields(t *testing.T) {
 	srv := inviteDeleteServer(t, invite)
 	req := httptest.NewRequest(http.MethodDelete, "/v1/admin/invite-codes", bytes.NewBufferString(`{"codes":["CODE-A"],"force":true}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rr, req)
@@ -116,7 +116,7 @@ func TestAdminDeleteInviteCodesRejectsTrailingJSON(t *testing.T) {
 	srv := inviteDeleteServer(t, invite)
 	req := httptest.NewRequest(http.MethodDelete, "/v1/admin/invite-codes", bytes.NewBufferString(`{"codes":["CODE-A"]}{"codes":["CODE-B"]}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rr, req)
@@ -134,7 +134,7 @@ func TestAdminDeleteInviteCodesMapsStoreFailureToServerError(t *testing.T) {
 	srv := inviteDeleteServer(t, invite)
 	req := httptest.NewRequest(http.MethodDelete, "/v1/admin/invite-codes", bytes.NewBufferString(`{"codes":["CODE-A"]}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rr, req)
@@ -152,7 +152,7 @@ func TestAdminDeleteInviteCodesRejectsEmptySelection(t *testing.T) {
 	srv := inviteDeleteServer(t, invite)
 	req := httptest.NewRequest(http.MethodDelete, "/v1/admin/invite-codes", bytes.NewBufferString(`{"codes":[]}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rr, req)
@@ -166,7 +166,7 @@ func TestAdminRevokeInviteCodeRouteRemainsCompatible(t *testing.T) {
 	invite := &inviteDeleteService{}
 	srv := inviteDeleteServer(t, invite)
 	req := httptest.NewRequest(http.MethodDelete, "/v1/admin/invite-codes/CODE-A", nil)
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(rr, req)

@@ -6,7 +6,6 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 
 SCHEMA_VERSION = "genericagent.capability-policy.v1"

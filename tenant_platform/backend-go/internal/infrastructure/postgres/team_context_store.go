@@ -202,3 +202,17 @@ FROM team_members WHERE id = $1
 	m.Status = domain.TeamMemberStatus(status)
 	return m, nil
 }
+
+// IsApprovedUser 报告用户是否为 approved 状态(审查 I-4: 任务提交门禁与
+// llmproxy capability 在线校验一致——pending/blocked 用户不得创建任务)。
+func (s *Store) IsApprovedUser(ctx context.Context, userID int64) (bool, error) {
+	var status string
+	err := s.pool.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, userID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return status == "approved", nil
+}

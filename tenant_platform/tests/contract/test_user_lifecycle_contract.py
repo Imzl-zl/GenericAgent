@@ -79,11 +79,13 @@ def test_openapi_exposes_admin_user_management_paths():
         assert path in text, f"OpenAPI missing path {path}"
 
 
-def test_openapi_exposes_binding_paths():
-    """OpenAPI must declare binding generation and activation paths."""
+def test_openapi_has_no_phantom_binding_paths():
+    """渠道绑定走 iLink 扫码(/v1/users/me/wechat-qrcode 等), 不再声明
+    规划中的 /v1/bindings + /v1/activate 幽灵端点(Round14 P1 清理)。"""
     text = OPENAPI_PATH.read_text(encoding="utf-8")
-    assert "/v1/bindings" in text, "OpenAPI missing /v1/bindings"
-    assert "/v1/activate" in text, "OpenAPI missing /v1/activate"
+    assert "/v1/bindings" not in text, "phantom /v1/bindings must not be declared"
+    assert "/v1/activate" not in text, "phantom /v1/activate must not be declared"
+    assert "/v1/admin/bots" not in text, "phantom /v1/admin/bots must not be declared"
 
 
 def test_openapi_declares_router_message_path():

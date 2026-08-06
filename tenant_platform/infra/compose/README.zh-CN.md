@@ -50,7 +50,7 @@ openssl rand -hex 32  # POSTGRES_PASSWORD
 openssl rand -hex 32  # BOT_TOKEN_KEY，必须 64 位十六进制
 openssl rand -hex 32  # BOT_POLLER_API_SECRET
 openssl rand -hex 32  # PLATFORM_WEBHOOK_SECRET
-openssl rand -hex 32  # PLATFORM_DEV_TOKEN
+openssl rand -hex 32  # PLATFORM_ADMIN_TOKEN
 openssl rand -hex 32  # LLM_PROXY_CAPABILITY_SIGNING_KEY
 ```
 

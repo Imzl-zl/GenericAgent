@@ -74,6 +74,19 @@ func envInt(name string, fallback int) int {
 	return n
 }
 
+// envInt64 is the int64 variant of envInt.
+func envInt64(name string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
 // buildWorkerRuntime constructs the production Worker runtime.
 // GA_WORKER_EXECUTION_MODE=user_workspace_runner(默认)使用 Sandbox 工作区
 // Runner; loopback 仅显式用于开发降级(方案 §7: 不作静默回退)。
@@ -81,7 +94,7 @@ func envInt(name string, fallback int) int {
 
 // buildSessionFiles 构建附件/输出沙箱(审查 R5-I3): 生产 Runner 模式用共享
 // 工作区卷布局(附件导入前经 Manager 控制面预置目录), loopback 用本地目录。
-func buildSessionFiles(boot application.DevBootstrapConfig, managerClient sandbox.RunnerCLI, devLoopback bool) (application.SessionFiles, error) {
+func buildSessionFiles(boot application.AdminBootstrapConfig, managerClient sandbox.RunnerCLI, devLoopback bool) (application.SessionFiles, error) {
 	if devLoopback {
 		if strings.TrimSpace(boot.RuntimeRoot) == "" {
 			return nil, nil
@@ -106,7 +119,7 @@ func buildSessionFiles(boot application.DevBootstrapConfig, managerClient sandbo
 }
 
 func buildWorkerRuntime(
-	boot application.DevBootstrapConfig,
+	boot application.AdminBootstrapConfig,
 	store *postgres.Store,
 	processID, policyFile, llmProxyAddr, sophubProxyAddr string,
 ) (worker.WorkerRuntime, sandbox.RunnerCLI, error) {
@@ -178,7 +191,7 @@ func buildWorkerRuntime(
 // 目标, 审查 C4): 生产 Runner 模式写 workspace 共享卷 config/ 子目录
 // (Runner 以 /ga/runner-config 只读挂载, 与 Manager writeConfigFiles 布局
 // 一致); loopback/dev 模式返回 nil 让 scheduler 回退 Platform 本地 ConfigRoot。
-func runtimeConfigDirFor(boot application.DevBootstrapConfig) func(sessionKey string, generation uint64) string {
+func runtimeConfigDirFor(boot application.AdminBootstrapConfig) func(sessionKey string, generation uint64) string {
 	mode := strings.TrimSpace(os.Getenv("GA_WORKER_EXECUTION_MODE"))
 	if mode == "" {
 		mode = "user_workspace_runner"
@@ -249,7 +262,7 @@ func sophubProxyBaseURL() string {
 // 避免旧容器残留到 Manager 绝对 TTL。容器是全局资源, 无论 owner 是谁都
 // 必须销毁; 释放(expires_at 置过期)只对本实例 lease 执行。
 func reconcileExpiredRunnerLeases(ctx context.Context, store *postgres.Store, manager sandbox.RunnerCLI, processID string) {
-	leases, err := store.ListExpiredRunnerLeases(ctx, time.Now().UTC())
+	leases, err := store.ListExpiredRunnerLeases(ctx) // 审查 F3: 过期判定用 DB 时钟
 	if err != nil {
 		slog.ErrorContext(ctx, "platform: list expired runner leases failed", "error", err)
 		return
@@ -454,7 +467,7 @@ func run() error {
 		workerSrc             = flag.String("worker-src", "", "path to worker-python/src")
 		llmProxyAddr          = flag.String("llm-proxy-addr", os.Getenv("GA_LLM_PROXY_ADDR"), "external LLM Proxy addr (or GA_LLM_PROXY_ADDR, e.g. http://llm-proxy:8081); empty = start in-process Proxy in dev-loopback")
 		capabilitySigningKey  = flag.String("capability-signing-key", "", "HMAC signing key for capability_tokens (or LLM_PROXY_CAPABILITY_SIGNING_KEY); >=32 bytes")
-		modelPolicyVersion    = flag.String("model-policy-version", "foundation.no-host-tools.v1", "model_policy_version stamped into capability_tokens")
+		modelPolicyVersion    = flag.String("model-policy-version", "foundation.session-files.v1", "model_policy_version stamped into capability_tokens (统一全能力档, 审查 D1 去分级)")
 		devExtraUsers         = flag.String("dev-extra-users", "", "comma-separated extra dev user IDs to bootstrap with personal workspaces")
 		devTeam               = flag.String("dev-team", "", "bootstrap a dev team: format 'name:owner_id:member_id,member_id,...'")
 		botTokenKey           = flag.String("bot-token-key", os.Getenv("BOT_TOKEN_KEY"), "AES-256-GCM hex key for encrypting bot tokens (or BOT_TOKEN_KEY)")
@@ -466,6 +479,7 @@ func run() error {
 		botMediaRoot         = flag.String("bot-media-root", os.Getenv("GA_BOT_MEDIA_ROOT"), "Bot Poller media root directory (or GA_BOT_MEDIA_ROOT); inbound media_paths are rejected unless they resolve inside this root; empty = no check (loopback/dev)")
 		platformWebhookURL    = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
 		webhookSecret         = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
+		maxBodyBytes          = envInt64("PLATFORM_MAX_BODY_BYTES", api.DefaultMaxRequestBodyBytes)
 		maxRunningTasks       = flag.Int("max-running-tasks", envInt("MAX_RUNNING_TASKS", 0), "global cap on simultaneously starting/running tasks (or MAX_RUNNING_TASKS); 0 = disabled (dev/test). Independent of Runner capacity GA_RUNNER_MAX_ACTIVE: task concurrency is a scheduler gate, Runner capacity is enforced in the lease transaction.")
 		perTenantRunningLimit = flag.Int("per-tenant-running-limit", envInt("PER_TENANT_RUNNING_LIMIT", 0), "per-requester cap on simultaneously starting/running tasks across all sessions (or PER_TENANT_RUNNING_LIMIT); 0 = disabled (dev/test)")
 		perUserQueueLimit     = flag.Int("per-user-queue-limit", envInt("PER_USER_QUEUE_LIMIT", 0), "per-requester cap on queued tasks (or PER_USER_QUEUE_LIMIT); 0 = disabled (dev/test)")
@@ -563,6 +577,10 @@ func run() error {
 	// Resource quotas: enforced by scheduler (global running cap) and store
 	// (per-user queued cap). Zero disables (dev/test).
 	store.SetPerUserQueueLimit(*perUserQueueLimit)
+	// 审查 D4: 全局 running-task 上限的跨实例原子门禁由 ClaimNextTask
+	// 事务内 advisory lock 强制执行; scheduler 侧 MaxRunningTasks 预检查
+	// 仅作快速拒绝。
+	store.SetRunningTaskLimit(*maxRunningTasks)
 	if *maxRunningTasks > 0 || *taskTimeoutSeconds > 0 || *taskIdleTimeoutSec > 0 {
 		fmt.Fprintf(os.Stderr, "platform: quota max_running_tasks=%d per_user_queue_limit=%d worker_task_timeout=%ds idle_reaper=%ds\n",
 			*maxRunningTasks, *perUserQueueLimit, *taskTimeoutSeconds, *taskIdleTimeoutSec)
@@ -570,7 +588,7 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "platform: quotas disabled (max_running_tasks=0 per_user_queue_limit=0 worker_task_timeout=0 idle_reaper=0); stuck detection via gRPC stream errors + heartbeat lease loss\n")
 	}
 
-	boot, err := application.LoadDevBootstrapFromEnv()
+	boot, err := application.LoadAdminBootstrapFromEnv()
 	if err != nil {
 		return err
 	}
@@ -608,13 +626,13 @@ func run() error {
 		boot.RunnerImage = "ga-runner:local"
 	}
 
-	var devCtx postgres.DevelopmentContext
+	var devCtx postgres.AdminContext
 	var coord checkpoint.Coordinator
 	if *devLoopback {
 		if boot.RuntimeRoot == "" || boot.ConfigRoot == "" || boot.LegacyRoot == "" {
 			return fmt.Errorf("--dev-loopback requires GA_RUNTIME_DIR, GA_CONFIG_ROOT, GA_LEGACY_ROOT")
 		}
-		devCtx, err = application.EnsureDevelopmentContext(ctx, store, boot)
+		devCtx, err = application.EnsureAdminContext(ctx, store, boot)
 		if err != nil {
 			return err
 		}
@@ -632,7 +650,7 @@ func run() error {
 				extraBoot := boot
 				extraBoot.UserID = uid
 				extraBoot.Username = fmt.Sprintf("dev-user-%d", uid)
-				if _, err := application.EnsureDevelopmentContext(ctx, store, extraBoot); err != nil {
+				if _, err := application.EnsureAdminContext(ctx, store, extraBoot); err != nil {
 					return fmt.Errorf("bootstrap extra user %d: %w", uid, err)
 				}
 			}
@@ -661,10 +679,10 @@ func run() error {
 			return fmt.Errorf("GA_WORKSPACES_ROOT is required for production checkpoint coordinator (use --dev-loopback for local development)")
 		}
 		if boot.UserID <= 0 {
-			return fmt.Errorf("PLATFORM_DEV_USER_ID is required as the platform admin user id in production")
+			return fmt.Errorf("PLATFORM_ADMIN_USER_ID is required as the platform admin user id in production")
 		}
-		if strings.TrimSpace(boot.DevToken) == "" {
-			return fmt.Errorf("PLATFORM_DEV_TOKEN is required as the admin API token in production")
+		if strings.TrimSpace(boot.AdminToken) == "" {
+			return fmt.Errorf("PLATFORM_ADMIN_TOKEN is required as the admin API token in production")
 		}
 		// 平台管理员身份(管理端 persona/policy/invite 的 actor)。
 		adminCtx, err := store.EnsurePlatformAdminUser(ctx, boot.UserID, boot.Username)
@@ -949,7 +967,6 @@ func run() error {
 			return sv.Validate(ctx, token)
 		},
 		SophubUsageCounter: store, // 审查 F10: sophub 调用按 JTI 原子计量
-		Bots:               store,
 		LLMProviders:       store, // admin LLM provider management (migration 0007)
 		MCPServers:         store, // global MCP server management (migration 0029)
 		BotLifecycle:       botLifecycle,
@@ -969,10 +986,11 @@ func run() error {
 		},
 		IMAggregationRuntime: botPollerClient,
 		Cipher:               cipher,
-		DevToken:             boot.DevToken,
-		DevUserID:            devCtx.UserID,
+		AdminToken:             boot.AdminToken,
+		AdminUserID:            devCtx.UserID,
 		SessionKey:           devCtx.SessionKey,
 		WebhookSecret:        strings.TrimSpace(*webhookSecret),
+		MaxBodyBytes:         maxBodyBytes,
 	})
 	if err != nil {
 		return err
@@ -990,7 +1008,6 @@ func run() error {
 			Transport:      botTransport,
 			Results:        coord,
 			Messages:       store, // audit outbound replies (migration 0013)
-			SessionFiles:   sessionFiles,
 			TeamMembership: store, // 审查 R5-I4: 团队任务交付前校验发起人成员资格
 			PollInterval: 2 * time.Second,
 			ClaimLease:   30 * time.Second,
@@ -1046,7 +1063,7 @@ func run() error {
 	if strings.TrimSpace(*unixListen) != "" {
 		go func() {
 			slog.Info("platform: unix api listener", "path", *unixListen)
-			if err := api.ServeUnixContext(ctx, *unixListen, server.Handler()); err != nil && !errors.Is(err, context.Canceled) {
+			if err := api.ServeUnixContext(ctx, *unixListen, server.Handler(), maxBodyBytes); err != nil && !errors.Is(err, context.Canceled) {
 				slog.ErrorContext(ctx, "platform: unix api listener failed", "error", err)
 				cancel()
 			}
@@ -1063,7 +1080,7 @@ func run() error {
 		}
 		go func() {
 			slog.Info("platform: worker internal listener", "addr", *workerInternalListen)
-			if err := api.ServeInternalContext(ctx, *workerInternalListen, internalHandler); err != nil && !errors.Is(err, context.Canceled) {
+			if err := api.ServeInternalContext(ctx, *workerInternalListen, internalHandler, maxBodyBytes); err != nil && !errors.Is(err, context.Canceled) {
 				slog.ErrorContext(ctx, "platform: worker internal listener failed", "error", err)
 				cancel()
 			}

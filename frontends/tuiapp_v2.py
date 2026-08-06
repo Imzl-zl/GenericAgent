@@ -29,7 +29,7 @@ import shutil
 from keysym import fmt_key, fmt_keys  # noqa: E402
 from dataclasses import dataclass, field
 from itertools import count
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 
 def _ensure_tui_deps() -> None:

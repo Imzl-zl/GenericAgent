@@ -42,7 +42,7 @@ if not TEST_DB:
         "(no SQLite/in-memory fallback)"
     )
 
-DEV_TOKEN = "foundation-dev-token-not-real"
+ADMIN_TOKEN = "foundation-admin-token-not-real"
 DEV_USER_ID = "1"
 # Fixture upstream credentials are submitted through the Admin Provider API.
 # The Worker receives only a capability token and Proxy URL.
@@ -324,7 +324,7 @@ def _platform_bin(tmp: Path) -> Path:
 
 
 def _http_json(
-    method: str, url: str, body: dict | None = None, token: str | None = DEV_TOKEN
+    method: str, url: str, body: dict | None = None, token: str | None = ADMIN_TOKEN, bearer: bool = False
 ):
     data = None
     headers = {}
@@ -332,7 +332,12 @@ def _http_json(
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
     if token:
-        headers["X-Platform-Dev-Token"] = token
+        # 审查 I-4: bearer=True 时任务/用户端点携带用户凭证,
+        # 默认 admin 凭证仅用于管理面。
+        if bearer:
+            headers["Authorization"] = f"Bearer {token}"
+        else:
+            headers["X-Platform-Admin-Token"] = token
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -421,9 +426,9 @@ def _start_platform(
     runtime_root.mkdir(exist_ok=True)
     env = os.environ.copy()
     env["DATABASE_URL"] = TEST_DB
-    env["PLATFORM_DEV_USER_ID"] = DEV_USER_ID
-    env["PLATFORM_DEV_TOKEN"] = DEV_TOKEN
-    env["PLATFORM_DEV_USERNAME"] = "foundation-dev"
+    env["PLATFORM_ADMIN_USER_ID"] = DEV_USER_ID
+    env["PLATFORM_ADMIN_TOKEN"] = ADMIN_TOKEN
+    env["PLATFORM_ADMIN_USERNAME"] = "foundation-dev"
     env["GA_CONFIG_ROOT"] = str(config_root)
     env["GA_RUNTIME_DIR"] = str(runtime_root)
     env["GA_LEGACY_ROOT"] = str(REPO_ROOT)
@@ -552,6 +557,8 @@ def _platform_instance_id(log_path: Path) -> str:
 
 
 def _seed_restart_rows(prior_instance: str) -> dict[str, str]:
+    import base64
+    import hashlib
     import psycopg
 
     ids = {
@@ -559,13 +566,31 @@ def _seed_restart_rows(prior_instance: str) -> dict[str, str]:
         "queued": "restart-queued-task",
         "live": "restart-live-task",
     }
+    # 审查 I-4: 任务端点只认用户 Bearer——为 seed 任务归属者直插会话,
+    # 供停机期间的 API 轮询使用(dev 用户与 user 2 无密码, 无法 login)。
+    dev_token = "restart-dev-token"
+    foreign_token = "restart-foreign-token"
+
+    def _session_hash(token: str) -> str:
+        return base64.urlsafe_b64encode(hashlib.sha256(token.encode()).digest()).rstrip(b"=").decode()
+
     with psycopg.connect(TEST_DB) as conn:
+        conn.execute(
+            "INSERT INTO user_sessions (token_hash, user_id, expires_at) VALUES "
+            "(%s, %s, timezone('utc', now()) + interval '1 hour')",
+            (_session_hash(dev_token), int(DEV_USER_ID)),
+        )
         dev_workspace = conn.execute(
             "SELECT id::text FROM workspaces WHERE session_key=%s",
             (f"personal:{DEV_USER_ID}",),
         ).fetchone()[0]
         conn.execute(
             "INSERT INTO users (id, username, status) VALUES (2, 'restart-foreign', 'approved')"
+        )
+        conn.execute(
+            "INSERT INTO user_sessions (token_hash, user_id, expires_at) VALUES "
+            "(%s, 2, timezone('utc', now()) + interval '1 hour')",
+            (_session_hash(foreign_token),),
         )
         foreign_workspace = "00000000-0000-4000-8000-000000000002"
         conn.execute(
@@ -653,6 +678,8 @@ def _seed_restart_rows(prior_instance: str) -> dict[str, str]:
             ),
         )
         conn.commit()
+    ids["dev_token"] = dev_token
+    ids["foreign_token"] = foreign_token
     return ids
 
 
@@ -698,12 +725,13 @@ def _restart_row_facts(ids: dict[str, str]) -> dict[str, object]:
 
 
 def _poll_status(
-    base: str, task_id: str, want: set[str], timeout: float = 120.0
+    base: str, task_id: str, want: set[str], timeout: float = 120.0, token: str | None = None
 ) -> dict:
     deadline = time.time() + timeout
     last = {}
     while time.time() < deadline:
-        code, body = _http_json("GET", f"{base}/v1/tasks/{task_id}")
+        # 审查 I-4: 任务端点只认用户 Bearer; 未传 token 时保持无凭证(404)。
+        code, body = _http_json("GET", f"{base}/v1/tasks/{task_id}", bearer=token is not None, token=token)
         if code == 200:
             last = body
             if body.get("status") in want:
@@ -712,25 +740,76 @@ def _poll_status(
     raise AssertionError(f"task {task_id} not in {want}; last={last}")
 
 
-def _submit_success(base: str, message_id: str, prompt: str) -> dict:
+def _register_user(base: str, username: str) -> tuple[int, str]:
+    """注册新用户并初始化其 workspace(审查 I-4: 任务端点需用户 Bearer + 归属 workspace)。
+
+    流程: 注册(pending) → 管理员批准(approved) → 返回 (user_id, bearer_token)。
+    workspace 由测试直插(volume_id 占位, loopback worker 不使用卷标识; 与
+    _seed_restart_rows 同模式)。
+    """
+    import psycopg
+
+    code, body = _http_json("POST", f"{base}/v1/admin/invite-codes")
+    assert code == 201, body
     code, body = _http_json(
         "POST",
-        f"{base}/v1/sessions/personal:{DEV_USER_ID}/tasks",
+        f"{base}/v1/register",
+        {"username": username, "password": "e2e-password-123", "invite_code": body["code"]},
+        token=None,
+    )
+    assert code == 201, body
+    uid: int = body["user_id"]
+    token: str = body["token"]
+    # 审查 I-4: 提交门禁与 capability 在线校验一致——pending 用户的任务
+    # 会被 llmproxy 拒绝, 注册后必须经管理员批准才能使用任务功能。
+    code, body = _http_json("POST", f"{base}/v1/admin/users/{uid}/approve")
+    assert code == 200, body
+    with psycopg.connect(TEST_DB) as conn:
+        conn.execute(
+            "INSERT INTO workspaces (id, session_key, owner_user_id, kind, volume_id) "
+            "VALUES (gen_random_uuid(), %s, %s, 'personal', 'e2e-user-volume')",
+            (f"personal:{uid}", uid),
+        )
+    return uid, token
+
+
+def _seed_user_session(user_id: int, token: str) -> None:
+    """为 seed 用户直插 bearer 会话(restart 测试在 platform 停机期间 seed)。"""
+    import base64
+    import hashlib
+    import psycopg
+
+    digest = base64.urlsafe_b64encode(hashlib.sha256(token.encode()).digest()).rstrip(b"=").decode()
+    with psycopg.connect(TEST_DB) as conn:
+        conn.execute(
+            "INSERT INTO user_sessions (token_hash, user_id, expires_at) "
+            "VALUES (%s, %s, timezone('utc', now()) + interval '1 hour')",
+            (digest, user_id),
+        )
+
+
+def _submit_success(base: str, message_id: str, prompt: str, token: str, session_key: str) -> dict:
+    code, body = _http_json(
+        "POST",
+        f"{base}/v1/sessions/{session_key}/tasks",
         {
             "message_id": message_id,
             "source_instance_id": "ga-contract-e2e",
             "prompt": prompt,
             "source": "web",
             "persona_snapshot": ["You are a concise contract-test agent."],
-            "tool_policy_version": "foundation.no-host-tools.v1",
         },
+        token=token,
+        bearer=True,
     )
     assert code == 202, body
-    final = _poll_status(base, body["task_id"], {"succeeded", "failed"}, timeout=150)
+    final = _poll_status(base, body["task_id"], {"succeeded", "failed"}, timeout=150, token=token)
     assert final["status"] == "succeeded", final
     result_code, result = _http_json(
         "GET",
         f"{base}/v1/tasks/{body['task_id']}/result?result_ref={final['result_ref']}",
+        token=token,
+        bearer=True,
     )
     assert result_code == 200, result
     serialized_result = json.dumps(result, ensure_ascii=False)
@@ -816,9 +895,7 @@ def _captured_request(
     )
 
 
-def _runtime_document(
-    config_root: Path, session_key: str = f"personal:{DEV_USER_ID}"
-) -> dict:
+def _runtime_document(config_root: Path, session_key: str) -> dict:
     session_dir = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
     path = config_root / session_dir / "mykey.runtime.json"
     deadline = time.time() + 15
@@ -1088,19 +1165,20 @@ def _configure_oai_providers(base: str, fixture: _Fixture) -> tuple[dict, dict]:
     return primary, secondary
 
 
-def _submit_started(base: str, message_id: str, prompt: str) -> dict:
+def _submit_started(base: str, message_id: str, prompt: str, token: str, session_key: str) -> dict:
     """提交任务并返回响应 body(不等待完成)。"""
     code, body = _http_json(
         "POST",
-        f"{base}/v1/sessions/personal:{DEV_USER_ID}/tasks",
+        f"{base}/v1/sessions/{session_key}/tasks",
         {
             "message_id": message_id,
             "source_instance_id": "ga-contract-e2e",
             "prompt": prompt,
             "source": "web",
             "persona_snapshot": ["You are a concise contract-test agent."],
-            "tool_policy_version": "foundation.no-host-tools.v1",
         },
+        token=token,
+        bearer=True,
     )
     assert code == 202, body
     return body
@@ -1114,14 +1192,14 @@ def _runtime_signature(document: dict) -> str:
 
 
 def _wait_runtime_token(
-    config_root: Path, primary: dict, prev_signature: str, timeout: float = 40.0
+    config_root: Path, primary: dict, prev_signature: str, session_key: str, timeout: float = 40.0
 ) -> tuple[str, str]:
     """轮询 runtime JSON 直到出现新的真实 capability token(任务执行期间
     签发, 尚未终态撤销)。round9 审查: 已终态任务的 token 会被在线校验与
     撤销表拒绝, capability 语义变体测试必须在任务活跃窗口内取样。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        document = _runtime_document(config_root)
+        document = _runtime_document(config_root, session_key)
         if _runtime_signature(document) != prev_signature:
             runtime_primary = _runtime_provider(document, primary)
             if runtime_primary["apikey"] not in REAL_KEY_SENTINELS:
@@ -1137,6 +1215,8 @@ def _exercise_initial_oai_binding(
     fixture: _Fixture,
     primary: dict,
     secondary: dict,
+    user_token: str,
+    user_session: str,
 ) -> None:
     # round9 审查: capability 语义变体测试(MODEL_MISMATCH/PROVIDER_TYPE_
     # MISMATCH/stream)必须在任务活跃窗口内取样 token——任务终态后 JTI 被
@@ -1144,33 +1224,33 @@ def _exercise_initial_oai_binding(
     # runtime JSON 可能在首个任务前尚未生成: 空签名使任何新签发都匹配。
     prev_signature = ""
     try:
-        prev_doc = _runtime_document(config_root)
+        prev_doc = _runtime_document(config_root, user_session)
         prev_signature = _runtime_signature(prev_doc)
     except AssertionError:
         pass
-    started = _submit_started(base, "ga-chat-primary", "ga-chat-primary")
-    token, proxy_base = _wait_runtime_token(config_root, primary, prev_signature)
+    started = _submit_started(base, "ga-chat-primary", "ga-chat-primary", user_token, user_session)
+    token, proxy_base = _wait_runtime_token(config_root, primary, prev_signature, user_session)
     # 决策 D2.1: 任务即进程——任务终态即销毁 Worker, 进程隔离断言必须在
     # 任务执行早期采样(token 刚签发, 进程必然活跃; psutil 已预热保证首次
     # 扫描毫秒级)。能力拒绝/流式测试随后仍在活跃窗口内。
     _assert_worker_process_isolated(proc.pid, config_root, REAL_KEY_SENTINELS)
     _assert_capability_rejections(proxy_base, token, primary)
     _assert_stream_first_chunk_unbuffered(proxy_base, token, primary["model"])
-    final = _poll_status(base, started["task_id"], {"succeeded", "failed"}, timeout=150)
+    final = _poll_status(base, started["task_id"], {"succeeded", "failed"}, timeout=150, token=user_token)
     assert final["status"] == "succeeded", final
     first_request = _captured_request(fixture, "ga-chat-primary", OAI_TOKEN)
     assert first_request["path"] == "/v1/chat/completions"
 
-    document = _runtime_document(config_root)
+    document = _runtime_document(config_root, user_session)
     signature = _runtime_signature(document)
     _set_default_provider(base, secondary["provider_id"])
-    _submit_success(base, "ga-existing-after-default", "ga-existing-after-default")
+    _submit_success(base, "ga-existing-after-default", "ga-existing-after-default", user_token, user_session)
     # 决策 D2.1(任务即进程): 每个任务都是新 Worker, 重新解析路由快照——
     # 默认切换后新任务跟随新默认(secondary 第一)。
     _captured_request(fixture, "ga-existing-after-default", SECONDARY_OAI_TOKEN)
     # 每任务 capability(方案 §7): 每个新任务都签发绑定自身 task_id 的新
     # token, 终态后旧 token 撤销——runtime 文档必然推进。
-    new_signature = _runtime_signature(_runtime_document(config_root))
+    new_signature = _runtime_signature(_runtime_document(config_root, user_session))
     assert new_signature != signature
 
 
@@ -1180,15 +1260,17 @@ def _exercise_new_worker_mixin_and_key_rotation(
     fixture: _Fixture,
     primary: dict,
     secondary: dict,
+    user_token: str,
+    user_session: str,
 ) -> dict:
-    _submit_success(base, "ga-new-worker-secondary", "ga-new-worker-secondary")
+    _submit_success(base, "ga-new-worker-secondary", "ga-new-worker-secondary", user_token, user_session)
     _captured_request(fixture, "ga-new-worker-secondary", SECONDARY_OAI_TOKEN)
-    document = _runtime_document(config_root)
+    document = _runtime_document(config_root, user_session)
     mixin_names = document["mixin_config"]["llm_nos"]
     assert mixin_names[0] == f"provider-{secondary['provider_id']}"
 
     fixture.server.set_failure(SECONDARY_OAI_TOKEN, True)
-    _submit_success(base, "ga-mixin-fallback", "ga-mixin-fallback")
+    _submit_success(base, "ga-mixin-fallback", "ga-mixin-fallback", user_token, user_session)
     _captured_request(fixture, "ga-mixin-fallback", SECONDARY_OAI_TOKEN)
     _captured_request(fixture, "ga-mixin-fallback", OAI_TOKEN)
 
@@ -1196,11 +1278,11 @@ def _exercise_new_worker_mixin_and_key_rotation(
     rotated = _update_provider(base, primary, api_key=ROTATED_OAI_TOKEN)
     assert rotated["revision"] == primary["revision"]
     fixture.server.replace_credential(OAI_TOKEN, ROTATED_OAI_TOKEN)
-    _submit_success(base, "ga-key-rotation", "ga-key-rotation")
+    _submit_success(base, "ga-key-rotation", "ga-key-rotation", user_token, user_session)
     request = _captured_request(fixture, "ga-key-rotation", ROTATED_OAI_TOKEN)
     assert "ga-mixin-fallback" in json.dumps(request["payload"])
     # 同 session 新任务同样推进 runtime 文档(每任务 token 绑定)。
-    new_signature = _runtime_signature(_runtime_document(config_root))
+    new_signature = _runtime_signature(_runtime_document(config_root, user_session))
     assert new_signature != signature
     return rotated
 
@@ -1210,8 +1292,10 @@ def _exercise_responses_and_claude_default(
     config_root: Path,
     fixture: _Fixture,
     primary: dict,
+    user_token: str,
+    user_session: str,
 ) -> dict:
-    document = _runtime_document(config_root)
+    document = _runtime_document(config_root, user_session)
     runtime_primary = _runtime_provider(document, primary)
     old_token = runtime_primary["apikey"]
     proxy_base = runtime_primary["apibase"].removesuffix("/v1")
@@ -1234,7 +1318,7 @@ def _exercise_responses_and_claude_default(
     )
     assert (status, body.get("code")) == (409, "PROVIDER_REVISION_MISMATCH"), body
 
-    _submit_success(base, "ga-responses-sse", "ga-responses-sse")
+    _submit_success(base, "ga-responses-sse", "ga-responses-sse", user_token, user_session)
     request = _captured_request(fixture, "ga-responses-sse", ROTATED_OAI_TOKEN)
     assert request["path"] == "/v1/responses" and request["payload"]["stream"] is True
     assert "ga-key-rotation" in json.dumps(request["payload"])
@@ -1261,13 +1345,13 @@ def _exercise_responses_and_claude_default(
             "transport_config": {"auth_mode": "auto"},
         },
     )
-    _submit_success(base, "ga-provider-added", "ga-provider-added")
+    _submit_success(base, "ga-provider-added", "ga-provider-added", user_token, user_session)
     request = _captured_request(fixture, "ga-provider-added", ROTATED_OAI_TOKEN)
     assert request["path"] == "/v1/responses"
-    assert len(_runtime_document(config_root)["mixin_config"]["llm_nos"]) == 3
+    assert len(_runtime_document(config_root, user_session)["mixin_config"]["llm_nos"]) == 3
     _set_default_provider(base, claude["provider_id"])
     _submit_success(
-        base, "ga-existing-oai-after-claude", "ga-existing-oai-after-claude"
+        base, "ga-existing-oai-after-claude", "ga-existing-oai-after-claude", user_token, user_session
     )
     # 决策 D2.1(任务即进程): 每任务重新解析路由快照——默认切到 claude 后
     # 新任务跟随 claude(不再复用旧 Worker 的旧快照)。
@@ -1284,8 +1368,10 @@ def _exercise_new_claude_worker(
     config_root: Path,
     fixture: _Fixture,
     claude: dict,
+    user_token: str,
+    user_session: str,
 ) -> None:
-    _submit_success(base, "ga-claude-sse", "ga-claude-sse")
+    _submit_success(base, "ga-claude-sse", "ga-claude-sse", user_token, user_session)
     request = _captured_request(fixture, "ga-claude-sse", CLAUDE_TOKEN)
     assert request["path"] == "/v1/messages"
     assert request["query"] == "beta=true"
@@ -1293,7 +1379,7 @@ def _exercise_new_claude_worker(
     assert request["payload"]["stream"] is True
     assert "context-1m-2025-08-07" in request["headers"]["anthropic-beta"]
     assert request["headers"]["x-api-key"] == CLAUDE_TOKEN
-    document = _runtime_document(config_root)
+    document = _runtime_document(config_root, user_session)
     mixin_names = document["mixin_config"]["llm_nos"]
     assert mixin_names[0] == f"provider-{claude['provider_id']}"
     assert len(mixin_names) == 3
@@ -1306,13 +1392,15 @@ def _exercise_provider_disable(
     config_root: Path,
     fixture: _Fixture,
     primary_id: int,
+    user_token: str,
+    user_session: str,
 ) -> None:
     current = next(
         provider
         for provider in _list_providers(base)
         if provider["provider_id"] == primary_id
     )
-    document = _runtime_document(config_root)
+    document = _runtime_document(config_root, user_session)
     runtime = _runtime_provider(document, current)
     old_token = runtime["apikey"]
     proxy_base = runtime["apibase"].removesuffix("/v1")
@@ -1330,18 +1418,18 @@ def _exercise_provider_disable(
     )
     assert (status, body.get("code")) == (409, "PROVIDER_DISABLED"), body
 
-    _submit_success(base, "ga-after-provider-disable", "ga-after-provider-disable")
+    _submit_success(base, "ga-after-provider-disable", "ga-after-provider-disable", user_token, user_session)
     _captured_request(fixture, "ga-after-provider-disable", CLAUDE_TOKEN)
-    disabled_document = _runtime_document(config_root)
+    disabled_document = _runtime_document(config_root, user_session)
     assert runtime_key not in disabled_document
     assert len(disabled_document["mixin_config"]["llm_nos"]) == 2
 
     enabled = _set_provider_state(base, primary_id, "active")
     assert enabled["state"] == "active"
     assert enabled["revision"] == disabled["revision"] + 1
-    _submit_success(base, "ga-after-provider-enable", "ga-after-provider-enable")
+    _submit_success(base, "ga-after-provider-enable", "ga-after-provider-enable", user_token, user_session)
     _captured_request(fixture, "ga-after-provider-enable", CLAUDE_TOKEN)
-    enabled_document = _runtime_document(config_root)
+    enabled_document = _runtime_document(config_root, user_session)
     assert runtime_key in enabled_document
     assert len(enabled_document["mixin_config"]["llm_nos"]) == 3
 
@@ -1356,9 +1444,12 @@ def test_real_ga_protocol_routing_rotation_and_security_contract(tmp_path: Path)
         proc, base, config_root, runtime_root, log_path, _ = _start_platform(
             tmp_path, fixture=fixture
         )
+        # 审查 I-4: 任务端点只认用户 Bearer——测试全链路用注册用户身份。
+        uid, utoken = _register_user(base, "e2e-routing-user")
+        user_session = f"personal:{uid}"
         primary, secondary = _configure_oai_providers(base, fixture)
         _exercise_initial_oai_binding(
-            proc, base, config_root, fixture, primary, secondary
+            proc, base, config_root, fixture, primary, secondary, utoken, user_session
         )
         logs.append(_stop(proc, log_path))
         proc = None
@@ -1367,10 +1458,10 @@ def test_real_ga_protocol_routing_rotation_and_security_contract(tmp_path: Path)
             tmp_path, reset_db=False, fixture=fixture
         )
         primary = _exercise_new_worker_mixin_and_key_rotation(
-            base, config_root, fixture, primary, secondary
+            base, config_root, fixture, primary, secondary, utoken, user_session
         )
         claude = _exercise_responses_and_claude_default(
-            base, config_root, fixture, primary
+            base, config_root, fixture, primary, utoken, user_session
         )
         logs.append(_stop(proc, log_path))
         proc = None
@@ -1378,8 +1469,8 @@ def test_real_ga_protocol_routing_rotation_and_security_contract(tmp_path: Path)
         proc, base, config_root, runtime_root, log_path, _ = _start_platform(
             tmp_path, reset_db=False, fixture=fixture
         )
-        _exercise_new_claude_worker(proc, base, config_root, fixture, claude)
-        _exercise_provider_disable(base, config_root, fixture, primary["provider_id"])
+        _exercise_new_claude_worker(proc, base, config_root, fixture, claude, utoken, user_session)
+        _exercise_provider_disable(base, config_root, fixture, primary["provider_id"], utoken, user_session)
         logs.append(_stop(proc, log_path))
         proc = None
         _assert_artifacts_exclude_secrets(
@@ -1395,7 +1486,9 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
     """Submit → succeeded; cancel second; recovery leaves unexpired foreign rows."""
     proc, base, _, _, log_path, fixture = _start_platform(tmp_path)
     try:
-        session = f"personal:{DEV_USER_ID}"
+        # 审查 I-4: 任务端点只认用户 Bearer——用注册用户身份提交/取消/查结果。
+        uid, utoken = _register_user(base, "e2e-cancel-user")
+        session = f"personal:{uid}"
         code, body = _http_json(
             "POST",
             f"{base}/v1/sessions/{session}/tasks",
@@ -1405,8 +1498,9 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
                 "prompt": "Reply with a short greeting for foundation e2e.",
                 "source": "web",
                 "persona_snapshot": ["You are a concise foundation agent."],
-                "tool_policy_version": "foundation.no-host-tools.v1",
             },
+            token=utoken,
+            bearer=True,
         )
         assert code == 202, body
         task_id = body["task_id"]
@@ -1421,8 +1515,9 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
                 "prompt": "CHANGED PROMPT SHOULD NOT CREATE NEW TASK",
                 "source": "web",
                 "persona_snapshot": ["other"],
-                "tool_policy_version": "foundation.no-host-tools.v1",
             },
+            token=utoken,
+            bearer=True,
         )
         assert code2 == 202
         assert body2["task_id"] == task_id
@@ -1436,18 +1531,19 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
                 "prompt": "second instance should be distinct",
                 "source": "web",
                 "persona_snapshot": ["p"],
-                "tool_policy_version": "foundation.no-host-tools.v1",
             },
+            token=utoken,
+            bearer=True,
         )
         assert code3 == 202
         other_id = body3["task_id"]
         assert other_id != task_id
 
-        ccode, cbody = _http_json("POST", f"{base}/v1/tasks/{other_id}/cancel")
+        ccode, cbody = _http_json("POST", f"{base}/v1/tasks/{other_id}/cancel", token=utoken, bearer=True)
         assert ccode == 200, cbody
         assert cbody.get("accepted") is True
 
-        final = _poll_status(base, task_id, {"succeeded", "failed"}, timeout=150)
+        final = _poll_status(base, task_id, {"succeeded", "failed"}, timeout=150, token=utoken)
         assert final["status"] == "succeeded", final
         assert final.get("result_ref")
         assert final.get("result_digest")
@@ -1456,6 +1552,8 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         rcode, rbody = _http_json(
             "GET",
             f"{base}/v1/tasks/{task_id}/result?result_ref={final['result_ref']}",
+            token=utoken,
+            bearer=True,
         )
         assert rcode == 200, rbody
         assert rbody["result_digest"] == final["result_digest"]
@@ -1464,11 +1562,13 @@ def test_submit_succeed_cancel_and_recovery(tmp_path: Path):
         pcode, pbody = _http_json(
             "GET",
             f"{base}/v1/tasks/{task_id}/result?result_ref=C:%5Csecrets",
+            token=utoken,
+            bearer=True,
         )
         assert pcode >= 400, pbody
 
         cancelled = _poll_status(
-            base, other_id, {"cancelled", "interrupted", "failed"}, timeout=30
+            base, other_id, {"cancelled", "interrupted", "failed"}, timeout=30, token=utoken
         )
         assert cancelled["status"] == "cancelled", cancelled
 
@@ -1496,8 +1596,8 @@ def test_platform_requires_dev_loopback_for_local_coordinator(tmp_path: Path):
     bin_path = _platform_bin(tmp_path)
     env = os.environ.copy()
     env["DATABASE_URL"] = TEST_DB
-    env["PLATFORM_DEV_USER_ID"] = DEV_USER_ID
-    env["PLATFORM_DEV_TOKEN"] = DEV_TOKEN
+    env["PLATFORM_ADMIN_USER_ID"] = DEV_USER_ID
+    env["PLATFORM_ADMIN_TOKEN"] = ADMIN_TOKEN
     proc = subprocess.run(
         [
             str(bin_path),
@@ -1531,23 +1631,26 @@ def test_restart_recovers_expired_preserves_live_and_runs_queued_once(tmp_path: 
         first_instance = _platform_instance_id(first_log)
     finally:
         _stop(first_proc, first_log)
-        first_fixture.close()
 
     seeded = _seed_restart_rows(first_instance)
+    # 复用 first 的 fixture: provider base_url 不变 → 重启后无需 PUT 刷新 →
+    # provider revision 不抬升, 避免 scheduler 启动即 dispatch 与 refresh
+    # 的时序竞争(旧 capability 409 PROVIDER_REVISION_MISMATCH 导致 LLM_FAILED,
+    # Round14 修复 C2 前该故障被当作成功而掩盖了此缺陷)。
     second_proc, base, _, _, second_log, second_fixture = _start_platform(
-        tmp_path / "second", reset_db=False
+        tmp_path / "second", reset_db=False, fixture=first_fixture
     )
     try:
         second_instance = _platform_instance_id(second_log)
         assert second_instance != first_instance
 
-        expired = _poll_status(base, seeded["expired"], {"interrupted"}, timeout=30)
+        expired = _poll_status(base, seeded["expired"], {"interrupted"}, timeout=30, token=seeded["dev_token"])
         assert expired["status"] == "interrupted"
         queued = _poll_status(
-            base, seeded["queued"], {"succeeded", "failed"}, timeout=150
+            base, seeded["queued"], {"succeeded", "failed"}, timeout=150, token=seeded["dev_token"]
         )
         assert queued["status"] == "succeeded", queued
-        live = _poll_status(base, seeded["live"], {"starting"}, timeout=10)
+        live = _poll_status(base, seeded["live"], {"starting"}, timeout=10, token=seeded["foreign_token"])
         assert live["status"] == "starting"
 
         before = _restart_row_facts(seeded)

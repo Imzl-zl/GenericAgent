@@ -2,39 +2,6 @@ package domain
 
 import "testing"
 
-func TestWorkspaceKeyPersonal(t *testing.T) {
-	key, err := PersonalWorkspaceKey(42)
-	if err != nil {
-		t.Fatalf("PersonalWorkspaceKey: %v", err)
-	}
-	if key != "personal:42" {
-		t.Fatalf("key = %q, want personal:42", key)
-	}
-}
-
-func TestWorkspaceKeyTeam(t *testing.T) {
-	key, err := TeamWorkspaceKey(7)
-	if err != nil {
-		t.Fatalf("TeamWorkspaceKey: %v", err)
-	}
-	if key != "team:7" {
-		t.Fatalf("key = %q, want team:7", key)
-	}
-}
-
-func TestWorkspaceKeyRejectsNonPositiveIDs(t *testing.T) {
-	if _, err := PersonalWorkspaceKey(0); err == nil {
-		t.Fatal("PersonalWorkspaceKey(0) should fail")
-	}
-	if _, err := PersonalWorkspaceKey(-1); err == nil {
-		t.Fatal("PersonalWorkspaceKey(-1) should fail")
-	}
-	if _, err := TeamWorkspaceKey(0); err == nil {
-		t.Fatal("TeamWorkspaceKey(0) should fail")
-	}
-}
-
-// 审查 R5-I: team 整数分支必须拒绝 0 与负整数(此前只拒绝 "0", 接受 team:-1)。
 func TestValidateWorkspaceKeyRejectsNonPositiveTeamIDs(t *testing.T) {
 	for _, bad := range []string{"team:-1", "team:0", "team:-999"} {
 		if err := ValidateWorkspaceKey(bad); err == nil {
@@ -45,48 +12,6 @@ func TestValidateWorkspaceKeyRejectsNonPositiveTeamIDs(t *testing.T) {
 		if err := ValidateWorkspaceKey(good); err != nil {
 			t.Fatalf("ValidateWorkspaceKey(%q) should pass: %v", good, err)
 		}
-	}
-}
-
-func TestRunnerKeyEqualsWorkspaceKey(t *testing.T) {
-	ws, err := PersonalWorkspaceKey(99)
-	if err != nil {
-		t.Fatalf("workspace: %v", err)
-	}
-	rk, err := RunnerKeyForWorkspace(ws)
-	if err != nil {
-		t.Fatalf("RunnerKeyForWorkspace: %v", err)
-	}
-	if rk != ws {
-		t.Fatalf("runner key = %q, want equal to workspace key %q", rk, ws)
-	}
-}
-
-func TestRunnerKeyRejectsForeignFormat(t *testing.T) {
-	if _, err := RunnerKeyForWorkspace("other:1"); err == nil {
-		t.Fatal("RunnerKeyForWorkspace(foreign) should fail")
-	}
-	if _, err := RunnerKeyForWorkspace("personal:abc"); err == nil {
-		t.Fatal("RunnerKeyForWorkspace(bad id) should fail")
-	}
-}
-
-func TestWorkspaceKeyParsing(t *testing.T) {
-	scope, id, err := ParseWorkspaceKey("personal:42")
-	if err != nil {
-		t.Fatalf("ParseWorkspaceKey: %v", err)
-	}
-	if scope != "personal" || id != 42 {
-		t.Fatalf("scope=%q id=%d, want personal 42", scope, id)
-	}
-	if _, _, err := ParseWorkspaceKey("team:abc"); err == nil {
-		t.Fatal("ParseWorkspaceKey(bad id) should fail")
-	}
-	if _, _, err := ParseWorkspaceKey("nonsense"); err == nil {
-		t.Fatal("ParseWorkspaceKey(no colon) should fail")
-	}
-	if _, _, err := ParseWorkspaceKey("unknown:1"); err == nil {
-		t.Fatal("ParseWorkspaceKey(unknown scope) should fail")
 	}
 }
 
@@ -115,17 +40,6 @@ func TestValidateWorkspaceKeyAcceptsTeamUUID(t *testing.T) {
 		if err := ValidateWorkspaceKey(key); err == nil {
 			t.Fatalf("ValidateWorkspaceKey(%q) should fail", key)
 		}
-	}
-}
-
-func TestRunnerKeyForWorkspaceAcceptsTeamUUID(t *testing.T) {
-	key := "team:3b1f6a2e-9d4c-4f8e-9b2a-1c3d5e7f9a0b"
-	rk, err := RunnerKeyForWorkspace(key)
-	if err != nil {
-		t.Fatalf("RunnerKeyForWorkspace(team uuid): %v", err)
-	}
-	if rk != key {
-		t.Fatalf("runner key = %q, want %q", rk, key)
 	}
 }
 

@@ -27,36 +27,6 @@ def test_worker_contract_declares_versioned_service_and_terminal_states():
         assert name in text
 
 
-def test_llm_proxy_contract_declares_versioned_service_and_no_api_key():
-    """Plan Task 1 Step 1: tests must read BOTH protobuf files.
-
-    Plan Task 1 Step 3: neither protobuf contract may contain a real API key
-    field. This guards llm_proxy.proto against regressions that reintroduce a
-    key/secret field or rename the versioned service.
-    """
-    text = (ROOT / "contracts/proto/genericagent/proxy/v1/llm_proxy.proto").read_text(
-        encoding="utf-8"
-    )
-    assert "package genericagent.proxy.v1;" in text
-    assert "service LlmProxyService" in text
-    assert "rpc Generate(GenerateRequest) returns (stream GenerateEvent)" in text
-    assert "capability_token" in text
-    assert "session_key" in text
-    # Deny any field name that looks like an upstream API key or secret.
-    lowered = text.lower()
-    for forbidden in (
-        "api_key",
-        "apikey",
-        "api_key_id",
-        "secret",
-        "secret_key",
-        "bearer_token",
-    ):
-        assert forbidden not in lowered, (
-            f"llm_proxy.proto must not declare {forbidden!r}"
-        )
-
-
 def test_foundation_policy_is_deny_by_default_without_host_tools():
     policy = json.loads(
         (ROOT / "contracts/policy/foundation.v1.json").read_text(encoding="utf-8")
@@ -91,9 +61,11 @@ def test_platform_openapi_exposes_foundation_task_paths():
         "snapshot_id",
         "snapshot_checksum",
         "result_ref",
-        "tool_policy_version",
     ):
         assert field in text
+    # 审查 D1(去分级): tool_policy_version 已从任务提交契约移除,
+    # 策略统一由平台内部默认档位决定, 客户端不再指定。
+    assert "tool_policy_version" not in text
     task_required = text.split("TaskEnvelope:", 1)[1].split("properties:", 1)[0]
     for field in (
         "message_id",
@@ -101,9 +73,10 @@ def test_platform_openapi_exposes_foundation_task_paths():
         "prompt",
         "source",
         "persona_snapshot",
-        "tool_policy_version",
     ):
         assert f"- {field}" in task_required
+    # 审查 D1(去分级): 客户端不再提交 tool_policy_version。
+    assert "- tool_policy_version" not in task_required
 
 
 def test_sophub_search_route_matches_backend_web_and_openapi():

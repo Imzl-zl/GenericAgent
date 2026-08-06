@@ -195,7 +195,7 @@ func (s *Server) handleAdminListPendingPersonas(w http.ResponseWriter, r *http.R
 func (s *Server) handleAdminListPersonas(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	if r.URL.Query().Get("mine") == "true" {
-		personas, err := s.personas.ListByAuthor(r.Context(), s.devUserID)
+		personas, err := s.personas.ListByAuthor(r.Context(), s.adminUserID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "PERSONA_LIST_FAILED", err.Error(), tid)
 			return
@@ -230,7 +230,7 @@ func (s *Server) handleAdminCreatePersona(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
 		return
 	}
-	p, err := s.personas.AdminCreatePersona(r.Context(), s.devUserID, body.Name, body.Description, body.SystemPrompt, body.IsPublic)
+	p, err := s.personas.AdminCreatePersona(r.Context(), s.adminUserID, body.Name, body.Description, body.SystemPrompt, body.IsPublic)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "PERSONA_CREATE_FAILED", err.Error(), tid)
 		return
@@ -255,7 +255,7 @@ func (s *Server) handleAdminUpdatePersona(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), tid)
 		return
 	}
-	p, err := s.personas.AdminUpdatePersona(r.Context(), id, s.devUserID, body.Name, body.Description, body.SystemPrompt)
+	p, err := s.personas.AdminUpdatePersona(r.Context(), id, s.adminUserID, body.Name, body.Description, body.SystemPrompt)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "PERSONA_UPDATE_FAILED", err.Error(), tid)
 		return
@@ -292,9 +292,9 @@ func (s *Server) handleAdminSetDefaultPersona(w http.ResponseWriter, r *http.Req
 	}
 	var err error
 	if body.PersonaID == "" {
-		err = s.personas.ClearDefault(r.Context(), s.devUserID)
+		err = s.personas.ClearDefault(r.Context(), s.adminUserID)
 	} else {
-		err = s.personas.SetDefault(r.Context(), s.devUserID, body.PersonaID)
+		err = s.personas.SetDefault(r.Context(), s.adminUserID, body.PersonaID)
 	}
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "DEFAULT_PERSONA_FAILED", err.Error(), tid)
@@ -327,7 +327,7 @@ func (s *Server) handleModeratePersona(w http.ResponseWriter, r *http.Request, s
 		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
 		return
 	}
-	if err := s.personas.Moderate(r.Context(), id, s.devUserID, status, body.Note); err != nil {
+	if err := s.personas.Moderate(r.Context(), id, s.adminUserID, status, body.Note); err != nil {
 		writeErr(w, http.StatusBadRequest, "PERSONA_MODERATE_FAILED", err.Error(), tid)
 		return
 	}

@@ -23,7 +23,7 @@ export function AdminLoginPage() {
     }
 
     if (!token.trim()) {
-      setError('Dev Token 必填');
+      setError('Admin Token 必填');
       return;
     }
 
@@ -48,7 +48,7 @@ export function AdminLoginPage() {
         <div className="auth-card animate-fade-in-up animate-delay-1">
           <div className="auth-scanline" />
           <h1 className="auth-title">运营者登录</h1>
-          <p className="auth-subtitle">使用平台 Dev Token 进入运营后台</p>
+          <p className="auth-subtitle">使用平台 Admin Token 进入运营后台</p>
           <form className="auth-form" onSubmit={handleSubmit}>
             <Input
               label="用户名"
@@ -58,8 +58,8 @@ export function AdminLoginPage() {
               autoComplete="username"
             />
             <Input
-              label="Dev Token"
-              placeholder="PLATFORM_DEV_TOKEN"
+              label="Admin Token"
+              placeholder="PLATFORM_ADMIN_TOKEN"
               value={token}
               onChange={(e) => setToken(e.target.value)}
             />

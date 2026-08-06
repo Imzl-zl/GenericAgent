@@ -3,14 +3,14 @@ info:
   title: GenericAgent Tenant Platform Foundation API
   version: 0.1.0
   description: >
-    Loopback foundation HTTP contract for session tasks. X-Platform-Dev-Token is
+    Loopback foundation HTTP contract for session tasks. X-Platform-Admin-Token is
     required for this foundation-only API. No browser chat endpoint is exposed;
     the P0 user chat path remains BotTransportAdapter.
 servers:
   - url: http://127.0.0.1:8080
     description: Local loopback foundation backend
 security:
-  - PlatformDevToken: []
+  - PlatformAdminToken: []
 paths:
   /healthz:
     get:
@@ -35,6 +35,8 @@ paths:
           $ref: "#/components/responses/InternalError"
   /v1/sessions/{session_key}/tasks:
     post:
+      security:
+        - BearerToken: []
       operationId: createTask
       summary: Accept a task for the given session
       parameters:
@@ -71,6 +73,8 @@ paths:
           $ref: "#/components/responses/InternalError"
   /v1/tasks/{task_id}:
     get:
+      security:
+        - BearerToken: []
       operationId: getTask
       summary: Read task status and opaque result references
       parameters:
@@ -90,6 +94,8 @@ paths:
           $ref: "#/components/responses/InternalError"
   /v1/tasks/{task_id}/result:
     get:
+      security:
+        - BearerToken: []
       operationId: getTaskResult
       summary: Read the bounded committed result by opaque result_ref
       description: >
@@ -143,6 +149,8 @@ paths:
           $ref: "#/components/responses/InternalError"
   /v1/tasks/{task_id}/cancel:
     post:
+      security:
+        - BearerToken: []
       operationId: cancelTask
       summary: Request cooperative task cancellation
       parameters:
@@ -258,39 +266,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
-  /v1/admin/bots:
-    post:
-      operationId: adminCreateBot
-      summary: Register a WeChat/iLink bot for a platform user
-      description: >
-        Stores the upstream bot token encrypted at rest. The plaintext token
-        is returned to the caller only once (from iLink); the platform never
-        persists or logs it in plaintext.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateBotRequest"
-      responses:
-        "201":
-          description: Bot registered
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/BotRecord"
-        "400":
-          $ref: "#/components/responses/ValidationError"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
   /v1/admin/llm-providers:
     get:
       operationId: adminListLLMProviders
       summary: List all LLM providers (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       responses:
         "200":
           description: Provider list
@@ -312,7 +293,7 @@ paths:
       operationId: adminCreateLLMProvider
       summary: Create an upstream LLM provider (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       requestBody:
         required: true
         content:
@@ -337,7 +318,7 @@ paths:
       operationId: adminGetLLMProvider
       summary: Get an LLM provider by ID (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: provider_id
           in: path
@@ -360,7 +341,7 @@ paths:
       operationId: adminUpdateLLMProvider
       summary: Update an LLM provider (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: provider_id
           in: path
@@ -391,7 +372,7 @@ paths:
       operationId: adminDeleteLLMProvider
       summary: Delete an LLM provider (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: provider_id
           in: path
@@ -411,7 +392,7 @@ paths:
       operationId: adminSetDefaultLLMProvider
       summary: Set the default LLM provider (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: provider_id
           in: path
@@ -444,7 +425,7 @@ paths:
       operationId: adminDisableLLMProvider
       summary: Disable a non-default LLM provider (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: provider_id
           in: path
@@ -468,7 +449,7 @@ paths:
       operationId: adminEnableLLMProvider
       summary: Enable an LLM provider (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: provider_id
           in: path
@@ -492,7 +473,7 @@ paths:
       operationId: adminListMCPServers
       summary: List globally shared MCP servers (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       responses:
         "200":
           description: MCP server list
@@ -511,7 +492,7 @@ paths:
       operationId: adminCreateMCPServer
       summary: Create a disabled global MCP server (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       requestBody:
         required: true
         content:
@@ -537,7 +518,7 @@ paths:
       operationId: adminUpdateMCPServer
       summary: Update a global MCP server (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       requestBody:
         required: true
         content:
@@ -558,7 +539,7 @@ paths:
       operationId: adminDeleteMCPServer
       summary: Delete a global MCP server (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       responses:
         "204": {description: MCP server deleted}
         "401": {$ref: "#/components/responses/Unauthorized"}
@@ -569,7 +550,7 @@ paths:
       operationId: adminEnableMCPServer
       summary: Enable an MCP server for every tenant (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: mcp_server_id
           in: path
@@ -589,7 +570,7 @@ paths:
       operationId: adminDisableMCPServer
       summary: Disable an MCP server for every tenant (admin-only)
       tags: [admin]
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: mcp_server_id
           in: path
@@ -604,60 +585,10 @@ paths:
         "401": {$ref: "#/components/responses/Unauthorized"}
         "404": {$ref: "#/components/responses/NotFound"}
         "500": {$ref: "#/components/responses/InternalError"}
-  /v1/bindings:
-    post:
-      operationId: createBinding
-      summary: Generate a one-time WeChat binding code for a user
-      description: >
-        Returns the plaintext code ONCE; only its SHA-256 hash is persisted.
-        The code expires after a short TTL (default 10 minutes).
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateBindingRequest"
-      responses:
-        "201":
-          description: Binding code generated
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/BindingCode"
-        "400":
-          $ref: "#/components/responses/ValidationError"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /v1/activate:
-    post:
-      operationId: activateBinding
-      summary: Activate a binding code and pair a bot with an ilink user
-      description: >
-        HTTP equivalent of the /activate bot command (spec §6.2). Consumes
-        the one-time code atomically and binds the bot to the ilink_user_id.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ActivateRequest"
-      responses:
-        "200":
-          description: Binding activated
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/BindingRecord"
-        "400":
-          $ref: "#/components/responses/ValidationError"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "500":
-          $ref: "#/components/responses/InternalError"
   /v1/router/messages:
     post:
+      security:
+        - PlatformAdminToken: []
       operationId: routerMessage
       summary: Ingest one bot message through the router pipeline
       description: >
@@ -689,7 +620,7 @@ paths:
     get:
       tags: [admin]
       summary: List all platform commands (admin-configurable)
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       responses:
         "200":
           description: Command list
@@ -705,7 +636,7 @@ paths:
     put:
       tags: [admin]
       summary: Update a platform command (enable/disable, reclassify, edit help)
-      security: [{PlatformDevToken: []}]
+      security: [{PlatformAdminToken: []}]
       parameters:
         - name: command_id
           in: path
@@ -727,40 +658,6 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
-  /v1/admin/tool-policies:
-    get:
-      tags: [admin]
-      summary: List all tool policies
-      security: [{PlatformDevToken: []}]
-      responses:
-        "200":
-          description: Policy list
-          content:
-            application/json:
-              schema:
-                type: array
-                items: {$ref: "#/components/schemas/ToolPolicy"}
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-    post:
-      tags: [admin]
-      summary: Create a new tool policy version
-      security: [{PlatformDevToken: []}]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {$ref: "#/components/schemas/CreateToolPolicyRequest"}
-      responses:
-        "201":
-          description: Created policy
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/ToolPolicy"}
-        "400":
-          $ref: "#/components/responses/ValidationError"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
 
   /v1/admin/sophub/binding:
     get:
@@ -847,12 +744,627 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/SophubInstallResult"}
         "401": {$ref: "#/components/responses/Unauthorized"}
+  /v1/admin/dashboard/stats:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminDashboardStats
+      summary: 仪表盘统计
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/invite-codes:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminListInviteCodes
+      summary: 列出邀请码
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    post:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminCreateInviteCode
+      summary: 生成邀请码
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    delete:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminDeleteInviteCodes
+      summary: 批量删除邀请码
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/invite-codes/{code}:
+    delete:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminRevokeInviteCode
+      summary: 吊销单个邀请码
+      parameters:
+        - name: code
+          in: path
+          required: true
+          description: 邀请码
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/me/default-persona:
+    post:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminSetDefaultPersona
+      summary: 管理员设置默认人设
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/me/wechat-qrcode:
+    post:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminCreateWechatQRCode
+      summary: 管理员申请微信二维码
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/me/wechat-qrcode/status:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminGetWechatQRCodeStatus
+      summary: 管理员查询微信绑定状态
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/personas:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminListPersonas
+      summary: 管理端列出人设
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    post:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminCreatePersona
+      summary: 管理端创建人设
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/personas/pending:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminListPendingPersonas
+      summary: 列出待审核公共人设
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/personas/{persona_id}:
+    put:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminUpdatePersona
+      summary: 管理端更新人设
+      parameters:
+        - name: persona_id
+          in: path
+          required: true
+          description: 人设 UUID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    delete:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminDeletePersona
+      summary: 管理端删除人设
+      parameters:
+        - name: persona_id
+          in: path
+          required: true
+          description: 人设 UUID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/personas/{persona_id}/approve:
+    post:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminApprovePersona
+      summary: 批准公共人设
+      parameters:
+        - name: persona_id
+          in: path
+          required: true
+          description: 人设 UUID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/personas/{persona_id}/reject:
+    post:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminRejectPersona
+      summary: 驳回公共人设
+      parameters:
+        - name: persona_id
+          in: path
+          required: true
+          description: 人设 UUID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/settings/agent-runtime:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminGetAgentRuntimeSettings
+      summary: 读取 agent 运行时设置
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    put:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminUpdateAgentRuntimeSettings
+      summary: 更新 agent 运行时设置
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/settings/im-aggregation:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminGetIMAggregationSettings
+      summary: 读取 IM 聚合设置
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    put:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminUpdateIMAggregationSettings
+      summary: 更新 IM 聚合设置
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/im/webhook:
+    post:
+      operationId: imWebhook
+      summary: Bot Poller 入站消息 webhook(HMAC-SHA256 签名)
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/login:
+    post:
+      operationId: login
+      summary: 用户密码登录, 返回 Bearer 会话 token
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/personas:
+    get:
+      security:
+        - BearerToken: []
+      operationId: listPersonas
+      summary: 列出当前用户可见的人设
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    post:
+      security:
+        - BearerToken: []
+      operationId: createPersona
+      summary: 创建人设(私有/待审批公共)
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/personas/{persona_id}:
+    get:
+      security:
+        - BearerToken: []
+      operationId: getPersona
+      summary: 获取人设详情
+      parameters:
+        - name: persona_id
+          in: path
+          required: true
+          description: 人设 UUID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    put:
+      security:
+        - BearerToken: []
+      operationId: updatePersona
+      summary: 更新本人创建的人设
+      parameters:
+        - name: persona_id
+          in: path
+          required: true
+          description: 人设 UUID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    delete:
+      security:
+        - BearerToken: []
+      operationId: deletePersona
+      summary: 删除本人创建的人设
+      parameters:
+        - name: persona_id
+          in: path
+          required: true
+          description: 人设 UUID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/personas/{persona_id}/submit:
+    post:
+      security:
+        - BearerToken: []
+      operationId: submitPersona
+      summary: 提交人设进入公共池审核
+      parameters:
+        - name: persona_id
+          in: path
+          required: true
+          description: 人设 UUID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/register:
+    post:
+      operationId: register
+      summary: 邀请码注册, 返回待审批用户与 Bearer token
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/users/me/bots:
+    get:
+      security:
+        - BearerToken: []
+      operationId: getOwnBot
+      summary: 获取当前用户绑定的 iLink bot
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/users/me/default-persona:
+    post:
+      security:
+        - BearerToken: []
+      operationId: setDefaultPersona
+      summary: 设置默认人设
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/users/me/wechat-qrcode:
+    post:
+      security:
+        - BearerToken: []
+      operationId: createWechatQRCode
+      summary: 申请微信扫码绑定二维码
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/users/me/wechat-qrcode/status:
+    get:
+      security:
+        - BearerToken: []
+      operationId: getWechatQRCodeStatus
+      summary: 查询微信绑定状态
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
 components:
   securitySchemes:
-    PlatformDevToken:
+    PlatformAdminToken:
       type: apiKey
       in: header
-      name: X-Platform-Dev-Token
+      name: X-Platform-Admin-Token
       description: Required foundation-only loopback development token
     BearerToken:
       type: http
@@ -892,7 +1404,7 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     Unauthorized:
-      description: Missing or invalid X-Platform-Dev-Token
+      description: Missing or invalid X-Platform-Admin-Token
       content:
         application/json:
           schema:
@@ -982,7 +1494,6 @@ components:
         - prompt
         - source
         - persona_snapshot
-        - tool_policy_version
       properties:
         message_id:
           type: string
@@ -997,8 +1508,6 @@ components:
           type: array
           items:
             type: string
-        tool_policy_version:
-          type: string
         task_id:
           type: string
           description: Ignored on submit; platform assigns task_id
@@ -1051,6 +1560,9 @@ components:
         username:
           type: string
           description: Platform username (1-64 bytes)
+        password:
+          type: string
+          description: Optional password; empty means an admin-created test account
     UserRecord:
       type: object
       required:
@@ -1071,116 +1583,6 @@ components:
           type: string
           format: date-time
         approved_at:
-          type: string
-          format: date-time
-          nullable: true
-    CreateBotRequest:
-      type: object
-      required:
-        - owner_id
-        - bot_uuid
-        - token
-      properties:
-        owner_id:
-          type: integer
-          format: int64
-          minimum: 1
-        bot_uuid:
-          type: string
-          format: uuid
-        token:
-          type: string
-          description: Upstream iLink bot token; encrypted at rest by the platform
-    BotRecord:
-      type: object
-      required:
-        - bot_id
-        - bot_uuid
-        - owner_id
-        - state
-        - created_at
-      properties:
-        bot_id:
-          type: integer
-          format: int64
-        bot_uuid:
-          type: string
-          format: uuid
-        owner_id:
-          type: integer
-          format: int64
-        state:
-          type: string
-          enum: [active, expired, revoked]
-        created_at:
-          type: string
-          format: date-time
-    CreateBindingRequest:
-      type: object
-      required:
-        - user_id
-      properties:
-        user_id:
-          type: integer
-          format: int64
-          minimum: 1
-    BindingCode:
-      type: object
-      required:
-        - code
-        - binding_id
-        - user_id
-        - state
-        - expires_at
-      properties:
-        code:
-          type: string
-          description: One-time plaintext binding code; returned ONCE, never persisted
-        binding_id:
-          type: integer
-          format: int64
-        user_id:
-          type: integer
-          format: int64
-        state:
-          type: string
-          enum: [requested, qr_pending, awaiting_activation, active, expired, revoked]
-        expires_at:
-          type: string
-          format: date-time
-    ActivateRequest:
-      type: object
-      required:
-        - code
-        - bot_uuid
-        - ilink_user_id
-      properties:
-        code:
-          type: string
-          description: One-time binding code (plaintext)
-        bot_uuid:
-          type: string
-          format: uuid
-        ilink_user_id:
-          type: string
-          description: External IM user id to bind to the bot
-    BindingRecord:
-      type: object
-      required:
-        - binding_id
-        - user_id
-        - state
-      properties:
-        binding_id:
-          type: integer
-          format: int64
-        user_id:
-          type: integer
-          format: int64
-        state:
-          type: string
-          enum: [requested, qr_pending, awaiting_activation, active, expired, revoked]
-        activated_at:
           type: string
           format: date-time
           nullable: true
@@ -1264,51 +1666,6 @@ components:
           type: boolean
         sort_order:
           type: integer
-    ToolPolicy:
-      type: object
-      required:
-        - id
-        - version
-        - allowed_tools
-        - enabled
-      properties:
-        id:
-          type: integer
-          format: int64
-        version:
-          type: string
-          example: "foundation.no-host-tools.v1"
-        allowed_tools:
-          type: array
-          items:
-            type: string
-          example: ["update_working_checkpoint"]
-        description:
-          type: string
-        enabled:
-          type: boolean
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-    CreateToolPolicyRequest:
-      type: object
-      required:
-        - version
-        - allowed_tools
-      properties:
-        version:
-          type: string
-          example: "foundation.code-run.v1"
-        allowed_tools:
-          type: array
-          items:
-            type: string
-          example: ["update_working_checkpoint", "code_run", "file_read"]
-        description:
-          type: string
     LLMProviderType:
       type: string
       enum: [native_oai, native_claude]

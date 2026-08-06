@@ -74,6 +74,8 @@ func migrationFiles() []string {
 		"0043_capability_usage.sql",
 		"0044_task_delivery_files.sql",
 		"0045_delivery_cancelled.sql",
+		"0046_drop_tool_policy.sql",
+		"0047_delivery_attempt_token.sql",
 	}
 }
 
@@ -123,6 +125,8 @@ var pendingMigrations = []struct {
 	{"0043_capability_usage.sql", "migration_0043_capability_usage_marker"},
 	{"0044_task_delivery_files.sql", "migration_0044_task_delivery_files_marker"},
 	{"0045_delivery_cancelled.sql", "migration_0045_delivery_cancelled_marker"},
+	{"0046_drop_tool_policy.sql", "migration_0046_drop_tool_policy_marker"},
+	{"0047_delivery_attempt_token.sql", "migration_0047_delivery_attempt_token_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -187,6 +191,9 @@ var foundationTableNames = []string{
 	"migration_0043_capability_usage_marker",
 	"task_delivery_files",
 	"migration_0044_task_delivery_files_marker",
+	"migration_0045_delivery_cancelled_marker",
+	"migration_0046_drop_tool_policy_marker",
+	"migration_0047_delivery_attempt_token_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",

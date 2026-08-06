@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Generate checked-in Go and Python Worker protobuf bindings."""
+"""Generate checked-in Go and Python Worker protobuf bindings.
+
+只生成 worker.proto。LLM Proxy 契约以 HTTP 实现为准
+(backend-go/internal/infrastructure/llmproxy, 路由 /v1/chat/completions 等),
+不生成 gRPC proxy 绑定。"""
 
 from __future__ import annotations
 

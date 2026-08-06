@@ -18,21 +18,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   });
 
-  const login = useCallback((username: string, token: string, isAdmin = false) => {
+  const login = useCallback((username: string, token: string, isAdmin = false, extra?: { userId?: number; status?: 'pending' | 'approved' | 'blocked' }) => {
     localStorage.removeItem('ga_username');
     localStorage.removeItem('ga_admin_token');
     localStorage.removeItem('ga_user_token');
     localStorage.removeItem('ga_is_admin');
-    localStorage.removeItem('ga_user_id');
 
     localStorage.setItem('ga_username', username);
     localStorage.setItem('ga_is_admin', String(isAdmin));
     if (isAdmin) {
       localStorage.setItem('ga_admin_token', token);
-      setState({ username, isAdmin, adminToken: token });
+      setState({ username, isAdmin, adminToken: token, userId: extra?.userId, status: extra?.status });
     } else {
       localStorage.setItem('ga_user_token', token);
-      setState({ username, isAdmin, userToken: token });
+      setState({ username, isAdmin, userToken: token, userId: extra?.userId, status: extra?.status });
     }
   }, []);
 
@@ -41,7 +40,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem('ga_admin_token');
     localStorage.removeItem('ga_user_token');
     localStorage.removeItem('ga_is_admin');
-    localStorage.removeItem('ga_user_id');
     setState(null);
   }, []);
 

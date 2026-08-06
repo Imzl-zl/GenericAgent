@@ -164,9 +164,12 @@ func (s *scheduler) initializeWorkerEntry(
 	}
 	credentials, files, err := s.issueInitialWorkerCredentials(ctx, task, generation)
 	if err != nil {
-		// 审查: lease 已获取/续租但初始化失败——立即释放归还全局容量,
-		// 否则多工作区各失败一次即可占满容量直到 TTL 到期。
-		s.releaseRunnerLeaseBestEffort(task.SessionKey, generation)
+		// 审查 F1: lease 已获取/续租但初始化失败——只归还容量
+		// (ExpireRunnerLease), 不清空 container_id/stale_container_id:
+		// 接管后旧容器可能仍挂载 workspace, 引用必须保留给下一轮
+		// EnsureRunner 定向销毁, 否则残留容器失去 DB 追踪只能等
+		// 扫描/TTL 兜底。语义与 sandbox_runtime 失败路径一致。
+		s.expireRunnerLeaseBestEffort(task.SessionKey, generation)
 		s.removeWorkerEntry(task.SessionKey, entry)
 		entry.lifecycleMu.Unlock()
 		return nil, nil, err
@@ -244,15 +247,16 @@ func (s *scheduler) cleanupWorkerEntryBestEffort(ctx context.Context, entry *wor
 // revokeCredentialSetBestEffort persists every JTI with the token's exact
 // expiry. Token material and full JTIs are never logged.
 
-// releaseRunnerLeaseBestEffort 释放会话的 Runner lease(best-effort):
-// loopback/static 无持久 lease 返回 nil; Sandbox 路径失败只记录日志,
-// 不阻断调用方(容量由 TTL 兜底)。
-func (s *scheduler) releaseRunnerLeaseBestEffort(sessionKey string, generation uint64) {
+// expireRunnerLeaseBestEffort 归还会话的 Runner 容量(best-effort), 但保留
+// 容器引用(container_id/stale_container_id)供下一轮接管定向销毁——
+// 与 sandbox_runtime 失败路径语义一致(审查 F1)。loopback/static 无持久
+// lease 返回 nil; Sandbox 路径失败只记录日志, 不阻断调用方。
+func (s *scheduler) expireRunnerLeaseBestEffort(sessionKey string, generation uint64) {
 	if s.cfg.Runtime == nil || generation == 0 {
 		return
 	}
-	if err := s.cfg.Runtime.ReleaseRunnerLease(context.Background(), sessionKey, generation); err != nil {
-		slog.WarnContext(context.Background(), "scheduler: release runner lease after init failure failed",
+	if err := s.cfg.Runtime.ExpireRunnerLease(context.Background(), sessionKey, generation); err != nil {
+		slog.WarnContext(context.Background(), "scheduler: expire runner lease after init failure failed",
 			"session_key", sessionKey, "generation", generation, "error", err)
 	}
 }

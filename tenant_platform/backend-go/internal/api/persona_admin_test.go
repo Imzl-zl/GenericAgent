@@ -17,8 +17,8 @@ import (
 )
 
 // personaAdminFixture builds a server wired with a real persona service backed
-// by the test Postgres pool. DevUserID 9 stands in for the admin identity used
-// by the dev-token (s.auth) admin endpoints.
+// by the test Postgres pool. AdminUserID 9 stands in for the admin identity used
+// by the admin token (s.auth) admin endpoints.
 func personaAdminFixture(t *testing.T) (*Server, *postgres.Store) {
 	t.Helper()
 	pool := postgres.OpenTestPool(t)
@@ -26,13 +26,13 @@ func personaAdminFixture(t *testing.T) (*Server, *postgres.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dev, err := store.EnsureDevelopmentContext(context.Background(), 9, "persona-admin-dev")
+	dev, err := store.EnsureAdminContext(context.Background(), 9, "persona-admin-dev")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Seed a second user (id 42) so tests can author personas under a
 	// non-admin author and verify the ?mine=true filter.
-	if _, err := store.EnsureDevelopmentContext(context.Background(), 42, "persona-other-user"); err != nil {
+	if _, err := store.EnsureAdminContext(context.Background(), 42, "persona-other-user"); err != nil {
 		t.Fatal(err)
 	}
 	_, file, _, _ := runtime.Caller(0)
@@ -55,8 +55,8 @@ func personaAdminFixture(t *testing.T) (*Server, *postgres.Store) {
 		Service:    svc,
 		Registry:   reg,
 		Personas:   personas,
-		DevToken:   "test-dev-token",
-		DevUserID:  9,
+		AdminToken:   "test-admin token",
+		AdminUserID:  9,
 		SessionKey: dev.SessionKey,
 	})
 	if err != nil {
@@ -76,7 +76,7 @@ func adminReq(t *testing.T, srv *Server, method, path string, body any) (*httpte
 	}
 	req := httptest.NewRequest(method, path, reader)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	var out map[string]any

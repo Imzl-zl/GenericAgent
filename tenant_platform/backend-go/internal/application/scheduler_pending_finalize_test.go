@@ -143,6 +143,15 @@ type foreignClaimStore struct {
 	*flakyTerminalStore
 }
 
+
+
+func (s *foreignClaimStore) IsApprovedUser(_ context.Context, _ int64) (bool, error) {
+	return true, nil
+}
+func (f *foreignClaimStore) IsApprovedTeamMember(_ context.Context, _ string, _ int64) (bool, error) {
+	return true, nil
+}
+
 func (s *foreignClaimStore) GetTask(ctx context.Context, taskID string) (domain.Task, error) {
 	t, err := s.Store.GetTask(ctx, taskID)
 	if err != nil {

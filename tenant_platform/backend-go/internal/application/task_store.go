@@ -12,6 +12,13 @@ import (
 // instead of hitting a real database (plan Task 5 Step 5: "Unit tests use an
 // in-process gRPC test service and a real temporary-filesystem coordinator").
 type TaskStore interface {
+	// IsApprovedTeamMember 报告 userID 是否为 teamID 的已批准成员
+	// (审查 I-4: 团队 session 的任务提交/访问校验)。
+	IsApprovedTeamMember(ctx context.Context, teamID string, userID int64) (bool, error)
+	// IsApprovedUser 报告 userID 是否为 approved 状态用户
+	// (审查 I-4: 任务提交门禁与 capability 在线校验一致——pending 用户
+	// 提交的任务执行时必然被拒, 提交即拒绝避免无效任务)。
+	IsApprovedUser(ctx context.Context, userID int64) (bool, error)
 	SubmitTask(ctx context.Context, cmd domain.SubmitTaskCommand) (domain.Task, error)
 	// SubmitTaskWithInboundMessage 同一事务内提交入站消息行与任务
 	// (round10 审查 B7)。

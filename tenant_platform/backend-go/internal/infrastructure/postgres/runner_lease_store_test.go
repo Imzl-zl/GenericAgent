@@ -288,7 +288,7 @@ func TestListExpiredRunnerLeasesOnlyReturnsExpired(t *testing.T) {
 	}
 	time.Sleep(5 * time.Millisecond)
 
-	expired, err := store.ListExpiredRunnerLeases(ctx, time.Now().UTC())
+	expired, err := store.ListExpiredRunnerLeases(ctx) // 审查 F3: DB 时钟
 	if err != nil {
 		t.Fatalf("ListExpiredRunnerLeases: %v", err)
 	}

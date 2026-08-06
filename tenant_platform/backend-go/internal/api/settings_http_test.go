@@ -60,15 +60,15 @@ func TestAdminIMAggregationSettingsGetAndUpdate(t *testing.T) {
 		Registry:             dashboardFakeRegistry{},
 		RuntimeSettings:      settings,
 		IMAggregationRuntime: runtime,
-		DevToken:             "test-dev-token",
-		DevUserID:            9,
+		AdminToken:             "test-admin token",
+		AdminUserID:            9,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/settings/im-aggregation", nil)
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -85,7 +85,7 @@ func TestAdminIMAggregationSettingsGetAndUpdate(t *testing.T) {
 	body, _ := json.Marshal(updateIMAggregationSettingsBody{WindowMS: 1800})
 	req = httptest.NewRequest(http.MethodPut, "/v1/admin/settings/im-aggregation", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -101,8 +101,8 @@ func TestAdminIMAggregationSettingsRejectInvalidWindow(t *testing.T) {
 		Service:         dashboardFakeTaskService{},
 		Registry:        dashboardFakeRegistry{},
 		RuntimeSettings: &fakeRuntimeSettingsStore{windowMS: 2500, maxTurns: 80},
-		DevToken:        "test-dev-token",
-		DevUserID:       9,
+		AdminToken:        "test-admin token",
+		AdminUserID:       9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func TestAdminIMAggregationSettingsRejectInvalidWindow(t *testing.T) {
 	body := []byte(`{"window_ms": 6000}`)
 	req := httptest.NewRequest(http.MethodPut, "/v1/admin/settings/im-aggregation", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
@@ -125,15 +125,15 @@ func TestAdminAgentRuntimeSettingsGetAndUpdate(t *testing.T) {
 		Service:         dashboardFakeTaskService{},
 		Registry:        dashboardFakeRegistry{},
 		RuntimeSettings: settings,
-		DevToken:        "test-dev-token",
-		DevUserID:       9,
+		AdminToken:        "test-admin token",
+		AdminUserID:       9,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/settings/agent-runtime", nil)
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -149,7 +149,7 @@ func TestAdminAgentRuntimeSettingsGetAndUpdate(t *testing.T) {
 
 	req = httptest.NewRequest(http.MethodPut, "/v1/admin/settings/agent-runtime", bytes.NewBufferString(`{"max_turns":120}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -167,8 +167,8 @@ func TestAdminRuntimeProfileConcurrentReadAndUpdate(t *testing.T) {
 		Registry:        dashboardFakeRegistry{},
 		RuntimeSettings: settings,
 		RuntimeProfile:  RuntimeProfile{AgentMaxTurns: 80},
-		DevToken:        "test-dev-token",
-		DevUserID:       9,
+		AdminToken:        "test-admin token",
+		AdminUserID:       9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -182,13 +182,13 @@ func TestAdminRuntimeProfileConcurrentReadAndUpdate(t *testing.T) {
 			body, _ := json.Marshal(map[string]int{"max_turns": value})
 			req := httptest.NewRequest(http.MethodPut, "/v1/admin/settings/agent-runtime", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+			req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 			srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
 		}(80 + i)
 		go func() {
 			defer wg.Done()
 			req := httptest.NewRequest(http.MethodGet, "/v1/admin/dashboard/stats", nil)
-			req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+			req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 			srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
 		}()
 	}
@@ -200,8 +200,8 @@ func TestAdminAgentRuntimeSettingsRejectInvalidMaxTurns(t *testing.T) {
 		Service:         dashboardFakeTaskService{},
 		Registry:        dashboardFakeRegistry{},
 		RuntimeSettings: &fakeRuntimeSettingsStore{windowMS: 2500, maxTurns: 80},
-		DevToken:        "test-dev-token",
-		DevUserID:       9,
+		AdminToken:        "test-admin token",
+		AdminUserID:       9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +211,7 @@ func TestAdminAgentRuntimeSettingsRejectInvalidMaxTurns(t *testing.T) {
 		body, _ := json.Marshal(map[string]int{"max_turns": value})
 		req := httptest.NewRequest(http.MethodPut, "/v1/admin/settings/agent-runtime", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+		req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 		rr := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rr, req)
 		if rr.Code != http.StatusBadRequest {

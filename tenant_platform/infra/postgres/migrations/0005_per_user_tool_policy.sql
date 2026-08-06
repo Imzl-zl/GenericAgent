@@ -1,5 +1,9 @@
 -- Migration 0005: Per-user tool policy assignment.
 --
+-- 审查 D1(去分级): 本机制已废弃。0046 迁移删除 users.tool_policy_version
+-- 列, 工具能力统一由静态 policy manifest(foundation.v1.json) 决定,
+-- 不再按用户分配/升级。保留本文件仅为迁移历史可追溯。
+--
 -- Problem: tool_policy_version was global (one policy for all users). Admins
 -- couldn't grant different capabilities to different users (e.g. free users
 -- get no-host-tools, premium users get code_run).

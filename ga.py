@@ -664,9 +664,14 @@ class GenericAgentHandler(BaseHandler):
         #next_prompt += '\n[SYSTEM TIPS] 此函数一般在任务开始或中间时调用，如果任务已成功完成应该是start_long_term_update用于结算长期记忆。\n'
         return StepOutcome({"result": "working key_info updated"}, next_prompt=next_prompt)
 
-    def _retry_or_exit(self, prompt):
+    def _retry_or_exit(self, prompt, fatal=False):
         self._empty_ct = getattr(self, '_empty_ct', 0) + 1
-        if self._empty_ct >= 3: return StepOutcome({}, should_exit=True)
+        if self._empty_ct >= 3:
+            # 审查 D5: 连续空/不完整/故障响应达到上限时, 以结构化 result 退出——
+            # 调用方(agentmain/Worker)据此映射失败终态, 而不是把故障当成功。
+            if fatal:
+                return StepOutcome({"result": "LLM_FAILED", "msg": prompt}, should_exit=True)
+            return StepOutcome({}, should_exit=True)
         return StepOutcome({}, next_prompt=prompt)
 
     def do_no_tool(self, args, response):
@@ -679,7 +684,9 @@ class GenericAgentHandler(BaseHandler):
             yield "[Warn] LLM returned an empty response. Retrying...\n"
             return self._retry_or_exit("[System] Blank response, regenerate and tooluse")
         if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[-100:] or content.endswith('</summary>'):
-            return self._retry_or_exit("[System] Incomplete response. Regenerate and tooluse.")
+            # 审查 D5: 传输/HTTP/解析故障(!!!Error:/流异常)是致命错误, 3 次
+            # 后必须标记 LLM_FAILED, 不能让故障响应被当作成功完成任务。
+            return self._retry_or_exit("[System] Incomplete response. Regenerate and tooluse.", fatal=True)
         if 'max_tokens !!!]' in content[-100:]:
             return self._retry_or_exit("[System] max_tokens limit reached. Use multi small steps to do it.")
         

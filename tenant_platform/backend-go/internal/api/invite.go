@@ -65,7 +65,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAdminCreateInviteCode(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
-	plaintext, ic, err := s.invite.GenerateInviteCode(r.Context(), s.devUserID)
+	plaintext, ic, err := s.invite.GenerateInviteCode(r.Context(), s.adminUserID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "INVITE_GENERATE_FAILED", err.Error(), tid)
 		return

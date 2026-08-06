@@ -32,7 +32,7 @@ func llmProviderServerFixture(t *testing.T) (*Server, *postgres.Store, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dev, err := store.EnsureDevelopmentContext(context.Background(), 42, "llm-dev")
+	dev, err := store.EnsureAdminContext(context.Background(), 42, "llm-dev")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func llmProviderServerFixture(t *testing.T) (*Server, *postgres.Store, string) {
 	}
 	srv, err := NewServer(ServerConfig{
 		Service: svc, Registry: reg, LLMProviders: store, Cipher: cipher,
-		DevToken: "test-dev-token", DevUserID: dev.UserID, SessionKey: dev.SessionKey,
+		AdminToken: "test-admin token", AdminUserID: dev.UserID, SessionKey: dev.SessionKey,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func TestAdminCreateLLMProviderEncryptsKey(t *testing.T) {
 	raw, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/llm-providers", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusCreated {
@@ -111,7 +111,7 @@ func TestAdminCreateLLMProviderRejectsInvalidType(t *testing.T) {
 	raw, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/llm-providers", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
@@ -121,7 +121,7 @@ func TestAdminCreateLLMProviderRejectsInvalidType(t *testing.T) {
 
 func TestAdminLLMProviderLifecycle(t *testing.T) {
 	srv, _, _ := llmProviderServerFixture(t)
-	devToken := "test-dev-token"
+	adminToken := "test-admin token"
 
 	// Create.
 	createBody := map[string]any{
@@ -134,7 +134,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 	raw, _ := json.Marshal(createBody)
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/llm-providers", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", devToken)
+	req.Header.Set("X-Platform-Admin-Token", adminToken)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusCreated {
@@ -151,7 +151,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 
 	// List.
 	req = httptest.NewRequest(http.MethodGet, "/v1/admin/llm-providers", nil)
-	req.Header.Set("X-Platform-Dev-Token", devToken)
+	req.Header.Set("X-Platform-Admin-Token", adminToken)
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -167,7 +167,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 
 	// Get.
 	req = httptest.NewRequest(http.MethodGet, "/v1/admin/llm-providers/"+itoa(id), nil)
-	req.Header.Set("X-Platform-Dev-Token", devToken)
+	req.Header.Set("X-Platform-Admin-Token", adminToken)
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -185,7 +185,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 	raw, _ = json.Marshal(updateBody)
 	req = httptest.NewRequest(http.MethodPut, "/v1/admin/llm-providers/"+itoa(id), bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Platform-Dev-Token", devToken)
+	req.Header.Set("X-Platform-Admin-Token", adminToken)
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -201,7 +201,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 
 	// Set default (idempotent for single provider).
 	req = httptest.NewRequest(http.MethodPost, "/v1/admin/llm-providers/"+itoa(id)+"/default", nil)
-	req.Header.Set("X-Platform-Dev-Token", devToken)
+	req.Header.Set("X-Platform-Admin-Token", adminToken)
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -210,7 +210,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 
 	// Delete.
 	req = httptest.NewRequest(http.MethodDelete, "/v1/admin/llm-providers/"+itoa(id), nil)
-	req.Header.Set("X-Platform-Dev-Token", devToken)
+	req.Header.Set("X-Platform-Admin-Token", adminToken)
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusNoContent {
@@ -219,7 +219,7 @@ func TestAdminLLMProviderLifecycle(t *testing.T) {
 
 	// List empty.
 	req = httptest.NewRequest(http.MethodGet, "/v1/admin/llm-providers", nil)
-	req.Header.Set("X-Platform-Dev-Token", devToken)
+	req.Header.Set("X-Platform-Admin-Token", adminToken)
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -410,7 +410,7 @@ func TestAdminCreateLLMProviderPreservesExplicitZeroAndOmitsSecrets(t *testing.T
 func TestProviderConfigEndpointRemoved(t *testing.T) {
 	srv, _, _ := llmProviderServerFixture(t)
 	request := httptest.NewRequest(http.MethodGet, "/v1/config/mykey.py", nil)
-	request.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	request.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	response := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusNotFound {
@@ -440,7 +440,7 @@ func performProviderWrite(
 	}
 	request := httptest.NewRequest(method, path, bytes.NewReader(raw))
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	request.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	response := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(response, request)
 	return response
@@ -458,7 +458,7 @@ func itoa(v int64) string {
 func performProviderCommand(t *testing.T, srv *Server, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	request := httptest.NewRequest(http.MethodPost, path, nil)
-	request.Header.Set("X-Platform-Dev-Token", "test-dev-token")
+	request.Header.Set("X-Platform-Admin-Token", "test-admin token")
 	response := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(response, request)
 	return response

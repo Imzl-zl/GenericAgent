@@ -13,10 +13,12 @@ Fixes applied during extraction:
 from __future__ import annotations
 
 import copy
+import logging
 import sys
-import threading
 from pathlib import Path
 from typing import Any, Callable
+
+_LOG = logging.getLogger(__name__)
 
 from ga_worker.limits import ToolPolicy
 from ga_worker.session_files import ensure_session_sandbox
@@ -171,7 +173,7 @@ def install_export_docx_tool(session: Any, legacy_mods: dict[str, Any] | None) -
 
         try:
             from docx import Document
-        except ImportError as exc:
+        except ImportError:
             yield "[Status] ❌ export_docx 不可用: 缺少 python-docx\n"
             step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)
             if step_outcome_cls is None:
@@ -658,8 +660,12 @@ def _swap_watched_agent(
 
         object.__setattr__(agent, "__class__", _WatchedAgent)
         return original_class, _WatchedAgent
-    except Exception:
-        agent._adapter_wrap_handler = wrap_handler  # type: ignore[attr-defined]
+    except Exception as exc:
+        # 审查(Minor): 移除隐藏 fallback——此前把 wrap_handler 挂到
+        # agent._adapter_wrap_handler 属性, 但没有任何消费方读取它,
+        # 类替换失败时输出字节计数会静默失效。显式告警让失效可见。
+        _LOG.warning("legacy_instrument: agent class swap failed; "
+                     "handler rebuild output counting may be bypassed: %s", exc)
         return original_class, None
 
 
@@ -690,7 +696,7 @@ def install_handler_print_counter(
                 and getattr(ga_mod, "GenericAgentHandler", None) is counted_cls):
             ga_mod.GenericAgentHandler = original_handler_cls  # type: ignore[assignment]
         _restore_wrapped_handlers(wrapped)
-        for attr in ("_adapter_handler_watch", "_adapter_wrap_handler"):
+        for attr in ("_adapter_handler_watch",):
             if hasattr(agent, attr):
                 try:
                     delattr(agent, attr)

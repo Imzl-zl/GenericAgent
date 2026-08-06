@@ -53,9 +53,9 @@ type DeliveryStore interface {
 	ClaimPendingDeliveries(ctx context.Context, limit int, lease time.Duration, retryWindow time.Duration, now time.Time) ([]domain.Delivery, error)
 	ResetStaleSendingDeliveries(ctx context.Context, now time.Time) (int64, error)
 	DeadLetterExpiredDeliveries(ctx context.Context, retryWindow time.Duration, now time.Time) (int64, error)
-	MarkDeliveryAcked(ctx context.Context, deliveryID string, ackedAt time.Time) error
-	MarkDeliveryRetry(ctx context.Context, deliveryID string, nextAttemptAt time.Time, now time.Time) error
-	MarkDeliveryDeadLetter(ctx context.Context, deliveryID string, errCode, errMessage string, terminalAt time.Time) error
+	MarkDeliveryAcked(ctx context.Context, deliveryID, attemptToken string, ackedAt time.Time) error
+	MarkDeliveryRetry(ctx context.Context, deliveryID, attemptToken string, nextAttemptAt time.Time, now time.Time) error
+	MarkDeliveryDeadLetter(ctx context.Context, deliveryID, attemptToken string, errCode, errMessage string, terminalAt time.Time) error
 	// LoadDeliveryFiles 返回 task_complete delivery 绑定的输出文件快照
 	// (审查 R5-I3: 成功事务时捕获, 发送时不再解析 workspace 路径)。
 	LoadDeliveryFiles(ctx context.Context, deliveryID string) ([]domain.DeliveryFile, error)
@@ -99,7 +99,6 @@ type DeliveryServiceConfig struct {
 	Transport    transport.BotTransportAdapter
 	Results      ResultReader
 	Messages     MessageStore
-	SessionFiles SessionFiles
 	// TeamMembership 非 nil 时, 团队任务的终端交付前校验发起人成员资格
 	// (审查 R5-I4: 已移除成员不得再收到团队任务结果)。
 	TeamMembership TeamMembershipChecker
@@ -416,7 +415,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				"error", err)
 		}
 	}
-	return s.cfg.Store.MarkDeliveryAcked(ctx, d.DeliveryID, now)
+	return s.cfg.Store.MarkDeliveryAcked(ctx, d.DeliveryID, d.AttemptToken, now)
 }
 
 type deliveryPart struct {
@@ -608,11 +607,11 @@ func (s *deliveryService) retryOrDeadLetter(ctx context.Context, d domain.Delive
 	if !deadline.IsZero() && next.After(deadline) {
 		return s.deadLetter(ctx, d, code, message, now)
 	}
-	return s.cfg.Store.MarkDeliveryRetry(ctx, d.DeliveryID, next, now)
+	return s.cfg.Store.MarkDeliveryRetry(ctx, d.DeliveryID, d.AttemptToken, next, now)
 }
 
 func (s *deliveryService) deadLetter(ctx context.Context, d domain.Delivery, code, message string, now time.Time) error {
-	return s.cfg.Store.MarkDeliveryDeadLetter(ctx, d.DeliveryID, code, message, now)
+	return s.cfg.Store.MarkDeliveryDeadLetter(ctx, d.DeliveryID, d.AttemptToken, code, message, now)
 }
 
 func retryDeadline(task domain.Task, window time.Duration) time.Time {

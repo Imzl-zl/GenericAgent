@@ -53,50 +53,6 @@ func ValidateWorkspaceKey(key string) error {
 	return nil
 }
 
-// PersonalWorkspaceKey derives the personal workspace key for a canonical user.
-func PersonalWorkspaceKey(canonicalUserID int64) (string, error) {
-	if canonicalUserID <= 0 {
-		return "", fmt.Errorf("canonical user id must be positive")
-	}
-	return fmt.Sprintf("%s:%d", ScopePersonal, canonicalUserID), nil
-}
-
-// TeamWorkspaceKey derives the shared team workspace key.
-func TeamWorkspaceKey(teamID int64) (string, error) {
-	if teamID <= 0 {
-		return "", fmt.Errorf("team id must be positive")
-	}
-	return fmt.Sprintf("%s:%d", ScopeTeam, teamID), nil
-}
-
-// RunnerKeyForWorkspace returns the serialization key for a workspace.
-// Per spec §3 the runner key and workspace key have the same form:
-// personal:<canonical_user_id> or team:<team_id>.
-func RunnerKeyForWorkspace(workspaceKey string) (string, error) {
-	if err := ValidateWorkspaceKey(workspaceKey); err != nil {
-		return "", err
-	}
-	return workspaceKey, nil
-}
-
-// ParseWorkspaceKey validates and splits a workspace key into scope and id.
-func ParseWorkspaceKey(key string) (WorkspaceScope, int64, error) {
-	scope, idText, found := strings.Cut(key, ":")
-	if !found {
-		return "", 0, fmt.Errorf("%w: missing ':' separator", errInvalidWorkspaceKey)
-	}
-	id, err := strconv.ParseInt(idText, 10, 64)
-	if err != nil || id <= 0 {
-		return "", 0, fmt.Errorf("%w: invalid id %q", errInvalidWorkspaceKey, idText)
-	}
-	switch WorkspaceScope(scope) {
-	case ScopePersonal, ScopeTeam:
-		return WorkspaceScope(scope), id, nil
-	default:
-		return "", 0, fmt.Errorf("%w: unknown scope %q", errInvalidWorkspaceKey, scope)
-	}
-}
-
 // WorkspaceDirHash returns the stable directory hash for a workspace key
 // (spec §4: workspaces/<hash(workspace_key)>/).
 func WorkspaceDirHash(workspaceKey string) (string, error) {

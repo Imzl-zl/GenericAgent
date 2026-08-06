@@ -54,8 +54,21 @@ func (r *router) loadCommands(ctx context.Context) map[string]domain.PlatformCom
 		return r.cachedCommands
 	}
 	list, err := r.commands.ListEnabledCommands(ctx)
-	if err != nil || len(list) == 0 {
-		// DB error or empty registry: use defaults (fail-safe).
+	if err != nil {
+		// 审查 M-1: DB 故障不得用默认集静默覆盖管理员配置——保留上次成功
+		// 加载的缓存(陈旧但真实), 仅首次加载失败才回退默认集并告警。
+		if r.cachedCommands != nil {
+			slog.ErrorContext(ctx, "router: list enabled commands failed; using stale cache", "error", err)
+			r.cacheLoaded = true
+			return r.cachedCommands
+		}
+		slog.ErrorContext(ctx, "router: list enabled commands failed; falling back to defaults", "error", err)
+		r.cachedCommands = defaultCommands()
+		r.cacheLoaded = true
+		return r.cachedCommands
+	}
+	if len(list) == 0 {
+		// 空注册表: 使用默认集(fail-safe, 管理员可后续添加)。
 		r.cachedCommands = defaultCommands()
 		r.cacheLoaded = true
 		return r.cachedCommands
@@ -214,16 +227,10 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	if prompt == "" && len(msg.MediaPaths) > 0 {
 		prompt = "[media message]"
 	}
-	// Per-user tool policy (migration 0005): resolve the user's assigned policy
-	// version, not a global default. Admins can grant different capabilities
-	// to different users at runtime.
-	userPolicy, err := r.store.GetUserToolPolicy(ctx, bot.OwnerID)
-	if err != nil {
-		return nil, RouterResult{}, fmt.Errorf("resolve user tool policy: %w", err)
-	}
-	if userPolicy == "" {
-		userPolicy = r.toolPolicy // fallback to global default
-	}
+	// 去分级(审查 D1): 工具策略统一使用全局默认(全能力档), 不再按用户
+	// 分配/升级。0005 per-user tool policy 机制已停用, worker 侧 policy.json
+	// 仍从静态 manifest 注入, 执行链不变。
+	userPolicy := r.toolPolicy
 	// round12 审查(I7): 会话 key 在路由入口唯一解析一次并贯穿本消息——任务
 	// 行、消息行与附件 staging 共用同一 key, 不再二次解析(并发切换/瞬时
 	// 错误下两次独立解析会分叉, 团队任务消息可能落入个人历史)。命令处理器
@@ -251,9 +258,6 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 				prompt += "\n\n"
 			}
 			prompt += hint
-		}
-		if userPolicy == "foundation.no-host-tools.v1" {
-			userPolicy = "foundation.session-files.v1"
 		}
 	} else if len(msg.MediaPaths) > 0 {
 		if prompt != "" {

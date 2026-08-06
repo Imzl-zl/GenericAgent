@@ -34,8 +34,7 @@ export function LoginPage() {
 
     try {
       const res = await login(username.trim(), password);
-      localStorage.setItem('ga_user_id', String(res.user_id));
-      setAuth(res.username, res.token, false);
+      setAuth(res.username, res.token, false, { userId: res.user_id, status: res.status });
       navigate('/app', { replace: true });
     } catch (err) {
       if (err instanceof ApiClientError) {

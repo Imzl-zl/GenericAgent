@@ -13,6 +13,10 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 )
 
+// runningTaskLimitLockKey 是全局 running-task 上限 advisory lock 常量键
+// (审查 D4): 所有 Platform 实例在同一 Postgres 上串行化计数+claim。
+const runningTaskLimitLockKey = 0x4752544C // "GRTL"
+
 // ClaimNextTask claims the oldest queued row for session when no starting/running exists.
 func (s *Store) ClaimNextTask(ctx context.Context, sessionKey, platformInstanceID string, claimLease time.Duration) (domain.Task, bool, error) {
 	if strings.TrimSpace(platformInstanceID) == "" {
@@ -24,6 +28,26 @@ func (s *Store) ClaimNextTask(ctx context.Context, sessionKey, platformInstanceI
 	var task domain.Task
 	var claimed bool
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		// 审查 D4: 全局 running-task 上限的原子门禁。advisory lock 把所有
+		// Platform 实例的 claim 容量检查串行化(仅 limit>0 时启用), 计数+
+		// claim 在同一事务内完成——两个实例同时观察到 limit-1 时只有一个
+		// 能通过, 不会超卖。锁在 workspace 行锁之前获取, 顺序固定, 不会
+		// 形成锁序环。scheduler 侧的 MaxRunningTasks 预检查保留作快速
+		// 拒绝, 此事务内检查才是跨实例硬门禁。
+		if s.runningTaskLimit > 0 {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, runningTaskLimitLockKey); err != nil {
+				return fmt.Errorf("acquire running task limit lock: %w", err)
+			}
+			var running int
+			if err := tx.QueryRow(ctx, `
+SELECT COUNT(*) FROM tasks WHERE status IN ('starting','running')
+`).Scan(&running); err != nil {
+				return err
+			}
+			if running >= s.runningTaskLimit {
+				return nil // 上限已满, 不 claim(claimed=false)
+			}
+		}
 		// Session lock via workspace row.
 		var workspaceID string
 		err := tx.QueryRow(ctx, `
@@ -287,7 +311,9 @@ SELECT `+taskSelectColumns+` FROM tasks WHERE id = $1 FOR UPDATE
 			}
 			return err
 		}
-		if requesterUserID != 0 && t.RequesterID != requesterUserID {
+		// 审查 I-4: 取消者必须为任务归属者(RequesterID), requester 必传不可
+		// 绕过(原 requesterUserID != 0 条件允许 0 值跳过校验)。
+		if requesterUserID <= 0 || t.RequesterID != requesterUserID {
 			return fmt.Errorf("requester %d cannot cancel task owned by %d", requesterUserID, t.RequesterID)
 		}
 		if t.Status.IsTerminal() {

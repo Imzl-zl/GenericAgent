@@ -21,8 +21,8 @@ const (
 	MaxMessageIDLen         = 256
 )
 
-// DevelopmentContext is the approved loopback user/workspace pair.
-type DevelopmentContext struct {
+// AdminContext is the approved loopback user/workspace pair.
+type AdminContext struct {
 	UserID      int64
 	Username    string
 	WorkspaceID string
@@ -33,6 +33,7 @@ type DevelopmentContext struct {
 type Store struct {
 	pool                            *pgxpool.Pool
 	perUserQueueLimit               int // 0 = disabled (dev/test); enforced inside SubmitTask tx
+	runningTaskLimit                int // 0 = disabled (dev/test); enforced inside ClaimNextTask tx (审查 D4)
 }
 
 type StoreOption func(*Store) error
@@ -58,6 +59,15 @@ func NewStore(pool *pgxpool.Pool, options ...StoreOption) (*Store, error) {
 // before the scheduler starts. 0 disables the check (dev/test only).
 func (s *Store) SetPerUserQueueLimit(limit int) {
 	s.perUserQueueLimit = limit
+}
+
+// SetRunningTaskLimit sets the global starting+running task cap (审查 D4).
+// Must be called before the scheduler starts. 0 disables the check.
+// 与 scheduler 侧的 MaxRunningTasks 预检查不同, 这里在 ClaimNextTask 的
+// 同一事务内以 advisory lock 串行化计数+claim, 跨 Platform 实例原子——
+// 多个实例同时观察到 limit-1 时, 只有一个能成功 claim, 不会超卖。
+func (s *Store) SetRunningTaskLimit(limit int) {
+	s.runningTaskLimit = limit
 }
 
 // Pool exposes the underlying pool for tests.

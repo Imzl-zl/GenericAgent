@@ -40,11 +40,11 @@ type ManagerServer struct {
 	now     func() time.Time
 
 	// seenNonces 是已消费 nonce 的一次性集合(nonce -> 过期时间)。
-	// stateDir 非空时经 nonces.json 持久化(round12 审查 I4)。
+	// stateDir 非空时经分段 JSON Lines 文件持久化(round12 审查 I4;
+	// 审查 Minor: 按分钟分段追加, 每请求 O(1) 写盘, 替代原全量重写 O(n))。
 	seenNoncesMu sync.Mutex
 	seenNonces   map[string]time.Time
 	stateDir     string
-	nonceFile    string
 }
 
 const managerAuthWindow = 5 * time.Minute
@@ -82,7 +82,6 @@ func NewManagerServerWithNonceState(manager *Manager, secret, stateDir string) (
 		return nil, fmt.Errorf("create manager nonce state dir %q: %w", stateDir, err)
 	}
 	s.stateDir = stateDir
-	s.nonceFile = filepath.Join(stateDir, "nonces.json")
 	if err := s.loadNoncesLocked(); err != nil {
 		return nil, err
 	}
@@ -294,8 +293,8 @@ func (s *ManagerServer) consumeNonce(ts int64, nonce string) (bool, error) {
 	}
 	expires := time.Unix(ts, 0).Add(2*managerAuthWindow + time.Minute)
 	s.seenNonces[nonce] = expires
-	if s.nonceFile != "" {
-		if err := s.persistNoncesLocked(); err != nil {
+	if s.stateDir != "" {
+		if err := s.appendNonceLocked(nonce, expires); err != nil {
 			// 未落盘前不放行: 该 nonce 仍可被重启后的实例接受。
 			delete(s.seenNonces, nonce)
 			return false, err
@@ -304,35 +303,45 @@ func (s *ManagerServer) consumeNonce(ts int64, nonce string) (bool, error) {
 	return true, nil
 }
 
-// persistNoncesLocked 把已消费 nonce 集合原子写入状态文件
-// (临时文件 + fsync + rename, 调用方必须持有 seenNoncesMu)。
-func (s *ManagerServer) persistNoncesLocked() error {
-	data, err := json.Marshal(s.seenNonces)
+// nonceSegmentsTTL 是段文件保留时长(签名合法窗口 + 时钟偏移余量)。
+// 段按写入时刻的 unix 分钟命名, 超过该时长的段启动/惰性清理时删除。
+const nonceSegmentsTTL = 2 * managerAuthWindow + time.Minute
+
+// nonceSegmentPath 返回 nonce 写入时刻所在分钟段的文件路径。
+func nonceSegmentPath(stateDir string, t time.Time) string {
+	return filepath.Join(stateDir, fmt.Sprintf("nonces-%d.json", t.Unix()/60))
+}
+
+// appendNonceLocked 把单个 nonce 追加到当前分钟段文件并 fsync
+// (调用方必须持有 seenNoncesMu)。JSON Lines: 每行一个 {"nonce","expires"}。
+// O(1) 追加替代原全量重写(审查 Minor): 不再随请求量线性放大写盘。
+func (s *ManagerServer) appendNonceLocked(nonce string, expires time.Time) error {
+	segPath := nonceSegmentPath(s.stateDir, s.now())
+	line, err := json.Marshal(map[string]string{
+		"nonce":   nonce,
+		"expires": expires.Format(time.RFC3339Nano),
+	})
 	if err != nil {
-		return fmt.Errorf("marshal nonces: %w", err)
+		return fmt.Errorf("marshal nonce: %w", err)
 	}
-	tmp := filepath.Join(s.stateDir, ".nonces.tmp")
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(segPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return fmt.Errorf("open nonce state tmp: %w", err)
+		return fmt.Errorf("open nonce segment %q: %w", segPath, err)
 	}
-	if _, err := f.Write(data); err != nil {
+	if _, err := f.Write(append(line, '\n')); err != nil {
 		f.Close()
-		return fmt.Errorf("write nonce state: %w", err)
+		return fmt.Errorf("append nonce segment: %w", err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		return fmt.Errorf("sync nonce state: %w", err)
+		return fmt.Errorf("sync nonce segment: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return fmt.Errorf("close nonce state: %w", err)
+		return fmt.Errorf("close nonce segment: %w", err)
 	}
-	if err := os.Rename(tmp, s.nonceFile); err != nil {
-		return fmt.Errorf("commit nonce state: %w", err)
-	}
-	// round13 审查(X1): rename 后 fsync 父目录, 否则掉电时目录项可能未持久,
-	// 重启后可能回退到旧 nonce 状态重开重放窗口。Windows 不支持目录 fsync,
-	// 忽略其错误(文件本身已 Sync)。
+	// round13 审查(X1): 新段文件首次创建时 fsync 父目录, 否则掉电时目录项
+	// 可能未持久, 重启后回退到旧 nonce 状态重开重放窗口。Windows 不支持
+	// 目录 fsync, 忽略其错误(文件本身已 Sync)。
 	if dir, err := os.Open(s.stateDir); err == nil {
 		_ = dir.Sync()
 		_ = dir.Close()
@@ -340,28 +349,50 @@ func (s *ManagerServer) persistNoncesLocked() error {
 	return nil
 }
 
-// loadNoncesLocked 启动时加载已持久化的 nonce 集合, 丢弃过期项
-// (调用方必须持有 seenNoncesMu)。文件不存在视为空状态; 文件损坏 fail-closed
-// 拒绝启动(部署需修复或删除状态文件)。
+// loadNoncesLocked 启动时加载已持久化的 nonce 集合: 读取全部段文件,
+// 合并未过期条目, 删除过期段文件(调用方必须持有 seenNoncesMu)。
+// 目录无段文件视为空状态; 段文件损坏 fail-closed 拒绝启动。
 func (s *ManagerServer) loadNoncesLocked() error {
-	data, err := os.ReadFile(s.nonceFile)
+	matches, err := filepath.Glob(filepath.Join(s.stateDir, "nonces-*.json"))
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read nonce state %q: %w", s.nonceFile, err)
-	}
-	var loaded map[string]time.Time
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		return fmt.Errorf("parse nonce state %q: %w", s.nonceFile, err)
+		return fmt.Errorf("glob nonce segments: %w", err)
 	}
 	now := s.now()
-	for n, expires := range loaded {
-		if now.After(expires) {
-			delete(loaded, n)
+	merged := make(map[string]time.Time)
+	for _, path := range matches {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read nonce segment %q: %w", path, err)
+		}
+		segExpired := true
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if line == "" {
+				continue
+			}
+			var entry struct {
+				Nonce   string `json:"nonce"`
+				Expires string `json:"expires"`
+			}
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				return fmt.Errorf("parse nonce segment %q: %w", path, err)
+			}
+			expires, err := time.Parse(time.RFC3339Nano, entry.Expires)
+			if err != nil {
+				return fmt.Errorf("parse nonce expiry in %q: %w", path, err)
+			}
+			if now.After(expires) {
+				continue
+			}
+			segExpired = false
+			merged[entry.Nonce] = expires
+		}
+		if segExpired {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove expired nonce segment %q: %w", path, err)
+			}
 		}
 	}
-	s.seenNonces = loaded
+	s.seenNonces = merged
 	return nil
 }
 

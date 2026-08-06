@@ -35,7 +35,7 @@ func (service *fakeSophubAPIService) FetchRemoteSOP(_ context.Context, remoteID 
 
 func newSophubTestServer(t *testing.T, service *fakeSophubAPIService) *Server {
 	t.Helper()
-	s := &Server{devUserID: 1, sophub: service}
+	s := &Server{adminUserID: 1, sophub: service}
 	return s
 }
 

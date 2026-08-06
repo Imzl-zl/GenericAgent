@@ -12,10 +12,7 @@ Also addresses:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import queue
-import re
 import threading
 from typing import Any, Callable, Iterator
 
@@ -55,13 +52,6 @@ def _validate_task_request(task: worker_pb2.TaskEnvelope) -> None:
         raise WorkerAdapterError("INVALID_TASK", "task_id required")
     if not task.prompt and task.prompt != "":
         raise WorkerAdapterError("INVALID_TASK", "prompt required")
-
-
-def _bounded_label(value: str, max_bytes: int, *, allow_empty: bool) -> bool:
-    if (not allow_empty and not value) or value != value.strip() or len(value.encode("utf-8")) > max_bytes:
-        return False
-    return not any(ord(char) < 32 or ord(char) == 127 for char in value)
-
 
 
 def _validate_and_reserve(
@@ -115,7 +105,6 @@ def _validate_and_reserve(
         pending = PendingTask(task_id=task.task_id, request=request)
         adapter._pending = pending
         session.active_task_id = task.task_id
-        adapter._event_queues[task.task_id] = queue.Queue()
     return pending, tool_policy
 
 
@@ -308,4 +297,3 @@ def _cleanup_task(adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunSta
             adapter._pending = None
         if adapter._session and adapter._session.active_task_id == task.task_id:
             adapter._session.active_task_id = None
-        adapter._event_queues.pop(task.task_id, None)

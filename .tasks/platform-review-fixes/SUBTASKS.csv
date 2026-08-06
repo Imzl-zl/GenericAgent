@@ -1,0 +1,15 @@
+id,status,description,notes
+1,DONE,D1 去掉工具策略分级: router 固定全能力, 停用 tool_policies CRUD/分配 API, 更新测试, 0046 迁移, openapi 同步
+2,DONE,D1 文档同步: 0004/0005 迁移注释已标注废弃, openapi 已移除已停用接口 (docs/README 待最终确认)
+3,DONE,D3 用户生命周期: block 撤销会话+login/ValidateSession 拒绝 blocked, 含单测+store 测试
+4,DONE,F1 凭据失败路径: 新增 ExpireRunnerLease 接口(保留容器引用), scheduler 初始化失败改用它
+5,DONE,F3 lease 时钟统一: expires_at 由 DB now()+interval 计算, 过期判定/列表/计数均用 DB 时钟
+6,DONE,F2 delivery fencing: attempt_token 生成+条件更新, 含 fencing 测试; 修复 0046/0047 marker 缺失
+7,DONE,D4 运行上限原子化: ClaimNextTask 事务内 advisory lock+计数, 含并发测试
+8,DONE,D2 成功路径销毁时序: sessionDraining 标记阻止 claim 窗口, 含测试
+9,DONE,D5+F4 根 Python: LLM_FAILED 结构化终态 + llmclient None 显式错误, worker 已正确映射
+10,DONE,F5 Web: Dashboard 用 AuthContext 状态, AuthProvider 保留 userId/status, lint+build 通过
+11,DONE,F6 SUBTASKS.csv 修复: 从 HEAD 恢复误删 5 行, 25 行×9 列规范化, 修正 21/22/23 依赖链
+12,DONE,F7 契约测试升级: 路由清单 vs OpenAPI 自动比对+已知缺口清单, 正向验证拦截有效
+13,DONE,验证: Go 18 包全绿(隔离库)+vet+build, Python 5+42+16+109, 集成 6, web lint+build
+14,DONE,CreateUser scan bug 修复+测试; memory.md/tools 更新+归档; 隔离库已清理

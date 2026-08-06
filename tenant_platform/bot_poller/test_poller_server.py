@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
+import threading
+
+import requests
 
 import tenant_platform.bot_poller.poller_server as poller_server
 from tenant_platform.bot_poller.poller_server import WxBotClient, coalesce_webhook_bodies
@@ -313,3 +318,92 @@ def test_send_passes_explicit_file_name_to_client(monkeypatch):
     entry.client.calls.clear()
     manager.send("b1", "u1", "hi", client_id="ga-abc123")
     assert entry.client.calls == [("text", "u1", "hi", "", "ga-abc123")]
+
+
+# ---------------------------------------------------------------------------
+# 审查修复测试: HTTP 控制面安全(请求体上限 / 签名校验 / fail-closed 门禁 /
+# 内部错误不透出)。此前无限流、空 secret 放行、异常细节透出。
+# ---------------------------------------------------------------------------
+
+def _start_handler_server(api_secret: str = ""):
+    """起一个 PollerHandler 直连的 ThreadingHTTPServer(等价 serve() 装配)。"""
+    from http.server import ThreadingHTTPServer
+
+    poller_server.PollerHandler.manager = poller_server.BotManager(
+        media_root=None, webhook_secret=""
+    )
+    poller_server.PollerHandler.api_secret = api_secret
+    server = ThreadingHTTPServer(("127.0.0.1", 0), poller_server.PollerHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{server.server_port}"
+
+
+def test_serve_refuses_non_loopback_without_secret():
+    """空 secret + 非回环绑定必须 fail-closed 拒绝启动(审查 I-2)。"""
+    try:
+        poller_server.serve("0.0.0.0:18080", api_secret="")
+    except SystemExit as exc:
+        assert "refuses to listen" in str(exc)
+    else:
+        raise AssertionError("serve() should have refused non-loopback bind without secret")
+
+
+def test_http_rejects_oversized_body():
+    server, base = _start_handler_server()
+    try:
+        # 服务器拒读超限 body 直接回 413——客户端可能因连接被关闭而抛
+        # ConnectionError(与 Go http.Server 行为一致: 超限不读 body)。
+        # 两种形态都证明请求被拒绝, 而不是被处理。
+        try:
+            resp = requests.post(
+                base + "/config", data=b"x" * (poller_server.MAX_BODY_BYTES + 1), timeout=5
+            )
+            assert resp.status_code == 413, resp.text
+        except requests.exceptions.ConnectionError:
+            pass  # 服务器拒收即防御生效
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_requires_signature_when_secret_configured():
+    secret = "test-secret"
+    server, base = _start_handler_server(api_secret=secret)
+    try:
+        # 无签名 -> 401
+        resp = requests.post(base + "/config", json={}, timeout=5)
+        assert resp.status_code == 401, resp.text
+        # 错误签名 -> 401
+        resp = requests.post(
+            base + "/config", json={},
+            headers={"X-API-Signature": "deadbeef"}, timeout=5,
+        )
+        assert resp.status_code == 401, resp.text
+        # 正确签名 -> 200
+        body = b'{"inbound_coalesce_window_ms": 0}'
+        sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        resp = requests.post(
+            base + "/config", data=body,
+            headers={"X-API-Signature": sig}, timeout=5,
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_hides_internal_error_details():
+    server, base = _start_handler_server()
+    try:
+        # /send 传非法 msg_type -> 400, 不带内部细节
+        resp = requests.post(base + "/send", json={"bot_uuid": "b1", "msg_type": "evil"}, timeout=5)
+        assert resp.status_code == 400, resp.text
+        assert "invalid msg_type" in resp.json()["error"]
+        # /config 传不可转 int 的值触发内部异常 -> 500 固定文案, 不透出 trace
+        resp = requests.post(base + "/config", json={"inbound_coalesce_window_ms": "abc"}, timeout=5)
+        assert resp.status_code in (400, 500)
+        assert "internal error" in resp.json().get("error", "").lower() or "invalid request body" in resp.json().get("error", "").lower()
+    finally:
+        server.shutdown()
+        server.server_close()

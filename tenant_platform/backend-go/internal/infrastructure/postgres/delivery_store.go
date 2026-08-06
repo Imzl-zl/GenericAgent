@@ -51,6 +51,9 @@ WITH eligible AS (
 UPDATE task_deliveries d SET
     status = 'sending',
     attempt_count = e.attempt_count + 1,
+    -- 审查 F2: 每次 claim 生成新 fencing token, Ack/Retry/DeadLetter 必须
+    -- 携带, 防止超时重置后旧 attempt 覆盖新 attempt。
+    attempt_token = md5(random()::text || clock_timestamp()::text),
     attempt_lease_until = $3,
     sent_at = $1,
     updated_at = $1
@@ -58,7 +61,8 @@ FROM eligible e
 WHERE d.delivery_id = e.delivery_id
 RETURNING d.delivery_id, d.task_id, d.delivery_type, d.status,
           COALESCE(d.payload_ref,''), COALESCE(d.payload_digest,''),
-          COALESCE(d.error_code,''), COALESCE(d.error_message,''), d.attempt_count
+          COALESCE(d.error_code,''), COALESCE(d.error_message,''), d.attempt_count,
+          d.attempt_token
 `, now, limit, leaseUntil, retryWindow.String())
 	if err != nil {
 		return nil, fmt.Errorf("claim deliveries: %w", err)
@@ -143,37 +147,44 @@ DELETE FROM task_delivery_files WHERE created_at < $1
 // MarkDeliveryAcked records that the carrier accepted the message. Only
 // pending/sending rows can transition to acked; if the row is already acked
 // or dead_letter, the UPDATE matches zero rows and this is a no-op (idempotent).
-func (s *Store) MarkDeliveryAcked(ctx context.Context, deliveryID string, ackedAt time.Time) error {
+func (s *Store) MarkDeliveryAcked(ctx context.Context, deliveryID, attemptToken string, ackedAt time.Time) error {
+	// 审查 F2: 必须携带 claim 时签发的 attempt_token——超时重置后新 attempt
+	// 已接管时, 旧执行者的 ack 不得生效(否则新 attempt 的 sending 被提前
+	// 置 acked, 重复发送/状态错误)。token 不匹配则零行更新(幂等 no-op)。
 	_, err := s.pool.Exec(ctx, `
 UPDATE task_deliveries
-SET status = 'acked', acked_at = $2, updated_at = $2
-WHERE delivery_id = $1 AND status IN ('pending','sending')
-`, deliveryID, ackedAt)
+SET status = 'acked', acked_at = $3, updated_at = $3
+WHERE delivery_id = $1 AND status IN ('pending','sending') AND attempt_token = $2
+`, deliveryID, attemptToken, ackedAt)
 	return err
 }
 
 // MarkDeliveryRetry returns a failed sending delivery to pending for a future
 // attempt. Only rows still in 'sending' can retry; acked/dead_letter rows are
 // left untouched.
-func (s *Store) MarkDeliveryRetry(ctx context.Context, deliveryID string, nextAttemptAt time.Time, now time.Time) error {
+func (s *Store) MarkDeliveryRetry(ctx context.Context, deliveryID, attemptToken string, nextAttemptAt time.Time, now time.Time) error {
+	// 审查 F2: 同 MarkDeliveryAcked——旧 attempt 不得把新 attempt 改回
+	// pending 并清空其 lease。
 	_, err := s.pool.Exec(ctx, `
 UPDATE task_deliveries
-SET status = 'pending', next_attempt_at = $2, attempt_lease_until = NULL, updated_at = $3
-WHERE delivery_id = $1 AND status = 'sending'
-`, deliveryID, nextAttemptAt, now)
+SET status = 'pending', next_attempt_at = $3, attempt_lease_until = NULL, updated_at = $4
+WHERE delivery_id = $1 AND status = 'sending' AND attempt_token = $2
+`, deliveryID, attemptToken, nextAttemptAt, now)
 	return err
 }
 
 // MarkDeliveryDeadLetter moves a delivery to the dead-letter state. Only
 // pending/sending rows can be dead-lettered; already-acked rows are left
 // untouched (carrier already accepted the message).
-func (s *Store) MarkDeliveryDeadLetter(ctx context.Context, deliveryID string, errCode, errMessage string, terminalAt time.Time) error {
+func (s *Store) MarkDeliveryDeadLetter(ctx context.Context, deliveryID, attemptToken string, errCode, errMessage string, terminalAt time.Time) error {
+	// 审查 F2: 同 MarkDeliveryAcked——旧 attempt 不得把新 attempt 提前
+	// dead-letter(新 attempt 可能随后 ack 成功)。
 	_, err := s.pool.Exec(ctx, `
 UPDATE task_deliveries
-SET status = 'dead_letter', error_code = $2, error_message = $3,
-    terminal_at = $4, updated_at = $4
-WHERE delivery_id = $1 AND status IN ('pending','sending')
-`, deliveryID, errCode, errMessage, terminalAt)
+SET status = 'dead_letter', error_code = $3, error_message = $4,
+    terminal_at = $5, updated_at = $5
+WHERE delivery_id = $1 AND status IN ('pending','sending') AND attempt_token = $2
+`, deliveryID, attemptToken, errCode, errMessage, terminalAt)
 	return err
 }
 
@@ -183,11 +194,13 @@ func (s *Store) GetDelivery(ctx context.Context, taskID string, dt domain.Delive
 	err := s.pool.QueryRow(ctx, `
 SELECT delivery_id, task_id, delivery_type, status,
        COALESCE(payload_ref,''), COALESCE(payload_digest,''),
-       COALESCE(error_code,''), COALESCE(error_message,''), attempt_count
+       COALESCE(error_code,''), COALESCE(error_message,''), attempt_count,
+       COALESCE(attempt_token,'')
 FROM task_deliveries WHERE task_id = $1 AND delivery_type = $2
 `, taskID, string(dt)).Scan(
 		&d.DeliveryID, &d.TaskID, &d.DeliveryType, &d.Status,
 		&d.PayloadRef, &d.PayloadDigest, &d.ErrorCode, &d.ErrorMessage, &d.AttemptCount,
+		&d.AttemptToken,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Delivery{}, fmt.Errorf("delivery not found")
@@ -202,6 +215,7 @@ func scanDeliveries(rows pgx.Rows) ([]domain.Delivery, error) {
 		err := rows.Scan(
 			&d.DeliveryID, &d.TaskID, &d.DeliveryType, &d.Status,
 			&d.PayloadRef, &d.PayloadDigest, &d.ErrorCode, &d.ErrorMessage, &d.AttemptCount,
+			&d.AttemptToken,
 		)
 		if err != nil {
 			return nil, err

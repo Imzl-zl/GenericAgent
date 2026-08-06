@@ -50,7 +50,7 @@ const adminSteps = [
   {
     icon: Shield,
     title: '运营者登录',
-    body: '通过部署者提供的独立运营后台入口登录，使用部署时设置的 PLATFORM_DEV_TOKEN 进入控制台。',
+    body: '通过部署者提供的独立运营后台入口登录，使用部署时设置的 PLATFORM_ADMIN_TOKEN 进入控制台。',
   },
   {
     icon: Users,

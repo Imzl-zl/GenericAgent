@@ -19,7 +19,6 @@ export interface DashboardStats {
   pending_users: number;
   approved_users: number;
   running_tasks: number;
-  active_workers: number;
   runtime_profile: RuntimeProfile;
 }
 

@@ -1,6 +1,8 @@
-// Package domain — admin-configurable platform commands and tool policies
-// (migration 0004). These types back the command registry and tool policy
-// store so admins can change behavior without recompiling the platform.
+// Package domain — admin-configurable platform commands (migration 0004).
+// These types back the command registry so admins can change behavior without
+// recompiling the platform.
+// 审查 D1(去分级): domain.ToolPolicy 已移除, 工具能力由静态 policy manifest
+// (infrastructure/policy.Registry) 单一真值决定。
 package domain
 
 import (
@@ -36,16 +38,3 @@ type PlatformCommand struct {
 	UpdatedAt time.Time
 }
 
-// ToolPolicy is an admin-configurable tool policy version.
-// AllowedTools is a JSON array of tool names the Worker may invoke
-// (e.g. ["update_working_checkpoint"], or ["code_run","file_read"]).
-type ToolPolicy struct {
-	ID           int64
-	Version      string   // "foundation.no-host-tools.v1"
-	AllowedTools []string // deserialized from JSONB
-	Description  string
-	Enabled      bool
-	CreatedBy    int64
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-}

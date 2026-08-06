@@ -178,6 +178,13 @@ type scheduler struct {
 	// 瞬时 DB 错误永久卡在 starting/running。进程崩溃时由 claim 过期 +
 	// RecoverAfterRestart 兜底。
 	pendingFinalize sync.Map
+	// sessionDraining 标记正在销毁 Worker 的 session(审查 D2): 成功路径
+	// 在 CompleteSucceeded 提交终态(释放串行槽)与 destroyTaskWorkerLocked
+	// 之间, 同 session 下一任务可能被 claim 并复用同 generation 容器,
+	// 随后旧 entry cleanup 销毁该容器杀死新任务。draining 期间 tick 跳过
+	// 该 session 的 claim; destroy 完成后清除。跨实例接管必然 generation+1
+	// 新容器, 旧容器销毁语义不变, 无需跨实例协调。
+	sessionDraining sync.Map
 }
 
 // NewScheduler validates config and constructs the scheduler.
@@ -300,8 +307,9 @@ func (s *scheduler) Run(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		if err := s.tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			// Keep running; surface via stderr-like return only on ctx done.
-			_ = err
+			// 审查 I-3: tick 内 DB 故障(列表/claim/recover 失败)必须可见——
+			// 静默丢弃会让 Postgres 故障时每 PollInterval 空转且无任何告警。
+			slog.ErrorContext(ctx, "scheduler: tick failed", "error", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -434,6 +442,12 @@ func (s *scheduler) tick(ctx context.Context) error {
 		}
 		claimed := false
 		for _, sk := range keys {
+			// 审查 D2: 正在销毁 Worker 的 session 不得 claim 新任务——
+			// 成功路径终态提交后到销毁完成前, 同 generation 容器仍被旧
+			// entry 引用, 新任务复用后会被旧 cleanup 销毁。
+			if _, draining := s.sessionDraining.Load(sk); draining {
+				continue
+			}
 			task, ok, err := s.cfg.Store.ClaimNextTask(ctx, sk, s.cfg.PlatformInstanceID, s.cfg.ClaimLease)
 			if err != nil {
 				return err

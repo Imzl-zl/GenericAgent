@@ -44,6 +44,15 @@ func newCapacityTaskStore() *capacityTaskStore {
 	}
 }
 
+
+
+func (s *capacityTaskStore) IsApprovedUser(_ context.Context, _ int64) (bool, error) {
+	return true, nil
+}
+func (f *capacityTaskStore) IsApprovedTeamMember(_ context.Context, _ string, _ int64) (bool, error) {
+	return true, nil
+}
+
 func (f *capacityTaskStore) GetTask(ctx context.Context, taskID string) (domain.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -193,6 +202,10 @@ func (r *capacityRuntime) ResolveGeneration(ctx context.Context, sessionKey stri
 }
 
 func (r *capacityRuntime) ReleaseRunnerLease(context.Context, string, uint64) error {
+	return nil
+}
+
+func (r *capacityRuntime) ExpireRunnerLease(context.Context, string, uint64) error {
 	return nil
 }
 
@@ -396,6 +409,7 @@ func (r *revokeDispatchRuntime) ResolveGeneration(context.Context, string) (uint
 	return 1, nil
 }
 func (r *revokeDispatchRuntime) ReleaseRunnerLease(context.Context, string, uint64) error { return nil }
+func (r *revokeDispatchRuntime) ExpireRunnerLease(context.Context, string, uint64) error { return nil }
 
 // TestDispatchRevokesCredentialsAfterTerminal 回归测试(第三轮 review C1):
 // dispatch 的撤销 defer 必须通过闭包捕获 taskCredentialSet——Go defer 注册时
@@ -524,5 +538,53 @@ func TestDispatchRequeueHeartbeatRaceDoesNotFinalize(t *testing.T) {
 	}
 	if len(store.finalized) != 0 {
 		t.Fatalf("requeued task must not be finalized by heartbeat race, got %+v", store.finalized)
+	}
+}
+
+// 审查 D2: draining 期间 tick 不得 claim 该 session 的新任务——成功路径
+// 终态提交(释放串行槽)到 Worker 销毁之间存在窗口, 新任务复用同 generation
+// 容器会被旧 entry cleanup 销毁。
+func TestTickSkipsDrainingSession(t *testing.T) {
+	store := &capacityTaskStore{
+		claimableKeys: []string{"personal:drain", "personal:other"},
+		claimable: map[string]domain.Task{
+			"personal:drain": {ID: "task-drain", SessionKey: "personal:drain", Status: domain.TaskQueued},
+			"personal:other": {ID: "task-other", SessionKey: "personal:other", Status: domain.TaskQueued},
+		},
+		claimed: make(map[string]domain.Task),
+		getTask: make(map[string]domain.Task),
+	}
+	// 模拟成功路径: draining 已标记(destroy 尚未完成)。
+	// tick 的 claim 循环在 NewScheduler 的 tick 中; 直接构造 scheduler 并
+	// 验证 sessionDraining 检查逻辑(通过 tick 驱动不可控, 这里验证核心语义)。
+	rt := &capacityRuntime{err: errors.New("no start")}
+	s := &scheduler{
+		cfg: SchedulerConfig{
+			PlatformInstanceID: "p-d2",
+			Store:              store,
+			Registry:           mustLoadFoundationPolicy(t),
+			Runtime:            rt,
+			ClaimLease:         time.Minute,
+			MaxRunningTasks:    10,
+		},
+		workers:          map[string]*workerEntry{},
+		mu:               sync.Mutex{},
+		sessionDraining:  sync.Map{},
+		dispatchInFlight: sync.Map{},
+		pendingFinalize:  sync.Map{},
+		cancelOnce:       sync.Map{},
+	}
+	s.sessionDraining.Store("personal:drain", struct{}{})
+	if err := s.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// draining session 不得被 claim; 其他 session 正常。
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if _, claimed := store.claimed["personal:drain"]; claimed {
+		t.Fatal("draining session must not be claimed")
+	}
+	if _, claimed := store.claimed["personal:other"]; !claimed {
+		t.Fatal("non-draining session must be claimed")
 	}
 }

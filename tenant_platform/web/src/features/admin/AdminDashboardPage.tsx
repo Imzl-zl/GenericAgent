@@ -71,12 +71,6 @@ export function AdminDashboardPage() {
             {isLoading ? '...' : stats?.running_tasks ?? 0}
           </p>
         </Card>
-        <Card className="animate-fade-in-up animate-delay-4">
-          <p className="admin-metric-label">活跃 Worker</p>
-          <p className="admin-metric-value">
-            {isLoading ? '...' : stats?.active_workers ?? 0}
-          </p>
-        </Card>
       </div>
 
       <div className="admin-grid admin-grid-2">

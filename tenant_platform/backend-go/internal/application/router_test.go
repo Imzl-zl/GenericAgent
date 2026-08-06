@@ -16,18 +16,16 @@ import (
 
 // fakeRouterStore is an in-memory RouterStore for router tests.
 type fakeRouterStore struct {
-	bots         map[string]domain.Bot // botUUID → bot
-	statuses     map[int64]domain.UserStatus
-	toolPolicies map[int64]string // userID → tool_policy_version
-	runningTask  *domain.Task
-	findTaskErr  error
+	bots        map[string]domain.Bot // botUUID → bot
+	statuses    map[int64]domain.UserStatus
+	runningTask *domain.Task
+	findTaskErr error
 }
 
 func newFakeRouterStore() *fakeRouterStore {
 	return &fakeRouterStore{
-		bots:         make(map[string]domain.Bot),
-		statuses:     make(map[int64]domain.UserStatus),
-		toolPolicies: make(map[int64]string),
+		bots:     make(map[string]domain.Bot),
+		statuses: make(map[int64]domain.UserStatus),
 	}
 }
 
@@ -45,14 +43,6 @@ func (f *fakeRouterStore) GetUserStatus(_ context.Context, userID int64) (domain
 		return "", fmt.Errorf("user %d not found", userID)
 	}
 	return s, nil
-}
-
-func (f *fakeRouterStore) GetUserToolPolicy(_ context.Context, userID int64) (string, error) {
-	p, ok := f.toolPolicies[userID]
-	if !ok {
-		return "foundation.no-host-tools.v1", nil // default
-	}
-	return p, nil
 }
 
 func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string) (domain.Task, error) {
@@ -103,7 +93,7 @@ func (f *fakeTaskService) SubmitTask(_ context.Context, cmd domain.SubmitTaskCom
 	return f.submittedTask, nil
 }
 
-func (f *fakeTaskService) GetTask(_ context.Context, _ string) (domain.Task, error) {
+func (f *fakeTaskService) GetTask(_ context.Context, _ string, _ int64) (domain.Task, error) {
 	return domain.Task{}, nil
 }
 func (f *fakeTaskService) CancelTask(_ context.Context, taskID string, _ int64) (domain.Task, error) {
@@ -117,7 +107,7 @@ func (f *fakeTaskService) ClaimNextTask(_ context.Context, _, _ string) (domain.
 	return domain.Task{}, false, nil
 }
 func (f *fakeTaskService) RecoverAfterRestart(_ context.Context, _ string) error { return nil }
-func (f *fakeTaskService) ReadResult(_ context.Context, _ string) (domain.ResultPayload, error) {
+func (f *fakeTaskService) ReadResult(_ context.Context, _ string, _ int64) (domain.ResultPayload, error) {
 	return domain.ResultPayload{}, nil
 }
 
@@ -345,7 +335,7 @@ func TestRouterMediaOnlyMessageUsesPlaceholder(t *testing.T) {
 	}
 }
 
-func TestRouterStagesMediaIntoSessionSandboxAndUpgradesPolicy(t *testing.T) {
+func TestRouterStagesMediaIntoSessionSandboxUsesGlobalPolicy(t *testing.T) {
 	store := newFakeRouterStore()
 	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
 	store.statuses[42] = domain.UserApproved
@@ -362,7 +352,8 @@ func TestRouterStagesMediaIntoSessionSandboxAndUpgradesPolicy(t *testing.T) {
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created, got %s", res.Action)
 	}
-	if tasks.submittedTask.ToolPolicyVersion != "foundation.session-files.v1" {
+	// 审查 D1(去分级): 不再按用户分配/升级, 任务统一使用全局默认工具策略。
+	if tasks.submittedTask.ToolPolicyVersion != "foundation.no-host-tools.v1" {
 		t.Fatalf("unexpected policy: %s", tasks.submittedTask.ToolPolicyVersion)
 	}
 	if !strings.Contains(tasks.submittedTask.Prompt, "attachments/F001_resume.txt") {

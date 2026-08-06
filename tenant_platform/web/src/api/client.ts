@@ -30,7 +30,7 @@ function requestOptions(tokenType: 'admin' | 'user' | null): Record<string, stri
   if (tokenType === 'admin') {
     const token = getAdminToken();
     if (token) {
-      headers['X-Platform-Dev-Token'] = token;
+      headers['X-Platform-Admin-Token'] = token;
     }
   } else if (tokenType === 'user') {
     const token = getUserToken();

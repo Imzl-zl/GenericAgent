@@ -1201,11 +1201,6 @@ def test_max_output_bytes_counts_handler_print(roots, foundation_registry):
                 self.is_running = False
                 self.task_queue.task_done()
 
-
-    class DocumentClient:
-        def close(self, task_id: str) -> None:
-            closed.append(task_id)
-
     adapter = _make_adapter(roots, foundation_registry, PrintyAgent)
     adapter.start_session(
         _start_req(runtime_policy=_runtime_policy(max_output_bytes=40, task_timeout_seconds=10))

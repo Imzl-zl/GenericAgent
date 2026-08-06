@@ -17,15 +17,15 @@ type ctxKey int
 
 const ctxUserIDKey ctxKey = 0
 
-// auth wraps a handler with the platform dev-token check. The dev token is a
+// auth wraps a handler with the platform admin token check. The admin token is a
 // single shared secret used by smoke tooling and the loopback admin path; it
 // is NOT a user authentication mechanism. User-authenticated endpoints use
 // userAuth instead.
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tok := r.Header.Get("X-Platform-Dev-Token")
-		if tok == "" || tok != s.devToken {
-			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid X-Platform-Dev-Token", traceID())
+		tok := r.Header.Get("X-Platform-Admin-Token")
+		if tok == "" || tok != s.adminToken {
+			writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid X-Platform-Admin-Token", traceID())
 			return
 		}
 		next(w, r)
@@ -62,7 +62,7 @@ func (s *Server) userAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // userIDFromContext extracts the user id set by userAuth. Returns false when
-// no user is authenticated (dev-token path).
+// no user is authenticated (admin token path).
 func userIDFromContext(ctx context.Context) (int64, bool) {
 	v, ok := ctx.Value(ctxUserIDKey).(int64)
 	return v, ok
@@ -82,7 +82,7 @@ func ServeContext(ctx context.Context, addr string, h http.Handler) error {
 	if ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("platform API must bind loopback, got %s", addr)
 	}
-	return serveUntil(ctx, addr, h)
+	return serveUntil(ctx, addr, h, DefaultMaxRequestBodyBytes)
 }
 
 // ServeInternalContext 运行显式启用的内部 listener(审查 R5-C1): 只挂
@@ -90,19 +90,19 @@ func ServeContext(ctx context.Context, addr string, h http.Handler) error {
 // 管理/用户路由; 由部署显式传 --worker-internal-listen 启用, 默认关闭。
 // 与主 API 共享相同的 timeout/recover/body-limit 中间件, 但不要求 loopback——
 // 独立 Runner 容器经 runner-control 网络访问。
-func ServeInternalContext(ctx context.Context, addr string, h http.Handler) error {
+func ServeInternalContext(ctx context.Context, addr string, h http.Handler, maxBodyBytes int64) error {
 	if addr == "" {
 		return fmt.Errorf("internal listener address is required")
 	}
-	return serveUntil(ctx, addr, h)
+	return serveUntil(ctx, addr, h, maxBodyBytes)
 }
 
-func serveUntil(ctx context.Context, addr string, h http.Handler) error {
+func serveUntil(ctx context.Context, addr string, h http.Handler, maxBodyBytes int64) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	return serveListener(ctx, ln, h)
+	return serveListener(ctx, ln, h, maxBodyBytes)
 }
 
 // ServeUnixContext 在 unix socket 上运行主 API(round10 审查 B1c): 独立
@@ -111,7 +111,7 @@ func serveUntil(ctx context.Context, addr string, h http.Handler) error {
 // 主 API 不能监听 0.0.0.0)。socket 权限 0660、属组 10001(Platform 主组),
 // web 容器 group_add 10001 后即可读写。与 loopback TCP listener 共用
 // timeout/recover/body-limit 中间件; 退出时删除 socket 文件。
-func ServeUnixContext(ctx context.Context, path string, h http.Handler) error {
+func ServeUnixContext(ctx context.Context, path string, h http.Handler, maxBodyBytes int64) error {
 	if path == "" {
 		return fmt.Errorf("unix listen path is required")
 	}
@@ -128,11 +128,14 @@ func ServeUnixContext(ctx context.Context, path string, h http.Handler) error {
 		return fmt.Errorf("chmod unix socket: %w", err)
 	}
 	defer os.Remove(path)
-	return serveListener(ctx, ln, h)
+	return serveListener(ctx, ln, h, maxBodyBytes)
 }
 
-func serveListener(ctx context.Context, ln net.Listener, h http.Handler) error {
-	wrapped := recoverMiddleware(bodyLimitMiddleware(MaxRequestBodyBytes)(h))
+func serveListener(ctx context.Context, ln net.Listener, h http.Handler, maxBodyBytes int64) error {
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = DefaultMaxRequestBodyBytes
+	}
+	wrapped := recoverMiddleware(bodyLimitMiddleware(maxBodyBytes)(h))
 	srv := &http.Server{
 		Handler:           wrapped,
 		ReadHeaderTimeout: 10 * time.Second,

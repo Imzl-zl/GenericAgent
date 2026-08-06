@@ -18,7 +18,7 @@ import (
 func seedTask(t *testing.T, store *postgres.Store) domain.Task {
 	t.Helper()
 	ctx := context.Background()
-	dev, err := store.EnsureDevelopmentContext(ctx, 42, "dev")
+	dev, err := store.EnsureAdminContext(ctx, 42, "dev")
 	if err != nil {
 		t.Fatal(err)
 	}

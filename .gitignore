@@ -39,6 +39,9 @@ tasks/
 *.exe
 
 memory/*
+# 协作归档(memory/archive/)必须入库, 与下方逐文件白名单同属 memory/ 显式白名单惯例
+!memory/archive/
+!memory/archive/**
 !memory/memory_management_sop.md
 
 # Allow tracking of specific SOPs

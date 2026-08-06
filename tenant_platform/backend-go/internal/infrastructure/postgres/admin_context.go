@@ -10,9 +10,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// EnsureDevelopmentContext inserts or refreshes only bootstrap_marker='dev-loopback' rows.
+// EnsureAdminContext inserts or refreshes only bootstrap_marker='dev-loopback' rows.
 // If the requested ID exists with another marker or non-approved status, it fails visibly.
-func (s *Store) EnsureDevelopmentContext(ctx context.Context, userID int64, username string) (DevelopmentContext, error) {
+func (s *Store) EnsureAdminContext(ctx context.Context, userID int64, username string) (AdminContext, error) {
 	return s.ensureContextUser(ctx, userID, username, "dev-loopback")
 }
 
@@ -20,19 +20,19 @@ func (s *Store) EnsureDevelopmentContext(ctx context.Context, userID int64, user
 // bootstrap_marker='platform-admin' 的 approved 用户与个人 workspace,
 // 供管理端 API(persona/policy/invite)使用。与 dev-loopback 隔离,
 // 不互相覆盖。
-func (s *Store) EnsurePlatformAdminUser(ctx context.Context, userID int64, username string) (DevelopmentContext, error) {
+func (s *Store) EnsurePlatformAdminUser(ctx context.Context, userID int64, username string) (AdminContext, error) {
 	return s.ensureContextUser(ctx, userID, username, "platform-admin")
 }
 
-func (s *Store) ensureContextUser(ctx context.Context, userID int64, username, bootstrapMarker string) (DevelopmentContext, error) {
+func (s *Store) ensureContextUser(ctx context.Context, userID int64, username, bootstrapMarker string) (AdminContext, error) {
 	if userID <= 0 {
-		return DevelopmentContext{}, fmt.Errorf("user id must be positive")
+		return AdminContext{}, fmt.Errorf("user id must be positive")
 	}
 	if strings.TrimSpace(username) == "" {
 		username = fmt.Sprintf("ga-user-%d", userID)
 	}
 	sessionKey := fmt.Sprintf("personal:%d", userID)
-	var out DevelopmentContext
+	var out AdminContext
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		var existingID int64
 		var status, marker *string
@@ -92,7 +92,7 @@ VALUES ($1, $2, $3, 'personal', NULL, NULL, $4)
 				return err
 			}
 		}
-		out = DevelopmentContext{
+		out = AdminContext{
 			UserID:      userID,
 			Username:    username,
 			WorkspaceID: wsID.String(),

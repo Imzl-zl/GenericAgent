@@ -351,6 +351,11 @@ func (r *SandboxWorkerRuntime) ReleaseRunnerLease(ctx context.Context, workspace
 	return r.cfg.LeaseStore.ReleaseRunnerLease(ctx, workspaceKey, r.cfg.PlatformInstanceID, generation)
 }
 
+// ExpireRunnerLease 归还会话容量但保留容器引用(审查 F1)。
+func (r *SandboxWorkerRuntime) ExpireRunnerLease(ctx context.Context, workspaceKey string, generation uint64) error {
+	return r.cfg.LeaseStore.ExpireRunnerLease(ctx, workspaceKey, r.cfg.PlatformInstanceID, generation)
+}
+
 func (r *SandboxWorkerRuntime) dialMTLS(ctx context.Context, endpoint string, clientCert CertMaterial) (*grpc.ClientConn, error) {
 	pair, err := tls.X509KeyPair(clientCert.CertPEM, clientCert.KeyPEM)
 	if err != nil {

@@ -423,7 +423,6 @@ func setupDeliveryService(t *testing.T) (context.Context, *deliveryService, deli
 		Transport:      deps.transport,
 		Results:        deps.results,
 		Messages:       deps.messages,
-		SessionFiles:   deps.sessionFiles,
 		TeamMembership: deps.membership,
 		Now:            func() time.Time { return time.Now().UTC() },
 	})
@@ -476,17 +475,17 @@ func (s *fakeDeliveryStore) DeadLetterExpiredDeliveries(_ context.Context, _ tim
 	return 0, nil
 }
 
-func (s *fakeDeliveryStore) MarkDeliveryAcked(_ context.Context, deliveryID string, _ time.Time) error {
+func (s *fakeDeliveryStore) MarkDeliveryAcked(_ context.Context, deliveryID, _ string, _ time.Time) error {
 	s.acked = append(s.acked, deliveryID)
 	return nil
 }
 
-func (s *fakeDeliveryStore) MarkDeliveryRetry(_ context.Context, deliveryID string, _ time.Time, _ time.Time) error {
+func (s *fakeDeliveryStore) MarkDeliveryRetry(_ context.Context, deliveryID, _ string, _ time.Time, _ time.Time) error {
 	s.retries = append(s.retries, deliveryID)
 	return nil
 }
 
-func (s *fakeDeliveryStore) MarkDeliveryDeadLetter(_ context.Context, deliveryID string, errCode, errMessage string, _ time.Time) error {
+func (s *fakeDeliveryStore) MarkDeliveryDeadLetter(_ context.Context, deliveryID, _ string, errCode, errMessage string, _ time.Time) error {
 	if s.deadLetterErr != nil {
 		return s.deadLetterErr
 	}

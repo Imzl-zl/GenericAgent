@@ -112,7 +112,7 @@ func TestBuildWorkerEnvironmentExcludesInheritedPlatformSecrets(t *testing.T) {
 		"LLM_PROXY_CAPABILITY_SIGNING_KEY=signing-secret",
 		"DATABASE_URL=postgres://secret",
 		"BOT_TOKEN_KEY=bot-secret",
-		"PLATFORM_DEV_TOKEN=dev-secret",
+		"PLATFORM_ADMIN_TOKEN=dev-secret",
 		"OPENAI_API_KEY=openai-secret",
 		"ANTHROPIC_API_KEY=anthropic-secret",
 		"UNRELATED_SECRET=must-not-cross-boundary",
@@ -128,7 +128,7 @@ func TestBuildWorkerEnvironmentExcludesInheritedPlatformSecrets(t *testing.T) {
 
 	for _, secret := range []string{
 		"LLM_PROVIDER_API_KEY", "LLM_PROXY_CAPABILITY_SIGNING_KEY", "DATABASE_URL",
-		"BOT_TOKEN_KEY", "PLATFORM_DEV_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "UNRELATED_SECRET",
+		"BOT_TOKEN_KEY", "PLATFORM_ADMIN_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "UNRELATED_SECRET",
 	} {
 		if value := getEnv(env, secret); value != "" {
 			t.Fatalf("Worker inherited %s=%q", secret, value)

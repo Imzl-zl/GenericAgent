@@ -1,0 +1,10 @@
+id,goal,task_type,depends_on,task_dir,status,validation,completed_at,notes
+1,语义改名: AdminToken/AdminUserID 全链路(Go+env+header+OpenAPI+web+测试+文档),durable,,,DONE,go vet+build+test; python contract/security/smoke/integration; web lint+build,2026-08-06,X-Platform-Dev-Token→X-Platform-Admin-Token; PLATFORM_DEV_*→PLATFORM_ADMIN_*; DevBootstrapConfig→AdminBootstrapConfig; --dev-loopback flag 与 bootstrap_marker 存量值保留。Round14 收尾(2026-08-06): openapi 三处 header 名 + PLATFORM_DEV_USERNAME→PLATFORM_ADMIN_USERNAME(Go/compose/env 模板/3 测试) + AdminLoginPage 文案统一; 全仓残留 grep 清零
+2,任务端点迁移 userAuth+owner 校验(create session 归属/get/result/cancel RequesterID),durable,1,,DONE,go test 全量; 越权测试(他人任务 403/404),2026-08-06,任务端点只认 Bearer; admin token 仅管理面+router/messages 服务入口; team session 走 TeamService 成员校验
+3,测试改造: 集成/smoke 注册→登录→Bearer 调任务端点,durable,2,,DONE,python integration+smoke+contract 全绿,2026-08-06,含 owner 校验正向/负向用例
+4,OpenAPI 33 条 KNOWN_SPEC_GAPS 补齐(login/register/im-webhook→用户面→管理面)+安全声明对齐,durable,2,,DONE,test_route_contract 通过,2026-08-06,,补 spec 时同步 security 声明(admin/bearer/public)
+5,Minor: legacy_instrument 隐藏 fallback 移除或接真,durable,,,DONE,,2026-08-06,,
+6,Minor: settings_http IM 聚合两阶段提交不一致窗口修复,durable,,,DONE,,2026-08-06,,
+7,Minor: sandbox manager nonce 全量写盘 O(n) 优化,durable,,,DONE,,2026-08-06,,
+8,Minor: handleGetResult JSON 包 JSON→text/plain 对齐 OpenAPI,durable,2,,DONE,误报: 契约(JSON envelope+payload string)与实现一致, 无双重 JSON,2026-08-06,,
+9,验证全绿: Go 全量+race+pytest 全组+web lint/build,durable,4;5;6;7;8,,DONE,Go 18 包全绿+race; pytest 73; worker-python 109; web lint+build,2026-08-06,,

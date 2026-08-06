@@ -8,34 +8,34 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/postgres"
 )
 
-func TestEnsureDevelopmentContext_RequiresFlag(t *testing.T) {
+func TestEnsureAdminContext_RequiresFlag(t *testing.T) {
 	pool := postgres.OpenTestPool(t)
 	store, err := postgres.NewStore(pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = EnsureDevelopmentContext(context.Background(), store, DevBootstrapConfig{
+	_, err = EnsureAdminContext(context.Background(), store, AdminBootstrapConfig{
 		Enabled:  false,
 		UserID:   1,
-		DevToken: "tok",
+		AdminToken: "tok",
 	})
 	if err == nil || !strings.Contains(err.Error(), "--dev-loopback") {
 		t.Fatalf("expected flag rejection: %v", err)
 	}
 }
 
-func TestEnsureDevelopmentContext_CreatesApprovedPersonalWorkspace(t *testing.T) {
+func TestEnsureAdminContext_CreatesApprovedPersonalWorkspace(t *testing.T) {
 	pool := postgres.OpenTestPool(t)
 	store, err := postgres.NewStore(pool)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	dev, err := EnsureDevelopmentContext(ctx, store, DevBootstrapConfig{
+	dev, err := EnsureAdminContext(ctx, store, AdminBootstrapConfig{
 		Enabled:  true,
 		UserID:   7,
 		Username: "dev7",
-		DevToken: "dev-token",
+		AdminToken: "admin token",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -63,8 +63,8 @@ SELECT kind, team_id, volume_id, bootstrap_marker FROM workspaces WHERE session_
 		t.Fatalf("workspace kind=%s team=%v vol=%v marker=%s", kind, team, vol, wmarker)
 	}
 
-	dev2, err := EnsureDevelopmentContext(ctx, store, DevBootstrapConfig{
-		Enabled: true, UserID: 7, Username: "dev7-renamed", DevToken: "dev-token",
+	dev2, err := EnsureAdminContext(ctx, store, AdminBootstrapConfig{
+		Enabled: true, UserID: 7, Username: "dev7-renamed", AdminToken: "admin token",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -78,8 +78,8 @@ INSERT INTO users (id, username, status, bootstrap_marker) VALUES (8, 'other', '
 `); err != nil {
 		t.Fatal(err)
 	}
-	_, err = EnsureDevelopmentContext(ctx, store, DevBootstrapConfig{
-		Enabled: true, UserID: 8, DevToken: "tok",
+	_, err = EnsureAdminContext(ctx, store, AdminBootstrapConfig{
+		Enabled: true, UserID: 8, AdminToken: "tok",
 	})
 	if err == nil {
 		t.Fatal("expected refusal to promote non-bootstrap user")

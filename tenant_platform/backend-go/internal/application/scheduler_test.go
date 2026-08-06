@@ -1294,7 +1294,7 @@ func TestSchedulerGlobalCapacityKeepsTasksQueued(t *testing.T) {
 	defer cancel()
 
 	// Two sessions, one task each, so per-tenant limits don't interfere.
-	dev2, err := store.EnsureDevelopmentContext(ctx, 2, "dev2")
+	dev2, err := store.EnsureAdminContext(ctx, 2, "dev2")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,9 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import signal
-import sys
 import threading
-import time
 from pathlib import Path
 
 import grpc
@@ -118,8 +116,9 @@ def serve(listen: str, adapter: ManagedAgentAdapter, *, grace_seconds: float = 1
     if bound == 0:
         raise SystemExit(f"failed to bind listen address: {listen}")
     server.start()
-    # bound is the concrete port when listen used :0
-    if listen.endswith(":0") or listen.rstrip().endswith("0"):
+    # bound is the concrete port when listen used :0 (审查: 仅 `:0` 后缀
+    # 表示动态端口; 此前 `rstrip().endswith("0")` 会把 `:10` 等端口误判)。
+    if listen.endswith(":0"):
         host = listen.rsplit(":", 1)[0]
         print(f"WORKER_LISTEN={host}:{bound}", flush=True)
     else:

@@ -32,7 +32,7 @@ func (s *Server) handleCreateWechatQRCode(w http.ResponseWriter, r *http.Request
 func (s *Server) handleAdminCreateWechatQRCode(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	// Admin uses the platform dev user id (configured via --dev-user-id)
-	sess, err := s.wechatBinding.GenerateQRCode(r.Context(), s.devUserID)
+	sess, err := s.wechatBinding.GenerateQRCode(r.Context(), s.adminUserID)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "ILINK_QR_FAILED", err.Error(), tid)
 		return

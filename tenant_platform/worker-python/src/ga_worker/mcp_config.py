@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from ga_worker.credential_config import CredentialConfigError, load_runtime_document
 from ga_worker.mcp_client import MCPServerConfig

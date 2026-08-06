@@ -51,4 +51,7 @@ type Delivery struct {
 	ErrorCode      string
 	ErrorMessage   string
 	AttemptCount   int
+	// AttemptToken 是本次 claim 的 fencing token(审查 F2): claim 时生成,
+	// Ack/Retry/DeadLetter 必须携带, 防止旧 attempt 覆盖新 attempt。
+	AttemptToken string
 }

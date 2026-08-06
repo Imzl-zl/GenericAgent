@@ -19,9 +19,9 @@ func requireDB(t *testing.T) *pgxpool.Pool {
 	return OpenTestPool(t)
 }
 
-func seedDev(t *testing.T, store *Store) DevelopmentContext {
+func seedDev(t *testing.T, store *Store) AdminContext {
 	t.Helper()
-	dev, err := store.EnsureDevelopmentContext(context.Background(), 1, "dev1")
+	dev, err := store.EnsureAdminContext(context.Background(), 1, "dev1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +638,7 @@ func TestSetTaskCapabilityJTIsRequiresActiveClaim(t *testing.T) {
 		t.Fatalf("SetTaskCapabilityJTIs on active claim: %v", err)
 	}
 	// 其他实例 owner 必须拒绝(用第二个 session 避免同 session 活跃约束)。
-	dev2, err := store.EnsureDevelopmentContext(ctx, 2, "dev2")
+	dev2, err := store.EnsureAdminContext(ctx, 2, "dev2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -733,10 +733,10 @@ func TestRemoveMemberCancelsDispatchedTasksAndScopesContextClear(t *testing.T) {
 	}
 	ctx := context.Background()
 	seedDev(t, store)
-	if _, err := store.EnsureDevelopmentContext(ctx, 2, "dev2"); err != nil {
+	if _, err := store.EnsureAdminContext(ctx, 2, "dev2"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.EnsureDevelopmentContext(ctx, 3, "dev3"); err != nil {
+	if _, err := store.EnsureAdminContext(ctx, 3, "dev3"); err != nil {
 		t.Fatal(err)
 	}
 	// owner=1 建团队, member=2 加入。
@@ -906,7 +906,7 @@ func TestRemoveMemberTerminalizesUndispatchedStartingTask(t *testing.T) {
 	}
 	ctx := context.Background()
 	seedDev(t, store)
-	if _, err := store.EnsureDevelopmentContext(ctx, 2, "dev2"); err != nil {
+	if _, err := store.EnsureAdminContext(ctx, 2, "dev2"); err != nil {
 		t.Fatal(err)
 	}
 	team, err := store.CreateTeam(ctx, 1, "rm-team2")
@@ -1070,7 +1070,7 @@ func TestRemoveMemberRevokesCapabilityJTIsOfUndispatchedStartingTask(t *testing.
 	}
 	ctx := context.Background()
 	seedDev(t, store)
-	if _, err := store.EnsureDevelopmentContext(ctx, 2, "dev2"); err != nil {
+	if _, err := store.EnsureAdminContext(ctx, 2, "dev2"); err != nil {
 		t.Fatal(err)
 	}
 	team, err := store.CreateTeam(ctx, 1, "rm-jti-team")
@@ -1185,7 +1185,7 @@ func TestRemoveMemberRevokesDispatchedTaskJTIs(t *testing.T) {
 	}
 	ctx := context.Background()
 	seedDev(t, store)
-	if _, err := store.EnsureDevelopmentContext(ctx, 2, "dev2"); err != nil {
+	if _, err := store.EnsureAdminContext(ctx, 2, "dev2"); err != nil {
 		t.Fatal(err)
 	}
 	team, err := store.CreateTeam(ctx, 1, "jti-team")
@@ -1531,5 +1531,204 @@ ON CONFLICT (id) DO NOTHING
 	}
 	if retryRow.ID == 0 {
 		t.Fatal("retry must backfill the inbound message row")
+	}
+}
+
+// 审查 D3(用户生命周期): BlockUser 必须撤销该用户全部登录会话——
+// 否则 blocked 用户可持旧 token 继续调用用户控制面 API。
+func TestBlockUserRevokesAllSessions(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	if _, err := store.CreateUserSession(ctx, "tok-hash-1", dev.UserID, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateUserSession(ctx, "tok-hash-2", dev.UserID, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.EnsureAdminContext(ctx, 2, "other-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateUserSession(ctx, "tok-hash-3", other.UserID, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.BlockUser(ctx, dev.UserID); err != nil {
+		t.Fatalf("BlockUser: %v", err)
+	}
+	if _, err := store.GetUserSession(ctx, "tok-hash-1"); err == nil {
+		t.Fatal("session 1 must be revoked after block")
+	}
+	if _, err := store.GetUserSession(ctx, "tok-hash-2"); err == nil {
+		t.Fatal("session 2 must be revoked after block")
+	}
+	// 其他用户会话不受影响。
+	if _, err := store.GetUserSession(ctx, "tok-hash-3"); err != nil {
+		t.Fatalf("other user session must survive block: %v", err)
+	}
+}
+
+
+// 审查 F2: delivery attempt fencing——旧 attempt 的 ack 携带过期 token 时
+// 不得影响新 attempt 的状态。
+func TestDeliveryAttemptTokenFencesStaleWrites(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-f2", MessageID: "f2-1",
+		Prompt: "delivery fencing", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim task: %v ok=%v", err, ok)
+	}
+	if _, err := store.CompleteFailedTerminal(ctx, task.ID, "p1", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claimed, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute, 5*time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first *domain.Delivery
+	for i := range claimed {
+		if claimed[i].DeliveryType == domain.DeliveryTaskFailed {
+			first = &claimed[i]
+			break
+		}
+	}
+	if first == nil {
+		t.Fatalf("task_failed delivery must be claimable, got %+v", claimed)
+	}
+	// 模拟超时: 重置回 pending, 新 attempt 重新 claim。
+	if _, err := store.ResetStaleSendingDeliveries(ctx, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	claimed2, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute, 5*time.Minute, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second *domain.Delivery
+	for i := range claimed2 {
+		if claimed2[i].DeliveryID == first.DeliveryID {
+			second = &claimed2[i]
+			break
+		}
+	}
+	if second == nil {
+		t.Fatalf("delivery %s not re-claimed", first.DeliveryID)
+	}
+	if second.AttemptToken == "" || second.AttemptToken == first.AttemptToken {
+		t.Fatalf("attempt token must rotate: first=%q second=%q", first.AttemptToken, second.AttemptToken)
+	}
+	// 旧 attempt 用过期 token ack——必须 no-op(状态保持 sending)。
+	if err := store.MarkDeliveryAcked(ctx, first.DeliveryID, first.AttemptToken, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	d, err := store.GetDelivery(ctx, second.TaskID, second.DeliveryType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Status != domain.DeliverySending {
+		t.Fatalf("stale ack must be fenced, status=%s", d.Status)
+	}
+	// 新 attempt 用正确 token ack——生效。
+	if err := store.MarkDeliveryAcked(ctx, second.DeliveryID, second.AttemptToken, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	d, err = store.GetDelivery(ctx, second.TaskID, second.DeliveryType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Status != domain.DeliveryAcked {
+		t.Fatalf("fresh ack must apply, status=%s", d.Status)
+	}
+}
+
+// 审查 D4: 全局 running-task 上限必须是跨实例原子门禁——两个并发 claim
+// (不同 session)同时观察到 limit-1 时, 只有一个能成功, 不会超卖。
+func TestRunningTaskLimitSerializesConcurrentClaims(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetRunningTaskLimit(1)
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	// 第二个 workspace(不同 session key, 可独立 claim)。
+	if _, err := pool.Exec(ctx, `
+INSERT INTO workspaces (id, session_key, owner_user_id, kind, team_id, volume_id, bootstrap_marker)
+VALUES ('00000000-0000-4000-8000-0000000000d4', 'personal:d4', 1, 'personal', NULL, 'vol-test-d4', NULL)
+ON CONFLICT (session_key) DO NOTHING;
+`); err != nil {
+		t.Fatal(err)
+	}
+	for i, sk := range []string{dev.SessionKey, "personal:d4"} {
+		if _, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+			SessionKey: sk, RequesterUserID: 1, Source: "web", SourceInstanceID: "d4",
+			MessageID: fmt.Sprintf("d4-%d", i), Prompt: "p", PersonaSnapshot: []string{},
+			ToolPolicyVersion: "foundation.no-host-tools.v1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 并发 claim 两个不同 session: limit=1 时最多一个成功。
+	var wg sync.WaitGroup
+	okCount := make([]bool, 2)
+	for i, sk := range []string{dev.SessionKey, "personal:d4"} {
+		wg.Add(1)
+		go func(i int, sk string) {
+			defer wg.Done()
+			_, ok, err := store.ClaimNextTask(ctx, sk, "p-d4", time.Minute)
+			if err != nil {
+				t.Errorf("claim %s: %v", sk, err)
+				return
+			}
+			okCount[i] = ok
+		}(i, sk)
+	}
+	wg.Wait()
+	n := 0
+	for _, ok := range okCount {
+		if ok {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("exactly one claim must win with limit=1, got %d (ok=%v)", n, okCount)
+	}
+}
+
+// 审查(platform-review-fixes): CreateUser 空密码(NULL password_hash)必须
+// 正常返回, 不能因 scanUser 扫 NULL 进 string 崩溃。
+func TestCreateUserEmptyPasswordHash(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	u, err := store.CreateUser(ctx, "empty-pw-user", "")
+	if err != nil {
+		t.Fatalf("CreateUser with empty password must succeed: %v", err)
+	}
+	if u.ID <= 0 || u.PasswordHash != "" || u.Status != domain.UserPending {
+		t.Fatalf("unexpected user: %+v", u)
 	}
 }

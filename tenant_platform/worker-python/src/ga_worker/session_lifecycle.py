@@ -23,7 +23,6 @@ from ga_worker.checkpoint import (
     CheckpointError,
     build_snapshot_bundle,
     load_snapshot_bundle,
-    result_digest_for,
     write_checkpoint_atomic,
 )
 from ga_worker.credential_config import CredentialConfigError, load_runtime_metadata
@@ -317,6 +316,16 @@ class SessionLifecycleMixin:
         # fail the coordinator's staging_ref equality check. Validation that
         # the ref resolves under runtime_root is done in _validate_checkpoint_request.
         staging = Path(request.staging_ref)
+        # 审查: _validate_checkpoint_request 与写入之间, 不受信任的 agent 线程
+        # 可把 staging 父目录换成指向 runtime_root 外的符号链接(TOCTOU)。写入前
+        # 紧邻重做一次 resolve 校验, 缩小窗口; Go 侧提交时另有二次前缀校验兜底。
+        try:
+            staging.resolve().relative_to(self.runtime_root.resolve())
+        except Exception as exc:
+            raise WorkerAdapterError(
+                "INVALID_STAGING_REF",
+                f"staging_ref no longer resolves under runtime root: {request.staging_ref}",
+            ) from exc
         try:
             bundle = build_snapshot_bundle(
                 task_id=completed.task_id,

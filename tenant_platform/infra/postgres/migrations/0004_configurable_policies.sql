@@ -10,6 +10,9 @@
 --   tool_policies     — admin can create new policy versions, change allowed
 --                       tools, without touching source code or JSON files.
 --
+-- 审查 D1(去分级): tool_policies 表已废弃(0046 迁移删除), 工具能力统一由
+-- 静态 policy manifest(foundation.v1.json) 决定; platform_commands 仍有效。
+--
 -- Handler logic stays in Go code (each intercept command has a handler func);
 -- the *registry* (which commands exist, are they enabled, what's their help
 -- text) is database-driven. Adding a brand-new intercept command needs code,

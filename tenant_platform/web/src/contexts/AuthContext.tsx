@@ -5,11 +5,13 @@ export interface AuthState {
   isAdmin: boolean;
   adminToken?: string;
   userToken?: string;
+  userId?: number;
+  status?: 'pending' | 'approved' | 'blocked';
 }
 
 export interface AuthContextValue {
   state: AuthState | null;
-  login: (username: string, token: string, isAdmin?: boolean) => void;
+  login: (username: string, token: string, isAdmin?: boolean, extra?: { userId?: number; status?: 'pending' | 'approved' | 'blocked' }) => void;
   logout: () => void;
 }
 

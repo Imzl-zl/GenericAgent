@@ -13,7 +13,7 @@ func TestDeleteInviteCodesPreservesRegisteredUserAndSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	dev, err := store.EnsureDevelopmentContext(ctx, 9, "invite-delete-dev")
+	dev, err := store.EnsureAdminContext(ctx, 9, "invite-delete-dev")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestCreateUserWithInviteRollsBackUserAndConsumptionWhenSessionInsertFails(t
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	dev, err := store.EnsureDevelopmentContext(ctx, 9, "invite-rollback-dev")
+	dev, err := store.EnsureAdminContext(ctx, 9, "invite-rollback-dev")
 	if err != nil {
 		t.Fatal(err)
 	}
