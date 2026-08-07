@@ -9,8 +9,8 @@ import (
 func TestRunnerNetworkHostsGathersNamesAndAliases(t *testing.T) {
 	runner := &fakeRunner{scripted: []fakeRunResult{
 		{stdout: `[{"Containers":{"a":{"Name":"genericagent-llm-proxy-1","IPv4Address":"172.26.0.2/16"},"b":{"Name":"genericagent-platform-1","IPv4Address":"172.26.0.3/16"}}}]`},
-		{stdout: `{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-llm-proxy-1","llm-proxy"]}}}}`},
-		{stdout: `{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-platform-1","platform"]}}}}`},
+		{stdout: `[{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-llm-proxy-1","llm-proxy"]}}}}]`},
+		{stdout: `[{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-platform-1","platform"]}}}}]`},
 	}}
 	cli := &DockerCLI{cfg: validConfig(), runner: runner}
 

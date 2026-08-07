@@ -57,8 +57,8 @@ func hostScript(extra ...fakeRunResult) []fakeRunResult {
 	base := []fakeRunResult{
 		{stdout: `[{"Containers":{"abc123":{"Name":"genericagent-platform-1","IPv4Address":"172.26.0.3/16"},"def456":{"Name":"genericagent-llm-proxy-1","IPv4Address":"172.26.0.2/16"}}}]`},
 		// 按容器名排序: 先 inspect genericagent-llm-proxy-1, 再 platform-1。
-		{stdout: `{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-llm-proxy-1","llm-proxy"]}}}}`},
-		{stdout: `{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-platform-1","platform"]}}}}`},
+		{stdout: `[{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-llm-proxy-1","llm-proxy"]}}}}]`},
+		{stdout: `[{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-platform-1","platform"]}}}}]`},
 	}
 	return append(base, extra...)
 }

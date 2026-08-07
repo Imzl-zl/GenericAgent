@@ -80,11 +80,12 @@ func (d *DockerCLI) runnerNetworkHosts(ctx context.Context, network string) ([]s
 		if aliasErr != nil || aliasCode != 0 {
 			continue // 容器名条目已足够; 别名缺失不阻断创建
 		}
-		var info containerInspect
-		if err := json.Unmarshal(aliasOut, &info); err != nil {
+		// docker inspect 输出是 JSON 数组(即使单个容器), 与 network inspect 不同。
+		var infos []containerInspect
+		if err := json.Unmarshal(aliasOut, &infos); err != nil || len(infos) == 0 {
 			continue
 		}
-		for _, alias := range info.NetworkSettings.Networks[network].Aliases {
+		for _, alias := range infos[0].NetworkSettings.Networks[network].Aliases {
 			if strings.TrimSpace(alias) != "" {
 				add(alias, ip.String())
 			}
