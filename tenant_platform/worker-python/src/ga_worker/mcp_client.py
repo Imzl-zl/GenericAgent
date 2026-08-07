@@ -36,6 +36,11 @@ class MCPServerConfig:
     name: str
     url: str
     timeout_seconds: float = 30.0
+    # proxy_base_url/capability_token 非空时, 请求经 Platform 受控 MCP proxy
+    # 转发(server_id → URL 映射即白名单): 拨号地址改写为
+    # {proxy_base_url}/v1/worker/mcp/{server_id}, 并携带短期 capability。
+    proxy_base_url: str = ""
+    capability_token: str = ""
 
     def validate(self) -> None:
         if not _NAME_RE.fullmatch(self.server_id or ""):
@@ -47,6 +52,28 @@ class MCPServerConfig:
             raise ValueError("url must contain no credentials or fragment")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if self.proxy_base_url:
+            parsed_proxy = urlparse(self.proxy_base_url)
+            if parsed_proxy.scheme not in ("http", "https") or not parsed_proxy.netloc:
+                raise ValueError("proxy_base_url must be an absolute http or https URL")
+            if parsed_proxy.username or parsed_proxy.password or parsed_proxy.fragment:
+                raise ValueError("proxy_base_url must contain no credentials or fragment")
+        if self.proxy_base_url and not self.capability_token.strip():
+            raise ValueError("capability_token is required when proxy_base_url is set")
+
+    @property
+    def dial_url(self) -> str:
+        """实际拨号地址: 配置 proxy 时改写为 Platform MCP proxy 端点。"""
+        if self.proxy_base_url:
+            return "{}/v1/worker/mcp/{}".format(
+                self.proxy_base_url.rstrip("/"), self.server_id
+            )
+        return self.url
+
+    def auth_headers(self) -> dict[str, str]:
+        if self.capability_token:
+            return {"Authorization": f"Bearer {self.capability_token}"}
+        return {}
 
 
 @dataclass(frozen=True)
@@ -210,6 +237,9 @@ class MCPHTTPClient:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
+        # 经 Platform MCP proxy 访问时携带短期 capability(不外泄给第三方 MCP
+        # Server——平台代理侧会剥离 Authorization 再转发上游)。
+        headers.update(self.config.auth_headers())
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
         if self._protocol_negotiated:
@@ -281,7 +311,7 @@ class MCPHTTPClient:
         request_timeout = self._remaining_timeout(deadline, method)
         try:
             response = self._http.post(
-                self.config.url,
+                self.config.dial_url,
                 headers=headers,
                 json=payload,
                 timeout=request_timeout,

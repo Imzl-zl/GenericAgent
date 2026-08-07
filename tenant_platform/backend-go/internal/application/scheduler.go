@@ -67,6 +67,10 @@ type SchedulerConfig struct {
 	// SophubProxyBaseURL 是 Platform 的 Worker Sophub proxy 地址(方案 §5.2);
 	// 非空时向 Worker 下发 _platform_sophub capability。
 	SophubProxyBaseURL string
+	// MCPProxyBaseURL 是 Platform 的 Worker MCP proxy 地址(Runner 无公网出口,
+	// MCP 一律经 Platform 受控代理); 非空且 MCP 快照含 server 时下发
+	// _platform_mcp.proxy capability。
+	MCPProxyBaseURL string
 	ModelPolicyVersion        string
 	// LLMProvider resolves an immutable provider routing snapshot per Worker.
 	LLMProvider LLMProviderSource

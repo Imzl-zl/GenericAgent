@@ -768,6 +768,7 @@ func run() error {
 		RuntimeRoot:           boot.RuntimeRoot,
 		LLMProxyAddr:          proxyAddr,
 		SophubProxyBaseURL:    sophubProxyBaseURL(),
+		MCPProxyBaseURL:       sophubProxyBaseURL(),
 		TokenIssuer:           issuer,
 		CapabilityStore:       store,
 		Audit:                 store,
@@ -968,6 +969,34 @@ func run() error {
 			return sv.Validate(ctx, token)
 		},
 		SophubUsageCounter: store, // 审查 F10: sophub 调用按 JTI 原子计量
+		MCPProxy: func() *api.WorkerMCPProxy {
+			mcpValidator, err := llmproxy.NewMCPValidator([]byte(signingKey), store)
+			if err != nil {
+				return nil
+			}
+			// round9 同款: MCP 调用在线联查 task/lease/成员状态。
+			mcpValidator.WithTaskChecker(store)
+			// server_id → URL 映射(启用中 server 即白名单)。
+			resolve := func(ctx context.Context, serverID string) (string, bool, error) {
+				servers, listErr := store.ListEnabledMCPServers(ctx)
+				if listErr != nil {
+					return "", false, listErr
+				}
+				for _, server := range servers {
+					if server.ServerKey == serverID {
+						return server.URL, true, nil
+					}
+				}
+				return "", false, nil
+			}
+			return api.NewWorkerMCPProxy(
+				resolve,
+				func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+					return mcpValidator.Validate(ctx, token)
+				},
+				store.ConsumeCapabilityCall, // MCP 调用按 JTI 原子计量(同审查 F10)
+			)
+		}(),
 		LLMProviders:       store, // admin LLM provider management (migration 0007)
 		MCPServers:         store, // global MCP server management (migration 0029)
 		BotLifecycle:       botLifecycle,
@@ -1070,14 +1099,13 @@ func run() error {
 			}
 		}()
 	}
-	// 审查 R5-C1: 内部 listener 只挂 capability-protected Worker Sophub 路由
-	// (NewWorkerSophubHandler), 默认关闭; 显式启用时绑定失败即 fail-closed
-	// 终止启动——Runner 依赖它访问 Sophub proxy, 静默降级会让 Runner 的
-	// sophub 工具全部失败。
+	// 审查 R5-C1: 内部 listener 只挂 capability-protected Worker 代理路由
+	// (NewWorkerInternalHandler 合并 Sophub/MCP), 默认关闭; 显式启用时绑定
+	// 失败即 fail-closed 终止启动——Runner 依赖它访问 Sophub/MCP proxy。
 	if strings.TrimSpace(*workerInternalListen) != "" {
-		internalHandler := server.WorkerSophubHandler()
+		internalHandler := server.WorkerInternalHandler()
 		if internalHandler == nil {
-			return fmt.Errorf("worker-internal-listen requires sophub proxy to be configured")
+			return fmt.Errorf("worker-internal-listen requires at least one worker proxy (sophub/mcp) to be configured")
 		}
 		go func() {
 			slog.Info("platform: worker internal listener", "addr", *workerInternalListen)

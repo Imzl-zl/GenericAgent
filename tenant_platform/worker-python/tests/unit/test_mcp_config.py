@@ -79,3 +79,61 @@ def test_runtime_mcp_rejects_unsupported_server_fields(tmp_path: Path, unsupport
 
     with pytest.raises(MCPConfigError, match="unknown fields"):
         load_runtime_mcp_snapshot(tmp_path)
+
+
+def test_runtime_mcp_parses_proxy_and_rewrites_dial_url(tmp_path: Path):
+    _write_runtime_config(tmp_path, {
+        "snapshot_id": "sha256:abc",
+        "servers": [{
+            "server_id": "exa",
+            "name": "Exa",
+            "url": "https://mcp.exa.ai/mcp",
+            "timeout_seconds": 30,
+        }],
+        "proxy": {
+            "base_url": "http://platform:8082",
+            "capability_token": "token-1",
+        },
+    })
+
+    snapshot = load_runtime_mcp_snapshot(tmp_path)
+
+    assert snapshot.proxy is not None
+    assert snapshot.proxy.base_url == "http://platform:8082"
+    assert snapshot.proxy.capability_token == "token-1"
+    server = snapshot.servers[0]
+    assert server.dial_url == "http://platform:8082/v1/worker/mcp/exa"
+    assert server.auth_headers() == {"Authorization": "Bearer token-1"}
+
+
+def test_runtime_mcp_proxy_without_servers_is_still_valid(tmp_path: Path):
+    # 代理配置随快照下发; 无 server 时不影响解析(签发侧不会同时出现)。
+    _write_runtime_config(tmp_path, {
+        "snapshot_id": "sha256:abc",
+        "servers": [],
+        "proxy": {
+            "base_url": "http://platform:8082",
+            "capability_token": "token-1",
+        },
+    })
+    snapshot = load_runtime_mcp_snapshot(tmp_path)
+    assert snapshot.servers == ()
+    assert snapshot.proxy is not None
+
+
+def test_runtime_mcp_rejects_invalid_proxy(tmp_path: Path):
+    cases = [
+        {"base_url": "", "capability_token": "t"},
+        {"base_url": "http://platform:8082", "capability_token": ""},
+        {"base_url": "http://user:pass@platform", "capability_token": "t"},
+        {"base_url": "not-a-url", "capability_token": "t"},
+        {"base_url": "http://platform:8082", "capability_token": "t", "extra": 1},
+    ]
+    for proxy in cases:
+        _write_runtime_config(tmp_path, {
+            "snapshot_id": "x",
+            "servers": [],
+            "proxy": proxy,
+        })
+        with pytest.raises(MCPConfigError):
+            load_runtime_mcp_snapshot(tmp_path)

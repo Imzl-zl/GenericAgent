@@ -101,6 +101,29 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 		}
 		sophub = &RuntimeSophubProxy{BaseURL: s.cfg.SophubProxyBaseURL, CapabilityToken: sophubToken}
 	}
+	// MCP proxy capability: 与 Sophub 同模式(audience=ga-mcp-proxy)。
+	// 仅在 MCP 快照含 server 且配置了 proxy 地址时签发——Runner 无公网出口,
+	// 外部 MCP Server 必须经 Platform 受控代理(server_id → URL 映射即白名单)。
+	// JTI 纳入同一撤销集合 + 预算计量(无预算 fail-closed, 同审查 F10)。
+	if s.cfg.TokenIssuer != nil && s.cfg.MCPProxyBaseURL != "" && len(mcpSnapshot.Servers) > 0 {
+		mcpBudget := fmt.Sprintf(`{"max_turns":%d}`, maxTurns)
+		mcpToken, mcpClaims, err := s.cfg.TokenIssuer.IssueMCPToken(sessionKey, taskID, runnerGeneration, llmproxy.DefaultTokenTTL, mcpBudget)
+		if err != nil {
+			s.revokeCredentialSetBestEffort(ctx, set)
+			return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("issue mcp capability: %w", err)
+		}
+		set.JTIs = append(set.JTIs, mcpClaims.ID)
+		if mcpClaims.ExpiresAt != nil {
+			expiresAt := mcpClaims.ExpiresAt.Time.UTC()
+			if set.ExpiresAt.IsZero() || expiresAt.Before(set.ExpiresAt) {
+				set.ExpiresAt = expiresAt
+			}
+		}
+		mcpSnapshot.Proxy = &RuntimeMCPProxy{
+			BaseURL:         s.cfg.MCPProxyBaseURL,
+			CapabilityToken: mcpToken,
+		}
+	}
 	// round11 审查(I4): 独立签发的 control capability——控制 RPC
 	// (CancelTask/Shutdown/BeginCheckpoint)使用它而不是任意 LLM/Sophub JTI。
 	// JTI 纳入同一持久化/撤销集合。

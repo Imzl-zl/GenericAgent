@@ -30,6 +30,10 @@ const (
 	// SophubAudience 是 Runner → Platform Sophub proxy 的 capability audience。
 	// 与 LLM capability 同签发体系但独立用途(方案 §5.2: Runner 不持有 Sophub Key)。
 	SophubAudience = "ga-sophub-proxy"
+	// MCPAudience 是 Runner → Platform MCP proxy 的 capability audience。
+	// 与 Sophub 同模式: Runner 直连外部 MCP Server 需经 Platform 受控代理
+	// (Runner 仅 internal 网络, 无公网出口), server_id → URL 映射即白名单。
+	MCPAudience = "ga-mcp-proxy"
 	CapabilityType = "ga-llm-cap+jwt"
 	validationLeeway = 30 * time.Second
 )
@@ -307,6 +311,60 @@ func (v *SophubValidator) Validate(ctx context.Context, tokenString string) (Cap
 	return claims, nil
 }
 
+// MCPValidator 校验 Runner → Platform MCP proxy 的 capability
+// (audience=ga-mcp-proxy): 与 SophubValidator 同构, 要求 session subject +
+// jti 未撤销 + task_id/runner_generation 绑定 + operation=mcp。
+type MCPValidator struct {
+	signingKey  []byte
+	revocations CapabilityRevocationSource
+	taskChecker TaskCapabilityChecker
+	clock       func() time.Time
+}
+
+// NewMCPValidator 构建 MCP audience 专用校验器。
+func NewMCPValidator(signingKey []byte, revocations CapabilityRevocationSource) (*MCPValidator, error) {
+	if len(signingKey) < MinSigningKeyLen {
+		return nil, fmt.Errorf("signing key must be at least %d bytes", MinSigningKeyLen)
+	}
+	if revocations == nil {
+		return nil, fmt.Errorf("capability revocation source is required")
+	}
+	return &MCPValidator{signingKey: append([]byte(nil), signingKey...), revocations: revocations, clock: time.Now}, nil
+}
+
+// WithTaskChecker 注入在线 task 活跃性校验(同 SophubValidator)。
+func (v *MCPValidator) WithTaskChecker(checker TaskCapabilityChecker) *MCPValidator {
+	v.taskChecker = checker
+	return v
+}
+
+func (v *MCPValidator) Validate(ctx context.Context, tokenString string) (CapabilityClaims, error) {
+	claims, err := validateWithAudience(v.signingKey, v.revocations, v.clock, ctx, tokenString, MCPAudience)
+	if err != nil {
+		return CapabilityClaims{}, err
+	}
+	if claims.TaskID == "" {
+		return CapabilityClaims{}, fmt.Errorf("%w: task_id binding required", ErrCapabilityInvalid)
+	}
+	if claims.RunnerGeneration == 0 {
+		return CapabilityClaims{}, fmt.Errorf("%w: runner_generation binding required", ErrCapabilityInvalid)
+	}
+	if claims.Operation != "mcp" {
+		return CapabilityClaims{}, fmt.Errorf("%w: operation must be mcp", ErrCapabilityInvalid)
+	}
+	if v.taskChecker != nil {
+		active, checkErr := v.taskChecker.IsTaskCapabilityActive(ctx, claims.TaskID, claims.RunnerGeneration)
+		if checkErr != nil {
+			return CapabilityClaims{}, fmt.Errorf("check task capability active: %w", checkErr)
+		}
+		if !active {
+			return CapabilityClaims{}, fmt.Errorf("%w: task %s no longer active at generation %d",
+				ErrCapabilityRevoked, claims.TaskID, claims.RunnerGeneration)
+		}
+	}
+	return claims, nil
+}
+
 // validateWithAudience 解析并校验 audience/签名/撤销(不含 provider/task 语义)。
 func (v *Validator) validateWithAudience(ctx context.Context, tokenString, audience string) (CapabilityClaims, error) {
 	return validateWithAudience(v.signingKey, v.revocations, v.clock, ctx, tokenString, audience)
@@ -444,6 +502,46 @@ func (i *Issuer) IssueSophubToken(sessionKey, taskID string, runnerGeneration ui
 	signed, err := token.SignedString(i.signingKey)
 	if err != nil {
 		return "", CapabilityClaims{}, fmt.Errorf("sign sophub capability token: %w", err)
+	}
+	return signed, claims, nil
+}
+
+// IssueMCPToken 签发 Runner → Platform MCP proxy 的短期 capability
+// (Runner 仅 internal 网络, 外部 MCP Server 一律经 Platform 受控代理)。
+// 与 Sophub token 同模式: taskID/generation 绑定 + JTI 纳入同一撤销集合,
+// 终态后旧 task 的 MCP token 立即失效; budget 为代理调用预算(无预算拒绝)。
+func (i *Issuer) IssueMCPToken(sessionKey, taskID string, runnerGeneration uint64, ttl time.Duration, budget string) (string, CapabilityClaims, error) {
+	if strings.TrimSpace(sessionKey) == "" {
+		return "", CapabilityClaims{}, fmt.Errorf("session key is required")
+	}
+	if ttl <= 0 {
+		ttl = i.ttl
+	}
+	jti, err := newJTI()
+	if err != nil {
+		return "", CapabilityClaims{}, err
+	}
+	now := i.clock().UTC()
+	claims := CapabilityClaims{
+		TaskID:           taskID,
+		RunnerGeneration: runnerGeneration,
+		Operation:        "mcp",
+		Budget:           budget,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    CapabilityIssuer,
+			Subject:   sessionKey,
+			Audience:  jwt.ClaimStrings{MCPAudience},
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			NotBefore: jwt.NewNumericDate(now),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        jti,
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["typ"] = CapabilityType
+	signed, err := token.SignedString(i.signingKey)
+	if err != nil {
+		return "", CapabilityClaims{}, fmt.Errorf("sign mcp capability token: %w", err)
 	}
 	return signed, claims, nil
 }

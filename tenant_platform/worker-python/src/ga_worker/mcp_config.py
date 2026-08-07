@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from ga_worker.credential_config import CredentialConfigError, load_runtime_document
 from ga_worker.mcp_client import MCPServerConfig
@@ -18,6 +19,24 @@ class MCPConfigError(ValueError):
 class MCPRuntimeSnapshot:
     snapshot_id: str
     servers: tuple[MCPServerConfig, ...]
+    # proxy 非空时, 所有 server 一律经 Platform 受控 MCP proxy 访问
+    # (Runner 仅 internal 网络, 无公网出口): server_id → URL 映射即白名单。
+    proxy: "MCPRuntimeProxy | None" = None
+
+
+@dataclass(frozen=True)
+class MCPRuntimeProxy:
+    base_url: str
+    capability_token: str
+
+    def validate(self) -> None:
+        parsed = urlparse(self.base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("proxy base_url must be an absolute http or https URL")
+        if parsed.username or parsed.password or parsed.fragment:
+            raise ValueError("proxy base_url must contain no credentials or fragment")
+        if not self.capability_token.strip():
+            raise ValueError("capability_token is required")
 
 
 def load_runtime_mcp_snapshot(config_root: Path) -> MCPRuntimeSnapshot:
@@ -39,6 +58,23 @@ def load_runtime_mcp_snapshot(config_root: Path) -> MCPRuntimeSnapshot:
     if not isinstance(servers, list):
         raise MCPConfigError("_platform_mcp.servers must be an array")
 
+    proxy = None
+    raw_proxy = raw.get("proxy")
+    if raw_proxy is not None:
+        if not isinstance(raw_proxy, dict):
+            raise MCPConfigError("_platform_mcp.proxy must be an object")
+        unknown = set(raw_proxy) - {"base_url", "capability_token"}
+        if unknown:
+            raise MCPConfigError(f"_platform_mcp.proxy contains unknown fields: {sorted(unknown)}")
+        proxy = MCPRuntimeProxy(
+            base_url=raw_proxy.get("base_url", ""),
+            capability_token=raw_proxy.get("capability_token", ""),
+        )
+        try:
+            proxy.validate()
+        except (TypeError, ValueError) as exc:
+            raise MCPConfigError(f"invalid MCP proxy: {exc}") from exc
+
     parsed: list[MCPServerConfig] = []
     seen: set[str] = set()
     for index, item in enumerate(servers):
@@ -54,6 +90,8 @@ def load_runtime_mcp_snapshot(config_root: Path) -> MCPRuntimeSnapshot:
             name=item.get("name", ""),
             url=item.get("url", ""),
             timeout_seconds=item.get("timeout_seconds", 30),
+            proxy_base_url=proxy.base_url if proxy else "",
+            capability_token=proxy.capability_token if proxy else "",
         )
         try:
             config.validate()
@@ -63,4 +101,4 @@ def load_runtime_mcp_snapshot(config_root: Path) -> MCPRuntimeSnapshot:
             raise MCPConfigError(f"duplicate MCP server_id: {config.server_id}")
         seen.add(config.server_id)
         parsed.append(config)
-    return MCPRuntimeSnapshot(snapshot_id=snapshot_id, servers=tuple(parsed))
+    return MCPRuntimeSnapshot(snapshot_id=snapshot_id, servers=tuple(parsed), proxy=proxy)

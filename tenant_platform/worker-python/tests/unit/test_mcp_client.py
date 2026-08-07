@@ -5,6 +5,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 import requests
@@ -25,6 +26,7 @@ class _MCPHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length) or b"{}")
         self.__class__.requests.append({
+            "path": self.path,
             "payload": payload,
             "session_id": self.headers.get("Mcp-Session-Id", ""),
             "accept": self.headers.get("Accept", ""),
@@ -113,6 +115,7 @@ class _MCPHandler(BaseHTTPRequestHandler):
 def test_server_config_exposes_only_supported_runtime_fields():
     assert set(MCPServerConfig.__dataclass_fields__) == {
         "server_id", "name", "url", "timeout_seconds",
+        "proxy_base_url", "capability_token",
     }
 
 
@@ -157,6 +160,38 @@ def test_initialize_list_and_call_support_json_and_sse(mcp_server: str):
     assert _MCPHandler.requests[0]["protocol_version"] == ""
     assert all(entry["protocol_version"] == "2024-11-05" for entry in _MCPHandler.requests[1:])
 
+
+def test_proxy_configured_dials_proxy_and_sends_capability(mcp_server: str):
+    # 经 Platform MCP proxy 访问: 拨号地址改写为 /v1/worker/mcp/{server_id},
+    # 并携带短期 capability(代理侧剥离 Authorization 后再转发上游)。
+    origin = "{scheme}://{netloc}".format(
+        scheme=urlsplit(mcp_server).scheme, netloc=urlsplit(mcp_server).netloc
+    )
+    client = MCPHTTPClient(MCPServerConfig(
+        server_id="exa",
+        name="Exa",
+        url=mcp_server,
+        timeout_seconds=2,
+        proxy_base_url=origin,
+        capability_token="cap-token-1",
+    ))
+
+    tools = client.initialize()
+
+    assert [tool.name for tool in tools] == ["web_search"]
+    assert all(entry["path"].startswith("/v1/worker/mcp/exa") for entry in _MCPHandler.requests)
+    assert all(entry["authorization"] == "Bearer cap-token-1" for entry in _MCPHandler.requests)
+
+
+def test_proxy_configured_without_token_is_rejected():
+    config = MCPServerConfig(
+        server_id="exa", name="Exa", url="https://mcp.exa.ai/mcp",
+        proxy_base_url="http://platform:8082", capability_token="",
+    )
+    with pytest.raises(ValueError, match="capability_token"):
+        config.validate()
+    assert config.dial_url == "http://platform:8082/v1/worker/mcp/exa"
+    assert config.auth_headers() == {}
 
 def test_stateless_server_receives_protocol_version_and_sse_response_is_selected_by_id(mcp_server: str):
     _MCPHandler.initialize_session_id = ""

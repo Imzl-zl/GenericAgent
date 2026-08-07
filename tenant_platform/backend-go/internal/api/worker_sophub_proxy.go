@@ -170,3 +170,26 @@ func NewWorkerSophubHandler(proxy *WorkerSophubProxy) http.Handler {
 func (s *Server) WorkerSophubHandler() http.Handler {
 	return NewWorkerSophubHandler(s.sophubProxy)
 }
+
+// WorkerMCPHandler 返回本 Server 的 capability-protected Worker MCP
+// handler(内部 listener 专用); mcpProxy 未接线时返回 nil。
+func (s *Server) WorkerMCPHandler() http.Handler {
+	return NewWorkerMCPHandler(s.mcpProxy)
+}
+
+// WorkerInternalHandler 合并内部 listener 的全部 worker 代理路由
+// (/v1/worker/sophub/* 与 /v1/worker/mcp/*)。全部未接线时返回 nil。
+func (s *Server) WorkerInternalHandler() http.Handler {
+	var mux *http.ServeMux
+	if h := s.WorkerSophubHandler(); h != nil {
+		mux = http.NewServeMux()
+		mux.Handle("/v1/worker/sophub/", h)
+	}
+	if h := s.WorkerMCPHandler(); h != nil {
+		if mux == nil {
+			mux = http.NewServeMux()
+		}
+		mux.Handle("/v1/worker/mcp/", h)
+	}
+	return mux
+}

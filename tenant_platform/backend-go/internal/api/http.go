@@ -45,6 +45,7 @@ type Server struct {
 	imAggregationRuntime            IMAggregationRuntime
 	sophub                          application.SophubService
 	sophubProxy                     *WorkerSophubProxy
+	mcpProxy                        *WorkerMCPProxy
 	cipher                          secret.TokenCipher
 	adminToken                        string
 	adminUserID                       int64
@@ -109,6 +110,14 @@ type ServerConfig struct {
 	// SophubProxy 由 NewServer 依据 Sophub+SophubValidator 构造; 非 nil 时注册
 	// /v1/worker/sophub/* 端点。
 	SophubProxy                     *WorkerSophubProxy
+	// MCPValidator 校验 Worker → Platform MCP proxy 的 capability JWT
+	// (audience=ga-mcp-proxy); 与 MCPProxy 同时提供时注册 /v1/worker/mcp/*。
+	MCPValidator func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error)
+	// MCPUsageCounter 按 JTI 原子计量 MCP 代理调用; 为 nil 时代理跳过计量(仅测试)。
+	MCPUsageCounter llmproxy.CapabilityUsageCounter
+	// MCPProxy 由 NewServer 依据 MCPValidator 构造(需调用方提供 enabled-server
+	// resolver); 非 nil 时注册 /v1/worker/mcp/{server_id} 端点。
+	MCPProxy *WorkerMCPProxy
 	Cipher                          secret.TokenCipher
 	AdminToken                        string
 	AdminUserID                       int64
@@ -167,6 +176,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		imAggregationRuntime:            cfg.IMAggregationRuntime,
 		sophub:                          cfg.Sophub,
 		sophubProxy:                     cfg.SophubProxy,
+		mcpProxy:                        cfg.MCPProxy,
 		cipher:                          cfg.Cipher,
 		adminToken:                        cfg.AdminToken,
 		adminUserID:                       cfg.AdminUserID,

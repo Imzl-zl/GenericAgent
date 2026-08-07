@@ -42,6 +42,15 @@ type RuntimeMCPServer struct {
 type RuntimeMCPSnapshot struct {
 	ID      string             `json:"snapshot_id"`
 	Servers []RuntimeMCPServer `json:"servers"`
+	// Proxy 非空时, Worker 经 Platform 受控 MCP proxy 访问外部 MCP Server
+	// (Runner 仅 internal 网络无公网出口): server_id → URL 映射即白名单。
+	Proxy *RuntimeMCPProxy `json:"proxy,omitempty"`
+}
+
+// RuntimeMCPProxy 是 Worker 可用的 MCP proxy 端点(带短期 capability)。
+type RuntimeMCPProxy struct {
+	BaseURL         string `json:"base_url"`
+	CapabilityToken string `json:"capability_token"`
 }
 
 type RuntimeConfigInput struct {
@@ -229,6 +238,14 @@ func validateRuntimeMCPSnapshot(snapshot RuntimeMCPSnapshot) error {
 			TimeoutSeconds: server.TimeoutSeconds,
 		}); err != nil {
 			return fmt.Errorf("MCP server %q: %w", server.ServerID, err)
+		}
+	}
+	if snapshot.Proxy != nil {
+		if strings.TrimSpace(snapshot.Proxy.BaseURL) == "" || strings.TrimSpace(snapshot.Proxy.CapabilityToken) == "" {
+			return fmt.Errorf("MCP proxy base_url and capability_token are required")
+		}
+		if _, err := parseProxyBase(snapshot.Proxy.BaseURL); err != nil {
+			return fmt.Errorf("MCP proxy base_url: %w", err)
 		}
 	}
 	return nil
