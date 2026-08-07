@@ -266,6 +266,8 @@ services:
       - no-new-privileges:true
     environment:
       GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
+      # round11 M2: 内部网络带项目名前缀, manager 必须按实际网络名创建 Runner。
+      GA_RUNNER_NETWORK: ${GA_RUNNER_NETWORK:-${COMPOSE_PROJECT_NAME:-ga}_runner-control}
       # fail-closed(审查): 默认拒绝可变 tag。本地开发需在 .env 显式设
       # GA_RUNNER_ALLOW_TAG=1 或改用 @sha256: digest 镜像; 生产禁止 tag。
       GA_RUNNER_ALLOW_TAG: ${GA_RUNNER_ALLOW_TAG:-0}

@@ -31,6 +31,7 @@ func main() {
 	var (
 		dockerBinary       = flag.String("docker-binary", envOr("GA_DOCKER_BINARY", "docker"), "docker binary path")
 		image              = flag.String("runner-image", envOr("GA_RUNNER_IMAGE", "ga-runner:local"), "ga-runner image reference")
+		network            = flag.String("runner-network", envOr("GA_RUNNER_NETWORK", "runner-control"), "docker network the runner joins (round11 M2: compose internal networks carry the project-name prefix)")
 		workspaces         = flag.String("workspaces-root", envOr("GA_WORKSPACES_ROOT", "/var/lib/ga/workspaces"), "daemon-visible root containing workspaces/<hash>/")
 		workspacesVolume   = flag.String("workspaces-volume", envOr("GA_WORKSPACES_VOLUME", ""), "named volume for workspaces (Compose); empty = bind mount from workspaces-root")
 		memoryTmpl         = flag.String("memory-template", envOr("GA_MEMORY_TEMPLATE", "/ga/memory-template"), "read-only memory template path inside the manager image")
@@ -73,6 +74,7 @@ func main() {
 
 	profile := sandbox.ValidProfile()
 	profile.Image = *image
+	profile.Networks = []string{*network}
 	profile.Runtime = *profileName
 	profile.ShareGID = *shareGID
 	profile.AllowMutableTag = *allowMutableTag

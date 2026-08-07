@@ -167,7 +167,7 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		// 持有控制面凭据的受损 Platform 删除其他部署中命名规则相同的容器。
 		"--label", "com.genericagent.runner.manager=" + d.cfg.ManagerID,
 		"--read-only",
-		"--network", RunnerNetwork,
+		"--network", p.Networks[0],
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges:true",
 		"--user", strconv.Itoa(p.UID) + ":" + strconv.Itoa(p.GID),

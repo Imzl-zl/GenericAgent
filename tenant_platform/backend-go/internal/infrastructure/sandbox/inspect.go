@@ -305,8 +305,12 @@ func validateInspect(info inspectOutput, profile Profile, workspacesRoot, worksp
 	if info.AppArmorProfile == "unconfined" {
 		return fmt.Errorf("runner apparmor is unconfined")
 	}
-	if len(info.Networks) != 1 || info.Networks[0] != RunnerNetwork {
-		return fmt.Errorf("runner networks = %v, want only %s", info.Networks, RunnerNetwork)
+	if len(profile.Networks) != 1 {
+		return fmt.Errorf("runner profile must specify exactly one network")
+	}
+	wantNetwork := profile.Networks[0]
+	if len(info.Networks) != 1 || info.Networks[0] != wantNetwork {
+		return fmt.Errorf("runner networks = %v, want only %s", info.Networks, wantNetwork)
 	}
 	// 镜像引用必须与部署配置完全一致(拒绝 tag 漂移/替换)。
 	if info.Image != profile.Image {

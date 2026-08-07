@@ -14,8 +14,13 @@ import (
 	"strings"
 )
 
-// RunnerNetwork is the only network a Runner joins.
+// RunnerNetwork 是 Runner 加入网络的默认名。部署可用 GA_RUNNER_NETWORK
+// 覆盖(round11 M2: compose 内部网络带项目名前缀, 多套部署隔离)。
 const RunnerNetwork = "runner-control"
+
+// runnerNetworkPattern 校验 docker 网络名(小写字母/数字/下划线/点/连字符,
+// 首字符不能是点/连字符)。
+var runnerNetworkPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // workspace subpaths mounted into the Runner (spec §4).
 const (
@@ -130,8 +135,11 @@ func (p Profile) Validate() error {
 	if !strings.Contains(p.Image, "@sha256:") && !p.AllowMutableTag {
 		return fmt.Errorf("profile image must be a fixed digest reference, got %q (set AllowMutableTag only for local dev)", p.Image)
 	}
-	if !containsExactly(p.Networks, RunnerNetwork) {
-		return fmt.Errorf("runner must join exactly %s, got %v", RunnerNetwork, p.Networks)
+	if len(p.Networks) != 1 {
+		return fmt.Errorf("runner must join exactly one network, got %v", p.Networks)
+	}
+	if !runnerNetworkPattern.MatchString(p.Networks[0]) {
+		return fmt.Errorf("unsafe runner network name %q", p.Networks[0])
 	}
 	if p.Privileged {
 		return errors.New("privileged runners are forbidden")
@@ -166,11 +174,4 @@ func (p Profile) Validate() error {
 		}
 	}
 	return nil
-}
-
-func containsExactly(values []string, want string) bool {
-	if len(values) != 1 {
-		return false
-	}
-	return values[0] == want
 }

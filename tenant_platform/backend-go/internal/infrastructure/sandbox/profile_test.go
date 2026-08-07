@@ -12,6 +12,22 @@ func TestProfileRejectsInvalidNetworks(t *testing.T) {
 	}
 }
 
+func TestProfileAllowsConfiguredNetworkName(t *testing.T) {
+	// round11 M2: compose 内部网络带项目名前缀, 部署经 GA_RUNNER_NETWORK 覆盖。
+	base := ValidProfile()
+	base.Runtime = "runsc"
+	base.Networks = []string{"genericagent_runner-control"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("project-prefixed network must be accepted: %v", err)
+	}
+	for _, bad := range []string{"", "runner control", "runner;control", "-runner"} {
+		base.Networks = []string{bad}
+		if err := base.Validate(); err == nil {
+			t.Fatalf("unsafe network name %q must fail", bad)
+		}
+	}
+}
+
 func TestProfileRejectsMountsOutsideWorkspaceSubpaths(t *testing.T) {
 	base := ValidProfile()
 	base.Mounts = []WorkspaceMount{
