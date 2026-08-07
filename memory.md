@@ -45,6 +45,7 @@
 - **git checkout 单文件会丢失未提交修改**——回滚前确认工作区版本是否含未提交变更
 - 契约测试 `test_route_contract.py` 拦截后端新增路由未同步 OpenAPI；KNOWN_SPEC_GAPS 已清空，新增路由必须进 spec
 - **微信绑定 404 坑**：`ILINK_BASE_URL` 为空时 main.go 不创建 wechatBindingSvc，`/v1/admin|users/me/wechat-qrcode` 路由不注册直接 404；compose 需透传 ILINK_* 变量，.env 配 `ILINK_BASE_URL=https://ilinkai.weixin.qq.com`（官方网关，需微信 iLink Bot 应用资格）
+- **ga-runner 镜像坑**：.env 的 `GA_RUNNER_IMAGE` 是 digest 引用（生产 fail-closed），镜像丢失后 `docker compose build ga-runner` 会报 "build tag cannot contain a digest"（compose 拿 image: 当 tag）——必须直接 `docker build -f tenant_platform/infra/compose/ga-runner.Dockerfile -t ga-runner:local .`（context=仓库根，先确保 memory-template/ 已生成）重建，再取新 digest 更新 .env 并重启 sandbox-manager；Worker 报 WORKER_START_FAILED/RUNNER_ENSURE_FAILED + "pull access denied for ga-runner" 即此症状
 - **部署配置注意**：`PER_TENANT_RUNNING_LIMIT` 已改名 `PER_REQUESTER_RUNNING_LIMIT`（compose 双模板同步）；`PLATFORM_DEV_*` 已改名 `PLATFORM_ADMIN_*`
 - **改 proto 注释必须重跑 `generate_bindings.py`**——注释会进入生成代码，不重生成则产物与 proto 漂移
 - **SQL 谓词收敛陷阱**：runner_leases 表有 status 列（多表查询必须保留别名前缀）；task_lifecycle 容量门禁的 status 谓词故意不含 lease 条件
