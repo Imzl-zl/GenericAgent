@@ -54,6 +54,14 @@
 - `memory/` 下新增需入库文件必须补 `.gitignore` 白名单（`!memory/...`），否则被 `memory/*` 吞掉。
 - worker-python 测试前必须 `pip install -e '.[test]'`（pythonpath 指向 `src`，缺 python-docx 时 docx 相关测试会失败）。
 - 平台产物（platform.exe 等）是构建产物，不要提交改动；契约/策略变更要同步 `contracts/` 与各端实现。
+- Dockerfile base 镜像 digest pin 会随 Docker Hub manifest 清理失效：构建报 `400 Bad Request` / `not found` 时，用 `docker buildx imagetools inspect <镜像>:<tag> | grep Digest` 取新 index digest 更新。已实测失效并修复：`alpine:3.19`（llm-proxy）、`docker:27-cli`（sandbox-manager）；其余 pin（python:3.11-slim/golang:1.22/node:22/nginx:1.27）2026-08 仍有效。
+
+## 镜像打包（compose）
+
+- 唯一部署入口：`tenant_platform/infra/compose/`（compose.yaml + 6 个 Dockerfile + Makefile + .env 模板）。文档：`compose/README.zh-CN.md`。
+- 打包命令（在 compose 目录）：`make build`（全量构建，tag = `:local` + `:$(git describe)`）；`make push REGISTRY=host/ga` / `make pull REGISTRY=host/ga VERSION=x`（registry 流转）；`make runner-digest`（输出生产 `GA_RUNNER_IMAGE=ga-runner@sha256:...` 供 .env）；`make verify`（compose config 校验）。
+- 构建上下文 = 仓库根；Makefile `ROOT := $(abspath ../../..)`，不要改层级。
+- 生产模板 `.env.example` fail-closed：`GA_RUNNER_IMAGE` 必须 digest 引用 + `GA_RUNNER_SECURITY_PROFILE=runsc`；本地开发用 `.env.example.dev`（允许 tag + runc）。
 
 ## 2026-08-06 补充坑点
 
@@ -63,3 +71,7 @@
 - 改名全链路清单（DevToken→AdminToken 类）：Go 标识符 → env 变量 → HTTP header → OpenAPI scheme → web client → 测试常量 → compose/.env 模板 → 部署文档；`--dev-loopback` flag 与 DB `bootstrap_marker` 存量值是部署形态标记，不在改名范围。
 - 集成测试 seed 用户会话：`token_hash = base64.urlsafe_b64encode(sha256(token).digest()).rstrip(b"=").decode()`（与 Go `hashToken` 一致）。
 - 用户侧任务能力链路：注册(pending) → 管理员批准(approved) → 提交任务；pending 用户提交会被 service 门禁拒绝。
+- 部署踩坑（2026-08-07 实测）：
+  - 复用旧 `postgres_data` 卷时 SASL 认证失败（密码是旧卷初始化时的，与 .env 无关）→ `reset-dev.sh` 清卷重建。
+  - 生产 .env 下 `docker compose up -d --build` 报 `build tag cannot contain a digest`（GA_RUNNER_IMAGE 是 digest，不能作 build tag）→ 构建/启动分离：`make build` + `make up`（Makefile 与 reset-dev.sh 已修）。
+  - 生产启动 bootstrap 报 `users_bootstrap_marker_check`(23514)：migration 0001 约束只放行 `'dev-loopback'`，而生产路径 `EnsurePlatformAdminUser` 用 `'platform-admin'` → 已新增 `0048_platform_admin_bootstrap.sql` 放宽（users/workspaces 两个约束 + null_volume_requires_loopback），migrations.go 三个列表同步。
