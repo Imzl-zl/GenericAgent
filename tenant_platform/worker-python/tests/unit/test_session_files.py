@@ -314,6 +314,86 @@ def test_global_mcp_install_is_transactional_when_catalog_contains_conflict():
     assert not hasattr(agentmain_mod, "_tenant_global_mcp_tool_names")
 
 
+def test_global_mcp_tools_allow_mcp_wildcard(tmp_path: Path, monkeypatch):
+    # mcp:* 通配: apply_tool_policy 与 dispatch_guard 都放行 MCP 工具,
+    # 非 MCP 工具仍精确匹配(deny-by-default)。
+    import sys
+
+    class StepOutcome:
+        def __init__(self, data, next_prompt=None, should_exit=False):
+            self.data = data
+            self.next_prompt = next_prompt
+            self.should_exit = should_exit
+
+    agent_loop_mod = types.SimpleNamespace(StepOutcome=StepOutcome)
+    monkeypatch.setitem(sys.modules, "agent_loop", agent_loop_mod)
+
+    dispatched: list[str] = []
+
+    class FakeHandler:
+        def __init__(self, *args, **kwargs):
+            self.cwd = "./temp"
+
+        def dispatch(self, tool_name, args, response, index=0, tool_num=1):
+            dispatched.append(tool_name)
+            method = getattr(self, f"do_{tool_name}", None)
+            if method is None:
+                yield f"unknown:{tool_name}\n"
+                return StepOutcome(None)
+            return (yield from method(args, response))
+
+    class FakeClient:
+        def call_tool(self, remote_name, public_args):
+            return f"result:{remote_name}"
+
+    ga_mod = types.SimpleNamespace(GenericAgentHandler=FakeHandler)
+    agentmain_mod = types.SimpleNamespace(TOOLS_SCHEMA=[])
+    session = types.SimpleNamespace(
+        mcp_tools={
+            "exa__web_search_exa": {
+                "client": FakeClient(),
+                "tool_name": "web_search_exa",
+                "schema": {
+                    "type": "function",
+                    "function": {
+                        "name": "exa__web_search_exa",
+                        "description": "Search",
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                    },
+                },
+            },
+        },
+    )
+    mods = {"ga": ga_mod, "agentmain": agentmain_mod, "agent_loop": sys.modules["agent_loop"]}
+    mcp_unwrap = install_global_mcp_tools(session, mods)
+    policy = ToolPolicy(
+        version="foundation.session-files.v1",
+        allowed_tools=frozenset({"file_read", "mcp:*"}),
+    )
+    previous = apply_tool_policy(policy, mods)
+    guard_unwrap = install_dispatch_guard(policy, mods)
+    try:
+        names = [tool["function"]["name"] for tool in agentmain_mod.TOOLS_SCHEMA]
+        assert names == ["exa__web_search_exa"], names
+
+        handler = ga_mod.GenericAgentHandler()
+        call = handler.dispatch("exa__web_search_exa", {"query": "GA"}, None)
+        chunks = []
+        try:
+            while True:
+                chunks.append(next(call))
+        except StopIteration as stop:
+            assert stop.value.data == "result:web_search_exa"
+        assert dispatched == ["exa__web_search_exa"]
+        # 非 MCP 工具(不在白名单)仍被守卫拒绝。
+        denied = handler.dispatch("file_write", {}, None)
+        assert "tool denied by policy" in next(denied)
+    finally:
+        guard_unwrap()
+        restore_tool_schema(previous, mods)
+        mcp_unwrap()
+
+
 def test_global_mcp_tools_must_intersect_with_tenant_policy(tmp_path: Path, monkeypatch):
     import sys
 

@@ -542,6 +542,12 @@ def install_dispatch_guard(
         return lambda: None
 
     allowed = tool_policy.allowed_tools
+    # MCP 工具动态命名, 策略用 mcp:* 通配放行(同 apply_tool_policy)。
+    allow_mcp = "mcp:*" in allowed
+    agentmain = legacy_mods.get("agentmain")
+    mcp_names = frozenset(
+        getattr(agentmain, "_tenant_global_mcp_tool_names", None) or []
+    ) if agentmain is not None else frozenset()
 
     # Restore original before (re)installing to avoid double-wrapping.
     original_dispatch = getattr(handler_cls, "_adapter_original_dispatch", None)
@@ -551,7 +557,11 @@ def install_dispatch_guard(
         handler_cls.dispatch = original_dispatch
 
     def guarded(self, tool_name, args, response, index=0, tool_num=1):
-        if tool_name not in allowed and tool_name not in ("no_tool", "bad_json"):
+        if (
+            tool_name not in allowed
+            and tool_name not in ("no_tool", "bad_json")
+            and not (allow_mcp and tool_name in mcp_names)
+        ):
             yield f"tool denied by policy: {tool_name}\n"
             step_outcome_cls = getattr(agent_loop, "StepOutcome", None) if agent_loop is not None else None
             if step_outcome_cls is None:
