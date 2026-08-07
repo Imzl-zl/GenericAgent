@@ -103,6 +103,12 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       BOT_TOKEN_KEY: ${BOT_TOKEN_KEY}
+      # 微信绑定(iLink)开关: 空值 = 禁用微信 QR 绑定路由(注册时会 404)。
+      # 官方网关 https://ilinkai.weixin.qq.com (与 GA Core wxbot_client 一致);
+      # 自建 iLink 网关可覆盖。启用时要求 BOT_TOKEN_KEY 非空。
+      ILINK_BASE_URL: ${ILINK_BASE_URL:-}
+      ILINK_APP_ID: ${ILINK_APP_ID:-bot}
+      ILINK_CLIENT_VERSION: ${ILINK_CLIENT_VERSION:-2.1.1}
       BOT_POLLER_URL: ${BOT_POLLER_URL}
       BOT_POLLER_API_SECRET: ${BOT_POLLER_API_SECRET}
       PLATFORM_WEBHOOK_URL: ${PLATFORM_WEBHOOK_URL}
