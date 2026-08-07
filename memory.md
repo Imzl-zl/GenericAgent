@@ -44,6 +44,7 @@
 - **openapi platform.yaml 不要用 yaml.safe_dump 重写**——会丢全部中文注释并破坏 test_contract_sources 的文本格式断言；补路径用文本插入
 - **git checkout 单文件会丢失未提交修改**——回滚前确认工作区版本是否含未提交变更
 - 契约测试 `test_route_contract.py` 拦截后端新增路由未同步 OpenAPI；KNOWN_SPEC_GAPS 已清空，新增路由必须进 spec
+- **微信绑定 404 坑**：`ILINK_BASE_URL` 为空时 main.go 不创建 wechatBindingSvc，`/v1/admin|users/me/wechat-qrcode` 路由不注册直接 404；compose 需透传 ILINK_* 变量，.env 配 `ILINK_BASE_URL=https://ilinkai.weixin.qq.com`（官方网关，需微信 iLink Bot 应用资格）
 - **部署配置注意**：`PER_TENANT_RUNNING_LIMIT` 已改名 `PER_REQUESTER_RUNNING_LIMIT`（compose 双模板同步）；`PLATFORM_DEV_*` 已改名 `PLATFORM_ADMIN_*`
 - **改 proto 注释必须重跑 `generate_bindings.py`**——注释会进入生成代码，不重生成则产物与 proto 漂移
 - **SQL 谓词收敛陷阱**：runner_leases 表有 status 列（多表查询必须保留别名前缀）；task_lifecycle 容量门禁的 status 谓词故意不含 lease 条件
