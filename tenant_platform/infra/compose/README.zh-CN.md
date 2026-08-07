@@ -24,6 +24,38 @@ tenant_platform/infra/compose/
 
 `.env` 不提交 Git。`compose.yaml` 不包含真实密码，只从 `.env` 读取变量。
 
+## 镜像打包（规范化流程）
+
+全部镜像在 `tenant_platform/infra/compose/` 下通过 `make` 统一构建。镜像 tag 自动取 git 版本（`git describe`，如 `9e8e4e8` 或 `v1.2.0-3-g9e8e4e8`；工作区有未提交改动时带 `-dirty` 后缀），同一镜像打两个 tag：
+
+- `:local` —— compose 默认引用，直接运行用；
+- `:<版本>` —— 追溯/推送用。
+
+### 场景 A：单服务器直接构建部署（最简单）
+
+```bash
+cd tenant_platform/infra/compose
+make build            # 构建全部 6 个镜像(首次约 10-20 分钟, 之后有缓存)
+make runner-digest    # 输出 GA_RUNNER_IMAGE=ga-runner@sha256:... 填入 .env(生产模板必填)
+make verify           # docker compose config 校验
+make up               # 启动全部服务
+```
+
+### 场景 B：构建机 + 私有 Registry（多机 / 规范 CI）
+
+```bash
+# 构建机: 构建并推送
+cd tenant_platform/infra/compose
+make build
+make push REGISTRY=registry.example.com/ga
+
+# 服务器: 拉取并重打 :local(.env 的 GA_*_IMAGE 无需改动)
+make pull REGISTRY=registry.example.com/ga VERSION=<构建机相同的版本号>
+make verify && make up
+```
+
+> 生产模板（`.env.example`）要求 `GA_RUNNER_IMAGE` 为 digest 引用：`make runner-digest` 输出的那一行直接粘贴到 `.env` 即可（本地构建的镜像也适用，digest 取自镜像 ID/RepoDigests）。
+
 ## 配置并启动
 
 ```bash
@@ -105,14 +137,14 @@ Sandbox Manager 拒绝启动(fail-closed, 不会静默降级)。
 ## 日常命令
 
 ```bash
-# 状态和日志
-docker compose ps
-docker compose logs -f platform
-docker compose logs -f sandbox-manager
+# 状态和日志(make 等价于下方 docker compose 命令)
+make ps
+make logs
 
 # 更新代码后重建并启动
+cd tenant_platform/infra/compose
 git pull
-docker compose up -d --build
+make build && make verify && make up
 
 # 停止服务但保留数据
 docker compose down

@@ -78,6 +78,8 @@ for v in "${volumes[@]}"; do
 done
 
 echo "==> 按新 schema 启动"
-docker compose -f "$compose_file" -p "$project_name" up -d --build
+# 生产 .env 的 GA_RUNNER_IMAGE 是 digest 引用, up --build 会报 build tag
+# cannot contain a digest; 镜像由 make build 预构建, 这里只启动不构建。
+docker compose -f "$compose_file" -p "$project_name" up -d
 
 echo "==> 完成: 旧数据卷已清除,新 schema 已启动"
