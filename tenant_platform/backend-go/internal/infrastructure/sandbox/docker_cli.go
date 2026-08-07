@@ -145,6 +145,15 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 	name := d.RunnerName(spec.WorkspaceHash, spec.Generation)
 	p := d.cfg.Profile
 
+	// runsc 下 Docker 内嵌 DNS 不可用(实测 EAI_AGAIN): 内部服务名
+	// (platform/llm-proxy)必须经 /etc/hosts 静态解析, 否则 Worker 无法
+	// 拨号 LLM/Sophub/MCP 代理。解析失败 fail-closed(没有 hosts 的
+	// Runner 不可能完成任务)。
+	hosts, err := d.runnerNetworkHosts(ctx, p.Networks[0])
+	if err != nil {
+		return Runner{}, fmt.Errorf("resolve runner network hosts: %w", err)
+	}
+
 	// 预置工作区目录(创建容器前),memory 为空时从模板初始化。
 	dirs, err := prepareWorkspaceDirs(d.cfg.WorkspacesRoot, spec.WorkspaceHash, spec.MemoryTemplate, p.UID, p.GID, p.ShareGID)
 	if err != nil {
@@ -170,7 +179,7 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		"--network", p.Networks[0],
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges:true",
-		"--user", strconv.Itoa(p.UID) + ":" + strconv.Itoa(p.GID),
+		"--user", strconv.Itoa(p.UID)+":"+strconv.Itoa(p.GID),
 		"--group-add", strconv.Itoa(p.ShareGID),
 		"--memory", strconv.FormatInt(p.MemoryBytes, 10),
 		"--cpu-period", strconv.FormatInt(p.CPUPeriod, 10),
@@ -186,6 +195,12 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		// 到工作区 temp(审查: 之前用 temp 挂载点做 workdir 会让相对路径
 		// 错位到 temp/temp, 破坏 GA 原生路径语义)。
 		"--workdir", LegacyRoot,
+	}
+	// runsc 下 Docker 内嵌 DNS 不可用(实测 EAI_AGAIN): 内部服务名经
+	// /etc/hosts 静态条目注入(见 runnerNetworkHosts), 否则 Worker 无法
+	// 拨号 LLM/Sophub/MCP 代理。
+	for _, host := range hosts {
+		args = append(args, "--add-host", host)
 	}
 	// 工作区挂载: Compose 部署用 named volume + volume-subpath(daemon 可解析),
 	// 裸机用 bind source(Manager 与 daemon 同主机时等价)。

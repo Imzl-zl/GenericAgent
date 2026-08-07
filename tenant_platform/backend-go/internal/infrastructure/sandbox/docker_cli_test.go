@@ -51,6 +51,18 @@ func (f *fakeRunner) Run(_ context.Context, _ string, args ...string) ([]byte, [
 	return []byte(f.stdout), []byte(f.stderr), 0, nil
 }
 
+// hostScript 返回创建 Runner 前 manager 的 network inspect + 逐容器 inspect
+// 脚本输出(runnerNetworkHosts 调用), 后续调用由 extra 追加。
+func hostScript(extra ...fakeRunResult) []fakeRunResult {
+	base := []fakeRunResult{
+		{stdout: `[{"Containers":{"abc123":{"Name":"genericagent-platform-1","IPv4Address":"172.26.0.3/16"},"def456":{"Name":"genericagent-llm-proxy-1","IPv4Address":"172.26.0.2/16"}}}]`},
+		// 按容器名排序: 先 inspect genericagent-llm-proxy-1, 再 platform-1。
+		{stdout: `{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-llm-proxy-1","llm-proxy"]}}}}`},
+		{stdout: `{"NetworkSettings":{"Networks":{"runner-control":{"Aliases":["genericagent-platform-1","platform"]}}}}`},
+	}
+	return append(base, extra...)
+}
+
 func validConfig() DockerConfig {
 	profile := ValidProfile()
 	profile.AllowRunc = true // 测试模拟默认 docker 运行时, 显式 trusted 开关
@@ -79,7 +91,7 @@ func validSpec() RunnerSpec {
 }
 
 func TestCreateRunnerUsesFixedProfileFlags(t *testing.T) {
-	runner := &fakeRunner{stdout: "0123456789abcdef\n"}
+	runner := &fakeRunner{scripted: hostScript(fakeRunResult{stdout: "0123456789abcdef\n"})}
 	cli := &DockerCLI{cfg: validConfig(), runner: runner}
 	ctx := context.Background()
 
@@ -92,6 +104,11 @@ func TestCreateRunnerUsesFixedProfileFlags(t *testing.T) {
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges:true",
 		"--network", "runner-control",
+		// runsc 下 Docker 内嵌 DNS 不可用: 内部服务名必须进 /etc/hosts。
+		"--add-host", "genericagent-llm-proxy-1:172.26.0.2",
+		"--add-host", "genericagent-platform-1:172.26.0.3",
+		"--add-host", "llm-proxy:172.26.0.2",
+		"--add-host", "platform:172.26.0.3",
 		"--memory", "1073741824",
 		"--pids-limit", "128",
 		"--user", "10002:10002",
@@ -151,7 +168,7 @@ func TestCreateRunnerUsesFixedProfileFlags(t *testing.T) {
 }
 
 func TestCreateRunnerUsesVolumeSubpathWhenConfigured(t *testing.T) {
-	runner := &fakeRunner{stdout: "0123456789abcdef\n"}
+	runner := &fakeRunner{scripted: hostScript(fakeRunResult{stdout: "0123456789abcdef\n"})}
 	cfg := validConfig()
 	cfg.WorkspaceVolume = "runner_workspaces"
 	cli := &DockerCLI{cfg: cfg, runner: runner}
@@ -519,7 +536,7 @@ func TestCreateRunnerRejectsProtectedEnvOverride(t *testing.T) {
 		}
 	}
 	// 非保护键仍允许透传。
-	runner.stdout = "cid123"
+	runner.scripted = hostScript(fakeRunResult{stdout: "cid123"})
 	spec := validSpec()
 	spec.Env = []string{"GA_LLM_PROXY_ADDR=http://llm-proxy:8081"}
 	if _, err := cli.CreateAndStart(context.Background(), spec); err != nil {
@@ -531,10 +548,10 @@ func TestCreateRunnerRejectsProtectedEnvOverride(t *testing.T) {
 // 已创建容器——否则遗留 Created/stopped 容器, 且 config/ 清理依赖 Manager
 // 的 cleanupWorkspaceConfig(仅 CreateAndStart 返回错误路径)。
 func TestCreateAndStartRemovesContainerWhenStartFails(t *testing.T) {
-	runner := &fakeRunner{scripted: []fakeRunResult{
-		{stdout: "cid123\n"},
-		{stderr: "start failed", code: 1},
-	}}
+	runner := &fakeRunner{scripted: hostScript(
+		fakeRunResult{stdout: "cid123\n"},
+		fakeRunResult{stderr: "start failed", code: 1},
+	)}
 	cli := &DockerCLI{cfg: validConfig(), runner: runner}
 	ctx := context.Background()
 
