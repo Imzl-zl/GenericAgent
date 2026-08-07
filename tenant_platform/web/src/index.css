@@ -82,9 +82,6 @@ body::after {
 
 #root {
   min-height: 100svh;
-  display: flex;
-  font-size: 1.5rem;
-  line-height: 1.2;
 }
 
 h3 {
