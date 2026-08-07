@@ -35,7 +35,9 @@ def test_foundation_policy_is_deny_by_default_without_host_tools():
     tool_policy = policy["capabilities"]["foundation.v1"]["tool_policies"][
         "foundation.no-host-tools.v1"
     ]
-    assert tool_policy["allowed_tools"] == ["update_working_checkpoint"]
+    assert tool_policy["allowed_tools"] == [
+        "update_working_checkpoint", "mcp:*",
+    ]
     assert not set(tool_policy["allowed_tools"]) & {
         "code_run",
         "file_read",
@@ -44,6 +46,12 @@ def test_foundation_policy_is_deny_by_default_without_host_tools():
         "web_scan",
         "web_execute_js",
     }
+    # mcp:* 只放行管理员启用的 MCP server 工具(动态命名, 见 apply_tool_policy),
+    # 不含任意外部工具。
+    session_policy = policy["capabilities"]["foundation.v1"]["tool_policies"][
+        "foundation.session-files.v1"
+    ]
+    assert "mcp:*" in session_policy["allowed_tools"]
 
 
 def test_platform_openapi_exposes_foundation_task_paths():

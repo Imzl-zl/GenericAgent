@@ -99,11 +99,19 @@ def apply_tool_policy(tool_policy: ToolPolicy, legacy_mods: dict[str, Any] | Non
         if any(isinstance(t, dict) and t.get("function", {}).get("name") == name for t in augmented):
             continue
         augmented.append(extra)
+    # MCP 工具名由 server_id 动态派生(如 exa__web_search), 静态策略无法
+    # 穷举——allowed_tools 中的 "mcp:*" 通配放行全部管理员启用 MCP server
+    # 的工具(启用动作本身即管理准入; 保持 deny-by-default)。
+    allow_mcp = "mcp:*" in allowed
+    mcp_names = frozenset(getattr(agentmain, "_tenant_global_mcp_tool_names", None) or [])
     filtered = [
         t
         for t in augmented
         if isinstance(t, dict)
-        and t.get("function", {}).get("name") in allowed
+        and (
+            t.get("function", {}).get("name") in allowed
+            or (allow_mcp and t.get("function", {}).get("name") in mcp_names)
+        )
     ]
     agentmain.TOOLS_SCHEMA = filtered
     return previous

@@ -1,26 +1,28 @@
 {
-  "schema_version": "genericagent.capability-policy.v1",
-  "capabilities": {
-    "foundation.v1": {
-      "tool_policies": {
-        "foundation.no-host-tools.v1": {
-          "allowed_tools": [
-            "update_working_checkpoint"
-          ]
-        },
-        "foundation.session-files.v1": {
-          "allowed_tools": [
-            "update_working_checkpoint",
-            "file_read",
-            "file_write",
-            "file_patch",
-            "code_run",
-            "export_docx",
-            "sophub_search",
-            "sophub_install"
-          ]
-        }
-      }
+ "schema_version": "genericagent.capability-policy.v1",
+ "capabilities": {
+  "foundation.v1": {
+   "tool_policies": {
+    "foundation.no-host-tools.v1": {
+     "allowed_tools": [
+      "update_working_checkpoint",
+      "mcp:*"
+     ]
+    },
+    "foundation.session-files.v1": {
+     "allowed_tools": [
+      "update_working_checkpoint",
+      "file_read",
+      "file_write",
+      "file_patch",
+      "code_run",
+      "export_docx",
+      "sophub_search",
+      "sophub_install",
+      "mcp:*"
+     ]
     }
+   }
   }
+ }
 }

@@ -346,7 +346,7 @@ def test_capability_registry_load_and_resolve(foundation_registry: CapabilityReg
     policy = foundation_registry.resolve("foundation.v1", "foundation.no-host-tools.v1")
     assert isinstance(policy, ToolPolicy)
     assert policy.version == "foundation.no-host-tools.v1"
-    assert policy.allowed_tools == frozenset({"update_working_checkpoint"})
+    assert policy.allowed_tools == frozenset({"update_working_checkpoint", "mcp:*"})
 
 
 def test_capability_registry_rejects_bad_schema(tmp_path: Path):
