@@ -20,6 +20,11 @@ type UserStore interface {
 	GetUserByID(ctx context.Context, userID int64) (int64, string, domain.UserStatus, error)
 	CountPendingUsers(ctx context.Context) (int, error)
 	CountApprovedUsers(ctx context.Context) (int, error)
+	// ListMyTasks returns the requester's recent tasks ordered by creation
+	// time descending (user self-service status page).
+	ListMyTasks(ctx context.Context, requesterUserID int64, limit int) ([]domain.Task, error)
+	// CountMyTaskStats returns per-status counts for the requester.
+	CountMyTaskStats(ctx context.Context, requesterUserID int64) (map[domain.TaskStatus]int, error)
 }
 
 // UserServiceConfig wires the user store and optional worker-cancel callback.
@@ -36,6 +41,12 @@ type UserService interface {
 	ListPendingUsers(ctx context.Context) ([]domain.User, error)
 	CountPendingUsers(ctx context.Context) (int, error)
 	CountApprovedUsers(ctx context.Context) (int, error)
+	GetUserByID(ctx context.Context, userID int64) (int64, string, domain.UserStatus, error)
+	// ListMyTasks returns the requester's recent tasks ordered by creation
+	// time descending (user self-service status page).
+	ListMyTasks(ctx context.Context, requesterUserID int64, limit int) ([]domain.Task, error)
+	// CountMyTaskStats returns per-status counts for the requester.
+	CountMyTaskStats(ctx context.Context, requesterUserID int64) (map[domain.TaskStatus]int, error)
 }
 
 type userService struct {
@@ -106,6 +117,30 @@ func (s *userService) CountPendingUsers(ctx context.Context) (int, error) {
 
 func (s *userService) CountApprovedUsers(ctx context.Context) (int, error) {
 	return s.store.CountApprovedUsers(ctx)
+}
+
+func (s *userService) ListMyTasks(ctx context.Context, requesterUserID int64, limit int) ([]domain.Task, error) {
+	if requesterUserID <= 0 {
+		return nil, fmt.Errorf("user id must be positive")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	return s.store.ListMyTasks(ctx, requesterUserID, limit)
+}
+
+func (s *userService) CountMyTaskStats(ctx context.Context, requesterUserID int64) (map[domain.TaskStatus]int, error) {
+	if requesterUserID <= 0 {
+		return nil, fmt.Errorf("user id must be positive")
+	}
+	return s.store.CountMyTaskStats(ctx, requesterUserID)
+}
+
+func (s *userService) GetUserByID(ctx context.Context, userID int64) (int64, string, domain.UserStatus, error) {
+	if userID <= 0 {
+		return 0, "", "", fmt.Errorf("user id must be positive")
+	}
+	return s.store.GetUserByID(ctx, userID)
 }
 
 // MaxUsernameLen is the application-enforced username byte limit.

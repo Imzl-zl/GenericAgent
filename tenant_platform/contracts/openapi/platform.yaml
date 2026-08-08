@@ -1286,6 +1286,64 @@ paths:
         "401": {$ref: "#/components/responses/Unauthorized"}
         "500": {$ref: "#/components/responses/InternalError"}
 
+  /v1/users/me:
+    get:
+      security:
+        - BearerToken: []
+      operationId: getMe
+      summary: 获取当前用户实时状态（用于审批后刷新账号状态）
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/users/me/tasks:
+    get:
+      security:
+        - BearerToken: []
+      operationId: listMyTasks
+      summary: 获取当前用户的最近任务列表（按创建时间倒序）
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: 返回条数上限
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UserTaskList"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/users/me/task-stats:
+    get:
+      security:
+        - BearerToken: []
+      operationId: getMyTaskStats
+      summary: 获取当前用户的任务统计（按状态分组计数）
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UserTaskStats"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
   /v1/users/me/bots:
     get:
       security:
@@ -1552,6 +1610,75 @@ components:
               type: string
             trace_id:
               type: string
+    UserTask:
+      type: object
+      required:
+        - task_id
+        - session_key
+        - status
+        - source
+        - created_at
+      properties:
+        task_id:
+          type: string
+        session_key:
+          type: string
+        status:
+          type: string
+          enum: [queued, starting, running, succeeded, failed, cancelled, interrupted]
+        source:
+          type: string
+          enum: [wechat, web]
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        terminal_at:
+          type: string
+          format: date-time
+          nullable: true
+        terminal_error_code:
+          type: string
+          description: 终态错误码（仅失败/取消时非空）
+    UserTaskList:
+      type: object
+      required:
+        - tasks
+      properties:
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/UserTask"
+    UserTaskStats:
+      type: object
+      required:
+        - queued
+        - running
+        - succeeded
+        - failed
+        - cancelled
+        - interrupted
+        - total
+      properties:
+        queued:
+          type: integer
+        running:
+          type: integer
+          description: starting + running 合计
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+        cancelled:
+          type: integer
+        interrupted:
+          type: integer
+        total:
+          type: integer
+          description: 全部任务数
     CreateUserRequest:
       type: object
       required:

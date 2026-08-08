@@ -190,6 +190,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	s.mux.HandleFunc("GET /v1/tasks/{task_id}", s.userAuth(s.handleGetTask))
 	s.mux.HandleFunc("GET /v1/tasks/{task_id}/result", s.userAuth(s.handleGetResult))
 	s.mux.HandleFunc("POST /v1/tasks/{task_id}/cancel", s.userAuth(s.handleCancel))
+	s.registerUserTaskRoutes()
 	s.registerLifecycleRoutes()
 	return s, nil
 }

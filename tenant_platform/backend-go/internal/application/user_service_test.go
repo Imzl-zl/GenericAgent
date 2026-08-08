@@ -117,6 +117,20 @@ func (f *fakeUserStore) CountApprovedUsers(_ context.Context) (int, error) {
 	return n, nil
 }
 
+func (f *fakeUserStore) ListMyTasks(_ context.Context, requesterUserID int64, limit int) ([]domain.Task, error) {
+	if requesterUserID <= 0 {
+		return nil, fmt.Errorf("user id must be positive")
+	}
+	return nil, nil
+}
+
+func (f *fakeUserStore) CountMyTaskStats(_ context.Context, requesterUserID int64) (map[domain.TaskStatus]int, error) {
+	if requesterUserID <= 0 {
+		return nil, fmt.Errorf("user id must be positive")
+	}
+	return map[domain.TaskStatus]int{}, nil
+}
+
 func TestUserServiceCreateUserRejectsEmptyUsername(t *testing.T) {
 	svc, err := NewUserService(UserServiceConfig{Store: newFakeUserStore()})
 	if err != nil {
