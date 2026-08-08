@@ -89,6 +89,17 @@ RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_m
 `, username, passwordHash), &user); err != nil {
 			return err
 		}
+		// 生命周期不变量: users 行 ⇔ personal workspace 行(见
+		// insertPersonalWorkspaceTx)——邀请注册与普通注册同路径建立,
+		// 审批保持纯状态迁移。
+		wsKey := fmt.Sprintf("personal:%d", user.ID)
+		wsHash, err := personalWorkspaceVolumeID(wsKey)
+		if err != nil {
+			return err
+		}
+		if _, err := insertPersonalWorkspaceTx(ctx, tx, user.ID, &wsHash, nil); err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx, `
 UPDATE invite_codes
 SET state = 'used', used_by_user_id = $2, used_at = $3

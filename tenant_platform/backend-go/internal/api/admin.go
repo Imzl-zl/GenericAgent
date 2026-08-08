@@ -28,6 +28,7 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("POST /v1/admin/users/{user_id}/approve", s.auth(s.handleAdminApproveUser))
 		s.mux.HandleFunc("POST /v1/admin/users/{user_id}/block", s.auth(s.handleAdminBlockUser))
 		s.mux.HandleFunc("GET /v1/admin/users/pending", s.auth(s.handleAdminListPending))
+		s.mux.HandleFunc("GET /v1/users/me", s.userAuth(s.handleGetMe))
 	}
 	if s.invite != nil {
 		s.mux.HandleFunc("POST /v1/admin/invite-codes", s.auth(s.handleAdminCreateInviteCode))
@@ -38,15 +39,16 @@ func (s *Server) registerLifecycleRoutes() {
 	if s.botSvc != nil {
 		s.mux.HandleFunc("GET /v1/users/me/bots", s.userAuth(s.handleGetOwnBot))
 	}
-	if s.wechatBinding != nil {
-		// 普通用户的微信绑定接口
-		s.mux.HandleFunc("POST /v1/users/me/wechat-qrcode", s.userAuth(s.handleCreateWechatQRCode))
-		s.mux.HandleFunc("GET /v1/users/me/wechat-qrcode/status", s.userAuth(s.handleGetWechatQRCodeStatus))
+	// 微信绑定接口（iLink 扫码）。路由无条件注册（OpenAPI 已声明），
+	// 服务未配置（ILINK_BASE_URL 为空）时统一返回 501 FEATURE_DISABLED，
+	// 避免前端拿到裸 404 无法区分"功能未启用"与"路径不存在"。
+	// 认证包在 wechatHandler 外层，未启用时同样保持 401/501 语义一致。
+	s.mux.HandleFunc("POST /v1/users/me/wechat-qrcode", s.userAuth(s.wechatHandler(s.handleCreateWechatQRCode)))
+	s.mux.HandleFunc("GET /v1/users/me/wechat-qrcode/status", s.userAuth(s.wechatHandler(s.handleGetWechatQRCodeStatus)))
 
-		// 管理员的微信绑定接口（使用开发者 user_id）
-		s.mux.HandleFunc("POST /v1/admin/me/wechat-qrcode", s.auth(s.handleAdminCreateWechatQRCode))
-		s.mux.HandleFunc("GET /v1/admin/me/wechat-qrcode/status", s.auth(s.handleAdminGetWechatQRCodeStatus))
-	}
+	// 管理员的微信绑定接口（使用开发者 user_id）
+	s.mux.HandleFunc("POST /v1/admin/me/wechat-qrcode", s.auth(s.wechatHandler(s.handleAdminCreateWechatQRCode)))
+	s.mux.HandleFunc("GET /v1/admin/me/wechat-qrcode/status", s.auth(s.wechatHandler(s.handleAdminGetWechatQRCodeStatus)))
 	if s.personas != nil {
 		s.mux.HandleFunc("GET /v1/personas", s.userAuth(s.handleListPersonas))
 		s.mux.HandleFunc("POST /v1/personas", s.userAuth(s.handleCreatePersona))
@@ -112,6 +114,18 @@ func (s *Server) registerLifecycleRoutes() {
 	}
 	// Dashboard statistics endpoint
 	s.mux.HandleFunc("GET /v1/admin/dashboard/stats", s.auth(s.handleAdminDashboardStats))
+}
+
+// wechatHandler wraps a QR-binding handler so that the route exists even when
+// the iLink binding service is not configured (ILINK_BASE_URL empty). In that
+// case it answers a structured FEATURE_DISABLED error instead of a bare 404.
+func (s *Server) wechatHandler(h func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
+	if s.wechatBinding != nil {
+		return h
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusNotImplemented, "FEATURE_DISABLED", "wechat binding disabled: ILINK_BASE_URL not configured", traceID())
+	}
 }
 
 // TaskStoreStats is a minimal interface for fetching dashboard statistics.

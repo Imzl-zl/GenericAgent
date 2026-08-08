@@ -24,6 +24,16 @@ func (client *fakeSophubClient) Verify(_ context.Context, key string) (domain.So
 func (client *fakeSophubClient) Search(context.Context, string, string, int, int) (domain.SophubSearchResult, error) {
 	return domain.SophubSearchResult{}, client.err
 }
+
+// searchableClient 返回固定列表的 fake client(供过滤逻辑测试)。
+type searchableClient struct {
+	fakeSophubClient
+	result domain.SophubSearchResult
+}
+
+func (client *searchableClient) Search(context.Context, string, string, int, int) (domain.SophubSearchResult, error) {
+	return client.result, nil
+}
 func (client *fakeSophubClient) GetSOP(_ context.Context, key, _ string) (domain.SophubRemoteSOP, error) {
 	client.keySeen = key
 	return client.remote, client.err
@@ -95,13 +105,50 @@ func TestSophubServiceDoesNotPersistFailedOrLeakKey(t *testing.T) {
 	}
 }
 
+// TestSophubServiceSearchFiltersInstallableOnly 回归: 远程 API 不返回
+// is_public 字段(2026-08 实测), 公开 SOP 以 source=community 表达——
+// 过滤必须放行, 否则搜索永远空结果。
+func TestSophubServiceSearchFiltersInstallableOnly(t *testing.T) {
+	cipher := &fakeSophubCipher{}
+	store := &fakeSophubStore{}
+	client := &searchableClient{result: domain.SophubSearchResult{
+		Items: []domain.SophubRemoteSOP{
+			{ID: "public-community", Source: "community", Status: "approved", PackageType: "single_file", FileType: "markdown"},
+			{ID: "public-flag", IsPublic: boolPtr(true), Status: "approved", PackageType: "single_file", FileType: "markdown"},
+			{ID: "explicit-private", IsPublic: boolPtr(false), Source: "community", Status: "approved", PackageType: "single_file", FileType: "markdown"},
+			{ID: "bundle", Source: "community", Status: "approved", PackageType: "bundle", FileType: "markdown"},
+			{ID: "unapproved", Source: "community", Status: "draft", PackageType: "single_file", FileType: "markdown"},
+		},
+	}}
+	service, err := NewSophubService(SophubServiceConfig{Store: store, Client: client, Cipher: cipher})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Bind(context.Background(), "admin-key", 1); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Search(context.Background(), "agent", 1, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, item := range result.Items {
+		ids = append(ids, item.ID)
+	}
+	if strings.Join(ids, ",") != "public-community,public-flag" {
+		t.Fatalf("filtered ids = %v, want [public-community public-flag]", ids)
+	}
+	if result.Total != 2 {
+		t.Fatalf("total = %d, want 2", result.Total)
+	}
+}
 
 func TestSophubServiceFetchRemoteSOPForWorkerProxy(t *testing.T) {
 	store := &fakeSophubStore{}
 	cipher := &fakeSophubCipher{}
 	client := &fakeSophubClient{remote: domain.SophubRemoteSOP{
 		ID: "sop-remote", FileType: "markdown", Status: "approved",
-		PackageType: "single_file", IsPublic: true, Content: "# SOP",
+		PackageType: "single_file", IsPublic: boolPtr(true), Content: "# SOP",
 	}}
 	service, err := NewSophubService(SophubServiceConfig{Store: store, Client: client, Cipher: cipher})
 	if err != nil {
@@ -127,3 +174,5 @@ func TestSophubServiceFetchRemoteSOPForWorkerProxy(t *testing.T) {
 		t.Fatal("fetch without binding must fail")
 	}
 }
+
+func boolPtr(v bool) *bool { return &v }

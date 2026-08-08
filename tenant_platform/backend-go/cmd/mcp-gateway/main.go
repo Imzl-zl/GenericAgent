@@ -38,7 +38,7 @@ type postgresCatalog struct {
 
 func (c *postgresCatalog) EnabledServers(ctx context.Context) ([]mcpgateway.Server, error) {
 	rows, err := c.pool.Query(ctx, `
-		SELECT server_key, name, command, args, timeout_seconds, max_instances
+		SELECT server_key, name, command, args, timeout_seconds, max_instances, revision
 		FROM mcp_servers
 		WHERE enabled = TRUE AND transport = 'stdio'
 		ORDER BY id`)
@@ -55,7 +55,7 @@ func (c *postgresCatalog) EnabledServers(ctx context.Context) ([]mcpgateway.Serv
 			maxInstances int
 		)
 		if err := rows.Scan(&server.ServerID, &server.Name, &server.Command,
-			&argsJSON, &timeoutSecs, &maxInstances); err != nil {
+			&argsJSON, &timeoutSecs, &maxInstances, &server.Revision); err != nil {
 			return nil, fmt.Errorf("scan mcp server: %w", err)
 		}
 		if len(argsJSON) > 0 {
@@ -75,7 +75,7 @@ func main() {
 		databaseURL = flag.String("database-url", "", "PostgreSQL URL (or DATABASE_URL)")
 		listen      = flag.String("listen", "", "listen address (or GA_MCP_GATEWAY_LISTEN, default 0.0.0.0:8083)")
 		workRoot    = flag.String("work-root", "", "stdio process work dir root (or GA_MCP_GATEWAY_WORK_ROOT)")
-		idleTTL     = flag.Duration("idle-ttl", mcpgateway.DefaultIdleTTL, "stdio process idle reap TTL")
+		idleTTLFlag = flag.Duration("idle-ttl", mcpgateway.DefaultIdleTTL, "stdio process idle reap TTL")
 	)
 	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -99,10 +99,18 @@ func main() {
 	}
 	defer pool.Close()
 
+	// 环境变量覆盖 flag(compose 经 GA_MCP_GATEWAY_IDLE_TTL 透传)。
+	idleTTL := *idleTTLFlag
+	if envTTL := os.Getenv("GA_MCP_GATEWAY_IDLE_TTL"); envTTL != "" {
+		if parsed, parseErr := time.ParseDuration(envTTL); parseErr == nil {
+			idleTTL = parsed
+		}
+	}
+
 	gateway := mcpgateway.New(mcpgateway.Config{
 		Catalog:  &postgresCatalog{pool: pool},
 		WorkRoot: workRootPath,
-		IdleTTL:  *idleTTL,
+		IdleTTL:  idleTTL,
 	})
 	defer gateway.Close()
 

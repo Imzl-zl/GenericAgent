@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ type fakeRouterStore struct {
 	statuses    map[int64]domain.UserStatus
 	runningTask *domain.Task
 	findTaskErr error
+	getBotErr   error
 }
 
 func newFakeRouterStore() *fakeRouterStore {
@@ -30,6 +32,9 @@ func newFakeRouterStore() *fakeRouterStore {
 }
 
 func (f *fakeRouterStore) GetBotByUUID(_ context.Context, botUUID string) (domain.Bot, error) {
+	if f.getBotErr != nil {
+		return domain.Bot{}, f.getBotErr
+	}
 	b, ok := f.bots[botUUID]
 	if !ok {
 		return domain.Bot{}, pgx.ErrNoRows
@@ -55,7 +60,9 @@ func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string) 
 	return *f.runningTask, nil
 }
 
-func (f *fakeRouterStore) ResetWorkspaceForNewSession(_ context.Context, _ string) (int, error) { return 0, nil }
+func (f *fakeRouterStore) ResetWorkspaceForNewSession(_ context.Context, _ string) (int, error) {
+	return 0, nil
+}
 
 // fakeTaskService is a minimal TaskService for router tests.
 type fakeTaskService struct {
@@ -213,6 +220,36 @@ func TestRouterUnknownBotRejected(t *testing.T) {
 	})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
+	}
+}
+
+// 瞬态 DB 故障(非 ErrNoRows)不得被当作 unknown bot 消费: 必须返回 error
+// (webhook 5xx → Poller 重试), 不得发送误导性回复, 也不得标记幂等——
+// 故障恢复后同消息重试必须正常路由。
+func TestRouterTransientBotLookupErrorNotConsumed(t *testing.T) {
+	store := newFakeRouterStore()
+	tr := transport.NewLoopbackTransport()
+	r, _ := newTestRouter(store, tr)
+	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}
+
+	store.getBotErr = errors.New("db connection refused")
+	if _, err := r.HandleMessage(context.Background(), msg); err == nil {
+		t.Fatal("expected error for transient bot lookup failure, got nil")
+	}
+	if last, ok := tr.LastSentMessage(); ok {
+		t.Fatalf("transient bot lookup failure must not send a reply, got %q", last.Text)
+	}
+
+	// 故障恢复: 同消息重试必须真正处理(未被消费/未标记幂等)。
+	store.getBotErr = nil
+	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.statuses[42] = domain.UserApproved
+	res, err := r.HandleMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Action != ActionTaskCreated {
+		t.Fatalf("retry after transient failure must be processed, got %s", res.Action)
 	}
 }
 

@@ -107,12 +107,12 @@ func (service *sophubService) Search(ctx context.Context, query string, page, pa
 	return result, nil
 }
 
-// filterInstallableSOPs 只保留公开 approved 单文件 markdown SOP(审查:
-// 搜索与安装准入一致, 私有项目可能含租户敏感内容)。
+// filterInstallableSOPs 只保留可安装 SOP(审查: 搜索与安装准入一致,
+// 私有项目可能含租户敏感内容)。
 func filterInstallableSOPs(items []domain.SophubRemoteSOP) []domain.SophubRemoteSOP {
 	out := items[:0]
 	for _, item := range items {
-		if item.IsPublic &&
+		if isSophubSOPPublic(item) &&
 			strings.EqualFold(item.Status, domain.SOPStatusApproved) &&
 			strings.EqualFold(item.PackageType, domain.SOPPackageTypeSingle) &&
 			strings.EqualFold(item.FileType, domain.SOPFileTypeMarkdown) {
@@ -120,6 +120,21 @@ func filterInstallableSOPs(items []domain.SophubRemoteSOP) []domain.SophubRemote
 		}
 	}
 	return out
+}
+
+// SophubSourceCommunity 是远程公开 SOP 的发布源(社区分享)。
+const SophubSourceCommunity = "community"
+
+// isSophubSOPPublic 判定远程 SOP 的公开性: 远程 API(fudankw.cn/sophub)
+// 不返回 is_public 字段(2026-08 实测列表与详情均无), 公开 SOP 以
+// source=community(社区分享)表达。is_public 显式存在时以其为准
+// (显式 false 拒绝——字段未来恢复时的 fail-closed); 缺失时以
+// source=community 作为公开信号。
+func isSophubSOPPublic(item domain.SophubRemoteSOP) bool {
+	if item.IsPublic != nil {
+		return *item.IsPublic
+	}
+	return item.Source == SophubSourceCommunity
 }
 
 // FetchRemoteSOP 返回远程 SOP(供 Worker proxy; 不写入任何注册表/候选)。
@@ -140,7 +155,7 @@ func (service *sophubService) FetchRemoteSOP(ctx context.Context, remoteSOPID st
 		return domain.SophubRemoteSOP{}, fmt.Errorf("Sophub SOP identity mismatch")
 	}
 	// 仅公开 approved single-file markdown 可被 Worker 安装(方案 §5.2)。
-	if !remote.IsPublic || !strings.EqualFold(remote.Status, domain.SOPStatusApproved) ||
+	if !isSophubSOPPublic(remote) || !strings.EqualFold(remote.Status, domain.SOPStatusApproved) ||
 		!strings.EqualFold(remote.PackageType, domain.SOPPackageTypeSingle) ||
 		!strings.EqualFold(remote.FileType, domain.SOPFileTypeMarkdown) {
 		return domain.SophubRemoteSOP{}, fmt.Errorf("Sophub SOP is not a public approved single-file markdown")

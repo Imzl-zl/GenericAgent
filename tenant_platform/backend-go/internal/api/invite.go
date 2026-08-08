@@ -38,6 +38,28 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetMe returns the authenticated user's profile read fresh from the
+// store. Clients use it to refresh the account status after admin approval
+// (the status in the login/register response is a point-in-time snapshot).
+func (s *Server) handleGetMe(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	userID, ok := userIDFromContext(r.Context())
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing user context", tid)
+		return
+	}
+	id, username, status, err := s.users.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "NOT_FOUND", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user_id":  id,
+		"username": username,
+		"status":   string(status),
+	})
+}
+
 type loginBody struct {
 	Username string `json:"username"`
 	Password string `json:"password"`

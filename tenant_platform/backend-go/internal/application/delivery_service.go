@@ -536,7 +536,7 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 		}
 		body := userVisibleTaskResult(string(payload.Body))
 		markers := extractFileMarkers(body)
-		cleaned := stripFileMarkers(body)
+		cleaned := cleanIMMarkdown(stripFileMarkers(body))
 		cleaned = domain.TruncateUTF8(cleaned, maxDeliveryTextBytes)
 		out := deliveryPayload{}
 		if cleaned != "" {
@@ -719,7 +719,53 @@ var (
 	hiddenTranscriptTagRE      = regexp.MustCompile(`(?is)<(?:thinking|summary|tool_use|file_content)>.*?</(?:thinking|summary|tool_use|file_content)>`)
 	compactToolLineRE          = regexp.MustCompile(`^\s*🛠️\s+[A-Za-z_][A-Za-z0-9_]*\(.*$`)
 	internalReasoningEnglishRE = regexp.MustCompile(`(?i)(the user is asking|let me\b|i should\b|actually\b|since there(?:'s| is)\b|i'?m just waiting for instructions)`)
+
+	// IM 渠道 md 降级(微信等不渲染 Markdown): 见 cleanIMMarkdown。
+	imBoldCodeRE    = regexp.MustCompile(`\*\*(.+?)\*\*|` + "`([^`]+)`" + `|~~(.+?)~~`)
+	imLinkRE        = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`)
+	imHeadingPrefixRE = regexp.MustCompile(`^\s*#{1,6}\s*`)
 )
+
+// cleanIMMarkdown 将 Markdown 文本降级为纯文本(微信等 IM 渠道不渲染 md)。
+// 覆盖加粗/行内代码/删除线/链接/标题/表格分隔线; 列表与引用保留可读符号。
+// 平台当前交付统一走 Bot(微信)渠道, 全量应用无副作用。
+func cleanIMMarkdown(s string) string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		t := imBoldCodeRE.ReplaceAllStringFunc(ln, func(m string) string {
+			switch {
+			case strings.HasPrefix(m, "**"):
+				return strings.TrimSuffix(strings.TrimPrefix(m, "**"), "**")
+			case strings.HasPrefix(m, "`"):
+				return strings.Trim(m, "`")
+			default: // ~~x~~
+				return strings.TrimSuffix(strings.TrimPrefix(m, "~~"), "~~")
+			}
+		})
+		t = imLinkRE.ReplaceAllString(t, "$1")
+		if strings.HasPrefix(t, "|") && strings.HasSuffix(t, "|") {
+			cells := strings.Split(strings.Trim(t, "|"), "|")
+			sep := true
+			for _, c := range cells {
+				if !strings.HasPrefix(strings.TrimSpace(c), "-") {
+					sep = false
+					break
+				}
+			}
+			if sep {
+				continue // 表格分隔行
+			}
+			for i := range cells {
+				cells[i] = strings.TrimSpace(cells[i])
+			}
+			out = append(out, strings.Join(cells, " | "))
+			continue
+		}
+		out = append(out, imHeadingPrefixRE.ReplaceAllString(t, ""))
+	}
+	return strings.Join(out, "\n")
+}
 
 func userVisibleTaskResult(raw string) string {
 	turns := splitTranscriptTurns(raw)

@@ -140,17 +140,18 @@ func ValidateMCPServerInput(input MCPServerCreate) error {
 				}
 			}
 		}
-		// stdio 的 url 可留空(快照下发时改写为 gateway 地址);
-		// 非空时必须也是合法 http(s) URL(管理员可显式指定 gateway 上游)。
-		if urlText := strings.TrimSpace(input.URL); urlText != "" {
-			parsed, err := url.Parse(urlText)
-			if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-				return fmt.Errorf("url must be an absolute http or https URL")
-			}
-			if parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" {
-				return fmt.Errorf("url must contain no credentials or fragment")
-			}
+		// stdio 的 url 必须为空: gateway 路由由平台统一合成
+		// (MCPServerGatewayURL), 管理员不需要也不应知道 gateway 内部地址。
+		if strings.TrimSpace(input.URL) != "" {
+			return fmt.Errorf("url must be empty for stdio transport (gateway route is synthesized by the platform)")
 		}
 	}
 	return nil
+}
+
+// MCPServerGatewayURL 是 stdio MCP server 的 gateway 路由合成函数
+// (平台内唯一实现: 快照下发与 proxy resolve 共用, 避免两处各自拼 URL)。
+// base 形如 http://mcp-gateway:8083, serverKey 是 mcp_servers.server_key。
+func MCPServerGatewayURL(base, serverKey string) string {
+	return strings.TrimRight(strings.TrimSpace(base), "/") + "/v1/mcp/" + serverKey
 }

@@ -11,6 +11,8 @@ import (
 )
 
 // CreateUser inserts a new user in status 'pending'. Username must be unique.
+// 随用户创建在同事务内建立 personal:<uid> workspace 行(生命周期不变量:
+// users 行 ⇔ personal workspace 行, 见 insertPersonalWorkspaceTx)。
 func (s *Store) CreateUser(ctx context.Context, username, passwordHash string) (domain.User, error) {
 	if username == "" {
 		return domain.User{}, fmt.Errorf("username is required")
@@ -19,11 +21,20 @@ func (s *Store) CreateUser(ctx context.Context, username, passwordHash string) (
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		// 审查: password_hash 为 NULL(空密码)时 COALESCE 成空串,
 		// 否则 scanUser 扫 NULL 进 string 崩溃。
-		return scanUser(tx.QueryRow(ctx, `
+		if err := scanUser(tx.QueryRow(ctx, `
 INSERT INTO users (username, status, password_hash)
 VALUES ($1, 'pending', $2)
 RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
-`, username, nullString(passwordHash)), &u)
+`, username, nullString(passwordHash)), &u); err != nil {
+			return err
+		}
+		wsKey := fmt.Sprintf("personal:%d", u.ID)
+		wsHash, err := personalWorkspaceVolumeID(wsKey)
+		if err != nil {
+			return err
+		}
+		_, err = insertPersonalWorkspaceTx(ctx, tx, u.ID, &wsHash, nil)
+		return err
 	})
 	return u, err
 }
@@ -76,6 +87,10 @@ RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_m
 `, userID, now), &u); err != nil {
 			return err
 		}
+		// 审查: 审批是纯状态迁移——workspace 行由用户创建路径(CreateUser /
+		// CreateUserWithInvite / bootstrap)与迁移 0050 保证存在
+		// (不变量: users 行 ⇔ personal workspace 行, 见 insertPersonalWorkspaceTx),
+		// 不再在此建行, 避免资源创建逻辑散落多个状态迁移点。
 		return s.AppendAuditEventTx(ctx, tx, domain.AuditEvent{
 			ActorUserID: userID,
 			Action:      domain.AuditUserApproved,

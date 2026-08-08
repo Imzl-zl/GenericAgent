@@ -288,6 +288,16 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		return Runner{}, fmt.Errorf("docker create runner: %w", err)
 	}
 	if exitCode != 0 {
+		// 镜像缺失是最常见的可操作原因(配置漂移: GA_RUNNER_IMAGE 与本地
+		// 构建产物名不一致), 附加诊断让错误信息可直接指导修复——错误
+		// 会原样透传到 Platform 任务失败(WORKER_START_FAILED)。
+		if ok, ierr := d.ImageExists(ctx, image); ierr == nil && !ok {
+			diagnostic := fmt.Sprintf("; runner image %q not found locally (fix GA_RUNNER_IMAGE in .env or run make build)", image)
+			if avail, aerr := d.AvailableImages(ctx, "ga-runner"); aerr == nil && avail != "" {
+				diagnostic += "; available: " + avail
+			}
+			return Runner{}, fmt.Errorf("docker create runner failed (%d): %s%s", exitCode, strings.TrimSpace(string(stderr)), diagnostic)
+		}
 		return Runner{}, fmt.Errorf("docker create runner failed (%d): %s", exitCode, strings.TrimSpace(string(stderr)))
 	}
 	containerID := strings.TrimSpace(string(stdout))
@@ -420,6 +430,38 @@ func (d *DockerCLI) ContainerExists(ctx context.Context, idOrName string) (bool,
 		return false, err
 	}
 	return exitCode == 0, nil
+}
+
+// ImageExists 报告本地 daemon 是否已有镜像引用(支持 tag 与 @sha256: digest)。
+func (d *DockerCLI) ImageExists(ctx context.Context, image string) (bool, error) {
+	if strings.TrimSpace(image) == "" {
+		return false, nil
+	}
+	_, _, exitCode, err := d.runner.Run(ctx, d.cfg.Binary, "image", "inspect", image)
+	if err != nil {
+		return false, err
+	}
+	return exitCode == 0, nil
+}
+
+// AvailableImages 列出本地 daemon 中名称含 prefix 的镜像(Repository:Tag)。
+// 用于镜像缺失时的可操作诊断——诊断文本随错误透传 Platform。
+func (d *DockerCLI) AvailableImages(ctx context.Context, prefix string) (string, error) {
+	stdout, _, _, err := d.runner.Run(ctx, d.cfg.Binary, "images", "--format", "{{.Repository}}:{{.Tag}}")
+	if err != nil {
+		return "", err
+	}
+	var names []string
+	for _, line := range strings.Split(string(stdout), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "<none>:<none>" {
+			continue
+		}
+		if prefix == "" || strings.Contains(line, prefix) {
+			names = append(names, line)
+		}
+	}
+	return strings.Join(names, ", "), nil
 }
 
 // IsRunnerContainer 校验容器(按 ID 或名称)带 com.genericagent.runner=true

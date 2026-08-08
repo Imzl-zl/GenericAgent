@@ -3,9 +3,12 @@ package ilink
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -151,5 +154,49 @@ func TestSetCommonHeadersDoesNotWriteBody(t *testing.T) {
 		if len(b) > 0 {
 			t.Errorf("unexpected body %q", b)
 		}
+	}
+}
+
+// TestIsRetryableStatusErrTreatsLongPollTimeoutAsNoChange guards the key
+// behavior: iLink get_qrcode_status long-polls while a QR awaits a scan, so
+// an attempt timeout is the steady state and must NOT be retried (retrying
+// would stack 8s attempts and blow past front-proxy timeouts → 504).
+func TestIsRetryableStatusErrTreatsLongPollTimeoutAsNoChange(t *testing.T) {
+	err := context.DeadlineExceeded
+	if isRetryableStatusErr(err) {
+		t.Error("long-poll timeout must not be retried")
+	}
+	// Wrapped variants (url.Error style) must also be recognized.
+	wrapped := fmt.Errorf("ilink request: %w", err)
+	if isRetryableStatusErr(wrapped) {
+		t.Error("wrapped long-poll timeout must not be retried")
+	}
+}
+
+// TestGetQRCodeStatusTimeoutIsNotRetried verifies that a status attempt that
+// exceeds StatusRequestTimeout results in exactly one request: the timeout is
+// the expected long-poll outcome, not a transient error to retry.
+func TestGetQRCodeStatusTimeoutIsNotRetried(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		time.Sleep(150 * time.Millisecond) // exceed the 30ms attempt timeout
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "wait", "ret": 0})
+	}))
+	defer srv.Close()
+
+	c, _ := NewClient(ClientConfig{
+		BaseURL:              srv.URL,
+		StatusRequestTimeout: 30 * time.Millisecond,
+	})
+	_, err := c.GetQRCodeStatus(context.Background(), "qr-token")
+	if err == nil {
+		t.Fatal("expected timeout error from long-polling server")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("attempts=%d, want 1 (timeout must not be retried)", got)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error=%v, want context deadline exceeded", err)
 	}
 }

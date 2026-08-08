@@ -1,18 +1,23 @@
 // fakeserver 是测试用 mock stdio MCP server:
-// 逐行读 stdin, 按 JSON-RPC 协议响应, 支持崩溃注入。
+// 逐行读 stdin, 按 JSON-RPC 协议响应, 支持崩溃/延迟注入
+// (--crash-after N: 处理 N 个请求后退出; --slow-ms N: 响应前延迟)。
 package main
 
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
-	crashAfter, _ := strconv.Atoi(os.Getenv("FAKE_CRASH_AFTER"))
+	crashAfter := flag.Int("crash-after", 0, "exit after handling N requests (0 = never)")
+	slowMS := flag.Int("slow-ms", 0, "sleep N ms before each response")
+	flag.Parse()
+
 	handled := 0
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
@@ -24,6 +29,9 @@ func main() {
 		var req map[string]any
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			continue
+		}
+		if *slowMS > 0 {
+			time.Sleep(time.Duration(*slowMS) * time.Millisecond)
 		}
 		method, _ := req["method"].(string)
 		id, hasID := req["id"]
@@ -62,7 +70,7 @@ func main() {
 			}
 		}
 		handled++
-		if crashAfter > 0 && handled >= crashAfter {
+		if *crashAfter > 0 && handled >= *crashAfter {
 			fmt.Fprintln(os.Stderr, "fakeserver: crashing on demand")
 			os.Exit(1)
 		}

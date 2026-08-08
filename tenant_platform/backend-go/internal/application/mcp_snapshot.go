@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -43,13 +44,15 @@ func (s *scheduler) resolveMCPSnapshot(ctx context.Context) (RuntimeMCPSnapshot,
 		}
 		url := strings.TrimSpace(server.URL)
 		if transport == domain.MCPTransportStdio {
-			// stdio 由 mcp-gateway 托管: 快照 URL 改写为 gateway 路由,
-			// server_key 即 gateway 的寻址键(白名单由 gateway 侧再查证)。
+			// stdio 由 mcp-gateway 托管: URL 由合成函数统一生成
+			// (与 proxy resolve 同函数), 管理员无需填写 gateway 地址。
 			// gateway 未配置时 fail-closed 不下发该 server。
 			if gatewayBase == "" {
+				slog.Warn("mcp snapshot: stdio server skipped, MCPGatewayBaseURL not configured",
+					"server_id", server.ServerKey)
 				continue
 			}
-			url = gatewayBase + "/v1/mcp/" + server.ServerKey
+			url = domain.MCPServerGatewayURL(gatewayBase, server.ServerKey)
 		}
 		fingerprint = append(fingerprint, mcpSnapshotFingerprint{
 			ID: server.ID, ServerID: server.ServerKey, Revision: server.Revision,

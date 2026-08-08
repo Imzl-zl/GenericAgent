@@ -317,6 +317,18 @@ func (f dashboardFakeUserService) CountApprovedUsers(context.Context) (int, erro
 	return f.approved, nil
 }
 
+func (f dashboardFakeUserService) GetUserByID(context.Context, int64) (int64, string, domain.UserStatus, error) {
+	return 0, "", domain.UserApproved, nil
+}
+
+func (f dashboardFakeUserService) ListMyTasks(context.Context, int64, int) ([]domain.Task, error) {
+	return nil, nil
+}
+
+func (f dashboardFakeUserService) CountMyTaskStats(context.Context, int64) (map[domain.TaskStatus]int, error) {
+	return map[domain.TaskStatus]int{}, nil
+}
+
 func (f dashboardFakeTaskStats) CountRunningTasks(context.Context) (int, error) {
 	return f.running, nil
 }

@@ -787,3 +787,32 @@ func TestDeliverableSnapshotBaseLeavesRoomForPrefix(t *testing.T) {
 		t.Fatalf("expected report.docx, got %q", got)
 	}
 }
+
+func TestCleanIMMarkdownDowngradesWechatText(t *testing.T) {
+	in := `任务完成：
+Word 文档已生成成功！文件大小 **42 KB**，位于 ` + "`outputs/简历.docx`" + ` ✅
+
+# 排版美化要点
+- 📄 **封面标题** — 居中大标题
+- 🔤 字体：正文等线、标题微软雅黑
+
+| 等级 | 内容 |
+|------|------|
+| A | 技术基础 |
+
+链接 [示例](https://example.com) 保留文本`
+	want := `任务完成：
+Word 文档已生成成功！文件大小 42 KB，位于 outputs/简历.docx ✅
+
+排版美化要点
+- 📄 封面标题 — 居中大标题
+- 🔤 字体：正文等线、标题微软雅黑
+
+等级 | 内容
+A | 技术基础
+
+链接 示例 保留文本`
+	if got := cleanIMMarkdown(in); got != want {
+		t.Errorf("cleanIMMarkdown mismatch\n got: %q\nwant: %q", got, want)
+	}
+}

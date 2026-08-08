@@ -26,14 +26,20 @@ type MCPTarget struct {
 //     MCP 表决定, 即白名单(管理员未启用的 server 一律 404);
 //   - 调用按 JTI 原子计量(预算耗尽 429, 无预算 fail-closed 拒绝);
 //   - 仅转发 JSON-RPC 流(Streamable HTTP), 不缓存/不解析内容;
-//   - http transport 直连第三方; stdio transport 经 mcp-gateway(ViaGateway),
-//     此时附加内部头 X-MCP-Workspace(capability 的 SessionKey), 该头只发往
-//     平台自有 gateway, 绝不外泄给第三方 MCP Server。
+//   - http transport 直连第三方(仅转发 MCP 语义头, 身份头绝不外泄);
+//   - stdio transport 经 mcp-gateway(ViaGateway): URL 由平台合成
+//     (domain.MCPServerGatewayURL), 附加内部头 X-MCP-Workspace
+//     (capability 的 SessionKey), 该头只发往平台自有 gateway, 绝不外泄。
+//
+// 双 http.Client: 第三方直连保留 30s 响应头保护(挂死服务器快速失败);
+// gateway 路由放宽到 MCP 超时上限+缓冲(stdio 调用由 gateway 按
+// timeout_seconds 执行超时, 最长 300s, 此处不得截断)。
 type WorkerMCPProxy struct {
 	resolve  func(ctx context.Context, serverID string) (MCPTarget, bool, error)
 	validate func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error)
 	consume  func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error)
-	client   *http.Client
+	client   *http.Client // 第三方直连: 30s 响应头超时
+	gwClient *http.Client // mcp-gateway: 310s 响应头超时(> timeout_seconds 上限)
 }
 
 // NewWorkerMCPProxy wires the proxy to the enabled-MCP resolver, token
@@ -46,21 +52,36 @@ func NewWorkerMCPProxy(
 	if resolve == nil || validate == nil {
 		return nil
 	}
-	return &WorkerMCPProxy{
-		resolve:  resolve,
-		validate: validate,
-		consume:  consume,
-		client: &http.Client{
+	newClient := func(responseHeaderTimeout time.Duration) *http.Client {
+		return &http.Client{
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 				// 上游必须尽快开始响应; SSE 流式响应不受此限(头部到达即放行)。
 				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
+				ResponseHeaderTimeout: responseHeaderTimeout,
 				IdleConnTimeout:       90 * time.Second,
 			},
-		},
+		}
+	}
+	return &WorkerMCPProxy{
+		resolve:  resolve,
+		validate: validate,
+		consume:  consume,
+		client:   newClient(30 * time.Second),
+		gwClient: newClient(domainMaxMCPTimeout + 10*time.Second),
 	}
 }
+
+// clientFor 按目标选择 http.Client(见类型注释的超时语义)。
+func (p *WorkerMCPProxy) clientFor(viaGateway bool) *http.Client {
+	if viaGateway {
+		return p.gwClient
+	}
+	return p.client
+}
+
+// domainMaxMCPTimeout 对齐 domain.MaxMCPTimeoutSeconds(300s)。
+const domainMaxMCPTimeout = 300 * time.Second
 
 // authenticate 校验 capability 并按 JTI 原子消费预算(审查 F10 同款 fail-closed)。
 func (p *WorkerMCPProxy) authenticate(w http.ResponseWriter, r *http.Request) (llmproxy.CapabilityClaims, int) {
@@ -160,8 +181,9 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "MCP_UPSTREAM_ERROR", "cannot build upstream request", tid)
 		return
 	}
-	// 只转发 MCP 语义头; capability/身份头绝不外泄给第三方 MCP Server。
-	for _, key := range []string{"Content-Type", "Accept", "MCP-Protocol-Version", "User-Agent"} {
+	// 只转发 MCP 语义头(capability/身份头绝不外泄给第三方 MCP Server);
+	// Mcp-Session-Id 是 Streamable HTTP 会话标识, 必须透传。
+	for _, key := range []string{"Content-Type", "Accept", "MCP-Protocol-Version", "Mcp-Session-Id", "User-Agent"} {
 		if v := r.Header.Get(key); v != "" {
 			upstream.Header.Set(key, v)
 		}
@@ -176,7 +198,7 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp, err := p.client.Do(upstream)
+	resp, err := p.clientFor(target.ViaGateway).Do(upstream)
 	if err != nil {
 		slog.WarnContext(r.Context(), "mcp proxy: upstream request failed",
 			"server_id", serverID, "url", upstreamURL, "error", err)

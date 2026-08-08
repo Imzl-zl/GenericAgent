@@ -131,6 +131,7 @@ var pendingMigrations = []struct {
 	{"0047_delivery_attempt_token.sql", "migration_0047_delivery_attempt_token_marker"},
 	{"0048_platform_admin_bootstrap.sql", "migration_0048_platform_admin_bootstrap_marker"},
 	{"0049_mcp_gateway.sql", "migration_0049_mcp_gateway_marker"},
+	{"0050_user_personal_workspace.sql", "migration_0050_user_personal_workspace_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).

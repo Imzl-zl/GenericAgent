@@ -84,11 +84,13 @@ WHERE id = $1 AND bootstrap_marker = $3
 				return err
 			}
 		} else {
-			wsID = uuid.New()
-			if _, err := tx.Exec(ctx, `
-INSERT INTO workspaces (id, session_key, owner_user_id, kind, team_id, volume_id, bootstrap_marker)
-VALUES ($1, $2, $3, 'personal', NULL, NULL, $4)
-`, wsID, sessionKey, userID, bootstrapMarker); err != nil {
+			// 统一走 insertPersonalWorkspaceTx(唯一实现): bootstrap 用户
+			// volume_id 为 NULL(共享卷由 WorkspaceCoordinator 首调写入)。
+			if _, err := insertPersonalWorkspaceTx(ctx, tx, userID, nil, &bootstrapMarker); err != nil {
+				return err
+			}
+			wsID, err = s.WorkspaceIDByKeyTx(ctx, tx, sessionKey)
+			if err != nil {
 				return err
 			}
 		}

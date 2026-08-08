@@ -30,8 +30,13 @@ type SophubRemoteSOP struct {
 	FileType    string `json:"file_type"`
 	PackageType string `json:"package_type"`
 	Status      string `json:"status"`
-	IsPublic    bool   `json:"is_public"`
-	Content     string `json:"content"`
+	// Source 是远程发布源(2026-08 实测 fudankw.cn/sophub 列表与详情均
+	// 不返回 is_public 字段): 公开 SOP 以 source=community(社区分享)
+	// + status=approved 表达。IsPublic 用指针区分"缺失"与"显式 false"
+	// (显式 false 仍拒绝), 见 application/isSophubSOPPublic。
+	IsPublic *bool `json:"is_public"`
+	Content  string `json:"content"`
+	Source   string `json:"source"`
 }
 
 type SophubSearchResult struct {

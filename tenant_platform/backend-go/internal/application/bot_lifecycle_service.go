@@ -132,9 +132,21 @@ func (s *botLifecycleService) resolveCursor(ctx context.Context, botID int64) (s
 
 // StopBot tells the Poller to stop long-polling, then encrypts and persists the
 // final cursor returned by the Poller.
+// 行不存在(pgx.ErrNoRows)时仍必须转发给 Poller: 重新绑定已用新 bot_uuid 覆盖
+// bots 行(ON CONFLICT DO UPDATE), 旧 UUID 从 DB 消失但 Poller 侧旧会话仍在
+// 运行——不停止则旧会话继续推送 webhook(unknown bot / 双回复)。无行可持久化
+// cursor, 直接忽略返回值。
 func (s *botLifecycleService) StopBot(ctx context.Context, botUUID string) error {
 	bot, err := s.store.GetBotByUUID(ctx, botUUID)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			if _, stopErr := s.poller.StopBot(ctx, botUUID); stopErr != nil {
+				return fmt.Errorf("poller stop: %w", stopErr)
+			}
+			slog.WarnContext(ctx, "bot_lifecycle: stopped poller session for removed bot row",
+				"bot_uuid", botUUID)
+			return nil
+		}
 		return fmt.Errorf("resolve bot: %w", err)
 	}
 	resp, err := s.poller.StopBot(ctx, botUUID)
@@ -179,12 +191,20 @@ func (s *botLifecycleService) RestoreActiveBots(ctx context.Context) error {
 // PersistUpdatesBuf encrypts and stores the plaintext cursor pushed by the
 // Poller alongside an inbound message. Called by the IM webhook handler.
 // Empty buffer is a no-op (Poller has not advanced its cursor).
+// bot 行不存在(pgx.ErrNoRows)时返回 nil 而不是错误: 消息已被路由层永久拒绝
+// (unknown bot 僵尸会话), cursor 无处可存——若返回错误, webhook 回 503,
+// Poller 按契约每 60s 重试同一条消息, 用户每 60s 收到一条拒绝回复(无限循环)。
 func (s *botLifecycleService) PersistUpdatesBuf(ctx context.Context, botUUID, plaintextBuf string) error {
 	if plaintextBuf == "" {
 		return nil
 	}
 	bot, err := s.store.GetBotByUUID(ctx, botUUID)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			slog.WarnContext(ctx, "bot_lifecycle: skip cursor persist for unknown bot",
+				"bot_uuid", botUUID)
+			return nil
+		}
 		return fmt.Errorf("resolve bot: %w", err)
 	}
 	return s.persistCursor(ctx, bot.ID, plaintextBuf, "polling", "")

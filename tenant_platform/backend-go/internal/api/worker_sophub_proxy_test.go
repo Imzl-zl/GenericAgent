@@ -25,7 +25,7 @@ func newTestSophubProxy() *WorkerSophubProxy {
 		func(ctx context.Context, remoteID string) (domain.SophubRemoteSOP, error) {
 			return domain.SophubRemoteSOP{
 				ID: remoteID, Title: "SOP One", FileType: "markdown", Status: "approved",
-				PackageType: "single_file", IsPublic: true, Content: "# SOP\ncontent",
+				PackageType: "single_file", IsPublic: boolPtr(true), Content: "# SOP\ncontent",
 			}, nil
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
@@ -184,7 +184,7 @@ func TestWorkerSophubInstallContentTooLarge(t *testing.T) {
 		func(ctx context.Context, remoteID string) (domain.SophubRemoteSOP, error) {
 			return domain.SophubRemoteSOP{
 				ID: remoteID, FileType: "markdown", Status: "approved",
-				PackageType: "single_file", IsPublic: true, Content: big,
+				PackageType: "single_file", IsPublic: boolPtr(true), Content: big,
 			}, nil
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
@@ -236,3 +236,5 @@ func TestWorkerSophubInternalHandlerOnlyExposesSophubRoutes(t *testing.T) {
 		t.Fatal("nil proxy must yield nil handler")
 	}
 }
+
+func boolPtr(v bool) *bool { return &v }

@@ -117,6 +117,7 @@ func TestWorkerMCPForwardsJSONRPC(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer good-token")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("MCP-Protocol-Version", "2024-11-05")
+	req.Header.Set("Mcp-Session-Id", "sess-abc")
 	rec := httptest.NewRecorder()
 	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
 
@@ -138,6 +139,53 @@ func TestWorkerMCPForwardsJSONRPC(t *testing.T) {
 	}
 	if ct := gotHeaders.Get("Content-Type"); ct != "application/json" {
 		t.Errorf("upstream Content-Type = %q", ct)
+	}
+	// 会话头透传(回归: 曾因白名单缺失被剥掉, 导致 gateway 侧第二跳 400)。
+	if sid := gotHeaders.Get("Mcp-Session-Id"); sid != "sess-abc" {
+		t.Errorf("Mcp-Session-Id = %q, want sess-abc", sid)
+	}
+}
+
+// TestWorkerMCPForwardsSessionHeader: Mcp-Session-Id 请求头透传 + 响应头
+// 回传(Streamable HTTP 会话语义的完整往返)。
+func TestWorkerMCPForwardsSessionHeader(t *testing.T) {
+	var gotSession string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSession = r.Header.Get("Mcp-Session-Id")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Mcp-Session-Id", "new-sess-1")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`))
+	}))
+	defer upstream.Close()
+
+	proxy := NewWorkerMCPProxy(
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			return MCPTarget{URL: upstream.URL}, true, nil
+		},
+		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+			return llmproxy.CapabilityClaims{
+				Operation: "mcp", Budget: `{"max_turns":100}`,
+				RegisteredClaims: jwt.RegisteredClaims{
+					ID: "jti-1", Audience: jwt.ClaimStrings{llmproxy.MCPAudience},
+				},
+			}, nil
+		},
+		nil,
+	)
+	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0"}`))
+	req.Header.Set("Authorization", "Bearer good-token")
+	req.Header.Set("Mcp-Session-Id", "sess-abc")
+	rec := httptest.NewRecorder()
+	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if gotSession != "sess-abc" {
+		t.Fatalf("upstream Mcp-Session-Id = %q, want sess-abc", gotSession)
+	}
+	if sid := rec.Header().Get("Mcp-Session-Id"); sid != "new-sess-1" {
+		t.Fatalf("response Mcp-Session-Id = %q, want new-sess-1", sid)
 	}
 }
 

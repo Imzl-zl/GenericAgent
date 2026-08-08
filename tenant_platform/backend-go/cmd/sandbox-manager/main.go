@@ -30,7 +30,7 @@ import (
 func main() {
 	var (
 		dockerBinary       = flag.String("docker-binary", envOr("GA_DOCKER_BINARY", "docker"), "docker binary path")
-		image              = flag.String("runner-image", envOr("GA_RUNNER_IMAGE", "ga-runner:local"), "ga-runner image reference")
+		image              = flag.String("runner-image", envOr("GA_RUNNER_IMAGE", "genericagent-ga-runner:local"), "ga-runner image reference (compose/Makefile 统一 genericagent-* 前缀)")
 		network            = flag.String("runner-network", envOr("GA_RUNNER_NETWORK", "runner-control"), "docker network the runner joins (round11 M2: compose internal networks carry the project-name prefix)")
 		workspaces         = flag.String("workspaces-root", envOr("GA_WORKSPACES_ROOT", "/var/lib/ga/workspaces"), "daemon-visible root containing workspaces/<hash>/")
 		workspacesVolume   = flag.String("workspaces-volume", envOr("GA_WORKSPACES_VOLUME", ""), "named volume for workspaces (Compose); empty = bind mount from workspaces-root")
@@ -98,6 +98,21 @@ func main() {
 	})
 	if err != nil {
 		slog.Error("docker cli", "error", err)
+		os.Exit(2)
+	}
+
+	// 启动即校验镜像存在性(fail-fast): 配置漂移(GA_RUNNER_IMAGE 与本地
+	// 构建产物名不一致、镜像被清理)必须在启动时暴露, 而不是任务运行时
+	// 以 409 RUNNER_ENSURE_FAILED 形式出现。
+	if ok, err := cli.ImageExists(context.Background(), *image); err != nil {
+		slog.Error("check runner image", "error", err)
+		os.Exit(2)
+	} else if !ok {
+		avail, _ := cli.AvailableImages(context.Background(), "ga-runner")
+		slog.Error("runner image not found at startup",
+			"image", *image,
+			"available", avail,
+			"hint", "fix GA_RUNNER_IMAGE in .env, or run: make build && make runner-digest && docker compose up -d sandbox-manager")
 		os.Exit(2)
 	}
 	manager := sandbox.NewManager(sandbox.ManagerConfig{

@@ -48,7 +48,7 @@ func TestLoadRegistry_FoundationDigestAndResolve(t *testing.T) {
 	if pol.Version != "foundation.no-host-tools.v1" {
 		t.Fatalf("version=%q", pol.Version)
 	}
-	if len(pol.AllowedTools) != 1 || pol.AllowedTools[0] != "update_working_checkpoint" {
+	if len(pol.AllowedTools) != 2 || pol.AllowedTools[0] != "update_working_checkpoint" || pol.AllowedTools[1] != "mcp:*" {
 		t.Fatalf("allowed_tools=%v", pol.AllowedTools)
 	}
 }

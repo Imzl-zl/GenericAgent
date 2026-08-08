@@ -20,11 +20,18 @@ const (
 	qrRetryAttempts = 6
 	qrRetryBase     = 2 * time.Second
 
-	// GetQRCodeStatus is polled by the frontend every 1-2s, so retries must
+	// GetQRCodeStatus is polled by the frontend every ~3s, so retries must
 	// stay short: 3 attempts with 200ms+400ms backoff caps total wait under
-	// 1s. Network blips should not surface as "binding failed" to the user.
+	// 1s for fast-failing attempts. Network blips should not surface as
+	// "binding failed" to the user; long-poll timeouts are never retried
+	// (see isRetryableStatusErr).
 	qrStatusRetryAttempts   = 3
 	qrStatusRetryBaseDelay  = 200 * time.Millisecond
+	// iLink get_qrcode_status is a long-poll: while a QR awaits a scan it
+	// holds the connection (~30s) before returning "wait". The frontend polls
+	// every few seconds, so each attempt is capped short and a timeout is
+	// treated as "no change yet" (never retried — see isRetryableStatusErr).
+	qrStatusRequestTimeout = 8 * time.Second
 )
 
 // ClientConfig wires the iLink client.
@@ -37,6 +44,10 @@ type ClientConfig struct {
 	RetryAttempts int
 	// RetryBaseDelay is the linear backoff base per retry. Zero defaults to 2s.
 	RetryBaseDelay time.Duration
+	// StatusRequestTimeout caps each get_qrcode_status attempt. The endpoint
+	// long-polls while a QR awaits a scan, so a timeout is the steady state
+	// ("still waiting") and is never retried. Zero defaults to 8s.
+	StatusRequestTimeout time.Duration
 }
 
 // QRCodeResponse is returned by get_bot_qrcode.
@@ -108,6 +119,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: defaultTimeout}
+	}
+	if cfg.StatusRequestTimeout <= 0 {
+		cfg.StatusRequestTimeout = qrStatusRequestTimeout
 	}
 	if cfg.RetryAttempts <= 0 {
 		cfg.RetryAttempts = qrRetryAttempts
@@ -192,7 +206,12 @@ func (c *Client) GetQRCodeStatus(ctx context.Context, qrCode string) (QRCodeStat
 
 // doQRStatusRequest builds and sends one get_qrcode_status request.
 func (c *Client) doQRStatusRequest(ctx context.Context, url string) (QRCodeStatusResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// Bound each attempt: the status endpoint long-polls while the QR is
+	// waiting for a scan, so an attempt timeout is the expected steady state
+	// ("still waiting") rather than an error to escalate.
+	attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.StatusRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return QRCodeStatusResponse{}, fmt.Errorf("build request: %w", err)
 	}
@@ -215,6 +234,12 @@ func (c *Client) doQRStatusRequest(ctx context.Context, url string) (QRCodeStatu
 // != 0) are not, because the server has given an authoritative answer.
 func isRetryableStatusErr(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Long-poll timeout: expected while a QR awaits a scan. The poller re-
+	// checks on the next frontend poll, so this must not be retried (retrying
+	// would stack 8s attempts and blow past front-proxy timeouts).
+	if errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	var httpErr *httpStatusError

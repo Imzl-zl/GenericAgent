@@ -69,7 +69,12 @@ RETURNING id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ci
 }
 
 // GetBotByUUID returns the bot with the given bot_uuid.
+// 非法 UUID 格式直接按"不存在"返回: 否则 $1::uuid 强转产生 22P02 永久性
+// 错误, 会被 Router 当瞬态故障 5xx 重试, 永远无法收敛。
 func (s *Store) GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error) {
+	if _, err := uuid.Parse(botUUID); err != nil {
+		return domain.Bot{}, pgx.ErrNoRows
+	}
 	var b domain.Bot
 	err := scanBot(s.pool.QueryRow(ctx, `
 SELECT id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
@@ -115,7 +120,6 @@ WHERE ilink_user_id = $1 AND state = 'active'
 `, ilinkUserID), &b)
 	return b, err
 }
-
 
 // UpdateBotState transitions a bot's state.
 func (s *Store) UpdateBotState(ctx context.Context, botUUID string, state domain.BotState) error {

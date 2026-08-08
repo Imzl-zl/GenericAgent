@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/transport"
 )
@@ -143,18 +145,18 @@ type Router interface {
 }
 
 type router struct {
-	store          RouterStore
-	tasks          TaskService
-	transport      transport.BotTransportAdapter
-	commands       CommandRegistry
-	messages       MessageStore
-	sessionFiles   SessionFiles
-	teams          TeamService
-	relay          RelayService
+	store           RouterStore
+	tasks           TaskService
+	transport       transport.BotTransportAdapter
+	commands        CommandRegistry
+	messages        MessageStore
+	sessionFiles    SessionFiles
+	teams           TeamService
+	relay           RelayService
 	channelBindings ChannelBindingResolver
-	toolPolicy     string
-	sourceInstance string
-	botMediaRoot   string
+	toolPolicy      string
+	sourceInstance  string
+	botMediaRoot    string
 	// Trigger-invalidated cache for command registry. Admin update handlers
 	// call InvalidateCommandCache() after changing platform_commands.
 	cacheMu        sync.Mutex
@@ -177,18 +179,18 @@ func NewRouter(cfg RouterConfig) (Router, error) {
 		cfg.SourceInstance = "router"
 	}
 	return &router{
-		store:            cfg.Store,
-		tasks:            cfg.Tasks,
-		transport:        cfg.Transport,
-		commands:         cfg.Commands,
-		messages:         cfg.Messages,
-		sessionFiles:     cfg.SessionFiles,
-		teams:            cfg.Teams,
-		relay:            cfg.Relay,
-		channelBindings:  cfg.ChannelBindings,
-		toolPolicy:       cfg.ToolPolicy,
-		sourceInstance:   cfg.SourceInstance,
-		botMediaRoot:     cfg.BotMediaRoot,
+		store:           cfg.Store,
+		tasks:           cfg.Tasks,
+		transport:       cfg.Transport,
+		commands:        cfg.Commands,
+		messages:        cfg.Messages,
+		sessionFiles:    cfg.SessionFiles,
+		teams:           cfg.Teams,
+		relay:           cfg.Relay,
+		channelBindings: cfg.ChannelBindings,
+		toolPolicy:      cfg.ToolPolicy,
+		sourceInstance:  cfg.SourceInstance,
+		botMediaRoot:    cfg.BotMediaRoot,
 	}, nil
 }
 
@@ -271,11 +273,26 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	if seen {
 		return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
 	}
-	// Step 2: resolve bot identity.
+	// Step 2: resolve bot identity。区分"bot 不存在"(永久拒绝)与"查询失败"
+	// (瞬态, 如 DB 抖动): 旧实现把所有 GetBotByUUID 错误都当 unknown bot
+	// 消费——DB 故障时用户收到误导性回复且 webhook 回 200, Poller ack 后
+	// 消息永久丢失。Round8 原则: 中途失败必须返回 error → webhook 5xx →
+	// Poller 按契约重试(任务/消息行唯一键保证重试幂等)。
 	bot, err := r.store.GetBotByUUID(ctx, msg.BotUUID)
 	if err != nil {
-		reply := "unknown bot"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return RouterResult{}, fmt.Errorf("resolve bot: %w", err)
+		}
+		reply := "机器人未注册或已失效，请联系管理员"
+		slog.WarnContext(ctx, "router: rejected message from unknown bot",
+			"bot_uuid", msg.BotUUID,
+			"ilink_user_id", msg.IlinkUserID,
+			"message_id", msg.MessageID)
+		if sendErr := r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, ""); sendErr != nil {
+			slog.WarnContext(ctx, "router: send unknown-bot reply failed",
+				"bot_uuid", msg.BotUUID,
+				"error", sendErr)
+		}
 		return RouterResult{Action: ActionRejected, Reply: reply}, nil
 	}
 	// Step 2.5: DB 级幂等(round9 审查: 重启/多实例后内存 seen 缓存变冷,

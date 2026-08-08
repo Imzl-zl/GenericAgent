@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/ilink"
@@ -28,6 +31,17 @@ type WechatQRSessionStore interface {
 type BotQRStore interface {
 	CreateBotFromQRSession(ctx context.Context, sess domain.WechatQRSession, tokenKeyVersion int) (domain.Bot, error)
 	GetBoundBotByIlinkUser(ctx context.Context, ilinkUserID string) (domain.Bot, error)
+	GetBotByOwner(ctx context.Context, ownerID int64) (domain.Bot, error)
+}
+
+// StaleBotStopper 停止重新绑定前的旧 bot 轮询会话。重新扫码会生成全新
+// bot_uuid 并覆盖 bots 行(ON CONFLICT (owner_id) DO UPDATE), 旧 UUID 的
+// Poller 长轮询线程不会自动退出——不停止的话旧会话继续推送带旧 UUID 的
+// webhook, 平台查不到旧 UUID → 用户收到 unknown-bot 回复; 若 iLink 侧
+// bot_id 未变则新旧会话并存, 同一条消息被双会话轮询 → 双回复/cursor 竞争。
+// 由 cmd 层注入 bot lifecycle 实现; nil = 不停止(测试/无 Poller 环境)。
+type StaleBotStopper interface {
+	StopBot(ctx context.Context, botUUID string) error
 }
 
 // WechatQRBindingService manages official iLink QR-code binding.
@@ -42,13 +56,16 @@ type WechatQRBindingConfig struct {
 	BotStore    BotQRStore
 	ILinkClient *ilink.Client
 	Cipher      secret.TokenCipher
+	// StaleBots 停止重新绑定产生的旧会话(见 StaleBotStopper)。nil = 不停止。
+	StaleBots StaleBotStopper
 }
 
 type wechatQRBindingService struct {
-	store    WechatQRSessionStore
-	botStore BotQRStore
-	client   *ilink.Client
-	cipher   secret.TokenCipher
+	store     WechatQRSessionStore
+	botStore  BotQRStore
+	client    *ilink.Client
+	cipher    secret.TokenCipher
+	staleBots StaleBotStopper
 
 	// qrMu guards qrLocks. Each qr_code gets its own *sync.Mutex so concurrent
 	// polls of the same QR session are serialized: the first caller advances
@@ -73,11 +90,12 @@ func NewWechatQRBindingService(cfg WechatQRBindingConfig) (WechatQRBindingServic
 		return nil, errors.New("cipher is required")
 	}
 	return &wechatQRBindingService{
-		store:    cfg.Store,
-		botStore: cfg.BotStore,
-		client:   cfg.ILinkClient,
-		cipher:   cfg.Cipher,
-		qrLocks:  make(map[string]*sync.Mutex),
+		store:     cfg.Store,
+		botStore:  cfg.BotStore,
+		client:    cfg.ILinkClient,
+		cipher:    cfg.Cipher,
+		staleBots: cfg.StaleBots,
+		qrLocks:   make(map[string]*sync.Mutex),
 	}, nil
 }
 
@@ -141,6 +159,13 @@ func (s *wechatQRBindingService) PollStatus(ctx context.Context, qrCode string) 
 
 	statusResp, err := s.client.GetQRCodeStatus(ctx, qrCode)
 	if err != nil {
+		// The status endpoint long-polls while a QR awaits a scan; a timeout
+		// means "no change yet" (the client caps and does not retry it), so
+		// report the last-known DB status and let the frontend keep polling.
+		// Any other error is a real failure and is surfaced as-is.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return sess, domain.Bot{}, nil
+		}
 		return domain.WechatQRSession{}, domain.Bot{}, fmt.Errorf("ilink status: %w", err)
 	}
 	status := mapILinkStatus(statusResp.Status)
@@ -170,9 +195,30 @@ func (s *wechatQRBindingService) PollStatus(ctx context.Context, qrCode string) 
 		return domain.WechatQRSession{}, domain.Bot{}, fmt.Errorf("update session: %w", err)
 	}
 
+	// 重新绑定检测: 建新 bot 前捕获当前 owner 的旧 bot(若有)。重新扫码会
+	// 用 ON CONFLICT (owner_id) DO UPDATE 覆盖 bots 行并生成全新 bot_uuid,
+	// 覆盖后旧 UUID 无法再从 DB 查到——必须先取出来, 供随后停止旧 Poller
+	// 会话, 否则旧会话继续推送 → unknown bot / 双回复。
+	oldBot, oldErr := s.botStore.GetBotByOwner(ctx, sess.UserID)
+	if oldErr != nil && !errors.Is(oldErr, pgx.ErrNoRows) {
+		return domain.WechatQRSession{}, domain.Bot{}, fmt.Errorf("get existing bot: %w", oldErr)
+	}
+
 	bot, err := s.botStore.CreateBotFromQRSession(ctx, updated, version)
 	if err != nil {
 		return updated, domain.Bot{}, fmt.Errorf("create bot: %w", err)
+	}
+	// 换 UUID 重新绑定: best-effort 停止旧会话。失败不阻断绑定——新会话由
+	// handler 的 StartBotForBoundUser 启动, 停旧失败仅是短暂并存, 日志便于
+	// 暴露 Poller 异常。
+	if s.staleBots != nil && oldBot.BotUUID != "" && oldBot.BotUUID != bot.BotUUID {
+		if stopErr := s.staleBots.StopBot(ctx, oldBot.BotUUID); stopErr != nil {
+			slog.WarnContext(ctx, "wechat_binding: stop stale bot session failed",
+				"old_bot_uuid", oldBot.BotUUID,
+				"new_bot_uuid", bot.BotUUID,
+				"owner_user_id", sess.UserID,
+				"error", stopErr)
+		}
 	}
 	return updated, bot, nil
 }
