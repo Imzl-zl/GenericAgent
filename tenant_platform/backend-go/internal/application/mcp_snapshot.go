@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
+
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 type mcpSnapshotFingerprint struct {
@@ -29,17 +32,35 @@ func (s *scheduler) resolveMCPSnapshot(ctx context.Context) (RuntimeMCPSnapshot,
 	sort.Slice(servers, func(i, j int) bool { return servers[i].ID < servers[j].ID })
 	fingerprint := make([]mcpSnapshotFingerprint, 0, len(servers))
 	runtimeServers := make([]RuntimeMCPServer, 0, len(servers))
+	gatewayBase := strings.TrimRight(strings.TrimSpace(s.cfg.MCPGatewayBaseURL), "/")
 	for _, server := range servers {
 		if server.ID <= 0 || server.Revision <= 0 || !server.Enabled {
 			return RuntimeMCPSnapshot{}, fmt.Errorf("invalid enabled MCP server %d", server.ID)
+		}
+		transport := server.Transport
+		if transport == "" {
+			transport = domain.MCPTransportHTTP
+		}
+		url := strings.TrimSpace(server.URL)
+		if transport == domain.MCPTransportStdio {
+			// stdio 由 mcp-gateway 托管: 快照 URL 改写为 gateway 路由,
+			// server_key 即 gateway 的寻址键(白名单由 gateway 侧再查证)。
+			// gateway 未配置时 fail-closed 不下发该 server。
+			if gatewayBase == "" {
+				continue
+			}
+			url = gatewayBase + "/v1/mcp/" + server.ServerKey
 		}
 		fingerprint = append(fingerprint, mcpSnapshotFingerprint{
 			ID: server.ID, ServerID: server.ServerKey, Revision: server.Revision,
 		})
 		runtimeServers = append(runtimeServers, RuntimeMCPServer{
-			ServerID: server.ServerKey, Name: server.Name, URL: server.URL,
+			ServerID: server.ServerKey, Name: server.Name, URL: url,
 			TimeoutSeconds: server.TimeoutSeconds,
 		})
+	}
+	if len(runtimeServers) == 0 {
+		return disabledMCPSnapshot(), nil
 	}
 	encoded, err := json.Marshal(fingerprint)
 	if err != nil {

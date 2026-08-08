@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +12,7 @@ import (
 )
 
 const mcpServerColumns = `id, server_key, name, url, timeout_seconds,
+transport, command, args, isolation, max_instances,
 enabled, revision, created_at, updated_at`
 
 func (s *Store) CreateMCPServer(ctx context.Context, input domain.MCPServerCreate) (domain.MCPServer, error) {
@@ -19,11 +21,17 @@ func (s *Store) CreateMCPServer(ctx context.Context, input domain.MCPServerCreat
 		return domain.MCPServer{}, err
 	}
 	query := `INSERT INTO mcp_servers (
-		server_key, name, url, timeout_seconds
-	) VALUES ($1, $2, $3, $4) RETURNING ` + mcpServerColumns
+		server_key, name, url, timeout_seconds,
+		transport, command, args, isolation, max_instances
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING ` + mcpServerColumns
 	var server domain.MCPServer
-	err := scanMCPServer(s.pool.QueryRow(ctx, query,
+	argsJSON, err := marshalMCPArgs(input.Args)
+	if err != nil {
+		return domain.MCPServer{}, err
+	}
+	err = scanMCPServer(s.pool.QueryRow(ctx, query,
 		input.ServerKey, input.Name, input.URL, input.TimeoutSeconds,
+		input.Transport, mcpCommandParam(input), argsJSON, input.Isolation, input.MaxInstances,
 	), &server)
 	return server, classifyMCPServerStoreError(err)
 }
@@ -76,17 +84,32 @@ func (s *Store) UpdateMCPServer(ctx context.Context, id int64, input domain.MCPS
 		name = $3,
 		url = $4,
 		timeout_seconds = $5,
+		transport = $6,
+		command = $7,
+		args = $8,
+		isolation = $9,
+		max_instances = $10,
 		revision = revision + CASE WHEN
 			server_key IS DISTINCT FROM $2 OR
 			name IS DISTINCT FROM $3 OR
 			url IS DISTINCT FROM $4 OR
-			timeout_seconds IS DISTINCT FROM $5
+			timeout_seconds IS DISTINCT FROM $5 OR
+			transport IS DISTINCT FROM $6 OR
+			command IS DISTINCT FROM $7 OR
+			args IS DISTINCT FROM $8 OR
+			isolation IS DISTINCT FROM $9 OR
+			max_instances IS DISTINCT FROM $10
 		THEN 1 ELSE 0 END,
 		updated_at = NOW()
 	WHERE id = $1 RETURNING ` + mcpServerColumns
 	var server domain.MCPServer
-	err := scanMCPServer(s.pool.QueryRow(ctx, query,
+	argsJSON, err := marshalMCPArgs(input.Args)
+	if err != nil {
+		return domain.MCPServer{}, err
+	}
+	err = scanMCPServer(s.pool.QueryRow(ctx, query,
 		id, input.ServerKey, input.Name, input.URL, input.TimeoutSeconds,
+		input.Transport, mcpCommandParam(input.MCPServerCreate), argsJSON, input.Isolation, input.MaxInstances,
 	), &server)
 	return server, classifyMCPServerStoreError(err)
 }
@@ -127,7 +150,44 @@ func normalizeMCPServerInput(input domain.MCPServerCreate) domain.MCPServerCreat
 	input.ServerKey = strings.TrimSpace(input.ServerKey)
 	input.Name = strings.TrimSpace(input.Name)
 	input.URL = strings.TrimSpace(input.URL)
+	input.Transport = strings.TrimSpace(input.Transport)
+	if input.Transport == "" {
+		input.Transport = domain.MCPTransportHTTP
+	}
+	input.Command = strings.TrimSpace(input.Command)
+	input.Isolation = strings.TrimSpace(input.Isolation)
+	if input.Isolation == "" {
+		input.Isolation = domain.MCPIsolationShared
+	}
+	if input.MaxInstances == 0 {
+		input.MaxInstances = domain.DefaultMCPMaxInstances
+	}
 	return input
+}
+
+// marshalMCPArgs 把 args 编码为 JSONB; nil/空数组统一为 NULL。
+func marshalMCPArgs(args []string) ([]byte, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("marshal mcp args: %w", err)
+	}
+	return encoded, nil
+}
+
+// mcpCommandParam 返回写入 DB 的 command 值: http transport 必须为 NULL
+// (CHECK 约束), stdio 为白名单绝对路径。
+func mcpCommandParam(input domain.MCPServerCreate) any {
+	transport := input.Transport
+	if transport == "" {
+		transport = domain.MCPTransportHTTP
+	}
+	if transport != domain.MCPTransportStdio {
+		return nil
+	}
+	return input.Command
 }
 
 func classifyMCPServerStoreError(err error) error {
@@ -144,9 +204,25 @@ func classifyMCPServerStoreError(err error) error {
 }
 
 func scanMCPServer(row pgx.Row, server *domain.MCPServer) error {
-	return row.Scan(
-		&server.ID, &server.ServerKey, &server.Name, &server.URL,
-		&server.TimeoutSeconds, &server.Enabled, &server.Revision,
-		&server.CreatedAt, &server.UpdatedAt,
+	var (
+		argsJSON []byte
+		command  *string // http transport 的 command 列为 NULL
 	)
+	if err := row.Scan(
+		&server.ID, &server.ServerKey, &server.Name, &server.URL,
+		&server.TimeoutSeconds, &server.Transport, &command, &argsJSON,
+		&server.Isolation, &server.MaxInstances, &server.Enabled, &server.Revision,
+		&server.CreatedAt, &server.UpdatedAt,
+	); err != nil {
+		return err
+	}
+	if command != nil {
+		server.Command = *command
+	}
+	if len(argsJSON) > 0 {
+		if err := json.Unmarshal(argsJSON, &server.Args); err != nil {
+			return fmt.Errorf("unmarshal mcp args: %w", err)
+		}
+	}
+	return nil
 }

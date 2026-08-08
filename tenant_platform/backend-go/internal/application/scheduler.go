@@ -71,7 +71,11 @@ type SchedulerConfig struct {
 	// MCP 一律经 Platform 受控代理); 非空且 MCP 快照含 server 时下发
 	// _platform_mcp.proxy capability。
 	MCPProxyBaseURL string
-	ModelPolicyVersion        string
+	// MCPGatewayBaseURL 是 mcp-gateway 服务地址(stdio transport 专用):
+	// stdio server 的快照 URL 统一改写为 {base}/v1/mcp/{server_key},
+	// http server 保持真实 URL(阶段 1)。空值时 stdio server 不下发。
+	MCPGatewayBaseURL  string
+	ModelPolicyVersion string
 	// LLMProvider resolves an immutable provider routing snapshot per Worker.
 	LLMProvider LLMProviderSource
 	// MCPServer resolves the administrator-enabled global MCP catalog.
@@ -154,7 +158,7 @@ const (
 	DefaultStartSessionTimeout = 90 * time.Second
 	// workerControlTimeout 是控制 RPC(CancelTask/Shutdown)的单次超时:
 	// 卡住的控制调用不得长期占用 per-entry 锁阻塞同 session 后续派发。
-	workerControlTimeout = 30 * time.Second
+	workerControlTimeout  = 30 * time.Second
 	workerShutdownTimeout = defaultWorkerShutdownSecs * time.Second
 )
 
@@ -163,11 +167,11 @@ const (
 var ErrLeaseExpired = domain.ErrLeaseExpired
 
 type scheduler struct {
-	cfg    SchedulerConfig
-	mu     sync.Mutex
-	wake   chan struct{}
-	workers map[string]*workerEntry // session_key -> dedicated worker
-	cancelOnce sync.Map            // taskID -> *cancelCall
+	cfg        SchedulerConfig
+	mu         sync.Mutex
+	wake       chan struct{}
+	workers    map[string]*workerEntry // session_key -> dedicated worker
+	cancelOnce sync.Map                // taskID -> *cancelCall
 	// lastCheckpointSweep 记录上次 checkpoint 残留清理时间(节流, 审查 R4-I12)。
 	lastCheckpointSweep time.Time
 	// dispatchInFlight 是 dispatch goroutine 的进程内 in-flight gate
@@ -260,7 +264,6 @@ func NewScheduler(cfg SchedulerConfig) (Scheduler, error) {
 		workers: make(map[string]*workerEntry),
 	}, nil
 }
-
 
 func validateSchedulerCredentialTiming(cfg SchedulerConfig) error {
 	if cfg.MaxTaskWallClock <= 0 {

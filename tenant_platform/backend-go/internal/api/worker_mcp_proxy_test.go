@@ -17,14 +17,14 @@ import (
 // newTestMCPProxy 构造带内存 resolver + 固定 token 校验的测试代理。
 func newTestMCPProxy() *WorkerMCPProxy {
 	return NewWorkerMCPProxy(
-		func(ctx context.Context, serverID string) (string, bool, error) {
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
 			switch serverID {
 			case "exa":
-				return "https://mcp.exa.ai/mcp", true, nil
+				return MCPTarget{URL: "https://mcp.exa.ai/mcp"}, true, nil
 			case "disabled":
-				return "", false, nil
+				return MCPTarget{}, false, nil
 			default:
-				return "", false, nil
+				return MCPTarget{}, false, nil
 			}
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
@@ -98,8 +98,8 @@ func TestWorkerMCPForwardsJSONRPC(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := NewWorkerMCPProxy(
-		func(ctx context.Context, serverID string) (string, bool, error) {
-			return upstream.URL + "/mcp", true, nil
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			return MCPTarget{URL: upstream.URL + "/mcp"}, true, nil
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
 			return llmproxy.CapabilityClaims{
@@ -156,8 +156,8 @@ func TestWorkerMCPStreamsSSE(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := NewWorkerMCPProxy(
-		func(ctx context.Context, serverID string) (string, bool, error) {
-			return upstream.URL, true, nil
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			return MCPTarget{URL: upstream.URL}, true, nil
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
 			return llmproxy.CapabilityClaims{
@@ -185,8 +185,8 @@ func TestWorkerMCPStreamsSSE(t *testing.T) {
 
 func TestWorkerMCPBudgetExceeded(t *testing.T) {
 	proxy := NewWorkerMCPProxy(
-		func(ctx context.Context, serverID string) (string, bool, error) {
-			return "https://mcp.example.com/mcp", true, nil
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			return MCPTarget{URL: "https://mcp.example.com/mcp"}, true, nil
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
 			return llmproxy.CapabilityClaims{
@@ -209,5 +209,90 @@ func TestWorkerMCPBudgetExceeded(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	if body["code"] != "MCP_BUDGET_EXCEEDED" {
 		t.Fatalf("code field = %v, want MCP_BUDGET_EXCEEDED", body["code"])
+	}
+}
+
+// TestWorkerMCPStdioViaGateway: stdio transport 的请求发往 gateway 且携带
+// 内部 workspace 头(capability Subject); http transport 直连第三方时
+// 绝不含任何平台内部头(MCP_GATEWAY_DESIGN.zh-CN.md §3)。
+func TestWorkerMCPStdioViaGateway(t *testing.T) {
+	var gotWorkspace, gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotWorkspace = r.Header.Get(mcpWorkspaceHeader)
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}`))
+	}))
+	defer upstream.Close()
+
+	proxy := NewWorkerMCPProxy(
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			// stdio server 解析为 gateway 路由。
+			return MCPTarget{URL: upstream.URL + "/v1/mcp/pandoc", ViaGateway: true}, true, nil
+		},
+		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+			return llmproxy.CapabilityClaims{
+				Operation: "mcp", Budget: `{"max_turns":100}`,
+				RegisteredClaims: jwt.RegisteredClaims{
+					ID: "jti-1", Subject: "personal:42",
+					Audience: jwt.ClaimStrings{llmproxy.MCPAudience},
+				},
+			}, nil
+		},
+		nil,
+	)
+	req := httptest.NewRequest("POST", "/v1/worker/mcp/pandoc", strings.NewReader(`{"jsonrpc":"2.0"}`))
+	req.Header.Set("Authorization", "Bearer good-token")
+	rec := httptest.NewRecorder()
+	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if gotWorkspace != "personal:42" {
+		t.Fatalf("X-MCP-Workspace = %q, want personal:42", gotWorkspace)
+	}
+	if gotAuth != "" {
+		t.Fatalf("Authorization leaked upstream: %q", gotAuth)
+	}
+}
+
+// TestWorkerMCPHTTPNoInternalHeaders: http transport 直连第三方时不得携带
+// workspace 头(平台内部信息不外泄)。
+func TestWorkerMCPHTTPNoInternalHeaders(t *testing.T) {
+	var gotWorkspace string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotWorkspace = r.Header.Get(mcpWorkspaceHeader)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	proxy := NewWorkerMCPProxy(
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			return MCPTarget{URL: upstream.URL, ViaGateway: false}, true, nil
+		},
+		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+			return llmproxy.CapabilityClaims{
+				Operation: "mcp", Budget: `{"max_turns":100}`,
+				RegisteredClaims: jwt.RegisteredClaims{
+					ID: "jti-1", Subject: "personal:42",
+					Audience: jwt.ClaimStrings{llmproxy.MCPAudience},
+				},
+			}, nil
+		},
+		nil,
+	)
+	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer good-token")
+	rec := httptest.NewRecorder()
+	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if gotWorkspace != "" {
+		t.Fatalf("X-MCP-Workspace leaked to third party: %q", gotWorkspace)
 	}
 }

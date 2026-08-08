@@ -255,6 +255,12 @@ func sophubProxyBaseURL() string {
 	return strings.TrimSpace(os.Getenv("GA_SOPHUB_PROXY_ADDR"))
 }
 
+// mcpGatewayBaseURL 返回 mcp-gateway 服务地址(stdio transport 托管)。
+// 空值 = 未部署 gateway: stdio server 快照 fail-closed 不下发(http 不受影响)。
+func mcpGatewayBaseURL() string {
+	return strings.TrimSpace(os.Getenv("GA_MCP_GATEWAY_ADDR"))
+}
+
 // runnerLeaseReaper 周期清理本实例已过期的 Runner lease: 销毁 lease 记录的
 // 容器并释放 lease(方案 §7: 持久 lease 驱动的重启恢复/孤儿回收)。
 // Worker idle eviction 的正常路径由 scheduler cleanup 直接销毁容器。
@@ -769,6 +775,7 @@ func run() error {
 		LLMProxyAddr:          proxyAddr,
 		SophubProxyBaseURL:    sophubProxyBaseURL(),
 		MCPProxyBaseURL:       sophubProxyBaseURL(),
+		MCPGatewayBaseURL:     mcpGatewayBaseURL(),
 		TokenIssuer:           issuer,
 		CapabilityStore:       store,
 		Audit:                 store,
@@ -976,18 +983,24 @@ func run() error {
 			}
 			// round9 同款: MCP 调用在线联查 task/lease/成员状态。
 			mcpValidator.WithTaskChecker(store)
-			// server_id → URL 映射(启用中 server 即白名单)。
-			resolve := func(ctx context.Context, serverID string) (string, bool, error) {
+			// server_id → 目标映射(启用中 server 即白名单)。
+			// http transport 直连真实 URL; stdio transport 经 mcp-gateway
+			// 路由(ViaGateway, proxy 附加内部 workspace 头供隔离)。
+			resolve := func(ctx context.Context, serverID string) (api.MCPTarget, bool, error) {
 				servers, listErr := store.ListEnabledMCPServers(ctx)
 				if listErr != nil {
-					return "", false, listErr
+					return api.MCPTarget{}, false, listErr
 				}
 				for _, server := range servers {
 					if server.ServerKey == serverID {
-						return server.URL, true, nil
+						target := api.MCPTarget{URL: server.URL}
+						if server.Transport == domain.MCPTransportStdio {
+							target.ViaGateway = true
+						}
+						return target, true, nil
 					}
 				}
-				return "", false, nil
+				return api.MCPTarget{}, false, nil
 			}
 			return api.NewWorkerMCPProxy(
 				resolve,

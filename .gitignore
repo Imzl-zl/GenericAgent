@@ -180,3 +180,6 @@ tenant_platform/runtime/
 # ga-runner memory 模板基线已入库(由 scripts/build-memory-template.sh 生成,
 # 与上游 9355c22d7 对齐; 重新生成后必须与 git 基线 diff 校验)
 tenant_platform/infra/compose/memory-template/*.tmp
+
+# worker 集成测试哨兵(测试运行时生成, 不入库)
+.worker_itest_sentinel_do_not_commit

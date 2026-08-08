@@ -11,15 +11,26 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 )
 
+// MCPTarget 是 proxy 解析出的上游目标。
+// URL 为空字符串表示不存在; ViaGateway 为 true 时请求发往 mcp-gateway
+// (stdio transport 托管), 必须携带内部 workspace 头用于隔离路由。
+type MCPTarget struct {
+	URL        string
+	ViaGateway bool
+}
+
 // WorkerMCPProxy 是 Runner 经 Platform 的受控 MCP 代理(Runner 仅 internal
 // 网络, 无公网出口——外部 MCP Server 一律经此代理, 与 Sophub proxy 同模式):
 //   - Runner 不持有任何外部凭据, 只持有短期 capability JWT(audience=ga-mcp-proxy);
-//   - server_id → URL 的映射由 Platform 的启用中 MCP 表决定, 即白名单
-//     (管理员未启用的 server 一律 404);
+//   - server_id → 目标(URL 或 mcp-gateway 路由)的映射由 Platform 的启用中
+//     MCP 表决定, 即白名单(管理员未启用的 server 一律 404);
 //   - 调用按 JTI 原子计量(预算耗尽 429, 无预算 fail-closed 拒绝);
-//   - 仅转发 JSON-RPC 流(Streamable HTTP), 不缓存/不解析内容。
+//   - 仅转发 JSON-RPC 流(Streamable HTTP), 不缓存/不解析内容;
+//   - http transport 直连第三方; stdio transport 经 mcp-gateway(ViaGateway),
+//     此时附加内部头 X-MCP-Workspace(capability 的 SessionKey), 该头只发往
+//     平台自有 gateway, 绝不外泄给第三方 MCP Server。
 type WorkerMCPProxy struct {
-	resolve  func(ctx context.Context, serverID string) (string, bool, error)
+	resolve  func(ctx context.Context, serverID string) (MCPTarget, bool, error)
 	validate func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error)
 	consume  func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error)
 	client   *http.Client
@@ -28,7 +39,7 @@ type WorkerMCPProxy struct {
 // NewWorkerMCPProxy wires the proxy to the enabled-MCP resolver, token
 // validator and budget counter. consume 为 nil 时跳过计量(仅测试)。
 func NewWorkerMCPProxy(
-	resolve func(ctx context.Context, serverID string) (string, bool, error),
+	resolve func(ctx context.Context, serverID string) (MCPTarget, bool, error),
 	validate func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error),
 	consume func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error),
 ) *WorkerMCPProxy {
@@ -43,9 +54,9 @@ func NewWorkerMCPProxy(
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 				// 上游必须尽快开始响应; SSE 流式响应不受此限(头部到达即放行)。
-				TLSHandshakeTimeout: 10 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
-				IdleConnTimeout:      90 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
 			},
 		},
 	}
@@ -97,6 +108,10 @@ func writeMCPAuthFailure(w http.ResponseWriter, status int, tid string) {
 	}
 }
 
+// mcpWorkspaceHeader 是 proxy → mcp-gateway 的内部头(capability SessionKey),
+// 供 gateway 做 workspace 隔离路由; 只发往平台自有 gateway, 绝不出平台。
+const mcpWorkspaceHeader = "X-MCP-Workspace"
+
 // hop-by-hop 头不转发(HTTP/1.1 语义, 代理侧自管连接)。
 var mcpProxyHopHeaders = map[string]struct{}{
 	"Connection":          {},
@@ -113,7 +128,8 @@ var mcpProxyHopHeaders = map[string]struct{}{
 // JSON-RPC 请求体原样转发到已启用 MCP Server 的真实 URL, 响应(含 SSE)流式回传。
 func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
-	if _, status := p.authenticate(w, r); status != 0 {
+	claims, status := p.authenticate(w, r)
+	if status != 0 {
 		writeMCPAuthFailure(w, status, tid)
 		return
 	}
@@ -122,13 +138,19 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "MCP_SERVER_ID_REQUIRED", "server_id is required", tid)
 		return
 	}
-	upstreamURL, ok, err := p.resolve(r.Context(), serverID)
+	target, ok, err := p.resolve(r.Context(), serverID)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "mcp proxy: resolve failed", "server_id", serverID, "error", err)
 		writeErr(w, http.StatusServiceUnavailable, "MCP_RESOLVE_FAILED", "MCP server store unavailable", tid)
 		return
 	}
 	if !ok {
+		writeErr(w, http.StatusNotFound, "MCP_SERVER_NOT_FOUND", "MCP server is not enabled or does not exist", tid)
+		return
+	}
+
+	upstreamURL := strings.TrimSpace(target.URL)
+	if upstreamURL == "" {
 		writeErr(w, http.StatusNotFound, "MCP_SERVER_NOT_FOUND", "MCP server is not enabled or does not exist", tid)
 		return
 	}
@@ -145,6 +167,14 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	upstream.Header.Del("Authorization")
+	// stdio transport 经平台自有 mcp-gateway 路由: 附加内部 workspace 头
+	// (来自 capability Subject=session_key)供 gateway 做隔离路由。该头只发往
+	// gateway——平台自有服务, 不是第三方 MCP Server。
+	if target.ViaGateway {
+		if workspace := strings.TrimSpace(claims.Subject); workspace != "" {
+			upstream.Header.Set(mcpWorkspaceHeader, workspace)
+		}
+	}
 
 	resp, err := p.client.Do(upstream)
 	if err != nil {

@@ -11,10 +11,15 @@ import (
 )
 
 type mcpServerWriteBody struct {
-	ServerKey      string `json:"server_key"`
-	Name           string `json:"name"`
-	URL            string `json:"url"`
-	TimeoutSeconds int    `json:"timeout_seconds"`
+	ServerKey      string   `json:"server_key"`
+	Name           string   `json:"name"`
+	URL            string   `json:"url"`
+	TimeoutSeconds int      `json:"timeout_seconds"`
+	Transport      string   `json:"transport"`
+	Command        string   `json:"command"`
+	Args           []string `json:"args"`
+	Isolation      string   `json:"isolation"`
+	MaxInstances   int      `json:"max_instances"`
 }
 
 func (b *mcpServerWriteBody) normalize() error {
@@ -23,7 +28,9 @@ func (b *mcpServerWriteBody) normalize() error {
 	b.URL = strings.TrimSpace(b.URL)
 	return domain.ValidateMCPServerInput(domain.MCPServerCreate{
 		ServerKey: b.ServerKey, Name: b.Name, URL: b.URL,
-		TimeoutSeconds: b.TimeoutSeconds,
+		TimeoutSeconds: b.TimeoutSeconds, Transport: b.Transport,
+		Command: b.Command, Args: b.Args, Isolation: b.Isolation,
+		MaxInstances: b.MaxInstances,
 	})
 }
 
@@ -40,7 +47,9 @@ func (s *Server) handleAdminCreateMCPServer(w http.ResponseWriter, r *http.Reque
 	}
 	server, err := s.mcpServers.CreateMCPServer(r.Context(), domain.MCPServerCreate{
 		ServerKey: body.ServerKey, Name: body.Name, URL: body.URL,
-		TimeoutSeconds: body.TimeoutSeconds,
+		TimeoutSeconds: body.TimeoutSeconds, Transport: body.Transport,
+		Command: body.Command, Args: body.Args, Isolation: body.Isolation,
+		MaxInstances: body.MaxInstances,
 	})
 	if err != nil {
 		writeMCPStoreError(w, err, "MCP_SERVER_CREATE_FAILED", tid)
@@ -81,7 +90,9 @@ func (s *Server) handleAdminUpdateMCPServer(w http.ResponseWriter, r *http.Reque
 	server, err := s.mcpServers.UpdateMCPServer(r.Context(), id, domain.MCPServerUpdate{
 		MCPServerCreate: domain.MCPServerCreate{
 			ServerKey: body.ServerKey, Name: body.Name, URL: body.URL,
-			TimeoutSeconds: body.TimeoutSeconds,
+			TimeoutSeconds: body.TimeoutSeconds, Transport: body.Transport,
+			Command: body.Command, Args: body.Args, Isolation: body.Isolation,
+			MaxInstances: body.MaxInstances,
 		},
 	})
 	if err != nil {
@@ -147,15 +158,30 @@ func parseMCPServerID(w http.ResponseWriter, r *http.Request, tid string) (int64
 }
 
 func mcpServerReply(server domain.MCPServer) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"mcp_server_id":   server.ID,
 		"server_key":      server.ServerKey,
 		"name":            server.Name,
 		"url":             server.URL,
 		"timeout_seconds": server.TimeoutSeconds,
+		"transport":       server.Transport,
+		"command":         server.Command,
+		"args":            server.Args,
+		"isolation":       server.Isolation,
+		"max_instances":   server.MaxInstances,
 		"enabled":         server.Enabled,
 		"revision":        server.Revision,
 		"created_at":      server.CreatedAt.UTC().Format(time.RFC3339),
 		"updated_at":      server.UpdatedAt.UTC().Format(time.RFC3339),
 	}
+	if out["transport"] == "" {
+		out["transport"] = domain.MCPTransportHTTP
+	}
+	if out["isolation"] == "" {
+		out["isolation"] = domain.MCPIsolationShared
+	}
+	if out["max_instances"] == 0 {
+		out["max_instances"] = domain.DefaultMCPMaxInstances
+	}
+	return out
 }
