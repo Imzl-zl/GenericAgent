@@ -58,10 +58,12 @@
 
 ## 镜像打包（compose）
 
-- 唯一部署入口：`tenant_platform/infra/compose/`（compose.yaml + 6 个 Dockerfile + Makefile + .env 模板）。文档：`compose/README.zh-CN.md`。
+- 唯一部署入口：`tenant_platform/infra/compose/`（compose.yaml + 7 个 Dockerfile + Makefile + .env 模板）。文档：`compose/README.zh-CN.md`。
 - 打包命令（在 compose 目录）：`make build`（全量构建，tag = `:local` + `:$(git describe)`）；`make push REGISTRY=host/ga` / `make pull REGISTRY=host/ga VERSION=x`（registry 流转）；`make runner-digest`（输出生产 `GA_RUNNER_IMAGE=ga-runner@sha256:...` 供 .env）；`make verify`（compose config 校验）。
+- **镜像 tag 名必须与 .env.example 的 `GA_*_IMAGE` 对齐**：Dockerfile 文件名（platform）≠ 镜像名（genericagent-platform），ga-runner 例外（无前缀）。Makefile 已按此映射打 tag（2026-08-08 修复）；手工 `docker build` 时按同样映射，否则 compose 静默用旧镜像（服务器曾踩：构建成功但容器一直跑旧 genericagent-*:local）。
 - 构建上下文 = 仓库根；Makefile `ROOT := $(abspath ../../..)`，不要改层级。
 - 生产模板 `.env.example` fail-closed：`GA_RUNNER_IMAGE` 必须 digest 引用 + `GA_RUNNER_SECURITY_PROFILE=runsc`；本地开发用 `.env.example.dev`（允许 tag + runc）。
+- 服务器（2026-08-08 部署）无 make 命令：`sudo apt-get install -y make` 后走正规流程；等价手动命令见 memory/archive/2026-08.md。
 
 ## 2026-08-06 补充坑点
 
