@@ -103,7 +103,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       BOT_TOKEN_KEY: ${BOT_TOKEN_KEY}
-      # 微信绑定(iLink)开关: 空值 = 禁用微信 QR 绑定路由(注册时会 404)。
+      # 微信绑定(iLink)开关: 空值 = 路由仍注册但返回 501 FEATURE_DISABLED。
       # 官方网关 https://ilinkai.weixin.qq.com (与 GA Core wxbot_client 一致);
       # 自建 iLink 网关可覆盖。启用时要求 BOT_TOKEN_KEY 非空。
       ILINK_BASE_URL: ${ILINK_BASE_URL:-}
@@ -136,7 +136,7 @@ services:
       GA_WORKSPACES_ROOT: /var/lib/ga/workspaces
       GA_MANAGER_ADDR: ${GA_MANAGER_ADDR:-http://sandbox-manager:8091}
       GA_MANAGER_SECRET: ${GA_MANAGER_SECRET}
-      GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
+      GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-genericagent-ga-runner:local}
       GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
       GA_SOPHUB_PROXY_ADDR: ${GA_SOPHUB_PROXY_ADDR:-http://platform:8082}
       # MCP Gateway(stdio transport 托管): 空值 = 未部署, stdio server 不下发。
@@ -267,7 +267,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-ga-runner:local}
+      GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-genericagent-ga-runner:local}
       # round11 M2: 内部网络带项目名前缀, manager 必须按实际网络名创建 Runner。
       GA_RUNNER_NETWORK: ${GA_RUNNER_NETWORK:-${COMPOSE_PROJECT_NAME:-ga}_runner-control}
       # fail-closed(审查): 默认拒绝可变 tag。本地开发需在 .env 显式设
@@ -407,8 +407,11 @@ services:
   # ga-runner 镜像构建入口(方案 §8): scale: 0 使 `docker compose up -d --build`
   # 构建镜像但不启动容器(审查: 单命令部署必须包含 Runner 镜像构建)。
   # 容器实例由 Sandbox Manager 按工作区活跃状态动态创建。
+  # image 固定为构建产物名(与 Makefile 一致, genericagent-* 前缀), 与运行时
+  # 引用解耦: 运行时镜像由 GA_RUNNER_IMAGE 控制(digest 模式不会让 compose
+  # build 把 digest 当 tag——历史坑)。
   ga-runner:
-    image: ${GA_RUNNER_IMAGE:-ga-runner:local}
+    image: genericagent-ga-runner:local
     build:
       context: ../../..
       dockerfile: tenant_platform/infra/compose/ga-runner.Dockerfile

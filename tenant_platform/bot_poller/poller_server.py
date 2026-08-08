@@ -150,7 +150,10 @@ def _can_coalesce(previous, current, window_ms):
         return False
     previous_at = int(previous.get('_received_at_ms') or 0)
     current_at = int(current.get('_received_at_ms') or 0)
-    return current_at >= previous_at and current_at - previous_at <= window_ms
+    # 时间接近即合并(窗口语义), 不要求严格递增: 微信"文件+文字"同时发送时,
+    # iLink 批次内顺序与 create_time 顺序可能相反(文件上传耗时), 严格递增
+    # 会把同一发送动作拆成两个任务(用户侧表现为"回复两个")。
+    return abs(current_at - previous_at) <= window_ms
 
 
 def _finalize_coalesced_group(group):

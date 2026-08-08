@@ -1,6 +1,6 @@
 # GenericAgent 完整 Docker Compose 部署
 
-这是平台唯一保留的部署方式：一个 `compose.yaml` 编排全部服务，一个 `.env` 放全部配置。`docker compose up -d --build` 会启动六个常驻服务：Web、Platform、Bot Poller、PostgreSQL、Sandbox Manager 与内部 LLM Proxy。GA Runner 不是常驻服务，由 Sandbox Manager 按工作区活跃状态动态创建。
+这是平台唯一保留的部署方式：一个 `compose.yaml` 编排全部服务，一个 `.env` 放全部配置。`docker compose up -d --build` 会启动七个常驻服务：Web、Platform、Bot Poller、PostgreSQL、Sandbox Manager、内部 LLM Proxy 与 MCP Gateway（stdio 工具宿主，见 `MCP_GATEWAY_DESIGN.zh-CN.md`）。GA Runner 不是常驻服务，由 Sandbox Manager 按工作区活跃状态动态创建。
 
 > 本部署对应 [GA Sandbox Runner 重构方案](../../docs/GA_SANDBOX_RUNNER_REFACTOR.zh-CN.md) 的最终形态：渠道身份绑定 → 个人/团队工作区 → 每工作区唯一隔离 Runner。
 

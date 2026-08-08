@@ -29,6 +29,26 @@ RUN groupadd --system --gid 10002 ga-runner \
     && useradd --system --uid 10002 --gid 10002 --no-create-home ga-runner
 
 # worker-python + 文档工具链(DOCX/PDF/XLSX 是镜像能力,不再走文档专用 RPC)。
+# 工具链决策(2026-08-08, 按官方能力对比):
+#   - pandoc 3.8.3 官方二进制: Debian apt 只有 2.17, 而官方 3.8 起新增
+#     xlsx/pptx/asciidoc 输入格式(官方 changelog); 官方 tar.gz 含全部引擎。
+#   - LibreOffice headless: 唯一支持 .doc/.xls 老格式的轻量方案, 且
+#     docx→pdf 为渲染式高保真转换(格式不乱), 官方 pandoc 的 pdf 输出
+#     需要额外 pdf-engine(默认 pdflatex 未装)。
+#   - fonts-noto-cjk: 中文渲染必需(weasyprint/LaTeX/LibreOffice 均依赖
+#     系统字体, 默认 DejaVu 无 CJK)。
+# 勿恢复 MCP pandoc: stdio server 与 runner 工作区文件系统隔离(2026-08-08)。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libreoffice-writer libreoffice-calc \
+        fonts-noto-cjk \
+        ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+# pandoc 官方二进制(apt 版 2.17 无 xlsx 输入; 3.8+ 官方支持)。
+RUN curl -fsSL -o /tmp/pandoc.tar.gz \
+        https://github.com/jgm/pandoc/releases/download/3.8.3/pandoc-3.8.3-linux-amd64.tar.gz \
+    && tar -xzf /tmp/pandoc.tar.gz -C /usr/local --strip-components=1 \
+    && rm /tmp/pandoc.tar.gz
 COPY tenant_platform/worker-python/pyproject.toml /tmp/worker/pyproject.toml
 COPY tenant_platform/worker-python/src/ /tmp/worker/src/
 RUN pip install --no-cache-dir /tmp/worker \

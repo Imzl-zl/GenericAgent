@@ -419,3 +419,39 @@ def test_http_hides_internal_error_details():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_coalesces_out_of_order_timestamps_in_same_batch():
+    """审查回归: 微信"文件+文字"一起发送时, iLink 同一批次内消息的时间戳
+    可能乱序(文件 create_time 晚于文字, 但返回顺序文字在前或反之)。
+    _can_coalesce 曾要求 current_at >= previous_at(严格递增), 乱序时拒绝
+    合并 → 文件/文字各成一个任务(用户侧表现为"回复两个")。窗口语义应是
+    时间接近即合并, 不要求顺序。"""
+    buffer = poller_server.InboundCoalescingBuffer(window_ms=2500)
+    # 模拟真实时序: 文字 create_time=1000, 文件 create_time=1765(差 765ms < 窗口),
+    # 同一批次内按 [text, file] 顺序 push(与 iLink 返回顺序一致)。
+    ready = buffer.push([
+        _body("m1", "这个文档排版美观点转成word 给我", at_ms=1000),
+        _body("m2", at_ms=1765, media="b1/resume.docx"),
+    ], now_ms=1765)
+    ready += buffer.flush_due(now_ms=10000)
+
+    assert len(ready) == 1, f"out-of-order timestamps must still coalesce, got {len(ready)}"
+    assert ready[0]["message_id"].startswith("coalesced:")
+    assert ready[0]["text"] == "这个文档排版美观点转成word 给我"
+    assert ready[0]["media_paths"] == ["b1/resume.docx"]
+
+
+def test_coalesces_reversed_batch_order():
+    """同窗口内 iLink 返回顺序与时间戳顺序相反(文件在前文字在后)。"""
+    buffer = poller_server.InboundCoalescingBuffer(window_ms=2500)
+    ready = buffer.push([
+        _body("m2", at_ms=1765, media="b1/resume.docx"),
+        _body("m1", "整理一下", at_ms=1000),
+    ], now_ms=1765)
+    ready += buffer.flush_due(now_ms=10000)
+
+    assert len(ready) == 1, f"reversed order must still coalesce, got {len(ready)}"
+    assert ready[0]["message_id"].startswith("coalesced:")
+    assert ready[0]["media_paths"] == ["b1/resume.docx"]
+    assert ready[0]["text"] == "整理一下"

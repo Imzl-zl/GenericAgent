@@ -25,6 +25,7 @@ Thumbs.db
 
 *.log
 .env
+.env.bak*
 auth.json
 model_responses.txt
 

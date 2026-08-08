@@ -744,6 +744,26 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/SophubInstallResult"}
         "401": {$ref: "#/components/responses/Unauthorized"}
+  # 内部 listener 专用路由(不进主 listener): Runner 经 Platform 受控 MCP
+  # proxy 访问外部 MCP Server(server_id → 目标映射即白名单, capability 鉴权)。
+  /v1/worker/mcp/{server_id}:
+    post:
+      operationId: workerMCPServe
+      summary: Forward JSON-RPC to an enabled MCP server on behalf of a Runner
+      tags: [worker, mcp]
+      security:
+        - BearerToken: []
+      parameters:
+        - {name: server_id, in: path, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: MCP JSON-RPC response(含 SSE)
+          content:
+            application/json:
+              schema: {type: object}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "429": {$ref: "#/components/responses/TooManyRequests"}
   /v1/admin/dashboard/stats:
     get:
       security:
@@ -1924,12 +1944,22 @@ components:
     MCPServer:
       type: object
       additionalProperties: false
-      required: [mcp_server_id, server_key, name, url, timeout_seconds, enabled, revision, created_at, updated_at]
+      required: [mcp_server_id, server_key, name, transport, timeout_seconds, enabled, revision, created_at, updated_at]
       properties:
         mcp_server_id: {type: integer, format: int64, minimum: 1}
         server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
         name: {type: string, minLength: 1}
-        url: {type: string, format: uri}
+        # transport=http: url 必填(第三方 Streamable HTTP 地址);
+        # transport=stdio: url 恒为空(gateway 路由由平台合成, 见
+        # MCP_GATEWAY_DESIGN.zh-CN.md)。
+        transport: {type: string, enum: [http, stdio]}
+        url: {type: string, format: uri, nullable: true}
+        # stdio 专用: 镜像预装工具集白名单绝对路径(/opt/mcp-tools/ 前缀)。
+        command: {type: string, nullable: true}
+        args: {type: array, items: {type: string}, nullable: true}
+        # v1 仅支持 shared(无状态无凭据工具跨租户共享进程)。
+        isolation: {type: string, enum: [shared, workspace]}
+        max_instances: {type: integer, minimum: 1, maximum: 16}
         timeout_seconds: {type: integer, minimum: 1, maximum: 300}
         enabled: {type: boolean}
         revision: {type: integer, format: int64, minimum: 1}
@@ -1938,20 +1968,31 @@ components:
     CreateMCPServerRequest:
       type: object
       additionalProperties: false
-      required: [server_key, name, url, timeout_seconds]
+      required: [server_key, name, transport, timeout_seconds]
       properties:
         server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
         name: {type: string, minLength: 1}
+        # http 必填; stdio 必须省略(为空)。
         url: {type: string, format: uri}
+        transport: {type: string, enum: [http, stdio]}
+        command: {type: string}
+        args: {type: array, items: {type: string}}
+        isolation: {type: string, enum: [shared, workspace]}
+        max_instances: {type: integer, minimum: 1, maximum: 16}
         timeout_seconds: {type: integer, minimum: 1, maximum: 300}
     UpdateMCPServerRequest:
       type: object
       additionalProperties: false
-      required: [server_key, name, url, timeout_seconds]
+      required: [server_key, name, transport, timeout_seconds]
       properties:
         server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
         name: {type: string, minLength: 1}
         url: {type: string, format: uri}
+        transport: {type: string, enum: [http, stdio]}
+        command: {type: string}
+        args: {type: array, items: {type: string}}
+        isolation: {type: string, enum: [shared, workspace]}
+        max_instances: {type: integer, minimum: 1, maximum: 16}
         timeout_seconds: {type: integer, minimum: 1, maximum: 300}
     CreateLLMProviderRequest:
       type: object
