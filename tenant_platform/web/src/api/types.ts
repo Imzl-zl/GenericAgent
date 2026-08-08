@@ -16,6 +16,13 @@ export interface RegisterResponse extends User {
   token: string;
 }
 
+/** GET /v1/users/me 响应：当前用户实时状态 */
+export interface MeResponse {
+  user_id: number;
+  username: string;
+  status: 'pending' | 'approved' | 'blocked';
+}
+
 export interface InviteCode {
   code: string;
   state: 'active' | 'used' | 'revoked' | 'expired';
@@ -99,7 +106,14 @@ export interface MCPServer {
   mcp_server_id: number;
   server_key: string;
   name: string;
-  url: string;
+  /** transport=http 时为第三方地址; transport=stdio 时为空(gateway 路由由平台合成) */
+  url: string | null;
+  transport: 'http' | 'stdio';
+  /** stdio 专用: 镜像预装工具集白名单绝对路径 */
+  command: string | null;
+  args: string[] | null;
+  isolation: 'shared' | 'workspace';
+  max_instances: number;
   timeout_seconds: number;
   enabled: boolean;
   revision: number;

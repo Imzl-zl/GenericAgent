@@ -5,10 +5,6 @@ import {
   ShieldCheck,
   QrCode,
   MessageCircle,
-  Shield,
-  Users,
-  Ticket,
-  Cpu,
   Terminal,
   Smartphone,
   Lock,
@@ -43,29 +39,6 @@ const userSteps = [
     icon: MessageCircle,
     title: '开始对话',
     body: '创建或选择人设后，在微信中直接发送消息，Agent 会通过官方协议接收并回复。',
-  },
-];
-
-const adminSteps = [
-  {
-    icon: Shield,
-    title: '运营者登录',
-    body: '通过部署者提供的独立运营后台入口登录，使用部署时设置的 PLATFORM_ADMIN_TOKEN 进入控制台。',
-  },
-  {
-    icon: Users,
-    title: '审批用户',
-    body: '在“用户审批”页查看待批准用户，点击“批准”激活账号；也可对已批准用户进行封禁。',
-  },
-  {
-    icon: Ticket,
-    title: '管理邀请码',
-    body: '在“邀请码”页生成一次性邀请码，复制给用户，或撤销未使用的邀请码。',
-  },
-  {
-    icon: Cpu,
-    title: '配置 Provider',
-    body: '在“LLM 供应”页添加上游模型（OpenAI 兼容或 Anthropic），设置默认 Provider 并加密存储 API Key。',
   },
 ];
 
@@ -207,26 +180,6 @@ export function DocsPage() {
         />
         <div className="docs-timeline">
           {userSteps.map((step, idx) => (
-            <div key={step.title} className="docs-step">
-              <div className="docs-step-number">{idx + 1}</div>
-              <div className="docs-step-icon">
-                <step.icon size={22} strokeWidth={1.5} />
-              </div>
-              <h3>{step.title}</h3>
-              <p>{step.body}</p>
-            </div>
-          ))}
-        </div>
-      </RevealSection>
-
-      <RevealSection className="docs-section">
-        <SectionHeader
-          icon={Shield}
-          title="运营者指南"
-          subtitle="管理用户、邀请码、模型供应和人设审核"
-        />
-        <div className="docs-timeline">
-          {adminSteps.map((step, idx) => (
             <div key={step.title} className="docs-step">
               <div className="docs-step-number">{idx + 1}</div>
               <div className="docs-step-icon">

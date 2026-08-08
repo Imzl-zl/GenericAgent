@@ -45,16 +45,9 @@ export function BindingPage() {
       });
     return () => {
       active = false;
-      clearInterval(pollRef.current ?? undefined);
+      clearTimeout(pollRef.current ?? undefined);
     };
   }, []);
-
-  const stopPolling = () => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  };
 
   const startPolling = (qrcodeToken: string) => {
     stopPolling();
@@ -66,18 +59,29 @@ export function BindingPage() {
           : await getWechatQRCodeStatus(qrcodeToken);
         setStatus(s);
         if (s.status === 'confirmed' || s.status === 'expired') {
-          stopPolling();
+          return; // 结束轮询（不排下一轮）
         }
         if (s.bound && s.bot) {
           setBoundBot(s.bot);
         }
       } catch (err) {
-        setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '轮询状态失败');
-        stopPolling();
+        // 单次轮询失败不能停止：confirmed 只在这一刻可捕捉，错过即永久
+        // 丢失（平台无后端兜底）。继续轮询直到 expired/confirmed。
+        setError(bindingErrorText(err, '轮询状态失败'));
+      }
+      // 串行轮询：等上一轮完成后再隔 3s 排下一轮（避免并发堆积）
+      if (pollRef.current) {
+        pollRef.current = setTimeout(tick, POLL_INTERVAL_MS);
       }
     };
-    tick();
-    pollRef.current = setInterval(tick, POLL_INTERVAL_MS);
+    pollRef.current = setTimeout(tick, 0);
+  };
+
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearTimeout(pollRef.current);
+      pollRef.current = null;
+    }
   };
 
   const handleGenerate = async () => {
@@ -94,10 +98,20 @@ export function BindingPage() {
       setQr(code);
       startPolling(code.qrcode_token);
     } catch (err) {
-      setError(err instanceof ApiClientError ? `${err.code}: ${err.message}` : '获取微信二维码失败');
+      setError(bindingErrorText(err, '获取微信二维码失败'));
     } finally {
       setIsGenerating(false);
     }
+  };
+
+  const bindingErrorText = (err: unknown, fallback: string) => {
+    if (err instanceof ApiClientError) {
+      if (err.code === 'FEATURE_DISABLED') {
+        return '微信绑定功能未启用（未配置 iLink，请联系管理员）';
+      }
+      return `${err.code}: ${err.message}`;
+    }
+    return fallback;
   };
 
   const formatExpiry = (s: string) => {
@@ -211,6 +225,11 @@ export function BindingPage() {
                   </Badge>
                 </div>
               )}
+              {(status?.status === 'scaned' || status?.status === 'scaned_but_redirect') && (
+                <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-muted)' }}>
+                  已扫码！请在微信中确认授权，并保持本页面打开等待绑定完成
+                </p>
+              )}
               <Button type="button" variant="secondary" onClick={handleGenerate} isLoading={isGenerating}>
                 <RefreshCw size={16} />
                 重新获取
@@ -234,7 +253,7 @@ export function BindingPage() {
             <li>点击左侧按钮，获取微信官方二维码</li>
             <li>打开微信，使用“扫一扫”扫描页面二维码</li>
             <li>在微信中点击确认授权</li>
-            <li>页面自动检测绑定结果，成功后即可开始对话</li>
+            <li>保持本页面打开，自动检测绑定结果，成功后即可开始对话</li>
           </ol>
           <div className="binding-command" style={{ marginTop: '20px' }}>
             <div className="metric-label" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>

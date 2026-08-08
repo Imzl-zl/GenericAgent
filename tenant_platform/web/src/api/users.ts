@@ -1,5 +1,10 @@
-import { api } from './client';
-import type { User } from './types';
+import { api, userApi } from './client';
+import type { MeResponse, User } from './types';
+
+/** 当前登录用户实时状态（审批后刷新用，userAuth 保护） */
+export async function getMe(): Promise<MeResponse> {
+  return userApi.get<MeResponse>('/v1/users/me');
+}
 
 interface PendingListResponse { users: User[] }
 

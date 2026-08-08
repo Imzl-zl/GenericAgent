@@ -8,7 +8,14 @@ interface MCPServerListResponse {
 export interface MCPServerWriteInput {
   server_key: string;
   name: string;
-  url: string;
+  transport: 'http' | 'stdio';
+  /** http 必填; stdio 必须为空 */
+  url?: string;
+  /** stdio 专用: /opt/mcp-tools/ 白名单绝对路径 */
+  command?: string;
+  args?: string[];
+  isolation?: 'shared' | 'workspace';
+  max_instances?: number;
   timeout_seconds: number;
 }
 

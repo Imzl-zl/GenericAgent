@@ -1,10 +1,24 @@
+import { useEffect } from 'react';
 import { Card } from '../../components/ui/Card';
 import { Badge } from '../../components/ui/Badge';
 import { useAuth } from '../../contexts/AuthContext';
 import './UserPages.css';
 
 export function DashboardPage() {
-  const { state } = useAuth();
+  const { state, refreshStatus } = useAuth();
+
+  // 管理员审批通过后，登录时缓存的状态快照已过期——挂载时从后端拉取
+  // 实时状态，避免页面一直显示"待批准"直到重新登录。
+  // 待批准状态下轻量轮询：审批通过后页面自动更新，无需手动刷新。
+  useEffect(() => {
+    refreshStatus().catch(() => undefined);
+    if (state?.status !== 'approved') {
+      const timer = window.setInterval(() => {
+        refreshStatus().catch(() => undefined);
+      }, 20000);
+      return () => window.clearInterval(timer);
+    }
+  }, [refreshStatus, state?.status]);
 
   // 审查 F5: 普通用户 Dashboard 不再调用管理员 /v1/admin/users/pending
   // (必然 401)。当前用户状态直接来自登录/注册响应(AuthContext), 由后端
