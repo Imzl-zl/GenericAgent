@@ -17,27 +17,28 @@ import (
 
 // fakeRouterStore is an in-memory RouterStore for router tests.
 type fakeRouterStore struct {
-	bots        map[string]domain.Bot // botUUID → bot
+	bots        map[string]domain.ChannelConfig // botUUID → bot
 	statuses    map[int64]domain.UserStatus
 	runningTask *domain.Task
 	findTaskErr error
 	getBotErr   error
+	resetKeys   []string // /new 桶级 reset 记录(conversation_key)
 }
 
 func newFakeRouterStore() *fakeRouterStore {
 	return &fakeRouterStore{
-		bots:     make(map[string]domain.Bot),
+		bots:     make(map[string]domain.ChannelConfig),
 		statuses: make(map[int64]domain.UserStatus),
 	}
 }
 
-func (f *fakeRouterStore) GetBotByUUID(_ context.Context, botUUID string) (domain.Bot, error) {
+func (f *fakeRouterStore) GetChannelConfigByUUID(_ context.Context, botUUID string) (domain.ChannelConfig, error) {
 	if f.getBotErr != nil {
-		return domain.Bot{}, f.getBotErr
+		return domain.ChannelConfig{}, f.getBotErr
 	}
 	b, ok := f.bots[botUUID]
 	if !ok {
-		return domain.Bot{}, pgx.ErrNoRows
+		return domain.ChannelConfig{}, pgx.ErrNoRows
 	}
 	return b, nil
 }
@@ -60,7 +61,8 @@ func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string, 
 	return *f.runningTask, nil
 }
 
-func (f *fakeRouterStore) ResetWorkspaceForNewSession(_ context.Context, _ string, _ string) (int, error) {
+func (f *fakeRouterStore) ResetWorkspaceForNewSession(_ context.Context, _ string, conversationKey string) (int, error) {
+	f.resetKeys = append(f.resetKeys, conversationKey)
 	return 0, nil
 }
 
@@ -96,7 +98,7 @@ func (f *fakeTaskService) SubmitTask(_ context.Context, cmd domain.SubmitTaskCom
 	if f.submitErr != nil {
 		return domain.Task{}, f.submitErr
 	}
-	f.submittedTask = domain.Task{ID: "task-fake", SessionKey: cmd.SessionKey, Prompt: cmd.Prompt, Source: cmd.Source, ToolPolicyVersion: cmd.ToolPolicyVersion, Status: domain.TaskQueued}
+	f.submittedTask = domain.Task{ID: "task-fake", SessionKey: cmd.SessionKey, Prompt: cmd.Prompt, Source: cmd.Source, ConversationKey: cmd.ConversationKey, ToolPolicyVersion: cmd.ToolPolicyVersion, Status: domain.TaskQueued}
 	return f.submittedTask, nil
 }
 
@@ -168,12 +170,12 @@ func TestRouterUnknownBotDoesNotConsumeIdempotency(t *testing.T) {
 	store := newFakeRouterStore()
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
-	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}
+	msg := IncomingMessage{BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello", ChannelType: "wechat"}
 	if _, err := r.HandleMessage(context.Background(), msg); err != nil {
 		t.Fatal(err)
 	}
 	// bot 恢复后, 同消息重试必须真正处理(而非被幂等缓存挡住)。
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	res, err := r.HandleMessage(context.Background(), msg)
 	if err != nil {
@@ -194,11 +196,11 @@ func TestRouterUnknownBotDoesNotConsumeIdempotency(t *testing.T) {
 
 func TestRouterDuplicateMessageIgnored(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
-	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}
+	msg := IncomingMessage{BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello", ChannelType: "wechat"}
 	if _, err := r.HandleMessage(context.Background(), msg); err != nil {
 		t.Fatal(err)
 	}
@@ -216,8 +218,8 @@ func TestRouterUnknownBotRejected(t *testing.T) {
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "unknown", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "unknown", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -230,7 +232,7 @@ func TestRouterTransientBotLookupErrorNotConsumed(t *testing.T) {
 	store := newFakeRouterStore()
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
-	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}
+	msg := IncomingMessage{BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello", ChannelType: "wechat"}
 
 	store.getBotErr = errors.New("db connection refused")
 	if _, err := r.HandleMessage(context.Background(), msg); err == nil {
@@ -242,7 +244,7 @@ func TestRouterTransientBotLookupErrorNotConsumed(t *testing.T) {
 
 	// 故障恢复: 同消息重试必须真正处理(未被消费/未标记幂等)。
 	store.getBotErr = nil
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	res, err := r.HandleMessage(context.Background(), msg)
 	if err != nil {
@@ -255,12 +257,12 @@ func TestRouterTransientBotLookupErrorNotConsumed(t *testing.T) {
 
 func TestRouterUnboundBotRejected(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected for unbound bot, got %s", res.Action)
 	}
@@ -272,12 +274,12 @@ func TestRouterUnboundBotRejected(t *testing.T) {
 
 func TestRouterIdentityMismatchRejected(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "correct-user", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "correct-user", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "wrong-user", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "wrong-user", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected for identity mismatch, got %s", res.Action)
 	}
@@ -285,13 +287,13 @@ func TestRouterIdentityMismatchRejected(t *testing.T) {
 
 func TestRouterBlockedUserRejected(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserBlocked
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected for blocked user, got %s", res.Action)
 	}
@@ -299,13 +301,13 @@ func TestRouterBlockedUserRejected(t *testing.T) {
 
 func TestRouterPendingUserRejected(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserPending
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected for pending user, got %s", res.Action)
 	}
@@ -313,13 +315,13 @@ func TestRouterPendingUserRejected(t *testing.T) {
 
 func TestRouterNormalMessageCreatesTask(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "do something",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "do something",
+		ChannelType: "wechat",})
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created, got %s", res.Action)
 	}
@@ -336,13 +338,13 @@ func TestRouterNormalMessageCreatesTask(t *testing.T) {
 
 func TestRouterMediaPathsAppendedToPrompt(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "check this image",
-		MediaPaths: []string{"/tmp/media/b1/img.jpg"},
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "check this image",
+		MediaPaths: []string{"/tmp/media/b1/img.jpg"}, ChannelType: "wechat",
 	})
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created, got %s", res.Action)
@@ -355,13 +357,13 @@ func TestRouterMediaPathsAppendedToPrompt(t *testing.T) {
 
 func TestRouterMediaOnlyMessageUsesPlaceholder(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "",
-		MediaPaths: []string{"/tmp/media/b1/a.pdf", "/tmp/media/b1/b.pdf"},
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "",
+		MediaPaths: []string{"/tmp/media/b1/a.pdf", "/tmp/media/b1/b.pdf"}, ChannelType: "wechat",
 	})
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created, got %s", res.Action)
@@ -374,7 +376,7 @@ func TestRouterMediaOnlyMessageUsesPlaceholder(t *testing.T) {
 
 func TestRouterStagesMediaIntoSessionSandboxUsesGlobalPolicy(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	src := filepath.Join(t.TempDir(), "resume.txt")
 	if err := os.WriteFile(src, []byte("resume"), 0o644); err != nil {
@@ -383,8 +385,8 @@ func TestRouterStagesMediaIntoSessionSandboxUsesGlobalPolicy(t *testing.T) {
 	tr := transport.NewLoopbackTransport()
 	r, tasks, sessionFiles := newTestRouterWithSessionFiles(t, store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "整理一下",
-		MediaPaths: []string{src},
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "整理一下",
+		MediaPaths: []string{src}, ChannelType: "wechat",
 	})
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created, got %s", res.Action)
@@ -407,14 +409,14 @@ func TestRouterStagesMediaIntoSessionSandboxUsesGlobalPolicy(t *testing.T) {
 
 func TestRouterStopCancelsRunningTask(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	store.runningTask = &domain.Task{ID: "task-running", SessionKey: "personal:42", Status: domain.TaskRunning}
 	tr := transport.NewLoopbackTransport()
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/stop",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/stop",
+		ChannelType: "wechat",})
 	if res.Action != ActionStopped {
 		t.Fatalf("expected stopped, got %s", res.Action)
 	}
@@ -425,13 +427,13 @@ func TestRouterStopCancelsRunningTask(t *testing.T) {
 
 func TestRouterStopWithNoRunningTask(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/stop",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/stop",
+		ChannelType: "wechat",})
 	if res.Action != ActionNoRunning {
 		t.Fatalf("expected no_running, got %s", res.Action)
 	}
@@ -439,13 +441,13 @@ func TestRouterStopWithNoRunningTask(t *testing.T) {
 
 func TestRouterNewCommandAcknowledged(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/new",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/new",
+		ChannelType: "wechat",})
 	if res.Action != ActionNewSession {
 		t.Fatalf("expected new_session, got %s", res.Action)
 	}
@@ -453,13 +455,13 @@ func TestRouterNewCommandAcknowledged(t *testing.T) {
 
 func TestRouterHelpCommand(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/help",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/help",
+		ChannelType: "wechat",})
 	if res.Action != ActionHelp {
 		t.Fatalf("expected help, got %s", res.Action)
 	}
@@ -479,13 +481,13 @@ func TestRouterHelpCommand(t *testing.T) {
 
 func TestRouterStatusIdle(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/status",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/status",
+		ChannelType: "wechat",})
 	if res.Action != ActionStatus {
 		t.Fatalf("expected status, got %s", res.Action)
 	}
@@ -497,14 +499,14 @@ func TestRouterStatusIdle(t *testing.T) {
 
 func TestRouterStatusRunning(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	store.runningTask = &domain.Task{ID: "task-1", Status: domain.TaskRunning}
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/status",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/status",
+		ChannelType: "wechat",})
 	if res.Action != ActionStatus {
 		t.Fatalf("expected status, got %s", res.Action)
 	}
@@ -516,13 +518,13 @@ func TestRouterStatusRunning(t *testing.T) {
 
 func TestRouterLLMCommandIsRestricted(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/llm 1",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/llm 1",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected restricted /llm to be rejected, got %s", res.Action)
 	}
@@ -533,14 +535,14 @@ func TestRouterLLMCommandIsRestricted(t *testing.T) {
 
 func TestRouterAbortAliasStopsRunningTask(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	store.runningTask = &domain.Task{ID: "task-running", SessionKey: "personal:42", Status: domain.TaskRunning}
 	tr := transport.NewLoopbackTransport()
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/abort",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/abort",
+		ChannelType: "wechat",})
 	if res.Action != ActionStopped || tasks.cancelledID != "task-running" {
 		t.Fatalf("expected /abort to stop task, result=%+v cancelled=%q", res, tasks.cancelledID)
 	}
@@ -548,13 +550,13 @@ func TestRouterAbortAliasStopsRunningTask(t *testing.T) {
 
 func TestRouterUnknownSlashCommandIsRejected(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/restore",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/restore",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected unknown /xxx to be rejected, got %s", res.Action)
 	}
@@ -569,13 +571,13 @@ func TestRouterUnknownSlashCommandIsRejected(t *testing.T) {
 
 func TestRouterSessionMutationCommandIsRejected(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/session.temperature=2",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/session.temperature=2",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected || tasks.submittedTask.ID != "" {
 		t.Fatalf("session mutation must be rejected before worker dispatch: result=%+v task=%+v", res, tasks.submittedTask)
 	}
@@ -583,13 +585,13 @@ func TestRouterSessionMutationCommandIsRejected(t *testing.T) {
 
 func TestRouterNormalMessageDoesNotSendImmediateReply(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	r, _ := newTestRouter(store, tr)
 	_, _ = r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if sent := tr.SentMessages(); len(sent) != 0 {
 		t.Fatalf("expected no immediate transport reply for normal message, got %+v", sent)
 	}

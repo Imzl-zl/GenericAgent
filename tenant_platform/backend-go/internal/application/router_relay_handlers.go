@@ -42,7 +42,7 @@ func parseRelayMention(text string) (username, body string, ok bool) {
 // named user's WeChat via their bound bot. No LLM is involved. When the
 // RelayService is nil (feature disabled), falls back to normal task routing
 // so the agent can still handle the message.
-func (r *router) handleRelay(ctx context.Context, msg IncomingMessage, bot domain.Bot, text string) (RouterResult, error) {
+func (r *router) handleRelay(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig, text string) (RouterResult, error) {
 	if r.relay == nil {
 		// Feature disabled: treat as a normal message so the agent can
 		// respond. This keeps @-text usable in loopback/dev mode.
@@ -52,50 +52,50 @@ func (r *router) handleRelay(ctx context.Context, msg IncomingMessage, bot domai
 	username, body, ok := parseRelayMention(text)
 	if !ok {
 		reply := "用法：@<用户名> <消息内容>\n例：@alice 你好"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if err := r.relay.Relay(ctx, bot.OwnerID, username, body); err != nil {
 		reply := formatRelayError(err, username)
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	reply := fmt.Sprintf("已转发给 %s", username)
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
 // handleRelayOff disables relay reception for the sender.
-func (r *router) handleRelayOff(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+func (r *router) handleRelayOff(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig) (RouterResult, error) {
 	if r.relay == nil {
 		reply := "转发功能未启用"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if err := r.relay.SetOptOut(ctx, bot.OwnerID, true); err != nil {
 		reply := fmt.Sprintf("操作失败: %s", err.Error())
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	reply := "已关闭 @用户名 转发接收\n发送 /relay_on 重新开启"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
 // handleRelayOn re-enables relay reception for the sender.
-func (r *router) handleRelayOn(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+func (r *router) handleRelayOn(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig) (RouterResult, error) {
 	if r.relay == nil {
 		reply := "转发功能未启用"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if err := r.relay.SetOptOut(ctx, bot.OwnerID, false); err != nil {
 		reply := fmt.Sprintf("操作失败: %s", err.Error())
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	reply := "已开启 @用户名 转发接收"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionReplied, Reply: reply, UserID: bot.OwnerID}, nil
 }
 

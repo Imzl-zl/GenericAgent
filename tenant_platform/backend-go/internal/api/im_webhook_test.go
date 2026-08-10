@@ -33,11 +33,11 @@ type fakeBotLifecycle struct {
 	persistBufBotUUID string
 	persistBuf        string
 	expiredBotUUID    string
-	startBotBot       domain.Bot
+	startBotBot       domain.ChannelConfig
 	persistErr        error
 }
 
-func (f *fakeBotLifecycle) StartBotForBoundUser(_ context.Context, bot domain.Bot) error {
+func (f *fakeBotLifecycle) StartChannelConfig(_ context.Context, bot domain.ChannelConfig) error {
 	f.startBotBot = bot
 	return nil
 }
@@ -62,10 +62,11 @@ func TestIMWebhookRoutesMessage(t *testing.T) {
 	server := newTestServerWithRouter(t, router)
 
 	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
-		BotUUID:    "bot-1",
-		IlinkUserID: "user-1",
-		MessageID:  "msg-1",
-		Text:       "hello",
+		BotUUID:          "bot-1",
+		ChannelType:      "wechat",
+		ChannelAccountID: "user-1",
+		MessageID:        "msg-1",
+		Text:             "hello",
 	})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -119,11 +120,12 @@ func TestIMWebhookPersistsUpdatesBuf(t *testing.T) {
 	server := newTestServerWithRouterAndLifecycle(t, router, lc)
 
 	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
-		BotUUID:    "bot-1",
-		IlinkUserID: "user-1",
-		MessageID:  "msg-1",
-		Text:       "hello",
-		UpdatesBuf: "cursor-123",
+		BotUUID:          "bot-1",
+		ChannelAccountID: "user-1",
+		MessageID:        "msg-1",
+		Text:             "hello",
+		UpdatesBuf:       "cursor-123",
+		ChannelType:      "wechat",
 	})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -145,11 +147,12 @@ func TestIMWebhookForwardsMediaPaths(t *testing.T) {
 	server := newTestServerWithRouter(t, captured)
 
 	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
-		BotUUID:    "bot-1",
-		IlinkUserID: "user-1",
-		MessageID:  "msg-1",
-		Text:       "see attached",
-		MediaPaths: []string{"/tmp/media/bot-1/img.jpg", "/tmp/media/bot-1/img2.jpg"},
+		BotUUID:          "bot-1",
+		ChannelAccountID: "user-1",
+		MessageID:        "msg-1",
+		Text:             "see attached",
+		MediaPaths:       []string{"/tmp/media/bot-1/img.jpg", "/tmp/media/bot-1/img2.jpg"},
+		ChannelType:      "wechat",
 	})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -185,13 +188,13 @@ func newTestServerWithRouter(t *testing.T, router application.Router) *Server {
 func newTestServerWithRouterAndLifecycle(t *testing.T, router application.Router, lc application.BotLifecycleService) *Server {
 	t.Helper()
 	srv, err := NewServer(ServerConfig{
-		Service:      &fakeTaskService{},
-		Registry:     &fakeRegistry{},
-		Router:       router,
-		BotLifecycle: lc,
-		AdminToken:     "admin token",
-		AdminUserID:    1,
-		SessionKey:   "personal:1",
+		Service:       &fakeTaskService{},
+		Registry:      &fakeRegistry{},
+		Router:        router,
+		BotLifecycle:  lc,
+		AdminToken:    "admin token",
+		AdminUserID:   1,
+		SessionKey:    "personal:1",
 		WebhookSecret: "test-secret",
 	})
 	if err != nil {
@@ -256,7 +259,8 @@ func TestIMWebhookRejectsMissingSignature(t *testing.T) {
 	server.webhookSecret = "test-secret"
 
 	req := newSignedWebhookRequest(t, "", imWebhookBody{ // empty secret → no header
-		BotUUID: "bot-1", IlinkUserID: "user-1", MessageID: "msg-1", Text: "hi",
+		BotUUID: "bot-1", ChannelAccountID: "user-1", MessageID: "msg-1", Text: "hi",
+		ChannelType: "wechat",
 	})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -272,7 +276,8 @@ func TestIMWebhookRejectsInvalidSignature(t *testing.T) {
 	server.webhookSecret = "test-secret"
 
 	req := newSignedWebhookRequest(t, "wrong-secret", imWebhookBody{
-		BotUUID: "bot-1", IlinkUserID: "user-1", MessageID: "msg-1", Text: "hi",
+		BotUUID: "bot-1", ChannelAccountID: "user-1", MessageID: "msg-1", Text: "hi",
+		ChannelType: "wechat",
 	})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -290,7 +295,8 @@ func TestIMWebhookAcceptsValidSignature(t *testing.T) {
 	server.webhookSecret = "test-secret"
 
 	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
-		BotUUID: "bot-1", IlinkUserID: "user-1", MessageID: "msg-1", Text: "hello",
+		BotUUID: "bot-1", ChannelAccountID: "user-1", MessageID: "msg-1", Text: "hello",
+		ChannelType: "wechat",
 	})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -312,10 +318,11 @@ func TestIMWebhookRejectsTamperedBody(t *testing.T) {
 	server := newTestServerWithRouter(t, router)
 	server.webhookSecret = "test-secret"
 
-	origBody := imWebhookBody{BotUUID: "bot-1", IlinkUserID: "user-1", MessageID: "msg-1", Text: "original"}
+	origBody := imWebhookBody{BotUUID: "bot-1", ChannelAccountID: "user-1", MessageID: "msg-1", Text: "original", ChannelType: "wechat"}
 	origBytes, _ := json.Marshal(origBody)
 	tamperedBytes, _ := json.Marshal(imWebhookBody{
-		BotUUID: "bot-1", IlinkUserID: "user-1", MessageID: "msg-1", Text: "tampered",
+		BotUUID: "bot-1", ChannelAccountID: "user-1", MessageID: "msg-1", Text: "tampered",
+		ChannelType: "wechat",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/im/webhook", bytes.NewReader(tamperedBytes))
 	req.Header.Set("X-Webhook-Signature", signWebhook(t, "test-secret", origBytes))
@@ -336,11 +343,12 @@ func TestIMWebhookDoesNotPersistCursorWhenRoutingFails(t *testing.T) {
 	server := newTestServerWithRouterAndLifecycle(t, router, lc)
 
 	req := newSignedWebhookRequest(t, "test-secret", imWebhookBody{
-		BotUUID:    "bot-1",
-		IlinkUserID: "user-1",
-		MessageID:  "msg-1",
-		Text:       "hello",
-		UpdatesBuf: "cursor-123",
+		BotUUID:          "bot-1",
+		ChannelAccountID: "user-1",
+		MessageID:        "msg-1",
+		Text:             "hello",
+		UpdatesBuf:       "cursor-123",
+		ChannelType:      "wechat",
 	})
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)

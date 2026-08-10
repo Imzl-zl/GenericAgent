@@ -372,6 +372,16 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		streamErr  error
 		chunkBatch chunkEventBatcher
 	)
+	// IM 流式转发(IM_STREAMING_DELIVERY §4.2): per-task 缓冲 + 500ms 节流
+	// 合并 + 终态 commit/abort。committed 防止失败路径 defer abort 误伤
+	// 已 commit 的流。
+	forwarder := NewStreamForwarder(s.cfg.Streaming, s.cfg.Bots, s.cfg.RuntimeSettings, taskRow)
+	streamCommitted := false
+	defer func() {
+		if !streamCommitted {
+			forwarder.Abort(context.WithoutCancel(ctx))
+		}
+	}()
 	eventsOpen, errsOpen := true, true
 	for eventsOpen || errsOpen {
 		select {
@@ -403,6 +413,9 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 					if err := flushChunkWindow(&chunkBatch); err != nil {
 						return err
 					}
+					// 心跳同时驱动流式缓冲窗口到期 flush(低频 chunk 场景下
+					// 文本不会滞留到 Terminal)。
+					forwarder.FlushDue(ctx, time.Now())
 					if err := s.cfg.Store.RecordHeartbeat(ctx, task.ID); err != nil {
 						slog.WarnContext(ctx, "scheduler: record heartbeat failed",
 							"task_id", task.ID, "error", err)
@@ -414,6 +427,9 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 						return err
 					}
 				}
+				// 流式转发: 非空 chunk 进 per-task 缓冲(节流合并; 流式片段不写
+				// messages 审计, 只记终态——与现 delivery 一致)。
+				forwarder.AppendText(ctx, text, time.Now())
 			}
 			if ev.IsTerminal() {
 				terminal = ev.Terminal
@@ -470,6 +486,16 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	}
 	switch terminal.GetStatus() {
 	case workerv1.TerminalStatus_TASK_SUCCEEDED:
+		// 终态 commit: 流式消息即最终交付(打字机最后一次更新/QQ 流式收尾);
+		// commit 成功置位 stream_final_at 抑制 delivery 文本 part(文件照发);
+		// 失败/未 open → 无标记, delivery 兜底补发最终结果。
+		if forwarder.Commit(ctx, time.Now()) {
+			if _, err := s.cfg.Store.MarkTaskStreamFinal(ctx, task.ID); err != nil {
+				slog.WarnContext(ctx, "scheduler: mark stream final failed; delivery will resend text",
+					"task_id", task.ID, "error", err)
+			}
+			streamCommitted = true
+		}
 		return s.completeSuccess(ctx, task, terminal)
 	case workerv1.TerminalStatus_TASK_CANCELLED:
 		_ = s.terminateTask(ctx, task, domain.TaskCancelled, domain.DeliveryTaskCancelled,

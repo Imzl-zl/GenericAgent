@@ -18,18 +18,18 @@ import (
 // The Go platform owns encryption + persistence; the Python Poller owns the
 // iLink protocol I/O. This store bridges them.
 type BotLifecycleStore interface {
-	GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error)
+	GetChannelConfigByUUID(ctx context.Context, botUUID string) (domain.ChannelConfig, error)
 	GetBotTransportState(ctx context.Context, botID int64) (domain.BotTransportState, error)
 	UpsertBotTransportState(ctx context.Context, botID int64, cursorCiphertext []byte, cursorKeyVersion int, reconnectState, lastErrorCode string) error
-	ListActiveBoundBots(ctx context.Context) ([]domain.Bot, error)
-	UpdateBotState(ctx context.Context, botUUID string, state domain.BotState) error
+	ListActiveChannelConfigs(ctx context.Context) ([]domain.ChannelConfig, error)
+	UpdateChannelConfigState(ctx context.Context, botUUID string, state domain.ChannelConfigState) error
 }
 
 // BotLifecycleService orchestrates bot start/stop/restore against the Bot
 // Poller. It decrypts bot tokens and cursors before handing them to the
 // Poller, and re-encrypts/persists cursors returned by the Poller.
 type BotLifecycleService interface {
-	StartBotForBoundUser(ctx context.Context, bot domain.Bot) error
+	StartChannelConfig(ctx context.Context, cfg domain.ChannelConfig) error
 	StopBot(ctx context.Context, botUUID string) error
 	RestoreActiveBots(ctx context.Context) error
 	PersistUpdatesBuf(ctx context.Context, botUUID, plaintextBuf string) error
@@ -81,28 +81,29 @@ func NewBotLifecycleService(cfg BotLifecycleConfig) (BotLifecycleService, error)
 	}, nil
 }
 
-// StartBotForBoundUser decrypts the bot token and any persisted cursor, then
-// tells the Poller to begin long-polling for this bot. Safe to call on a fresh
-// bot (no cursor yet) or after a platform restart (cursor resumes from DB).
-func (s *botLifecycleService) StartBotForBoundUser(ctx context.Context, bot domain.Bot) error {
-	if !bot.IsBound() {
-		return fmt.Errorf("bot %s is not bound", bot.BotUUID)
+// StartChannelConfig decrypts the channel config JSON and any persisted
+// cursor, then tells the Poller to begin polling for this channel. Safe to
+// call on a fresh config (no cursor yet) or after a platform restart
+// (cursor resumes from DB for wechat).
+func (s *botLifecycleService) StartChannelConfig(ctx context.Context, cfg domain.ChannelConfig) error {
+	if !cfg.IsBound() {
+		return fmt.Errorf("channel config %s is not bound", cfg.BotUUID)
 	}
-	token, err := s.cipher.Decrypt(bot.TokenCiphertext, bot.TokenKeyVersion)
+	configJSON, err := s.cipher.Decrypt(cfg.ConfigCiphertext, cfg.ConfigKeyVersion)
 	if err != nil {
-		return fmt.Errorf("decrypt bot token: %w", err)
+		return fmt.Errorf("decrypt channel config: %w", err)
 	}
-	cursor, err := s.resolveCursor(ctx, bot.ID)
+	cursor, err := s.resolveCursor(ctx, cfg.ID)
 	if err != nil {
 		return err
 	}
 	return s.poller.StartBot(ctx, poller.StartBotRequest{
-		BotUUID:    bot.BotUUID,
-		BotToken:   string(token),
-		ILinkBotID: bot.IlinkBotID,
-		BaseURL:    bot.BaseURL,
-		UpdatesBuf: cursor,
-		WebhookURL: s.webhookURL,
+		BotUUID:     cfg.BotUUID,
+		ChannelType: string(cfg.ChannelType),
+		ConfigJSON:  configJSON,
+		BaseURL:     cfg.BaseURL,
+		UpdatesBuf:  cursor,
+		WebhookURL:  s.webhookURL,
 	})
 }
 
@@ -137,7 +138,7 @@ func (s *botLifecycleService) resolveCursor(ctx context.Context, botID int64) (s
 // 运行——不停止则旧会话继续推送 webhook(unknown bot / 双回复)。无行可持久化
 // cursor, 直接忽略返回值。
 func (s *botLifecycleService) StopBot(ctx context.Context, botUUID string) error {
-	bot, err := s.store.GetBotByUUID(ctx, botUUID)
+	bot, err := s.store.GetChannelConfigByUUID(ctx, botUUID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			if _, stopErr := s.poller.StopBot(ctx, botUUID); stopErr != nil {
@@ -161,27 +162,29 @@ func (s *botLifecycleService) StopBot(ctx context.Context, botUUID string) error
 // so one bad bot does not block the rest. Bots are restored in parallel up to
 // RestoreConcurrency to avoid 10-30s serial startup on 10-20 bots.
 func (s *botLifecycleService) RestoreActiveBots(ctx context.Context) error {
-	bots, err := s.store.ListActiveBoundBots(ctx)
+	cfgs, err := s.store.ListActiveChannelConfigs(ctx)
 	if err != nil {
-		return fmt.Errorf("list active bots: %w", err)
+		return fmt.Errorf("list active channels: %w", err)
 	}
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(s.restoreConcurrency)
-	for _, bot := range bots {
-		bot := bot // capture
+	for _, cfg := range cfgs {
+		cfg := cfg // capture
 		g.Go(func() error {
-			if err := s.StartBotForBoundUser(gctx, bot); err != nil {
-				slog.ErrorContext(gctx, "bot_lifecycle: restore bot failed",
-					"bot_uuid", bot.BotUUID,
-					"bot_id", bot.ID,
-					"owner_user_id", bot.OwnerID,
+			if err := s.StartChannelConfig(gctx, cfg); err != nil {
+				slog.ErrorContext(gctx, "bot_lifecycle: restore channel failed",
+					"bot_uuid", cfg.BotUUID,
+					"bot_id", cfg.ID,
+					"channel_type", cfg.ChannelType,
+					"owner_user_id", cfg.OwnerID,
 					"error", err)
 				return nil // do not cancel the group; one bad bot must not block others
 			}
-			slog.InfoContext(gctx, "bot_lifecycle: restored bot",
-				"bot_uuid", bot.BotUUID,
-				"bot_id", bot.ID,
-				"owner_user_id", bot.OwnerID)
+			slog.InfoContext(gctx, "bot_lifecycle: restored channel",
+				"bot_uuid", cfg.BotUUID,
+				"bot_id", cfg.ID,
+				"channel_type", cfg.ChannelType,
+				"owner_user_id", cfg.OwnerID)
 			return nil
 		})
 	}
@@ -198,7 +201,7 @@ func (s *botLifecycleService) PersistUpdatesBuf(ctx context.Context, botUUID, pl
 	if plaintextBuf == "" {
 		return nil
 	}
-	bot, err := s.store.GetBotByUUID(ctx, botUUID)
+	cfg, err := s.store.GetChannelConfigByUUID(ctx, botUUID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			slog.WarnContext(ctx, "bot_lifecycle: skip cursor persist for unknown bot",
@@ -207,24 +210,24 @@ func (s *botLifecycleService) PersistUpdatesBuf(ctx context.Context, botUUID, pl
 		}
 		return fmt.Errorf("resolve bot: %w", err)
 	}
-	return s.persistCursor(ctx, bot.ID, plaintextBuf, "polling", "")
+	return s.persistCursor(ctx, cfg.ID, plaintextBuf, "polling", "")
 }
 
 // HandleAuthExpired marks the bot as expired and records the error in the
 // transport state. The Poller has already stopped its loop for this bot.
 func (s *botLifecycleService) HandleAuthExpired(ctx context.Context, botUUID string) error {
-	bot, err := s.store.GetBotByUUID(ctx, botUUID)
+	cfg, err := s.store.GetChannelConfigByUUID(ctx, botUUID)
 	if err != nil {
 		return fmt.Errorf("resolve bot: %w", err)
 	}
-	if err := s.store.UpdateBotState(ctx, botUUID, domain.BotExpired); err != nil {
+	if err := s.store.UpdateChannelConfigState(ctx, botUUID, domain.ChannelExpired); err != nil {
 		return fmt.Errorf("mark bot expired: %w", err)
 	}
 	// Pass keyVersion=1 (the default) instead of 0 to avoid violating the NOT NULL
 	// constraint when this is the first transport_state insert for this bot.
 	// cursorCiphertext=nil means "keep existing cursor", which works for both
 	// INSERT (no cursor yet) and UPDATE (preserve last known cursor).
-	return s.store.UpsertBotTransportState(ctx, bot.ID, nil, 1, "error", "AUTH_EXPIRED")
+	return s.store.UpsertBotTransportState(ctx, cfg.ID, nil, 1, "error", "AUTH_EXPIRED")
 }
 
 // persistCursor encrypts the plaintext cursor and upserts the transport state.

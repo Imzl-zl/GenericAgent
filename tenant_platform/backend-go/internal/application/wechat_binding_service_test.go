@@ -17,7 +17,7 @@ import (
 // fakeQRStore implements both WechatQRSessionStore and BotQRStore in-memory.
 type fakeQRStore struct {
 	sess        domain.WechatQRSession
-	existingBot domain.Bot // 重新绑定前 owner 已有的旧 bot(GetBotByOwner)
+	existingBot domain.ChannelConfig // 重新绑定前 owner 已有的旧 bot(GetChannelConfigByOwnerAndType)
 }
 
 func (f *fakeQRStore) CreateWechatQRSession(ctx context.Context, userID int64, ilinkQRCode, imgURL string, expiresAt time.Time) (domain.WechatQRSession, error) {
@@ -34,25 +34,25 @@ func (f *fakeQRStore) UpdateWechatQRSessionStatus(ctx context.Context, id string
 	return f.sess, nil
 }
 
-func (f *fakeQRStore) CreateBotFromQRSession(ctx context.Context, sess domain.WechatQRSession, tokenKeyVersion int) (domain.Bot, error) {
+func (f *fakeQRStore) CreateChannelConfigFromQRSession(ctx context.Context, sess domain.WechatQRSession, tokenKeyVersion int) (domain.ChannelConfig, error) {
 	// 模拟真实语义: 重新扫码总是生成全新 bot_uuid(ON CONFLICT 覆盖)。
-	return domain.Bot{
+	return domain.ChannelConfig{
 		BotUUID:     "rebound-new-uuid",
 		ID:          2,
 		OwnerID:     sess.UserID,
 		IlinkBotID:  sess.ILINKBotID,
 		IlinkUserID: sess.ILINKUserID,
-		State:       domain.BotActive,
-	}, nil
+		State:       domain.ChannelActive,
+		ChannelType: domain.ChannelWechat,}, nil
 }
 
-func (f *fakeQRStore) GetBoundBotByIlinkUser(ctx context.Context, ilinkUserID string) (domain.Bot, error) {
-	return domain.Bot{}, nil
+func (f *fakeQRStore) GetBoundChannelConfigByIlinkUser(ctx context.Context, ilinkUserID string) (domain.ChannelConfig, error) {
+	return domain.ChannelConfig{}, nil
 }
 
-func (f *fakeQRStore) GetBotByOwner(ctx context.Context, ownerID int64) (domain.Bot, error) {
+func (f *fakeQRStore) GetChannelConfigByOwnerAndType(ctx context.Context, ownerID int64, channelType domain.ChannelType) (domain.ChannelConfig, error) {
 	if f.existingBot.BotUUID == "" {
-		return domain.Bot{}, pgx.ErrNoRows
+		return domain.ChannelConfig{}, pgx.ErrNoRows
 	}
 	return f.existingBot, nil
 }
@@ -165,7 +165,7 @@ func TestPollStatusRebindStopsStaleBotSession(t *testing.T) {
 			ID: "sess-1", UserID: 1, ILINKQRCode: "qr-token",
 			Status: domain.WechatQRWait, ExpiresAt: time.Now().UTC().Add(time.Hour),
 		},
-		existingBot: domain.Bot{BotUUID: "old-uuid", ID: 1, OwnerID: 1, State: domain.BotActive},
+		existingBot: domain.ChannelConfig{BotUUID: "old-uuid", ID: 1, OwnerID: 1, State: domain.ChannelActive, ChannelType: domain.ChannelWechat},
 	}
 	svc := newRebindTestService(t, store, stopper)
 

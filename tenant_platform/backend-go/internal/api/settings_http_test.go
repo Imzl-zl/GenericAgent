@@ -9,14 +9,16 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 type fakeRuntimeSettingsStore struct {
-	mu           sync.Mutex
-	windowMS     int
-	maxTurns     int
-	updateErr    error
-	afterUpdate  func()
+	mu          sync.Mutex
+	windowMS    int
+	maxTurns    int
+	streamMode  domain.IMStreamingMode
+	updateErr   error
+	afterUpdate func()
 }
 
 func (f *fakeRuntimeSettingsStore) GetIMInboundCoalesceWindowMS(context.Context) (int, error) {
@@ -45,6 +47,25 @@ func (f *fakeRuntimeSettingsStore) UpdateAgentMaxTurns(_ context.Context, maxTur
 	return f.maxTurns, nil
 }
 
+func (f *fakeRuntimeSettingsStore) GetIMStreamingMode(context.Context) (domain.IMStreamingMode, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.streamMode == "" {
+		return domain.DefaultIMStreamingMode, nil
+	}
+	return f.streamMode, nil
+}
+
+func (f *fakeRuntimeSettingsStore) UpdateIMStreamingMode(_ context.Context, mode domain.IMStreamingMode, _ int64) (domain.IMStreamingMode, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateErr != nil {
+		return "", f.updateErr
+	}
+	f.streamMode = mode
+	return f.streamMode, nil
+}
+
 type fakeIMAggregationRuntime struct{ windowMS int }
 
 func (f *fakeIMAggregationRuntime) ConfigureInboundCoalescing(_ context.Context, windowMS int) error {
@@ -60,8 +81,8 @@ func TestAdminIMAggregationSettingsGetAndUpdate(t *testing.T) {
 		Registry:             dashboardFakeRegistry{},
 		RuntimeSettings:      settings,
 		IMAggregationRuntime: runtime,
-		AdminToken:             "test-admin token",
-		AdminUserID:            9,
+		AdminToken:           "test-admin token",
+		AdminUserID:          9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -101,8 +122,8 @@ func TestAdminIMAggregationSettingsRejectInvalidWindow(t *testing.T) {
 		Service:         dashboardFakeTaskService{},
 		Registry:        dashboardFakeRegistry{},
 		RuntimeSettings: &fakeRuntimeSettingsStore{windowMS: 2500, maxTurns: 80},
-		AdminToken:        "test-admin token",
-		AdminUserID:       9,
+		AdminToken:      "test-admin token",
+		AdminUserID:     9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -125,8 +146,8 @@ func TestAdminAgentRuntimeSettingsGetAndUpdate(t *testing.T) {
 		Service:         dashboardFakeTaskService{},
 		Registry:        dashboardFakeRegistry{},
 		RuntimeSettings: settings,
-		AdminToken:        "test-admin token",
-		AdminUserID:       9,
+		AdminToken:      "test-admin token",
+		AdminUserID:     9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -167,8 +188,8 @@ func TestAdminRuntimeProfileConcurrentReadAndUpdate(t *testing.T) {
 		Registry:        dashboardFakeRegistry{},
 		RuntimeSettings: settings,
 		RuntimeProfile:  RuntimeProfile{AgentMaxTurns: 80},
-		AdminToken:        "test-admin token",
-		AdminUserID:       9,
+		AdminToken:      "test-admin token",
+		AdminUserID:     9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -200,8 +221,8 @@ func TestAdminAgentRuntimeSettingsRejectInvalidMaxTurns(t *testing.T) {
 		Service:         dashboardFakeTaskService{},
 		Registry:        dashboardFakeRegistry{},
 		RuntimeSettings: &fakeRuntimeSettingsStore{windowMS: 2500, maxTurns: 80},
-		AdminToken:        "test-admin token",
-		AdminUserID:       9,
+		AdminToken:      "test-admin token",
+		AdminUserID:     9,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -217,5 +238,69 @@ func TestAdminAgentRuntimeSettingsRejectInvalidMaxTurns(t *testing.T) {
 		if rr.Code != http.StatusBadRequest {
 			t.Fatalf("max_turns=%d status=%d body=%s", value, rr.Code, rr.Body.String())
 		}
+	}
+}
+
+func TestAdminIMStreamingSettingsGetAndUpdate(t *testing.T) {
+	settings := &fakeRuntimeSettingsStore{windowMS: 2500, maxTurns: 80}
+	srv, err := NewServer(ServerConfig{
+		Service:         dashboardFakeTaskService{},
+		Registry:        dashboardFakeRegistry{},
+		RuntimeSettings: settings,
+		AdminToken:      "test-admin token",
+		AdminUserID:     9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 默认 streaming(设计: 私聊默认开)。
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/settings/im-streaming", nil)
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["mode"] != string(domain.IMStreamingStreaming) {
+		t.Fatalf("default mode=%q, want streaming", got["mode"])
+	}
+
+	// 更新为 final_only。
+	req = httptest.NewRequest(http.MethodPut, "/v1/admin/settings/im-streaming", bytes.NewBufferString(`{"mode":"final_only"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("put status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if settings.streamMode != domain.IMStreamingFinalOnly {
+		t.Fatalf("stored mode=%q, want final_only", settings.streamMode)
+	}
+}
+
+func TestAdminIMStreamingSettingsRejectInvalidMode(t *testing.T) {
+	srv, err := NewServer(ServerConfig{
+		Service:         dashboardFakeTaskService{},
+		Registry:        dashboardFakeRegistry{},
+		RuntimeSettings: &fakeRuntimeSettingsStore{windowMS: 2500, maxTurns: 80},
+		AdminToken:      "test-admin token",
+		AdminUserID:     9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/v1/admin/settings/im-streaming", bytes.NewBufferString(`{"mode":"banana"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Platform-Admin-Token", "test-admin token")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid mode status=%d, want 400", rr.Code)
 	}
 }

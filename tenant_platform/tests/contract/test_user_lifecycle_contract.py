@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 MIGRATION_PATH = ROOT / "infra/postgres/migrations/0003_user_lifecycle.sql"
+MIGRATIONS_DIR = ROOT / "infra/postgres/migrations"
 OPENAPI_PATH = ROOT / "contracts/openapi/platform.yaml"
 DOMAIN_BINDING_PATH = ROOT / "backend-go/internal/domain/binding.go"
 TRANSPORT_ADAPTER_PATH = (
@@ -44,12 +45,20 @@ def test_migration_binding_attempts_stores_code_hash_not_plaintext():
 
 
 def test_migration_bots_owner_unique_and_ilink_bindable():
-    """bots.owner_id is unique; ilink_user_id is bound after activation (spec §5)."""
+    """bots(0003)具备 owner_id/ilink_user_id; 0053 统一为 channel_configs
+    (owner_id, channel_type 唯一, config_ciphertext)。"""
     text = MIGRATION_PATH.read_text(encoding="utf-8")
     assert "owner_id" in text, "bots must have owner_id"
     assert "bot_uuid" in text, "bots must have bot_uuid"
     assert "ilink_user_id" in text, "bots must have ilink_user_id"
     assert "UNIQUE" in text, "bots must enforce uniqueness"
+    # IM_CHANNEL_BINDING §3: bots → channel_configs 统一渠道配置模型。
+    m53 = MIGRATIONS_DIR / "0053_channel_configs.sql"
+    t53 = m53.read_text(encoding="utf-8")
+    assert "RENAME TO channel_configs" in t53
+    assert "channel_configs_owner_type_uq" in t53, "每用户每渠道唯一索引"
+    assert "channel_type TEXT NOT NULL DEFAULT 'wechat'" in t53
+    assert "config_ciphertext" in t53, "token_ciphertext 改名 config_ciphertext"
 
 
 def test_migration_context_tokens_unique_per_bot_and_user():
@@ -99,12 +108,25 @@ def test_domain_binding_go_declares_lifecycle_types():
     text = DOMAIN_BINDING_PATH.read_text(encoding="utf-8")
     for typename in (
         "WechatQRSession",
-        "Bot",
+        "ChannelConfig",
         "BotTransportState",
         "ContextToken",
         "AuditEvent",
     ):
         assert f"type {typename} struct" in text, f"domain missing type {typename}"
+
+
+def test_domain_binding_channel_config_states_enforce_lifecycle():
+    """ChannelConfig states must cover active, disabled, expired, revoked."""
+    text = DOMAIN_BINDING_PATH.read_text(encoding="utf-8")
+    for state in (
+        "ChannelActive",
+        "ChannelDisabled",
+        "ChannelExpired",
+        "ChannelRevoked",
+    ):
+        assert re.search(rf"{state}\s+ChannelConfigState = \"{state[7:].lower()}\"", text), \
+            f"domain missing channel state {state}"
 
 
 def test_domain_binding_states_enforce_lifecycle():

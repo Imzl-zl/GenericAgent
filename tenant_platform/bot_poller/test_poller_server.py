@@ -16,7 +16,9 @@ def _body(mid: str, text: str = "", *, user: str = "u1", token: str = "", at_ms:
     items = [{"storage_path": media, "file_name": media.rsplit("/", 1)[-1]}] if media else []
     return {
         "bot_uuid": "b1",
-        "ilink_user_id": user,
+        "channel_type": "wechat",
+        "channel_account_id": user,
+        "conversation_id": "",
         "message_id": mid,
         "text": text,
         "context_token": token,
@@ -113,40 +115,47 @@ def test_coalescing_buffer_merges_text_and_file_across_poll_batches():
     assert ready[0]["context_token"] == "ctx-2"
 
 
+def _media_adapter(media_root):
+    return poller_server.WeChatAdapter(
+        "b1", {"token": "test"}, "http://platform/webhook",
+        media_root=media_root, webhook_secret="",
+    )
+
+
 def test_collect_media_items_restores_original_file_name():
     """Round8 审查: 落盘名含内容 hash 前缀时, media_items.file_name 必须恢复
     为发送者原始文件名(不得暴露 hash 前缀)。"""
-    mgr = poller_server.BotManager(media_root="/media")
+    adapter = _media_adapter("/media")
     paths = ["/media/b1/a1b2c3d4e5_resume.txt"]
     names = ["resume.txt"]
-    items = mgr._collect_media_items(paths, names)
+    items = adapter._collect_media_items(paths, names)
     assert len(items) == 1
     assert items[0]["file_name"] == "resume.txt"
     assert items[0]["storage_path"] == "b1/a1b2c3d4e5_resume.txt"
     # 无 names 时回退 basename。
-    fallback = mgr._collect_media_items(paths)
+    fallback = adapter._collect_media_items(paths)
     assert fallback[0]["file_name"] == "a1b2c3d4e5_resume.txt"
 
 
 def test_collect_media_items_names_align_with_paths_not_item_list():
     """Round8(review): names 与 paths 同序对齐——item_list 中下载失败的项
     不产生 path, 若按位置索引 item_list 会错位(张冠李戴)。"""
-    mgr = poller_server.BotManager(media_root="/media")
+    adapter = _media_adapter("/media")
     # item_list 3 项, 中间项下载失败 → 只返回 2 个 path。
     paths = ["/media/b1/a1b2c3d4e5_a.txt", "/media/b1/f6e7d8c9b0a1_c.txt"]
     names = ["a.txt", "c.txt"]
-    items = mgr._collect_media_items(paths, names)
+    items = adapter._collect_media_items(paths, names)
     assert [it["file_name"] for it in items] == ["a.txt", "c.txt"]
     # names 短于 paths 时剩余回退 basename。
-    short = mgr._collect_media_items(paths, ["a.txt"])
+    short = adapter._collect_media_items(paths, ["a.txt"])
     assert short[1]["file_name"] == "f6e7d8c9b0a1_c.txt"
 
 
 def test_collect_media_items_restores_original_name_without_media_root():
     """Round8: 未配置 media_root 时同样恢复原始文件名。"""
-    mgr = poller_server.BotManager(media_root=None)
+    adapter = _media_adapter(None)
     paths = ["/tmp/x/a1b2c3d4e5_report.docx"]
-    items = mgr._collect_media_items(paths, ["report.docx"])
+    items = adapter._collect_media_items(paths, ["report.docx"])
     assert items[0]["file_name"] == "report.docx"
 
 
@@ -208,24 +217,31 @@ def test_run_coalesces_across_polls_and_uses_deadline_as_request_timeout(monkeyp
 
     monkeypatch.setattr(poller_server.time, "time", lambda: clock[0])
     client = Client()
-    entry = poller_server.BotEntry(client, "http://platform/webhook", "b1", 2500)
-    entry.media_dir = None
-    manager = poller_server.BotManager(inbound_coalesce_window_ms=2500)
+    adapter = poller_server.WeChatAdapter(
+        "b1", {"token": "test"}, "http://platform/webhook",
+        updates_buf="cursor-0",
+        coalesce_window_provider=lambda: 2500,
+    )
+    adapter.client = client
+    adapter._media_dir = None
     posted = []
 
-    def post(_entry, body, max_attempts=None):
+    def post(body, max_attempts=None):
         posted.append(body)
-        entry.stop_event.set()
+        adapter.stop_event.set()
         return True
 
-    monkeypatch.setattr(manager, "_post_webhook_body", post)
-    manager._run(entry)
+    monkeypatch.setattr(adapter, "post_webhook", post)
+    adapter._run()
 
     assert client.timeouts == [None, 2.5, 2.5]
     assert len(posted) == 1
     assert posted[0]["source_message_ids"] == ["m1", "m2"]
     assert posted[0]["updates_buf"] == "cursor-2"
     assert posted[0]["context_token"] == "ctx-2"
+    assert posted[0]["channel_type"] == "wechat"
+    assert posted[0]["conversation_id"] == ""
+    assert posted[0]["channel_account_id"] == "u1"
 
 
 def test_webhook_success_advances_committed_cursor(monkeypatch):
@@ -234,14 +250,13 @@ def test_webhook_success_advances_committed_cursor(monkeypatch):
         text = "ok"
 
     monkeypatch.setattr(poller_server.requests, "post", lambda *args, **kwargs: Response())
-    entry = poller_server.BotEntry(object(), "http://platform/webhook", "b1", 2500)
-    entry.committed_updates_buf = "cursor-before"
-    manager = poller_server.BotManager(inbound_coalesce_window_ms=2500)
+    adapter = poller_server.WeChatAdapter(
+        "b1", {"token": "test"}, "http://platform/webhook", updates_buf="cursor-before")
 
-    delivered = manager._post_webhook_body(entry, _body("m1") | {"updates_buf": "cursor-after"})
+    delivered = adapter.post_webhook(_body("m1") | {"updates_buf": "cursor-after"})
 
     assert delivered is True
-    assert entry.committed_updates_buf == "cursor-after"
+    assert adapter.committed_updates_buf == "cursor-after"
 
 
 def test_stop_waits_for_inflight_webhook_before_returning_cursor():
@@ -253,16 +268,17 @@ def test_stop_waits_for_inflight_webhook_before_returning_cursor():
             return None
 
     manager = poller_server.BotManager(inbound_coalesce_window_ms=2500)
-    entry = poller_server.BotEntry(Client(), "http://platform/webhook", "b1", 2500)
-    entry.thread = Thread()
-    entry.committed_updates_buf = "cursor-old"
-    entry.webhook_idle = poller_server.threading.Event()
-    manager._bots["b1"] = entry
+    adapter = poller_server.WeChatAdapter(
+        "b1", {"token": "test"}, "http://platform/webhook", updates_buf="cursor-old")
+    adapter.thread = Thread()
+    adapter.webhook_idle = poller_server.threading.Event()
+    adapter.client = Client()
+    manager._adapters["b1"] = adapter
 
     def finish_webhook():
         poller_server.time.sleep(0.05)
-        entry.committed_updates_buf = "cursor-new"
-        entry.webhook_idle.set()
+        adapter.committed_updates_buf = "cursor-new"
+        adapter.webhook_idle.set()
 
     worker = poller_server.threading.Thread(target=finish_webhook)
     worker.start()
@@ -281,11 +297,15 @@ def test_stop_does_not_commit_cursor_for_pending_debounce_message():
             return None
 
     manager = poller_server.BotManager(inbound_coalesce_window_ms=2500)
-    entry = poller_server.BotEntry(Client(), "http://platform/webhook", "b1", 2500)
-    entry.thread = Thread()
-    entry.committed_updates_buf = "cursor-before-pending"
-    entry.coalescer.push([_body("m1") | {"updates_buf": "cursor-after-pending"}], now_ms=1000)
-    manager._bots["b1"] = entry
+    adapter = poller_server.WeChatAdapter(
+        "b1", {"token": "test"}, "http://platform/webhook",
+        updates_buf="cursor-before-pending",
+        coalesce_window_provider=lambda: 2500,
+    )
+    adapter.thread = Thread()
+    adapter.client = Client()
+    adapter.coalescer.push([_body("m1") | {"updates_buf": "cursor-after-pending"}], now_ms=1000)
+    manager._adapters["b1"] = adapter
 
     returned_cursor = manager.stop("b1")
 
@@ -315,21 +335,23 @@ def test_send_passes_explicit_file_name_to_client(monkeypatch):
             self.calls.append(("text", ilink_user_id, text, context_token, client_id))
 
     manager = poller_server.BotManager(inbound_coalesce_window_ms=2500)
-    entry = poller_server.BotEntry(Client(), "http://platform/webhook", "b1", 2500)
-    manager._bots["b1"] = entry
+    adapter = poller_server.WeChatAdapter(
+        "b1", {"token": "test"}, "http://platform/webhook", updates_buf="")
+    adapter.client = Client()
+    manager._adapters["b1"] = adapter
 
     manager.send("b1", "u1", "", msg_type="file", file_path="/tmp/abc123_report.docx", file_name="report.docx")
-    assert entry.client.calls == [("u1", "/tmp/abc123_report.docx", "", "report.docx", "")]
+    assert adapter.client.calls == [("u1", "/tmp/abc123_report.docx", "", "report.docx", "")]
 
     # 未传 file_name 时回退为空串(客户端侧回退本地 basename), 不报错。
-    entry.client.calls.clear()
+    adapter.client.calls.clear()
     manager.send("b1", "u1", "", msg_type="file", file_path="/tmp/abc123_other.docx")
-    assert entry.client.calls == [("u1", "/tmp/abc123_other.docx", "", "", "")]
+    assert adapter.client.calls == [("u1", "/tmp/abc123_other.docx", "", "", "")]
 
     # round9 审查: client_id 透传到客户端(稳定幂等键)。
-    entry.client.calls.clear()
+    adapter.client.calls.clear()
     manager.send("b1", "u1", "hi", client_id="ga-abc123")
-    assert entry.client.calls == [("text", "u1", "hi", "", "ga-abc123")]
+    assert adapter.client.calls == [("text", "u1", "hi", "", "ga-abc123")]
 
 
 # ---------------------------------------------------------------------------

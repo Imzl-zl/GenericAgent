@@ -12,11 +12,12 @@ import (
 )
 
 // GetRelayRecipient resolves a username to the full relay target: user identity,
-// relay opt-out flag, and bot binding. Returns domain.ErrRelayUserNotFound when
+// relay opt-out flag, and wechat bot binding. Returns domain.ErrRelayUserNotFound when
 // no user matches the username.
 //
 // The query LEFT JOINs relay_preferences (defaulting to opt_out=FALSE when no
-// row exists) and bots (only active bots). One round-trip per relay.
+// row exists) and channel_configs (only active wechat configs). One round-trip
+// per relay.
 func (s *Store) GetRelayRecipient(ctx context.Context, username string) (domain.RelayRecipient, error) {
 	if username == "" {
 		return domain.RelayRecipient{}, fmt.Errorf("username is required")
@@ -37,7 +38,7 @@ SELECT u.id,
        b.ilink_user_id
 FROM users u
 LEFT JOIN relay_preferences rp ON rp.user_id = u.id
-LEFT JOIN bots b ON b.owner_id = u.id AND b.state = 'active'
+LEFT JOIN channel_configs b ON b.owner_id = u.id AND b.channel_type = 'wechat' AND b.state = 'active'
 WHERE u.username = $1
 `, username).Scan(&r.UserID, &r.Username, &r.Status, &r.OptOut, &botID, &botUUID, &ilinkUsr)
 	if err != nil {

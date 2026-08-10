@@ -910,6 +910,139 @@ paths:
         "401": {$ref: "#/components/responses/Unauthorized"}
         "500": {$ref: "#/components/responses/InternalError"}
 
+  /v1/me/im-bindings:
+    get:
+      security:
+        - BearerToken: []
+      operationId: listIMBindings
+      summary: 列出当前用户所有渠道绑定状态
+      description: >
+        各渠道状态列表 [{channel_type, state, bound_at, meta}]。meta 只含脱敏
+        app_id / ilink_bot_id, 永不回明文凭据(IM_CHANNEL_BINDING §4/§8)。
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/ChannelBinding"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/me/im-bindings/{channel_type}:
+    put:
+      security:
+        - BearerToken: []
+      operationId: saveIMBinding
+      summary: 保存/更新渠道凭据(feishu|dingtalk|qq), 保存即生效
+      description: >
+        凭据加密入库(state=active)并热推 poller 重连; 无独立连通性测试按钮。
+      parameters:
+        - name: channel_type
+          in: path
+          required: true
+          schema: {type: string, enum: [feishu, dingtalk, qq]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SaveChannelBindingRequest"}
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChannelBinding"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    delete:
+      security:
+        - BearerToken: []
+      operationId: unbindIMChannel
+      summary: 解绑渠道(state=disabled)并通知 poller 断开
+      parameters:
+        - name: channel_type
+          in: path
+          required: true
+          schema: {type: string, enum: [feishu, dingtalk, qq]}
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChannelBinding"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/me/im-bindings:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminListIMBindings
+      summary: 管理员列出渠道绑定状态(开发者用户)
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/ChannelBinding"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/me/im-bindings/{channel_type}:
+    put:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminSaveIMBinding
+      summary: 管理员保存/更新渠道凭据(开发者用户)
+      parameters:
+        - name: channel_type
+          in: path
+          required: true
+          schema: {type: string, enum: [feishu, dingtalk, qq]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SaveChannelBindingRequest"}
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChannelBinding"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    delete:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminUnbindIMChannel
+      summary: 管理员解绑渠道(开发者用户)
+      parameters:
+        - name: channel_type
+          in: path
+          required: true
+          schema: {type: string, enum: [feishu, dingtalk, qq]}
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChannelBinding"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
   /v1/admin/personas:
     get:
       security:
@@ -1111,6 +1244,36 @@ paths:
         - PlatformAdminToken: []
       operationId: adminUpdateIMAggregationSettings
       summary: 更新 IM 聚合设置
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+
+  /v1/admin/settings/im-streaming:
+    get:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminGetIMStreamingSettings
+      summary: 读取 IM 流式输出开关(off|final_only|streaming)
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    put:
+      security:
+        - PlatformAdminToken: []
+      operationId: adminUpdateIMStreamingSettings
+      summary: 更新 IM 流式输出开关
       responses:
         "200":
           description: Success
@@ -1737,21 +1900,67 @@ components:
       type: object
       required:
         - bot_uuid
-        - ilink_user_id
+        - channel_type
+        - channel_account_id
         - message_id
-        - text
       properties:
         bot_uuid:
           type: string
           format: uuid
-        ilink_user_id:
+        channel_type:
           type: string
+          enum: [wechat, feishu, dingtalk, qq]
+          description: 渠道类型(同时是任务 Source 与回复分发依据)
+        channel_account_id:
+          type: string
+          description: 渠道侧账号标识(微信=ilink_user_id, 其他=发送者账号)
+        conversation_id:
+          type: string
+          description: 对话单元 ID(群 ID / 对端 ID; 微信恒空)——分桶键
         message_id:
           type: string
           description: Transport-unique message id for idempotency
         text:
           type: string
           description: Message text; may be a command (/stop, /new, /activate) or normal text
+    SaveChannelBindingRequest:
+      type: object
+      required:
+        - app_id
+        - app_secret
+      additionalProperties: false
+      properties:
+        app_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: 飞书/QQ 应用 app_id; 钉钉为 app_key
+        app_secret:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: 应用密钥(加密入库, 永不回显)
+    ChannelBinding:
+      type: object
+      required:
+        - channel_type
+        - state
+      properties:
+        channel_type:
+          type: string
+          enum: [wechat, feishu, dingtalk, qq]
+        state:
+          type: string
+          enum: [active, disabled, expired, revoked]
+        bound_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        meta:
+          type: object
+          description: '脱敏元数据(wechat: ilink_bot_id/channel_account_id; 其他: app_id)'
     RouterResult:
       type: object
       required:

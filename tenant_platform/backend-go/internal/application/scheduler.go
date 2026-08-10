@@ -13,6 +13,7 @@ import (
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/checkpoint"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/transport"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/worker"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/workerclient"
 )
@@ -33,6 +34,14 @@ type SchedulerConfig struct {
 	Store              TaskStore
 	Registry           policy.Registry
 	Coordinator        checkpoint.Coordinator
+	// Streaming 是可选 IM 流式转发端口(IM_STREAMING_DELIVERY §4.2):
+	// 支持流式回复的 transport 实现 StreamingSender(生产=ILinkAdapter 代理
+	// poller /send stream_*; loopback/测试=LoopbackTransport)。nil = 关闭
+	// (只发终态结果, 与现状一致)。
+	Streaming transport.StreamingSender
+	// Bots 解析流式回复目标渠道配置(与 delivery 同款接口)。nil 时流式
+	// 转发关闭(转发判定 fail-closed)。
+	Bots ChannelResolverByOwner
 	// SessionFiles 供成功事务前捕获 [FILE:...] 输出文件快照(审查 R5-I3);
 	// nil(loopback 未接线)时跳过捕获, 成功事务不绑定文件内容。
 	SessionFiles SessionFiles
@@ -141,6 +150,9 @@ type CapabilityStore interface {
 // Worker session. Admin updates apply to subsequent tasks.
 type AgentRuntimeSettings interface {
 	GetAgentMaxTurns(ctx context.Context) (int, error)
+	// GetIMStreamingMode 解析 IM 流式输出开关(off|final_only|streaming)。
+	// 读失败时调用方 fail-closed(不转发, 终态 delivery 兜底)。
+	GetIMStreamingMode(ctx context.Context) (domain.IMStreamingMode, error)
 }
 
 const (

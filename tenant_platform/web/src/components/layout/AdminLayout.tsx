@@ -10,7 +10,7 @@ const navItems = [
   { to: '/admin/personas', label: '人设审核', icon: UserCog },
   { to: '/admin/providers', label: 'LLM 供应', icon: Cpu },
   { to: '/admin/mcp-servers', label: 'MCP 工具', icon: Plug },
-  { to: '/admin/binding', label: '微信绑定', icon: MessageCircle },
+  { to: '/admin/binding', label: '渠道绑定', icon: MessageCircle },
   { to: '/admin/sops', label: 'Sophub SOP', icon: BookOpen },
   { to: '/admin/settings', label: '策略设置', icon: Settings },
 ];

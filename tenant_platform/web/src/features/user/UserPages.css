@@ -258,3 +258,28 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* 渠道绑定: 凭据表单输入框(复用 Input 视觉, 保持 Card 内紧凑布局) */
+.binding-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  transition:
+    border-color 180ms var(--ease-out-expo),
+    box-shadow 180ms var(--ease-out-expo);
+}
+
+.binding-input::placeholder {
+  color: var(--text-disabled);
+}
+
+.binding-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}

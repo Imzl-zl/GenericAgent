@@ -28,7 +28,7 @@ func round8Router(store *fakeRouterStore, tr *transport.LoopbackTransport, messa
 // Round8 审查: 身份不匹配的发送者不得向目标租户写入任何 messages/media_assets 记录。
 func TestRouterIdentityMismatchDoesNotPersistInbound(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "correct-user", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "correct-user", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
@@ -36,8 +36,8 @@ func TestRouterIdentityMismatchDoesNotPersistInbound(t *testing.T) {
 	r := round8Router(store, tr, messages, tasks)
 
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "wrong-user", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "wrong-user", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,15 +58,15 @@ func TestRouterIdentityMismatchDoesNotPersistInbound(t *testing.T) {
 // Round8 审查: 未绑定 bot 的消息不得写入租户记录。
 func TestRouterUnboundBotDoesNotPersistInbound(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
 	r := round8Router(store, tr, messages, &fakeTaskService{})
 
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,15 +81,15 @@ func TestRouterUnboundBotDoesNotPersistInbound(t *testing.T) {
 // Round8 审查: 被阻止/待审用户的消息不得写入租户记录。
 func TestRouterBlockedUserDoesNotPersistInbound(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserBlocked
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
 	r := round8Router(store, tr, messages, &fakeTaskService{})
 
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestRouterBlockedUserDoesNotPersistInbound(t *testing.T) {
 // Round8 审查: 任务提交失败必须返回 error(不标记幂等), Poller 重试能真正重新处理。
 func TestRouterFailedTaskSubmitIsRetryable(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
@@ -112,8 +112,8 @@ func TestRouterFailedTaskSubmitIsRetryable(t *testing.T) {
 	r := round8Router(store, tr, messages, tasks)
 
 	_, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "do something",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "do something",
+		ChannelType: "wechat",})
 	if err == nil {
 		t.Fatal("expected error when task submission fails")
 	}
@@ -124,8 +124,8 @@ func TestRouterFailedTaskSubmitIsRetryable(t *testing.T) {
 	// Poller 重试: 必须能真正重新处理并创建任务。
 	tasks.submitErr = nil
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "do something",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "do something",
+		ChannelType: "wechat",})
 	if err != nil {
 		t.Fatalf("retry after transient failure must succeed, got: %v", err)
 	}
@@ -137,8 +137,8 @@ func TestRouterFailedTaskSubmitIsRetryable(t *testing.T) {
 	}
 	// 成功后消息入库一次且幂等标记生效: 第三次直接 Duplicate。
 	dupe, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "do something",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "do something",
+		ChannelType: "wechat",})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestRouterFailedTaskSubmitIsRetryable(t *testing.T) {
 // Round8 审查: media_paths 必须绑定 BotMediaRoot; 越界路径拒绝且不产生副作用。
 func TestRouterRejectsMediaPathOutsideBotMediaRoot(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
@@ -176,10 +176,11 @@ func TestRouterRejectsMediaPathOutsideBotMediaRoot(t *testing.T) {
 	}
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID:     "b1",
-		IlinkUserID: "u1",
+		ChannelAccountID: "u1",
 		MessageID:   "m1",
 		Text:        "read this",
 		MediaPaths:  []string{secret},
+		ChannelType: "wechat",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +197,7 @@ func TestRouterRejectsMediaPathOutsideBotMediaRoot(t *testing.T) {
 // Round8 审查: media_paths 在 BotMediaRoot 内且文件真实存在时正常放行。
 func TestRouterAcceptsMediaPathInsideBotMediaRoot(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
@@ -222,10 +223,11 @@ func TestRouterAcceptsMediaPathInsideBotMediaRoot(t *testing.T) {
 
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID:     "b1",
-		IlinkUserID: "u1",
+		ChannelAccountID: "u1",
 		MessageID:   "m1",
 		Text:        "check image",
 		MediaPaths:  []string{media},
+		ChannelType: "wechat",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -238,14 +240,14 @@ func TestRouterAcceptsMediaPathInsideBotMediaRoot(t *testing.T) {
 // Round8 审查: 成功处理后同消息重试被幂等缓存判定为 Duplicate(不重复创建任务)。
 func TestRouterSuccessfulMessageMarkedIdempotent(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
 	tasks := &fakeTaskService{}
 	r := round8Router(store, tr, messages, tasks)
 
-	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}
+	msg := IncomingMessage{BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello", ChannelType: "wechat"}
 	res, err := r.HandleMessage(context.Background(), msg)
 	if err != nil || res.Action != ActionTaskCreated {
 		t.Fatalf("first handling: action=%s err=%v", res.Action, err)
@@ -273,7 +275,7 @@ var _ = errors.Is // keep errors import when tests above are edited
 // 该测试模拟"内存缓存空 + messages 行已存在"的重启窗口。
 func TestRouterDurableInboundDedupShortCircuitsRouting(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
@@ -281,7 +283,7 @@ func TestRouterDurableInboundDedupShortCircuitsRouting(t *testing.T) {
 	r := round8Router(store, tr, messages, tasks)
 
 	// 首次处理成功: 任务提交 + 消息入库。
-	msg := IncomingMessage{BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello"}
+	msg := IncomingMessage{BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello", ChannelType: "wechat"}
 	res, err := r.HandleMessage(context.Background(), msg)
 	if err != nil || res.Action != ActionTaskCreated {
 		t.Fatalf("first handling: action=%s err=%v", res.Action, err)
@@ -313,7 +315,7 @@ func TestRouterDurableInboundDedupShortCircuitsRouting(t *testing.T) {
 // Duplicate 而不是返回 error——否则 Poller 对 5xx 无限重试。
 func TestRouterRejectedCommandClaimConflictShortCircuits(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	tr := transport.NewLoopbackTransport()
 	messages := &fakeMessageStore{}
@@ -327,8 +329,8 @@ func TestRouterRejectedCommandClaimConflictShortCircuits(t *testing.T) {
 	})
 	tr.Reset()
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m-rejected", Text: "/bogus",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m-rejected", Text: "/bogus",
+		ChannelType: "wechat",})
 	if err != nil {
 		t.Fatalf("claim conflict must not surface as error: %v", err)
 	}

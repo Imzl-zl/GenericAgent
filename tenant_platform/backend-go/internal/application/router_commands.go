@@ -111,15 +111,15 @@ func defaultCommands() map[string]domain.PlatformCommand {
 
 // handleStop implements /stop: cancels the running task for the user's
 // session (personal or team) if one exists.
-func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig) (RouterResult, error) {
 	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
-	task, err := r.store.FindRunningTaskBySession(ctx, sessionKey, "") // 微信默认桶
+	task, err := r.store.FindRunningTaskBySession(ctx, sessionKey, msg.ConversationID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		reply := "no running task to stop"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionNoRunning, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	if err != nil {
@@ -127,11 +127,11 @@ func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain
 	}
 	if _, err := r.tasks.CancelTask(ctx, task.ID, bot.OwnerID); err != nil {
 		reply := fmt.Sprintf("cancel failed: %s", err.Error())
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	reply := "task cancelled"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionStopped, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
@@ -139,34 +139,34 @@ func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain
 // marks the workspace for fresh start. The next submitted task carries
 // fresh_session=true, causing the scheduler to restart the Worker without
 // loading the prior snapshot (spec §7 /new).
-func (r *router) handleNew(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+func (r *router) handleNew(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig) (RouterResult, error) {
 	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
-	if task, err := r.store.FindRunningTaskBySession(ctx, sessionKey, ""); err == nil { // 微信默认桶
+	if task, err := r.store.FindRunningTaskBySession(ctx, sessionKey, msg.ConversationID); err == nil {
 		if _, err := r.tasks.CancelTask(ctx, task.ID, bot.OwnerID); err != nil {
 			slog.ErrorContext(ctx, "router: /new cancel running task failed",
 				"task_id", task.ID, "error", err)
 		}
 	}
-	// 微信 Bot 个人自用单桶: /new 清默认桶(IM_CHANNEL_ARCHITECTURE §2/§3);
-	// 群聊渠道接入后由各渠道 conversation_key 区分。
-	if _, err := r.store.ResetWorkspaceForNewSession(ctx, sessionKey, ""); err != nil {
+	// 桶级 /new(IM_CHANNEL_ARCHITECTURE §3): 只清当前对话单元桶; 微信
+	// conversation_id 恒空 = 默认桶。
+	if _, err := r.store.ResetWorkspaceForNewSession(ctx, sessionKey, msg.ConversationID); err != nil {
 		return RouterResult{}, fmt.Errorf("reset workspace: %w", err)
 	}
 	reply := "已开启新会话，history 和 working 已清空"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionNewSession, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
 // handleStatus reports whether there is a running task for the user's session.
-func (r *router) handleStatus(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+func (r *router) handleStatus(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig) (RouterResult, error) {
 	sessionKey, err := r.resolveSessionKey(ctx, bot.OwnerID)
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
-	_, err = r.store.FindRunningTaskBySession(ctx, sessionKey, "") // 微信默认桶
+	_, err = r.store.FindRunningTaskBySession(ctx, sessionKey, msg.ConversationID)
 	var reply string
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -176,16 +176,16 @@ func (r *router) handleStatus(ctx context.Context, msg IncomingMessage, bot doma
 	default:
 		reply = "🔴 running — task in progress"
 	}
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionStatus, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
 // handleHelp returns the list of platform-level commands, generated from the
 // admin-configurable command registry (not hardcoded).
-func (r *router) handleHelp(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+func (r *router) handleHelp(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig) (RouterResult, error) {
 	commands := r.loadCommands(ctx)
 	reply := buildHelpText(commands)
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionHelp, Reply: reply, UserID: bot.OwnerID}, nil
 }
 
@@ -219,10 +219,10 @@ func buildHelpText(commands map[string]domain.PlatformCommand) string {
 
 // handleNormalMessage forwards a non-command text/media payload as a task to
 // the Worker via TaskService.SubmitTask.
-func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, text string, inboundSessionKey string) (*domain.Message, RouterResult, error) {
+func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig, text string, inboundSessionKey string) (*domain.Message, RouterResult, error) {
 	if text == "" && len(msg.MediaPaths) == 0 {
 		reply := "empty message ignored"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return nil, RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	prompt := text
@@ -275,14 +275,17 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		_, row, err := r.tasks.SubmitTaskWithInboundMessage(ctx, domain.SubmitTaskCommand{
 			SessionKey:        sessionKey,
 			RequesterUserID:   bot.OwnerID,
-			Source:            domain.SourceWechat,
+			Source:            msg.ChannelType,
 			SourceInstanceID:  r.sourceInstance,
 			MessageID:         msg.MessageID,
 			Prompt:            prompt,
 			PersonaSnapshot:   []string{},
 			ToolPolicyVersion: userPolicy,
-			// 微信 Bot 个人自用单桶: conversation_key 恒空(IM_CHANNEL_ARCHITECTURE §2)。
-			ConversationKey: "",
+			// 分桶(IM_CHANNEL_ARCHITECTURE §3): Source=渠道, ConversationKey=
+			// 对话单元 ID(微信恒空=默认桶)。
+			ConversationKey: msg.ConversationID,
+			// 群/私聊维度(IM_STREAMING_DELIVERY §4.4): 群聊统一只发最终结果。
+			ConversationType: msg.ConversationType,
 		}, domain.Message{
 			UserID:      bot.OwnerID,
 			BotID:       bot.ID,
@@ -306,14 +309,14 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		if _, err := r.tasks.SubmitTask(ctx, domain.SubmitTaskCommand{
 			SessionKey:        sessionKey,
 			RequesterUserID:   bot.OwnerID,
-			Source:            domain.SourceWechat,
+			Source:            msg.ChannelType,
 			SourceInstanceID:  r.sourceInstance,
 			MessageID:         msg.MessageID,
 			Prompt:            prompt,
 			PersonaSnapshot:   []string{},
 			ToolPolicyVersion: userPolicy,
-			// 微信 Bot 个人自用单桶: conversation_key 恒空(IM_CHANNEL_ARCHITECTURE §2)。
-			ConversationKey: "",
+			ConversationKey:   msg.ConversationID,
+			ConversationType: msg.ConversationType,
 		}); err != nil {
 			r.rollbackImportedAttachments(ctx, sessionKey, importedRefs)
 			return nil, RouterResult{}, fmt.Errorf("submit task: %w", err)

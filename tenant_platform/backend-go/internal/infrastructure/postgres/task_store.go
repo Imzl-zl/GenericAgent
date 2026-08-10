@@ -171,17 +171,20 @@ SELECT COALESCE(MAX(session_sequence), 0) + 1 FROM tasks WHERE session_key = $1
 INSERT INTO tasks (
   id, workspace_id, session_key, session_sequence, requester_user_id,
   source, source_instance_id, message_id, message_idempotency_key, conversation_key,
+  conversation_type,
   prompt, persona_snapshot, tool_policy_version, prompt_bytes, persona_bytes,
   status, fresh_session
 ) VALUES (
   $1,$2,$3,$4,$5,
   $6,$7,$8,$9,$10,
-  $11,$12::jsonb,$13,$14,$15,
-  'queued', $16
+  $11,
+  $12,$13::jsonb,$14,$15,$16,
+  'queued', $17
 )
 ON CONFLICT (source, source_instance_id, message_idempotency_key) DO NOTHING
 RETURNING `+taskSelectColumns, taskID, workspaceID, cmd.SessionKey, nextSeq, requester,
 			cmd.Source, cmd.SourceInstanceID, cmd.MessageID, idemKey, cmd.ConversationKey,
+			domain.NormalizeConversationType(cmd.ConversationType),
 			cmd.Prompt, string(personaRaw), cmd.ToolPolicyVersion, promptBytes, personaBytes,
 			freshSession,
 		)
@@ -228,6 +231,28 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (domain.Task, error)
 		return domain.Task{}, err
 	}
 	return t, nil
+}
+
+// MarkTaskStreamFinal 置位任务的流式最终交付标记(IM_STREAMING_DELIVERY
+// §4.2): scheduler 在流式回复 commit 成功后调用, delivery 据此跳过文本
+// part(文件照发)。幂等: 已置位/任务已终态时无操作。返回置位后的
+// stream_final_at(未置位返回 nil)。
+func (s *Store) MarkTaskStreamFinal(ctx context.Context, taskID string) (*time.Time, error) {
+	var finalAt *time.Time
+	err := s.pool.QueryRow(ctx, `
+UPDATE tasks SET
+  stream_final_at = timezone('utc', now()),
+  updated_at = timezone('utc', now())
+WHERE id = $1 AND stream_final_at IS NULL
+RETURNING stream_final_at
+`, taskID).Scan(&finalAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("mark task stream final: %w", err)
+	}
+	return finalAt, nil
 }
 
 // WorkspaceIsFresh 返回本对话单元桶的 reset 标记是否仍待消费(/new 后首个成功

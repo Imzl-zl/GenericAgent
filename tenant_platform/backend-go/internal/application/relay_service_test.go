@@ -97,7 +97,7 @@ func TestRelaySuccess(t *testing.T) {
 	if !ok {
 		t.Fatal("expected one sent message")
 	}
-	if sent.BotUUID != "bot-bob" || sent.IlinkUserID != "ilink-bob" {
+	if sent.BotUUID != "bot-bob" || sent.ChannelAccountID != "ilink-bob" {
 		t.Fatalf("unexpected send target: %+v", sent)
 	}
 	want := "[来自 alice 的消息] hello"
@@ -173,7 +173,7 @@ func TestRelayRecipientNotBound(t *testing.T) {
 			Username: "bob",
 			Status:   domain.UserApproved,
 			OptOut:   false,
-			// BotUUID and IlinkUserID empty
+			// BotUUID and ChannelAccountID empty
 		},
 	}
 	svc := newRelayServiceForTest(store, transport.NewLoopbackTransport())

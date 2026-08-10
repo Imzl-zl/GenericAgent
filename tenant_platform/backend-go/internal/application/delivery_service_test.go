@@ -311,7 +311,7 @@ func TestDeliveryServiceReconcilesCarrierFileSuccessAfterTransientDatabaseFailur
 func TestDeliveryServiceDeadLettersUnboundBot(t *testing.T) {
 	ctx, svc, deps := setupDeliveryService(t)
 	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1}
-	deps.bots.bot = domain.Bot{OwnerID: 1, BotUUID: "b1"} // not bound
+	deps.bots.bot = domain.ChannelConfig{OwnerID: 1, BotUUID: "b1", ChannelType: domain.ChannelWechat} // not bound
 
 	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_failed", TaskID: "t1", DeliveryType: domain.DeliveryTaskFailed, ErrorCode: "E", ErrorMessage: "fail"}}
 
@@ -432,8 +432,14 @@ func setupDeliveryService(t *testing.T) (context.Context, *deliveryService, deli
 	return context.Background(), svc.(*deliveryService), deps
 }
 
-func boundBot(ownerID int64) domain.Bot {
-	return domain.Bot{OwnerID: ownerID, BotUUID: "b1", IlinkUserID: "u1"}
+func boundBot(ownerID int64) domain.ChannelConfig {
+	return domain.ChannelConfig{
+		OwnerID:     ownerID,
+		BotUUID:     "b1",
+		ChannelType: domain.ChannelWechat,
+		IlinkUserID: "u1",
+		State:       domain.ChannelActive,
+	}
 }
 
 func ptr(t time.Time) *time.Time { return &t }
@@ -503,11 +509,11 @@ func (r *fakeTaskReader) GetTask(_ context.Context, _ string) (domain.Task, erro
 }
 
 type fakeBotResolver struct {
-	bot domain.Bot
+	bot domain.ChannelConfig
 	err error
 }
 
-func (r *fakeBotResolver) GetBotByOwner(_ context.Context, _ int64) (domain.Bot, error) {
+func (r *fakeBotResolver) GetChannelConfigByOwnerAndType(_ context.Context, _ int64, _ domain.ChannelType) (domain.ChannelConfig, error) {
 	return r.bot, r.err
 }
 
@@ -519,18 +525,18 @@ type fakeTransport struct {
 }
 
 type transportRecord struct {
-	BotUUID, IlinkUserID, Text, ClientID string
+	BotUUID, ChannelAccountID, Text, ClientID string
 }
 
 type fileTransportRecord struct {
-	BotUUID, IlinkUserID, FilePath, FileName, ClientID string
+	BotUUID, ChannelAccountID, FilePath, FileName, ClientID string
 }
 
 func (t *fakeTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, text, clientID string) error {
 	if t.err != nil {
 		return t.err
 	}
-	t.sent = append(t.sent, transportRecord{BotUUID: botUUID, IlinkUserID: ilinkUserID, Text: text, ClientID: clientID})
+	t.sent = append(t.sent, transportRecord{BotUUID: botUUID, ChannelAccountID: ilinkUserID, Text: text, ClientID: clientID})
 	return nil
 }
 
@@ -541,7 +547,7 @@ func (t *fakeTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePa
 	if t.err != nil {
 		return t.err
 	}
-	t.sentFiles = append(t.sentFiles, fileTransportRecord{BotUUID: botUUID, IlinkUserID: ilinkUserID, FilePath: filePath, FileName: fileName, ClientID: clientID})
+	t.sentFiles = append(t.sentFiles, fileTransportRecord{BotUUID: botUUID, ChannelAccountID: ilinkUserID, FilePath: filePath, FileName: fileName, ClientID: clientID})
 	return nil
 }
 

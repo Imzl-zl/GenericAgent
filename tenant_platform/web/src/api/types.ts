@@ -51,12 +51,33 @@ export interface WechatQRCodeStatus {
 export interface Bot {
   bot_id: number;
   bot_uuid: string;
+  channel_type: string;
   ilink_bot_id: string;
-  ilink_user_id?: string;
+  channel_account_id?: string;
   baseurl?: string;
   owner_id: number;
   state: string;
   created_at: string;
+}
+
+// 渠道绑定(IM_CHANNEL_BINDING §4): GET/PUT/DELETE /v1/me/im-bindings。
+export type ChannelType = 'wechat' | 'feishu' | 'dingtalk' | 'qq';
+
+export interface ChannelBinding {
+  channel_type: ChannelType;
+  state: 'active' | 'disabled' | 'expired' | 'revoked';
+  bound_at: string;
+  updated_at?: string;
+  meta: {
+    ilink_bot_id?: string;
+    channel_account_id?: string;
+    app_id?: string;
+  };
+}
+
+export interface SaveChannelBindingRequest {
+  app_id: string;
+  app_secret: string;
 }
 
 export interface Persona {

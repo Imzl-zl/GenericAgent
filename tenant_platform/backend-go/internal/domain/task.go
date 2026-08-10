@@ -20,6 +20,10 @@ type SubmitTaskCommand struct {
 	// ConversationKey 是渠道内对话单元标识(对端/群 ID); 空 = 该渠道默认桶
 	// (微信个人自用单桶 / 非渠道入口)。分桶见 IM_CHANNEL_ARCHITECTURE §3。
 	ConversationKey string
+	// ConversationType 是对话单元类型('private'|'group'): IM 流式转发
+	// 判定维度(群聊统一只发最终结果, IM_STREAMING_DELIVERY §4.4)。
+	// 微信恒 private; web/非 IM 入口默认 private。
+	ConversationType string
 }
 
 // TaskStatus is the durable task lifecycle state.
@@ -36,15 +40,86 @@ const (
 )
 
 // Source values are the protocol-level origins allowed for task submission
-// (architecture §4.2: wechat|web).
+// (architecture §4.2: wechat|web; IM_CHANNEL_BINDING §5: feishu|dingtalk|qq).
 const (
-	SourceWechat = "wechat"
-	SourceWeb    = "web"
+	SourceWechat   = "wechat"
+	SourceWeb      = "web"
+	SourceFeishu   = "feishu"
+	SourceDingTalk = "dingtalk"
+	SourceQQ       = "qq"
 )
 
 // IsValidSource reports whether s is an allowed task source.
 func IsValidSource(s string) bool {
-	return s == SourceWechat || s == SourceWeb
+	switch s {
+	case SourceWechat, SourceWeb, SourceFeishu, SourceDingTalk, SourceQQ:
+		return true
+	default:
+		return false
+	}
+}
+
+// ConversationType values identify the conversation bucket kind for IM
+// streaming delivery decisions (IM_STREAMING_DELIVERY §4.4: 群聊收敛)。
+const (
+	ConversationTypePrivate = "private"
+	ConversationTypeGroup   = "group"
+)
+
+// NormalizeConversationType 校验并归一 conversation_type: 空/非法回退
+// 'private'(web 入口、存量任务、微信均无群概念)。
+func NormalizeConversationType(t string) string {
+	if t == ConversationTypeGroup {
+		return ConversationTypeGroup
+	}
+	return ConversationTypePrivate
+}
+
+// IsGroupConversation reports whether the conversation is a group bucket.
+func IsGroupConversation(t string) bool {
+	return t == ConversationTypeGroup
+}
+
+// IMStreamingMode is the administrator-managed IM streaming switch
+// (IM_STREAMING_DELIVERY §5).
+//
+//	off:        不转发任何流式片段(全渠道只发最终结果)
+//	final_only: 同上——保留语义别名(与 off 行为一致, 供 web 下拉区分
+//	            "完全关闭"与"只发最终结果"的展示; 实现上两者均为最终结果)
+//	streaming:  私聊按渠道能力转发流式片段(群聊恒定只发最终结果)
+//
+// 注: final_only 与 off 在 v1 行为相同(钉钉/微信本就不流式), 保留两个值
+// 是为了 web 设置项的用户语义清晰与后续扩展空间。
+type IMStreamingMode string
+
+const (
+	IMStreamingOff        IMStreamingMode = "off"
+	IMStreamingFinalOnly  IMStreamingMode = "final_only"
+	IMStreamingStreaming  IMStreamingMode = "streaming"
+	DefaultIMStreamingMode               = IMStreamingStreaming
+)
+
+// ValidIMStreamingMode reports whether m is an allowed mode value.
+func ValidIMStreamingMode(m IMStreamingMode) bool {
+	switch m {
+	case IMStreamingOff, IMStreamingFinalOnly, IMStreamingStreaming:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeIMStreamingMode 归一非法值到默认 streaming(设计: 私聊默认开)。
+func NormalizeIMStreamingMode(m IMStreamingMode) IMStreamingMode {
+	if ValidIMStreamingMode(m) {
+		return m
+	}
+	return DefaultIMStreamingMode
+}
+
+// StreamingEnabled reports whether the mode forwards streaming fragments.
+func (m IMStreamingMode) StreamingEnabled() bool {
+	return m == IMStreamingStreaming
 }
 
 // Task is the durable task envelope stored in PostgreSQL.
@@ -59,7 +134,14 @@ type Task struct {
 	MessageIdempotencyKey string
 	// ConversationKey 是该任务的对话单元桶键(渠道内对端/群 ID; 空=默认桶)。
 	ConversationKey string
-	Prompt          string
+	// ConversationType 是该任务的对话单元类型('private'|'group'; 默认
+	// 'private')——IM 流式转发判定维度(群聊只发最终结果)。
+	ConversationType string
+	// StreamFinalAt 非空 = 该任务的流式回复已 commit 成功(最终文本已
+	// 交付 IM), delivery 发送文本 part 时跳过(文件照发); 失败路径无
+	// 标记 → delivery 照发兜底。
+	StreamFinalAt *time.Time
+	Prompt        string
 	PersonaSnapshot       []string
 	ToolPolicyVersion     string
 	ClaimOwner            string

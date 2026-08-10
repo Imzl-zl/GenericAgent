@@ -1479,10 +1479,10 @@ func TestSubmitTaskWithInboundMessageAtomicity(t *testing.T) {
 	}
 	ctx := context.Background()
 	dev := seedDev(t, store)
-	// messages.bot_id 外键要求 bot 行存在。
+	// messages.bot_id 外键要求 channel_configs 行存在(0053 后 bots → channel_configs)。
 	if _, err := pool.Exec(ctx, `
-INSERT INTO bots (id, bot_uuid, owner_id, token_ciphertext, state, created_at, updated_at)
-VALUES (1, '00000000-0000-4000-8000-000000000001', 1, 'ciphertext', 'active', timezone('utc', now()), timezone('utc', now()))
+INSERT INTO channel_configs (id, bot_uuid, channel_type, owner_id, config_ciphertext, state, created_at, updated_at)
+VALUES (1, '00000000-0000-4000-8000-000000000001', 'wechat', 1, 'ciphertext', 'active', timezone('utc', now()), timezone('utc', now()))
 ON CONFLICT (id) DO NOTHING
 `); err != nil {
 		t.Fatal(err)

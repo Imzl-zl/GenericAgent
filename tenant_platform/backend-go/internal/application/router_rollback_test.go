@@ -116,7 +116,7 @@ func TestRemoveInboundKeepsOtherMessages(t *testing.T) {
 // imported attachments when task submission (with authz/idempotency) fails.
 func TestRouterRollsBackAttachmentsOnSubmitFailure(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	src := filepath.Join(t.TempDir(), "resume.txt")
 	if err := os.WriteFile(src, []byte("resume"), 0o644); err != nil {
@@ -127,8 +127,8 @@ func TestRouterRollsBackAttachmentsOnSubmitFailure(t *testing.T) {
 	tasks.submitErr = errors.New("member removed from team")
 
 	_, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "整理简历",
-		MediaPaths: []string{src},
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "整理简历",
+		MediaPaths: []string{src}, ChannelType: "wechat",
 	})
 	if err == nil {
 		t.Fatal("expected submit failure")
@@ -146,7 +146,7 @@ func TestRouterRollsBackAttachmentsOnSubmitFailure(t *testing.T) {
 // the imported attachments (no rollback on success).
 func TestRouterKeepsAttachmentsOnSuccessfulSubmit(t *testing.T) {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.BotActive}
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
 	store.statuses[42] = domain.UserApproved
 	src := filepath.Join(t.TempDir(), "resume.txt")
 	if err := os.WriteFile(src, []byte("resume"), 0o644); err != nil {
@@ -156,8 +156,8 @@ func TestRouterKeepsAttachmentsOnSuccessfulSubmit(t *testing.T) {
 	r, _, sessionFiles := newTestRouterWithSessionFiles(t, store, tr)
 
 	res, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "整理简历",
-		MediaPaths: []string{src},
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "整理简历",
+		MediaPaths: []string{src}, ChannelType: "wechat",
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/llmproxy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/policy"
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/infrastructure/secret"
@@ -25,31 +26,31 @@ const DefaultMaxRequestBodyBytes int64 = 1 << 20 // 1 MiB
 
 // Server is the loopback HTTP API.
 type Server struct {
-	svc                             application.TaskService
-	users                           application.UserService
-	wechatBinding                   application.WechatQRBindingService
-	botSvc                          application.BotService
-	invite                          application.InviteService
-	personas                        application.PersonaService
-	router                          application.Router
-	registry                        policy.Registry
-	policies                        application.AdminCommandPort
-	runtimeSettings                 application.RuntimeSettingsPort
-	llmProviders                    application.LLMProviderPort
-	mcpServers                      application.MCPServerPort
-	botLifecycle                    application.BotLifecycleService
-	taskStats                       application.TaskStatsPort
-	maxBodyBytes                    int64
-	runtimeProfileMu                sync.RWMutex
-	runtimeProfile                  RuntimeProfile
-	imAggregationRuntime            IMAggregationRuntime
-	sophub                          application.SophubService
-	sophubProxy                     *WorkerSophubProxy
-	mcpProxy                        *WorkerMCPProxy
-	cipher                          secret.TokenCipher
-	adminToken                        string
-	adminUserID                       int64
-	sessionKey                      string
+	svc                  application.TaskService
+	users                application.UserService
+	wechatBinding        application.WechatQRBindingService
+	channelSvc           application.ChannelConfigService
+	invite               application.InviteService
+	personas             application.PersonaService
+	router               application.Router
+	registry             policy.Registry
+	policies             application.AdminCommandPort
+	runtimeSettings      application.RuntimeSettingsPort
+	llmProviders         application.LLMProviderPort
+	mcpServers           application.MCPServerPort
+	botLifecycle         application.BotLifecycleService
+	taskStats            application.TaskStatsPort
+	maxBodyBytes         int64
+	runtimeProfileMu     sync.RWMutex
+	runtimeProfile       RuntimeProfile
+	imAggregationRuntime IMAggregationRuntime
+	sophub               application.SophubService
+	sophubProxy          *WorkerSophubProxy
+	mcpProxy             *WorkerMCPProxy
+	cipher               secret.TokenCipher
+	adminToken           string
+	adminUserID          int64
+	sessionKey           string
 	// webhookSecret is the HMAC-SHA256 key shared with the Bot Poller. When
 	// non-empty, /v1/im/webhook rejects requests whose X-Webhook-Signature
 	// header doesn't match. Empty = unauthenticated (dev/test only; logs once).
@@ -71,37 +72,38 @@ type Cipher interface {
 
 // ServerConfig configures the foundation API.
 type RuntimeProfile struct {
-	ClaimLeaseSeconds         int `json:"claim_lease_seconds"`
-	TokenTTLSeconds           int `json:"token_ttl_seconds"`
-	TokenRefreshSkewSeconds   int `json:"token_refresh_skew_seconds"`
-	MaxTaskWallClockSeconds   int `json:"max_task_wall_clock_seconds"`
-	TaskTimeoutSeconds        int `json:"task_timeout_seconds"`
-	TaskIdleTimeoutSeconds    int `json:"task_idle_timeout_seconds"`
-	MaxRunningTasks           int `json:"max_running_tasks"`
-	PerRequesterRunningLimit     int `json:"per_requester_running_limit"`
-	PerUserQueueLimit         int `json:"per_user_queue_limit"`
-	IMInboundCoalesceWindowMS int `json:"im_inbound_coalesce_window_ms"`
-	AgentMaxTurns             int `json:"agent_max_turns"`
+	ClaimLeaseSeconds         int                    `json:"claim_lease_seconds"`
+	TokenTTLSeconds           int                    `json:"token_ttl_seconds"`
+	TokenRefreshSkewSeconds   int                    `json:"token_refresh_skew_seconds"`
+	MaxTaskWallClockSeconds   int                    `json:"max_task_wall_clock_seconds"`
+	TaskTimeoutSeconds        int                    `json:"task_timeout_seconds"`
+	TaskIdleTimeoutSeconds    int                    `json:"task_idle_timeout_seconds"`
+	MaxRunningTasks           int                    `json:"max_running_tasks"`
+	PerRequesterRunningLimit  int                    `json:"per_requester_running_limit"`
+	PerUserQueueLimit         int                    `json:"per_user_queue_limit"`
+	IMInboundCoalesceWindowMS int                    `json:"im_inbound_coalesce_window_ms"`
+	AgentMaxTurns             int                    `json:"agent_max_turns"`
+	IMStreamingMode           domain.IMStreamingMode `json:"im_streaming_mode"`
 }
 
 type ServerConfig struct {
-	Service                         application.TaskService
-	Users                           application.UserService
-	WechatBinding                   application.WechatQRBindingService
-	BotService                      application.BotService
-	Invite                          application.InviteService
-	Personas                        application.PersonaService
-	Router                          application.Router
-	Registry                        policy.Registry
-	Policies                        application.AdminCommandPort
-	RuntimeSettings                 application.RuntimeSettingsPort
-	LLMProviders                    application.LLMProviderPort
-	MCPServers                      application.MCPServerPort
-	BotLifecycle                    application.BotLifecycleService
-	TaskStats                       application.TaskStatsPort
-	RuntimeProfile                  RuntimeProfile
-	IMAggregationRuntime            IMAggregationRuntime
-	Sophub                          application.SophubService
+	Service              application.TaskService
+	Users                application.UserService
+	WechatBinding        application.WechatQRBindingService
+	ChannelConfigService application.ChannelConfigService
+	Invite               application.InviteService
+	Personas             application.PersonaService
+	Router               application.Router
+	Registry             policy.Registry
+	Policies             application.AdminCommandPort
+	RuntimeSettings      application.RuntimeSettingsPort
+	LLMProviders         application.LLMProviderPort
+	MCPServers           application.MCPServerPort
+	BotLifecycle         application.BotLifecycleService
+	TaskStats            application.TaskStatsPort
+	RuntimeProfile       RuntimeProfile
+	IMAggregationRuntime IMAggregationRuntime
+	Sophub               application.SophubService
 	// SophubValidator 校验 Worker → Platform Sophub proxy 的 capability JWT。
 	SophubValidator func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error)
 	// SophubUsageCounter 按 JTI 原子计量 sophub 代理调用(审查 F10);
@@ -109,7 +111,7 @@ type ServerConfig struct {
 	SophubUsageCounter llmproxy.CapabilityUsageCounter
 	// SophubProxy 由 NewServer 依据 Sophub+SophubValidator 构造; 非 nil 时注册
 	// /v1/worker/sophub/* 端点。
-	SophubProxy                     *WorkerSophubProxy
+	SophubProxy *WorkerSophubProxy
 	// MCPValidator 校验 Worker → Platform MCP proxy 的 capability JWT
 	// (audience=ga-mcp-proxy); 与 MCPProxy 同时提供时注册 /v1/worker/mcp/*。
 	MCPValidator func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error)
@@ -117,11 +119,11 @@ type ServerConfig struct {
 	MCPUsageCounter llmproxy.CapabilityUsageCounter
 	// MCPProxy 由 NewServer 依据 MCPValidator 构造(需调用方提供 enabled-server
 	// resolver); 非 nil 时注册 /v1/worker/mcp/{server_id} 端点。
-	MCPProxy *WorkerMCPProxy
-	Cipher                          secret.TokenCipher
-	AdminToken                        string
-	AdminUserID                       int64
-	SessionKey                      string
+	MCPProxy    *WorkerMCPProxy
+	Cipher      secret.TokenCipher
+	AdminToken  string
+	AdminUserID int64
+	SessionKey  string
 	// WebhookSecret, when set, requires Bot Poller requests to /v1/im/webhook
 	// to carry a valid X-Webhook-Signature header (HMAC-SHA256 over body).
 	WebhookSecret string
@@ -158,32 +160,32 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		)
 	}
 	s := &Server{
-		svc:                             cfg.Service,
-		users:                           cfg.Users,
-		wechatBinding:                   cfg.WechatBinding,
-		botSvc:                          cfg.BotService,
-		invite:                          cfg.Invite,
-		personas:                        cfg.Personas,
-		router:                          cfg.Router,
-		registry:                        cfg.Registry,
-		policies:                        cfg.Policies,
-		runtimeSettings:                 cfg.RuntimeSettings,
-		llmProviders:                    cfg.LLMProviders,
-		mcpServers:                      cfg.MCPServers,
-		botLifecycle:                    cfg.BotLifecycle,
-		taskStats:                       cfg.TaskStats,
-		runtimeProfile:                  cfg.RuntimeProfile,
-		imAggregationRuntime:            cfg.IMAggregationRuntime,
-		sophub:                          cfg.Sophub,
-		sophubProxy:                     cfg.SophubProxy,
-		mcpProxy:                        cfg.MCPProxy,
-		cipher:                          cfg.Cipher,
-		adminToken:                        cfg.AdminToken,
-		adminUserID:                       cfg.AdminUserID,
-		sessionKey:                      cfg.SessionKey,
-		webhookSecret:                   cfg.WebhookSecret,
-		maxBodyBytes:                    cfg.MaxBodyBytes,
-		mux:                             http.NewServeMux(),
+		svc:                  cfg.Service,
+		users:                cfg.Users,
+		wechatBinding:        cfg.WechatBinding,
+		channelSvc:           cfg.ChannelConfigService,
+		invite:               cfg.Invite,
+		personas:             cfg.Personas,
+		router:               cfg.Router,
+		registry:             cfg.Registry,
+		policies:             cfg.Policies,
+		runtimeSettings:      cfg.RuntimeSettings,
+		llmProviders:         cfg.LLMProviders,
+		mcpServers:           cfg.MCPServers,
+		botLifecycle:         cfg.BotLifecycle,
+		taskStats:            cfg.TaskStats,
+		runtimeProfile:       cfg.RuntimeProfile,
+		imAggregationRuntime: cfg.IMAggregationRuntime,
+		sophub:               cfg.Sophub,
+		sophubProxy:          cfg.SophubProxy,
+		mcpProxy:             cfg.MCPProxy,
+		cipher:               cfg.Cipher,
+		adminToken:           cfg.AdminToken,
+		adminUserID:          cfg.AdminUserID,
+		sessionKey:           cfg.SessionKey,
+		webhookSecret:        cfg.WebhookSecret,
+		maxBodyBytes:         cfg.MaxBodyBytes,
+		mux:                  http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("POST /v1/sessions/{session_key}/tasks", s.userAuth(s.handleCreateTask))

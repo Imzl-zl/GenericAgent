@@ -26,6 +26,8 @@ type RuntimeSettingsPort interface {
 	UpdateIMInboundCoalesceWindowMS(ctx context.Context, windowMS int, updatedBy int64) (int, error)
 	GetAgentMaxTurns(ctx context.Context) (int, error)
 	UpdateAgentMaxTurns(ctx context.Context, maxTurns int, updatedBy int64) (int, error)
+	GetIMStreamingMode(ctx context.Context) (domain.IMStreamingMode, error)
+	UpdateIMStreamingMode(ctx context.Context, mode domain.IMStreamingMode, updatedBy int64) (domain.IMStreamingMode, error)
 }
 
 // LLMProviderPort 是上游 LLM 提供方管理端口。

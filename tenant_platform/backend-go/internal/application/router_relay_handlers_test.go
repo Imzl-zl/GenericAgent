@@ -55,17 +55,18 @@ func newTestRouterWithRelay(store *fakeRouterStore, tr *transport.LoopbackTransp
 	return r, fakeRelay
 }
 
-func relayTestBot(uuid, ilinkUser string, ownerID int64) domain.Bot {
-	return domain.Bot{
+func relayTestBot(uuid, ilinkUser string, ownerID int64) domain.ChannelConfig {
+	return domain.ChannelConfig{
 		ID:          1,
 		BotUUID:     uuid,
 		OwnerID:     ownerID,
 		IlinkUserID: ilinkUser,
-		State:       domain.BotActive,
+		State:       domain.ChannelActive,
+		ChannelType: domain.ChannelWechat,
 	}
 }
 
-func approvedStoreWithBot(bot domain.Bot) *fakeRouterStore {
+func approvedStoreWithBot(bot domain.ChannelConfig) *fakeRouterStore {
 	s := newFakeRouterStore()
 	s.bots[bot.BotUUID] = bot
 	s.statuses[bot.OwnerID] = domain.UserApproved
@@ -116,8 +117,8 @@ func TestRouterRelayMentionDispatched(t *testing.T) {
 	r, relay := newTestRouterWithRelay(store, tr, nil)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@bob hello there",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@bob hello there",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -142,8 +143,8 @@ func TestRouterRelayUserNotFound(t *testing.T) {
 	r, _ := newTestRouterWithRelay(store, tr, relay)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@nobody hi",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@nobody hi",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -161,8 +162,8 @@ func TestRouterRelaySelfTarget(t *testing.T) {
 	r, _ := newTestRouterWithRelay(store, tr, relay)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@alice hi",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@alice hi",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -180,8 +181,8 @@ func TestRouterRelayOptedOut(t *testing.T) {
 	r, _ := newTestRouterWithRelay(store, tr, relay)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@bob hi",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@bob hi",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -199,8 +200,8 @@ func TestRouterRelayNotBound(t *testing.T) {
 	r, _ := newTestRouterWithRelay(store, tr, relay)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@bob hi",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@bob hi",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -218,8 +219,8 @@ func TestRouterRelayNotApproved(t *testing.T) {
 	r, _ := newTestRouterWithRelay(store, tr, relay)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@bob hi",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@bob hi",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -236,8 +237,8 @@ func TestRouterRelayEmptyBody(t *testing.T) {
 	r, relay := newTestRouterWithRelay(store, tr, nil)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@bob",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@bob",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -258,8 +259,8 @@ func TestRouterRelayNilServiceFallsThrough(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@bob hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@bob hello",
+		ChannelType: "wechat",})
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created (fallback), got %s", res.Action)
 	}
@@ -273,8 +274,8 @@ func TestRouterRelayTransportFailure(t *testing.T) {
 	r, _ := newTestRouterWithRelay(store, tr, relay)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@bob hi",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@bob hi",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -291,8 +292,8 @@ func TestRouterRelayOffCommand(t *testing.T) {
 	r, relay := newTestRouterWithRelay(store, tr, nil)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/relay_off",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/relay_off",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -312,8 +313,8 @@ func TestRouterRelayOnCommand(t *testing.T) {
 	r, relay := newTestRouterWithRelay(store, tr, nil)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/relay_on",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/relay_on",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -334,8 +335,8 @@ func TestRouterRelayOffWhenServiceNil(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/relay_off",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/relay_off",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -353,8 +354,8 @@ func TestRouterRelayMentionDoesNotConflictWithCommands(t *testing.T) {
 
 	// /stop is still a command, not a relay target
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/stop",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/stop",
+		ChannelType: "wechat",})
 	if res.Action == ActionReplied && contains(res.Reply, "已转发") {
 		t.Fatalf("/stop should not be treated as relay, got %s", res.Action)
 	}

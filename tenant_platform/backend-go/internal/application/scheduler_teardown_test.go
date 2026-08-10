@@ -127,6 +127,10 @@ func (e *errRuntimeSettings) GetAgentMaxTurns(context.Context) (int, error) {
 	return 0, errors.New("runtime settings unavailable")
 }
 
+func (e *errRuntimeSettings) GetIMStreamingMode(context.Context) (domain.IMStreamingMode, error) {
+	return "", errors.New("runtime settings unavailable")
+}
+
 // terminalizeAfterMarkRunningStore 在 MarkRunning 成功后立即终态化任务,
 // 模拟"另一路径在 MarkRunning 与 GetTask 之间终态化任务"的并发场景。
 type terminalizeAfterMarkRunningStore struct {

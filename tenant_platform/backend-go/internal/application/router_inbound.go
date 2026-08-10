@@ -16,7 +16,7 @@ var nowFunc = func() time.Time { return time.Now().UTC() }
 // (round10 审查 B7): 消息行本身已在路由时持久化(任务同事务 / 命令-relay
 // claim), 此处只插入媒体资产元数据。插入幂等(UNIQUE on message_id +
 // storage_path); 失败非致命——消息已持久化并路由, 缺失媒体审计行可接受。
-func (r *router) persistInboundMedia(ctx context.Context, msg IncomingMessage, bot domain.Bot, msgRow domain.Message) error {
+func (r *router) persistInboundMedia(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig, msgRow domain.Message) error {
 	// Insert media_assets metadata. Idempotent (UNIQUE on message_id +
 	// storage_path). Failure is non-fatal: the message is already persisted
 	// and routed; a missing media audit row is acceptable.

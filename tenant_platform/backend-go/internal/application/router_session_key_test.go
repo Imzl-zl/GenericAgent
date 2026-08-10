@@ -25,8 +25,8 @@ func TestRouterFailsClosedOnActiveContextError(t *testing.T) {
 	r := newTeamTestRouter(store, tr, teams)
 
 	_, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if err == nil {
 		t.Fatal("expected error when active context resolution fails")
 	}
@@ -91,8 +91,8 @@ func TestRouterRelayUsesSingleResolvedContext(t *testing.T) {
 	}
 
 	if _, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "@alice 你好",
-	}); err != nil {
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "@alice 你好",
+		ChannelType: "wechat",}); err != nil {
 		t.Fatal(err)
 	}
 	if len(relay.relayCalls) != 0 {
@@ -125,8 +125,8 @@ func TestRouterTaskAndMessageShareSingleSessionKey(t *testing.T) {
 	}
 
 	if _, err := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	}); err != nil {
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",}); err != nil {
 		t.Fatal(err)
 	}
 	want := "team:11111111-2222-3333-4444-555555555555"

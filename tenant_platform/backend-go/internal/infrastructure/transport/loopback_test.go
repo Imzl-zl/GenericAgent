@@ -15,7 +15,7 @@ func TestLoopbackSendMessageRecordsMessage(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("expected 1 sent message, got %d", len(sent))
 	}
-	if sent[0].BotUUID != "bot-1" || sent[0].IlinkUserID != "user-1" || sent[0].Text != "hello" {
+	if sent[0].BotUUID != "bot-1" || sent[0].ChannelAccountID != "user-1" || sent[0].Text != "hello" {
 		t.Fatalf("unexpected message: %+v", sent[0])
 	}
 }

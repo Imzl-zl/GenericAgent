@@ -52,12 +52,12 @@ func personaAdminFixture(t *testing.T) (*Server, *postgres.Store) {
 		t.Fatal(err)
 	}
 	srv, err := NewServer(ServerConfig{
-		Service:    svc,
-		Registry:   reg,
-		Personas:   personas,
-		AdminToken:   "test-admin token",
-		AdminUserID:  9,
-		SessionKey: dev.SessionKey,
+		Service:     svc,
+		Registry:    reg,
+		Personas:    personas,
+		AdminToken:  "test-admin token",
+		AdminUserID: 9,
+		SessionKey:  dev.SessionKey,
 	})
 	if err != nil {
 		t.Fatal(err)

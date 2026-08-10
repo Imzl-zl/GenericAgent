@@ -10,18 +10,28 @@ import (
 	"strings"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/application"
+	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
 
 // imWebhookBody is the payload pushed by the Bot Poller to the platform.
-// The Poller reuses GA Core's WxBotClient and forwards every inbound message
-// here. Two payload variants exist:
-//   - normal message: bot_uuid, ilink_user_id, message_id, text, updates_buf,
-//     context_token, media_paths (absolute local paths for the worker),
+// The Poller forwards every inbound channel message here. Two payload
+// variants exist:
+//   - normal message: bot_uuid, channel_type, channel_account_id,
+//     conversation_id, message_id, text, updates_buf, context_token,
+//     media_paths (absolute local paths for the worker),
 //     media_items (metadata for media_assets persistence)
-//   - auth-expired signal: bot_uuid, auth_expired=true
+//   - auth-expired signal: bot_uuid, auth_expired=true (wechat iLink)
+//
+// 契约(IM_CHANNEL_BINDING §5): channel_type 标识渠道, conversation_id 是
+// 对话单元分桶键(微信恒空), updates_buf/context_token 为微信专用。
 type imWebhookBody struct {
-	BotUUID          string         `json:"bot_uuid"`
-	IlinkUserID      string         `json:"ilink_user_id"`
+	BotUUID          string `json:"bot_uuid"`
+	ChannelType      string `json:"channel_type"`
+	ChannelAccountID string `json:"channel_account_id"`
+	ConversationID   string `json:"conversation_id"`
+	// ConversationType 是对话单元类型('private'|'group'); 空回退 'private'。
+	// IM 流式转发判定维度(IM_STREAMING_DELIVERY §4.4: 群聊只发最终结果)。
+	ConversationType string         `json:"conversation_type"`
 	MessageID        string         `json:"message_id"`
 	Text             string         `json:"text"`
 	UpdatesBuf       string         `json:"updates_buf"`
@@ -115,12 +125,15 @@ func (s *Server) handleIMWebhook(w http.ResponseWriter, r *http.Request) {
 	// 新顺序中任何中间崩溃都由重试协议收敛: 任务/消息行唯一键保证路由
 	// 幂等, 路由成功后再提交 cursor, 2xx 语义 = 消息已处理且 cursor 已确认。
 	result, err := s.router.HandleMessage(r.Context(), application.IncomingMessage{
-		BotUUID:     body.BotUUID,
-		IlinkUserID: body.IlinkUserID,
-		MessageID:   body.MessageID,
-		Text:        body.Text,
-		MediaPaths:  body.MediaPaths,
-		MediaItems:  convertWebhookMedia(body.MediaItems),
+		BotUUID:          body.BotUUID,
+		ChannelType:      body.ChannelType,
+		ChannelAccountID: body.ChannelAccountID,
+		ConversationID:   body.ConversationID,
+		ConversationType: domain.NormalizeConversationType(body.ConversationType),
+		MessageID:        body.MessageID,
+		Text:             body.Text,
+		MediaPaths:       body.MediaPaths,
+		MediaItems:       convertWebhookMedia(body.MediaItems),
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "ROUTER_ERROR", err.Error(), tid)
@@ -168,8 +181,11 @@ func (s *Server) verifyWebhookSignature(body []byte, sigHex string) bool {
 }
 
 func validateIMWebhookBody(body imWebhookBody) error {
-	if strings.TrimSpace(body.IlinkUserID) == "" {
-		return errors.New("ilink_user_id is required")
+	if strings.TrimSpace(body.ChannelType) == "" {
+		return errors.New("channel_type is required")
+	}
+	if strings.TrimSpace(body.ChannelAccountID) == "" {
+		return errors.New("channel_account_id is required")
 	}
 	if strings.TrimSpace(body.MessageID) == "" {
 		return errors.New("message_id is required")

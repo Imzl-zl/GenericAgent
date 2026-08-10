@@ -5,7 +5,7 @@ import './Layout.css';
 
 const navItems = [
   { to: '/app', label: '仪表盘', icon: LayoutDashboard },
-  { to: '/app/binding', label: '微信绑定', icon: Link2 },
+  { to: '/app/binding', label: '渠道绑定', icon: Link2 },
   { to: '/app/persona', label: '人设', icon: UserCog },
   { to: '/app/status', label: '运行状态', icon: Activity },
   { to: '/app/docs', label: '使用文档', icon: BookOpen },

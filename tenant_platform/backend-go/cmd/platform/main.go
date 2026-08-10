@@ -759,6 +759,10 @@ func run() error {
 	}
 	sessionScopedConfig := true
 
+	// botTransport 在 transport 装配段(下方)赋值: 此处提前声明供 Scheduler
+	// 的流式转发端口注入(IM_STREAMING_DELIVERY §4.2); 装配段不再重复声明。
+	var botTransport transport.BotTransportAdapter
+
 	sched, err := application.NewScheduler(application.SchedulerConfig{
 		PlatformInstanceID:       processID,
 		ClaimLease:               *claimLease,
@@ -789,6 +793,16 @@ func run() error {
 		PerRequesterRunningLimit: *perRequesterRunningLimit,
 		TaskTimeoutSeconds:       *taskTimeoutSeconds,
 		RuntimeSettings:          store,
+		// IM 流式转发端口(IM_STREAMING_DELIVERY §4.2): 生产 = botTransport
+		// (ILinkAdapter 代理 poller /send stream_*; LoopbackTransport 测试);
+		// 断言失败(渠道 transport 未实现 StreamingSender)= nil = 关闭。
+		Streaming: func() transport.StreamingSender {
+			if s, ok := botTransport.(transport.StreamingSender); ok {
+				return s
+			}
+			return nil
+		}(),
+		Bots: store,
 		IdleTimeout:              time.Duration(*taskIdleTimeoutSec) * time.Second,
 	})
 	if err != nil {
@@ -824,7 +838,24 @@ func run() error {
 		return err
 	}
 
-	botSvc, err := application.NewBotService(store)
+	// 声明前置: channelSvc 的 Start 闭包引用 botLifecycle(Go 块级作用域
+	// 要求标识符声明先于引用出现)。
+	var botLifecycle application.BotLifecycleService
+	var botPollerClient *poller.Client
+
+	channelSvc, err := application.NewChannelConfigService(application.ChannelConfigServiceConfig{
+		Store:  store,
+		Cipher: cipher,
+		// 保存即生效: 凭据变更后热推 poller 重启连接; 无 Poller 时(测试/
+		// loopback)为 nil, 服务跳过。
+		Start: func(ctx context.Context, cfg domain.ChannelConfig) error {
+			if botLifecycle != nil {
+				return botLifecycle.StartChannelConfig(ctx, cfg)
+			}
+			return nil
+		},
+		Stop: botLifecycle,
+	})
 	if err != nil {
 		return err
 	}
@@ -852,14 +883,12 @@ func run() error {
 		}
 	}
 
-	// Bot transport + lifecycle: when iLink is configured, the Go platform
-	// delegates all iLink protocol I/O to the Python Bot Poller (which reuses
-	// GA Core's verified WxBotClient). Go owns encryption + persistence; the
-	// Poller owns getupdates/sendmessage. Without iLink, an in-process
-	// loopback transport is used for dev/test.
-	var botTransport transport.BotTransportAdapter
-	var botLifecycle application.BotLifecycleService
-	var botPollerClient *poller.Client
+	// Bot transport + lifecycle: when the poller is configured, the Go platform
+	// delegates all channel protocol I/O to the Python Bot Poller (wechat via
+	// GA Core's verified WxBotClient; feishu/dingtalk/qq via their SDK WS
+	// adapters). Go owns encryption + persistence; the Poller owns the
+	// long-lived connections. Without a poller, an in-process loopback
+	// transport is used for dev/test.
 	if pollerURL := strings.TrimSpace(*botPollerURL); pollerURL != "" {
 		if cipher == nil {
 			return fmt.Errorf("--bot-poller-url requires --bot-token-key/BOT_TOKEN_KEY")
@@ -962,7 +991,7 @@ func run() error {
 		Service:         svc,
 		Users:           userSvc,
 		WechatBinding:   wechatBindingSvc,
-		BotService:      botSvc,
+		ChannelConfigService: channelSvc,
 		Invite:          inviteSvc,
 		Personas:        personaSvc,
 		Router:          routerSvc,

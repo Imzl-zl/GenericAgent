@@ -21,10 +21,10 @@ func (s *Server) handleCreateWechatQRCode(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"qrcode_token":   sess.ILINKQRCode,
-		"qrcode_url":     sess.QRCodeImgURL,
-		"status":         string(sess.Status),
-		"expires_at":     sess.ExpiresAt.UTC().Format(time.RFC3339),
+		"qrcode_token": sess.ILINKQRCode,
+		"qrcode_url":   sess.QRCodeImgURL,
+		"status":       string(sess.Status),
+		"expires_at":   sess.ExpiresAt.UTC().Format(time.RFC3339),
 	})
 }
 
@@ -39,10 +39,10 @@ func (s *Server) handleAdminCreateWechatQRCode(w http.ResponseWriter, r *http.Re
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"qrcode_token":   sess.ILINKQRCode,
-		"qrcode_url":     sess.QRCodeImgURL,
-		"status":         string(sess.Status),
-		"expires_at":     sess.ExpiresAt.UTC().Format(time.RFC3339),
+		"qrcode_token": sess.ILINKQRCode,
+		"qrcode_url":   sess.QRCodeImgURL,
+		"status":       string(sess.Status),
+		"expires_at":   sess.ExpiresAt.UTC().Format(time.RFC3339),
 	})
 }
 
@@ -82,18 +82,19 @@ func (s *Server) handleGetWechatQRCodeStatus(w http.ResponseWriter, r *http.Requ
 		// begins long-polling iLink for inbound messages. The Poller's start
 		// is idempotent, so repeated confirmed-status polls are safe.
 		if s.botLifecycle != nil {
-			if err := s.botLifecycle.StartBotForBoundUser(r.Context(), bot); err != nil {
+			if err := s.botLifecycle.StartChannelConfig(r.Context(), bot); err != nil {
 				writeErr(w, http.StatusBadGateway, "BOT_START_FAILED", err.Error(), tid)
 				return
 			}
 		}
 		reply["bot"] = map[string]any{
-			"bot_uuid":      bot.BotUUID,
-			"ilink_bot_id":  bot.IlinkBotID,
-			"ilink_user_id": bot.IlinkUserID,
-			"baseurl":       bot.BaseURL,
-			"state":         string(bot.State),
-			"created_at":    bot.CreatedAt.UTC().Format(time.RFC3339),
+			"bot_uuid":           bot.BotUUID,
+			"channel_type":       bot.ChannelType,
+			"ilink_bot_id":       bot.IlinkBotID,
+			"channel_account_id": bot.IlinkUserID,
+			"baseurl":            bot.BaseURL,
+			"state":              string(bot.State),
+			"created_at":         bot.CreatedAt.UTC().Format(time.RFC3339),
 		}
 	}
 	writeJSON(w, http.StatusOK, reply)

@@ -13,6 +13,10 @@ const (
 	DefaultAgentMaxTurns    = 80
 	MinAgentMaxTurns        = 10
 	MaxAgentMaxTurns        = 500
+
+	// IMStreamingModeSettingKey 是 IM 流式输出开关(off|final_only|streaming),
+	// 默认 streaming(设计: 私聊默认开, 群聊由转发判定收敛)。
+	IMStreamingModeSettingKey = "im_streaming_mode"
 )
 
 func ValidateIMInboundCoalesceWindowMS(windowMS int) error {
@@ -25,6 +29,14 @@ func ValidateIMInboundCoalesceWindowMS(windowMS int) error {
 func ValidateAgentMaxTurns(maxTurns int) error {
 	if maxTurns < MinAgentMaxTurns || maxTurns > MaxAgentMaxTurns {
 		return fmt.Errorf("max_turns must be between %d and %d", MinAgentMaxTurns, MaxAgentMaxTurns)
+	}
+	return nil
+}
+
+// ValidateIMStreamingMode 校验 im_streaming_mode 枚举值。
+func ValidateIMStreamingMode(m string) error {
+	if !ValidIMStreamingMode(IMStreamingMode(m)) {
+		return fmt.Errorf("im_streaming_mode must be one of off|final_only|streaming, got %q", m)
 	}
 	return nil
 }

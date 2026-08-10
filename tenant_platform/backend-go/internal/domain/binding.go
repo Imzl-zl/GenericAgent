@@ -43,34 +43,69 @@ type ChannelBinding struct {
 	UpdatedAt        time.Time
 }
 
-// BotState is the bot lifecycle (spec §5: bots).
-type BotState string
+// ChannelType identifies an IM channel integration (IM_CHANNEL_BINDING §2).
+type ChannelType string
 
 const (
-	BotActive  BotState = "active"
-	BotExpired BotState = "expired"
-	BotRevoked BotState = "revoked"
+	// ChannelWechat is the iLink official gateway bot (个人自用, 扫码绑定).
+	ChannelWechat ChannelType = "wechat"
+	// ChannelFeishu is the Lark/Feishu enterprise self-built app (lark-oapi WS).
+	ChannelFeishu ChannelType = "feishu"
+	// ChannelDingTalk is the DingTalk open-platform app (dingtalk-stream).
+	ChannelDingTalk ChannelType = "dingtalk"
+	// ChannelQQ is the QQ open-platform bot (botpy WS).
+	ChannelQQ ChannelType = "qq"
 )
 
-// Bot is a WeChat bot owned by a platform user (spec §5).
-// ilink_user_id is set via the official iLink QR binding flow;
-// token_ciphertext is the encrypted upstream bot token, never plaintext.
-type Bot struct {
+// IsValidChannelType reports whether s is a supported channel type.
+func IsValidChannelType(s string) bool {
+	switch ChannelType(s) {
+	case ChannelWechat, ChannelFeishu, ChannelDingTalk, ChannelQQ:
+		return true
+	default:
+		return false
+	}
+}
+
+// ChannelConfigState is the channel config lifecycle.
+type ChannelConfigState string
+
+const (
+	ChannelActive   ChannelConfigState = "active"
+	ChannelDisabled ChannelConfigState = "disabled"
+	ChannelExpired  ChannelConfigState = "expired"
+	ChannelRevoked  ChannelConfigState = "revoked"
+)
+
+// ChannelConfig is a user-owned channel connection configuration
+// (IM_CHANNEL_BINDING §3; formerly Bot). One row per (owner_id, channel_type).
+// ilink_user_id 是微信专用列(新渠道 NULL); 账号标识在 config JSON 内。
+// ConfigCiphertext 是加密的渠道凭据 JSON(微信={token}, 新渠道={app_id,
+// app_secret}), 永不明文入库。
+type ChannelConfig struct {
 	ID                int64
 	BotUUID           string
+	ChannelType       ChannelType
 	IlinkBotID        string
 	OwnerID           int64
 	IlinkUserID       string
 	BaseURL           string
-	TokenCiphertext   []byte
-	TokenKeyVersion   int
-	State             BotState
+	ConfigCiphertext  []byte
+	ConfigKeyVersion  int
+	State             ChannelConfigState
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
 
-// IsBound reports whether the bot has a paired ilink_user_id.
-func (b Bot) IsBound() bool { return b.IlinkUserID != "" }
+// IsBound reports whether the channel config is usable for routing.
+// 微信: 扫码确认后才算绑定(ilink_user_id 非空); 新渠道: active 即可用
+// (属主即 canonical user, 无需二次绑定)。
+func (c ChannelConfig) IsBound() bool {
+	if c.ChannelType == ChannelWechat {
+		return c.IlinkUserID != ""
+	}
+	return c.State == ChannelActive
+}
 
 // WechatQRStatus is the iLink QR-code scan lifecycle.
 type WechatQRStatus string

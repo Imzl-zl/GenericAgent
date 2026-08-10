@@ -109,8 +109,6 @@ func (s *Server) handleGetAgentRuntimeSettings(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, agentRuntimeSettingsReply{MaxTurns: maxTurns})
 }
 
-
-
 func (s *Server) handleUpdateAgentRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
 	var body updateAgentRuntimeSettingsBody
@@ -131,4 +129,44 @@ func (s *Server) handleUpdateAgentRuntimeSettings(w http.ResponseWriter, r *http
 		profile.AgentMaxTurns = maxTurns
 	})
 	writeJSON(w, http.StatusOK, agentRuntimeSettingsReply{MaxTurns: maxTurns})
+}
+
+type imStreamingSettingsReply struct {
+	Mode domain.IMStreamingMode `json:"mode"`
+}
+
+type updateIMStreamingSettingsBody struct {
+	Mode domain.IMStreamingMode `json:"mode"`
+}
+
+func (s *Server) handleGetIMStreamingSettings(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	mode, err := s.runtimeSettings.GetIMStreamingMode(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "GET_IM_STREAMING_FAILED", err.Error(), tid)
+		return
+	}
+	writeJSON(w, http.StatusOK, imStreamingSettingsReply{Mode: mode})
+}
+
+func (s *Server) handleUpdateIMStreamingSettings(w http.ResponseWriter, r *http.Request) {
+	tid := traceID()
+	var body updateIMStreamingSettingsBody
+	if err := decodeStrict(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), tid)
+		return
+	}
+	if err := domain.ValidateIMStreamingMode(string(body.Mode)); err != nil {
+		writeErr(w, http.StatusBadRequest, "INVALID_IM_STREAMING_MODE", err.Error(), tid)
+		return
+	}
+	mode, err := s.runtimeSettings.UpdateIMStreamingMode(r.Context(), body.Mode, s.adminUserID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "UPDATE_IM_STREAMING_FAILED", err.Error(), tid)
+		return
+	}
+	s.updateRuntimeProfile(func(profile *RuntimeProfile) {
+		profile.IMStreamingMode = mode
+	})
+	writeJSON(w, http.StatusOK, imStreamingSettingsReply{Mode: mode})
 }

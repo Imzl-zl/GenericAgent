@@ -81,6 +81,8 @@ func migrationFiles() []string {
 		"0050_user_personal_workspace.sql",
 		"0051_conversation_key.sql",
 		"0052_conversation_resets.sql",
+		"0053_channel_configs.sql",
+		"0054_im_streaming.sql",
 	}
 }
 
@@ -137,6 +139,8 @@ var pendingMigrations = []struct {
 	{"0050_user_personal_workspace.sql", "migration_0050_user_personal_workspace_marker"},
 	{"0051_conversation_key.sql", "migration_0051_conversation_key_marker"},
 	{"0052_conversation_resets.sql", "migration_0052_conversation_resets_marker"},
+	{"0053_channel_configs.sql", "migration_0053_channel_configs_marker"},
+	{"0054_im_streaming.sql", "migration_0054_im_streaming_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -156,6 +160,7 @@ var foundationTableNames = []string{
 	"audit_events",
 	"context_tokens",
 	"bot_transport_state",
+	"channel_configs",
 	"bots",
 	"binding_attempts",
 	"task_deliveries",
@@ -202,6 +207,8 @@ var foundationTableNames = []string{
 	"migration_0047_delivery_attempt_token_marker",
 	"migration_0048_platform_admin_bootstrap_marker",
 	"migration_0049_mcp_gateway_marker",
+	"migration_0053_channel_configs_marker",
+	"migration_0054_im_streaming_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",

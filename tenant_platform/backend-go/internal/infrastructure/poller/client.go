@@ -75,19 +75,25 @@ func (c *Client) ConfigureInboundCoalescing(ctx context.Context, windowMS int) e
 }
 
 // StartBotRequest is the body for POST /start.
+//
+// ChannelType selects the adapter (wechat|feishu|dingtalk|qq); ConfigJSON is
+// the decrypted channel config JSON (wechat={token}, 新渠道={app_id,
+// app_secret}), never plaintext at rest but always carried over the local
+// control-plane HTTP link (same trust domain as the old bot_token).
 type StartBotRequest struct {
-	BotUUID    string `json:"bot_uuid"`
-	BotToken   string `json:"bot_token"`
-	ILinkBotID string `json:"ilink_bot_id"`
+	BotUUID     string          `json:"bot_uuid"`
+	ChannelType string          `json:"channel_type"`
+	ConfigJSON  json.RawMessage `json:"config_json"`
+	// BaseURL / UpdatesBuf are wechat-only (iLink gateway endpoint + cursor).
 	BaseURL    string `json:"base_url"`
 	UpdatesBuf string `json:"updates_buf"`
 	WebhookURL string `json:"webhook_url"`
 }
 
-// StartBot tells the poller to begin long-polling for one bot.
+// StartBot tells the poller to begin polling for one channel config.
 func (c *Client) StartBot(ctx context.Context, req StartBotRequest) error {
-	if req.BotUUID == "" || req.BotToken == "" || req.WebhookURL == "" {
-		return errors.New("bot_uuid, bot_token, and webhook_url are required")
+	if req.BotUUID == "" || req.ChannelType == "" || len(req.ConfigJSON) == 0 || req.WebhookURL == "" {
+		return errors.New("bot_uuid, channel_type, config_json, and webhook_url are required")
 	}
 	_, err := c.post(ctx, "/start", req)
 	return err
@@ -131,13 +137,17 @@ const (
 // For text messages, only Text needs to be set (MsgType defaults to "text").
 // For media messages, MsgType must be one of image/video/file and FilePath
 // must point to a local file accessible to the Python Poller process.
+//
+// ChannelAccountID 是回复目标(微信=ilink_user_id, 新渠道=conversation_id/
+// 对端 ID); ChannelType 用于跨 adapter 分发(与注册表核对)。
 type SendMessageRequest struct {
-	BotUUID      string `json:"bot_uuid"`
-	ILinkUserID  string `json:"ilink_user_id"`
-	Text         string `json:"text,omitempty"`
-	ContextToken string `json:"context_token,omitempty"`
-	MsgType      string `json:"msg_type,omitempty"`
-	FilePath     string `json:"file_path,omitempty"`
+	BotUUID          string `json:"bot_uuid"`
+	ChannelType      string `json:"channel_type"`
+	ChannelAccountID string `json:"channel_account_id"`
+	Text             string `json:"text,omitempty"`
+	ContextToken     string `json:"context_token,omitempty"`
+	MsgType          string `json:"msg_type,omitempty"`
+	FilePath         string `json:"file_path,omitempty"`
 	// FileName 是用户可见的文件名(审查 R5-I10): 与 file_path 分离, 快照
 	// 临时文件名不得作为显示名暴露给用户。
 	FileName string `json:"file_name,omitempty"`
@@ -146,11 +156,11 @@ type SendMessageRequest struct {
 	ClientID string `json:"client_id,omitempty"`
 }
 
-// SendMessage delivers a text or media reply via the poller (which calls
-// iLink sendmessage). Empty MsgType defaults to "text" for backward compat.
+// SendMessage delivers a text or media reply via the poller (which dispatches
+// to the channel adapter). Empty MsgType defaults to "text" for backward compat.
 func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error {
-	if req.BotUUID == "" || req.ILinkUserID == "" {
-		return errors.New("bot_uuid and ilink_user_id are required")
+	if req.BotUUID == "" || req.ChannelAccountID == "" {
+		return errors.New("bot_uuid and channel_account_id are required")
 	}
 	msgType := req.MsgType
 	if msgType == "" {
@@ -171,6 +181,60 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 	req.MsgType = msgType
 	_, err := c.post(ctx, "/send", req)
 	return err
+}
+
+// Stream action constants for StreamActionRequest.Action
+// (IM_STREAMING_DELIVERY §4.2: /send 扩展 stream_action, 不新增端点)。
+const (
+	StreamActionOpen   = "open"
+	StreamActionAppend = "append"
+	StreamActionCommit = "commit"
+	StreamActionAbort  = "abort"
+)
+
+// StreamActionRequest is the body for a /send stream_action call.
+type StreamActionRequest struct {
+	BotUUID          string `json:"bot_uuid"`
+	ChannelAccountID string `json:"channel_account_id"`
+	StreamID         string `json:"stream_id,omitempty"`
+	StreamAction     string `json:"stream_action"`
+	Text             string `json:"text,omitempty"`
+}
+
+// StreamActionResponse is returned by stream_action=open.
+type StreamActionResponse struct {
+	Sent     bool   `json:"sent"`
+	StreamID string `json:"stream_id,omitempty"`
+}
+
+// StreamAction 执行一次 IM 流式动作(open|append|commit|abort)。open 返回
+// 渠道侧 stream_id(飞书=占位消息句柄), 其余动作按 stream_id 路由。
+// 非流渠道返回 NotImplementedError → 调用方回退终态 delivery。
+func (c *Client) StreamAction(ctx context.Context, req StreamActionRequest) (StreamActionResponse, error) {
+	if req.BotUUID == "" {
+		return StreamActionResponse{}, errors.New("bot_uuid is required")
+	}
+	switch req.StreamAction {
+	case StreamActionOpen:
+		if req.ChannelAccountID == "" {
+			return StreamActionResponse{}, errors.New("channel_account_id is required for stream_action=open")
+		}
+	case StreamActionAppend, StreamActionCommit, StreamActionAbort:
+		if req.StreamID == "" {
+			return StreamActionResponse{}, fmt.Errorf("stream_id is required for stream_action=%s", req.StreamAction)
+		}
+	default:
+		return StreamActionResponse{}, fmt.Errorf("unsupported stream_action: %s", req.StreamAction)
+	}
+	body, err := c.post(ctx, "/send", req)
+	if err != nil {
+		return StreamActionResponse{}, err
+	}
+	var resp StreamActionResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return StreamActionResponse{}, fmt.Errorf("decode stream action response: %w", err)
+	}
+	return resp, nil
 }
 
 // HealthResponse is returned by GET /health.

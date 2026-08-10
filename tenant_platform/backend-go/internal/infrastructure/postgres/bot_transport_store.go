@@ -86,27 +86,28 @@ ON CONFLICT (bot_id) DO UPDATE SET
 	return err
 }
 
-// ListActiveBoundBots returns all bots in 'active' state that have a bound
-// ilink_user_id. Used by RestoreActiveBots on platform startup to re-register
-// each bot with the Bot Poller.
-func (s *Store) ListActiveBoundBots(ctx context.Context) ([]domain.Bot, error) {
+// ListActiveChannelConfigs returns all channel configs in 'active' state
+// (wechat configs additionally require a bound ilink_user_id). Used by
+// RestoreActiveBots on platform startup to re-register every channel with
+// the Bot Poller.
+func (s *Store) ListActiveChannelConfigs(ctx context.Context) ([]domain.ChannelConfig, error) {
 	rows, err := s.pool.Query(ctx, `
-SELECT id, bot_uuid, ilink_bot_id, owner_id, ilink_user_id, baseurl, token_ciphertext, token_key_version, state, created_at, updated_at
-FROM bots
-WHERE state = 'active' AND ilink_user_id IS NOT NULL
+SELECT id, bot_uuid, channel_type, ilink_bot_id, owner_id, ilink_user_id, baseurl, config_ciphertext, config_key_version, state, created_at, updated_at
+FROM channel_configs
+WHERE state = 'active' AND (channel_type <> 'wechat' OR ilink_user_id IS NOT NULL)
 ORDER BY created_at
 `)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var bots []domain.Bot
+	var cfgs []domain.ChannelConfig
 	for rows.Next() {
-		var b domain.Bot
-		if err := scanBot(rows, &b); err != nil {
+		var c domain.ChannelConfig
+		if err := scanChannelConfig(rows, &c); err != nil {
 			return nil, err
 		}
-		bots = append(bots, b)
+		cfgs = append(cfgs, c)
 	}
-	return bots, rows.Err()
+	return cfgs, rows.Err()
 }

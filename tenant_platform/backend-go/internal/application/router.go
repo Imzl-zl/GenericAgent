@@ -41,12 +41,22 @@ type RouterResult struct {
 	UserID int64
 }
 
-// IncomingMessage is a message received from a bot transport.
+// IncomingMessage is a message received from a channel transport
+// (IM_CHANNEL_BINDING §5).
 type IncomingMessage struct {
-	BotUUID     string
-	IlinkUserID string
-	MessageID   string
-	Text        string
+	BotUUID string
+	// ChannelType 标识渠道(wechat|feishu|dingtalk|qq), 同时是任务 Source 与
+	// 回复分发依据。
+	ChannelType string
+	// ChannelAccountID 是渠道侧账号标识(微信=ilink_user_id, 其他=发送者账号)。
+	ChannelAccountID string
+	// ConversationID 是对话单元 ID(群 ID / 对端 ID; 微信恒空)——分桶键。
+	ConversationID string
+	// ConversationType 是对话单元类型('private'|'group'; 空/非法回退
+	// 'private')——IM 流式转发判定维度(群聊只发最终结果)。
+	ConversationType string
+	MessageID      string
+	Text           string
 	// MediaPaths are absolute local file paths of inbound media downloaded by
 	// the Bot Poller. Surfaced in the task prompt so GA's file tools can read
 	// them. Empty for text-only messages.
@@ -55,6 +65,15 @@ type IncomingMessage struct {
 	// storage_path, content_type, size). Used to populate the media_assets
 	// table for audit / Web UI history / cross-instance idempotency.
 	MediaItems []IncomingMediaItem
+}
+
+// replyTarget 返回回复目标地址: 新渠道优先回对话单元(群/单聊), 微信回
+// 发送者 ilink_user_id(conversation_id 恒空)。
+func (m IncomingMessage) replyTarget() string {
+	if m.ConversationID != "" {
+		return m.ConversationID
+	}
+	return m.ChannelAccountID
 }
 
 // IncomingMediaItem is the per-file metadata forwarded by the Bot Poller.
@@ -68,7 +87,7 @@ type IncomingMediaItem struct {
 
 // RouterStore is the persistence port for router identity resolution.
 type RouterStore interface {
-	GetBotByUUID(ctx context.Context, botUUID string) (domain.Bot, error)
+	GetChannelConfigByUUID(ctx context.Context, botUUID string) (domain.ChannelConfig, error)
 	GetUserStatus(ctx context.Context, userID int64) (domain.UserStatus, error)
 	FindRunningTaskBySession(ctx context.Context, sessionKey, conversationKey string) (domain.Task, error)
 	// ResetWorkspaceForNewSession 设置 reset_at 并取消 queued 任务(/new)。
@@ -236,15 +255,16 @@ func validateMediaPaths(root string, paths []string) error {
 	return nil
 }
 
-// resolveOwnerID 解析消息发送者的 canonical user: 渠道绑定存在时用绑定用户
-// (跨渠道统一身份, 方案 §5.1), 未绑定时回退 bot 属主; 绑定查询发生非
-// "未找到"错误时返回错误(不静默路由到 bot owner 的工作区, 防止 DB 故障
-// 下跨用户串区)。
+// resolveOwnerID 解析消息发送者的 canonical user: 仅微信渠道走渠道绑定
+// (方案 §5.1, 跨渠道统一身份); 新渠道(channel_configs 的属主即 canonical
+// user, IM_CHANNEL_BINDING §6)与未绑定场景直接回退 config 属主。绑定查询
+// 发生非"未找到"错误时返回错误(不静默路由到 bot owner 的工作区, 防止
+// DB 故障下跨用户串区)。
 func (r *router) resolveOwnerID(ctx context.Context, msg IncomingMessage, botOwnerID int64) (int64, error) {
-	if r.channelBindings == nil || msg.IlinkUserID == "" {
+	if r.channelBindings == nil || msg.ChannelType != string(domain.ChannelWechat) || msg.ChannelAccountID == "" {
 		return botOwnerID, nil
 	}
-	canonical, err := r.channelBindings.ResolveCanonicalUserID(ctx, "ilink", msg.IlinkUserID)
+	canonical, err := r.channelBindings.ResolveCanonicalUserID(ctx, string(domain.ChannelWechat), msg.ChannelAccountID)
 	if err != nil {
 		if errors.Is(err, domain.ErrChannelBindingNotFound) {
 			return botOwnerID, nil
@@ -262,8 +282,15 @@ func (r *router) resolveOwnerID(ctx context.Context, msg IncomingMessage, botOwn
 // 被阻止的发送者不得向目标租户写入 messages/media_assets 记录; 任务提交
 // 先于消息入库, 重试撞 DB 唯一键时任务已存在, 不会丢任务。
 func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (RouterResult, error) {
-	if msg.BotUUID == "" || msg.IlinkUserID == "" || msg.MessageID == "" {
+	if msg.BotUUID == "" || msg.ChannelAccountID == "" || msg.MessageID == "" {
 		return RouterResult{Action: ActionRejected, Reply: "missing required fields"}, nil
+	}
+	// 渠道类型必须是已支持渠道(未识别渠道拒绝而非透传, 防误路由)。
+	if msg.ChannelType == "" {
+		return RouterResult{Action: ActionRejected, Reply: "missing channel_type"}, nil
+	}
+	if !domain.IsValidChannelType(msg.ChannelType) {
+		return RouterResult{Action: ActionRejected, Reply: "unsupported channel_type"}, nil
 	}
 	// Step 1: 幂等只读检查(成功处理后 Mark, 见函数末尾)。
 	seen, err := r.transport.CheckMessageIdempotency(ctx, msg.BotUUID, msg.MessageID)
@@ -274,11 +301,11 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 		return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
 	}
 	// Step 2: resolve bot identity。区分"bot 不存在"(永久拒绝)与"查询失败"
-	// (瞬态, 如 DB 抖动): 旧实现把所有 GetBotByUUID 错误都当 unknown bot
+	// (瞬态, 如 DB 抖动): 旧实现把所有 GetChannelConfigByUUID 错误都当 unknown bot
 	// 消费——DB 故障时用户收到误导性回复且 webhook 回 200, Poller ack 后
 	// 消息永久丢失。Round8 原则: 中途失败必须返回 error → webhook 5xx →
 	// Poller 按契约重试(任务/消息行唯一键保证重试幂等)。
-	bot, err := r.store.GetBotByUUID(ctx, msg.BotUUID)
+	bot, err := r.store.GetChannelConfigByUUID(ctx, msg.BotUUID)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return RouterResult{}, fmt.Errorf("resolve bot: %w", err)
@@ -286,9 +313,10 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 		reply := "机器人未注册或已失效，请联系管理员"
 		slog.WarnContext(ctx, "router: rejected message from unknown bot",
 			"bot_uuid", msg.BotUUID,
-			"ilink_user_id", msg.IlinkUserID,
+			"channel_account_id", msg.ChannelAccountID,
+			"channel_type", msg.ChannelType,
 			"message_id", msg.MessageID)
-		if sendErr := r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, ""); sendErr != nil {
+		if sendErr := r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, ""); sendErr != nil {
 			slog.WarnContext(ctx, "router: send unknown-bot reply failed",
 				"bot_uuid", msg.BotUUID,
 				"error", sendErr)
@@ -310,11 +338,23 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 			return RouterResult{Action: ActionDuplicate, Reply: "duplicate message ignored"}, nil
 		}
 	}
+	if bot.ChannelType != domain.ChannelType(msg.ChannelType) {
+		// 契约完整性(IM_CHANNEL_BINDING §5): bot_uuid 与 channel_type 必须
+		// 一致(Source=ChannelType 直接进任务, 错配会污染桶归属)。fail-closed。
+		slog.WarnContext(ctx, "router: rejected message with channel_type mismatch",
+			"bot_uuid", msg.BotUUID,
+			"bot_channel_type", bot.ChannelType,
+			"msg_channel_type", msg.ChannelType,
+			"message_id", msg.MessageID)
+		reply := "channel type mismatch"
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
+		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
+	}
 	// canonical identity(方案 §5.1): 后续 status/任务提交全部以绑定用户为准。
 	ownerID, err := r.resolveOwnerID(ctx, msg, bot.OwnerID)
 	if err != nil {
 		reply := "身份解析失败，请稍后重试"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	bot.OwnerID = ownerID
@@ -322,12 +362,14 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	// 目标租户的 messages/media_assets)。
 	if !bot.IsBound() {
 		reply := "bot not bound; contact admin to rebind via WeChat QR"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	if bot.IlinkUserID != msg.IlinkUserID {
+	// 微信身份校验: 只允许绑定用户本人与 bot 对话。新渠道无此概念——
+	// 配置属主即 canonical user, 群内任意成员 @ 触发都路由到属主工作区。
+	if bot.ChannelType == domain.ChannelWechat && bot.IlinkUserID != msg.ChannelAccountID {
 		reply := "identity mismatch"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply}, nil
 	}
 	status, err := r.store.GetUserStatus(ctx, bot.OwnerID)
@@ -336,16 +378,17 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 	}
 	if status != domain.UserApproved {
 		reply := fmt.Sprintf("user is %s, cannot process messages", status)
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
-	// canonical 绑定写入(方案 §5.1): 身份校验通过后幂等建立渠道账号 →
-	// canonical user 绑定, 保证跨渠道同一用户落在同一工作区。绑定失败
-	// 不阻断消息(仅影响跨渠道身份合并)。
-	if r.channelBindings != nil && msg.IlinkUserID != "" {
-		if _, bindErr := r.channelBindings.BindChannelAccount(ctx, "ilink", msg.IlinkUserID, ownerID); bindErr != nil {
+	// canonical 绑定写入(方案 §5.1): 仅微信——身份校验通过后幂等建立渠道
+	// 账号 → canonical user 绑定, 保证跨渠道同一用户落在同一工作区。新渠道
+	// 不需要(channel_configs 的 owner 即 canonical user)。绑定失败不阻断
+	// 消息(仅影响跨渠道身份合并)。
+	if r.channelBindings != nil && bot.ChannelType == domain.ChannelWechat && msg.ChannelAccountID != "" {
+		if _, bindErr := r.channelBindings.BindChannelAccount(ctx, string(domain.ChannelWechat), msg.ChannelAccountID, ownerID); bindErr != nil {
 			slog.WarnContext(ctx, "router: auto-bind channel account failed",
-				"ilink_user_id", msg.IlinkUserID, "canonical_user_id", ownerID, "error", bindErr)
+				"channel_account_id", msg.ChannelAccountID, "canonical_user_id", ownerID, "error", bindErr)
 		}
 	}
 	// Round8: media_paths 必须位于 BotMediaRoot 内(Poller 可被攻破时防止
@@ -354,7 +397,7 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 		slog.ErrorContext(ctx, "router: rejected message with out-of-root media path",
 			"bot_uuid", msg.BotUUID, "message_id", msg.MessageID, "error", err)
 		reply := "invalid media path"
-		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 		return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 	}
 	// Step 4: 路由(命令/中继/任务提交)。round10 审查(B7): 消息行不再在
@@ -414,7 +457,7 @@ func (r *router) HandleMessage(ctx context.Context, msg IncomingMessage) (Router
 //
 // The command set is admin-configurable via the platform_commands table
 // (migration 0004). If CommandRegistry is nil (tests), falls back to defaults.
-func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, inboundSessionKey string, personalContext bool) (RouterResult, *domain.Message, error) {
+func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig, inboundSessionKey string, personalContext bool) (RouterResult, *domain.Message, error) {
 	text := strings.TrimSpace(msg.Text)
 	// Relay intercept: "@<username> <body>" is forwarded directly to the
 	// named user's WeChat, bypassing the LLM/Worker. Checked before command
@@ -464,7 +507,7 @@ func (r *router) routeBoundMessage(ctx context.Context, msg IncomingMessage, bot
 // 命令/relay 副作用; 副作用失败时删除 claim 行并返回 error, 让 Poller 重试
 // 能重新执行(round10 审查 B7: 把"副作用后写行"的重复窗口换成"先写行后
 // 副作用"的丢失窗口——命令可重发, 重复执行(如重复转发/重复加人)危害更大)。
-func (r *router) claimAndRun(ctx context.Context, msg IncomingMessage, bot domain.Bot, inboundSessionKey string, run func() (RouterResult, error)) (RouterResult, *domain.Message, error) {
+func (r *router) claimAndRun(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig, inboundSessionKey string, run func() (RouterResult, error)) (RouterResult, *domain.Message, error) {
 	if r.messages == nil {
 		result, err := run()
 		return result, nil, err
@@ -488,7 +531,7 @@ func (r *router) claimAndRun(ctx context.Context, msg IncomingMessage, bot domai
 }
 
 // claimInboundMessage 插入入站消息行作为"处理中"标记(round10 审查 B7)。
-func (r *router) claimInboundMessage(ctx context.Context, msg IncomingMessage, bot domain.Bot, inboundSessionKey string) (domain.Message, error) {
+func (r *router) claimInboundMessage(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig, inboundSessionKey string) (domain.Message, error) {
 	mediaPath := ""
 	if len(msg.MediaPaths) > 0 {
 		mediaPath = msg.MediaPaths[0]
@@ -507,7 +550,7 @@ func (r *router) claimInboundMessage(ctx context.Context, msg IncomingMessage, b
 // dispatchHandler routes to the Go handler func by handler key.
 // Handler keys are stable identifiers (e.g. "stop", "status"); the registry
 // maps command text → handler key, and this function maps handler key → func.
-func (r *router) dispatchHandler(ctx context.Context, msg IncomingMessage, bot domain.Bot, handler, text string) (RouterResult, error) {
+func (r *router) dispatchHandler(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig, handler, text string) (RouterResult, error) {
 	switch handler {
 	case "stop":
 		return r.handleStop(ctx, msg, bot)
@@ -559,8 +602,8 @@ func isRestrictedUserCommand(text string) bool {
 	}
 }
 
-func (r *router) rejectUnavailableCommand(ctx context.Context, msg IncomingMessage, bot domain.Bot) (RouterResult, error) {
+func (r *router) rejectUnavailableCommand(ctx context.Context, msg IncomingMessage, bot domain.ChannelConfig) (RouterResult, error) {
 	reply := "该命令不可用。发送 /help 查看可用命令。"
-	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
+	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionRejected, Reply: reply, UserID: bot.OwnerID}, nil
 }

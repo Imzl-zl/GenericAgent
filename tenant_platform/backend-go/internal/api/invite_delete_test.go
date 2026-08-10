@@ -53,9 +53,9 @@ func (s *inviteDeleteService) ValidateSession(context.Context, string) (int64, e
 func inviteDeleteServer(t *testing.T, invite *inviteDeleteService) *Server {
 	t.Helper()
 	srv, err := NewServer(ServerConfig{
-		Service:   dashboardFakeTaskService{},
-		Registry:  dashboardFakeRegistry{},
-		Invite:    invite,
+		Service:     dashboardFakeTaskService{},
+		Registry:    dashboardFakeRegistry{},
+		Invite:      invite,
 		AdminToken:  "test-admin token",
 		AdminUserID: 9,
 	})

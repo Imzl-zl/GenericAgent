@@ -30,10 +30,18 @@ func TestSchedulerConfigValidation(t *testing.T) {
 
 type fakeAgentRuntimeSettings struct {
 	maxTurns int
+	mode     domain.IMStreamingMode
 }
 
 func (f *fakeAgentRuntimeSettings) GetAgentMaxTurns(context.Context) (int, error) {
 	return f.maxTurns, nil
+}
+
+func (f *fakeAgentRuntimeSettings) GetIMStreamingMode(context.Context) (domain.IMStreamingMode, error) {
+	if f.mode == "" {
+		return domain.DefaultIMStreamingMode, nil
+	}
+	return f.mode, nil
 }
 
 type controlledWorker struct {

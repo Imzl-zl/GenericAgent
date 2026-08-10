@@ -86,17 +86,17 @@ func TestStartBot(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	req := StartBotRequest{
-		BotUUID:    "bot-1",
-		BotToken:   "token-abc",
-		ILinkBotID: "ilink-1",
-		BaseURL:    "https://api.example.com",
-		UpdatesBuf: "cursor-xyz",
-		WebhookURL: "http://127.0.0.1:8080/v1/im/webhook",
+		BotUUID:     "bot-1",
+		ChannelType: "wechat",
+		ConfigJSON:  json.RawMessage(`{"token":"token-abc"}`),
+		BaseURL:     "https://api.example.com",
+		UpdatesBuf:  "cursor-xyz",
+		WebhookURL:  "http://127.0.0.1:8080/v1/im/webhook",
 	}
 	if err := c.StartBot(context.Background(), req); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if received.BotUUID != "bot-1" || received.BotToken != "token-abc" {
+	if received.BotUUID != "bot-1" || string(received.ConfigJSON) != `{"token":"token-abc"}` {
 		t.Fatalf("payload mismatch: %+v", received)
 	}
 	if received.WebhookURL == "" {
@@ -164,13 +164,13 @@ func TestSendMessage(t *testing.T) {
 	}
 	err = c.SendMessage(context.Background(), SendMessageRequest{
 		BotUUID:     "bot-1",
-		ILinkUserID: "user-1",
+		ChannelAccountID: "user-1",
 		Text:        "hello",
 	})
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if received.BotUUID != "bot-1" || received.ILinkUserID != "user-1" || received.Text != "hello" {
+	if received.BotUUID != "bot-1" || received.ChannelAccountID != "user-1" || received.Text != "hello" {
 		t.Fatalf("payload mismatch: %+v", received)
 	}
 	if received.MsgType != MsgTypeText {
@@ -209,7 +209,7 @@ func TestSendMessageMedia(t *testing.T) {
 			}
 			err = c.SendMessage(context.Background(), SendMessageRequest{
 				BotUUID:     "bot-1",
-				ILinkUserID: "user-1",
+				ChannelAccountID: "user-1",
 				MsgType:     tt.msgType,
 				Text:        tt.text,
 				FilePath:    tt.filePath,
@@ -268,7 +268,7 @@ func TestPollerErrorPropagates(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	if err := c.SendMessage(context.Background(), SendMessageRequest{
-		BotUUID: "bot-1", ILinkUserID: "user-1", Text: "hi",
+		BotUUID: "bot-1", ChannelAccountID: "user-1", Text: "hi",
 	}); err == nil {
 		t.Fatal("expected error on 500")
 	}
@@ -291,7 +291,7 @@ func TestPostSignsRequestWithAPISecret(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	if err := c.SendMessage(context.Background(), SendMessageRequest{
-		BotUUID: "b1", ILinkUserID: "u1", Text: "hello",
+		BotUUID: "b1", ChannelAccountID: "u1", Text: "hello",
 	}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestPostOmitsSignatureWithoutSecret(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	if err := c.SendMessage(context.Background(), SendMessageRequest{
-		BotUUID: "b1", ILinkUserID: "u1", Text: "hello",
+		BotUUID: "b1", ChannelAccountID: "u1", Text: "hello",
 	}); err != nil {
 		t.Fatalf("send: %v", err)
 	}

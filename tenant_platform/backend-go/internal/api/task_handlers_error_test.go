@@ -75,6 +75,9 @@ func (m *memoryTaskStore) RecordChunkEvent(ctx context.Context, taskID string, b
 func (m *memoryTaskStore) RecordHeartbeat(ctx context.Context, taskID string) error {
 	return errors.New("unused")
 }
+func (m *memoryTaskStore) MarkTaskStreamFinal(ctx context.Context, taskID string) (*time.Time, error) {
+	return nil, errors.New("unused")
+}
 func (m *memoryTaskStore) CountRunningTasks(ctx context.Context) (int, error) {
 	return 0, errors.New("unused")
 }

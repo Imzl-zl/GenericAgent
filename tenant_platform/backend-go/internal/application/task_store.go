@@ -35,6 +35,9 @@ type TaskStore interface {
 	MarkDispatchStarted(ctx context.Context, taskID, platformInstanceID, workerInstanceID string, freshSession bool) (domain.Task, error)
 	MarkRunning(ctx context.Context, taskID, platformInstanceID string) (domain.Task, error)
 	RecordChunkEvent(ctx context.Context, taskID string, byteCount int, digest string) error
+	// MarkTaskStreamFinal 置位任务的流式最终交付标记(IM_STREAMING_DELIVERY
+	// §4.2): 流式 commit 成功后调用, delivery 据此跳过文本 part(文件照发)。
+	MarkTaskStreamFinal(ctx context.Context, taskID string) (*time.Time, error)
 	// RecordHeartbeat refreshes tasks.last_activity_at without writing a chunk
 	// event. Called when the Worker sends an empty-text Chunk as a heartbeat
 	// (see task_drain.HEARTBEAT_INTERVAL_S). Used by the idle reaper.

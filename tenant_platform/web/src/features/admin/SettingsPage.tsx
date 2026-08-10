@@ -3,8 +3,13 @@ import { ApiClientError } from '../../api/client';
 import {
   getAgentRuntimeSettings,
   getIMAggregationSettings,
+  getIMStreamingSettings,
+  IM_STREAMING_MODE_LABELS,
+  IM_STREAMING_MODE_OPTIONS,
   updateAgentRuntimeSettings,
   updateIMAggregationSettings,
+  updateIMStreamingSettings,
+  type IMStreamingMode,
 } from '../../api/settings';
 import { Card } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
@@ -18,18 +23,20 @@ function errorMessage(error: unknown, fallback: string): string {
 export function SettingsPage() {
   const [windowMs, setWindowMs] = useState('2500');
   const [maxTurns, setMaxTurns] = useState('80');
+  const [streamMode, setStreamMode] = useState<IMStreamingMode>('streaming');
   const [isLoading, setIsLoading] = useState(true);
-  const [savingKey, setSavingKey] = useState<'aggregation' | 'agent' | ''>('');
+  const [savingKey, setSavingKey] = useState<'aggregation' | 'agent' | 'streaming' | ''>('');
   const [error, setError] = useState('');
   const [saved, setSaved] = useState('');
 
   useEffect(() => {
     let active = true;
-    void Promise.all([getIMAggregationSettings(), getAgentRuntimeSettings()])
-      .then(([aggregation, agent]) => {
+    void Promise.all([getIMAggregationSettings(), getAgentRuntimeSettings(), getIMStreamingSettings()])
+      .then(([aggregation, agent, streaming]) => {
         if (!active) return;
         setWindowMs(String(aggregation.window_ms));
         setMaxTurns(String(agent.max_turns));
+        setStreamMode(streaming.mode);
       })
       .catch((loadError: unknown) => {
         if (active) setError(errorMessage(loadError, '加载失败'));
@@ -42,7 +49,7 @@ export function SettingsPage() {
     };
   }, []);
 
-  const beginSave = (key: 'aggregation' | 'agent') => {
+  const beginSave = (key: 'aggregation' | 'agent' | 'streaming') => {
     setSavingKey(key);
     setError('');
     setSaved('');
@@ -78,6 +85,20 @@ export function SettingsPage() {
     }
   };
 
+  const handleStreamingSave = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    beginSave('streaming');
+    try {
+      const response = await updateIMStreamingSettings({ mode: streamMode });
+      setStreamMode(response.mode);
+      setSaved('IM 流式输出设置已保存');
+    } catch (saveError) {
+      setError(errorMessage(saveError, '保存失败'));
+    } finally {
+      setSavingKey('');
+    }
+  };
+
   const disabled = isLoading || savingKey !== '';
 
   return (
@@ -104,6 +125,20 @@ export function SettingsPage() {
             <Input label="入站聚合窗口（毫秒）" type="number" min={0} max={5000} step={100} value={windowMs} disabled={disabled} onChange={(event) => setWindowMs(event.target.value)} />
             <div className="settings-group" style={{ marginTop: '8px' }}><div className="settings-row"><div className="settings-row-info"><span className="settings-row-title">说明</span><span className="settings-row-desc">仅对微信 IM 普通消息生效。0 表示关闭，建议范围 1500~2500ms。</span></div></div></div>
             <div className="provider-form-full provider-actions"><Button isLoading={savingKey === 'aggregation'} disabled={disabled}>保存配置</Button></div>
+          </form>
+        </Card>
+
+        <Card className="animate-fade-in-up animate-delay-3">
+          <h3>IM 流式输出</h3>
+          <form className="provider-form" onSubmit={handleStreamingSave}>
+            <label className="form-label">流式模式</label>
+            <select className="input-field" value={streamMode} disabled={disabled} onChange={(event) => setStreamMode(event.target.value as IMStreamingMode)}>
+              {IM_STREAMING_MODE_OPTIONS.map((mode) => (
+                <option key={mode} value={mode}>{IM_STREAMING_MODE_LABELS[mode]}</option>
+              ))}
+            </select>
+            <div className="settings-group" style={{ marginTop: '8px' }}><div className="settings-row"><div className="settings-row-info"><span className="settings-row-title">生效范围</span><span className="settings-row-desc">私聊默认开（飞书编辑消息 / QQ 单聊原生流式）；群聊统一只发最终结果；钉钉/微信仅最终结果。保存后对后续任务生效。</span></div></div></div>
+            <div className="provider-form-full provider-actions"><Button isLoading={savingKey === 'streaming'} disabled={disabled}>保存配置</Button></div>
           </form>
         </Card>
       </div>

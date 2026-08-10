@@ -172,6 +172,9 @@ func (f *capacityTaskStore) RecordChunkEvent(ctx context.Context, taskID string,
 func (f *capacityTaskStore) RecordHeartbeat(ctx context.Context, taskID string) error {
 	return nil
 }
+func (f *capacityTaskStore) MarkTaskStreamFinal(ctx context.Context, taskID string) (*time.Time, error) {
+	return nil, nil
+}
 func (f *capacityTaskStore) CountQueuedTasksByRequester(ctx context.Context, requesterUserID int64) (int, error) {
 	panic("unexpected CountQueuedTasksByRequester")
 }

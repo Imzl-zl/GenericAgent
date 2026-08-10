@@ -49,8 +49,8 @@ func TestILinkAdapterSendMessage(t *testing.T) {
 	if received.BotUUID != "bot-1" {
 		t.Fatalf("bot_uuid mismatch: %q", received.BotUUID)
 	}
-	if received.ILinkUserID != "user-1" {
-		t.Fatalf("ilink_user_id mismatch: %q", received.ILinkUserID)
+	if received.ChannelAccountID != "user-1" {
+		t.Fatalf("channel_account_id mismatch: %q", received.ChannelAccountID)
 	}
 	if received.Text != "hello" {
 		t.Fatalf("text mismatch: %q", received.Text)

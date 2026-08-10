@@ -1,26 +1,35 @@
-"""Bot Poller: multi-tenant WeChat iLink long-poll service.
+"""Bot Poller: multi-channel IM gateway service (wechat/feishu/dingtalk/qq).
 
-Reuses frontends/wxbot_client.WxBotClient (the verified GA Core protocol
-implementation) so the platform never re-implements iLink getupdates/sendmessage.
-
-Architecture:
+Architecture (IM_CHANNEL_BINDING §5):
     Go platform (control plane)  ──HTTP──▶  Bot Poller (this process)
          │                                    │
          │  /v1/im/webhook ◀──HTTP POST────  │  (inbound messages + media_paths)
          │                                    │
-         └── /send ──▶ Poller.send_text/send_image/send_video/send_file ──▶ iLink
+         └── /send ──▶ adapter.send_* ──▶ channel SDK
 
-Each active bot runs in its own thread via WxBotClient.get_updates.
-Token is injected at start time (decrypted by Go); nothing is written to disk
-except inbound media files, which land under --media-dir/{bot_uuid}/.
+BotAdapter 注册表: channel_type → adapter 工厂。每个活跃 channel_configs
+行(bot_uuid)在独立线程运行:
+    WeChatAdapter   = WxBotClient iLink 长轮询(现有逻辑迁移, 读 config {token})
+    FeishuAdapter   = lark-oapi WebSocket 长连接(config {app_id, app_secret})
+    DingTalkAdapter = dingtalk-stream 长连接(config {app_id→app_key, app_secret})
+    QQAdapter       = botpy WebSocket(config {app_id, app_secret})
 
-iLink officially supports 4 media types (image/voice/file/video) for both
-send and receive (see docs/superpowers/specs/2026-07-25-ilink-official-binding-flow.md).
-GA Core's WxBotClient implements send_image/send_video/send_file and
-wxbot_media.download_media covers all 4 inbound types.
+SDK 惰性导入(import 时缺失只在该渠道启动时报错, 不影响其他渠道/测试)。
+
+群消息触发 = 渠道平台协议规则(IM_CHANNEL_BINDING §2, 非本服务选择):
+钉钉/QQ 平台只推送 @ 机器人的消息(GROUP_AT_MESSAGE_CREATE); 飞书申请
+group_at_msg 权限(仅 @, 不申请收全部的敏感权限 group_msg)。
+
+入站统一 POST /v1/im/webhook, body 契约:
+    {bot_uuid, channel_type, channel_account_id, conversation_id,
+     message_id, text, updates_buf(微信), context_token(微信),
+     media_paths/media_items(微信), source_message_ids}
+conversation_id 取值: QQ=group_openid/openid、钉钉=conversationId、飞书=
+chat_id、微信恒空(单桶)。
 """
 
 import argparse
+import asyncio
 import collections
 import hashlib
 import hmac
@@ -29,6 +38,8 @@ import os
 import sys
 import threading
 import time
+import uuid
+from abc import ABC, abstractmethod
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
@@ -49,6 +60,13 @@ from wxbot_media import download_media  # noqa: E402
 
 POLL_TIMEOUT = 30
 WEBHOOK_TIMEOUT = 10
+
+# 渠道类型常量(与 Go domain.ChannelType 对齐)。
+CHANNEL_WECHAT = 'wechat'
+CHANNEL_FEISHU = 'feishu'
+CHANNEL_DINGTALK = 'dingtalk'
+CHANNEL_QQ = 'qq'
+VALID_CHANNEL_TYPES = {CHANNEL_WECHAT, CHANNEL_FEISHU, CHANNEL_DINGTALK, CHANNEL_QQ}
 
 
 def _env_int(name, default):
@@ -72,7 +90,7 @@ MAX_BODY_BYTES = _env_int("BOT_POLLER_MAX_BODY_BYTES", 1024 * 1024)
 HTTP_READ_TIMEOUT = 30.0
 HTTP_REQUEST_QUEUE_SIZE = 64
 # Webhook delivery retry: exponential backoff base/cap. Retrying blocks the
-# bot's dispatch loop on purpose — that is the backpressure that stops the
+# adapter's dispatch loop on purpose — that is the backpressure that stops the
 # cursor from advancing past an undelivered message (same model as a Kafka
 # consumer that refuses to commit an offset it failed to process).
 WEBHOOK_RETRY_BASE_SECONDS = 2.0
@@ -146,7 +164,11 @@ def _can_coalesce(previous, current, window_ms):
         return False
     if previous.get('bot_uuid') != current.get('bot_uuid'):
         return False
-    if previous.get('ilink_user_id') != current.get('ilink_user_id'):
+    if previous.get('channel_account_id') != current.get('channel_account_id'):
+        return False
+    if previous.get('channel_type') != current.get('channel_type'):
+        return False
+    if previous.get('conversation_id') != current.get('conversation_id'):
         return False
     previous_at = int(previous.get('_received_at_ms') or 0)
     current_at = int(current.get('_received_at_ms') or 0)
@@ -278,148 +300,311 @@ class _DedupWindow:
         return True
 
 
-class BotEntry:
-    """Per-bot runtime state held by the poller."""
+class _TokenBucket:
+    """令牌桶节流(飞书官方 5 QPS 上限, IM_STREAMING_DELIVERY 决策 3)。
 
-    def __init__(self, client, webhook_url, bot_uuid, coalesce_window_ms=0):
-        self.client = client
-        self.webhook_url = webhook_url
+    acquire 阻塞等待令牌(有界超时): 超时返回 False 由调用方抛错/降级。
+    线程安全。"""
+
+    def __init__(self, capacity, refill_per_sec):
+        self._capacity = capacity
+        self._tokens = float(capacity)
+        self._refill_per_sec = refill_per_sec
+        self._lock = threading.Lock()
+        self._last = time.monotonic()
+
+    def acquire(self, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self._capacity,
+                    self._tokens + (now - self._last) * self._refill_per_sec,
+                )
+                self._last = now
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+class _QQRateLimited(Exception):
+    """QQ 流式帧限流(HTTP 429 / err_code 50002)——重试信号。"""
+
+
+def _is_qq_rate_limit(resp):
+    """官方 SDK isRateLimitError 同构: HTTP 429 或 err_code 50002。"""
+    if not isinstance(resp, dict):
+        return False
+    if str(resp.get('code', '')) == '429':
+        return True
+    if str(resp.get('err_code', '')) == '50002':
+        return True
+    msg = str(resp.get('message', '')) or str(resp.get('msg', ''))
+    return 'rate limit' in msg.lower()
+
+
+class BotAdapter(ABC):
+    """Base class for one channel connection (IM_CHANNEL_BINDING §5).
+
+    每个活跃 channel_configs 行一个 adapter 实例, 独立线程运行连接循环。
+    入站消息统一走 post_webhook(body) → /v1/im/webhook(HMAC 签名, 重试
+    契约与旧 wechat 实现一致)。
+    """
+
+    #: 渠道类型(子类覆盖), 与 channel_configs.channel_type 对齐。
+    channel_type = ''
+    #: 流式能力开关(IM_STREAMING_DELIVERY §4.3): 飞书/QQ 单聊实现,
+    #: 钉钉/微信不实现(非流渠道保持 SendMessage)。
+    stream_supported = False
+
+    def __init__(self, bot_uuid, webhook_url, media_root=None, webhook_secret=''):
         self.bot_uuid = bot_uuid
+        self.webhook_url = webhook_url
         self.stop_event = threading.Event()
         self.thread = None
-        self.committed_updates_buf = getattr(client, 'updates_buf', '') or ''
         self.webhook_idle = threading.Event()
         self.webhook_idle.set()
-        self.coalescer = InboundCoalescingBuffer(coalesce_window_ms)
-
-
-class BotManager:
-    """Manages long-poll threads for multiple bots."""
-
-    def __init__(self, media_root=None, webhook_secret='', inbound_coalesce_window_ms=0):
-        self._bots = {}
-        self._lock = threading.Lock()
-        self._media_root = media_root
-        self._inbound_coalesce_window_ms = 0
-        self.configure_inbound_coalescing(inbound_coalesce_window_ms)
-        # HMAC-SHA256 secret shared with the Go platform. When set, every
-        # webhook POST carries X-Webhook-Signature = hex(HMAC-SHA256(body)).
-        # Empty = unauthenticated (dev/test only; Go side logs a warning).
         self._webhook_secret = webhook_secret or ''
+        self._media_root = media_root
+        self._media_dir = None
         if media_root:
-            os.makedirs(media_root, exist_ok=True)
+            self._media_dir = os.path.join(media_root, bot_uuid)
+            os.makedirs(self._media_dir, exist_ok=True)
 
-    def configure_inbound_coalescing(self, window_ms):
-        window_ms = int(window_ms)
-        if window_ms < 0 or window_ms > MAX_INBOUND_COALESCE_WINDOW_MS:
-            raise ValueError(
-                f'window_ms must be between 0 and {MAX_INBOUND_COALESCE_WINDOW_MS}'
-            )
-        with self._lock:
-            self._inbound_coalesce_window_ms = window_ms
-        return window_ms
+    # -- 生命周期 ----------------------------------------------------------
+    def start(self):
+        """Spawn the connection thread. Idempotent."""
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
 
-    def _coalesce_window_ms(self):
-        with self._lock:
-            return self._inbound_coalesce_window_ms
+    def stop(self):
+        """Request shutdown and wait for the connection thread. Returns the
+        committed updates_buf for wechat ('' for other channels)."""
+        self.stop_event.set()
+        self.webhook_idle.wait(timeout=WEBHOOK_TIMEOUT + 1)
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+        return ''
 
-    def start(self, bot_uuid, bot_token, ilink_bot_id, base_url, updates_buf, webhook_url):
-        with self._lock:
-            if bot_uuid in self._bots:
-                return  # idempotent: frontend polls confirmed status repeatedly
-            client = WxBotClient(token=bot_token, persist=False, base_url=base_url or None)
-            client.bot_id = ilink_bot_id
-            client.updates_buf = updates_buf or ''
-            entry = BotEntry(
-                client=client,
-                webhook_url=webhook_url,
-                bot_uuid=bot_uuid,
-                coalesce_window_ms=self._inbound_coalesce_window_ms,
-            )
-            entry.media_dir = self._bot_media_dir(bot_uuid)
-            entry.thread = threading.Thread(target=self._run, args=(entry,), daemon=True)
-            entry.thread.start()
-            self._bots[bot_uuid] = entry
+    @abstractmethod
+    def _run(self):
+        """Connection loop; exits on stop_event or fatal auth error."""
 
-    def _bot_media_dir(self, bot_uuid):
-        if not self._media_root:
-            return None
-        d = os.path.join(self._media_root, bot_uuid)
-        os.makedirs(d, exist_ok=True)
-        return d
+    # -- 出站 --------------------------------------------------------------
+    @abstractmethod
+    def send_text(self, target, text, client_id=''):
+        """Send a text reply to target (微信=ilink_user_id, 新渠道=对话单元)。"""
+    def send_file(self, target, file_path, file_name='', client_id=''):
+        raise NotImplementedError(f'send_file not supported by {self.channel_type} adapter')
 
-    def _run(self, entry):
-        """Long-poll loop for one bot. Exits on stop_event or AuthExpired."""
-        # Bounded FIFO dedup window, local to this bot's thread (no sharing).
-        # The old implementation trimmed with `seen = set(list(seen)[-2000:])`
-        # which only rebound the local parameter — the caller's set was never
-        # trimmed, so memory grew without bound.
-        # set gives O(1) lookup; deque(maxlen) evicts oldest ids in FIFO order.
-        # The platform's (bot_id, message_id) idempotency key remains the
-        # final defense; this window only avoids redundant webhook POSTs.
-        seen = _DedupWindow(maxlen=2000)
-        while not entry.stop_event.is_set():
+    # -- IM 流式输出(IM_STREAMING_DELIVERY §4.3) ---------------------------
+    # 非流渠道(钉钉/微信)不实现: 基类默认抛错, Go 侧 BeginReply 失败后
+    # 回退终态 delivery。流式渠道实现 open/append/commit/abort。
+    def send_stream_open(self, target, text=''):
+        raise NotImplementedError(
+            f'send_stream_open not supported by {self.channel_type} adapter (final-only)')
+
+    def send_stream_append(self, stream_id, text):
+        raise NotImplementedError(
+            f'send_stream_append not supported by {self.channel_type} adapter (final-only)')
+
+    def send_stream_commit(self, stream_id, text=''):
+        raise NotImplementedError(
+            f'send_stream_commit not supported by {self.channel_type} adapter (final-only)')
+
+    def send_stream_abort(self, stream_id):
+        raise NotImplementedError(
+            f'send_stream_abort not supported by {self.channel_type} adapter (final-only)')
+
+    # -- 入站 webhook 投递 -------------------------------------------------
+    def post_webhook(self, body, max_attempts=None):
+        """POST an inbound message body with deterministic JSON + HMAC.
+
+        契约与旧 wechat 实现一致(见 _post_webhook_body_inner):
+        2xx 成功; 4xx 永久拒绝丢弃; 5xx/网络错误指数退避重试, 阻塞本渠道
+        dispatch(背压保持顺序, 防 cursor 越过未投递消息)。
+        """
+        self.webhook_idle.clear()
+        try:
+            delivered = self._post_webhook_inner(body, max_attempts=max_attempts)
+            if delivered:
+                self._on_webhook_delivered(body)
+            return delivered
+        finally:
+            self.webhook_idle.set()
+
+    def _on_webhook_delivered(self, body):
+        """2xx 后的钩子(微信提交 cursor; 其他渠道无状态)。"""
+
+    def _post_webhook_inner(self, body, max_attempts=None):
+        body_bytes = json.dumps(body, separators=(',', ':')).encode('utf-8')
+        headers = {'Content-Type': 'application/json'}
+        if self._webhook_secret:
+            sig = hmac.new(
+                self._webhook_secret.encode('utf-8'),
+                body_bytes,
+                hashlib.sha256,
+            ).hexdigest()
+            headers['X-Webhook-Signature'] = sig
+
+        attempt = 0
+        while not self.stop_event.is_set():
+            attempt += 1
             try:
+                resp = requests.post(self.webhook_url, data=body_bytes,
+                                     headers=headers, timeout=WEBHOOK_TIMEOUT)
+                if 200 <= resp.status_code < 300:
+                    return True
+                if 400 <= resp.status_code < 500:
+                    print(f'[Poller] webhook PERMANENTLY rejected ({self.bot_uuid}) '
+                          f'status={resp.status_code} body={resp.text[:200]} — message dropped',
+                          flush=True)
+                    return False
+                err_desc = f'status={resp.status_code} body={resp.text[:200]}'
+            except Exception as exc:
+                err_desc = f'error={exc}'
+
+            if max_attempts is not None and attempt >= max_attempts:
+                print(f'[Poller] webhook delivery gave up after {attempt} attempts '
+                      f'({self.bot_uuid}): {err_desc}', flush=True)
+                return False
+            backoff = min(WEBHOOK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                          WEBHOOK_RETRY_CAP_SECONDS)
+            print(f'[Poller] webhook post failed ({self.bot_uuid}) attempt={attempt} '
+                  f'{err_desc}; retrying in {backoff:.0f}s', flush=True)
+            self.stop_event.wait(backoff)
+        return False
+
+    # -- 工具 --------------------------------------------------------------
+    def webhook_body(self, *, channel_account_id, conversation_id, message_id, text,
+                     updates_buf='', context_token='', media_paths=None, media_items=None,
+                     source_message_ids=None, received_at_ms=0, conversation_type='private'):
+        """Build one platform webhook body (IM_CHANNEL_BINDING §5 契约)。
+
+        conversation_type: 'private' | 'group'——IM 流式转发判定维度
+        (IM_STREAMING_DELIVERY §4.4: 群聊统一只发最终结果)。各 adapter
+        有现成信息: QQ is_group、飞书 chat_type、钉钉 conversation_type。
+        """
+        body = {
+            'bot_uuid': self.bot_uuid,
+            'channel_type': self.channel_type,
+            'channel_account_id': channel_account_id,
+            'conversation_id': conversation_id,
+            'conversation_type': conversation_type,
+            'message_id': message_id,
+            'text': text,
+            'context_token': context_token,
+            'updates_buf': updates_buf,
+            'media_paths': media_paths or [],
+            'media_items': media_items or [],
+        }
+        if received_at_ms:
+            body['_received_at_ms'] = received_at_ms
+        if source_message_ids:
+            body['source_message_ids'] = source_message_ids
+        return body
+
+
+class WeChatAdapter(BotAdapter):
+    """iLink official gateway long-poll adapter (现有 WxBotClient 逻辑迁移)。
+
+    config: {token}; 附加 base_url / updates_buf 经构造参数注入。仅私聊
+    单桶(IM_CHANNEL_ARCHITECTURE §2): conversation_id 恒空, 回复目标 =
+    ilink_user_id。
+    """
+
+    channel_type = CHANNEL_WECHAT
+
+    def _on_webhook_delivered(self, body):
+        """提交 cursor: 与旧 BotEntry 语义一致(2xx 后推进 committed)。"""
+        committed_cursor = body.get('updates_buf', '')
+        if committed_cursor:
+            self.committed_updates_buf = committed_cursor
+
+    def __init__(self, bot_uuid, config, webhook_url, *, base_url='', updates_buf='',
+                 media_root=None, webhook_secret='', coalesce_window_provider=None):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+        token = (config or {}).get('token') or ''
+        self.client = WxBotClient(token=token, persist=False, base_url=base_url or None)
+        self.committed_updates_buf = updates_buf or getattr(self.client, 'updates_buf', '') or ''
+        self.coalescer = InboundCoalescingBuffer(
+            coalesce_window_provider() if coalesce_window_provider else 0
+        )
+        self._coalesce_window_provider = coalesce_window_provider
+
+    def _run(self):
+        """Long-poll loop. Exits on stop_event or AuthExpired."""
+        seen = _DedupWindow(maxlen=2000)
+        while not self.stop_event.is_set():
+            try:
+                if self._coalesce_window_provider:
+                    self.coalescer.set_window(self._coalesce_window_provider())
                 now_ms = int(time.time() * 1000)
-                entry.coalescer.set_window(self._coalesce_window_ms())
-                for body in entry.coalescer.flush_due(now_ms):
-                    self._post_webhook_body(entry, body)
-                request_timeout = entry.coalescer.timeout_seconds(now_ms)
-                messages = entry.client.get_updates(
+                for body in self.coalescer.flush_due(now_ms):
+                    self.post_webhook(body)
+                request_timeout = self.coalescer.timeout_seconds(now_ms)
+                messages = self.client.get_updates(
                     POLL_TIMEOUT, request_timeout=request_timeout
                 )
-                self._dispatch_batch(entry, messages, seen)
+                self._dispatch_batch(messages, seen)
             except AuthExpired:
-                self._notify_expired(entry)
+                self._notify_expired()
                 break
             except Exception as exc:  # network jitter: back off and retry
-                print(f'[Poller] bot {entry.bot_uuid} err: {exc}', flush=True)
-                entry.stop_event.wait(5)
+                print(f'[Poller] bot {self.bot_uuid} err: {exc}', flush=True)
+                self.stop_event.wait(5)
 
-    def _dispatch_batch(self, entry, messages, seen):
+    def _dispatch_batch(self, messages, seen):
         received_at_ms = int(time.time() * 1000)
         bodies = []
         for msg in messages:
-            body = self._prepare_webhook_body(entry, msg, seen, received_at_ms)
+            body = self._prepare_webhook_body(msg, seen, received_at_ms)
             if body is not None:
                 bodies.append(body)
-        entry.coalescer.set_window(self._coalesce_window_ms())
-        ready = entry.coalescer.push(bodies, received_at_ms)
-        ready.extend(entry.coalescer.flush_due(received_at_ms))
+        if self._coalesce_window_provider:
+            self.coalescer.set_window(self._coalesce_window_provider())
+        ready = self.coalescer.push(bodies, received_at_ms)
+        ready.extend(self.coalescer.flush_due(received_at_ms))
         for body in ready:
-            self._post_webhook_body(entry, body)
+            self.post_webhook(body)
 
-    def _prepare_webhook_body(self, entry, msg, seen, fallback_time_ms):
+    def _prepare_webhook_body(self, msg, seen, fallback_time_ms):
         """Download media and build one platform webhook body."""
         mid = str(msg.get('message_id', 0))
-        if not entry.client.is_user_msg(msg) or not seen.add(mid):
+        if not self.client.is_user_msg(msg) or not seen.add(mid):
             return None
-        text = entry.client.extract_text(msg)
+        text = self.client.extract_text(msg)
         uid = msg.get('from_user_id', '')
         ctx = msg.get('context_token', '')
         media_paths = []
         media_items = []
-        if entry.media_dir:
+        if self._media_dir:
             try:
                 # Round8: with_names 返回 (path, 原始 file_name) 同序对, 避免
                 # 按位置索引 item_list 错位(下载失败的项会使索引偏移)。
-                downloaded = download_media(msg.get('item_list', []), dest_dir=entry.media_dir, with_names=True)
+                downloaded = download_media(msg.get('item_list', []), dest_dir=self._media_dir, with_names=True)
                 media_paths = [p for p, _ in downloaded]
                 media_names = [n for _, n in downloaded]
                 media_items = self._collect_media_items(media_paths, media_names)
             except Exception as exc:
-                print(f'[Poller] media dl err ({entry.bot_uuid}): {exc}', flush=True)
-        return {
-            'bot_uuid': entry.bot_uuid,
-            'ilink_user_id': uid,
-            'message_id': mid,
-            'text': text,
-            'context_token': ctx,
-            'updates_buf': entry.client.updates_buf,
-            'media_paths': media_paths or [],
-            'media_items': media_items or [],
-            '_received_at_ms': _message_time_ms(msg, fallback_time_ms),
-        }
+                print(f'[Poller] media dl err ({self.bot_uuid}): {exc}', flush=True)
+        return self.webhook_body(
+            channel_account_id=uid,
+            conversation_id='',  # 微信个人自用单桶(IM_CHANNEL_ARCHITECTURE §2)
+            message_id=mid,
+            text=text,
+            updates_buf=self.client.updates_buf,
+            context_token=ctx,
+            media_paths=media_paths,
+            media_items=media_items,
+            received_at_ms=_message_time_ms(msg, fallback_time_ms),
+        )
 
     def _collect_media_items(self, paths, names=None):
         """Build metadata for each downloaded media file.
@@ -458,128 +643,817 @@ class BotManager:
             })
         return items
 
-    def _notify_expired(self, entry):
-        body = {'bot_uuid': entry.bot_uuid, 'auth_expired': True}
+    def _notify_expired(self):
+        body = {'bot_uuid': self.bot_uuid, 'auth_expired': True}
         # Bounded attempts: the bot loop is exiting either way; the platform
         # also detects expiry via send failures, so losing this signal is
         # recoverable and must not wedge the thread forever.
-        self._post_webhook_body(entry, body, max_attempts=5)
+        self.post_webhook(body, max_attempts=5)
 
-    def _post_webhook_body(self, entry, body, max_attempts=None):
-        entry.webhook_idle.clear()
+    def stop(self):
+        self.stop_event.set()
+        self.webhook_idle.wait(timeout=WEBHOOK_TIMEOUT + 1)
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+        return self.committed_updates_buf
+
+    def send_text(self, target, text, client_id=''):
+        self.client.send_text(target, text, context_token='', client_id=client_id)
+
+    def send_file(self, target, file_path, file_name='', client_id=''):
+        self.client.send_file(target, file_path, context_token='', file_name=file_name, client_id=client_id)
+
+    def send_image(self, target, file_path, client_id=''):
+        self.client.send_image(target, file_path, context_token='', client_id=client_id)
+
+    def send_video(self, target, file_path, client_id=''):
+        self.client.send_video(target, file_path, context_token='', client_id=client_id)
+
+
+
+class FeishuAdapter(BotAdapter):
+    """飞书企业自建应用(lark-oapi WebSocket)。
+
+    config: {app_id, app_secret}。订阅 p2_im.message.receive_v1(含 p2p 与
+    @群消息——权限申请 group_at_msg, 不申请收全部的敏感权限 group_msg)。
+    conversation_id = chat_id(p2p/group 均为现成字段); 回复目标 = chat_id。
+    """
+
+    channel_type = CHANNEL_FEISHU
+    #: 飞书支持消息编辑打字机(IM_STREAMING_DELIVERY §4.3): 发占位消息拿
+    #: message_id, append 走 PUT /im/v1/messages/:id 全量更新, commit 最后一次
+    #: 更新, abort 改写"生成中断"提示。
+    stream_supported = True
+    #: 官方硬限制: 一条消息最多编辑 20 次(open.feishu.cn im-v1 message update
+    #: Limitation of Use)。append 每帧一次 PUT + commit 一次 PUT ≤ 20;
+    #: 留 1 帧余量给 commit, append 最多 18 次。超过后文本继续累积,
+    #: 由 commit 最后一次更新一次性送达(打字机冻结, 内容不丢)。
+    _MAX_STREAM_EDITS = 18
+
+    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret=''):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+        self._app_id = (config or {}).get('app_id') or ''
+        self._app_secret = (config or {}).get('app_secret') or ''
+        self._ws_client = None
+        self._api_client = None  # 出站 API client(惰性)
+        self._sdk_error = None
+        # 流式状态: stream_id -> {target, message_id, text(累积)}
+        self._streams = {}
+        self._stream_lock = threading.Lock()
+        # 飞书官方频控: 同用户/同群 5 QPS(IM_STREAMING_DELIVERY 渠道矩阵)。
+        # platform 侧 500ms 节流合并已天然 ≤2 QPS, 此处是防御性上限。
+        self._throttle = _TokenBucket(capacity=5, refill_per_sec=5)
         try:
-            return self._post_webhook_body_inner(entry, body, max_attempts=max_attempts)
-        finally:
-            entry.webhook_idle.set()
+            import lark_oapi as lark  # 惰性导入: SDK 缺失只影响本渠道
+            self._lark = lark
+        except Exception as exc:  # pragma: no cover - 环境缺失路径
+            self._sdk_error = exc
 
-    def _post_webhook_body_inner(self, entry, body, max_attempts=None):
-        """POST webhook with deterministic JSON + HMAC-SHA256 signature.
+    def _build_handler(self):
+        lark = self._lark
 
-        We serialize once and send as raw bytes so the signature matches the
-        exact bytes on the wire (requests' json= would re-serialize and could
-        diverge on key ordering/whitespace across versions).
+        def handle_message(data):
+            self._handle_feishu_message(data)
 
-        Delivery contract (matches im_webhook.go, which returns 5xx expecting
-        a retry, e.g. CURSOR_PERSIST_FAILED):
-          - 2xx  -> delivered, return True.
-          - 4xx  -> permanent rejection (bad signature / validation); log
-                    loudly and drop, return False. Retrying cannot heal it.
-          - 5xx / network error -> retry with capped exponential backoff,
-                    blocking this bot's loop (backpressure keeps ordering and
-                    stops the cursor from advancing past an undelivered
-                    message). Platform (bot_id, message_id) dedup absorbs any
-                    resulting at-least-once redelivery.
+        return lark.EventDispatcherHandler.builder('', '').register_p2_im_message_receive_v1(handle_message).build()
 
-        max_attempts=None retries until stop_event is set.
-        Returns True when delivered, False when dropped or interrupted.
-        """
-        body_bytes = json.dumps(body, separators=(',', ':')).encode('utf-8')
-        headers = {'Content-Type': 'application/json'}
-        if self._webhook_secret:
-            sig = hmac.new(
-                self._webhook_secret.encode('utf-8'),
-                body_bytes,
-                hashlib.sha256,
-            ).hexdigest()
-            headers['X-Webhook-Signature'] = sig
-
-        attempt = 0
-        while not entry.stop_event.is_set():
-            attempt += 1
+    def _handle_feishu_message(self, data):
+        """飞书入站消息 → webhook body。conversation_id = chat_id(p2p/group
+        统一); 群消息仅 @ 触发(权限申请 group_at_msg, 不申请收全部的敏感
+        权限 group_msg——IM_CHANNEL_BINDING §2)。"""
+        event = getattr(data, 'event', None)
+        message = getattr(event, 'message', None)
+        sender = getattr(event, 'sender', None)
+        if message is None:
+            return
+        message_id = getattr(message, 'message_id', '') or ''
+        chat_id = getattr(message, 'chat_id', '') or ''
+        sender_id = ''
+        sender_obj = getattr(sender, 'sender_id', None)
+        if sender_obj is not None:
+            sender_id = getattr(sender_obj, 'open_id', '') or ''
+        if not message_id:
+            return
+        text = ''
+        if getattr(message, 'message_type', '') == 'text':
             try:
-                resp = requests.post(entry.webhook_url, data=body_bytes,
-                                     headers=headers, timeout=WEBHOOK_TIMEOUT)
-                if 200 <= resp.status_code < 300:
-                    committed_cursor = body.get('updates_buf', '')
-                    if committed_cursor:
-                        entry.committed_updates_buf = committed_cursor
-                    return True
-                if 400 <= resp.status_code < 500:
-                    print(f'[Poller] webhook PERMANENTLY rejected ({entry.bot_uuid}) '
-                          f'status={resp.status_code} body={resp.text[:200]} — message dropped',
-                          flush=True)
-                    return False
-                err_desc = f'status={resp.status_code} body={resp.text[:200]}'
-            except Exception as exc:
-                err_desc = f'error={exc}'
+                content = json.loads(getattr(message, 'content', '') or '{}')
+                text = str(content.get('text', ''))
+            except (ValueError, TypeError):
+                text = ''
+        self.post_webhook(self.webhook_body(
+            channel_account_id=sender_id,
+            conversation_id=chat_id,  # p2p/group 统一 chat_id
+            message_id=message_id,
+            text=text,
+            conversation_type=self._conversation_type(data),
+        ))
 
-            if max_attempts is not None and attempt >= max_attempts:
-                print(f'[Poller] webhook delivery gave up after {attempt} attempts '
-                      f'({entry.bot_uuid}): {err_desc}', flush=True)
-                return False
-            backoff = min(WEBHOOK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
-                          WEBHOOK_RETRY_CAP_SECONDS)
-            print(f'[Poller] webhook post failed ({entry.bot_uuid}) attempt={attempt} '
-                  f'{err_desc}; retrying in {backoff:.0f}s', flush=True)
-            entry.stop_event.wait(backoff)
-        return False
+    @staticmethod
+    def _conversation_type(data):
+        """群/私聊判定: message.chat_type('p2p'|'group')。缺省回退 private。"""
+        try:
+            chat_type = getattr(getattr(data, 'event', None), 'message', None)
+            chat_type = getattr(chat_type, 'chat_type', '') or ''
+            if chat_type == 'group':
+                return 'group'
+        except Exception:
+            pass
+        return 'private'
+
+    def _run(self):
+        if self._sdk_error is not None:
+            print(f'[Poller] feishu {self.bot_uuid}: lark_oapi unavailable: {self._sdk_error}', flush=True)
+            return
+        if not self._app_id or not self._app_secret:
+            print(f'[Poller] feishu {self.bot_uuid}: app_id/app_secret required', flush=True)
+            return
+        try:
+            handler = self._build_handler()
+            self._ws_client = self._lark.ws.Client(
+                self._app_id, self._app_secret, event_handler=handler,
+                log_level=self._lark.LogLevel.WARN,
+            )
+            print(f'[Poller] feishu {self.bot_uuid} ws started', flush=True)
+            self._ws_client.start()  # blocking; reconnects internally
+        except Exception as exc:
+            print(f'[Poller] feishu {self.bot_uuid} ws error: {exc}', flush=True)
+        finally:
+            print(f'[Poller] feishu {self.bot_uuid} ws exited', flush=True)
+
+    def send_text(self, target, text, client_id=''):
+        if not self._app_id or not self._app_secret:
+            raise RuntimeError(f'feishu {self.bot_uuid} not configured')
+        # 出站走独立 API client(WS 通道只收不发的官方用法): 回复目标 =
+        # chat_id(p2p/group 统一)。
+        from lark_oapi import Client as LarkAPIClient
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest, CreateMessageRequestBody,
+        )
+        api = self._api_client
+        if api is None:
+            api = LarkAPIClient.builder()\
+                .app_id(self._app_id)\
+                .app_secret(self._app_secret)\
+                .build()
+            self._api_client = api
+        request = CreateMessageRequest.builder() \
+            .receive_id_type('chat_id') \
+            .request_body(CreateMessageRequestBody.builder()
+                          .receive_id(target)
+                          .msg_type('text')
+                          .content(json.dumps({'text': text}, ensure_ascii=False))
+                          .build()) \
+            .build()
+        resp = api.im.v1.message.create(request)
+        if not resp.success():
+            raise RuntimeError(f'feishu send failed: code={resp.code} msg={resp.msg}')
+
+    # -- IM 流式输出: 消息编辑打字机 ----------------------------------------
+    # 语义(IM_STREAMING_DELIVERY §4.3): open 发占位消息取 message_id;
+    # append 累积文本后 PUT /im/v1/messages/:id 全量替换(飞书编辑是整条
+    # 更新, 不是增量); commit 最后一次更新(最终文本已在 append 累积);
+    # abort 改写"生成中断"提示(IM 消息不可撤回, 至少告知用户)。
+    # 所有 SDK 调用过 5 QPS 令牌桶, 超时抛错 → Go 侧 abort → delivery 兜底。
+
+    def _ensure_api_client(self):
+        if self._api_client is None:
+            self._api_client = self._lark.Client.builder()\
+                .app_id(self._app_id)\
+                .app_secret(self._app_secret)\
+                .build()
+        return self._api_client
+
+    def _update_message(self, message_id, text):
+        v1 = self._lark.api.im.v1
+        api = self._ensure_api_client()
+        request = v1.UpdateMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(v1.UpdateMessageRequestBody.builder()
+                          .msg_type('text')
+                          .content(json.dumps({'text': text}, ensure_ascii=False))
+                          .build()) \
+            .build()
+        resp = api.im.v1.message.update(request)
+        if not resp.success():
+            raise RuntimeError(f'feishu stream update failed: code={resp.code} msg={resp.msg}')
+
+    def send_stream_open(self, target, text=''):
+        if not self._app_id or not self._app_secret:
+            raise RuntimeError(f'feishu {self.bot_uuid} not configured')
+        v1 = self._lark.api.im.v1
+        api = self._ensure_api_client()
+        request = v1.CreateMessageRequest.builder() \
+            .receive_id_type('chat_id') \
+            .request_body(v1.CreateMessageRequestBody.builder()
+                          .receive_id(target)
+                          .msg_type('text')
+                          .content(json.dumps({'text': text or '…'}, ensure_ascii=False))
+                          .build()) \
+            .build()
+        resp = api.im.v1.message.create(request)
+        if not resp.success():
+            raise RuntimeError(f'feishu stream open failed: code={resp.code} msg={resp.msg}')
+        message_id = getattr(getattr(resp, 'data', None), 'message_id', '') or ''
+        if not message_id:
+            raise RuntimeError('feishu stream open: empty message_id')
+        stream_id = uuid.uuid4().hex
+        with self._stream_lock:
+            self._streams[stream_id] = {
+                'target': target, 'message_id': message_id,
+                'text': text or '', 'edits': 0,
+            }
+        return stream_id
+
+    def send_stream_append(self, stream_id, text):
+        with self._stream_lock:
+            st = self._streams.get(stream_id)
+            if st is None:
+                raise KeyError(f'feishu unknown stream {stream_id}')
+            st['text'] += text
+            st['edits'] += 1
+            if st['edits'] > self._MAX_STREAM_EDITS:
+                # 20 次编辑上限保护(官方): 停止 PUT, 文本累积到 commit
+                # 最后一次更新一次性送达。
+                return
+            message_id = st['message_id']
+        if not self._throttle.acquire():
+            raise RuntimeError('feishu stream rate limited (5 QPS)')
+        self._update_message(message_id, st['text'])
+
+    def send_stream_commit(self, stream_id, text=''):
+        with self._stream_lock:
+            st = self._streams.pop(stream_id, None)
+            if st is None:
+                return  # 已结束/未知: 幂等
+            if text:
+                st['text'] = text
+            message_id = st['message_id']
+            final_text = st['text']
+        if not self._throttle.acquire():
+            raise RuntimeError('feishu stream rate limited (5 QPS)')
+        # 最后一次更新: 保证消息为最终累积文本(编辑时限内)。
+        self._update_message(message_id, final_text)
+
+    def send_stream_abort(self, stream_id):
+        with self._stream_lock:
+            st = self._streams.pop(stream_id, None)
+            if st is None:
+                return  # 幂等
+            message_id = st['message_id']
+        if not self._throttle.acquire():
+            return  # 限流时放弃改写(终态 delivery 仍会补发结果)
+        try:
+            self._update_message(message_id, '⚠️ 生成中断，请稍后查看最终结果')
+        except Exception:
+            pass  # 改写失败可接受: 占位消息残留, 终态 delivery 兜底
+
+    def send_stream_close_all(self):
+        """连接关闭时清理流状态(测试/停 bot 用)。"""
+        with self._stream_lock:
+            self._streams.clear()
+
+
+class DingTalkAdapter(BotAdapter):
+    """钉钉开放平台应用(dingtalk-stream 长连接)。
+
+    config: {app_id→app_key, app_secret}。平台只推送 @ 机器人的群消息
+    (硬规则, IM_CHANNEL_BINDING §2); conversation_id = conversationId
+    (群/单聊统一), 回复目标 = conversation_id。
+    """
+
+    channel_type = CHANNEL_DINGTALK
+
+    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret=''):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+        self._app_key = (config or {}).get('app_id') or ''  # API 层 app_id 即钉钉 app_key
+        self._app_secret = (config or {}).get('app_secret') or ''
+        self._client = None
+        self._sdk_error = None
+        try:
+            import dingtalk_stream  # 惰性导入: SDK 缺失只影响本渠道
+            self._dingtalk_stream = dingtalk_stream
+        except Exception as exc:  # pragma: no cover
+            self._sdk_error = exc
+
+    def _run(self):
+        if self._sdk_error is not None:
+            print(f'[Poller] dingtalk {self.bot_uuid}: dingtalk_stream unavailable: {self._sdk_error}', flush=True)
+            return
+        if not self._app_key or not self._app_secret:
+            print(f'[Poller] dingtalk {self.bot_uuid}: app_key/app_secret required', flush=True)
+            return
+        dt = self._dingtalk_stream
+        from dingtalk_stream.chatbot import ChatbotMessage
+
+        class _Handler(dt.CallbackHandler):
+            def __init__(self, adapter):
+                super().__init__()
+                self._adapter = adapter
+
+            async def process(self, message):
+                try:
+                    chatbot_msg = ChatbotMessage.from_dict(message.data)
+                    self._adapter._handle_chatbot_message(chatbot_msg)
+                except Exception as exc:
+                    print(f'[Poller] dingtalk {self._adapter.bot_uuid} callback error: {exc}', flush=True)
+                return dt.AckMessage.STATUS_OK, 'OK'
+
+        try:
+            self._client = dt.DingTalkStreamClient(dt.Credential(self._app_key, self._app_secret))
+            self._client.register_callback_handler(ChatbotMessage.TOPIC, _Handler(self))
+            print(f'[Poller] dingtalk {self.bot_uuid} stream started', flush=True)
+            asyncio.run(self._client.start())  # blocking; 重连由 SDK 处理
+        except Exception as exc:
+            print(f'[Poller] dingtalk {self.bot_uuid} stream error: {exc}', flush=True)
+
+    def _handle_chatbot_message(self, chatbot_msg):
+        """钉钉入站消息 → webhook body。conversation_id = conversationId
+        (群/单聊统一), 平台只推 @ 消息(硬规则, 无需本侧过滤)。"""
+        text = getattr(getattr(chatbot_msg, 'text', None), 'content', '') or ''
+        text = text.strip()
+        if not text:
+            return
+        self.post_webhook(self.webhook_body(
+            channel_account_id=str(
+                getattr(chatbot_msg, 'sender_staff_id', None)
+                or getattr(chatbot_msg, 'sender_id', None) or ''),
+            conversation_id=str(getattr(chatbot_msg, 'conversation_id', '') or ''),
+            message_id=str(getattr(chatbot_msg, 'message_id', '') or ''),
+            text=text,
+            # 钉钉会话形态: conversation_type=='2' = 群(IM_CHANNEL_BINDING §2)。
+            conversation_type=('group'
+                               if str(getattr(chatbot_msg, 'conversation_type', '') or '') == '2'
+                               else 'private'),
+        ))
+
+    def send_text(self, target, text, client_id=''):
+        # 回复: 直接调用机器人开放 API(target = conversationId, 群/单聊统一)。
+        self._send_via_api(target, text)
+
+    def _send_via_api(self, conversation_id, text):
+        import requests
+        token = self._access_token()
+        if not token:
+            raise RuntimeError('dingtalk access token failed')
+        headers = {'x-acs-dingtalk-access-token': token}
+        url = 'https://api.dingtalk.com/v1.0/robot/groupMessages/send'
+        payload = {
+            'robotCode': self._app_key,
+            'openConversationId': conversation_id,
+            'msgKey': 'sampleText',
+            'msgParam': json.dumps({'content': text}, ensure_ascii=False),
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f'dingtalk send HTTP {resp.status_code}: {resp.text[:200]}')
+        body = resp.json() if 'json' in resp.headers.get('content-type', '') else {}
+        if body.get('errcode') not in (None, 0):
+            raise RuntimeError(f'dingtalk send errcode={body.get("errcode")}')
+
+    def _access_token(self):
+        import requests
+        resp = requests.post(
+            'https://api.dingtalk.com/v1.0/oauth2/accessToken',
+            json={'appKey': self._app_key, 'appSecret': self._app_secret},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data.get('accessToken')
+
+
+class QQAdapter(BotAdapter):
+    """QQ 开放平台机器人(botpy WebSocket)。
+
+    config: {app_id, app_secret}。订阅 C2C 与 GROUP_AT_MESSAGE(平台只推
+    @ 消息, 硬规则); conversation_id: 群=group_openid / C2C=openid。
+    回复目标 = conversation_id。
+
+    流式(IM_STREAMING_DELIVERY §4.3): 仅 C2C 单聊——官方"发送单聊消息/
+    流式消息"接口(POST /v2/users/{openid}/messages + stream 参数:
+    state 1=生成中/10=结束, id 首条 null 后续用返回 id, index 会话内
+    递增, reset 终帧全量替换); 群消息官方明确不支持流式参数(群聊由
+    platform 转发判定收敛, 只发最终结果)。参数细节以真实凭据实测为准
+    (linux.do 2026-03 实测 + easybot SDK 参考, index/msg_seq 递增语义
+    有歧义——见 PROGRESS.md 残余风险)。
+    """
+
+    channel_type = CHANNEL_QQ
+    #: 仅单聊支持原生流式接口(群聊无流式参数)。
+    stream_supported = True
+    #: 流式帧业务上限: 官方 SDK(openStream)不做帧数限制(仅 500ms 节流),
+    #: 但平台任务可达 45 分钟, 无上限会刷爆单关系频控(单聊 20 QPM 主动)
+    #: 与被动回复次数限制——设 60 帧(≈30s 活跃生成的 500ms 节流输出,
+    #: 覆盖绝大多数 AI 回复)。超出后文本继续累积, 由 commit 终帧
+    #: (input_state=10 全量替换)一次性送达, 内容不丢。
+    _MAX_STREAM_APPENDS = 60
+
+    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret=''):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+        self._app_id = (config or {}).get('app_id') or ''
+        self._app_secret = (config or {}).get('app_secret') or ''
+        self._client = None
+        self._sdk_error = None
+        # 流式状态: stream_id -> {openid, msg_id, msg_seq, index, text, appends}
+        self._streams = {}
+        self._stream_lock = threading.Lock()
+        # 最近一条 C2C 入站消息 id(被动回复 msg_id; 无则主动消息流式)。
+        self._last_c2c_msg_id = ''
+        try:
+            import botpy  # 惰性导入: SDK 缺失只影响本渠道
+            self._botpy = botpy
+        except Exception as exc:  # pragma: no cover
+            self._sdk_error = exc
+
+    def _run(self):
+        if self._sdk_error is not None:
+            print(f'[Poller] qq {self.bot_uuid}: botpy unavailable: {self._sdk_error}', flush=True)
+            return
+        if not self._app_id or not self._app_secret:
+            print(f'[Poller] qq {self.bot_uuid}: app_id/app_secret required', flush=True)
+            return
+        bp = self._botpy
+
+        class _QQClient(bp.Client):
+            def __init__(self, adapter):
+                self._adapter = adapter
+                super().__init__(intents=self._adapter._intents(), ext_handlers=False)
+
+            async def on_ready(self):
+                print(f'[Poller] qq {self._adapter.bot_uuid} ready', flush=True)
+
+            async def on_c2c_message_create(self, message):
+                self._adapter._handle_message(message, is_group=False)
+
+            async def on_group_at_message_create(self, message):
+                self._adapter._handle_message(message, is_group=True)
+
+        self._client = _QQClient(self)
+        try:
+            print(f'[Poller] qq {self.bot_uuid} ws started', flush=True)
+            self._client.run(appid=self._app_id, secret=self._app_secret)
+        except Exception as exc:
+            print(f'[Poller] qq {self.bot_uuid} ws error: {exc}', flush=True)
+
+    @staticmethod
+    def _intents():
+        try:
+            import botpy
+            intents = botpy.Intents(public_guild_messages=False)
+            intents.public_messages = False
+            intents.direct_message = True
+            intents.c2c_message = True
+            intents.group_at_message = True
+            return intents
+        except Exception:
+            return None
+
+    def _handle_message(self, message, is_group):
+        try:
+            message_id = str(getattr(message, 'id', '') or '')
+            if not message_id:
+                return
+            content = (getattr(message, 'content', '') or '').strip()
+            author = getattr(message, 'author', None)
+            member_openid = str(getattr(author, 'member_openid', '') or '')
+            user_openid = str(getattr(author, 'user_openid', '') or '')
+            group_openid = str(getattr(message, 'group_openid', '') or '')
+            if is_group:
+                conversation_id = group_openid or member_openid
+                channel_account_id = member_openid or user_openid
+            else:
+                conversation_id = user_openid  # C2C: openid 即对话单元
+                channel_account_id = user_openid
+            if not is_group and message_id:
+                # 流式被动回复锚点(单聊 4 次/条限制下的 msg_id+msg_seq 去重)。
+                self._last_c2c_msg_id = message_id
+            self.post_webhook(self.webhook_body(
+                channel_account_id=channel_account_id,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                text=content,
+                conversation_type='group' if is_group else 'private',
+            ))
+        except Exception as exc:
+            print(f'[Poller] qq {self.bot_uuid} handle error: {exc}', flush=True)
+
+    def send_text(self, target, text, client_id=''):
+        if self._client is None:
+            raise RuntimeError(f'qq {self.bot_uuid} not connected')
+        # 群回复 target=group_openid, C2C 回复 target=openid——由入站消息的
+        # conversation_id 决定(先试群再退 C2C)。botpy 出站是异步 API,
+        # 调度到 bot 自身事件循环。
+        async def _send():
+            try:
+                await self._client.api.post_group_message(
+                    group_openid=target, msg_type=2,
+                    markdown={'content': text[:2000]},
+                )
+                return
+            except Exception:
+                pass
+            await self._client.api.post_c2c_message(
+                openid=target, msg_type=0, content=text[:2000],
+            )
+
+        loop = getattr(self._client, 'loop', None)
+        if loop is None or loop.is_closed():
+            raise RuntimeError(f'qq {self.bot_uuid} event loop unavailable')
+        fut = asyncio.run_coroutine_threadsafe(_send(), loop)
+        fut.result(timeout=30)
+
+    # -- IM 流式输出: 单聊原生流式接口 -------------------------------------
+    # 语义(IM_STREAMING_DELIVERY §4.3): open 发首帧(stream.id=null)拿
+    # 流式消息 id; append 续接(stream.id=返回 id, state=1 生成中, 内容
+    # 全量替换语义——与飞书编辑同, 发送累积文本); commit 终帧(state=10,
+    # reset=true, 全量最终文本); abort 终帧 + 中断提示(QQ 无编辑, 终帧
+    # 结束"生成中"状态, 最终结果由 delivery 补发)。群聊拒绝(官方无流式
+    # 参数)。botpy 当前版本无流式封装, 走其内部 _http.request(Route 与
+    # api.py 自身 post_c2c_message 实现一致); 版本升级后如官方封装流式
+    # API 再切换。
+
+    def _send_stream_frame(self, openid, text, *, state, index, msg_id, msg_seq,
+                           stream_msg_id='', timeout=30):
+        """发一帧官方 stream_messages 帧(调度到 bot 事件循环)。返回响应 dict。
+
+        官方契约(@tencent-connect/qqbot-nodejs 1.0.4 实证, 与 StreamReq proto
+        一致): POST /v2/users/{openid}/stream_messages, 扁平字段——
+        input_mode='replace'(全量替换)、input_state 1=生成中/10=结束、
+        content_type='markdown'、content_raw=全量文本、event_id/msg_id=
+        被动回复锚点、stream_msg_id=首帧响应 id 后续帧携带、msg_seq=同一
+        流所有帧共享(仅 index 递增)、index=从 0 起每帧递增。
+        """
+        async def _send():
+            from botpy.http import Route  # botpy 内部(与 api.py 同源)
+            payload = {
+                'input_mode': 'replace',
+                'input_state': state,          # 1=GENERATING, 10=DONE
+                'content_type': 'markdown',
+                'content_raw': text,
+                'event_id': msg_id,
+                'msg_id': msg_id,
+                'msg_seq': msg_seq,
+                'index': index,
+            }
+            if stream_msg_id:
+                payload['stream_msg_id'] = stream_msg_id
+            route = Route('POST', '/v2/users/{openid}/stream_messages', openid=openid)
+            # 限流重试(官方 SDK sendWithRetry 同构): 429/50002 指数退避
+            # 1s/2s 共 2 次重试; 重试帧 index 递增(官方同款, 避免 stale
+            # index 冲突)。仍失败抛给上层(append 失败由 commit 兜底)。
+            for attempt in range(3):
+                try:
+                    resp = await self._client.api._http.request(route, json=payload)
+                    if isinstance(resp, dict) and _is_qq_rate_limit(resp):
+                        raise _QQRateLimited(resp)
+                    return resp or {}
+                except _QQRateLimited:
+                    if attempt >= 2:
+                        raise
+                    payload['index'] = payload['index'] + 1
+                    await asyncio.sleep(2 ** attempt)
+                except Exception:
+                    if attempt >= 2:
+                        raise
+                    payload['index'] = payload['index'] + 1
+                    await asyncio.sleep(2 ** attempt)
+
+        loop = getattr(self._client, 'loop', None)
+        if loop is None or loop.is_closed():
+            raise RuntimeError(f'qq {self.bot_uuid} event loop unavailable')
+        fut = asyncio.run_coroutine_threadsafe(_send(), loop)
+        return fut.result(timeout=timeout)
+
+    def send_stream_open(self, target, text=''):
+        """target = C2C openid。发首帧(无 stream_msg_id), 响应 id 即流句柄。
+
+        官方 SDK 要求流式必须带入站 msg_id(被动回复形态)——无锚点直接
+        拒绝(主动消息不可流式)。"""
+        if self._client is None:
+            raise RuntimeError(f'qq {self.bot_uuid} not connected')
+        if not target:
+            raise ValueError('qq stream open requires C2C openid target')
+        msg_id = self._last_c2c_msg_id or ''
+        if not msg_id:
+            raise RuntimeError('qq stream open requires an inbound c2c msg_id anchor')
+        # msg_seq 同一流共享(官方 SDK getNextMsgSeq 同构: 时间戳^随机 % 65536)。
+        msg_seq = (int(time.time() * 1000) % 100_000_000 ^ __import__('random').randrange(65536)) % 65536
+        resp = self._send_stream_frame(
+            target, text or '…', state=1, index=0, msg_id=msg_id, msg_seq=msg_seq)
+        stream_id = (resp or {}).get('id') or ''
+        if not stream_id:
+            raise RuntimeError('qq stream open: empty stream id in response')
+        with self._stream_lock:
+            self._streams[stream_id] = {
+                'openid': target, 'msg_id': msg_id,
+                'msg_seq': msg_seq, 'index': 0, 'text': text or '', 'appends': 0,
+            }
+        return stream_id
+
+    def send_stream_append(self, stream_id, text):
+        with self._stream_lock:
+            st = self._streams.get(stream_id)
+            if st is None:
+                raise KeyError(f'qq unknown stream {stream_id}')
+            st['text'] += text
+            st['appends'] += 1
+            if st['appends'] > self._MAX_STREAM_APPENDS:
+                # 被动回复 4 次/条上限保护: 停止追加帧, 文本累积到 commit
+                # 终帧(input_state=10 全量替换)一次性送达。
+                return
+            st['index'] += 1
+            frame = dict(st)
+        try:
+            self._send_stream_frame(
+                frame['openid'], frame['text'],
+                state=1, index=frame['index'], msg_id=frame['msg_id'],
+                msg_seq=frame['msg_seq'], stream_msg_id=stream_id)
+        except Exception:
+            # 追加帧失败(限流/网络): 不再续帧, commit 终帧兜底。
+            with self._stream_lock:
+                st['appends'] = self._MAX_STREAM_APPENDS + 1
+
+    def send_stream_commit(self, stream_id, text=''):
+        with self._stream_lock:
+            st = self._streams.pop(stream_id, None)
+            if st is None:
+                return  # 幂等
+            if text:
+                st['text'] = text
+            index = st['index'] + 1
+            frame = dict(st)
+        # 终帧: input_state=10(DONE) 全量最终文本。
+        self._send_stream_frame(
+            frame['openid'], frame['text'],
+            state=10, index=index, msg_id=frame['msg_id'],
+            msg_seq=frame['msg_seq'], stream_msg_id=stream_id)
+
+    def send_stream_abort(self, stream_id):
+        with self._stream_lock:
+            st = self._streams.pop(stream_id, None)
+            if st is None:
+                return  # 幂等
+            index = st['index'] + 1
+            frame = dict(st)
+            text = frame['text'] + '\n\n⚠️ 生成中断，请稍后查看最终结果'
+        try:
+            # 终帧(DONE)带中断提示: 保证消息闭合(官方 cancel() 不发 DONE,
+            # 消息会停在生成中状态)。
+            self._send_stream_frame(
+                frame['openid'], text,
+                state=10, index=index, msg_id=frame['msg_id'],
+                msg_seq=frame['msg_seq'], stream_msg_id=stream_id)
+        except Exception:
+            pass  # 终帧失败可接受: delivery 兜底补发最终结果
+
+
+class BotManager:
+    """BotAdapter 注册表: bot_uuid → adapter(channel_type 工厂)。
+
+    配置来源 = 平台热推(/start /stop), 复用既有配置热更新链路
+    (IM_CHANNEL_BINDING §5): 新增/更新/解绑由 Go 控制面触发连接重载。
+    """
+
+    def __init__(self, media_root=None, webhook_secret='', inbound_coalesce_window_ms=0):
+        self._adapters = {}
+        self._lock = threading.Lock()
+        self._media_root = media_root
+        self._inbound_coalesce_window_ms = 0
+        self.configure_inbound_coalescing(inbound_coalesce_window_ms)
+        self._webhook_secret = webhook_secret or ''
+        if media_root:
+            os.makedirs(media_root, exist_ok=True)
+
+    def configure_inbound_coalescing(self, window_ms):
+        window_ms = int(window_ms)
+        if window_ms < 0 or window_ms > MAX_INBOUND_COALESCE_WINDOW_MS:
+            raise ValueError(
+                f'window_ms must be between 0 and {MAX_INBOUND_COALESCE_WINDOW_MS}'
+            )
+        with self._lock:
+            self._inbound_coalesce_window_ms = window_ms
+        return window_ms
+
+    def _coalesce_window_ms(self):
+        with self._lock:
+            return self._inbound_coalesce_window_ms
+
+    def start(self, bot_uuid, channel_type, config_json, *, base_url='', updates_buf='', webhook_url=''):
+        """创建/重启一个渠道连接。幂等: 已存在的 bot_uuid 不重复启动。
+
+        config_json 是解密后的渠道配置 JSON(wechat={token}, 新渠道=
+        {app_id, app_secret})。
+        """
+        if not bot_uuid or not channel_type:
+            raise ValueError('bot_uuid and channel_type are required')
+        if channel_type not in VALID_CHANNEL_TYPES:
+            raise ValueError(f'unsupported channel_type: {channel_type}')
+        if isinstance(config_json, (str, bytes)):
+            config = json.loads(config_json)
+        else:
+            config = config_json or {}
+        with self._lock:
+            if bot_uuid in self._adapters:
+                return  # idempotent: frontend polls confirmed status repeatedly
+        # 构造在锁外: WeChatAdapter 构造会经 coalesce_window_provider 回调
+        # _coalesce_window_ms()(非重入锁, 持锁构造必然死锁)。
+        adapter = self._build_adapter(bot_uuid, channel_type, config,
+                                      base_url=base_url, updates_buf=updates_buf,
+                                      webhook_url=webhook_url)
+        adapter.start()
+        with self._lock:
+            if bot_uuid in self._adapters:
+                # 并发重复 start 输给了其他线程: 停掉本次重复连接。
+                adapter.stop()
+                return
+            self._adapters[bot_uuid] = adapter
+
+    def _build_adapter(self, bot_uuid, channel_type, config, *, base_url, updates_buf, webhook_url):
+        common = dict(media_root=self._media_root, webhook_secret=self._webhook_secret)
+        if channel_type == CHANNEL_WECHAT:
+            return WeChatAdapter(
+                bot_uuid, config, webhook_url,
+                base_url=base_url, updates_buf=updates_buf,
+                coalesce_window_provider=self._coalesce_window_ms,
+                **common,
+            )
+        if channel_type == CHANNEL_FEISHU:
+            return FeishuAdapter(bot_uuid, config, webhook_url, **common)
+        if channel_type == CHANNEL_DINGTALK:
+            return DingTalkAdapter(bot_uuid, config, webhook_url, **common)
+        if channel_type == CHANNEL_QQ:
+            return QQAdapter(bot_uuid, config, webhook_url, **common)
+        raise ValueError(f'unsupported channel_type: {channel_type}')
 
     def stop(self, bot_uuid):
         with self._lock:
-            entry = self._bots.pop(bot_uuid, None)
-        if not entry:
+            adapter = self._adapters.pop(bot_uuid, None)
+        if not adapter:
             return ''
-        entry.stop_event.set()
-        entry.webhook_idle.wait(timeout=WEBHOOK_TIMEOUT + 1)
-        entry.thread.join(timeout=5)
-        return entry.committed_updates_buf
+        return adapter.stop()
 
-    def send(self, bot_uuid, ilink_user_id, text, context_token='', msg_type=MSG_TYPE_TEXT, file_path='', file_name='', client_id=''):
-        """Dispatch to send_text/send_image/send_video/send_file based on msg_type.
-
-        iLink officially supports image/video/file media sends (see spec).
-        Voice send is not implemented in GA Core's WxBotClient, so 'voice'
-        is not a valid msg_type here (inbound voice still downloads fine).
-        file_name 是用户可见显示名(审查 R5-I10): 与 file_path 分离, 快照临时
-        文件名含 marker hash 前缀, 不得作为显示名暴露给用户。
-        client_id 是 Platform 传入的稳定幂等键(round9 审查: delivery 重试投递
-        同一内容时保持同 id, 供 iLink 服务端去重); 空值回退随机。
-        """
+    def send(self, bot_uuid, channel_account_id, text, context_token='', msg_type=MSG_TYPE_TEXT,
+             file_path='', file_name='', client_id=''):
+        """按 bot_uuid 路由到对应渠道 adapter(回复目标=channel_account_id)。"""
         with self._lock:
-            entry = self._bots.get(bot_uuid)
-        if not entry:
+            adapter = self._adapters.get(bot_uuid)
+        if not adapter:
             raise KeyError(f'bot {bot_uuid} not running')
         if msg_type == MSG_TYPE_TEXT or not msg_type:
-            entry.client.send_text(ilink_user_id, text, context_token=context_token, client_id=client_id)
+            adapter.send_text(channel_account_id, text, client_id=client_id)
             return
         if not file_path:
             raise ValueError(f'file_path is required for msg_type={msg_type}')
         if msg_type == MSG_TYPE_IMAGE:
-            entry.client.send_image(ilink_user_id, file_path, context_token=context_token, client_id=client_id)
+            if not hasattr(adapter, 'send_image'):
+                raise ValueError(f'msg_type={msg_type} not supported by {adapter.channel_type}')
+            adapter.send_image(channel_account_id, file_path, client_id=client_id)
         elif msg_type == MSG_TYPE_VIDEO:
-            entry.client.send_video(ilink_user_id, file_path, context_token=context_token, client_id=client_id)
+            if not hasattr(adapter, 'send_video'):
+                raise ValueError(f'msg_type={msg_type} not supported by {adapter.channel_type}')
+            adapter.send_video(channel_account_id, file_path, client_id=client_id)
         elif msg_type == MSG_TYPE_FILE:
-            entry.client.send_file(ilink_user_id, file_path, context_token=context_token, file_name=file_name, client_id=client_id)
+            adapter.send_file(channel_account_id, file_path, file_name=file_name, client_id=client_id)
         else:
             raise ValueError(f'unsupported msg_type: {msg_type}')
 
+    def send_stream(self, bot_uuid, stream_id, action, target='', text=''):
+        """IM 流式出站(IM_STREAMING_DELIVERY §4.2): /send 扩展 stream_action。
+
+        action ∈ open|append|commit|abort。open 返回渠道侧 stream_id
+        (飞书=占位消息 message_id 关联的流句柄), 其余动作按 stream_id
+        路由。非流渠道抛 NotImplementedError(Go 侧 BeginReply 失败回退
+        终态 delivery)。
+        """
+        with self._lock:
+            adapter = self._adapters.get(bot_uuid)
+        if not adapter:
+            raise KeyError(f'bot {bot_uuid} not running')
+        if action == 'open':
+            return adapter.send_stream_open(target, text)
+        if action == 'append':
+            if not stream_id:
+                raise ValueError('stream_id is required for stream_action=append')
+            return adapter.send_stream_append(stream_id, text)
+        if action == 'commit':
+            if not stream_id:
+                raise ValueError('stream_id is required for stream_action=commit')
+            return adapter.send_stream_commit(stream_id, text)
+        if action == 'abort':
+            if not stream_id:
+                raise ValueError('stream_id is required for stream_action=abort')
+            return adapter.send_stream_abort(stream_id)
+        raise ValueError(f'unsupported stream_action: {action}')
+
     def health(self):
         with self._lock:
-            return {'healthy': True, 'active_bots': list(self._bots.keys())}
+            return {'healthy': True, 'active_bots': list(self._adapters.keys())}
 
 
 class PollerHandler(BaseHTTPRequestHandler):
-    """HTTP API: /start /stop /send /health."""
+    """HTTP API: /start /stop /send /health /config."""
 
     manager = None  # set by serve()
     api_secret = ''  # set by serve(); HMAC-SHA256 shared secret for inbound API auth
@@ -659,9 +1533,11 @@ class PollerHandler(BaseHTTPRequestHandler):
                 self._reply(200, {'inbound_coalesce_window_ms': window_ms})
             elif self.path == '/start':
                 self.manager.start(
-                    body['bot_uuid'], body['bot_token'], body.get('ilink_bot_id', ''),
-                    body.get('base_url', ''), body.get('updates_buf', ''),
-                    body['webhook_url'])
+                    body['bot_uuid'], body['channel_type'],
+                    body.get('config_json', '{}'),
+                    base_url=body.get('base_url', ''),
+                    updates_buf=body.get('updates_buf', ''),
+                    webhook_url=body['webhook_url'])
                 self._reply(200, {'started': True})
             elif self.path == '/stop':
                 buf = self.manager.stop(body['bot_uuid'])
@@ -671,7 +1547,22 @@ class PollerHandler(BaseHTTPRequestHandler):
                 if msg_type not in _VALID_MSG_TYPES:
                     self._reply(400, {'error': f'invalid msg_type: {msg_type}'})
                     return
-                self.manager.send(body['bot_uuid'], body['ilink_user_id'],
+                # IM 流式输出(IM_STREAMING_DELIVERY §4.2): /send 扩展
+                # stream_id + stream_action(open|append|commit|abort),
+                # 复用既有通道不新增端点。open 响应携带渠道侧 stream_id。
+                stream_action = body.get('stream_action') or ''
+                if stream_action:
+                    stream_id = self.manager.send_stream(
+                        body['bot_uuid'], body.get('stream_id', ''), stream_action,
+                        target=body.get('channel_account_id', ''),
+                        text=body.get('text', ''),
+                    )
+                    reply = {'sent': True}
+                    if stream_action == 'open':
+                        reply['stream_id'] = stream_id
+                    self._reply(200, reply)
+                    return
+                self.manager.send(body['bot_uuid'], body['channel_account_id'],
                                   body.get('text', ''), body.get('context_token', ''),
                                   msg_type=msg_type, file_path=body.get('file_path', ''),
                                   file_name=body.get('file_name', ''),

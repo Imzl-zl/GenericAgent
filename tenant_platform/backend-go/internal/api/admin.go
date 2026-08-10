@@ -36,8 +36,16 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("DELETE /v1/admin/invite-codes", s.auth(s.handleAdminDeleteInviteCodes))
 		s.mux.HandleFunc("DELETE /v1/admin/invite-codes/{code}", s.auth(s.handleAdminRevokeInviteCode))
 	}
-	if s.botSvc != nil {
+	if s.channelSvc != nil {
 		s.mux.HandleFunc("GET /v1/users/me/bots", s.userAuth(s.handleGetOwnBot))
+		// 渠道绑定 API(userAuth + admin 同款, IM_CHANNEL_BINDING §4)。
+		// 微信由既有扫码流程管理, 不在此 CRUD 内(wechat 会被 handler 拒绝)。
+		s.mux.HandleFunc("GET /v1/me/im-bindings", s.userAuth(s.handleGetOwnBindings))
+		s.mux.HandleFunc("PUT /v1/me/im-bindings/{channel_type}", s.userAuth(s.handleSaveChannelBinding))
+		s.mux.HandleFunc("DELETE /v1/me/im-bindings/{channel_type}", s.userAuth(s.handleUnbindChannel))
+		s.mux.HandleFunc("GET /v1/admin/me/im-bindings", s.auth(s.handleAdminGetOwnBindings))
+		s.mux.HandleFunc("PUT /v1/admin/me/im-bindings/{channel_type}", s.auth(s.handleAdminSaveChannelBinding))
+		s.mux.HandleFunc("DELETE /v1/admin/me/im-bindings/{channel_type}", s.auth(s.handleAdminUnbindChannel))
 	}
 	// 微信绑定接口（iLink 扫码）。路由无条件注册（OpenAPI 已声明），
 	// 服务未配置（ILINK_BASE_URL 为空）时统一返回 501 FEATURE_DISABLED，
@@ -82,6 +90,8 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("PUT /v1/admin/settings/im-aggregation", s.auth(s.handleUpdateIMAggregationSettings))
 		s.mux.HandleFunc("GET /v1/admin/settings/agent-runtime", s.auth(s.handleGetAgentRuntimeSettings))
 		s.mux.HandleFunc("PUT /v1/admin/settings/agent-runtime", s.auth(s.handleUpdateAgentRuntimeSettings))
+		s.mux.HandleFunc("GET /v1/admin/settings/im-streaming", s.auth(s.handleGetIMStreamingSettings))
+		s.mux.HandleFunc("PUT /v1/admin/settings/im-streaming", s.auth(s.handleUpdateIMStreamingSettings))
 	}
 	if s.llmProviders != nil && s.cipher != nil {
 		s.mux.HandleFunc("POST /v1/admin/llm-providers", s.auth(s.handleAdminCreateLLMProvider))
@@ -225,16 +235,17 @@ func (s *Server) handleAdminListPending(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
 }
 
-func botReply(b domain.Bot) map[string]any {
+func channelConfigReply(c domain.ChannelConfig) map[string]any {
 	return map[string]any{
-		"bot_id":        b.ID,
-		"bot_uuid":      b.BotUUID,
-		"ilink_bot_id":  b.IlinkBotID,
-		"ilink_user_id": b.IlinkUserID,
-		"baseurl":       b.BaseURL,
-		"owner_id":      b.OwnerID,
-		"state":         string(b.State),
-		"created_at":    b.CreatedAt.UTC().Format(time.RFC3339),
+		"bot_id":             c.ID,
+		"bot_uuid":           c.BotUUID,
+		"channel_type":       c.ChannelType,
+		"ilink_bot_id":       c.IlinkBotID,
+		"channel_account_id": c.IlinkUserID,
+		"baseurl":            c.BaseURL,
+		"owner_id":           c.OwnerID,
+		"state":              string(c.State),
+		"created_at":         c.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 

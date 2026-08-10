@@ -92,10 +92,10 @@ func newTeamTestRouter(store *fakeRouterStore, tr *transport.LoopbackTransport, 
 
 func boundBotStore(userID int64) *fakeRouterStore {
 	store := newFakeRouterStore()
-	store.bots["b1"] = domain.Bot{
+	store.bots["b1"] = domain.ChannelConfig{
 		ID: 1, BotUUID: "b1", OwnerID: userID,
-		IlinkUserID: "u1", State: domain.BotActive,
-	}
+		IlinkUserID: "u1", State: domain.ChannelActive,
+		ChannelType: domain.ChannelWechat,}
 	store.statuses[userID] = domain.UserApproved
 	return store
 }
@@ -156,8 +156,8 @@ func TestRouterTeamCommandsDisabledWhenServiceNil(t *testing.T) {
 	})
 	// /团队 with no team service → "功能未启用"
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/团队",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/团队",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -172,8 +172,8 @@ func TestRouterHandlePersonalSwitch(t *testing.T) {
 	teams := &fakeTeamService{}
 	r := newTeamTestRouter(store, tr, teams)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/个人",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/个人",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -193,8 +193,8 @@ func TestRouterHandleTeamList(t *testing.T) {
 	}
 	r := newTeamTestRouter(store, tr, teams)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/团队",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/团队",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -211,8 +211,8 @@ func TestRouterHandleInviteCode(t *testing.T) {
 	}
 	r := newTeamTestRouter(store, tr, teams)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/邀请码 ABC123",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/邀请码 ABC123",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -228,8 +228,8 @@ func TestRouterHandleInviteCodeInvalid(t *testing.T) {
 	teams := &fakeTeamService{submitErr: domain.ErrInviteCodeInvalid}
 	r := newTeamTestRouter(store, tr, teams)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/邀请码 BADCODE",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/邀请码 BADCODE",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -246,8 +246,8 @@ func TestRouterHandleApprove(t *testing.T) {
 	}
 	r := newTeamTestRouter(store, tr, teams)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/批准 t-456",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/批准 t-456",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}
@@ -259,8 +259,8 @@ func TestRouterHandleApproveMissingArg(t *testing.T) {
 	teams := &fakeTeamService{}
 	r := newTeamTestRouter(store, tr, teams)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/批准",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/批准",
+		ChannelType: "wechat",})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -283,8 +283,8 @@ func TestRouterNormalMessageRoutesToTeamContext(t *testing.T) {
 		ToolPolicy: "v1", SourceInstance: "t", Teams: teams,
 	})
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "处理这个任务",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "处理这个任务",
+		ChannelType: "wechat",})
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created, got %s", res.Action)
 	}
@@ -307,8 +307,8 @@ func TestRouterNormalMessageRoutesToPersonalByDefault(t *testing.T) {
 		ToolPolicy: "v1", SourceInstance: "t", Teams: teams,
 	})
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "hello",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
+		ChannelType: "wechat",})
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created, got %s", res.Action)
 	}
@@ -328,8 +328,8 @@ func TestRouterHandleIdentityInTeam(t *testing.T) {
 	}
 	r := newTeamTestRouter(store, tr, teams)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
-		BotUUID: "b1", IlinkUserID: "u1", MessageID: "m1", Text: "/我的身份",
-	})
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/我的身份",
+		ChannelType: "wechat",})
 	if res.Action != ActionReplied {
 		t.Fatalf("expected replied, got %s", res.Action)
 	}

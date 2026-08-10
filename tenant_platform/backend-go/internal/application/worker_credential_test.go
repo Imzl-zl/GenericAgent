@@ -486,6 +486,9 @@ func (f *jtiPersistingStore) RecordChunkEvent(ctx context.Context, taskID string
 func (f *jtiPersistingStore) RecordHeartbeat(ctx context.Context, taskID string) error {
 	panic("unexpected")
 }
+func (f *jtiPersistingStore) MarkTaskStreamFinal(ctx context.Context, taskID string) (*time.Time, error) {
+	panic("unexpected")
+}
 func (f *jtiPersistingStore) CountRunningTasks(ctx context.Context) (int, error) {
 	panic("unexpected")
 }

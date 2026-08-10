@@ -70,3 +70,38 @@ RETURNING int_value
 	}
 	return stored, nil
 }
+
+// GetIMStreamingMode 解析 IM 流式输出开关; 缺失/非法值回退默认
+// (streaming——设计: 私聊默认开, 群聊由转发判定收敛)。
+func (s *Store) GetIMStreamingMode(ctx context.Context) (domain.IMStreamingMode, error) {
+	var raw string
+	err := s.pool.QueryRow(ctx, `
+SELECT text_value
+FROM platform_runtime_settings
+WHERE setting_key = $1
+`, domain.IMStreamingModeSettingKey).Scan(&raw)
+	if err != nil {
+		return domain.NormalizeIMStreamingMode(""), fmt.Errorf("get im streaming mode: %w", err)
+	}
+	return domain.NormalizeIMStreamingMode(domain.IMStreamingMode(raw)), nil
+}
+
+// UpdateIMStreamingMode 更新 IM 流式输出开关并返回归一后的模式。
+func (s *Store) UpdateIMStreamingMode(ctx context.Context, mode domain.IMStreamingMode, updatedBy int64) (domain.IMStreamingMode, error) {
+	if err := domain.ValidateIMStreamingMode(string(mode)); err != nil {
+		return "", err
+	}
+	var stored string
+	err := s.pool.QueryRow(ctx, `
+UPDATE platform_runtime_settings
+SET text_value = $2,
+    updated_by = $3,
+    updated_at = timezone('utc', now())
+WHERE setting_key = $1
+RETURNING text_value
+`, domain.IMStreamingModeSettingKey, string(mode), updatedBy).Scan(&stored)
+	if err != nil {
+		return "", fmt.Errorf("update im streaming mode: %w", err)
+	}
+	return domain.NormalizeIMStreamingMode(domain.IMStreamingMode(stored)), nil
+}

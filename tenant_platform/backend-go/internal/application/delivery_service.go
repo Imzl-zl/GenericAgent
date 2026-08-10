@@ -65,9 +65,11 @@ type DeliveryStore interface {
 	DeleteExpiredDeliveryFiles(ctx context.Context, before time.Time) (int64, error)
 }
 
-// BotResolverByOwner locates the bot registered to a platform user.
-type BotResolverByOwner interface {
-	GetBotByOwner(ctx context.Context, ownerID int64) (domain.Bot, error)
+// ChannelResolverByOwner locates the channel config a task's reply should go
+// through (IM_CHANNEL_BINDING §6: 回复按任务 Source 渠道路由; 非渠道来源
+// 回退微信)。
+type ChannelResolverByOwner interface {
+	GetChannelConfigByOwnerAndType(ctx context.Context, ownerID int64, channelType domain.ChannelType) (domain.ChannelConfig, error)
 }
 
 // TaskReader loads task metadata for delivery addressing.
@@ -86,6 +88,21 @@ type ResultReader interface {
 	ReadResult(ctx context.Context, ref, digest string) (domain.ResultPayload, error)
 }
 
+// channelTypeForTaskSource 映射任务来源到回复渠道: IM 渠道任务回来源渠道,
+// 其余(web/未知)回退微信(与既有行为一致)。
+func channelTypeForTaskSource(source string) domain.ChannelType {
+	switch source {
+	case domain.SourceFeishu:
+		return domain.ChannelFeishu
+	case domain.SourceDingTalk:
+		return domain.ChannelDingTalk
+	case domain.SourceQQ:
+		return domain.ChannelQQ
+	default:
+		return domain.ChannelWechat
+	}
+}
+
 // DeliveryService polls the outbox and sends terminal notifications via the
 // configured BotTransportAdapter.
 type DeliveryService interface {
@@ -97,7 +114,7 @@ type DeliveryService interface {
 type DeliveryServiceConfig struct {
 	Store        DeliveryStore
 	Tasks        TaskReader
-	Bots         BotResolverByOwner
+	Bots         ChannelResolverByOwner
 	Transport    transport.BotTransportAdapter
 	Results      ResultReader
 	Messages     MessageStore
@@ -308,12 +325,23 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 		}
 		return nil
 	}
-	bot, err := s.cfg.Bots.GetBotByOwner(ctx, task.RequesterID)
+	// 回复渠道 = 任务来源渠道(IM_CHANNEL_BINDING §6); 非渠道来源(web 等)
+	// 回退微信。
+	channelType := channelTypeForTaskSource(task.Source)
+	bot, err := s.cfg.Bots.GetChannelConfigByOwnerAndType(ctx, task.RequesterID, channelType)
 	if err != nil {
 		return s.deadLetter(ctx, d, "BOT_RESOLVE_FAILED", err.Error(), now)
 	}
 	if !bot.IsBound() {
-		return s.deadLetter(ctx, d, "BOT_NOT_BOUND", "bot has no bound ilink user", now)
+		return s.deadLetter(ctx, d, "BOT_NOT_BOUND", "channel config is not bound", now)
+	}
+	// 回复目标: 微信=绑定 ilink_user_id; 新渠道=任务对话单元(conversation_id)。
+	replyTarget := bot.IlinkUserID
+	if bot.ChannelType != domain.ChannelWechat {
+		replyTarget = task.ConversationKey
+		if replyTarget == "" {
+			return s.deadLetter(ctx, d, "NO_REPLY_TARGET", "task has no conversation key for channel reply", now)
+		}
 	}
 	payload, err := s.buildPayload(ctx, d, task)
 	if err != nil {
@@ -325,7 +353,10 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 	defer removePayloadFiles(payload)
 	sendCtx, cancel := context.WithTimeout(ctx, deliverySendTimeout)
 	defer cancel()
-	if payload.Text != "" {
+	// IM 流式交付(IM_STREAMING_DELIVERY §4.2): 任务流式回复已 commit 成功
+	// (stream_final_at 非空)时, 最终文本已在流式消息中交付, 跳过文本 part
+	// 防重复; 文件 part 照发。失败/未流式路径无标记 → 文本照发兜底。
+	if payload.Text != "" && task.StreamFinalAt == nil {
 		partKey := d.DeliveryID + ":text"
 		_, _, partErr := s.sendAndJournalPart(ctx, deliveryPart{
 			key: partKey,
@@ -344,7 +375,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				if err := assertMemberAtSend(); err != nil {
 					return err
 				}
-				return s.cfg.Transport.SendMessage(sendCtx, bot.BotUUID, bot.IlinkUserID, payload.Text, deliveryClientID(partKey))
+				return s.cfg.Transport.SendMessage(sendCtx, bot.BotUUID, replyTarget, payload.Text, deliveryClientID(partKey))
 			},
 			sendErrorCode: "SEND_FAILED",
 		})
@@ -376,7 +407,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				// (safefs 限长读取 + 普通文件校验), tmp 位于 Platform 私有
 				// 目录(0700), 直接发送, 无需二次快照。
 				if file.snapshotContent {
-					return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, file.absPath, file.displayName, deliveryClientID(partKey))
+					return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey))
 				}
 				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
 				// 后复制到 Platform 私有快照, transport 发送不可变快照,
@@ -386,7 +417,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 					return snapErr
 				}
 				defer os.Remove(snap)
-				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, bot.IlinkUserID, snap, file.displayName, deliveryClientID(partKey))
+				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, replyTarget, snap, file.displayName, deliveryClientID(partKey))
 			},
 			sendErrorCode: "SEND_FILE_FAILED",
 		})
