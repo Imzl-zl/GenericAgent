@@ -53,11 +53,11 @@ type TaskStore interface {
 	// ResetWorkspaceForNewSession marks the session for fresh start (/new):
 	// workspace 行锁下设置 reset_at、终态化未派发任务并对已派发任务写入
 	// durable cancel request(审查 F3: 与 claim 竞态闭合)。
-	ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error)
+	ResetWorkspaceForNewSession(ctx context.Context, sessionKey, conversationKey string) (int, error)
 	// WorkspaceIsFresh 返回 workspaces.reset_at 是否仍待消费(/new 后首个
 	// 成功任务之前)。dispatch 时实时判定, 而非沿用提交时快照——多条 queued
 	// 任务共享同一 fresh 快照会让第二条任务错误地空启动(审查 F2)。
-	WorkspaceIsFresh(ctx context.Context, sessionKey string) (bool, error)
+	WorkspaceIsFresh(ctx context.Context, sessionKey, conversationKey string) (bool, error)
 	// SetTaskCapabilityJTIs 持久化任务实际签发的 capability JTI 列表
 	// (崩溃恢复时用于撤销, 审查: 撤销必须是持久工作流)。
 	// platformInstanceID 与任务活跃 claim 绑定(审查 R5-I2): 任务已终态/被

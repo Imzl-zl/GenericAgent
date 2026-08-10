@@ -84,10 +84,10 @@ func (m *memoryTaskStore) RequeueTask(ctx context.Context, taskID, platformInsta
 func (m *memoryTaskStore) CountQueuedTasksByRequester(ctx context.Context, requesterUserID int64) (int, error) {
 	return 0, errors.New("unused")
 }
-func (m *memoryTaskStore) ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error) {
+func (m *memoryTaskStore) ResetWorkspaceForNewSession(ctx context.Context, sessionKey, conversationKey string) (int, error) {
 	return 0, errors.New("unused")
 }
-func (m *memoryTaskStore) WorkspaceIsFresh(ctx context.Context, sessionKey string) (bool, error) {
+func (m *memoryTaskStore) WorkspaceIsFresh(ctx context.Context, sessionKey, conversationKey string) (bool, error) {
 	return false, errors.New("unused")
 }
 func (m *memoryTaskStore) SetTaskCapabilityJTIs(ctx context.Context, taskID, platformInstanceID string, jtis []string) error {

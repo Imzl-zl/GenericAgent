@@ -206,7 +206,7 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 	// 当前值决定, 而不是任务提交时的快照——首条 fresh 任务成功清除
 	// reset_at 后, 后提交的 queued 任务在此处判定为非 fresh, 正确继承
 	// 上一条任务已提交的 checkpoint, 而不是再次空启动。
-	fresh, err := s.cfg.Store.WorkspaceIsFresh(ctx, task.SessionKey)
+	fresh, err := s.cfg.Store.WorkspaceIsFresh(ctx, task.SessionKey, task.ConversationKey)
 	if err != nil {
 		return fmt.Errorf("resolve workspace fresh flag: %w", err)
 	}

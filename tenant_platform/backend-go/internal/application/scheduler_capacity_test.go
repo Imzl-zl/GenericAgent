@@ -175,10 +175,10 @@ func (f *capacityTaskStore) RecordHeartbeat(ctx context.Context, taskID string) 
 func (f *capacityTaskStore) CountQueuedTasksByRequester(ctx context.Context, requesterUserID int64) (int, error) {
 	panic("unexpected CountQueuedTasksByRequester")
 }
-func (f *capacityTaskStore) ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error) {
+func (f *capacityTaskStore) ResetWorkspaceForNewSession(ctx context.Context, sessionKey, conversationKey string) (int, error) {
 	panic("unexpected ResetWorkspaceForNewSession")
 }
-func (f *capacityTaskStore) WorkspaceIsFresh(ctx context.Context, sessionKey string) (bool, error) {
+func (f *capacityTaskStore) WorkspaceIsFresh(ctx context.Context, sessionKey, conversationKey string) (bool, error) {
 	return false, nil
 }
 

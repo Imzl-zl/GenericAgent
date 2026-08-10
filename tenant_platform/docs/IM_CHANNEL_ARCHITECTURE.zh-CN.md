@@ -56,6 +56,7 @@ workspace（personal:<uid> / team:<uuid>）── 共享：memory/、SOP、项�
 - **checkpoint/state 按对话单元分桶**：`backend_history`/`agent_history`/`display_history` 三视图同桶存取；**per-conversation 同样走 staging/commit**（只有成功 task 才推进该桶恢复指针），失败/取消不污染。
 - **memory L0-L4 / SOP 保持 workspace 级共享**，写穿语义不变（与 `GA_SANDBOX_RUNNER_REFACTOR` §2 一致）。
 - **群桶成员**：群内多人共享该群桶（团队=租户，不按人再分）；私聊各自一桶。
+- **`/new` 桶级实现（0052 已落地）**：reset 标记在 `conversation_resets(workspace_id, conversation_key)` 表，按桶 upsert；/new 只取消该桶 queued 任务并标记该桶；消费语义不变（该桶 fresh 任务成功终态才清除，失败/取消不消费，R4-I8）；旧 `workspaces.reset_at` 列已随 0052 退役。微信 /new 只清 `''` 默认桶。
 
 ## 4. 落地路径（平台侧）
 

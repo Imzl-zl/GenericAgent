@@ -492,10 +492,10 @@ func (f *jtiPersistingStore) CountRunningTasks(ctx context.Context) (int, error)
 func (f *jtiPersistingStore) CountQueuedTasksByRequester(ctx context.Context, requesterUserID int64) (int, error) {
 	panic("unexpected")
 }
-func (f *jtiPersistingStore) ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error) {
+func (f *jtiPersistingStore) ResetWorkspaceForNewSession(ctx context.Context, sessionKey, conversationKey string) (int, error) {
 	panic("unexpected")
 }
-func (f *jtiPersistingStore) WorkspaceIsFresh(ctx context.Context, sessionKey string) (bool, error) {
+func (f *jtiPersistingStore) WorkspaceIsFresh(ctx context.Context, sessionKey, conversationKey string) (bool, error) {
 	panic("unexpected")
 }
 

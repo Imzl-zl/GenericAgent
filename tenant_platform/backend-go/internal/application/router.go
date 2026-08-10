@@ -72,7 +72,7 @@ type RouterStore interface {
 	GetUserStatus(ctx context.Context, userID int64) (domain.UserStatus, error)
 	FindRunningTaskBySession(ctx context.Context, sessionKey string) (domain.Task, error)
 	// ResetWorkspaceForNewSession 设置 reset_at 并取消 queued 任务(/new)。
-	ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error)
+	ResetWorkspaceForNewSession(ctx context.Context, sessionKey, conversationKey string) (int, error)
 }
 
 // MessageStore persists inbound and outbound WeChat messages for history,

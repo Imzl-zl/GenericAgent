@@ -60,7 +60,7 @@ func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string) 
 	return *f.runningTask, nil
 }
 
-func (f *fakeRouterStore) ResetWorkspaceForNewSession(_ context.Context, _ string) (int, error) {
+func (f *fakeRouterStore) ResetWorkspaceForNewSession(_ context.Context, _ string, _ string) (int, error) {
 	return 0, nil
 }
 

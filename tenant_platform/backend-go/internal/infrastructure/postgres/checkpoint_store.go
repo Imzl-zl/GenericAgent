@@ -419,11 +419,14 @@ ON CONFLICT (delivery_id, marker) DO NOTHING
 		if err := revokeTaskCapabilityJTIs(ctx, tx, tt.ID); err != nil {
 			return err
 		}
-		// 审查 R4-I8: fresh 任务成功终态才清除 reset_at 标记——失败/取消的
+		// 审查 R4-I8: fresh 任务成功终态才清除本桶 reset 标记——失败/取消的
 		// fresh 任务保留重置标记, 下一任务仍从干净状态开始, 不会静默恢复
-		// /new 前的旧 snapshot。
+		// /new 前的旧 snapshot。桶级: 只清本对话单元桶, 其他桶不受影响
+		// (IM_CHANNEL_ARCHITECTURE §3)。
 		if t.FreshSession {
-			if _, err := tx.Exec(ctx, `UPDATE workspaces SET reset_at = NULL WHERE session_key = $1`, t.SessionKey); err != nil {
+			if _, err := tx.Exec(ctx, `
+DELETE FROM conversation_resets WHERE workspace_id = $1 AND conversation_key = $2
+`, t.WorkspaceID, t.ConversationKey); err != nil {
 				return err
 			}
 		}

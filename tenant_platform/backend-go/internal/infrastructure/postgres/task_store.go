@@ -109,10 +109,9 @@ func (s *Store) submitTaskTx(ctx context.Context, tx pgx.Tx, cmd domain.SubmitTa
 		var workspaceID uuid.UUID
 		var ownerID int64
 		var kind, teamID string
-		var resetAt *time.Time
 		err := tx.QueryRow(ctx, `
-SELECT id, owner_user_id, kind, COALESCE(team_id::text, ''), reset_at FROM workspaces WHERE session_key = $1 FOR UPDATE
-`, cmd.SessionKey).Scan(&workspaceID, &ownerID, &kind, &teamID, &resetAt)
+SELECT id, owner_user_id, kind, COALESCE(team_id::text, '') FROM workspaces WHERE session_key = $1 FOR UPDATE
+`, cmd.SessionKey).Scan(&workspaceID, &ownerID, &kind, &teamID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				// Round16-P1: 哨兵化, api 层据此映射 404(而非全 500)。
@@ -127,12 +126,20 @@ SELECT id, owner_user_id, kind, COALESCE(team_id::text, ''), reset_at FROM works
 		if err := authorizeSubmitter(tx, ctx, kind, ownerID, teamID, requester); err != nil {
 			return err
 		}
-		// /new was issued since the last committed snapshot: the next task
-		// starts with cleared history and working state. 审查 R4-I8: 标记
+		// /new 桶级判定(IM_CHANNEL_ARCHITECTURE §3): 本对话单元桶是否有未消费的
+		// reset 标记——有则本任务 fresh(空 history 开始)。审查 R4-I8: 标记
 		// 不在提交时清除——它保留到 fresh 任务成功终态, 因此 fresh 任务
 		// 失败/取消后, 下一个任务仍然 fresh, 不会静默恢复 /new 前的旧
 		// snapshot。并发提交的多个任务共享同一 fresh 语义。
 		freshSession := false
+		var resetAt *time.Time
+		if err := tx.QueryRow(ctx, `
+SELECT reset_at FROM conversation_resets WHERE workspace_id = $1 AND conversation_key = $2
+`, workspaceID, cmd.ConversationKey).Scan(&resetAt); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("read conversation reset: %w", err)
+			}
+		}
 		if resetAt != nil {
 			freshSession = true
 		}
@@ -223,7 +230,7 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (domain.Task, error)
 	return t, nil
 }
 
-// WorkspaceIsFresh 返回 workspaces.reset_at 是否仍待消费(/new 后首个成功
+// WorkspaceIsFresh 返回本对话单元桶的 reset 标记是否仍待消费(/new 后首个成功
 // 任务之前)。dispatch 时实时判定并写回 tasks.fresh_session(MarkDispatchStarted
 // 事务), 解决多条 queued 任务共享提交时 fresh 快照、第二条任务错误空启动
 // 丢失连续上下文的问题(审查 F2)。
@@ -274,14 +281,15 @@ WHERE id = $1
 
 // ResetWorkspaceForNewSession marks the session for fresh start (/new):
 // 在 workspace 行锁下原子完成三件事(审查 F3):
-//  1. 设置 reset_at(/new 语义, 保留到 fresh 任务成功终态);
-//  2. 终态化所有 queued 任务与未派发的 starting 任务(worker_dispatch_started_at
-//     IS NULL), 防止旧上下文任务带旧 snapshot 执行;
+//  1. 设置本对话单元桶的 reset 标记(/new 语义, 保留到该桶 fresh 任务成功终态);
+//  2. 终态化该桶所有 queued 任务与未派发的 starting 任务(worker_dispatch_started_at
+//     IS NULL), 防止旧上下文任务带旧 snapshot 执行; 其他桶任务不受影响
+//     (IM_CHANNEL_ARCHITECTURE §3: /new 清当前桶);
 //  3. 对已派发的 starting/running 任务写入 durable cancel_requested_at
 //     (tick 驱动 Worker cancel RPC, dispatch 观察后终态化), 闭合
 //     "查询活跃任务 -> claim -> reset" 的竞态窗口——即使任务在
 //     FindRunningTaskBySession 之后才被 claim, 也会在此事务内被取消。
-func (s *Store) ResetWorkspaceForNewSession(ctx context.Context, sessionKey string) (int, error) {
+func (s *Store) ResetWorkspaceForNewSession(ctx context.Context, sessionKey, conversationKey string) (int, error) {
 	var cancelled int
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		// workspace 行锁: 与 SubmitTask/ClaimNextTask 串行, 确保取消与
@@ -291,18 +299,20 @@ func (s *Store) ResetWorkspaceForNewSession(ctx context.Context, sessionKey stri
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
-UPDATE workspaces SET reset_at = timezone('utc', now())
-WHERE session_key = $1
-`, sessionKey); err != nil {
+INSERT INTO conversation_resets (workspace_id, conversation_key, reset_at)
+VALUES ($1::uuid, $2, timezone('utc', now()))
+ON CONFLICT (workspace_id, conversation_key) DO UPDATE SET reset_at = timezone('utc', now())
+`, workspaceID, conversationKey); err != nil {
 			return err
 		}
 		// queued + 未派发的 starting: 直接终态化为 cancelled(与 CancelTask
-		// 的未派发分支语义一致)。
+		// 的未派发分支语义一致)。按桶过滤, 其他桶任务不受 /new 影响。
 		rows, err := tx.Query(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
-WHERE session_key = $1 AND (status = 'queued' OR (status = 'starting' AND worker_dispatch_started_at IS NULL))
+WHERE session_key = $1 AND conversation_key = $2
+  AND (status = 'queued' OR (status = 'starting' AND worker_dispatch_started_at IS NULL))
 FOR UPDATE
-`, sessionKey)
+`, sessionKey, conversationKey)
 		if err != nil {
 			return err
 		}
@@ -329,10 +339,10 @@ FOR UPDATE
 		// 已派发的 starting/running: 写入 durable cancel request(仅一次)。
 		rows2, err := tx.Query(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
-WHERE session_key = $1 AND status IN `+activeTaskStatusesSQL+`
+WHERE session_key = $1 AND conversation_key = $2 AND status IN `+activeTaskStatusesSQL+`
   AND worker_dispatch_started_at IS NOT NULL AND cancel_requested_at IS NULL
 FOR UPDATE
-`, sessionKey)
+`, sessionKey, conversationKey)
 		if err != nil {
 			return err
 		}
@@ -366,15 +376,19 @@ RETURNING `+taskSelectColumns, t.ID)
 	return cancelled, err
 }
 
-// WorkspaceIsFresh 返回 workspaces.reset_at 是否仍待消费(/new 后首个成功
-// 任务之前)。dispatch 时实时判定并写回 tasks.fresh_session(MarkDispatchStarted
+// WorkspaceIsFresh 返回本对话单元桶的 reset 标记是否仍待消费(/new 后首个
+// 成功任务之前)。dispatch 时实时判定并写回 tasks.fresh_session(MarkDispatchStarted
 // 事务), 解决多条 queued 任务共享提交时 fresh 快照、第二条任务错误空启动
-// 丢失连续上下文的问题(审查 F2)。
-func (s *Store) WorkspaceIsFresh(ctx context.Context, sessionKey string) (bool, error) {
+// 丢失连续上下文的问题(审查 F2)。桶级判定见 IM_CHANNEL_ARCHITECTURE §3。
+func (s *Store) WorkspaceIsFresh(ctx context.Context, sessionKey, conversationKey string) (bool, error) {
 	var fresh bool
 	err := s.pool.QueryRow(ctx, `
-SELECT COALESCE(reset_at IS NOT NULL, false) FROM workspaces WHERE session_key = $1
-`, sessionKey).Scan(&fresh)
+SELECT EXISTS (
+  SELECT 1 FROM conversation_resets AS r
+  JOIN workspaces AS w ON w.id = r.workspace_id
+  WHERE w.session_key = $1 AND r.conversation_key = $2
+)
+`, sessionKey, conversationKey).Scan(&fresh)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, fmt.Errorf("workspace not found for session_key %q", sessionKey)
 	}

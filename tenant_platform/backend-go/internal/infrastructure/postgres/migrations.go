@@ -80,6 +80,7 @@ func migrationFiles() []string {
 		"0049_mcp_gateway.sql",
 		"0050_user_personal_workspace.sql",
 		"0051_conversation_key.sql",
+		"0052_conversation_resets.sql",
 	}
 }
 
@@ -135,6 +136,7 @@ var pendingMigrations = []struct {
 	{"0049_mcp_gateway.sql", "migration_0049_mcp_gateway_marker"},
 	{"0050_user_personal_workspace.sql", "migration_0050_user_personal_workspace_marker"},
 	{"0051_conversation_key.sql", "migration_0051_conversation_key_marker"},
+	{"0052_conversation_resets.sql", "migration_0052_conversation_resets_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
