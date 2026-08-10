@@ -48,6 +48,7 @@
 ## Pitfalls
 
 - Python 3.14 与 pywebview 等依赖不兼容；推荐 3.11/3.12（CI 用 3.11）。
+- **表改名迁移（2026-08-10 实证）**：早期迁移的 marker 可能就是表本身（0003 的 marker = bots 表）——RENAME 后必须重建仅作 marker 的 stub 表，否则该迁移被重放重建空表；RENAME/列改名/约束改名无 IF NOT EXISTS，用 DO 块条件执行（0052/0053 先例）。
 - `TEST_DATABASE_URL` 缺失时集成测试显式失败；本地先起 Postgres 并设环境变量。
 - 两包并行跑共享测试库有既有 flaky（死锁/唯一键冲突），用 `go test -p 1` 规避，不要当代码 bug 修。
 - runsc 运行时、mTLS 证书注入、六服务 compose 冒烟、共享卷跨 UID 读写只能在真实 Linux 主机验证（方案 §10 声明），CI/Windows 本地不可覆盖。
@@ -61,6 +62,9 @@
 - **微信 Bot（iLink）只能个人自用**：仅私聊、不能加群、无"多个好友/客服"场景——`wxbot_client.py` 消息模型只有 `from_user_id/to_user_id`，无群概念；对话单元固定单桶（`wechat:me`）。平台侧微信 bot ↔ 用户 1:1（QR 扫码绑定）。设计多 IM 时勿把微信当客服机器人模型。
 - 可群聊渠道：QQ（`qqapp.py` `group_openid`）、Telegram（chat 模型天然支持）、钉钉（`dingtalkapp.py` `conversation_type=="2"` → `group:{id}`）、企微（`wecomapp.py` `chatid`）、飞书（`fsapp.py`）。
 - 数据模型定案：隔离单元 = workspace（personal/team），memory/SOP/项目文件全共享；**对话上下文按"对话单元"（渠道×群/对端）分桶**，`/new` 清当前桶；桶 key = `channel:chat_id`。设计真值：`tenant_platform/docs/IM_CHANNEL_ARCHITECTURE.zh-CN.md`。
+- **渠道配置模型（2026-08-10 定案，bots → channel_configs）**：每用户每渠道一行（(owner_id, channel_type) 唯一）；凭据 = JSON 密文（微信={token}、新渠道={app_id, app_secret}）；新渠道属主即 canonical user（无二次绑定）；群消息触发 = 平台协议硬规则（钉钉/QQ 必须 @，飞书只申请 `group_at_msg`，不申请收全部的敏感权限 group_msg）；契约字段 `ilink_user_id` → `channel_account_id`（已全链路同步）。设计真值：`tenant_platform/docs/IM_CHANNEL_BINDING.zh-CN.md`。
+- **Poller BotAdapter 注册表（2026-08-10）**：`bot_poller/poller_server.py` 按 bot_uuid 注册渠道 adapter（WeChat=WxBotClient 长轮询 / Feishu=lark-oapi WS / DingTalk=dingtalk-stream / QQ=botpy WS）；SDK 惰性导入（缺失只影响该渠道）；/start 契约 = bot_uuid + channel_type + config_json（解密后的凭据 JSON）；入站统一 POST /v1/im/webhook（body 含 channel_type/channel_account_id/conversation_id/conversation_type；conversation_id 取值：QQ=group_openid/openid、钉钉=conversationId、飞书=chat_id、微信恒空；conversation_type：QQ is_group、飞书 chat_type、钉钉 conversation_type=='2'，微信恒 private）；配置热更新 = 平台热推（PUT/DELETE im-bindings → poller start/stop）。
+- **IM 流式输出（2026-08-10，im-streaming-delivery 已落地）**：`StreamingSender`/`StreamReply` 可选接口（transport 包），非流渠道不实现；poller /send 扩展 stream_id+stream_action(open|append|commit|abort)（不新增端点，open 响应回 stream_id）；飞书=占位消息+PUT 全量替换打字机（_TokenBucket 5 QPS）；QQ 单聊=原生流式帧（stream{state 1/10, id, index, reset}，全量替换语义，append≤2 保护被动回复 4 次/条）；scheduler 500ms 节流合并（首条 chunk 为窗口起点，flush 由下一 chunk/心跳/Terminal 驱动）；stream_final_at 置位后 delivery 跳过文本 part（文件照发）；群聊统一只发最终结果（tasks.conversation_type）。设计真值：`tenant_platform/docs/IM_STREAMING_DELIVERY.zh-CN.md`。QQ 流式帧参数需真实凭据实测。
 
 ## 镜像打包（compose）
 
