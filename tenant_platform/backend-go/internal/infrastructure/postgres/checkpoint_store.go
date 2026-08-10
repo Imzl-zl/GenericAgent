@@ -368,10 +368,15 @@ WHERE id = $1::uuid AND task_id = $7 AND state = 'writing' AND token IS NOT NULL
 		if tag.RowsAffected() != 1 {
 			return fmt.Errorf("complete: snapshot %s not writable", snapshotID)
 		}
-		if _, err := tx.Exec(ctx, `
+		// 仅默认桶(conversation_key='')推进 workspaces.current_snapshot_id 显式
+		// 指针——非默认桶恢复走 workspace_snapshots 按桶查询(取该桶最近
+		// committed)，更新指针会跨桶覆盖默认桶恢复点(IM_CHANNEL_ARCHITECTURE §3)。
+		if t.ConversationKey == "" {
+			if _, err := tx.Exec(ctx, `
 UPDATE workspaces SET current_snapshot_id = $2::uuid WHERE id = $1::uuid
 `, t.WorkspaceID, snapshotID); err != nil {
-			return err
+				return err
+			}
 		}
 		row = tx.QueryRow(ctx, `
 UPDATE tasks SET
