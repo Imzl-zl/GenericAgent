@@ -93,3 +93,36 @@ DELETE FROM conversation_resets WHERE workspace_id = $1 AND conversation_key = '
 		t.Fatalf("default bucket fresh after consume = %v err=%v, want false", ok, err)
 	}
 }
+
+// TestConversationResetMigrationReapplyIdempotent 验证 0052 在 marker 缺失
+// 重放场景下幂等(EnsureSchema 重放不得因 workspaces.reset_at 列已删而失败)。
+func TestConversationResetMigrationReapplyIdempotent(t *testing.T) {
+	pool := requireDB(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS migration_0052_conversation_resets_marker`); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSchema(ctx, pool, ""); err != nil {
+		t.Fatalf("EnsureSchema reapply after marker drop: %v", err)
+	}
+	var hasResetAt bool
+	if err := pool.QueryRow(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM information_schema.columns
+  WHERE table_schema = current_schema() AND table_name = 'workspaces' AND column_name = 'reset_at'
+)`).Scan(&hasResetAt); err != nil {
+		t.Fatal(err)
+	}
+	if hasResetAt {
+		t.Fatal("workspaces.reset_at must stay dropped after reapply")
+	}
+	var hasResets bool
+	if err := pool.QueryRow(ctx, `
+SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'conversation_resets')
+`).Scan(&hasResets); err != nil {
+		t.Fatal(err)
+	}
+	if !hasResets {
+		t.Fatal("conversation_resets table missing after reapply")
+	}
+}

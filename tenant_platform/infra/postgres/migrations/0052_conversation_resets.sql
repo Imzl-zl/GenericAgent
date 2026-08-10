@@ -15,9 +15,22 @@ CREATE TABLE IF NOT EXISTS conversation_resets (
 );
 
 -- 存量 reset 标记迁移(旧实现只有默认桶语义 → conversation_key='')
-INSERT INTO conversation_resets (workspace_id, conversation_key, reset_at)
-SELECT id, '', reset_at FROM workspaces WHERE reset_at IS NOT NULL
-ON CONFLICT (workspace_id, conversation_key) DO NOTHING;
+-- 条件执行: 本迁移已应用后 workspaces.reset_at 列被删, EnsureSchema 重放
+-- 场景(如测试删 marker)下直接 SELECT reset_at 会因列不存在而失败。
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = 'workspaces'
+      AND column_name = 'reset_at'
+  ) THEN
+    INSERT INTO conversation_resets (workspace_id, conversation_key, reset_at)
+    SELECT id, '', reset_at FROM workspaces WHERE reset_at IS NOT NULL
+    ON CONFLICT (workspace_id, conversation_key) DO NOTHING;
+  END IF;
+END
+$$;
 
 -- 旧列与索引退役(0018 的 workspace 级语义)
 DROP INDEX IF EXISTS idx_workspaces_reset_at;

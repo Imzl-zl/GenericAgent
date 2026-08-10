@@ -262,13 +262,15 @@ func scanUser(row pgx.Row, u *domain.User) error {
 // FindRunningTaskBySession returns the single starting/running task for the
 // given session_key, or pgx.ErrNoRows if none. Relies on the
 // one_running_task_per_session unique index.
-func (s *Store) FindRunningTaskBySession(ctx context.Context, sessionKey string) (domain.Task, error) {
+func (s *Store) FindRunningTaskBySession(ctx context.Context, sessionKey, conversationKey string) (domain.Task, error) {
 	if sessionKey == "" {
 		return domain.Task{}, fmt.Errorf("session key is required")
 	}
+	// 按对话单元桶过滤(IM_CHANNEL_ARCHITECTURE §3): /stop、/new、/status
+	// 只作用于当前桶——桶 A 的 /new 不得误杀桶 B 正在跑的任务。
 	row := s.pool.QueryRow(ctx, `
 SELECT `+taskSelectColumns+` FROM tasks
-WHERE session_key = $1 AND status IN `+activeTaskStatusesSQL+`
-`, sessionKey)
+WHERE session_key = $1 AND conversation_key = $2 AND status IN `+activeTaskStatusesSQL+`
+`, sessionKey, conversationKey)
 	return scanTask(row)
 }

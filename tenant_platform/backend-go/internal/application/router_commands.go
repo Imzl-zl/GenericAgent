@@ -116,7 +116,7 @@ func (r *router) handleStop(ctx context.Context, msg IncomingMessage, bot domain
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
-	task, err := r.store.FindRunningTaskBySession(ctx, sessionKey)
+	task, err := r.store.FindRunningTaskBySession(ctx, sessionKey, "") // 微信默认桶
 	if errors.Is(err, pgx.ErrNoRows) {
 		reply := "no running task to stop"
 		_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.IlinkUserID, reply, "")
@@ -144,7 +144,7 @@ func (r *router) handleNew(ctx context.Context, msg IncomingMessage, bot domain.
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
-	if task, err := r.store.FindRunningTaskBySession(ctx, sessionKey); err == nil {
+	if task, err := r.store.FindRunningTaskBySession(ctx, sessionKey, ""); err == nil { // 微信默认桶
 		if _, err := r.tasks.CancelTask(ctx, task.ID, bot.OwnerID); err != nil {
 			slog.ErrorContext(ctx, "router: /new cancel running task failed",
 				"task_id", task.ID, "error", err)
@@ -166,7 +166,7 @@ func (r *router) handleStatus(ctx context.Context, msg IncomingMessage, bot doma
 	if err != nil {
 		return RouterResult{}, fmt.Errorf("resolve session: %w", err)
 	}
-	_, err = r.store.FindRunningTaskBySession(ctx, sessionKey)
+	_, err = r.store.FindRunningTaskBySession(ctx, sessionKey, "") // 微信默认桶
 	var reply string
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):

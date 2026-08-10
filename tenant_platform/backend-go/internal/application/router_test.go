@@ -50,7 +50,7 @@ func (f *fakeRouterStore) GetUserStatus(_ context.Context, userID int64) (domain
 	return s, nil
 }
 
-func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string) (domain.Task, error) {
+func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string, _ string) (domain.Task, error) {
 	if f.findTaskErr != nil {
 		return domain.Task{}, f.findTaskErr
 	}
