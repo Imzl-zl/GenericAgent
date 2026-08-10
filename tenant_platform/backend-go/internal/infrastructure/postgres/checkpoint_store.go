@@ -96,12 +96,14 @@ SELECT COALESCE(MAX(generation), 0) + 1 FROM workspace_snapshots WHERE workspace
 		if _, err := tx.Exec(ctx, `
 INSERT INTO workspace_snapshots (
   id, workspace_id, task_id, schema_version, state, generation,
-  runner_generation, lease_owner, lease_until, token, staging_ref, max_bundle_bytes
+  runner_generation, lease_owner, lease_until, token, staging_ref, max_bundle_bytes,
+  conversation_key
 ) VALUES (
   $1, $2::uuid, $3, 'genericagent.snapshot.v1', 'writing', $4,
-  $5, $6, $7, $8, $9, $10
+  $5, $6, $7, $8, $9, $10,
+  $11
 )
-`, sid, t.WorkspaceID, t.ID, gen, runnerGeneration, platformInstanceID, leaseUntil, tok, stagingRef, int64(maxBundleBytes)); err != nil {
+`, sid, t.WorkspaceID, t.ID, gen, runnerGeneration, platformInstanceID, leaseUntil, tok, stagingRef, int64(maxBundleBytes), t.ConversationKey); err != nil {
 			return err
 		}
 		snapshotID = sid.String()
@@ -127,10 +129,32 @@ FROM workspace_snapshots WHERE id = $1::uuid AND token = $2
 }
 
 // CurrentWorkspaceSnapshot returns the latest committed snapshot selected by a workspace.
+// conversationKey 为空时保持存量单桶语义(workspaces.current_snapshot_id 显式
+// 指针); 非空时按对话单元桶查最近 committed(generation 为 workspace 级
+// 单调递增, 桶内取最大即该桶最近恢复点)。
 func (s *Store) CurrentWorkspaceSnapshot(
 	ctx context.Context,
 	workspaceID string,
+	conversationKey string,
 ) (snapshotID, fileRef, checksum string, ok bool, err error) {
+	if conversationKey != "" {
+		err = s.pool.QueryRow(ctx, `
+SELECT snapshot.id::text, snapshot.file_ref, snapshot.checksum
+FROM workspace_snapshots AS snapshot
+WHERE snapshot.workspace_id = $1::uuid
+  AND snapshot.conversation_key = $2
+  AND snapshot.state = 'committed'
+ORDER BY snapshot.generation DESC
+LIMIT 1
+`, workspaceID, conversationKey).Scan(&snapshotID, &fileRef, &checksum)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", "", false, nil
+		}
+		if err != nil {
+			return "", "", "", false, err
+		}
+		return snapshotID, fileRef, checksum, true, nil
+	}
 	err = s.pool.QueryRow(ctx, `
 SELECT snapshot.id::text, snapshot.file_ref, snapshot.checksum
 FROM workspaces AS workspace

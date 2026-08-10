@@ -89,7 +89,7 @@ func (c *cleanupRecordingCoordinator) Commit(ctx context.Context, ready checkpoi
 	}, nil
 }
 
-func (c *cleanupRecordingCoordinator) CurrentRestorePoint(ctx context.Context, workspaceID string) (checkpoint.RestorePoint, bool, error) {
+func (c *cleanupRecordingCoordinator) CurrentRestorePoint(ctx context.Context, workspaceID, conversationKey string) (checkpoint.RestorePoint, bool, error) {
 	return checkpoint.RestorePoint{}, false, nil
 }
 

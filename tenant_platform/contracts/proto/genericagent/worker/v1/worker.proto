@@ -65,6 +65,13 @@ message TaskEnvelope {
   // ExecuteTask 执行路径只校验集合成员(不强制 ctrl: 前缀)——loopback/无
   // control token 时 Platform 回退 firstJTI(可能无前缀), 该不对称是有意的。
   string capability_jti = 13;
+  // conversation_id 是渠道内的对话单元标识（对端用户/群 ID）。
+  // 语义: 同 workspace 内每个对话单元一个独立上下文桶, 互不串味
+  // (IM_CHANNEL_ARCHITECTURE.zh-CN.md §3)。
+  // 空字符串 = 该渠道 default 桶（个人自用型渠道如微信恒为空 → wechat:default
+  // 单桶; 非渠道入口如 sessions API 同样归 default）。桶 key 归一化唯一实现
+  // 在 worker 侧: f"{source}:{conversation_id or 'default'}"。
+  string conversation_id = 14;
 }
 
 message ExecuteTaskRequest { TaskEnvelope task = 1; }

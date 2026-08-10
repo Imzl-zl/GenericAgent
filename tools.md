@@ -56,6 +56,12 @@
 - 平台产物（platform.exe 等）是构建产物，不要提交改动；契约/策略变更要同步 `contracts/` 与各端实现。
 - Dockerfile base 镜像 digest pin 会随 Docker Hub manifest 清理失效：构建报 `400 Bad Request` / `not found` 时，用 `docker buildx imagetools inspect <镜像>:<tag> | grep Digest` 取新 index digest 更新。已实测失效并修复：`alpine:3.19`（llm-proxy）、`docker:27-cli`（sandbox-manager）；其余 pin（python:3.11-slim/golang:1.22/node:22/nginx:1.27）2026-08 仍有效。
 
+## IM 渠道能力（稳定事实）
+
+- **微信 Bot（iLink）只能个人自用**：仅私聊、不能加群、无"多个好友/客服"场景——`wxbot_client.py` 消息模型只有 `from_user_id/to_user_id`，无群概念；对话单元固定单桶（`wechat:me`）。平台侧微信 bot ↔ 用户 1:1（QR 扫码绑定）。设计多 IM 时勿把微信当客服机器人模型。
+- 可群聊渠道：QQ（`qqapp.py` `group_openid`）、Telegram（chat 模型天然支持）、钉钉（`dingtalkapp.py` `conversation_type=="2"` → `group:{id}`）、企微（`wecomapp.py` `chatid`）、飞书（`fsapp.py`）。
+- 数据模型定案：隔离单元 = workspace（personal/team），memory/SOP/项目文件全共享；**对话上下文按"对话单元"（渠道×群/对端）分桶**，`/new` 清当前桶；桶 key = `channel:chat_id`。设计真值：`tenant_platform/docs/IM_CHANNEL_ARCHITECTURE.zh-CN.md`。
+
 ## 镜像打包（compose）
 
 - 唯一部署入口：`tenant_platform/infra/compose/`（compose.yaml + 7 个 Dockerfile + Makefile + .env 模板）。文档：`compose/README.zh-CN.md`。

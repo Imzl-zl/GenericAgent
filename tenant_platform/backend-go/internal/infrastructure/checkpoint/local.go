@@ -223,11 +223,13 @@ func (c *LocalCoordinator) Commit(ctx context.Context, ready ReadyCheckpoint) (C
 }
 
 // CurrentRestorePoint resolves the workspace's opaque committed snapshot for Worker startup.
+// conversationKey 空 = 存量单桶; 非空 = 该对话单元桶最近恢复点。
 func (c *LocalCoordinator) CurrentRestorePoint(
 	ctx context.Context,
 	workspaceID string,
+	conversationKey string,
 ) (RestorePoint, bool, error) {
-	snapshotID, fileRef, checksum, ok, err := c.store.CurrentWorkspaceSnapshot(ctx, workspaceID)
+	snapshotID, fileRef, checksum, ok, err := c.store.CurrentWorkspaceSnapshot(ctx, workspaceID, conversationKey)
 	if err != nil || !ok {
 		return RestorePoint{}, ok, err
 	}

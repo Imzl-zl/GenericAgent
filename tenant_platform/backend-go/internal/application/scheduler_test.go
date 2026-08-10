@@ -209,6 +209,7 @@ func (c *successfulCoordinator) Commit(_ context.Context, ready checkpoint.Ready
 func (c *successfulCoordinator) CurrentRestorePoint(
 	context.Context,
 	string,
+	string,
 ) (checkpoint.RestorePoint, bool, error) {
 	return c.restorePoint, c.hasRestore, c.restoreErr
 }
@@ -267,6 +268,7 @@ func (c *readFailCoordinator) Commit(context.Context, checkpoint.ReadyCheckpoint
 
 func (c *readFailCoordinator) CurrentRestorePoint(
 	context.Context,
+	string,
 	string,
 ) (checkpoint.RestorePoint, bool, error) {
 	return checkpoint.RestorePoint{}, false, nil

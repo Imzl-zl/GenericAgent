@@ -62,7 +62,7 @@ type RestorePoint struct {
 type Coordinator interface {
 	Prepare(ctx context.Context, request CheckpointPrepareRequest) (CheckpointLease, error)
 	Commit(ctx context.Context, ready ReadyCheckpoint) (CommittedCheckpoint, error)
-	CurrentRestorePoint(ctx context.Context, workspaceID string) (RestorePoint, bool, error)
+	CurrentRestorePoint(ctx context.Context, workspaceID, conversationKey string) (RestorePoint, bool, error)
 	ReadResult(ctx context.Context, ref string, expectedDigest string) (domain.ResultPayload, error)
 	// SweepExpiredCheckpoints 定期清理 checkpoint lease 已过期的 writing
 	// snapshot(置为 quarantined)并删除其宿主 staging 文件(审查 R4-I12)。

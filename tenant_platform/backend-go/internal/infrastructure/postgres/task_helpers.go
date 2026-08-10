@@ -16,7 +16,7 @@ import (
 
 const taskSelectColumns = `
 id, workspace_id::text, session_key, session_sequence, requester_user_id,
-source, source_instance_id, message_id, message_idempotency_key,
+source, source_instance_id, message_id, message_idempotency_key, conversation_key,
 prompt, persona_snapshot, tool_policy_version, prompt_bytes, persona_bytes,
 status, COALESCE(claim_owner,''), claim_lease_until,
 COALESCE(worker_instance_id,''), worker_dispatch_started_at, cancel_requested_at,
@@ -48,6 +48,7 @@ func scanTask(row scannable) (domain.Task, error) {
 	err := row.Scan(
 		&t.ID, &t.WorkspaceID, &t.SessionKey, &t.SessionSequence, &t.RequesterID,
 		&t.Source, &t.SourceInstanceID, &t.MessageID, &t.MessageIdempotencyKey,
+		&t.ConversationKey,
 		&t.Prompt, &personaRaw, &t.ToolPolicyVersion, &t.PromptBytes, &t.PersonaBytes,
 		&t.Status, &t.ClaimOwner, &leaseUntil,
 		&t.WorkerInstanceID, &dispatchAt, &cancelAt,

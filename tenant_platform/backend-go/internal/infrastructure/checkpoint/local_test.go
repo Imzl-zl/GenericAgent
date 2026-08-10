@@ -126,7 +126,7 @@ func TestLocalCoordinator_PrepareCommitRead_TokenMismatch(t *testing.T) {
 	if _, err := store.CompleteSucceeded(ctx, task.ID, "platform-a", committed.SnapshotID, committed.FileRef, committed.Checksum, committed.ResultRef, committed.ResultDigest, len(body), nil); err != nil {
 		t.Fatal(err)
 	}
-	restore, ok, err := coord.CurrentRestorePoint(ctx, task.WorkspaceID)
+	restore, ok, err := coord.CurrentRestorePoint(ctx, task.WorkspaceID, "")
 	if err != nil {
 		t.Fatal(err)
 	}

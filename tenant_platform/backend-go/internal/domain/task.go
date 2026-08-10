@@ -17,6 +17,9 @@ type SubmitTaskCommand struct {
 	Prompt            string
 	PersonaSnapshot   []string
 	ToolPolicyVersion string
+	// ConversationKey 是渠道内对话单元标识(对端/群 ID); 空 = 该渠道默认桶
+	// (微信个人自用单桶 / 非渠道入口)。分桶见 IM_CHANNEL_ARCHITECTURE §3。
+	ConversationKey string
 }
 
 // TaskStatus is the durable task lifecycle state.
@@ -54,7 +57,9 @@ type Task struct {
 	SourceInstanceID      string
 	MessageID             string
 	MessageIdempotencyKey string
-	Prompt                string
+	// ConversationKey 是该任务的对话单元桶键(渠道内对端/群 ID; 空=默认桶)。
+	ConversationKey string
+	Prompt          string
 	PersonaSnapshot       []string
 	ToolPolicyVersion     string
 	ClaimOwner            string

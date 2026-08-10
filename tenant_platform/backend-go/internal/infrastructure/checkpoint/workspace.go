@@ -525,8 +525,9 @@ func validateBundleIdentity(bundle map[string]any, readyTaskID, taskSessionKey s
 func (c *WorkspaceCoordinator) CurrentRestorePoint(
 	ctx context.Context,
 	workspaceID string,
+	conversationKey string,
 ) (RestorePoint, bool, error) {
-	snapshotID, fileRef, checksum, ok, err := c.store.CurrentWorkspaceSnapshot(ctx, workspaceID)
+	snapshotID, fileRef, checksum, ok, err := c.store.CurrentWorkspaceSnapshot(ctx, workspaceID, conversationKey)
 	if err != nil || !ok {
 		return RestorePoint{}, ok, err
 	}

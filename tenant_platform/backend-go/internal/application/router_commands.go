@@ -279,6 +279,8 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 			Prompt:            prompt,
 			PersonaSnapshot:   []string{},
 			ToolPolicyVersion: userPolicy,
+			// 微信 Bot 个人自用单桶: conversation_key 恒空(IM_CHANNEL_ARCHITECTURE §2)。
+			ConversationKey: "",
 		}, domain.Message{
 			UserID:      bot.OwnerID,
 			BotID:       bot.ID,
@@ -308,6 +310,8 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 			Prompt:            prompt,
 			PersonaSnapshot:   []string{},
 			ToolPolicyVersion: userPolicy,
+			// 微信 Bot 个人自用单桶: conversation_key 恒空(IM_CHANNEL_ARCHITECTURE §2)。
+			ConversationKey: "",
 		}); err != nil {
 			r.rollbackImportedAttachments(ctx, sessionKey, importedRefs)
 			return nil, RouterResult{}, fmt.Errorf("submit task: %w", err)

@@ -309,7 +309,7 @@ func (s *scheduler) startSessionOnWorker(ctx context.Context, task domain.Task) 
 		},
 	}
 	if !task.FreshSession && s.cfg.Coordinator != nil {
-		restore, ok, err := s.cfg.Coordinator.CurrentRestorePoint(ctx, task.WorkspaceID)
+		restore, ok, err := s.cfg.Coordinator.CurrentRestorePoint(ctx, task.WorkspaceID, task.ConversationKey)
 		if err != nil {
 			// round13 审查(D4): 统一走 disposeWorkerEntryCore(本函数已持有
 			// lifecycleMu)——修复前直接 cleanup 绕过 destroyed CAS, 与

@@ -163,18 +163,18 @@ SELECT COALESCE(MAX(session_sequence), 0) + 1 FROM tasks WHERE session_key = $1
 		row := tx.QueryRow(ctx, `
 INSERT INTO tasks (
   id, workspace_id, session_key, session_sequence, requester_user_id,
-  source, source_instance_id, message_id, message_idempotency_key,
+  source, source_instance_id, message_id, message_idempotency_key, conversation_key,
   prompt, persona_snapshot, tool_policy_version, prompt_bytes, persona_bytes,
   status, fresh_session
 ) VALUES (
   $1,$2,$3,$4,$5,
-  $6,$7,$8,$9,
-  $10,$11::jsonb,$12,$13,$14,
-  'queued', $15
+  $6,$7,$8,$9,$10,
+  $11,$12::jsonb,$13,$14,$15,
+  'queued', $16
 )
 ON CONFLICT (source, source_instance_id, message_idempotency_key) DO NOTHING
 RETURNING `+taskSelectColumns, taskID, workspaceID, cmd.SessionKey, nextSeq, requester,
-			cmd.Source, cmd.SourceInstanceID, cmd.MessageID, idemKey,
+			cmd.Source, cmd.SourceInstanceID, cmd.MessageID, idemKey, cmd.ConversationKey,
 			cmd.Prompt, string(personaRaw), cmd.ToolPolicyVersion, promptBytes, personaBytes,
 			freshSession,
 		)
