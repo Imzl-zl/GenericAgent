@@ -28,7 +28,7 @@
 - CI 门禁分支/PR 级矩阵；集成测试必须真实 Postgres（`-p 1` 串行化规避 flaky）
 - 生命周期不变量以结构强制（文件拆分）；跨语言契约（proto/openapi）为单一真值源
 - 身份模型只有一类主体——用户（Bearer）；AdminToken（`PLATFORM_ADMIN_TOKEN`）仅管理面 + `/v1/router/messages` 服务入口
-- **2026-08-10（IM 多渠道模型定案）**：数据隔离单元 = workspace（personal/team），memory/SOP/项目文件全共享（团队=租户，不区分人）；**对话上下文按"对话单元"分桶**（桶 key = `channel:chat_id`；微信个人自用固定单桶 `wechat:me`，服务型 bot 每群/每私聊一桶）；`/new` 清当前桶；业界对照 Coze"文件共享+上下文隔离"；落地 = TaskEnvelope 加 channel/conversation_id + checkpoint 分桶 + router 透传，GA 核心零改动。设计真值：`tenant_platform/docs/IM_CHANNEL_ARCHITECTURE.zh-CN.md`。
+- **2026-08-10（IM 多渠道模型定案）**：数据隔离单元 = workspace（personal/team），memory/SOP/项目文件全共享（团队=租户，不区分人）；**对话上下文按"对话单元"分桶**（桶 key = `channel:chat_id`；微信个人自用固定单桶 `wechat:me`，服务型 bot 每群/每私聊一桶）；`/new` 清当前桶；业界对照 Coze"文件共享+上下文隔离"；落地 = TaskEnvelope 加 channel/conversation_id + checkpoint 分桶 + router 透传，GA 核心零改动。设计真值：`tenant_platform/docs/IM_CHANNEL_ARCHITECTURE.zh-CN.md`。 **已落地（2026-08-10 三批提交）**：TaskEnvelope.conversation_id=14 + migration 0051（tasks/workspace_snapshots 加 conversation_key）+ Go 全链路（恢复双路径：空=存量指针/非空=按桶 MAX(generation)；CompleteSucceeded 仅默认桶推进指针——曾发现跨桶覆盖缺陷已修）；/new 桶级化 migration 0052（conversation_resets 表，workspaces.reset_at 退役；按桶取消/判定/消费）；worker 零改动（选桶在 Go 控制面）；任务 6（frontends IMAdapter）用户决策砍掉。
 - **2026-08-06（Round16）**：GA 侧故障语义统一——`_retry_or_exit` 无 fatal 分支，3 次空响应/流异常/max_tokens 统一 LLM_FAILED；`total_cd_tokens` 只累计本条消息增量（勿改回累积拼接）；API 错误契约：队列满 429 / 越权 403 / 会话不存在 404（domain 哨兵 `ErrSessionAccessDenied`/`ErrWorkspaceNotFound`）；session key 解析唯一入口 `domain.ValidateWorkspaceKey`（Sscanf 宽松解析已删，勿恢复）；team id 只接受 uuid（`teamSessionKey`/`validateSessionAccess` 一致）
 - **2026-08-06（Round16）**：poller 合并语义唯一实现在 `InboundCoalescingBuffer`——`coalesce_webhook_bodies` 已收敛为恒等 finalize（无 window 参数），新增合并逻辑必须改 buffer 而非该函数
 - **2026-08-06（Round15）**：workspace hash 推导/校验唯一实现在 `domain.WorkspaceDirHash`（改算法只动一处）；`ctrl:` 控制 JTI 约定真值在 worker.proto TaskEnvelope.capability_jti（ExecuteTask 不强制 ctrl: 前缀是**有意不对称**，勿"修复"）；配额命名统一 per-requester（env `PER_REQUESTER_RUNNING_LIMIT`，旧名失效）；活跃任务状态集合/claim lease 谓词真值在 postgres 包常量（状态值来自 domain.TaskStatus）
@@ -63,7 +63,7 @@
 
 ## 最近活跃窗口
 
-- 2026-08-10：IM 多渠道架构调研与模型定案（渠道能力矩阵 / 对话单元分桶 / 微信单桶）；微信对接已完成，下一步按 IM_CHANNEL_ARCHITECTURE 落地分桶（契约 + checkpoint + 路由）
+- 2026-08-10：IM 多渠道架构**全部落地**（3 批提交）：契约 conversation_id + Go 分桶全链路 + /new 桶级化；分桶端到端测试发现并修复 CompleteSucceeded 跨桶覆盖缺陷；epic im-channel-session 任务 1-5 DONE、任务 6 砍掉
 
 - 2026-08-08：**MCP Gateway 架构重构**（3b834bb 的 stdio 支持修复+收敛，未提交）：编译修复（缺 types.go/常量定义）+ proxy 会话头丢失 + JSON-RPC id 错位 + stdio URL 语义统一（`MCPServerGatewayURL`）+ gateway 无状态会话化 + 进程池/指数退避/熔断/热更新 + 子进程白名单环境（DATABASE_URL 泄漏修复）+ 双超时客户端 + openapi/web/文档同步；真实 E2E 验证（worker MCPHTTPClient ↔ gateway ↔ 子进程，含 gateway 重启恢复）；详见 memory/archive/2026-08.md
 
