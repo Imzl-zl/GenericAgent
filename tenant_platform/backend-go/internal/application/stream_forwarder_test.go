@@ -95,6 +95,8 @@ func TestStreamForwarderEnabledMatrix(t *testing.T) {
 	}{
 		{"feishu private streaming", domain.SourceFeishu, domain.ConversationTypePrivate, domain.IMStreamingStreaming, sender, true},
 		{"qq private streaming", domain.SourceQQ, domain.ConversationTypePrivate, domain.IMStreamingStreaming, sender, true},
+		{"wecom private streaming", domain.SourceWecom, domain.ConversationTypePrivate, domain.IMStreamingStreaming, sender, true},
+		{"wecom group converged", domain.SourceWecom, domain.ConversationTypeGroup, domain.IMStreamingStreaming, sender, false},
 		{"feishu group converged", domain.SourceFeishu, domain.ConversationTypeGroup, domain.IMStreamingStreaming, sender, false},
 		{"qq group converged", domain.SourceQQ, domain.ConversationTypeGroup, domain.IMStreamingStreaming, sender, false},
 		{"wechat non-stream", domain.SourceWechat, domain.ConversationTypePrivate, domain.IMStreamingStreaming, sender, false},

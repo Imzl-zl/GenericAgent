@@ -55,12 +55,14 @@ const (
 	ChannelDingTalk ChannelType = "dingtalk"
 	// ChannelQQ is the QQ open-platform bot (botpy WS).
 	ChannelQQ ChannelType = "qq"
+	// ChannelWecom is the WeCom intelligent bot (wecom_aibot_sdk WS).
+	ChannelWecom ChannelType = "wecom"
 )
 
 // IsValidChannelType reports whether s is a supported channel type.
 func IsValidChannelType(s string) bool {
 	switch ChannelType(s) {
-	case ChannelWechat, ChannelFeishu, ChannelDingTalk, ChannelQQ:
+	case ChannelWechat, ChannelFeishu, ChannelDingTalk, ChannelQQ, ChannelWecom:
 		return true
 	default:
 		return false

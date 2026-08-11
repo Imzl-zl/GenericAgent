@@ -61,7 +61,7 @@ export interface Bot {
 }
 
 // 渠道绑定(IM_CHANNEL_BINDING §4): GET/PUT/DELETE /v1/me/im-bindings。
-export type ChannelType = 'wechat' | 'feishu' | 'dingtalk' | 'qq';
+export type ChannelType = 'wechat' | 'feishu' | 'dingtalk' | 'qq' | 'wecom';
 
 export interface ChannelBinding {
   channel_type: ChannelType;

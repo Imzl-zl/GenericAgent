@@ -66,7 +66,8 @@ CHANNEL_WECHAT = 'wechat'
 CHANNEL_FEISHU = 'feishu'
 CHANNEL_DINGTALK = 'dingtalk'
 CHANNEL_QQ = 'qq'
-VALID_CHANNEL_TYPES = {CHANNEL_WECHAT, CHANNEL_FEISHU, CHANNEL_DINGTALK, CHANNEL_QQ}
+CHANNEL_WECOM = 'wecom'
+VALID_CHANNEL_TYPES = {CHANNEL_WECHAT, CHANNEL_FEISHU, CHANNEL_DINGTALK, CHANNEL_QQ, CHANNEL_WECOM}
 
 
 def _env_int(name, default):
@@ -1309,6 +1310,182 @@ class QQAdapter(BotAdapter):
             pass  # 终帧失败可接受: delivery 兜底补发最终结果
 
 
+class WeComAdapter(BotAdapter):
+    """企业微信智能机器人(wecom_aibot_sdk WebSocket)。
+
+    config: {app_id: bot_id, app_secret: secret}(复用凭据槽位)。SDK 为纯
+    asyncio 客户端: 本适配器在线程内自管事件循环(与 botpy/dingtalk-stream
+    的同步 run() 封装不同)。入站 frame = {cmd, headers:{req_id}, body};
+    conversation_id = chatid(单聊=userid, 群聊=群 ID——SDK 文档注释),
+    conversation_type = private(chatid==userid) / group。
+
+    出站(IM_STREAMING_DELIVERY §4.3): 平台 delivery 是异步主动推送, 不走
+    被动回复窗口, 统一用 WSClient.send_message(chatid, body):
+    - 终态文本: SEND_MSG 只支持 markdown/template_card/media(SDK
+      SendMsgBody 无 text), 用 markdown 类型承载纯文本;
+    - 流式: SEND_MSG + stream 帧(与被动 reply_stream 同协议层格式)。
+      若企微服务端拒绝 SEND_MSG 流式帧, Go 侧 BeginReply 失败自动
+      fail-closed 回退终态 delivery(渠道矩阵判定)。
+    """
+
+    channel_type = CHANNEL_WECOM
+    #: 流式通过 SEND_MSG + stream 帧实现; 失败由平台判定矩阵收敛回终态。
+    stream_supported = True
+
+    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret=''):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+        self._bot_id = (config or {}).get('app_id') or ''
+        self._secret = (config or {}).get('app_secret') or ''
+        self._client = None
+        self._loop = None
+        self._sdk_error = None
+        # 流式状态: stream_id -> {target, text}
+        self._streams = {}
+        self._stream_lock = threading.Lock()
+        try:
+            import wecom_aibot_sdk  # 惰性导入: SDK 缺失只影响本渠道
+            self._wecom_sdk = wecom_aibot_sdk
+        except Exception as exc:  # pragma: no cover - 环境缺失路径
+            self._sdk_error = exc
+
+    # -- 入站 --------------------------------------------------------------
+    def _handle_wecom_message(self, frame):
+        """企微智能机器人入站帧 → webhook body。frame 为 SDK 消息回调
+        (message_handler.py 透传的 dict: {cmd, headers, body})。"""
+        body = frame.get('body', {}) if isinstance(frame, dict) else {}
+        if not isinstance(body, dict):
+            return
+        message_id = str(body.get('msgid') or '')
+        if not message_id:
+            return
+        sender_id = str((body.get('from') or {}).get('userid', '') or '')
+        chat_id = str(body.get('chatid') or '') or sender_id
+        text = ''
+        if body.get('msgtype') == 'text':
+            text = str((body.get('text') or {}).get('content', '') or '')
+        # 单聊 chatid == 发送者 userid(SDK 文档: 单聊会话 ID = userid);
+        # sender 缺失时保守归群(空==空不得判为私聊)。
+        conversation_type = 'private' if sender_id and chat_id == sender_id else 'group'
+        self.post_webhook(self.webhook_body(
+            channel_account_id=sender_id,
+            conversation_id=chat_id,
+            message_id=message_id,
+            text=text,
+            conversation_type=conversation_type,
+        ))
+
+    # -- 生命周期 ----------------------------------------------------------
+    def _run(self):
+        if self._sdk_error is not None:
+            print(f'[Poller] wecom {self.bot_uuid}: wecom_aibot_sdk unavailable: {self._sdk_error}', flush=True)
+            return
+        if not self._bot_id or not self._secret:
+            print(f'[Poller] wecom {self.bot_uuid}: app_id/app_secret required', flush=True)
+            return
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._async_run())
+        except Exception as exc:
+            print(f'[Poller] wecom {self.bot_uuid} ws error: {exc}', flush=True)
+        finally:
+            self._loop = None
+            loop.close()
+            print(f'[Poller] wecom {self.bot_uuid} ws exited', flush=True)
+
+    async def _async_run(self):
+        sdk = self._wecom_sdk
+        client = sdk.WSClient(self._bot_id, self._secret)
+        self._client = client
+
+        def dispatch(event):
+            def handler(frame):
+                try:
+                    self._handle_wecom_message(frame)
+                except Exception as exc:
+                    print(f'[Poller] wecom {self.bot_uuid} {event} error: {exc}', flush=True)
+            return handler
+
+        client.on('message.text', dispatch('text'))
+        client.on('message.image', dispatch('image'))
+        client.on('message.file', dispatch('file'))
+        print(f'[Poller] wecom {self.bot_uuid} ws started', flush=True)
+        await client.connect()  # blocking; reconnects internally
+
+    # -- 出站 --------------------------------------------------------------
+    def _run_coro(self, coro):
+        """同步桥: 把 async 出站调用提交到连接事件循环并等待结果。"""
+        if self._loop is None or self._client is None:
+            raise RuntimeError(f'wecom {self.bot_uuid} not connected')
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=WEBHOOK_TIMEOUT)
+
+    def send_text(self, target, text, client_id=''):
+        if not self._bot_id or not self._secret:
+            raise RuntimeError(f'wecom {self.bot_uuid} not configured')
+        # SEND_MSG 无 text 类型(SDK SendMsgBody): markdown 承载纯文本。
+        self._run_coro(self._client.send_message(
+            target, {'msgtype': 'markdown', 'markdown': {'content': text}}))
+
+    # -- IM 流式输出: SEND_MSG + stream 帧 ----------------------------------
+    # 语义(IM_STREAMING_DELIVERY §4.3 对齐): open 发首帧(finish=False);
+    # append 累积文本后发增量帧(服务端按 stream_id 合并); commit 发终帧
+    # (finish=True 全量文本); abort 发终帧 + 中断提示。未知流幂等。
+
+    def _stream_frame(self, target, stream_id, content, finish):
+        self._run_coro(self._client.send_message(target, {
+            'msgtype': 'stream',
+            'stream': {'id': stream_id, 'finish': finish, 'content': content},
+        }))
+
+    def send_stream_open(self, target, text=''):
+        if not self._bot_id or not self._secret:
+            raise RuntimeError(f'wecom {self.bot_uuid} not configured')
+        stream_id = uuid.uuid4().hex
+        with self._stream_lock:
+            self._streams[stream_id] = {'target': target, 'text': text or ''}
+        try:
+            self._stream_frame(target, stream_id, text or '…', finish=False)
+        except Exception:
+            with self._stream_lock:
+                self._streams.pop(stream_id, None)  # 首帧失败不留残留条目
+            raise
+        return stream_id
+
+    def send_stream_append(self, stream_id, text):
+        with self._stream_lock:
+            st = self._streams.get(stream_id)
+            if st is None:
+                raise KeyError(f'wecom unknown stream {stream_id}')
+            st['text'] += text
+            content = st['text']
+            target = st['target']
+        self._stream_frame(target, stream_id, content, finish=False)
+
+    def send_stream_commit(self, stream_id, text=''):
+        with self._stream_lock:
+            st = self._streams.pop(stream_id, None)
+            if st is None:
+                return  # 已结束/未知: 幂等
+            if text:
+                st['text'] = text
+            content = st['text']
+            target = st['target']
+        self._stream_frame(target, stream_id, content, finish=True)
+
+    def send_stream_abort(self, stream_id):
+        with self._stream_lock:
+            st = self._streams.pop(stream_id, None)
+            if st is None:
+                return  # 幂等
+            content = st['text'] + '\n\n⚠️ 生成中断，请稍后查看最终结果'
+            target = st['target']
+        try:
+            self._stream_frame(target, stream_id, content, finish=True)
+        except Exception:
+            pass  # 终帧失败可接受: delivery 兜底补发最终结果
+
+
 class BotManager:
     """BotAdapter 注册表: bot_uuid → adapter(channel_type 工厂)。
 
@@ -1385,6 +1562,8 @@ class BotManager:
             return DingTalkAdapter(bot_uuid, config, webhook_url, **common)
         if channel_type == CHANNEL_QQ:
             return QQAdapter(bot_uuid, config, webhook_url, **common)
+        if channel_type == CHANNEL_WECOM:
+            return WeComAdapter(bot_uuid, config, webhook_url, **common)
         raise ValueError(f'unsupported channel_type: {channel_type}')
 
     def stop(self, bot_uuid):

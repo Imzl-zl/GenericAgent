@@ -35,6 +35,28 @@ func TestNewDeliveryServiceRequiresAllPorts(t *testing.T) {
 	mustFail("missing messages", DeliveryServiceConfig{Store: store, Tasks: tasks, Bots: bots, Transport: transport, Results: results})
 }
 
+func TestDeliveryServiceSendsWeComTaskCompleteToWeComBot(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, Source: domain.SourceWecom, ConversationKey: "chatid_1", TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = domain.ChannelConfig{OwnerID: 1, BotUUID: "b1", ChannelType: domain.ChannelWecom, State: domain.ChannelActive}
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("result body")}
+
+	delivery := domain.Delivery{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}
+	deps.store.pending = []domain.Delivery{delivery}
+
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	// 企微任务必须解析到企微渠道 bot(channelTypeForTaskSource 路由键)。
+	if len(deps.transport.sent) != 1 {
+		t.Fatalf("expected 1 sent, got %d (wecom task routed to wrong channel?)", len(deps.transport.sent))
+	}
+	if deps.transport.sent[0].BotUUID != "b1" {
+		t.Fatalf("sent to %s, want b1", deps.transport.sent[0].BotUUID)
+	}
+}
+
 func TestDeliveryServiceAcksTaskComplete(t *testing.T) {
 	ctx, svc, deps := setupDeliveryService(t)
 	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
@@ -513,8 +535,16 @@ type fakeBotResolver struct {
 	err error
 }
 
-func (r *fakeBotResolver) GetChannelConfigByOwnerAndType(_ context.Context, _ int64, _ domain.ChannelType) (domain.ChannelConfig, error) {
-	return r.bot, r.err
+func (r *fakeBotResolver) GetChannelConfigByOwnerAndType(_ context.Context, _ int64, channelType domain.ChannelType) (domain.ChannelConfig, error) {
+	if r.err != nil {
+		return domain.ChannelConfig{}, r.err
+	}
+	// 模拟真实 store 的 WHERE channel_type = ? 语义: 请求渠道与 bot 不匹配
+	// 即视为未绑定(捕获 channelTypeForTaskSource 错投缺陷)。
+	if r.bot.ChannelType != "" && r.bot.ChannelType != channelType {
+		return domain.ChannelConfig{}, domain.ErrChannelBindingNotFound
+	}
+	return r.bot, nil
 }
 
 type fakeTransport struct {

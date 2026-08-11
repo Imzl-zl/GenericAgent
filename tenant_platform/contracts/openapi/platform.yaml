@@ -936,14 +936,14 @@ paths:
       security:
         - BearerToken: []
       operationId: saveIMBinding
-      summary: 保存/更新渠道凭据(feishu|dingtalk|qq), 保存即生效
+      summary: 保存/更新渠道凭据(feishu|dingtalk|qq|wecom), 保存即生效
       description: >
         凭据加密入库(state=active)并热推 poller 重连; 无独立连通性测试按钮。
       parameters:
         - name: channel_type
           in: path
           required: true
-          schema: {type: string, enum: [feishu, dingtalk, qq]}
+          schema: {type: string, enum: [feishu, dingtalk, qq, wecom]}
       requestBody:
         required: true
         content:
@@ -967,7 +967,7 @@ paths:
         - name: channel_type
           in: path
           required: true
-          schema: {type: string, enum: [feishu, dingtalk, qq]}
+          schema: {type: string, enum: [feishu, dingtalk, qq, wecom]}
       responses:
         "200":
           description: Success
@@ -1007,7 +1007,7 @@ paths:
         - name: channel_type
           in: path
           required: true
-          schema: {type: string, enum: [feishu, dingtalk, qq]}
+          schema: {type: string, enum: [feishu, dingtalk, qq, wecom]}
       requestBody:
         required: true
         content:
@@ -1031,7 +1031,7 @@ paths:
         - name: channel_type
           in: path
           required: true
-          schema: {type: string, enum: [feishu, dingtalk, qq]}
+          schema: {type: string, enum: [feishu, dingtalk, qq, wecom]}
       responses:
         "200":
           description: Success
@@ -1909,7 +1909,7 @@ components:
           format: uuid
         channel_type:
           type: string
-          enum: [wechat, feishu, dingtalk, qq]
+          enum: [wechat, feishu, dingtalk, qq, wecom]
           description: 渠道类型(同时是任务 Source 与回复分发依据)
         channel_account_id:
           type: string
@@ -1948,7 +1948,7 @@ components:
       properties:
         channel_type:
           type: string
-          enum: [wechat, feishu, dingtalk, qq]
+          enum: [wechat, feishu, dingtalk, qq, wecom]
         state:
           type: string
           enum: [active, disabled, expired, revoked]

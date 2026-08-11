@@ -75,7 +75,8 @@ type RuntimeStreamSettings interface {
 //   * StreamingSender 未接线 → 关闭(测试/loopback 无流式依赖)
 //   * im_streaming_mode != streaming → 关闭(off/final_only 只发最终结果)
 //   * 群聊桶 → 关闭(群聊统一只发最终结果, 防刷屏 + QQ 群被动回复限制)
-//   * 渠道能力分档: 仅 feishu(消息编辑)与 qq 单聊(原生流式)支持流式;
+//   * 渠道能力分档: 仅 feishu(消息编辑)、qq 单聊(原生流式)与 wecom
+//     (SEND_MSG stream 帧)支持流式;
 //     wechat(iLink 无流式)/dingtalk(v1 不分片)/web → 关闭
 //
 // 失败语义(决策 4): 转发中途失败(限流/SDK 错误) → Abort 弃流, 由既有
@@ -121,8 +122,8 @@ func (f *StreamForwarder) Enabled() bool {
 		return false
 	}
 	switch f.task.Source {
-	case domain.SourceFeishu, domain.SourceQQ:
-		// 渠道能力分档: 仅飞书/QQ 有流式能力(QQ 群聊已在群聊收敛排除)。
+	case domain.SourceFeishu, domain.SourceQQ, domain.SourceWecom:
+		// 渠道能力分档: 飞书/QQ/企业微信有流式能力(群聊已在群聊收敛排除)。
 	default:
 		// wechat(iLink 非流) / dingtalk(v1 不分片) / web → 仅终态。
 		return false

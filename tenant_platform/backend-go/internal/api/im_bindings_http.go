@@ -41,7 +41,7 @@ func (s *Server) saveBinding(w http.ResponseWriter, r *http.Request, userID int6
 	channelType := domain.ChannelType(strings.TrimSpace(r.PathValue("channel_type")))
 	if !domain.IsValidChannelType(string(channelType)) || channelType == domain.ChannelWechat {
 		writeErr(w, http.StatusBadRequest, "INVALID_CHANNEL_TYPE",
-			"channel_type must be one of feishu|dingtalk|qq", tid)
+			"channel_type must be one of feishu|dingtalk|qq|wecom", tid)
 		return
 	}
 	var body saveChannelBindingBody
@@ -83,7 +83,7 @@ func (s *Server) unbindChannel(w http.ResponseWriter, r *http.Request, userID in
 	channelType := domain.ChannelType(strings.TrimSpace(r.PathValue("channel_type")))
 	if !domain.IsValidChannelType(string(channelType)) || channelType == domain.ChannelWechat {
 		writeErr(w, http.StatusBadRequest, "INVALID_CHANNEL_TYPE",
-			"channel_type must be one of feishu|dingtalk|qq", tid)
+			"channel_type must be one of feishu|dingtalk|qq|wecom", tid)
 		return
 	}
 	cfg, err := s.channelSvc.Unbind(r.Context(), userID, channelType)

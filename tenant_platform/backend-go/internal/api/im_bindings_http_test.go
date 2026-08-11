@@ -190,6 +190,31 @@ func TestSaveChannelBindingValidatesAndPersists(t *testing.T) {
 	}
 }
 
+func TestSaveWeComBindingPersists(t *testing.T) {
+	svc := &fakeChannelService{}
+	srv := imBindingsFixture(t, svc)
+
+	// 企业微信智能机器人: bot_id/secret 走 app_id/app_secret 槽位。
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/v1/me/im-bindings/wecom",
+		strings.NewReader(`{"app_id":"wecom-bot","app_secret":"wecom-secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.Handler().ServeHTTP(rr, bearerHeader(req))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("save wecom: %d %s", rr.Code, rr.Body.String())
+	}
+	if svc.savedType != domain.ChannelWecom || svc.savedID != "wecom-bot" {
+		t.Fatalf("service got type=%s app_id=%s", svc.savedType, svc.savedID)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out["channel_type"] != "wecom" || out["state"] != "active" {
+		t.Fatalf("reply: %+v", out)
+	}
+}
+
 func TestUnbindChannelDisables(t *testing.T) {
 	svc := &fakeChannelService{}
 	srv := imBindingsFixture(t, svc)

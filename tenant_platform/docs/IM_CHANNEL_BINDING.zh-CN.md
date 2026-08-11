@@ -24,7 +24,7 @@
 | 飞书 | 配置企业自建应用 | `app_id + app_secret` | lark-oapi WebSocket 长连接 | 直接收（需 p2p 权限） | **权限决定**：`group_at_msg`=仅@消息（默认），`group_msg`=全部消息（敏感权限） | 可（敏感权限，我们不申请） |
 | 钉钉 | 配置开放平台应用 | `app_key + app_secret` | dingtalk-stream 长连接 | 直接收 | **必须 @（硬规则）**："群聊中只有 AT 机器人的消息可以被机器人接收到" | 不可 |
 | QQ | 配置开放平台机器人 | `app_id + app_secret` | botpy WebSocket 长连接 | 直接收（C2C） | **必须 @（硬规则）**：GROUP_AT_MESSAGE_CREATE，"API 仅投递@提及了机器人的群消息" | 不可 |
-| 企业微信 | 配置智能机器人 | BotID + Secret | 长连接 | 直接收 | **必须 @（硬规则）** | 不可（普通应用"暂不支持接收群聊消息"） |
+| 企业微信 | 配置智能机器人 | BotID + Secret | wecom_aibot_sdk WebSocket 长连接（已实现 2026-08-11） | 直接收 | **必须 @（硬规则）** | 不可（普通应用"暂不支持接收群聊消息"） |
 | Telegram（备） | BotFather token | token | polling | 直接收 | **@/命令（默认）**，可关 privacy mode 收全部 | 可（bot 端配置） |
 
 **结论**：adapter 只按平台规则订阅事件（钉钉/QQ/企微天然只收到 @ 消息，飞书申请 `group_at_msg` 权限）；**我们不申请"收全部群消息"（飞书敏感权限/TG privacy 关闭）——业务只需要 @ 触发**，与主流一致。
@@ -57,7 +57,7 @@ CREATE UNIQUE INDEX channel_configs_owner_type_uq
 ```
 GET    /v1/me/im-bindings                        → 各渠道状态列表
          [{channel_type, state, bound_at, meta: {app_id 脱敏}}...] + 微信 bot 状态
-PUT    /v1/me/im-bindings/{channel_type}         → 保存/更新凭据（feishu|dingtalk|qq）
+PUT    /v1/me/im-bindings/{channel_type}         → 保存/更新凭据（feishu|dingtalk|qq|wecom）
          body: {app_id, app_secret}；加密入库，state=active；触发 poller 重载
 DELETE /v1/me/im-bindings/{channel_type}         → 解绑：state=disabled；通知 poller 断开
 POST   /v1/me/im-bindings/{channel_type}/test    → 连通性测试（可选，v1 可省）
@@ -76,6 +76,7 @@ adapters: dict[str, BotAdapter]  # channel_type → 连接线程工厂
 # FeishuAdapter  = lark-oapi ws client
 # DingTalkAdapter= dingtalk-stream
 # QQAdapter      = botpy ws
+# WeComAdapter   = wecom_aibot_sdk ws（企微智能机器人, bot_id+secret 复用 app_id/app_secret 槽位）
 ```
 
 - 配置来源：现有 bot 列表轮询接口扩展为"活跃 channel_configs"（poller 定期拉取，热更新：新增/更新/解绑触发连接重载——复用现有配置热推机制）。
@@ -84,7 +85,7 @@ adapters: dict[str, BotAdapter]  # channel_type → 连接线程工厂
 ```json
 {
   "bot_uuid": "渠道连接实例 UUID",
-  "channel_type": "feishu | dingtalk | qq | wechat",
+  "channel_type": "feishu | dingtalk | qq | wechat | wecom",
   "channel_account_id": "渠道侧账号标识(微信=ilink_user_id, 其他=应用账号)",
   "conversation_id": "对话单元 ID(群 ID / 对端 ID; 微信恒空)",
   "message_id": "...",
@@ -106,7 +107,7 @@ adapters: dict[str, BotAdapter]  # channel_type → 连接线程工厂
 - **菜单改名**：`AppLayout`/`AdminLayout` "微信绑定" → **"渠道绑定"**（推荐，与实现术语一致；备选"IM 绑定"——你拍板）。
 - `BindingPage` 重构为渠道列表：
   - 微信卡片：现有扫码流程原样嵌入。
-  - 飞书/钉钉/QQ 卡片：状态徽章（未配置/已启用）+ 凭据表单（app_id / app_secret）+ 保存/解绑按钮 + 帮助文案（如何创建应用）。
+  - 飞书/钉钉/QQ/企业微信卡片：状态徽章（未配置/已启用）+ 凭据表单（app_id / app_secret，企微显示 Bot ID / Bot Secret）+ 保存/解绑按钮 + 帮助文案（如何创建应用）。
 - 路由 `/app/binding` 不变。
 
 ## 8. 安全
@@ -121,7 +122,7 @@ adapters: dict[str, BotAdapter]  # channel_type → 连接线程工厂
 | 1 | migration 0053：bots → channel_configs（RENAME + channel_type + 唯一索引 + 列改名） | 零 FK 风险；存量微信行默认值；Go domain/store 改名同步（domain.Bot → ChannelConfig） |
 | 2 | API：GET/PUT/DELETE `/v1/me/im-bindings`（user + admin）+ OpenAPI；微信扫码落库到 channel_configs | 契约测试；ilink_user_id 契约字段 → channel_account_id（openapi 同步） |
 | 3 | Router 入站扩展：channel_type + conversation_id + Source/ConversationKey 映射 + 回复 transport 按渠道路由 | 微信链路回归（bot_uuid/channel_account_id 改名同步 poller） |
-| 4 | Poller BotAdapter 注册表 + WeChat 迁移 + Feishu/DingTalk/QQ adapter（Python） | 每 adapter 单测 + 配置热更新 + bot_poller 测试套件 |
+| 4 | Poller BotAdapter 注册表 + WeChat 迁移 + Feishu/DingTalk/QQ/WeCom adapter（Python） | 每 adapter 单测 + 配置热更新 + bot_poller 测试套件 |
 | 5 | Web：菜单改名"渠道绑定" + BindingPage 渠道化 + api client/types 同步 | lint/build + 浏览器冒烟 |
 | 6 | 集成验证：契约 + Go + poller + web；真实渠道冒烟（需各渠道凭据） | 用户提供凭据后执行 |
 

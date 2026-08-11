@@ -20,6 +20,7 @@
 | QQ 群聊 | 被动：每条消息 5 分钟内限回 5 次；主动 60 QPM、日 1000 条/群 | ❌ 不支持流式参数 | 只能最终结果 |
 | 钉钉 | 自定义机器人**每分钟 20 条**，超限流 10 分钟；企业机器人 `send.too.fast`；标准版组织**每月 1 万次**服务端 API 总量 | ❌ 无编辑接口（可撤回） | 分片可行但必须克制（≤20 条/分）；建议只发最终结果 |
 | 微信 iLink | 官方网关无公开文档（内测），已知单条 3000 字符限制 | ❌ 无 | 非流（现状） |
+| 企业微信 | 智能机器人协议层无公开频控表（SDK 内部 reply 队列 500 条） | ⚠️ SDK 暴露 `reply_stream`（被动）；主动 SEND_MSG + stream 帧待真实凭据实测（2026-08-11 实现） | 已实现 SEND_MSG 流式；失败 fail-closed 回退终态 delivery |
 
 参考：飞书 https://open.feishu.cn/document/server-docs/im-v1/message/create 、https://open.feishu.cn/document/server-docs/im-v1/message/update ；QQ https://bot.qq.com/wiki/develop/api-v2/server-inter/message/overview.html 、发送群聊消息文档；钉钉 https://open.dingtalk.com/document/orgapp/invocation-frequency-limit.md 、https://open.dingtalk.com/document/orgapp/the-robot-sends-ordinary-messages-in-a-person-to-person-conversation.md
 
@@ -68,9 +69,10 @@ type StreamReply interface {
 | QQAdapter | 单聊用官方**流式消息接口**（botpy 对应 API，实测确认参数）；群聊不实现 |
 | DingTalkAdapter | 不实现（v1 只发最终结果，规避频控） |
 | WeChatAdapter | 不实现（现状） |
+| WeComAdapter | `send_stream_open/append/commit/abort` 走 SEND_MSG + stream 帧（`{msgtype: stream, stream: {id, finish, content}}`，SDK `reply_stream` 同协议层格式）；群聊由 4.4 收敛 |
 
 ### 4.4 群聊收敛
-Router/delivery 已有渠道上下文（Source + ConversationID + channel_configs），转发判定在 platform：`task.Source` 为飞书/QQ 单聊且私聊桶 → 流式；群聊桶（或钉钉/微信）→ 只走既有终态 delivery。
+Router/delivery 已有渠道上下文（Source + ConversationID + channel_configs），转发判定在 platform：`task.Source` 为飞书/QQ/企业微信单聊且私聊桶 → 流式；群聊桶（或钉钉/微信）→ 只走既有终态 delivery。
 
 ## 5. 实施拆分（epic: im-streaming-delivery）
 
@@ -86,6 +88,7 @@ Router/delivery 已有渠道上下文（Source + ConversationID + channel_config
 ## 6. 残余风险
 
 - **QQ 流式消息接口的具体参数**：官方文档仅列出入口，请求字段需真实凭据实测（任务 4 前置验证）。
+- **企微 SEND_MSG 主动流式帧未实测**（2026-08-11 实现）：SDK `reply_stream` 是被动回复（需入站 req_id），平台 delivery 是异步主动推送，故流式走 `send_message`(SEND_MSG) + stream 帧——协议层格式与被动一致，但服务端是否接受 SEND_MSG 流式帧未验证。**上线前必须真实凭据冒烟**；若服务端拒绝，open 帧抛错 → Go 侧 fail-closed 回退终态 delivery（无损），若静默丢弃则存在用户只见首帧的风险——冒烟重点验证该路径，未通过前建议管理员保持 `im_streaming_mode=off|final_only`。
 - **飞书编辑时限**：消息可编辑时间由企业管理员设置（默认 24h 内），任务时长内无虞；超长任务（>编辑时限）自动退化为补发最终结果。
 - **iLink 微信频控未知**：非流式不受影响。
 - 钉钉每月 1 万次 API 总量：v1 不做钉钉分片即不消耗。

@@ -98,6 +98,8 @@ func channelTypeForTaskSource(source string) domain.ChannelType {
 		return domain.ChannelDingTalk
 	case domain.SourceQQ:
 		return domain.ChannelQQ
+	case domain.SourceWecom:
+		return domain.ChannelWecom
 	default:
 		return domain.ChannelWechat
 	}

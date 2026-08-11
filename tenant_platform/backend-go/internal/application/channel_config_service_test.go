@@ -141,6 +141,10 @@ func TestChannelConfigServiceValidation(t *testing.T) {
 	if _, err := svc.UpsertCredentials(ctx, 9, "telegram", "a", "b"); err == nil {
 		t.Fatal("telegram must be rejected")
 	}
+	// wecom 是凭据可配置渠道(企微智能机器人 bot_id/secret)。
+	if _, err := svc.UpsertCredentials(ctx, 9, domain.ChannelWecom, "wecom-bot", "s"); err != nil {
+		t.Fatalf("wecom credentials must be accepted: %v", err)
+	}
 	// 空 app_id/app_secret。
 	if _, err := svc.UpsertCredentials(ctx, 9, domain.ChannelQQ, "", "b"); err == nil {
 		t.Fatal("empty app_id must be rejected")

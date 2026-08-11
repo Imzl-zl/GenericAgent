@@ -40,19 +40,20 @@ const (
 )
 
 // Source values are the protocol-level origins allowed for task submission
-// (architecture §4.2: wechat|web; IM_CHANNEL_BINDING §5: feishu|dingtalk|qq).
+// (architecture §4.2: wechat|web; IM_CHANNEL_BINDING §5: feishu|dingtalk|qq|wecom).
 const (
 	SourceWechat   = "wechat"
 	SourceWeb      = "web"
 	SourceFeishu   = "feishu"
 	SourceDingTalk = "dingtalk"
 	SourceQQ       = "qq"
+	SourceWecom    = "wecom"
 )
 
 // IsValidSource reports whether s is an allowed task source.
 func IsValidSource(s string) bool {
 	switch s {
-	case SourceWechat, SourceWeb, SourceFeishu, SourceDingTalk, SourceQQ:
+	case SourceWechat, SourceWeb, SourceFeishu, SourceDingTalk, SourceQQ, SourceWecom:
 		return true
 	default:
 		return false

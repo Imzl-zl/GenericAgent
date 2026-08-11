@@ -29,6 +29,7 @@ interface ChannelMeta {
   label: string;
   appIdLabel: string;
   appIdHint: string;
+  secretLabel?: string; // 默认 'App Secret'
   help: string[];
 }
 
@@ -67,6 +68,18 @@ const CREDENTIAL_CHANNELS: ChannelMeta[] = [
       '沙箱环境需添加测试成员',
       '群聊只有 @ 机器人的消息可被接收(平台硬规则)',
       '将 App ID / App Secret 填入本页保存',
+    ],
+  },
+  {
+    key: 'wecom',
+    label: '企业微信',
+    appIdLabel: 'Bot ID',
+    appIdHint: '企微智能机器人 Bot ID',
+    secretLabel: 'Bot Secret',
+    help: [
+      '在「企业微信智能机器人」平台创建机器人并获取凭据',
+      'WebSocket 长连接接入(与飞书/钉钉/QQ 同模式), 无需公网回调地址',
+      '将 Bot ID / Bot Secret 填入本页保存',
     ],
   },
 ];
@@ -193,7 +206,7 @@ export function BindingPage() {
   const handleSave = async (meta: ChannelMeta) => {
     const f = forms[meta.key] ?? { app_id: '', app_secret: '' };
     if (!f.app_id.trim() || !f.app_secret.trim()) {
-      setFormErrors((p) => ({ ...p, [meta.key]: 'App ID 与 App Secret 均为必填' }));
+      setFormErrors((p) => ({ ...p, [meta.key]: `${meta.appIdLabel} 与 ${meta.secretLabel ?? 'App Secret'} 均为必填` }));
       return;
     }
     setError('');
@@ -364,7 +377,7 @@ export function BindingPage() {
             />
           </div>
           <div>
-            <label className="metric-label" htmlFor={`${meta.key}-secret`}>App Secret</label>
+            <label className="metric-label" htmlFor={`${meta.key}-secret`}>{meta.secretLabel ?? 'App Secret'}</label>
             <input
               id={`${meta.key}-secret`}
               className="binding-input"
@@ -421,9 +434,7 @@ export function BindingPage() {
         <div className="grid">
           <div className="grid grid-2">
             {renderWechatCard()}
-            {renderCredentialCard(CREDENTIAL_CHANNELS[0])}
-            {renderCredentialCard(CREDENTIAL_CHANNELS[1])}
-            {renderCredentialCard(CREDENTIAL_CHANNELS[2])}
+            {CREDENTIAL_CHANNELS.map((meta) => renderCredentialCard(meta))}
           </div>
           <Card className="animate-fade-in-up animate-delay-2">
             <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
