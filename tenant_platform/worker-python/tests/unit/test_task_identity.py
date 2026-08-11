@@ -330,5 +330,5 @@ def test_checkpoint_staging_file_is_group_readable(tmp_path):
     if os.name == "nt":
         # Windows 无 POSIX 权限位语义(fchmod 仅影响只读位), 跳过。
         return
-    assert mode & 0o004, f"staging bundle must be group-readable, got mode {oct(mode)}"
+    assert mode & 0o040, f"staging bundle must be group-readable, got mode {oct(mode)}"
     assert not (mode & 0o002), f"staging bundle must not be group-writable, got mode {oct(mode)}"

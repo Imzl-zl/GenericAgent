@@ -122,11 +122,11 @@ def _media_adapter(media_root):
     )
 
 
-def test_collect_media_items_restores_original_file_name():
+def test_collect_media_items_restores_original_file_name(tmp_path):
     """Round8 审查: 落盘名含内容 hash 前缀时, media_items.file_name 必须恢复
     为发送者原始文件名(不得暴露 hash 前缀)。"""
-    adapter = _media_adapter("/media")
-    paths = ["/media/b1/a1b2c3d4e5_resume.txt"]
+    adapter = _media_adapter(str(tmp_path))
+    paths = [str(tmp_path / "b1" / "a1b2c3d4e5_resume.txt")]
     names = ["resume.txt"]
     items = adapter._collect_media_items(paths, names)
     assert len(items) == 1
@@ -137,12 +137,12 @@ def test_collect_media_items_restores_original_file_name():
     assert fallback[0]["file_name"] == "a1b2c3d4e5_resume.txt"
 
 
-def test_collect_media_items_names_align_with_paths_not_item_list():
+def test_collect_media_items_names_align_with_paths_not_item_list(tmp_path):
     """Round8(review): names 与 paths 同序对齐——item_list 中下载失败的项
     不产生 path, 若按位置索引 item_list 会错位(张冠李戴)。"""
-    adapter = _media_adapter("/media")
+    adapter = _media_adapter(str(tmp_path))
     # item_list 3 项, 中间项下载失败 → 只返回 2 个 path。
-    paths = ["/media/b1/a1b2c3d4e5_a.txt", "/media/b1/f6e7d8c9b0a1_c.txt"]
+    paths = [str(tmp_path / "b1" / "a1b2c3d4e5_a.txt"), str(tmp_path / "b1" / "f6e7d8c9b0a1_c.txt")]
     names = ["a.txt", "c.txt"]
     items = adapter._collect_media_items(paths, names)
     assert [it["file_name"] for it in items] == ["a.txt", "c.txt"]

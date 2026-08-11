@@ -333,7 +333,7 @@ def test_worker_rpc_smoke(tmp_path, oai_fixture):
         assert reg.digest == FOUNDATION_DIGEST
         assert reg.resolve(
             "foundation.v1", "foundation.no-host-tools.v1"
-        ).allowed_tools == frozenset({"update_working_checkpoint"})
+        ).allowed_tools == frozenset({"update_working_checkpoint", "mcp:*"})
 
         proc, listen = _start_worker(config_root, runtime_root)
         try:

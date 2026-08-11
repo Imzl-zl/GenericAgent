@@ -91,6 +91,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pyyaml pycryptodome
           pip install -e .
+          # bot_poller 的 QQ 原生流式测试硬依赖 botpy(http.Route 帧构造)
+          pip install qq-botpy
           # contract 绑定测试 import worker-python 生成代码(需要 protobuf/grpcio)
           pip install -e 'tenant_platform/worker-python[test]'
           # E2E 重启恢复场景用 psycopg 直连 Postgres 播种旧实例数据

@@ -1060,17 +1060,39 @@ def _assert_capability_rejections(proxy_base: str, token: str, provider: dict) -
 
 
 def _list_python_pids() -> list[int]:
-    """tasklist 快速枚举 python 解释器 PID(毫秒级, 适合短命 Worker 采样)。"""
+    """快速枚举 python 解释器 PID(毫秒级, 适合短命 Worker 采样)。
+
+    Windows 用 tasklist(官方最快枚举); POSIX 扫 /proc/<pid>/comm——
+    read 单个 comm 是微秒级, 与 tasklist 同数量级, 不依赖 psutil 全系统
+    enumerate(秒级, 会错过任务即进程的短命 Worker)。
+    """
     import subprocess
-    out = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
-        capture_output=True, text=True, timeout=10,
-    ).stdout
-    pids: list[int] = []
-    for line in out.splitlines():
-        parts = [p.strip().strip('"') for p in line.split('","')]
-        if len(parts) >= 2 and parts[1].isdigit():
-            pids.append(int(parts[1]))
+    if os.name == "nt":
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        pids: list[int] = []
+        for line in out.splitlines():
+            parts = [p.strip().strip('"') for p in line.split('","')]
+            if len(parts) >= 2 and parts[1].isdigit():
+                pids.append(int(parts[1]))
+        return pids
+    pids = []
+    try:
+        proc_entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for entry in proc_entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm", "r", encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip()
+        except OSError:
+            continue  # 进程已退出或权限不足
+        if comm.startswith("python"):
+            pids.append(int(entry))
     return pids
 
 
