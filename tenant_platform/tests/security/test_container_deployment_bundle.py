@@ -32,6 +32,7 @@ def test_compose_bundle_has_one_complete_operator_entrypoint() -> None:
         "compose.yaml",
         "ga-runner.Dockerfile",
         "llm-proxy.Dockerfile",
+        "mcp-gateway.Dockerfile",
         "sandbox-manager.Dockerfile",
         "nginx.conf",
         "platform.Dockerfile",
@@ -86,10 +87,11 @@ def test_one_env_template_contains_every_compose_value() -> None:
     assert values["POSTGRES_PASSWORD"] in values["DATABASE_URL"]
 
 
-def test_compose_starts_six_services_and_only_sandbox_manager_receives_docker_socket() -> None:
+def test_compose_starts_seven_services_and_only_sandbox_manager_receives_docker_socket() -> None:
     services = _compose()["services"]
     # ga-runner 是 scale: 0 服务(只构建不启动), 不算常驻服务。
-    assert set(services) == {"postgres", "bot-poller", "platform", "web", "llm-proxy", "sandbox-manager", "ga-runner"}
+    # mcp-gateway 是 2026-08-08 MCP stdio gateway 常驻服务(仅 database 内部网络)。
+    assert set(services) == {"postgres", "bot-poller", "platform", "web", "llm-proxy", "sandbox-manager", "ga-runner", "mcp-gateway"}
     assert services["ga-runner"].get("scale") == 0, "ga-runner must be scale: 0 (built but not started by up)"
     assert "build" in services["ga-runner"], "ga-runner must be buildable via docker compose build"
 
@@ -115,7 +117,7 @@ def test_compose_starts_six_services_and_only_sandbox_manager_receives_docker_so
     manager = services["sandbox-manager"]
     assert manager["build"]["dockerfile"] == "tenant_platform/infra/compose/sandbox-manager.Dockerfile"
     assert "/var/run/docker.sock:/var/run/docker.sock" in manager["volumes"]
-    assert manager["environment"]["GA_RUNNER_IMAGE"] == "${GA_RUNNER_IMAGE:-ga-runner:local}"
+    assert manager["environment"]["GA_RUNNER_IMAGE"] == "${GA_RUNNER_IMAGE:-genericagent-ga-runner:local}"
     # 最小权限(审查): Manager 不依赖数据库, 不得持有 DB 凭据/网络/卷。
     assert "DATABASE_URL" not in manager["environment"]
     assert "depends_on" not in manager
@@ -232,6 +234,7 @@ def test_only_loopback_application_ports_are_published() -> None:
     assert "ports" not in services["bot-poller"]
     assert "ports" not in services["llm-proxy"]
     assert "ports" not in services["sandbox-manager"]
+    assert "ports" not in services["mcp-gateway"]  # 仅 database 内部网络(GA_MCP_GATEWAY_LISTEN)
 
 
 def test_platform_image_contains_worker_policy_and_explicit_migrations() -> None:
