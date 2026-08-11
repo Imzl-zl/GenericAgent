@@ -97,6 +97,8 @@ jobs:
           pip install -e 'tenant_platform/worker-python[test]'
           # E2E 重启恢复场景用 psycopg 直连 Postgres 播种旧实例数据
           pip install 'psycopg[binary]'
+          # E2E _assert_worker_process_isolated 用 psutil 枚举 Worker 进程 cmdline
+          pip install psutil
       - name: Core tests (root)
         run: python -m pytest tests -q
       - name: Platform contract/security/smoke
