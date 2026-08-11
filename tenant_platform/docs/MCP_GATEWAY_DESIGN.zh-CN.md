@@ -1,5 +1,10 @@
 # MCP Gateway 设计：stdio transport 统一网关
 
+> **退役（2026-08-11）**：mcp-gateway 服务与 stdio transport 支持已整体移除
+> （EPIC mcp-governance D5：pandoc 本地化完成后 gateway 无业务用途）。
+> 本文保留为历史设计决策记录；当前 MCP 仅 http transport，key 平台侧持有
+> （mcp_servers.headers，proxy 注入），配额按用户 × server × 周期强制。
+>
 > 状态：已实施（2025-08，真实环境验证通过 + 重构收敛）。目标：管理员注册
 > MCP Server（http 或 stdio/uvx 型），全租户可用，架构统一、不堆补丁。
 > 本文是 `mcp_servers` / WorkerMCPProxy / worker `_platform_mcp` 快照链路

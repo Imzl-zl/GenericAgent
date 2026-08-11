@@ -255,12 +255,6 @@ func sophubProxyBaseURL() string {
 	return strings.TrimSpace(os.Getenv("GA_SOPHUB_PROXY_ADDR"))
 }
 
-// mcpGatewayBaseURL 返回 mcp-gateway 服务地址(stdio transport 托管)。
-// 空值 = 未部署 gateway: stdio server 快照 fail-closed 不下发(http 不受影响)。
-func mcpGatewayBaseURL() string {
-	return strings.TrimSpace(os.Getenv("GA_MCP_GATEWAY_ADDR"))
-}
-
 // runnerLeaseReaper 周期清理本实例已过期的 Runner lease: 销毁 lease 记录的
 // 容器并释放 lease(方案 §7: 持久 lease 驱动的重启恢复/孤儿回收)。
 // Worker idle eviction 的正常路径由 scheduler cleanup 直接销毁容器。
@@ -779,7 +773,6 @@ func run() error {
 		LLMProxyAddr:             proxyAddr,
 		SophubProxyBaseURL:       sophubProxyBaseURL(),
 		MCPProxyBaseURL:          sophubProxyBaseURL(),
-		MCPGatewayBaseURL:        mcpGatewayBaseURL(),
 		TokenIssuer:              issuer,
 		CapabilityStore:          store,
 		Audit:                    store,
@@ -1017,9 +1010,8 @@ func run() error {
 			// round9 同款: MCP 调用在线联查 task/lease/成员状态。
 			mcpValidator.WithTaskChecker(store)
 			// server_id → 目标映射(启用中 server 即白名单)。
-			// http transport 直连真实 URL; stdio transport 经 mcp-gateway
-			// 路由(ViaGateway): URL 由 domain.MCPServerGatewayURL 合成
-			// (与快照同函数), gateway 未配置时 fail-closed 视为不存在。
+			// http transport 直连真实 URL; headers 为平台侧持有的凭据头
+			// (EPIC D8'): 只存在于 DB, worker 快照与 capability 均不含。
 			resolve := func(ctx context.Context, serverID string) (api.MCPTarget, bool, error) {
 				servers, listErr := store.ListEnabledMCPServers(ctx)
 				if listErr != nil {
@@ -1029,19 +1021,18 @@ func run() error {
 					if server.ServerKey != serverID {
 						continue
 					}
-					if server.Transport == domain.MCPTransportStdio {
-						gatewayBase := mcpGatewayBaseURL()
-						if gatewayBase == "" {
-							return api.MCPTarget{}, false, nil
-						}
-						return api.MCPTarget{
-							URL:        domain.MCPServerGatewayURL(gatewayBase, server.ServerKey),
-							ViaGateway: true,
-						}, true, nil
-					}
-					return api.MCPTarget{URL: server.URL}, true, nil
+					return api.MCPTarget{URL: server.URL, Headers: server.Headers}, true, nil
 				}
 				return api.MCPTarget{}, false, nil
+			}
+			// 配额强制闭包(D6/D7): sessionKey → owner(workspaces.owner_user_id),
+			// 对 day+month 周期原子扣减; 任一耗尽 → 429 MCP_QUOTA_EXCEEDED。
+			quota := func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+				owner, err := store.GetWorkspaceOwner(ctx, sessionKey)
+				if err != nil {
+					return false, err
+				}
+				return store.ConsumeMCPQuotas(ctx, strconv.FormatInt(owner, 10), serverID)
 			}
 			return api.NewWorkerMCPProxy(
 				resolve,
@@ -1049,6 +1040,7 @@ func run() error {
 					return mcpValidator.Validate(ctx, token)
 				},
 				store.ConsumeCapabilityCall, // MCP 调用按 JTI 原子计量(同审查 F10)
+				quota,                       // 每用户周期配额(无限额行自动放行)
 			)
 		}(),
 		LLMProviders: store, // admin LLM provider management (migration 0007)

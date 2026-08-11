@@ -80,10 +80,6 @@ type SchedulerConfig struct {
 	// MCP 一律经 Platform 受控代理); 非空且 MCP 快照含 server 时下发
 	// _platform_mcp.proxy capability。
 	MCPProxyBaseURL string
-	// MCPGatewayBaseURL 是 mcp-gateway 服务地址(stdio transport 专用):
-	// stdio server 的快照 URL 统一改写为 {base}/v1/mcp/{server_key},
-	// http server 保持真实 URL(阶段 1)。空值时 stdio server 不下发。
-	MCPGatewayBaseURL  string
 	ModelPolicyVersion string
 	// LLMProvider resolves an immutable provider routing snapshot per Worker.
 	LLMProvider LLMProviderSource
@@ -139,6 +135,10 @@ type LLMProviderSource interface {
 
 type MCPServerSource interface {
 	ListEnabledMCPServers(ctx context.Context) ([]domain.MCPServer, error)
+	// MCPQuotaAvailable 判断某用户对某 server 是否仍有可用配额
+	// (无限额行 = 默认放行; 任一周期耗尽 = 不可用)。调度签发 MCP
+	// capability 前按用户过滤, 耗尽 server 不下发(任务内不可见)。
+	MCPQuotaAvailable(ctx context.Context, ownerKey, serverID string) (bool, error)
 }
 
 type CapabilityStore interface {

@@ -13,20 +13,14 @@ const (
 	DefaultMCPTimeoutSeconds = 30
 	MaxMCPTimeoutSeconds     = 300
 
-	// MCPTransportHTTP 是 Streamable HTTP 型 MCP Server(现有行为)。
+	// MCPTransportHTTP 是 Streamable HTTP 型 MCP Server(唯一 transport,
+	// stdio 已随 mcp-gateway 退役移除——EPIC mcp-governance D5)。
 	MCPTransportHTTP = "http"
-	// MCPTransportStdio 是 stdio 型 MCP Server(uvx/npx 启动的本地进程),
-	// 由 mcp-gateway 托管(见 tenant_platform/docs/MCP_GATEWAY_DESIGN.zh-CN.md)。
-	MCPTransportStdio = "stdio"
 
 	// MCPIsolationShared: 无状态无凭据工具, 跨租户共享进程(如 pandoc)。
 	MCPIsolationShared = "shared"
 	// MCPIsolationWorkspace: 有状态/带凭据工具, 每工作区独立进程(预留)。
 	MCPIsolationWorkspace = "workspace"
-
-	// MCPStdioCommandPrefix 是 stdio 命令白名单前缀: 只允许镜像预装工具集。
-	// 工具集变更 = 镜像变更(与 Runner 镜像能力同哲学, 防止管理员任意命令 RCE)。
-	MCPStdioCommandPrefix = "/opt/mcp-tools/"
 
 	DefaultMCPMaxInstances = 1
 	MaxMCPMaxInstances     = 16
@@ -37,6 +31,55 @@ var (
 	ErrMCPServerConflict = errors.New("MCP server conflict")
 )
 
+// mcpReservedHeaders 是禁止注入的请求头(hop-by-hop 与代理自有语义头):
+// proxy 只透传 MCP 语义头, 管理员配置的头若覆盖它们会破坏转发或造成
+// 请求走私/主机头注入, fail-closed 拒绝。
+var mcpReservedHeaders = map[string]struct{}{
+	"host":               {},
+	"content-length":     {},
+	"transfer-encoding":  {},
+	"connection":         {},
+	"keep-alive":         {},
+	"proxy-authenticate": {},
+	"proxy-authorization": {},
+	"te":                 {},
+	"trailer":            {},
+	"upgrade":            {},
+}
+
+// MCPQuotaPeriod 是配额周期粒度(day | month)。
+type MCPQuotaPeriod string
+
+const (
+	MCPQuotaPeriodDay   MCPQuotaPeriod = "day"
+	MCPQuotaPeriodMonth MCPQuotaPeriod = "month"
+)
+
+// MCPQuotaLimit 是每用户 × 每 server × 周期的配额限额(admin 配置真值)。
+// 无行 = 默认放行(与 max_turns 行为一致); 超限由 proxy 原子扣减强制。
+type MCPQuotaLimit struct {
+	OwnerKey   string
+	ServerID   string
+	Period     MCPQuotaPeriod
+	LimitCount int64
+}
+
+func (l MCPQuotaLimit) Validate() error {
+	if strings.TrimSpace(l.OwnerKey) == "" {
+		return fmt.Errorf("owner_key is required")
+	}
+	if strings.TrimSpace(l.ServerID) == "" {
+		return fmt.Errorf("server_id is required")
+	}
+	if l.Period != MCPQuotaPeriodDay && l.Period != MCPQuotaPeriodMonth {
+		return fmt.Errorf("period must be day or month")
+	}
+	if l.LimitCount <= 0 {
+		return fmt.Errorf("limit_count must be positive")
+	}
+	return nil
+}
+
 var mcpServerKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,32}$`)
 
 type MCPServerCreate struct {
@@ -44,14 +87,17 @@ type MCPServerCreate struct {
 	Name           string
 	URL            string
 	TimeoutSeconds int
-	// Transport 是接入方式: http(默认) | stdio。
+	// Headers 是 proxy 转发时注入上游的请求头(Authorization/x-api-key 等),
+	// 平台侧持有: 绝不下发 worker 快照, admin API 回显掩码。
+	Headers map[string]string
+	// Transport 接入方式(http; stdio 已随 gateway 退役移除)。
 	Transport string
-	// Command/Args 仅 stdio 使用: 白名单绝对路径 + 参数数组。
+	// Command/Args 是 stdio 遗留字段(0049 列保留, 恒为空)。
 	Command string
 	Args    []string
 	// Isolation 隔离维度: shared(默认) | workspace(预留, v1 拒绝)。
 	Isolation string
-	// MaxInstances stdio 进程数上限(shared 池 / workspace 每工作区上限)。
+	// MaxInstances 保留字段(与 isolation 同源遗留)。
 	MaxInstances int
 }
 
@@ -65,6 +111,7 @@ type MCPServer struct {
 	Name           string
 	URL            string
 	TimeoutSeconds int
+	Headers        map[string]string
 	Transport      string
 	Command        string
 	Args           []string
@@ -87,8 +134,19 @@ func ValidateMCPServerInput(input MCPServerCreate) error {
 	if transport == "" {
 		transport = MCPTransportHTTP
 	}
-	if transport != MCPTransportHTTP && transport != MCPTransportStdio {
-		return fmt.Errorf("transport must be %q or %q", MCPTransportHTTP, MCPTransportStdio)
+	// stdio transport 已随 mcp-gateway 退役整体移除(EPIC mcp-governance D5):
+	// 校验 fail-closed 拒绝, 上层(api/snapshot/proxy)同步清理中。
+	if transport != MCPTransportHTTP {
+		return fmt.Errorf("transport %q is not supported: stdio was removed with mcp-gateway retirement", transport)
+	}
+	for name := range input.Headers {
+		lower := strings.ToLower(strings.TrimSpace(name))
+		if lower == "" {
+			return fmt.Errorf("header name must not be empty")
+		}
+		if _, reserved := mcpReservedHeaders[lower]; reserved {
+			return fmt.Errorf("header %q is reserved and must not be configured", name)
+		}
 	}
 	isolation := strings.TrimSpace(input.Isolation)
 	if isolation == "" {
@@ -114,7 +172,7 @@ func ValidateMCPServerInput(input MCPServerCreate) error {
 	switch transport {
 	case MCPTransportHTTP:
 		if strings.TrimSpace(input.Command) != "" || len(input.Args) > 0 {
-			return fmt.Errorf("command/args are only valid for stdio transport")
+			return fmt.Errorf("command/args are not supported (stdio transport was removed)")
 		}
 		parsed, err := url.Parse(strings.TrimSpace(input.URL))
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -123,35 +181,7 @@ func ValidateMCPServerInput(input MCPServerCreate) error {
 		if parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" {
 			return fmt.Errorf("url must contain no credentials or fragment")
 		}
-	case MCPTransportStdio:
-		command := strings.TrimSpace(input.Command)
-		if !strings.HasPrefix(command, MCPStdioCommandPrefix) {
-			return fmt.Errorf("command must be an absolute path under %s", MCPStdioCommandPrefix)
-		}
-		if strings.ContainsAny(command, " \t\n\r\x00") {
-			return fmt.Errorf("command must contain no whitespace or NUL")
-		}
-		if len(input.Args) == 0 {
-			// args 可空: 镜像预装工具可能无需参数(如 /opt/mcp-tools/mcp-pandoc)。
-		} else {
-			for _, arg := range input.Args {
-				if strings.TrimSpace(arg) == "" || strings.ContainsRune(arg, '\x00') {
-					return fmt.Errorf("args must be non-empty and contain no NUL")
-				}
-			}
-		}
-		// stdio 的 url 必须为空: gateway 路由由平台统一合成
-		// (MCPServerGatewayURL), 管理员不需要也不应知道 gateway 内部地址。
-		if strings.TrimSpace(input.URL) != "" {
-			return fmt.Errorf("url must be empty for stdio transport (gateway route is synthesized by the platform)")
-		}
 	}
 	return nil
 }
 
-// MCPServerGatewayURL 是 stdio MCP server 的 gateway 路由合成函数
-// (平台内唯一实现: 快照下发与 proxy resolve 共用, 避免两处各自拼 URL)。
-// base 形如 http://mcp-gateway:8083, serverKey 是 mcp_servers.server_key。
-func MCPServerGatewayURL(base, serverKey string) string {
-	return strings.TrimRight(strings.TrimSpace(base), "/") + "/v1/mcp/" + serverKey
-}

@@ -41,6 +41,7 @@ func newTestMCPProxy() *WorkerMCPProxy {
 			}, nil
 		},
 		nil, // consume: nil = 跳过计量(现有测试保持语义)
+	nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 }
 
@@ -112,6 +113,7 @@ func TestWorkerMCPForwardsJSONRPC(t *testing.T) {
 			}, nil
 		},
 		nil,
+	nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0","method":"initialize"}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -171,6 +173,7 @@ func TestWorkerMCPForwardsSessionHeader(t *testing.T) {
 			}, nil
 		},
 		nil,
+	nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0"}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -214,6 +217,7 @@ func TestWorkerMCPStreamsSSE(t *testing.T) {
 			}, nil
 		},
 		nil,
+	nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -245,6 +249,7 @@ func TestWorkerMCPBudgetExceeded(t *testing.T) {
 		func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error) {
 			return false, nil // budget exhausted
 		},
+	nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -260,14 +265,14 @@ func TestWorkerMCPBudgetExceeded(t *testing.T) {
 	}
 }
 
-// TestWorkerMCPStdioViaGateway: stdio transport 的请求发往 gateway 且携带
-// 内部 workspace 头(capability Subject); http transport 直连第三方时
-// 绝不含任何平台内部头(MCP_GATEWAY_DESIGN.zh-CN.md §3)。
-func TestWorkerMCPStdioViaGateway(t *testing.T) {
-	var gotWorkspace, gotAuth string
+// TestWorkerMCPInjectsPlatformHeaders: 平台侧持有的凭据头(headers)注入上游,
+// 同时 capability 的 Authorization 绝不外泄; 无任何平台内部头(EPIC D8')。
+func TestWorkerMCPInjectsPlatformHeaders(t *testing.T) {
+	var gotWorkspace, gotAuth, gotXKey string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotWorkspace = r.Header.Get(mcpWorkspaceHeader)
+		gotWorkspace = r.Header.Get("X-MCP-Workspace")
 		gotAuth = r.Header.Get("Authorization")
+		gotXKey = r.Header.Get("x-api-key")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}`))
@@ -276,8 +281,13 @@ func TestWorkerMCPStdioViaGateway(t *testing.T) {
 
 	proxy := NewWorkerMCPProxy(
 		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
-			// stdio server 解析为 gateway 路由。
-			return MCPTarget{URL: upstream.URL + "/v1/mcp/pandoc", ViaGateway: true}, true, nil
+			return MCPTarget{
+				URL: upstream.URL + "/mcp",
+				Headers: map[string]string{
+					"Authorization": "Bearer tvly-platform-held-key",
+					"x-api-key":     "exa-platform-held-key",
+				},
+			}, true, nil
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
 			return llmproxy.CapabilityClaims{
@@ -289,8 +299,9 @@ func TestWorkerMCPStdioViaGateway(t *testing.T) {
 			}, nil
 		},
 		nil,
+		nil, // quota: nil = 跳过配额
 	)
-	req := httptest.NewRequest("POST", "/v1/worker/mcp/pandoc", strings.NewReader(`{"jsonrpc":"2.0"}`))
+	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0"}`))
 	req.Header.Set("Authorization", "Bearer good-token")
 	rec := httptest.NewRecorder()
 	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
@@ -298,28 +309,22 @@ func TestWorkerMCPStdioViaGateway(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d", rec.Code)
 	}
-	if gotWorkspace != "personal:42" {
-		t.Fatalf("X-MCP-Workspace = %q, want personal:42", gotWorkspace)
+	if gotAuth != "Bearer tvly-platform-held-key" {
+		t.Fatalf("injected Authorization = %q, want platform-held key", gotAuth)
 	}
-	if gotAuth != "" {
-		t.Fatalf("Authorization leaked upstream: %q", gotAuth)
+	if gotXKey != "exa-platform-held-key" {
+		t.Fatalf("injected x-api-key = %q", gotXKey)
+	}
+	if gotWorkspace != "" {
+		t.Fatalf("X-MCP-Workspace leaked: %q", gotWorkspace)
 	}
 }
 
-// TestWorkerMCPHTTPNoInternalHeaders: http transport 直连第三方时不得携带
-// workspace 头(平台内部信息不外泄)。
-func TestWorkerMCPHTTPNoInternalHeaders(t *testing.T) {
-	var gotWorkspace string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotWorkspace = r.Header.Get(mcpWorkspaceHeader)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer upstream.Close()
-
+// TestWorkerMCPQuotaRejectsExhausted: 用户周期配额耗尽 → 429 MCP_QUOTA_EXCEEDED。
+func TestWorkerMCPQuotaRejectsExhausted(t *testing.T) {
 	proxy := NewWorkerMCPProxy(
 		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
-			return MCPTarget{URL: upstream.URL, ViaGateway: false}, true, nil
+			return MCPTarget{URL: "https://mcp.example.com/mcp"}, true, nil
 		},
 		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
 			return llmproxy.CapabilityClaims{
@@ -331,16 +336,24 @@ func TestWorkerMCPHTTPNoInternalHeaders(t *testing.T) {
 			}, nil
 		},
 		nil,
+		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			if sessionKey != "personal:42" || serverID != "exa" {
+				t.Fatalf("quota args = (%q, %q)", sessionKey, serverID)
+			}
+			return false, nil // 耗尽
+		},
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer good-token")
 	rec := httptest.NewRecorder()
 	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d", rec.Code)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429", rec.Code)
 	}
-	if gotWorkspace != "" {
-		t.Fatalf("X-MCP-Workspace leaked to third party: %q", gotWorkspace)
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["code"] != "MCP_QUOTA_EXCEEDED" {
+		t.Fatalf("code field = %v, want MCP_QUOTA_EXCEEDED", body["code"])
 	}
 }

@@ -765,9 +765,13 @@ def _register_user(base: str, username: str) -> tuple[int, str]:
     code, body = _http_json("POST", f"{base}/v1/admin/users/{uid}/approve")
     assert code == 200, body
     with psycopg.connect(TEST_DB) as conn:
+        # 注册路径已同事务创建 personal workspace(生命周期不变量:
+        # users ⇔ personal:<uid> 行)——此直插仅为兜底, 幂等(0050 后
+        # 平台自动建行, 直接 INSERT 会唯一键冲突, 2026-08-11 实证)。
         conn.execute(
             "INSERT INTO workspaces (id, session_key, owner_user_id, kind, volume_id) "
-            "VALUES (gen_random_uuid(), %s, %s, 'personal', 'e2e-user-volume')",
+            "VALUES (gen_random_uuid(), %s, %s, 'personal', 'e2e-user-volume') "
+            "ON CONFLICT (session_key) DO NOTHING",
             (f"personal:{uid}", uid),
         )
     return uid, token

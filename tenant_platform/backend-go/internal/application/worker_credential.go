@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -35,6 +36,7 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 	mcpSnapshot RuntimeMCPSnapshot,
 	runnerGeneration uint64,
 	taskID string,
+	ownerKey string,
 ) (workerCredentialSet, RuntimeConfigFiles, error) {
 	if s.cfg.TokenIssuer == nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, nil
@@ -169,6 +171,31 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 	return set, files, nil
 }
 
+// filterMCPServersByQuota 按用户配额过滤快照 server: 无限额行/未耗尽保留,
+// 任一周期耗尽的剔除。配额源不可用时 fail-closed(剔除全部, 不冒泄漏风险)。
+func (s *scheduler) filterMCPServersByQuota(ctx context.Context, ownerKey string, snapshot RuntimeMCPSnapshot) RuntimeMCPSnapshot {
+	if s.cfg.MCPServer == nil || len(snapshot.Servers) == 0 {
+		return snapshot
+	}
+	filtered := make([]RuntimeMCPServer, 0, len(snapshot.Servers))
+	for _, server := range snapshot.Servers {
+		available, err := s.cfg.MCPServer.MCPQuotaAvailable(ctx, ownerKey, server.ServerID)
+		if err != nil {
+			slog.ErrorContext(ctx, "mcp quota check failed, excluding server",
+				"server_id", server.ServerID, "error", err)
+			continue
+		}
+		if !available {
+			slog.InfoContext(ctx, "mcp server excluded: user quota exhausted",
+				"server_id", server.ServerID, "owner_key", ownerKey)
+			continue
+		}
+		filtered = append(filtered, server)
+	}
+	snapshot.Servers = filtered
+	return snapshot
+}
+
 func (s *scheduler) issueInitialWorkerCredentials(
 	ctx context.Context, task domain.Task, generation uint64,
 ) (workerCredentialSet, RuntimeConfigFiles, error) {
@@ -183,7 +210,7 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
 	}
-	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, generation, task.ID)
+	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, generation, task.ID, strconv.FormatInt(task.RequesterID, 10))
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
 	}

@@ -25,9 +25,13 @@ func (s *memoryMCPStore) CreateMCPServer(_ context.Context, input domain.MCPServ
 	if s.createErr != nil {
 		return domain.MCPServer{}, s.createErr
 	}
+	// 与真实 postgres store 同款: 校验唯一实现在 domain(被 store 调用)。
+	if err := domain.ValidateMCPServerInput(input); err != nil {
+		return domain.MCPServer{}, err
+	}
 	s.server = domain.MCPServer{
 		ID: 1, ServerKey: input.ServerKey, Name: input.Name, URL: input.URL,
-		TimeoutSeconds: input.TimeoutSeconds, Enabled: false, Revision: 1,
+		TimeoutSeconds: input.TimeoutSeconds, Headers: input.Headers, Enabled: false, Revision: 1,
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	return s.server, nil
@@ -49,6 +53,7 @@ func (s *memoryMCPStore) UpdateMCPServer(_ context.Context, id int64, input doma
 	}
 	s.server.ServerKey, s.server.Name, s.server.URL = input.ServerKey, input.Name, input.URL
 	s.server.TimeoutSeconds = input.TimeoutSeconds
+	s.server.Headers = input.Headers
 	s.server.Revision++
 	return s.server, nil
 }
@@ -83,6 +88,7 @@ func TestAdminMCPCreateDoesNotExposeHeadersAndSupportsEnable(t *testing.T) {
 	server := &Server{mcpServers: store}
 	request := httptest.NewRequest("POST", "/v1/admin/mcp-servers", strings.NewReader(`{
 		"server_key":"exa","name":"Exa","url":"https://mcp.exa.ai/mcp",
+		"headers":{"Authorization":"Bearer tvly-secret-key-12345"},
 		"timeout_seconds":30
 	}`))
 	response := httptest.NewRecorder()
@@ -90,15 +96,16 @@ func TestAdminMCPCreateDoesNotExposeHeadersAndSupportsEnable(t *testing.T) {
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
-	if strings.Contains(response.Body.String(), "headers") {
-		t.Fatalf("response exposed unsupported headers fields: %s", response.Body.String())
-	}
 	var created map[string]any
 	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
 	if created["server_key"] != "exa" || created["enabled"] != false {
 		t.Fatalf("created=%v", created)
+	}
+	// 新契约(EPIC D4'): headers 可配置, 回显掩码——明文 key 只写不读。
+	if h, ok := created["headers"].(map[string]any); !ok || h["Authorization"] != "Bear***" {
+		t.Fatalf("headers must be masked in reply: %v", created["headers"])
 	}
 
 	enable := httptest.NewRequest("POST", "/v1/admin/mcp-servers/1/enable", nil)
@@ -110,14 +117,14 @@ func TestAdminMCPCreateDoesNotExposeHeadersAndSupportsEnable(t *testing.T) {
 	}
 }
 
-func TestAdminMCPRejectsInvalidServerKeyAndAnyHeadersField(t *testing.T) {
+func TestAdminMCPRejectsInvalidServerKeyAndHeaders(t *testing.T) {
 	server := &Server{mcpServers: &memoryMCPStore{}}
 	for name, body := range map[string]string{
-		"invalid key":           `{"server_key":"bad id","name":"Bad","url":"https://example.com/mcp","timeout_seconds":30}`,
-		"missing timeout":       `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp"}`,
-		"zero timeout":          `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp","timeout_seconds":0}`,
-		"empty headers":         `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp","headers":{},"timeout_seconds":30}`,
-		"authenticated headers": `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp","headers":{"Authorization":"Bearer secret"},"timeout_seconds":30}`,
+		"invalid key":      `{"server_key":"bad id","name":"Bad","url":"https://example.com/mcp","timeout_seconds":30}`,
+		"missing timeout":  `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp"}`,
+		"zero timeout":     `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp","timeout_seconds":0}`,
+		"reserved header":  `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp","headers":{"Host":"evil"},"timeout_seconds":30}`,
+		"empty header key": `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp","headers":{"":"v"},"timeout_seconds":30}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			request := httptest.NewRequest("POST", "/v1/admin/mcp-servers", strings.NewReader(body))
@@ -127,6 +134,17 @@ func TestAdminMCPRejectsInvalidServerKeyAndAnyHeadersField(t *testing.T) {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+	// 新契约(D4'): 合法凭据头(Authorization/x-api-key)接受并掩码回显。
+	okBody := `{"server_key":"ok","name":"Bad","url":"https://example.com/mcp","headers":{"Authorization":"Bearer secret"},"timeout_seconds":30}`
+	request := httptest.NewRequest("POST", "/v1/admin/mcp-servers", strings.NewReader(okBody))
+	response := httptest.NewRecorder()
+	server.handleAdminCreateMCPServer(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("valid headers rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "Bear***") {
+		t.Fatalf("valid headers must be masked in reply: %s", response.Body.String())
 	}
 }
 
@@ -227,5 +245,59 @@ func TestAdminMCPMapsStoreErrors(t *testing.T) {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+
+func (s *memoryMCPStore) SetMCPQuotaLimit(_ context.Context, ownerKey, serverID, period string, limitCount int64) error {
+	return nil
+}
+
+func (s *memoryMCPStore) ListMCPQuotaLimits(_ context.Context, ownerKey string) ([]domain.MCPQuotaLimit, error) {
+	return nil, nil
+}
+
+func (s *memoryMCPStore) DeleteMCPQuotaLimit(_ context.Context, ownerKey, serverID, period string) error {
+	return nil
+}
+
+// 掩码合并(JSON 编辑契约): Update 提交掩码值(与当前掩码一致)时保留原 key,
+// 明文值更新; Create 提交掩码值拒绝(必须明文)。
+func TestAdminMCPUpdatePreservesMaskedHeaders(t *testing.T) {
+	store := &memoryMCPStore{server: domain.MCPServer{
+		ID: 1, ServerKey: "tavily", Name: "Tavily", URL: "https://mcp.tavily.com/mcp/",
+		TimeoutSeconds: 30, Headers: map[string]string{"Authorization": "Bearer tvly-secret-12345"},
+		Revision: 1, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}}
+	server := &Server{mcpServers: store}
+	// 掩码值保留 + 新明文键更新。
+	request := httptest.NewRequest("PUT", "/v1/admin/mcp-servers/1", strings.NewReader(`{
+		"server_key":"tavily","name":"Tavily","url":"https://mcp.tavily.com/mcp/",
+		"headers":{"Authorization":"Bear***","x-api-key":"exa-new-key"},"timeout_seconds":30
+	}`))
+	request.SetPathValue("mcp_server_id", "1")
+	response := httptest.NewRecorder()
+	server.handleAdminUpdateMCPServer(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if store.server.Headers["Authorization"] != "Bearer tvly-secret-12345" {
+		t.Fatalf("masked header must be preserved, got %q", store.server.Headers["Authorization"])
+	}
+	if store.server.Headers["x-api-key"] != "exa-new-key" {
+		t.Fatalf("new plaintext header must be set, got %q", store.server.Headers["x-api-key"])
+	}
+}
+
+func TestAdminMCPCreateRejectsMaskedHeaders(t *testing.T) {
+	server := &Server{mcpServers: &memoryMCPStore{}}
+	request := httptest.NewRequest("POST", "/v1/admin/mcp-servers", strings.NewReader(`{
+		"server_key":"ok","name":"Bad","url":"https://example.com/mcp",
+		"headers":{"Authorization":"Bear***"},"timeout_seconds":30
+	}`))
+	response := httptest.NewRecorder()
+	server.handleAdminCreateMCPServer(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("masked header on create must be rejected: status=%d body=%s", response.Code, response.Body.String())
 	}
 }

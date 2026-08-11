@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"errors"
 	"testing"
 
@@ -132,9 +133,8 @@ func TestMCPServerStoreLifecycleAndRevision(t *testing.T) {
 }
 
 // TestMCPServerMixedTransportRoundTrip 回归: 真实环境 WORKER_START_FAILED
-// (scan NULL into *string)——http server 的 command 列为 NULL, 混合
-// http+stdio 启用列表必须能正常扫描, 且 CHECK 约束要求 http 的
-// command/args 为 NULL、stdio 的 command 非空(0049_mcp_gateway.sql)。
+// (scan NULL into *string)——http server 的 command 列为 NULL, 启用列表必须
+// 能正常扫描 NULL command(0049 遗留列, 0055 后 stdio 已移除)。
 func TestMCPServerMixedTransportRoundTrip(t *testing.T) {
 	pool := requireDB(t)
 	store, err := NewStore(pool)
@@ -154,26 +154,20 @@ func TestMCPServerMixedTransportRoundTrip(t *testing.T) {
 		t.Fatalf("http server fields: transport=%q command=%q args=%v", httpServer.Transport, httpServer.Command, httpServer.Args)
 	}
 
-	stdioServer, err := store.CreateMCPServer(ctx, domain.MCPServerCreate{
-		ServerKey: "pandoc", Name: "Pandoc", Transport: domain.MCPTransportStdio,
+	// stdio transport 已移除(EPIC D5): store 层透传 domain 校验, 创建必须拒绝。
+	if _, err := store.CreateMCPServer(ctx, domain.MCPServerCreate{
+		ServerKey: "pandoc", Name: "Pandoc", Transport: "stdio",
 		Command: "/opt/mcp-tools/mcp-pandoc", Args: []string{"--stdio"},
 		TimeoutSeconds: 60,
-	})
-	if err != nil {
-		t.Fatalf("create stdio server: %v", err)
-	}
-	if stdioServer.Transport != domain.MCPTransportStdio || stdioServer.Command != "/opt/mcp-tools/mcp-pandoc" {
-		t.Fatalf("stdio server fields: %+v", stdioServer)
+	}); err == nil || !strings.Contains(err.Error(), "stdio") {
+		t.Fatalf("expected stdio rejection, got %v", err)
 	}
 
 	if _, err := store.SetMCPServerEnabled(ctx, httpServer.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.SetMCPServerEnabled(ctx, stdioServer.ID, true); err != nil {
-		t.Fatal(err)
-	}
 
-	// 回归点: ListEnabledMCPServers 必须能扫描混合 transport(NULL command)。
+	// 回归点: ListEnabledMCPServers 必须能扫描 NULL command(遗留列)。
 	servers, err := store.ListEnabledMCPServers(ctx)
 	if err != nil {
 		t.Fatalf("list enabled servers: %v", err)
@@ -184,12 +178,9 @@ func TestMCPServerMixedTransportRoundTrip(t *testing.T) {
 		if s.ServerKey == "exa" && s.Command != "" {
 			t.Fatalf("http server command must be empty, got %q", s.Command)
 		}
-		if s.ServerKey == "pandoc" && s.Command != "/opt/mcp-tools/mcp-pandoc" {
-			t.Fatalf("stdio server command mismatch: %q", s.Command)
-		}
 	}
-	if !seen["exa"] || !seen["pandoc"] {
-		t.Fatalf("expected both servers in enabled list, got %v", seen)
+	if !seen["exa"] {
+		t.Fatalf("expected exa in enabled list, got %v", seen)
 	}
 
 	// http server 不允许携带 stdio 字段(domain 校验 + CHECK 双保险)。

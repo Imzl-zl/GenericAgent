@@ -48,6 +48,10 @@ type MCPServerPort interface {
 	UpdateMCPServer(ctx context.Context, id int64, input domain.MCPServerUpdate) (domain.MCPServer, error)
 	SetMCPServerEnabled(ctx context.Context, id int64, enabled bool) (domain.MCPServer, error)
 	DeleteMCPServer(ctx context.Context, id int64) error
+	// 配额 CRUD(每用户 × 每 server × 周期)。
+	SetMCPQuotaLimit(ctx context.Context, ownerKey, serverID, period string, limitCount int64) error
+	ListMCPQuotaLimits(ctx context.Context, ownerKey string) ([]domain.MCPQuotaLimit, error)
+	DeleteMCPQuotaLimit(ctx context.Context, ownerKey, serverID, period string) error
 }
 
 // TaskStatsPort 是管理端仪表盘统计端口。

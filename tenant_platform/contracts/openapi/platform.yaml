@@ -468,6 +468,73 @@ paths:
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/admin/mcp-quotas:
+    get:
+      operationId: adminListMCPQuotas
+      summary: List per-user MCP quota limits, optionally filtered by owner_key (admin-only)
+      tags: [admin]
+      security: [{PlatformAdminToken: []}]
+      parameters:
+        - name: owner_key
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        "200":
+          description: MCP quota limits
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [quotas]
+                properties:
+                  quotas:
+                    type: array
+                    items: {$ref: "#/components/schemas/MCPQuotaLimit"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    put:
+      operationId: adminUpsertMCPQuota
+      summary: Create or update a per-user MCP quota limit (admin-only)
+      tags: [admin]
+      security: [{PlatformAdminToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/MCPQuotaLimit"}
+      responses:
+        "200":
+          description: MCP quota limit upserted
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MCPQuotaLimit"}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    delete:
+      operationId: adminDeleteMCPQuota
+      summary: Delete a per-user MCP quota limit (admin-only)
+      tags: [admin]
+      security: [{PlatformAdminToken: []}]
+      parameters:
+        - name: owner_key
+          in: query
+          required: true
+          schema: {type: string}
+        - name: server_id
+          in: query
+          required: true
+          schema: {type: string}
+        - name: period
+          in: query
+          required: true
+          schema: {type: string, enum: [day, month]}
+      responses:
+        "204": {description: MCP quota limit deleted}
+        "400": {$ref: "#/components/responses/ValidationError"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
   /v1/admin/mcp-servers:
     get:
       operationId: adminListMCPServers
@@ -2158,15 +2225,14 @@ components:
         mcp_server_id: {type: integer, format: int64, minimum: 1}
         server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
         name: {type: string, minLength: 1}
-        # transport=http: url 必填(第三方 Streamable HTTP 地址);
-        # transport=stdio: url 恒为空(gateway 路由由平台合成, 见
-        # MCP_GATEWAY_DESIGN.zh-CN.md)。
-        transport: {type: string, enum: [http, stdio]}
+        # stdio transport 已随 mcp-gateway 退役移除(EPIC mcp-governance D5)。
+        transport: {type: string, enum: [http]}
         url: {type: string, format: uri, nullable: true}
-        # stdio 专用: 镜像预装工具集白名单绝对路径(/opt/mcp-tools/ 前缀)。
+        # headers 为平台侧持有的凭据头(proxy 注入, worker 快照不含);
+        # 回显掩码(只写不读, 值保留前 4 字符 + ***)。
+        headers: {type: object, additionalProperties: {type: string}, nullable: true}
         command: {type: string, nullable: true}
         args: {type: array, items: {type: string}, nullable: true}
-        # v1 仅支持 shared(无状态无凭据工具跨租户共享进程)。
         isolation: {type: string, enum: [shared, workspace]}
         max_instances: {type: integer, minimum: 1, maximum: 16}
         timeout_seconds: {type: integer, minimum: 1, maximum: 300}
@@ -2181,9 +2247,10 @@ components:
       properties:
         server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
         name: {type: string, minLength: 1}
-        # http 必填; stdio 必须省略(为空)。
         url: {type: string, format: uri}
-        transport: {type: string, enum: [http, stdio]}
+        # 凭据头(Authorization/x-api-key 等); 敏感键名(Host 等)拒绝。
+        headers: {type: object, additionalProperties: {type: string}}
+        transport: {type: string, enum: [http]}
         command: {type: string}
         args: {type: array, items: {type: string}}
         isolation: {type: string, enum: [shared, workspace]}
@@ -2197,12 +2264,23 @@ components:
         server_key: {type: string, pattern: "^[A-Za-z0-9_]{1,32}$"}
         name: {type: string, minLength: 1}
         url: {type: string, format: uri}
-        transport: {type: string, enum: [http, stdio]}
+        headers: {type: object, additionalProperties: {type: string}}
+        transport: {type: string, enum: [http]}
         command: {type: string}
         args: {type: array, items: {type: string}}
         isolation: {type: string, enum: [shared, workspace]}
         max_instances: {type: integer, minimum: 1, maximum: 16}
         timeout_seconds: {type: integer, minimum: 1, maximum: 300}
+    # MCPQuotaLimit: 每用户 × 每 server × 周期限额(无行 = 默认放行)。
+    MCPQuotaLimit:
+      type: object
+      additionalProperties: false
+      required: [owner_key, server_id, period, limit_count]
+      properties:
+        owner_key: {type: string, minLength: 1}
+        server_id: {type: string, minLength: 1}
+        period: {type: string, enum: [day, month]}
+        limit_count: {type: integer, format: int64, minimum: 1}
     CreateLLMProviderRequest:
       type: object
       additionalProperties: false

@@ -12,7 +12,7 @@ import (
 )
 
 const mcpServerColumns = `id, server_key, name, url, timeout_seconds,
-transport, command, args, isolation, max_instances,
+headers, transport, command, args, isolation, max_instances,
 enabled, revision, created_at, updated_at`
 
 func (s *Store) CreateMCPServer(ctx context.Context, input domain.MCPServerCreate) (domain.MCPServer, error) {
@@ -22,16 +22,20 @@ func (s *Store) CreateMCPServer(ctx context.Context, input domain.MCPServerCreat
 	}
 	query := `INSERT INTO mcp_servers (
 		server_key, name, url, timeout_seconds,
-		transport, command, args, isolation, max_instances
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING ` + mcpServerColumns
+		headers, transport, command, args, isolation, max_instances
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING ` + mcpServerColumns
 	var server domain.MCPServer
 	argsJSON, err := marshalMCPArgs(input.Args)
 	if err != nil {
 		return domain.MCPServer{}, err
 	}
+	headersJSON, err := marshalMCPHeaders(input.Headers)
+	if err != nil {
+		return domain.MCPServer{}, err
+	}
 	err = scanMCPServer(s.pool.QueryRow(ctx, query,
 		input.ServerKey, input.Name, input.URL, input.TimeoutSeconds,
-		input.Transport, mcpCommandParam(input), argsJSON, input.Isolation, input.MaxInstances,
+		headersJSON, input.Transport, nil, argsJSON, input.Isolation, input.MaxInstances,
 	), &server)
 	return server, classifyMCPServerStoreError(err)
 }
@@ -84,21 +88,23 @@ func (s *Store) UpdateMCPServer(ctx context.Context, id int64, input domain.MCPS
 		name = $3,
 		url = $4,
 		timeout_seconds = $5,
-		transport = $6,
-		command = $7,
-		args = $8,
-		isolation = $9,
-		max_instances = $10,
+		headers = $6,
+		transport = $7,
+		command = $8,
+		args = $9,
+		isolation = $10,
+		max_instances = $11,
 		revision = revision + CASE WHEN
 			server_key IS DISTINCT FROM $2 OR
 			name IS DISTINCT FROM $3 OR
 			url IS DISTINCT FROM $4 OR
 			timeout_seconds IS DISTINCT FROM $5 OR
-			transport IS DISTINCT FROM $6 OR
-			command IS DISTINCT FROM $7 OR
-			args IS DISTINCT FROM $8 OR
-			isolation IS DISTINCT FROM $9 OR
-			max_instances IS DISTINCT FROM $10
+			headers IS DISTINCT FROM $6 OR
+			transport IS DISTINCT FROM $7 OR
+			command IS DISTINCT FROM $8 OR
+			args IS DISTINCT FROM $9 OR
+			isolation IS DISTINCT FROM $10 OR
+			max_instances IS DISTINCT FROM $11
 		THEN 1 ELSE 0 END,
 		updated_at = NOW()
 	WHERE id = $1 RETURNING ` + mcpServerColumns
@@ -107,9 +113,13 @@ func (s *Store) UpdateMCPServer(ctx context.Context, id int64, input domain.MCPS
 	if err != nil {
 		return domain.MCPServer{}, err
 	}
+	headersJSON, err := marshalMCPHeaders(input.Headers)
+	if err != nil {
+		return domain.MCPServer{}, err
+	}
 	err = scanMCPServer(s.pool.QueryRow(ctx, query,
 		id, input.ServerKey, input.Name, input.URL, input.TimeoutSeconds,
-		input.Transport, mcpCommandParam(input.MCPServerCreate), argsJSON, input.Isolation, input.MaxInstances,
+		headersJSON, input.Transport, nil, argsJSON, input.Isolation, input.MaxInstances,
 	), &server)
 	return server, classifyMCPServerStoreError(err)
 }
@@ -177,17 +187,16 @@ func marshalMCPArgs(args []string) ([]byte, error) {
 	return encoded, nil
 }
 
-// mcpCommandParam 返回写入 DB 的 command 值: http transport 必须为 NULL
-// (CHECK 约束), stdio 为白名单绝对路径。
-func mcpCommandParam(input domain.MCPServerCreate) any {
-	transport := input.Transport
-	if transport == "" {
-		transport = domain.MCPTransportHTTP
+// marshalMCPHeaders 把 headers 编码为 JSONB; nil/空 map 统一为 NULL。
+func marshalMCPHeaders(headers map[string]string) ([]byte, error) {
+	if len(headers) == 0 {
+		return nil, nil
 	}
-	if transport != domain.MCPTransportStdio {
-		return nil
+	encoded, err := json.Marshal(headers)
+	if err != nil {
+		return nil, fmt.Errorf("marshal mcp headers: %w", err)
 	}
-	return input.Command
+	return encoded, nil
 }
 
 func classifyMCPServerStoreError(err error) error {
@@ -205,12 +214,13 @@ func classifyMCPServerStoreError(err error) error {
 
 func scanMCPServer(row pgx.Row, server *domain.MCPServer) error {
 	var (
-		argsJSON []byte
-		command  *string // http transport 的 command 列为 NULL
+		argsJSON    []byte
+		headersJSON []byte
+		command     *string // http transport 的 command 列为 NULL
 	)
 	if err := row.Scan(
 		&server.ID, &server.ServerKey, &server.Name, &server.URL,
-		&server.TimeoutSeconds, &server.Transport, &command, &argsJSON,
+		&server.TimeoutSeconds, &headersJSON, &server.Transport, &command, &argsJSON,
 		&server.Isolation, &server.MaxInstances, &server.Enabled, &server.Revision,
 		&server.CreatedAt, &server.UpdatedAt,
 	); err != nil {
@@ -224,5 +234,195 @@ func scanMCPServer(row pgx.Row, server *domain.MCPServer) error {
 			return fmt.Errorf("unmarshal mcp args: %w", err)
 		}
 	}
+	if len(headersJSON) > 0 {
+		if err := json.Unmarshal(headersJSON, &server.Headers); err != nil {
+			return fmt.Errorf("unmarshal mcp headers: %w", err)
+		}
+	}
 	return nil
+}
+
+// SetMCPQuotaLimit upsert 每用户 × 每 server × 周期的配额限额。
+// period: "day" | "month"; limitCount 必须为正。
+func (s *Store) SetMCPQuotaLimit(ctx context.Context, ownerKey, serverID, period string, limitCount int64) error {
+	if err := validateQuotaPeriod(period); err != nil {
+		return err
+	}
+	if limitCount <= 0 {
+		return fmt.Errorf("quota limit must be positive: %d", limitCount)
+	}
+	if strings.TrimSpace(ownerKey) == "" || strings.TrimSpace(serverID) == "" {
+		return fmt.Errorf("quota owner_key and server_id are required")
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO mcp_quota_limits (owner_key, server_id, period, limit_count, updated_at)
+		VALUES ($1, $2, $3, $4, timezone('utc', now()))
+		ON CONFLICT (owner_key, server_id, period) DO UPDATE
+		SET limit_count = EXCLUDED.limit_count,
+		    updated_at = timezone('utc', now())
+	`, ownerKey, serverID, period, limitCount)
+	return err
+}
+
+// ConsumeMCPQuota 原子扣减周期配额(照搬 ConsumeCapabilityCall 原子模式):
+// 有限额行时首调插行 used=1, 后续 +1; 已到 limit 不再更新并返回 (false, nil)。
+// 无限额行 = 默认放行(D6), 不写用量。
+func (s *Store) ConsumeMCPQuota(ctx context.Context, ownerKey, serverID, period string) (bool, error) {
+	if err := validateQuotaPeriod(period); err != nil {
+		return false, err
+	}
+	var limitCount int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT limit_count FROM mcp_quota_limits
+		WHERE owner_key = $1 AND server_id = $2 AND period = $3
+	`, ownerKey, serverID, period).Scan(&limitCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, nil // 无限额行 = 默认放行
+	}
+	if err != nil {
+		return false, err
+	}
+	var used int64
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO mcp_quota_usage (owner_key, server_id, period_key, used_count)
+		VALUES ($1, $2, `+quotaPeriodKeyExpr(period)+`, 1)
+		ON CONFLICT (owner_key, server_id, period_key) DO UPDATE
+		SET used_count = mcp_quota_usage.used_count + 1,
+		    updated_at = timezone('utc', now())
+		WHERE mcp_quota_usage.used_count < $3
+		RETURNING used_count
+	`, ownerKey, serverID, limitCount).Scan(&used)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil // 已到限额
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func validateQuotaPeriod(period string) error {
+	if period != "day" && period != "month" {
+		return fmt.Errorf("quota period must be day or month: %q", period)
+	}
+	return nil
+}
+
+// quotaPeriodKeyExpr 生成 UTC 周期键: day='YYYY-MM-DD' / month='YYYY-MM'。
+// 仅接受 validateQuotaPeriod 校验过的 day/month, 无注入面。
+func quotaPeriodKeyExpr(period string) string {
+	if period == "month" {
+		return `to_char(timezone('utc', now()), 'YYYY-MM')`
+	}
+	return `to_char(timezone('utc', now()), 'YYYY-MM-DD')`
+}
+
+// MCPQuotaAvailable 判断某用户对某 server 是否仍可用配额:
+// - 无限额行(day/month 均无) → 可用(默认放行);
+// - 任一有限额周期已耗尽 → 不可用(即使另一周期仍有剩余);
+// - 全部有限额周期未耗尽 → 可用。
+func (s *Store) MCPQuotaAvailable(ctx context.Context, ownerKey, serverID string) (bool, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT period FROM mcp_quota_limits
+		WHERE owner_key = $1 AND server_id = $2
+	`, ownerKey, serverID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	periods := make([]string, 0, 2)
+	for rows.Next() {
+		var period string
+		if err := rows.Scan(&period); err != nil {
+			return false, err
+		}
+		periods = append(periods, period)
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(periods) == 0 {
+		return true, nil
+	}
+	for _, period := range periods {
+		var limitCount, usedCount int64
+		err := s.pool.QueryRow(ctx, `
+			SELECT l.limit_count, COALESCE(u.used_count, 0)
+			FROM mcp_quota_limits l
+			LEFT JOIN mcp_quota_usage u
+				ON u.owner_key = l.owner_key AND u.server_id = l.server_id
+				AND u.period_key = `+quotaPeriodKeyExpr(period)+`
+			WHERE l.owner_key = $1 AND l.server_id = $2 AND l.period = $3
+		`, ownerKey, serverID, period).Scan(&limitCount, &usedCount)
+		if err != nil {
+			return false, err
+		}
+		if usedCount >= limitCount {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// ConsumeMCPQuotas 组合扣减 day + month 两个周期(proxy 每次调用执行):
+// 任一周期耗尽 → false(整体拒绝); 无限额行周期自动放行不计数。
+// 部分扣减副作用: day 成功且 month 耗尽时 day 已计数——计数尽力而为,
+// 拒绝由下一次调度过滤(MCPQuotaAvailable)与月限额兜底。
+func (s *Store) ConsumeMCPQuotas(ctx context.Context, ownerKey, serverID string) (bool, error) {
+	allowed, err := s.ConsumeMCPQuota(ctx, ownerKey, serverID, "day")
+	if err != nil {
+		return false, err
+	}
+	if !allowed {
+		return false, nil
+	}
+	return s.ConsumeMCPQuota(ctx, ownerKey, serverID, "month")
+}
+
+// ListMCPQuotaLimits 列出某用户的全部配额限额。
+func (s *Store) ListMCPQuotaLimits(ctx context.Context, ownerKey string) ([]domain.MCPQuotaLimit, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT owner_key, server_id, period, limit_count
+		FROM mcp_quota_limits
+		WHERE owner_key = $1
+		ORDER BY server_id, period
+	`, ownerKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	limits := make([]domain.MCPQuotaLimit, 0)
+	for rows.Next() {
+		var l domain.MCPQuotaLimit
+		if err := rows.Scan(&l.OwnerKey, &l.ServerID, &l.Period, &l.LimitCount); err != nil {
+			return nil, err
+		}
+		limits = append(limits, l)
+	}
+	return limits, rows.Err()
+}
+
+// DeleteMCPQuotaLimit 删除某用户的某 server 某周期限额(删除后默认放行)。
+func (s *Store) DeleteMCPQuotaLimit(ctx context.Context, ownerKey, serverID, period string) error {
+	if err := validateQuotaPeriod(period); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `
+		DELETE FROM mcp_quota_limits
+		WHERE owner_key = $1 AND server_id = $2 AND period = $3
+	`, ownerKey, serverID, period)
+	return err
+}
+
+// GetWorkspaceOwner 返回 session_key 对应的 workspace 属主用户 ID
+// (配额 owner 解析: capability Subject=sessionKey → owner_user_id)。
+func (s *Store) GetWorkspaceOwner(ctx context.Context, sessionKey string) (int64, error) {
+	var owner int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT owner_user_id FROM workspaces WHERE session_key = $1
+	`, sessionKey).Scan(&owner)
+	if err != nil {
+		return 0, fmt.Errorf("resolve workspace owner for session %q: %w", sessionKey, err)
+	}
+	return owner, nil
 }

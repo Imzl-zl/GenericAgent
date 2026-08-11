@@ -83,6 +83,7 @@ func migrationFiles() []string {
 		"0052_conversation_resets.sql",
 		"0053_channel_configs.sql",
 		"0054_im_streaming.sql",
+		"0055_mcp_governance.sql",
 	}
 }
 
@@ -141,6 +142,7 @@ var pendingMigrations = []struct {
 	{"0052_conversation_resets.sql", "migration_0052_conversation_resets_marker"},
 	{"0053_channel_configs.sql", "migration_0053_channel_configs_marker"},
 	{"0054_im_streaming.sql", "migration_0054_im_streaming_marker"},
+	{"0055_mcp_governance.sql", "migration_0055_mcp_governance_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -209,6 +211,7 @@ var foundationTableNames = []string{
 	"migration_0049_mcp_gateway_marker",
 	"migration_0053_channel_configs_marker",
 	"migration_0054_im_streaming_marker",
+	"migration_0055_mcp_governance_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",

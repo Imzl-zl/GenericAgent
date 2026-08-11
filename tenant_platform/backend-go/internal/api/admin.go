@@ -111,6 +111,9 @@ func (s *Server) registerLifecycleRoutes() {
 		s.mux.HandleFunc("DELETE /v1/admin/mcp-servers/{mcp_server_id}", s.auth(s.handleAdminDeleteMCPServer))
 		s.mux.HandleFunc("POST /v1/admin/mcp-servers/{mcp_server_id}/enable", s.auth(s.handleAdminEnableMCPServer))
 		s.mux.HandleFunc("POST /v1/admin/mcp-servers/{mcp_server_id}/disable", s.auth(s.handleAdminDisableMCPServer))
+		s.mux.HandleFunc("GET /v1/admin/mcp-quotas", s.auth(s.handleAdminListMCPQuotas))
+		s.mux.HandleFunc("PUT /v1/admin/mcp-quotas", s.auth(s.handleAdminUpsertMCPQuota))
+		s.mux.HandleFunc("DELETE /v1/admin/mcp-quotas", s.auth(s.handleAdminDeleteMCPQuota))
 	}
 	if s.sophub != nil {
 		s.mux.HandleFunc("GET /v1/admin/sophub/binding", s.auth(s.handleAdminGetSophubBinding))

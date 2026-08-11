@@ -590,3 +590,37 @@ func TestIssueInitialCredentialsWritesGenerationScopedConfigDir(t *testing.T) {
 		t.Fatalf("runtime config must be written under config/g2 (err=%v)", err)
 	}
 }
+
+type fakeQuotaSource struct {
+	available map[string]bool // serverID → available
+}
+
+func (f *fakeQuotaSource) ListEnabledMCPServers(ctx context.Context) ([]domain.MCPServer, error) {
+	return nil, nil
+}
+
+func (f *fakeQuotaSource) MCPQuotaAvailable(_ context.Context, ownerKey, serverID string) (bool, error) {
+	if f.available == nil {
+		return true, nil
+	}
+	return f.available[serverID], nil
+}
+
+func TestIssueProviderCapabilitiesFiltersExhaustedQuota(t *testing.T) {
+	// 快照 2 个 server: exa(可用) + tavily(耗尽)。签发后快照只含 exa。
+	snapshot := RuntimeMCPSnapshot{Servers: []RuntimeMCPServer{
+		{ServerID: "exa", Name: "Exa", URL: "https://mcp.exa.ai/mcp", TimeoutSeconds: 30},
+		{ServerID: "tavily", Name: "Tavily", URL: "https://mcp.tavily.com/mcp/", TimeoutSeconds: 30},
+	}}
+	quota := &fakeQuotaSource{available: map[string]bool{"exa": true, "tavily": false}}
+
+	s := &scheduler{cfg: SchedulerConfig{
+		MCPServer:       quota,
+		TokenIssuer:     nil, // 不签发 token, 只验证过滤行为
+		MCPProxyBaseURL: "http://platform-proxy:8090",
+	}}
+	filtered := s.filterMCPServersByQuota(context.Background(), "42", snapshot)
+	if len(filtered.Servers) != 1 || filtered.Servers[0].ServerID != "exa" {
+		t.Fatalf("expected only exa after quota filter, got %+v", filtered.Servers)
+	}
+}

@@ -139,8 +139,6 @@ services:
       GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-genericagent-ga-runner:local}
       GA_MEMORY_TEMPLATE: ${GA_MEMORY_TEMPLATE:-/ga/memory-template}
       GA_SOPHUB_PROXY_ADDR: ${GA_SOPHUB_PROXY_ADDR:-http://platform:8082}
-      # MCP Gateway(stdio transport 托管): 空值 = 未部署, stdio server 不下发。
-      GA_MCP_GATEWAY_ADDR: ${GA_MCP_GATEWAY_ADDR:-http://mcp-gateway:8083}
       # round9 审查: task 去重唯一键依赖稳定 source_instance_id; 单实例部署
       # 固定该值, 重启后 Poller 重试的同一消息命中唯一键, 不产生重复任务。
       GA_PLATFORM_INSTANCE_ID: ${GA_PLATFORM_INSTANCE_ID:-platform-1}
@@ -359,57 +357,7 @@ services:
     stop_grace_period: 15s
     logging: *default-logging
 
-  # MCP Gateway: stdio/HTTP 统一 transport 网关(设计文档
-  # tenant_platform/docs/MCP_GATEWAY_DESIGN.zh-CN.md)。仅接入 database
-  # internal 网络(读白名单 + 接收 Platform 转发), 不接任何 egress 网络:
-  # stdio 子进程继承无网, uv/npm 依赖构建期预装。
-  mcp-gateway:
-    image: ${GA_MCP_GATEWAY_IMAGE:-genericagent-mcp-gateway:local}
-    build:
-      context: ../../..
-      dockerfile: tenant_platform/infra/compose/mcp-gateway.Dockerfile
-    restart: unless-stopped
-    init: true
-    user: "65534:65534"
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      GA_MCP_GATEWAY_LISTEN: ${GA_MCP_GATEWAY_LISTEN:-0.0.0.0:8083}
-      GA_MCP_GATEWAY_WORK_ROOT: ${GA_MCP_GATEWAY_WORK_ROOT:-/tmp/mcp-gateway}
-      GA_MCP_GATEWAY_IDLE_TTL: ${GA_MCP_GATEWAY_IDLE_TTL:-5m}
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=65534,gid=65534,mode=0700
-    networks:
-      - database
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/healthz', timeout=3).read()"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-    pids_limit: 128
-    mem_limit: 512m
-    cpus: 1.0
-    ulimits:
-      nofile:
-        soft: 4096
-        hard: 4096
-    stop_grace_period: 30s
-    logging: *default-logging
 
-  # ga-runner 镜像构建入口(方案 §8): scale: 0 使 `docker compose up -d --build`
-  # 构建镜像但不启动容器(审查: 单命令部署必须包含 Runner 镜像构建)。
-  # 容器实例由 Sandbox Manager 按工作区活跃状态动态创建。
-  # image 固定为构建产物名(与 Makefile 一致, genericagent-* 前缀), 与运行时
-  # 引用解耦: 运行时镜像由 GA_RUNNER_IMAGE 控制(digest 模式不会让 compose
-  # build 把 digest 当 tag——历史坑)。
   ga-runner:
     image: genericagent-ga-runner:local
     build:

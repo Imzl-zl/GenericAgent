@@ -127,10 +127,11 @@ export interface MCPServer {
   mcp_server_id: number;
   server_key: string;
   name: string;
-  /** transport=http 时为第三方地址; transport=stdio 时为空(gateway 路由由平台合成) */
   url: string | null;
   transport: 'http' | 'stdio';
-  /** stdio 专用: 镜像预装工具集白名单绝对路径 */
+  /** 平台侧持有的凭据头(proxy 注入); 回显掩码(值保留前 4 字符 + ***) */
+  headers: Record<string, string> | null;
+  /** stdio 遗留字段(已退役, 恒为空) */
   command: string | null;
   args: string[] | null;
   isolation: 'shared' | 'workspace';
@@ -140,6 +141,14 @@ export interface MCPServer {
   revision: number;
   created_at: string;
   updated_at: string;
+}
+
+/** 每用户 × 每 MCP server × 周期配额限额(无行 = 默认放行) */
+export interface MCPQuotaLimit {
+  owner_key: string;
+  server_id: string;
+  period: 'day' | 'month';
+  limit_count: number;
 }
 
 export interface LLMProvider {

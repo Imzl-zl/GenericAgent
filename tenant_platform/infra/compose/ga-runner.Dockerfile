@@ -37,7 +37,6 @@ RUN groupadd --system --gid 10002 ga-runner \
 #     需要额外 pdf-engine(默认 pdflatex 未装)。
 #   - fonts-noto-cjk: 中文渲染必需(weasyprint/LaTeX/LibreOffice 均依赖
 #     系统字体, 默认 DejaVu 无 CJK)。
-# 勿恢复 MCP pandoc: stdio server 与 runner 工作区文件系统隔离(2026-08-08)。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libreoffice-writer libreoffice-calc \

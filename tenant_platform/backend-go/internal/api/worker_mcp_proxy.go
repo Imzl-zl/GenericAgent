@@ -12,11 +12,11 @@ import (
 )
 
 // MCPTarget 是 proxy 解析出的上游目标。
-// URL 为空字符串表示不存在; ViaGateway 为 true 时请求发往 mcp-gateway
-// (stdio transport 托管), 必须携带内部 workspace 头用于隔离路由。
+// URL 为空字符串表示不存在; Headers 是平台侧持有的凭据头(Authorization/
+// x-api-key 等), proxy 转发时注入上游——worker 快照永不携带(EPIC D8')。
 type MCPTarget struct {
-	URL        string
-	ViaGateway bool
+	URL     string
+	Headers map[string]string
 }
 
 // WorkerMCPProxy 是 Runner 经 Platform 的受控 MCP 代理(Runner 仅 internal
@@ -26,62 +26,48 @@ type MCPTarget struct {
 //     MCP 表决定, 即白名单(管理员未启用的 server 一律 404);
 //   - 调用按 JTI 原子计量(预算耗尽 429, 无预算 fail-closed 拒绝);
 //   - 仅转发 JSON-RPC 流(Streamable HTTP), 不缓存/不解析内容;
-//   - http transport 直连第三方(仅转发 MCP 语义头, 身份头绝不外泄);
-//   - stdio transport 经 mcp-gateway(ViaGateway): URL 由平台合成
-//     (domain.MCPServerGatewayURL), 附加内部头 X-MCP-Workspace
-//     (capability 的 SessionKey), 该头只发往平台自有 gateway, 绝不外泄。
+//   - 转发时注入平台侧持有的凭据头(MCPTarget.Headers, 来自 mcp_servers.headers);
+//   - 配额强制: 每次调用按 owner(经 sessionKey 解析)对 day+month 周期原子
+//     扣减, 任一耗尽 → 429 MCP_QUOTA_EXCEEDED(quota 为 nil 时跳过, 仅测试)。
 //
-// 双 http.Client: 第三方直连保留 30s 响应头保护(挂死服务器快速失败);
-// gateway 路由放宽到 MCP 超时上限+缓冲(stdio 调用由 gateway 按
-// timeout_seconds 执行超时, 最长 300s, 此处不得截断)。
+// 单一 http.Client: 30s 响应头保护(挂死服务器快速失败; SSE 流式不受限)。
 type WorkerMCPProxy struct {
 	resolve  func(ctx context.Context, serverID string) (MCPTarget, bool, error)
 	validate func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error)
 	consume  func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error)
-	client   *http.Client // 第三方直连: 30s 响应头超时
-	gwClient *http.Client // mcp-gateway: 310s 响应头超时(> timeout_seconds 上限)
+	quota    func(ctx context.Context, sessionKey, serverID string) (bool, error)
+	client   *http.Client // 30s 响应头超时(挂死服务器快速失败)
 }
 
 // NewWorkerMCPProxy wires the proxy to the enabled-MCP resolver, token
-// validator and budget counter. consume 为 nil 时跳过计量(仅测试)。
+// validator, budget counter and quota consumer. consume/quota 为 nil 时
+// 跳过对应检查(仅测试)。
 func NewWorkerMCPProxy(
 	resolve func(ctx context.Context, serverID string) (MCPTarget, bool, error),
 	validate func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error),
 	consume func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error),
+	quota func(ctx context.Context, sessionKey, serverID string) (bool, error),
 ) *WorkerMCPProxy {
 	if resolve == nil || validate == nil {
 		return nil
 	}
-	newClient := func(responseHeaderTimeout time.Duration) *http.Client {
-		return &http.Client{
-			Transport: &http.Transport{
-				DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-				// 上游必须尽快开始响应; SSE 流式响应不受此限(头部到达即放行)。
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: responseHeaderTimeout,
-				IdleConnTimeout:       90 * time.Second,
-			},
-		}
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+			// 上游必须尽快开始响应; SSE 流式响应不受此限(头部到达即放行)。
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		},
 	}
 	return &WorkerMCPProxy{
 		resolve:  resolve,
 		validate: validate,
 		consume:  consume,
-		client:   newClient(30 * time.Second),
-		gwClient: newClient(domainMaxMCPTimeout + 10*time.Second),
+		quota:    quota,
+		client:   client,
 	}
 }
-
-// clientFor 按目标选择 http.Client(见类型注释的超时语义)。
-func (p *WorkerMCPProxy) clientFor(viaGateway bool) *http.Client {
-	if viaGateway {
-		return p.gwClient
-	}
-	return p.client
-}
-
-// domainMaxMCPTimeout 对齐 domain.MaxMCPTimeoutSeconds(300s)。
-const domainMaxMCPTimeout = 300 * time.Second
 
 // authenticate 校验 capability 并按 JTI 原子消费预算(审查 F10 同款 fail-closed)。
 func (p *WorkerMCPProxy) authenticate(w http.ResponseWriter, r *http.Request) (llmproxy.CapabilityClaims, int) {
@@ -129,10 +115,6 @@ func writeMCPAuthFailure(w http.ResponseWriter, status int, tid string) {
 	}
 }
 
-// mcpWorkspaceHeader 是 proxy → mcp-gateway 的内部头(capability SessionKey),
-// 供 gateway 做 workspace 隔离路由; 只发往平台自有 gateway, 绝不出平台。
-const mcpWorkspaceHeader = "X-MCP-Workspace"
-
 // hop-by-hop 头不转发(HTTP/1.1 语义, 代理侧自管连接)。
 var mcpProxyHopHeaders = map[string]struct{}{
 	"Connection":          {},
@@ -158,6 +140,20 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 	if serverID == "" {
 		writeErr(w, http.StatusBadRequest, "MCP_SERVER_ID_REQUIRED", "server_id is required", tid)
 		return
+	}
+	// 配额强制: 每次调用按 owner(经 sessionKey 解析)对 day+month 周期原子
+	// 扣减, 任一耗尽 → 429(D6/D7; quota nil = 仅测试跳过)。
+	if p.quota != nil {
+		allowed, err := p.quota(r.Context(), claims.Subject, serverID)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "mcp proxy: quota check failed", "server_id", serverID, "error", err)
+			writeErr(w, http.StatusServiceUnavailable, "MCP_QUOTA_UNAVAILABLE", "quota store unavailable", tid)
+			return
+		}
+		if !allowed {
+			writeErr(w, http.StatusTooManyRequests, "MCP_QUOTA_EXCEEDED", "user MCP quota exceeded for this period", tid)
+			return
+		}
 	}
 	target, ok, err := p.resolve(r.Context(), serverID)
 	if err != nil {
@@ -189,19 +185,17 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	upstream.Header.Del("Authorization")
-	// stdio transport 经平台自有 mcp-gateway 路由: 附加内部 workspace 头
-	// (来自 capability Subject=session_key)供 gateway 做隔离路由。该头只发往
-	// gateway——平台自有服务, 不是第三方 MCP Server。
-	if target.ViaGateway {
-		if workspace := strings.TrimSpace(claims.Subject); workspace != "" {
-			upstream.Header.Set(mcpWorkspaceHeader, workspace)
-		}
+	// 平台侧持有的凭据头注入(D8'): 管理员配置的 headers(Authorization/
+	// x-api-key 等)由 proxy 附加——worker 快照不含, 第三方只见凭据不见来源。
+	for key, value := range target.Headers {
+		upstream.Header.Set(key, value)
 	}
 
-	resp, err := p.clientFor(target.ViaGateway).Do(upstream)
+	resp, err := p.client.Do(upstream)
 	if err != nil {
+		// 日志脱敏: 打 server_id 不打完整 URL(url 可能含 query 凭据)。
 		slog.WarnContext(r.Context(), "mcp proxy: upstream request failed",
-			"server_id", serverID, "url", upstreamURL, "error", err)
+			"server_id", serverID, "error", err)
 		writeErr(w, http.StatusBadGateway, "MCP_UPSTREAM_ERROR", "MCP server unreachable", tid)
 		return
 	}
