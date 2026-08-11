@@ -9,7 +9,8 @@
 - 集成测试依赖真实 PostgreSQL（`TEST_DATABASE_URL`），缺失显式失败
 - **IM 多渠道完成（2026-08-10，im-channel-binding epic 6/6 DONE）**：渠道配置统一模型（channel_configs）+ 飞书/钉钉/QQ 接入（poller BotAdapter 注册表）+ im-bindings API + Web 渠道绑定页
 - **IM 流式输出完成（2026-08-10，im-streaming-delivery epic 7/7 DONE）**：StreamingSender 可选接口 + scheduler 500ms 节流转发管道 + 飞书消息编辑打字机 + QQ 单聊原生流式 + 群聊收敛（只发最终结果）+ im_streaming_mode 管理开关；真实渠道冒烟待用户凭据
-- 最后更新：2026-08-10
+- **企微渠道完成（2026-08-11，commit 3023e3d2）**：WeComAdapter（wecom_aibot_sdk WS）+ 渠道绑定页企业微信卡片 + 流式判定矩阵 + delivery 回复路由（审查 C1 修复）；真实渠道冒烟待用户凭据，流式模式建议保持 off/final_only
+- 最后更新：2026-08-11
 
 ## 已完成能力
 
@@ -17,18 +18,20 @@
 - 多前端：TUI（tui_v3）、Streamlit、桌面端、IM 机器人（TG/QQ/飞书/微信/企微/钉钉）、conductor
 - 租户平台：Go 后端（api/application/domain/infrastructure 分层）+ gRPC Python worker + React/Vite Web + bot poller + 契约（proto/openapi/policy）
 - IM 多渠道（2026-08-10）：对话单元分桶（workspace 共享 + 每群/私聊一桶 + /new 桶级化）+ 渠道绑定（微信扫码 + 飞书/钉钉/QQ 凭据表单，凭据 JSON 加密入库）
+- 企微渠道（2026-08-11）：WeComAdapter（wecom_aibot_sdk WebSocket，线程内自管 asyncio loop；入站 chatid/userid 映射——单聊 chatid==userid 判 private，空 sender 保守归群；出站 SEND_MSG markdown 承载纯文本；流式 SEND_MSG+stream 帧）+ 注册表接线 + Web 卡片（Bot ID/Bot Secret 标签，secretLabel 泛化）+ OpenAPI/文档同步
 - IM 流式输出（2026-08-10）：worker Chunk → scheduler 500ms 节流合并 → StreamingSender（飞书=占位消息+PUT 编辑打字机 / QQ 单聊=原生 stream{state,id,index,reset} 帧 / 钉钉微信=仅终态）；群聊统一只发最终结果（conversation_type 判定）；stream_final_at 抑制 delivery 文本重复（文件照发）；im_streaming_mode 管理开关（默认 streaming）
 - sandbox-runner 重构（Round13）：生命周期不变量结构强制、沙箱安全加固、Foundation 垂直 E2E
 
 ## 进行中 / 未完成
 
-- im-channel-binding epic 仅剩**真实渠道冒烟**（需用户提供飞书/钉钉/QQ 应用凭据）
+- im-channel-binding epic 仅剩**真实渠道冒烟**（需用户提供飞书/钉钉/QQ/企微应用凭据；企微重点=SEND_MSG 主动流式帧是否被服务端接受）
 - im-streaming-delivery epic 仅剩**真实渠道冒烟**（需用户提供凭据；重点=飞书编辑链路 + QQ 流式帧序列参数实测）
 - 有意遗留（不产生功能缺陷，已评估）：C5 delivery_service 834 行未拆（纯结构债）；bundle 多文件 SOP 平台侧不支持（sophub 平台已上线 bundle，平台 proxy 有意收窄为 single-file，若需用要加支持）
 - 残余验证（需真实 Linux 主机 + Docker/runsc）：runsc 运行时、mTLS 注入、六服务 compose 冒烟、共享卷跨 UID
 
 ## 关键决策（仍有效）
 
+- **2026-08-11（企微渠道定案，已落地）**：接入形态 = 企业微信智能机器人（wecom_aibot_sdk WebSocket 长连接，与飞书/钉钉/QQ 同模式，无公网回调地址）；凭据 bot_id/secret **复用 app_id/app_secret 存储槽位**（契约字段不变，Web 标签与前端必填文案随渠道泛化）；conversation_type = chatid==userid 判 private（空 sender 保守归群）；出站统一 SEND_MSG（文本用 markdown 承载——SDK 主动发送无 text 类型，被动 reply_stream 依赖入站 req_id 不适合异步 delivery）；流式 = SEND_MSG+stream 帧（协议层与被动 reply_stream 同格式，**待真实凭据实测，未通过前 im_streaming_mode 建议 off/final_only**）；新渠道加入必须同步：Go IsValidChannelType/IsValidSource/channelTypeForTaskSource/StreamForwarder 矩阵 + poller VALID_CHANNEL_TYPES/工厂 + OpenAPI 枚举 + Web ChannelType/卡片
 - CI 门禁分支/PR 级矩阵；集成测试必须真实 Postgres（`-p 1` 串行化规避 flaky）
 - 生命周期不变量以结构强制（文件拆分）；跨语言契约（proto/openapi）为单一真值源
 - 身份模型只有一类主体——用户（Bearer）；AdminToken（`PLATFORM_ADMIN_TOKEN`）仅管理面 + `/v1/router/messages` 服务入口
@@ -50,6 +53,7 @@
 - **git checkout 单文件会丢失未提交修改**——回滚前确认工作区版本是否含未提交变更
 - 契约测试 `test_route_contract.py` 拦截后端新增路由未同步 OpenAPI；KNOWN_SPEC_GAPS 已清空，新增路由必须进 spec
 - **表改名迁移坑（2026-08-10 新增）**：0003 的 marker 就是 bots 表本身——0053 RENAME 后必须重建仅作 marker 的 stub `bots` 表（否则 0003 被重放重建空表）；RENAME/列改名/约束改名无 IF NOT EXISTS，用 DO 块条件执行（0052 先例）
+- **新渠道回复路由坑（2026-08-11，审查 C1）**：`delivery_service.channelTypeForTaskSource` 是独立的 source→channel 映射——加渠道枚举/白名单/流式矩阵后**必须同步它**，漏掉会导致任务回复错投微信（跨渠道泄漏）或死信；独立审查子代理抓到的，自己验证矩阵全绿仍漏此路径（测试只覆盖 Enabled() 未覆盖 openReply/delivery 解析）
 - **poller BotManager.start 构造必须在锁外**（2026-08-10）：WeChatAdapter 构造回调 coalesce_window_provider → 同一非重入锁死锁
 - **凭据 upsert 前捕获旧配置**（2026-08-10）：ON CONFLICT DO UPDATE 覆盖 bot_uuid 后无法再取旧 UUID 停 poller 会话
 - **微信绑定坑（2026-08-08）**：① `ILINK_BASE_URL` 为空时现路由已无条件注册返回 `501 FEATURE_DISABLED`；② iLink get_qrcode_status 是长轮询——status 请求每尝试 8s 封顶且超时不重试，PollStatus 超时返回 DB 最近状态（200 wait）
@@ -70,6 +74,7 @@
 
 ## 最近活跃窗口
 
+- 2026-08-11：**企微渠道全链路落地（3023e3d2）**：WeComAdapter + 注册表 + Web 卡片 + OpenAPI/文档；独立审查抓 C1（channelTypeForTaskSource 缺 wecom 分支→回复错投微信）已修+delivery 路由测试（fake resolver 按 channel_type 匹配真实 store 语义）；M2-M5 小修（前端校验文案/空 sender 归群/首帧占位/失败清理）；poller 52 用例 + Go TDD 全绿；已提交推送 origin/main；残余：真实凭据冒烟（SEND_MSG 流式帧验证）
 - 2026-08-10：**im-streaming-delivery 全部落地**（7/7 DONE）：StreamingSender/StreamReply 接口 + StreamForwarder（500ms 节流合并 + open/append/commit/abort）+ scheduler 接入（Terminal commit + 失败 abort + 群聊收敛）+ 飞书编辑打字机 + QQ 单聊原生流式 + im_streaming_mode 开关 + Web 设置项；migration 0054（conversation_type + stream_final_at + text_value）；全量验证绿（存量失败 4 处与本次无关）；真实渠道冒烟待用户凭据
 - 2026-08-10：**im-channel-binding 全部落地**（6/6 DONE）：migration 0053（bots→channel_configs）+ domain.Bot→ChannelConfig 全库改名 + im-bindings API（user+admin）+ Router 多渠道分桶（Source/ConversationKey）+ poller BotAdapter 注册表（飞书/钉钉/QQ adapter）+ Web 渠道绑定页；契约字段 ilink_user_id→channel_account_id（B3 命名债已清）；全量验证绿（存量失败 4 处与本次无关，base commit 复现）；真实渠道冒烟待用户凭据
 - 2026-08-10：IM 多渠道架构落地（3 批提交）：契约 conversation_id + Go 分桶全链路 + /new 桶级化；epic im-channel-session 任务 1-5 DONE、任务 6 砍掉
