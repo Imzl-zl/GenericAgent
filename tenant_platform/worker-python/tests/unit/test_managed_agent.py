@@ -1506,6 +1506,8 @@ def test_kill_all_code_run_processes_kills_registered_groups(roots, monkeypatch)
     ga = _import_overlay_ga(roots)
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr(ga.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)), raising=False)
+    # 安全: mock 掉 /proc 兕底清理, 防止测试在宿主机上误杀系统进程
+    monkeypatch.setattr(ga, "_kill_other_processes", lambda: None, raising=False)
 
     ga._code_run_pgids = {11, 22}
     ga.kill_all_code_run_processes()
@@ -1726,6 +1728,8 @@ def test_kill_all_kills_pgid_even_when_leader_exited(roots, monkeypatch):
     ga = _import_overlay_ga(roots)
     killed: list[int] = []
     monkeypatch.setattr(ga.os, "killpg", lambda pgid, sig: killed.append(pgid), raising=False)
+    # 安全: mock 掉 /proc 兕底清理, 防止测试在宿主机上误杀系统进程
+    monkeypatch.setattr(ga, "_kill_other_processes", lambda: None, raising=False)
 
     ga._code_run_pgids = {501, 502}
     ga.kill_all_code_run_processes()
@@ -1807,13 +1811,23 @@ def test_checkpoint_trims_live_history_on_reuse(roots, foundation_registry, tmp_
 def test_kill_all_kills_setsid_escaped_process(roots, monkeypatch):
     """round9 审查(C3): 任务代码用 setsid 创建新会话后, 登记 PGID 无法覆盖;
     /proc 枚举兜底必须杀掉逃逸进程(容器 PID namespace 内)。Linux 专属——
-    该测试在真实 Linux 容器中验证逃逸进程被 SIGKILL, Windows 跳过。"""
+    该测试在真实 Linux 容器中验证逃逸进程被 SIGKILL, Windows 跳过。
+
+    安全阀(2026-08-11 生产事故修复): /proc 兕底清理仅在独立 PID namespace
+    (容器)内有效; 宿主机上枚举 /proc 会看到系统全部进程, 直接执行会误杀
+    同用户的所有进程(user manager/tmux 等)。宿主机环境跳过本测试。"""
     import platform
     import subprocess
     import sys
 
     if platform.system() != "Linux":
         pytest.skip("Linux-only: verifies /proc sweep semantics")
+    try:
+        in_container = os.stat('/proc/self/ns/pid').st_ino != os.stat('/proc/1/ns/pid').st_ino
+    except OSError:
+        in_container = False
+    if not in_container:
+        pytest.skip("container-only: /proc sweep must never run on the host")
     ga = _import_overlay_ga(roots)
     # 以新会话启动一个长时间存活的后台进程(setsid 语义)。
     proc = subprocess.Popen(

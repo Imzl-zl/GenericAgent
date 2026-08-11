@@ -101,6 +101,18 @@ def kill_all_code_run_processes() -> bool:
     return False
 
 
+def _in_isolated_pid_namespace() -> bool:
+    """仅当运行在独立 PID namespace(容器)内才允许 /proc 兜底清理。
+
+    宿主环境与 PID 1 共享 namespace, 枚举 /proc 会看到系统全部进程——
+    "杀所有其他进程"会误杀宿主机上同用户的全部进程(如 user manager/tmux)。
+    """
+    try:
+        return os.stat('/proc/self/ns/pid').st_ino != os.stat('/proc/1/ns/pid').st_ino
+    except (OSError, ValueError):
+        return False
+
+
 def _other_process_pids() -> list:
     """返回容器 PID namespace 内非自身、非自身线程、非僵尸的进程。
 
@@ -110,8 +122,13 @@ def _other_process_pids() -> list:
     进程(subreaper)收养。按 /proc/<pid>/status 的 Tgid 字段排除自身进程与
     自身线程; 跳过僵尸(State=Z, 已死不执行代码, 由 subreaper 回收, 不影响
     跨任务隔离)。非 POSIX(Windows)无 /proc 语义, 返回空列表。
+
+    安全阀: 仅当处于独立 PID namespace(容器)时才枚举; 宿主机上直接返回
+    空列表, 避免误杀系统进程(2026-08-11 生产事故修复)。
     """
     if os.name == 'nt':
+        return []
+    if not _in_isolated_pid_namespace():
         return []
     try:
         import glob
