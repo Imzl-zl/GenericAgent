@@ -10,6 +10,7 @@
 - **IM 多渠道完成（2026-08-10，im-channel-binding epic 6/6 DONE）**：渠道配置统一模型（channel_configs）+ 飞书/钉钉/QQ 接入（poller BotAdapter 注册表）+ im-bindings API + Web 渠道绑定页
 - **IM 流式输出完成（2026-08-10，im-streaming-delivery epic 7/7 DONE）**：StreamingSender 可选接口 + scheduler 500ms 节流转发管道 + 飞书消息编辑打字机 + QQ 单聊原生流式 + 群聊收敛（只发最终结果）+ im_streaming_mode 管理开关；真实渠道冒烟待用户凭据
 - **企微渠道完成（2026-08-11，commit 3023e3d2）**：WeComAdapter（wecom_aibot_sdk WS）+ 渠道绑定页企业微信卡片 + 流式判定矩阵 + delivery 回复路由（审查 C1 修复）；真实渠道冒烟待用户凭据，流式模式建议保持 off/final_only
+- **MCP 治理完成（2026-08-11，commit 58b27620）**：key 平台侧注入（mcp_servers.headers，proxy 转发注入，worker 快照永不含 key）+ 每用户×每 server×周期配额（proxy 原子扣减 429）+ **mcp-gateway 退役**（stdio transport 整体移除，pandoc 本地化后无业务用途）+ web JSON 直接编辑 + 用户配额面板；集成测试修复（_register_user 冗余直插 workspace，0050 不变量遗留）
 - 最后更新：2026-08-11
 
 ## 已完成能力
@@ -21,6 +22,7 @@
 - 企微渠道（2026-08-11）：WeComAdapter（wecom_aibot_sdk WebSocket，线程内自管 asyncio loop；入站 chatid/userid 映射——单聊 chatid==userid 判 private，空 sender 保守归群；出站 SEND_MSG markdown 承载纯文本；流式 SEND_MSG+stream 帧）+ 注册表接线 + Web 卡片（Bot ID/Bot Secret 标签，secretLabel 泛化）+ OpenAPI/文档同步
 - IM 流式输出（2026-08-10）：worker Chunk → scheduler 500ms 节流合并 → StreamingSender（飞书=占位消息+PUT 编辑打字机 / QQ 单聊=原生 stream{state,id,index,reset} 帧 / 钉钉微信=仅终态）；群聊统一只发最终结果（conversation_type 判定）；stream_final_at 抑制 delivery 文本重复（文件照发）；im_streaming_mode 管理开关（默认 streaming）
 - sandbox-runner 重构（Round13）：生命周期不变量结构强制、沙箱安全加固、Foundation 垂直 E2E
+- MCP 治理（2026-08-11）：管理员 web 端 mcp.json 风格 JSON 直接编辑（url+headers+timeout，headers 掩码回显/更新保留原 key）；key 平台侧持有（proxy 注入，快照不含 key，日志脱敏）；每用户配额（day/month 原子扣减，无配额行默认放行，调度粗过滤+proxy 精确强制）；stdio transport 与 mcp-gateway 已移除（http 唯一 transport）
 
 ## 进行中 / 未完成
 
@@ -30,6 +32,8 @@
 - 残余验证（需真实 Linux 主机 + Docker/runsc）：runsc 运行时、mTLS 注入、六服务 compose 冒烟、共享卷跨 UID
 
 ## 关键决策（仍有效）
+
+- **2026-08-11（MCP 治理定案，已落地）**：MCP 配置 = mcp.json 风格 JSON 直接编辑（web 端），存储保留 DB（mcp_servers.headers，无独立 key 字段）；key 平台侧持有（proxy 注入，admin API 掩码回显，更新掩码值保留原 key）；配额 = 每用户 × 每 server × 周期（day/month），proxy 每次调用原子扣减（429 MCP_QUOTA_EXCEEDED），调度层按用户粗过滤耗尽 server；stdio 分发（将来如需）= npx/uvx 共享缓存卷 + 版本固定；pandoc 保持镜像预装 CLI 直调（不启用 MCP 协议）；PDF 引擎保持 pandoc→docx→LibreOffice 渲染式（不引 TeX Live）。设计真值：`.tasks/mcp-governance/` + `tenant_platform/docs/MCP_GATEWAY_DESIGN.zh-CN.md`（已标注退役）
 
 - **2026-08-11（企微渠道定案，已落地）**：接入形态 = 企业微信智能机器人（wecom_aibot_sdk WebSocket 长连接，与飞书/钉钉/QQ 同模式，无公网回调地址）；凭据 bot_id/secret **复用 app_id/app_secret 存储槽位**（契约字段不变，Web 标签与前端必填文案随渠道泛化）；conversation_type = chatid==userid 判 private（空 sender 保守归群）；出站统一 SEND_MSG（文本用 markdown 承载——SDK 主动发送无 text 类型，被动 reply_stream 依赖入站 req_id 不适合异步 delivery）；流式 = SEND_MSG+stream 帧（协议层与被动 reply_stream 同格式，**待真实凭据实测，未通过前 im_streaming_mode 建议 off/final_only**）；新渠道加入必须同步：Go IsValidChannelType/IsValidSource/channelTypeForTaskSource/StreamForwarder 矩阵 + poller VALID_CHANNEL_TYPES/工厂 + OpenAPI 枚举 + Web ChannelType/卡片
 - CI 门禁分支/PR 级矩阵；集成测试必须真实 Postgres（`-p 1` 串行化规避 flaky）
@@ -53,6 +57,8 @@
 - **git checkout 单文件会丢失未提交修改**——回滚前确认工作区版本是否含未提交变更
 - 契约测试 `test_route_contract.py` 拦截后端新增路由未同步 OpenAPI；KNOWN_SPEC_GAPS 已清空，新增路由必须进 spec
 - **表改名迁移坑（2026-08-10 新增）**：0003 的 marker 就是 bots 表本身——0053 RENAME 后必须重建仅作 marker 的 stub `bots` 表（否则 0003 被重放重建空表）；RENAME/列改名/约束改名无 IF NOT EXISTS，用 DO 块条件执行（0052 先例）
+- **集成测试勿直插 workspace（2026-08-11 新增）**：注册路径已同事务自动创建 personal workspace（0050 生命周期不变量：users ⇔ personal:<uid> 行）——测试直插 `INSERT INTO workspaces ... personal:{uid}` 必唯一键冲突；需要时用 `ON CONFLICT (session_key) DO NOTHING` 幂等兑底
+- **Docker Desktop 容器内进程会被 SIGKILL（2026-08-11 实证）**：Windows Docker Desktop 下容器主进程/exec 跑长任务（pytest+go build）反复 `7 Killed`（非 OOM，MemAvailable 充足）；docker 只适合短命令验证（如基线复现），长跑集成测试用 Windows 本地
 - **新渠道回复路由坑（2026-08-11，审查 C1）**：`delivery_service.channelTypeForTaskSource` 是独立的 source→channel 映射——加渠道枚举/白名单/流式矩阵后**必须同步它**，漏掉会导致任务回复错投微信（跨渠道泄漏）或死信；独立审查子代理抓到的，自己验证矩阵全绿仍漏此路径（测试只覆盖 Enabled() 未覆盖 openReply/delivery 解析）
 - **poller BotManager.start 构造必须在锁外**（2026-08-10）：WeChatAdapter 构造回调 coalesce_window_provider → 同一非重入锁死锁
 - **凭据 upsert 前捕获旧配置**（2026-08-10）：ON CONFLICT DO UPDATE 覆盖 bot_uuid 后无法再取旧 UUID 停 poller 会话

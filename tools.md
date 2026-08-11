@@ -22,6 +22,7 @@
 
 定向验证：
 - 集成测试前先设 `TEST_DATABASE_URL`（真实 PostgreSQL）；缺失时集成测试显式失败
+- 集成测试直插 workspace 必须幂等（`ON CONFLICT (session_key) DO NOTHING`）——注册路径已自动建行（0050 不变量）；`_register_user` 先例
 - 契约绑定测试：`tenant_platform/tests/contract`（import worker-python 生成代码，需 protobuf/grpcio）
 - 安全测试：`tenant_platform/tests/security`（子进程调用 go test 验证 Worker 无真实密钥）
 - 本地安装根包：`pip install -e .`（按需 `pip install -e '.[ui]'` 或 `.[all-frontends]`）
