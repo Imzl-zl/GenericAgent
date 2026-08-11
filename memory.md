@@ -11,7 +11,7 @@
 - **IM 流式输出完成（2026-08-10，im-streaming-delivery epic 7/7 DONE）**：StreamingSender 可选接口 + scheduler 500ms 节流转发管道 + 飞书消息编辑打字机 + QQ 单聊原生流式 + 群聊收敛（只发最终结果）+ im_streaming_mode 管理开关；真实渠道冒烟待用户凭据
 - **企微渠道完成（2026-08-11，commit 3023e3d2）**：WeComAdapter（wecom_aibot_sdk WS）+ 渠道绑定页企业微信卡片 + 流式判定矩阵 + delivery 回复路由（审查 C1 修复）；真实渠道冒烟待用户凭据，流式模式建议保持 off/final_only
 - **MCP 治理完成（2026-08-11，commit 58b27620）**：key 平台侧注入（mcp_servers.headers，proxy 转发注入，worker 快照永不含 key）+ 每用户×每 server×周期配额（proxy 原子扣减 429）+ **mcp-gateway 退役**（stdio transport 整体移除，pandoc 本地化后无业务用途）+ web JSON 直接编辑 + 用户配额面板；集成测试修复（_register_user 冗余直插 workspace，0050 不变量遗留）
-- 最后更新：2026-08-11
+- 最后更新：2026-08-11（CI Python 矩阵盲区审查修复 92c37af）
 
 ## 已完成能力
 
@@ -51,6 +51,8 @@
 ## 仍需注意的坑点
 
 - Python 3.14 与 pywebview 不兼容，用 3.11/3.12
+- **测试硬编码平台命令/路径（2026-08-11 新增）**：`_list_python_pids` 曾硬编码 Windows tasklist 导致 Linux CI E2E 必失败（已加 /proc 分支）；`/media` 等宿主根目录在测试中无写权限，用 tmp_path
+- **CI Python job 前置步骤失败会跳过 Worker/bot_poller/E2E（2026-08-11 新增）**：contract/smoke 失败时后续步骤全 skip，worker 断言过期可长期未被发现——本地需手动补跑 `pytest tenant_platform/worker-python -q` 与 bot_poller；bot_poller QQ 流式测试硬依赖 qq-botpy（CI 已补装）
 - runsc/mTLS/真实 Docker 验证只能在 Linux 主机
 - **`postgres.OpenTestPool` 有全局互斥锁，同一测试内二次调用死锁**——测试数据直插用 pgx 单连接
 - **openapi platform.yaml 不要用 yaml.safe_dump 重写**——会丢全部中文注释并破坏 test_contract_sources 的文本格式断言；补路径用文本插入
