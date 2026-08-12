@@ -52,8 +52,11 @@ RUN curl -fsSL -o /tmp/pandoc.tar.gz \
 # uv; 预装命令型(如 serena)用 pip 即可。固定版本 + sha256 校验(镜像层固定
 # digest 精神)。npx/uvx/pip 缓存目录由 sandbox-manager 运行时注入到共享卷
 # (GA_PKG_CACHE_VOLUME, 全租户复用一份)。
-# node 20 LTS: 官方二进制(apt bookworm 只有 18.x)。
-RUN curl -fsSL -o /tmp/node.tar.xz \
+# node 20 LTS: 官方二进制(apt bookworm 只有 18.x)。官方仅发布 .tar.xz,
+# slim 镜像无 xz 解压器, 先装 xz-utils(真实构建验证 2026-08-12)。
+RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL -o /tmp/node.tar.xz \
         https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.xz \
     && echo "df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d  /tmp/node.tar.xz" | sha256sum -c - \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \

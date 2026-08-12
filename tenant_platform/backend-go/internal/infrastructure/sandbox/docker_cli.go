@@ -257,12 +257,15 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 	)
 	// 共享包缓存卷(stdio MCP 的 npx/uv/pip 缓存, 全租户复用): 挂载 + 缓存
 	// 目录 env 固定指向卷内子目录。卷名来自部署配置(GA_PKG_CACHE_VOLUME),
-	// 空 = 不挂(裸机/无 stdio 需求部署)。
+	// 空 = 不挂(裸机/无 stdio 需求部署)。UV_TOOL_DIR 一并指入共享卷:
+	// runner 容器 read_only + 无 HOME, uvx 默认装工具到 ~/.local/share/uv
+	// 会 Permission denied(真实容器验证 2026-08-12)。
 	if d.cfg.PkgCacheVolume != "" {
 		args = append(args,
 			"--mount", "type=volume,source="+d.cfg.PkgCacheVolume+",destination="+PkgCacheMount,
 			"--env", "NPM_CONFIG_CACHE="+PkgCacheMount+"/npm",
 			"--env", "UV_CACHE_DIR="+PkgCacheMount+"/uv",
+			"--env", "UV_TOOL_DIR="+PkgCacheMount+"/uv-tools",
 			"--env", "PIP_CACHE_DIR="+PkgCacheMount+"/pip",
 		)
 	}
