@@ -1026,12 +1026,31 @@ func run() error {
 			}
 			// 配额强制闭包(D6/D7): sessionKey → owner(workspaces.owner_user_id),
 			// 对 day+month 周期原子扣减; 任一耗尽 → 429 MCP_QUOTA_EXCEEDED。
-			quota := func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			// 配额两阶段闭包(审查 Y5 二轮): sessionKey → owner
+			// (workspaces.owner_user_id)。quotaCheck = 只读预检(MCPQuotaAvailable,
+			// 不扣减, 先于 JTI 消费); quotaConsume = 条件扣减
+			// (ConsumeMCPQuotas, 在 JTI 消费之后)——任一拒绝路径都不产生
+			// 扣减副作用。任一耗尽 → 429 MCP_QUOTA_EXCEEDED。
+			quotaOwner := func(ctx context.Context, sessionKey string) (string, error) {
 				owner, err := store.GetWorkspaceOwner(ctx, sessionKey)
+				if err != nil {
+					return "", err
+				}
+				return strconv.FormatInt(owner, 10), nil
+			}
+			quotaCheck := func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+				owner, err := quotaOwner(ctx, sessionKey)
 				if err != nil {
 					return false, err
 				}
-				return store.ConsumeMCPQuotas(ctx, strconv.FormatInt(owner, 10), serverID)
+				return store.MCPQuotaAvailable(ctx, owner, serverID)
+			}
+			quotaConsume := func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+				owner, err := quotaOwner(ctx, sessionKey)
+				if err != nil {
+					return false, err
+				}
+				return store.ConsumeMCPQuotas(ctx, owner, serverID)
 			}
 			return api.NewWorkerMCPProxy(
 				resolve,
@@ -1039,7 +1058,8 @@ func run() error {
 					return mcpValidator.Validate(ctx, token)
 				},
 				store.ConsumeCapabilityCall, // MCP 调用按 JTI 原子计量(同审查 F10)
-				quota,                       // 每用户周期配额(无限额行自动放行)
+				quotaCheck,                  // 配额只读预检(先于 JTI 消费, 拒绝不扣)
+				quotaConsume,                // 配额条件扣减(在 JTI 消费之后)
 			)
 		}(),
 		LLMProviders: store, // admin LLM provider management (migration 0007)

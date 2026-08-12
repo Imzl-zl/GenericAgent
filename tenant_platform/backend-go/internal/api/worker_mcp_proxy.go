@@ -38,18 +38,24 @@ type WorkerMCPProxy struct {
 	resolve  func(ctx context.Context, serverID string) (MCPTarget, bool, error)
 	validate func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error)
 	consume  func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error)
-	quota    func(ctx context.Context, sessionKey, serverID string) (bool, error)
-	client   *http.Client // 30s 响应头超时(挂死服务器快速失败)
+	// quotaCheck 是配额只读预检(MCPQuotaAvailable, 不扣减); quotaConsume
+	// 是配额条件扣减(ConsumeMCPQuotas)。两阶段分离(审查 Y5 二轮): 预检
+	// 在 JTI 消费之前, 扣减在 JTI 消费之后——任一拒绝路径都不产生任何
+	// 扣减副作用(仅极端竞态下 JTI 可能白扣一次, 短期预算可接受)。
+	quotaCheck  func(ctx context.Context, sessionKey, serverID string) (bool, error)
+	quotaConsume func(ctx context.Context, sessionKey, serverID string) (bool, error)
+	client      *http.Client // 30s 响应头超时(挂死服务器快速失败)
 }
 
 // NewWorkerMCPProxy wires the proxy to the enabled-MCP resolver, token
-// validator, budget counter and quota consumer. consume/quota 为 nil 时
-// 跳过对应检查(仅测试)。
+// validator, budget counter, quota pre-check and quota consumer.
+// consume/quotaCheck/quotaConsume 为 nil 时跳过对应检查(仅测试)。
 func NewWorkerMCPProxy(
 	resolve func(ctx context.Context, serverID string) (MCPTarget, bool, error),
 	validate func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error),
 	consume func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error),
-	quota func(ctx context.Context, sessionKey, serverID string) (bool, error),
+	quotaCheck func(ctx context.Context, sessionKey, serverID string) (bool, error),
+	quotaConsume func(ctx context.Context, sessionKey, serverID string) (bool, error),
 ) *WorkerMCPProxy {
 	if resolve == nil || validate == nil {
 		return nil
@@ -64,11 +70,12 @@ func NewWorkerMCPProxy(
 		},
 	}
 	return &WorkerMCPProxy{
-		resolve:  resolve,
-		validate: validate,
-		consume:  consume,
-		quota:    quota,
-		client:   client,
+		resolve:      resolve,
+		validate:     validate,
+		consume:      consume,
+		quotaCheck:   quotaCheck,
+		quotaConsume: quotaConsume,
+		client:       client,
 	}
 }
 
@@ -170,12 +177,12 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 配额强制: 每次调用按 owner(经 sessionKey 解析)对 day+month 周期原子
-	// 扣减, 任一耗尽 → 429(D6/D7; quota nil = 仅测试跳过)。
-	// 审查 Y1: 扣减必须发生在 resolve 白名单校验之后——对不存在/未启用
-	// server 的调用不得消耗用户配额(否则 404/拼错 key 会烧掉配额)。
-	if p.quota != nil {
-		allowed, err := p.quota(r.Context(), claims.Subject, serverID)
+	// 配额强制(审查 Y5 二轮): 只读预检先于 JTI 消费——预检拒绝(429)不产生
+	// 任何扣减; 条件扣减在 JTI 消费之后——JTI 拒绝(429/403/503)时配额未扣。
+	// 两阶段分离保证任一拒绝路径都无扣减副作用(quotaCheck/quotaConsume
+	// 为 nil 时跳过, 仅测试)。
+	if p.quotaCheck != nil {
+		allowed, err := p.quotaCheck(r.Context(), claims.Subject, serverID)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "mcp proxy: quota check failed", "server_id", serverID, "error", err)
 			writeErr(w, http.StatusServiceUnavailable, "MCP_QUOTA_UNAVAILABLE", "quota store unavailable", tid)
@@ -187,11 +194,26 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 调用即将发起: 消费 JTI 预算(审查 Y5——配额 429 与 404 路径不消费,
+	// 调用即将发起: 消费 JTI 预算(审查 Y5——404/配额 429 路径不消费,
 	// 上游调用失败 502 视为已发起, 消费)。
 	if status := p.consumeBudget(r, claims); status != 0 {
 		writeMCPAuthFailure(w, status, tid)
 		return
+	}
+
+	// 配额条件扣减(预检已通过, 仅极端并发竞态下可能在此耗尽——此时
+	// JTI 已消费一次, 属可接受的短期预算白扣; 用户配额从不错扣)。
+	if p.quotaConsume != nil {
+		allowed, err := p.quotaConsume(r.Context(), claims.Subject, serverID)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "mcp proxy: quota consume failed", "server_id", serverID, "error", err)
+			writeErr(w, http.StatusServiceUnavailable, "MCP_QUOTA_UNAVAILABLE", "quota store unavailable", tid)
+			return
+		}
+		if !allowed {
+			writeErr(w, http.StatusTooManyRequests, "MCP_QUOTA_EXCEEDED", "user MCP quota exceeded for this period", tid)
+			return
+		}
 	}
 
 	upstream, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, r.Body)

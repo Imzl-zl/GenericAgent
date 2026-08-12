@@ -411,7 +411,9 @@ FOR UPDATE`, ownerKey, serverID).Scan(&used)
 			}
 		}
 		// 3. 全部未耗尽 → 两个周期各 +1(仅限有限额行的周期; 限额行已加锁,
-		//    并发下不可能在此处耗尽, ErrNoRows 仅防御)。
+		//    并发下不可能在此处耗尽, ErrNoRows 仅防御)。防御触发必须返回
+		//    error 触发回滚——返回 nil 会提交事务, 已扣周期生效造成部分扣减
+		//    (审查二轮: 原防御分支 return nil 语义错误)。
 		for period, limit := range limits {
 			var used int64
 			err := tx.QueryRow(ctx, `
@@ -424,7 +426,7 @@ WHERE mcp_quota_usage.used_count < $3
 RETURNING used_count
 `, ownerKey, serverID, limit).Scan(&used)
 			if errors.Is(err, pgx.ErrNoRows) {
-				return nil // 防御: 已耗尽, 整体拒绝
+				return fmt.Errorf("quota %s consumed concurrently (limit %d): %w", period, limit, err)
 			}
 			if err != nil {
 				return err

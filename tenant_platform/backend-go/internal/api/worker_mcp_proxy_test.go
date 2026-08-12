@@ -41,7 +41,8 @@ func newTestMCPProxy() *WorkerMCPProxy {
 			}, nil
 		},
 		nil, // consume: nil = 跳过计量(现有测试保持语义)
-		nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quotaCheck: nil = 跳过配额预检(现有测试语义)
+		nil, // quotaConsume: nil = 跳过配额扣减(现有测试语义)
 	)
 }
 
@@ -113,7 +114,8 @@ func TestWorkerMCPForwardsJSONRPC(t *testing.T) {
 			}, nil
 		},
 		nil,
-		nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quotaCheck: nil = 跳过配额预检(现有测试语义)
+		nil, // quotaConsume: nil = 跳过配额扣减(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0","method":"initialize"}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -173,7 +175,8 @@ func TestWorkerMCPForwardsSessionHeader(t *testing.T) {
 			}, nil
 		},
 		nil,
-		nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quotaCheck: nil = 跳过配额预检(现有测试语义)
+		nil, // quotaConsume: nil = 跳过配额扣减(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0"}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -217,7 +220,8 @@ func TestWorkerMCPStreamsSSE(t *testing.T) {
 			}, nil
 		},
 		nil,
-		nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quotaCheck: nil = 跳过配额预检(现有测试语义)
+		nil, // quotaConsume: nil = 跳过配额扣减(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -249,7 +253,8 @@ func TestWorkerMCPBudgetExceeded(t *testing.T) {
 		func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error) {
 			return false, nil // budget exhausted
 		},
-		nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quotaCheck: nil = 跳过配额预检(现有测试语义)
+		nil, // quotaConsume: nil = 跳过配额扣减(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -299,7 +304,8 @@ func TestWorkerMCPInjectsPlatformHeaders(t *testing.T) {
 			}, nil
 		},
 		nil,
-		nil, // quota: nil = 跳过配额
+		nil, // quotaCheck: nil = 跳过配额预检
+		nil, // quotaConsume: nil = 跳过配额扣减
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0"}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -320,8 +326,10 @@ func TestWorkerMCPInjectsPlatformHeaders(t *testing.T) {
 	}
 }
 
-// TestWorkerMCPQuotaRejectsExhausted: 用户周期配额耗尽 → 429 MCP_QUOTA_EXCEEDED。
+// TestWorkerMCPQuotaRejectsExhausted: 用户周期配额预检耗尽 → 429
+// MCP_QUOTA_EXCEEDED(预检阶段拒绝, JTI/配额扣减均不触发)。
 func TestWorkerMCPQuotaRejectsExhausted(t *testing.T) {
+	consumeCalls, quotaConsumeCalls := 0, 0
 	proxy := NewWorkerMCPProxy(
 		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
 			return MCPTarget{URL: "https://mcp.example.com/mcp"}, true, nil
@@ -335,12 +343,19 @@ func TestWorkerMCPQuotaRejectsExhausted(t *testing.T) {
 				},
 			}, nil
 		},
-		nil,
+		func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error) {
+			consumeCalls++
+			return true, nil
+		},
 		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
 			if sessionKey != "personal:42" || serverID != "exa" {
 				t.Fatalf("quota args = (%q, %q)", sessionKey, serverID)
 			}
-			return false, nil // 耗尽
+			return false, nil // 预检耗尽
+		},
+		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			quotaConsumeCalls++
+			return true, nil
 		},
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
@@ -356,13 +371,19 @@ func TestWorkerMCPQuotaRejectsExhausted(t *testing.T) {
 	if body["code"] != "MCP_QUOTA_EXCEEDED" {
 		t.Fatalf("code field = %v, want MCP_QUOTA_EXCEEDED", body["code"])
 	}
+	if consumeCalls != 0 {
+		t.Fatalf("JTI budget must not be consumed when quota pre-check rejects, got %d calls", consumeCalls)
+	}
+	if quotaConsumeCalls != 0 {
+		t.Fatalf("quota must not be consumed when pre-check rejects, got %d calls", quotaConsumeCalls)
+	}
 }
 
 // TestWorkerMCPQuotaNotConsumedOnUnknownServer(Y1 回归): 对不存在/未启用
 // server 的调用(404)不得消耗用户配额与 JTI 预算——扣减必须发生在 resolve
 // 白名单校验之后。原实现在 resolve 前扣配额、authenticate 合一烧 JTI。
 func TestWorkerMCPQuotaNotConsumedOnUnknownServer(t *testing.T) {
-	quotaCalls, consumeCalls := 0, 0
+	quotaCheckCalls, quotaConsumeCalls, consumeCalls := 0, 0, 0
 	proxy := NewWorkerMCPProxy(
 		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
 			return MCPTarget{}, false, nil // 不存在
@@ -381,7 +402,11 @@ func TestWorkerMCPQuotaNotConsumedOnUnknownServer(t *testing.T) {
 			return true, nil
 		},
 		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
-			quotaCalls++
+			quotaCheckCalls++
+			return true, nil
+		},
+		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			quotaConsumeCalls++
 			return true, nil
 		},
 	)
@@ -393,18 +418,22 @@ func TestWorkerMCPQuotaNotConsumedOnUnknownServer(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("code = %d, want 404", rec.Code)
 	}
-	if quotaCalls != 0 {
-		t.Fatalf("quota must not be consumed for an unknown server, got %d calls", quotaCalls)
+	if quotaCheckCalls != 0 {
+		t.Fatalf("quota pre-check must not run for an unknown server, got %d calls", quotaCheckCalls)
+	}
+	if quotaConsumeCalls != 0 {
+		t.Fatalf("quota must not be consumed for an unknown server, got %d calls", quotaConsumeCalls)
 	}
 	if consumeCalls != 0 {
 		t.Fatalf("JTI budget must not be consumed for an unknown server, got %d calls", consumeCalls)
 	}
 }
 
-// TestWorkerMCPBudgetNotConsumedOnQuotaRejected(Y5 回归): 用户配额耗尽
-// (429)时 JTI 预算不得消费——拒绝路径不计量, 预算只在调用即将发起时扣。
+// TestWorkerMCPBudgetNotConsumedOnQuotaRejected(Y5 回归): 配额预检拒绝
+// (429)时 JTI 与配额扣减均不得消费——拒绝路径不计量, 扣减只在调用即将
+// 发起时执行。
 func TestWorkerMCPBudgetNotConsumedOnQuotaRejected(t *testing.T) {
-	consumeCalls := 0
+	consumeCalls, quotaConsumeCalls := 0, 0
 	proxy := NewWorkerMCPProxy(
 		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
 			return MCPTarget{URL: "https://mcp.example.com/mcp"}, true, nil
@@ -423,7 +452,11 @@ func TestWorkerMCPBudgetNotConsumedOnQuotaRejected(t *testing.T) {
 			return true, nil
 		},
 		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
-			return false, nil // 用户配额耗尽
+			return false, nil // 配额预检耗尽
+		},
+		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			quotaConsumeCalls++
+			return true, nil
 		},
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
@@ -441,5 +474,55 @@ func TestWorkerMCPBudgetNotConsumedOnQuotaRejected(t *testing.T) {
 	}
 	if consumeCalls != 0 {
 		t.Fatalf("JTI budget must not be consumed when quota rejects, got %d calls", consumeCalls)
+	}
+	if quotaConsumeCalls != 0 {
+		t.Fatalf("quota must not be consumed when pre-check rejects, got %d calls", quotaConsumeCalls)
+	}
+}
+
+// TestWorkerMCPQuotaConsumeNotCalledWhenBudgetExhausted(Y5 二轮回归): 预检
+// 通过但 JTI 预算耗尽(429)时, 配额扣减不得执行——两阶段设计保证 JTI
+// 拒绝路径不产生任何配额扣减副作用(否则被拒调用会逐步烧尽用户配额)。
+func TestWorkerMCPQuotaConsumeNotCalledWhenBudgetExhausted(t *testing.T) {
+	quotaConsumeCalls := 0
+	proxy := NewWorkerMCPProxy(
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			return MCPTarget{URL: "https://mcp.example.com/mcp"}, true, nil
+		},
+		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+			return llmproxy.CapabilityClaims{
+				Operation: "mcp", Budget: `{"max_turns":5}`,
+				RegisteredClaims: jwt.RegisteredClaims{
+					ID: "jti-1", Subject: "personal:42",
+					Audience: jwt.ClaimStrings{llmproxy.MCPAudience},
+				},
+			}, nil
+		},
+		func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error) {
+			return false, nil // JTI 预算耗尽
+		},
+		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			return true, nil // 配额预检通过
+		},
+		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			quotaConsumeCalls++
+			return true, nil
+		},
+	)
+	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer good-token")
+	rec := httptest.NewRecorder()
+	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429", rec.Code)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["code"] != "MCP_BUDGET_EXCEEDED" {
+		t.Fatalf("code field = %v, want MCP_BUDGET_EXCEEDED", body["code"])
+	}
+	if quotaConsumeCalls != 0 {
+		t.Fatalf("quota must not be consumed when JTI budget is exhausted, got %d calls", quotaConsumeCalls)
 	}
 }

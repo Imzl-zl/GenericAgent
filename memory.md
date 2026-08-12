@@ -34,7 +34,7 @@
 
 ## 关键决策（仍有效）
 
-- **2026-08-12（推送审查修复定案，已落地）**：①main.go 装配时序——transport 块必须在 NewScheduler 之前（Streaming 端口构造时立即断言 botTransport，值语义非延迟引用，先前声明后赋值=恒 nil 流式全链路静默失效）；②MCP 配额调度过滤唯一生产入口=签发路径（resolveMCPSnapshot 后 filterMCPServersByQuota，死代码教训：有定义有单测不等于接入调用链）；③proxy 配额扣减在 resolve 白名单之后（404 不烧配额）；④ConsumeMCPQuotas 单事务双周期（day→month 固定锁序，要么都扣要么都不扣，被拒调用不烧 day）；⑤掩码合并不匹配/新键掩码 → 400 拒绝（不落库）；⑥**proxy 计量原则（Y5）**：JTI 预算只在"调用即将发起"时消费——validate 与 consume 拆分（authenticate 拆 validateToken+consumeBudget），客户端错误/白名单 404/配额 429/系统 503 路径不计量，上游 502 与 fetch 后判定视为已发起；MCP 与 Sophub 两 proxy 对称实现
+- **2026-08-12（推送审查修复定案，已落地）**：①main.go 装配时序——transport 块必须在 NewScheduler 之前（Streaming 端口构造时立即断言 botTransport，值语义非延迟引用，先前声明后赋值=恒 nil 流式全链路静默失效）；②MCP 配额调度过滤唯一生产入口=签发路径（resolveMCPSnapshot 后 filterMCPServersByQuota，死代码教训：有定义有单测不等于接入调用链）；③proxy 配额扣减在 resolve 白名单之后（404 不烧配额）；④ConsumeMCPQuotas 单事务双周期（day→month 固定锁序，要么都扣要么都不扣，被拒调用不烧 day）；⑤掩码合并不匹配/新键掩码 → 400 拒绝（不落库）；⑥**proxy 计量原则（Y5）**：JTI 预算只在"调用即将发起"时消费——validate 与 consume 拆分（authenticate 拆 validateToken+consumeBudget），客户端错误/白名单 404/配额 429/系统 503 路径不计量，上游 502 与 fetch 后判定视为已发起；MCP 与 Sophub 两 proxy 对称实现；**配额两阶段（二轮）**：quotaCheck 只读预检先于 JTI 消费、quotaConsume 条件扣减在 JTI 之后——任一拒绝路径零扣减，极端竞态白扣选短期 JTI（用户配额从不错扣）
 
 - **2026-08-11（MCP 治理定案，已落地）**：MCP 配置 = mcp.json 风格 JSON 直接编辑（web 端），存储保留 DB（mcp_servers.headers，无独立 key 字段）；key 平台侧持有（proxy 注入，admin API 掩码回显，更新掩码值保留原 key）；配额 = 每用户 × 每 server × 周期（day/month），proxy 每次调用原子扣减（429 MCP_QUOTA_EXCEEDED），调度层按用户粗过滤耗尽 server；stdio 分发（将来如需）= npx/uvx 共享缓存卷 + 版本固定；pandoc 保持镜像预装 CLI 直调（不启用 MCP 协议）；PDF 引擎保持 pandoc→docx→LibreOffice 渲染式（不引 TeX Live）。设计真值：`.tasks/mcp-governance/` + `tenant_platform/docs/MCP_GATEWAY_DESIGN.zh-CN.md`（已标注退役）
 
