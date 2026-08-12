@@ -202,6 +202,7 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	if s.cfg.TokenIssuer == nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, nil
 	}
+	ownerKey := strconv.FormatInt(task.RequesterID, 10)
 	snapshot, err := s.resolveRoutingSnapshot(ctx)
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
@@ -210,7 +211,12 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
 	}
-	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, generation, task.ID, strconv.FormatInt(task.RequesterID, 10))
+	// 按用户配额过滤快照(EPIC mcp-governance D7): 任一周期耗尽的 server
+	// 不下发——任务内不可见, 不会发起注定 429 的调用。配额源不可用时
+	// filter 内部 fail-closed(剔除全部)。签发路径是过滤的唯一生产入口
+	// (2026-08-11 审查 B2: 此前 filter 仅有定义与单测, 未接入调用链)。
+	mcpSnapshot = s.filterMCPServersByQuota(ctx, ownerKey, mcpSnapshot)
+	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, generation, task.ID, ownerKey)
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
 	}

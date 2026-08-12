@@ -11,7 +11,8 @@
 - **IM 流式输出完成（2026-08-10，im-streaming-delivery epic 7/7 DONE）**：StreamingSender 可选接口 + scheduler 500ms 节流转发管道 + 飞书消息编辑打字机 + QQ 单聊原生流式 + 群聊收敛（只发最终结果）+ im_streaming_mode 管理开关；真实渠道冒烟待用户凭据
 - **企微渠道完成（2026-08-11，commit 3023e3d2）**：WeComAdapter（wecom_aibot_sdk WS）+ 渠道绑定页企业微信卡片 + 流式判定矩阵 + delivery 回复路由（审查 C1 修复）；真实渠道冒烟待用户凭据，流式模式建议保持 off/final_only
 - **MCP 治理完成（2026-08-11，commit 58b27620）**：key 平台侧注入（mcp_servers.headers，proxy 转发注入，worker 快照永不含 key）+ 每用户×每 server×周期配额（proxy 原子扣减 429）+ **mcp-gateway 退役**（stdio transport 整体移除，pandoc 本地化后无业务用途）+ web JSON 直接编辑 + 用户配额面板；集成测试修复（_register_user 冗余直插 workspace，0050 不变量遗留）
-- 最后更新：2026-08-11（CI Python 矩阵盲区审查修复 92c37af）
+- **推送审查修复完成（2026-08-12，B1/B2/Y1/Y2/Y3）**：IM 流式接线（main.go 装配时序）+ MCP 配额调度过滤接入签发路径 + proxy 扣配额后移 resolve + 双周期事务扣减 + 掩码不匹配拒绝；含回归测试，Go 全量+race 绿
+- 最后更新：2026-08-12（推送审查修复 5 项）
 
 ## 已完成能力
 
@@ -33,6 +34,8 @@
 
 ## 关键决策（仍有效）
 
+- **2026-08-12（推送审查修复定案，已落地）**：①main.go 装配时序——transport 块必须在 NewScheduler 之前（Streaming 端口构造时立即断言 botTransport，值语义非延迟引用，先前声明后赋值=恒 nil 流式全链路静默失效）；②MCP 配额调度过滤唯一生产入口=签发路径（resolveMCPSnapshot 后 filterMCPServersByQuota，死代码教训：有定义有单测不等于接入调用链）；③proxy 配额扣减在 resolve 白名单之后（404 不烧配额）；④ConsumeMCPQuotas 单事务双周期（day→month 固定锁序，要么都扣要么都不扣，被拒调用不烧 day）；⑤掩码合并不匹配/新键掩码 → 400 拒绝（不落库）
+
 - **2026-08-11（MCP 治理定案，已落地）**：MCP 配置 = mcp.json 风格 JSON 直接编辑（web 端），存储保留 DB（mcp_servers.headers，无独立 key 字段）；key 平台侧持有（proxy 注入，admin API 掩码回显，更新掩码值保留原 key）；配额 = 每用户 × 每 server × 周期（day/month），proxy 每次调用原子扣减（429 MCP_QUOTA_EXCEEDED），调度层按用户粗过滤耗尽 server；stdio 分发（将来如需）= npx/uvx 共享缓存卷 + 版本固定；pandoc 保持镜像预装 CLI 直调（不启用 MCP 协议）；PDF 引擎保持 pandoc→docx→LibreOffice 渲染式（不引 TeX Live）。设计真值：`.tasks/mcp-governance/` + `tenant_platform/docs/MCP_GATEWAY_DESIGN.zh-CN.md`（已标注退役）
 
 - **2026-08-11（企微渠道定案，已落地）**：接入形态 = 企业微信智能机器人（wecom_aibot_sdk WebSocket 长连接，与飞书/钉钉/QQ 同模式，无公网回调地址）；凭据 bot_id/secret **复用 app_id/app_secret 存储槽位**（契约字段不变，Web 标签与前端必填文案随渠道泛化）；conversation_type = chatid==userid 判 private（空 sender 保守归群）；出站统一 SEND_MSG（文本用 markdown 承载——SDK 主动发送无 text 类型，被动 reply_stream 依赖入站 req_id 不适合异步 delivery）；流式 = SEND_MSG+stream 帧（协议层与被动 reply_stream 同格式，**待真实凭据实测，未通过前 im_streaming_mode 建议 off/final_only**）；新渠道加入必须同步：Go IsValidChannelType/IsValidSource/channelTypeForTaskSource/StreamForwarder 矩阵 + poller VALID_CHANNEL_TYPES/工厂 + OpenAPI 枚举 + Web ChannelType/卡片
@@ -51,6 +54,8 @@
 ## 仍需注意的坑点
 
 - Python 3.14 与 pywebview 不兼容，用 3.11/3.12
+- **main.go 装配时序坑（2026-08-12 审查 B1 修复）**：Scheduler.Streaming 端口在 NewScheduler 构造时立即断言 botTransport——该变量若在构造后才赋值（哪怕是同函数内后面几行），断言恒 nil、IM 流式静默失效且单测全绿；装配类注入必须保证赋值先于构造，或改用 setter/延迟引用
+- **死代码坑（2026-08-12 审查 B2 修复）**：filterMCPServersByQuota 有定义+单测但生产调用链从未接线——写功能后 grep 一下生产路径是否有调用点（`rg "函数名" --glob '!*_test.go'`）
 - **测试硬编码平台命令/路径（2026-08-11 新增）**：`_list_python_pids` 曾硬编码 Windows tasklist 导致 Linux CI E2E 必失败（已加 /proc 分支）；`/media` 等宿主根目录在测试中无写权限，用 tmp_path
 - **CI Python job 前置步骤失败会跳过 Worker/bot_poller/E2E（2026-08-11 新增）**：contract/smoke 失败时后续步骤全 skip，worker 断言过期可长期未被发现——本地需手动补跑 `pytest tenant_platform/worker-python -q` 与 bot_poller；bot_poller QQ 流式测试硬依赖 qq-botpy（CI 已补装）
 - runsc/mTLS/真实 Docker 验证只能在 Linux 主机
@@ -82,6 +87,7 @@
 
 ## 最近活跃窗口
 
+- 2026-08-12：**推送审查修复（5 项全落地+回归测试）**：B1 main.go transport 装配块前移（含 botLifecycle/botPollerClient 一并提前，channelSvc Start 闭包窗口一并消除）；B2 filterMCPServersByQuota 接入 issueInitialWorkerCredentials（新测试验证签发快照不含耗尽 server）；Y1 proxy quota 后移 resolve（404 不烧配额）；Y2 ConsumeMCPQuotas 单事务双周期（新增不烧 day 回归 + 20 并发恰 limit 成功测试）；Y3 掩码不匹配/新键掩码 400 拒绝；Go 全量（含 DB）+ race 6 包 + api race 全绿
 - 2026-08-11：**企微渠道全链路落地（3023e3d2）**：WeComAdapter + 注册表 + Web 卡片 + OpenAPI/文档；独立审查抓 C1（channelTypeForTaskSource 缺 wecom 分支→回复错投微信）已修+delivery 路由测试（fake resolver 按 channel_type 匹配真实 store 语义）；M2-M5 小修（前端校验文案/空 sender 归群/首帧占位/失败清理）；poller 52 用例 + Go TDD 全绿；已提交推送 origin/main；残余：真实凭据冒烟（SEND_MSG 流式帧验证）
 - 2026-08-10：**im-streaming-delivery 全部落地**（7/7 DONE）：StreamingSender/StreamReply 接口 + StreamForwarder（500ms 节流合并 + open/append/commit/abort）+ scheduler 接入（Terminal commit + 失败 abort + 群聊收敛）+ 飞书编辑打字机 + QQ 单聊原生流式 + im_streaming_mode 开关 + Web 设置项；migration 0054（conversation_type + stream_final_at + text_value）；全量验证绿（存量失败 4 处与本次无关）；真实渠道冒烟待用户凭据
 - 2026-08-10：**im-channel-binding 全部落地**（6/6 DONE）：migration 0053（bots→channel_configs）+ domain.Bot→ChannelConfig 全库改名 + im-bindings API（user+admin）+ Router 多渠道分桶（Source/ConversationKey）+ poller BotAdapter 注册表（飞书/钉钉/QQ adapter）+ Web 渠道绑定页；契约字段 ilink_user_id→channel_account_id（B3 命名债已清）；全量验证绿（存量失败 4 处与本次无关，base commit 复现）；真实渠道冒烟待用户凭据

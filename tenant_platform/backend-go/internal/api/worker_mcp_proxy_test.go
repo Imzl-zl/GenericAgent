@@ -41,7 +41,7 @@ func newTestMCPProxy() *WorkerMCPProxy {
 			}, nil
 		},
 		nil, // consume: nil = 跳过计量(现有测试保持语义)
-	nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 }
 
@@ -113,7 +113,7 @@ func TestWorkerMCPForwardsJSONRPC(t *testing.T) {
 			}, nil
 		},
 		nil,
-	nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0","method":"initialize"}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -173,7 +173,7 @@ func TestWorkerMCPForwardsSessionHeader(t *testing.T) {
 			}, nil
 		},
 		nil,
-	nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{"jsonrpc":"2.0"}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -217,7 +217,7 @@ func TestWorkerMCPStreamsSSE(t *testing.T) {
 			}, nil
 		},
 		nil,
-	nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -249,7 +249,7 @@ func TestWorkerMCPBudgetExceeded(t *testing.T) {
 		func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error) {
 			return false, nil // budget exhausted
 		},
-	nil, // quota: nil = 跳过配额(现有测试语义)
+		nil, // quota: nil = 跳过配额(现有测试语义)
 	)
 	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer good-token")
@@ -355,5 +355,42 @@ func TestWorkerMCPQuotaRejectsExhausted(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	if body["code"] != "MCP_QUOTA_EXCEEDED" {
 		t.Fatalf("code field = %v, want MCP_QUOTA_EXCEEDED", body["code"])
+	}
+}
+
+// TestWorkerMCPQuotaNotConsumedOnUnknownServer(Y1 回归): 对不存在/未启用
+// server 的调用(404)不得消耗用户配额——配额扣减必须发生在 resolve 白名单
+// 校验之后。原实现在 resolve 前扣减, 拼错 server_key 会烧掉配额。
+func TestWorkerMCPQuotaNotConsumedOnUnknownServer(t *testing.T) {
+	quotaCalls := 0
+	proxy := NewWorkerMCPProxy(
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			return MCPTarget{}, false, nil // 不存在
+		},
+		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+			return llmproxy.CapabilityClaims{
+				Operation: "mcp", Budget: `{"max_turns":100}`,
+				RegisteredClaims: jwt.RegisteredClaims{
+					ID: "jti-1", Subject: "personal:42",
+					Audience: jwt.ClaimStrings{llmproxy.MCPAudience},
+				},
+			}, nil
+		},
+		nil,
+		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			quotaCalls++
+			return true, nil
+		},
+	)
+	req := httptest.NewRequest("POST", "/v1/worker/mcp/nope", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer good-token")
+	rec := httptest.NewRecorder()
+	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, want 404", rec.Code)
+	}
+	if quotaCalls != 0 {
+		t.Fatalf("quota must not be consumed for an unknown server, got %d calls", quotaCalls)
 	}
 }

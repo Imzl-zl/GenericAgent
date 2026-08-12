@@ -33,7 +33,7 @@ func (b *mcpServerWriteBody) normalize() error {
 		ServerKey: b.ServerKey, Name: b.Name, URL: b.URL,
 		TimeoutSeconds: b.TimeoutSeconds, Headers: b.Headers,
 		Transport: b.Transport,
-		Command: b.Command, Args: b.Args, Isolation: b.Isolation,
+		Command:   b.Command, Args: b.Args, Isolation: b.Isolation,
 		MaxInstances: b.MaxInstances,
 	})
 }
@@ -60,7 +60,7 @@ func (s *Server) handleAdminCreateMCPServer(w http.ResponseWriter, r *http.Reque
 		ServerKey: body.ServerKey, Name: body.Name, URL: body.URL,
 		TimeoutSeconds: body.TimeoutSeconds, Headers: body.Headers,
 		Transport: body.Transport,
-		Command: body.Command, Args: body.Args, Isolation: body.Isolation,
+		Command:   body.Command, Args: body.Args, Isolation: body.Isolation,
 		MaxInstances: body.MaxInstances,
 	})
 	if err != nil {
@@ -100,11 +100,12 @@ func (s *Server) handleAdminUpdateMCPServer(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	// 掩码合并(JSON 编辑契约): 提交值与当前存储值的掩码一致时保留原 key
-	// (secret 惯例: 留空/掩码 = 不变, 明文 = 更新)。
+	// (secret 惯例: 留空/掩码 = 不变, 明文 = 更新)。掩码不匹配/新键掩码是
+	// 客户端校验错误 → 400(审查 Y3: 拒绝而非落库)。
 	if len(body.Headers) > 0 {
 		merged, mergeErr := s.mergeMaskedHeaders(r.Context(), id, body.Headers)
 		if mergeErr != nil {
-			writeErr(w, http.StatusInternalServerError, "MCP_SERVER_UPDATE_FAILED", mergeErr.Error(), tid)
+			writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", mergeErr.Error(), tid)
 			return
 		}
 		body.Headers = merged
@@ -114,7 +115,7 @@ func (s *Server) handleAdminUpdateMCPServer(w http.ResponseWriter, r *http.Reque
 			ServerKey: body.ServerKey, Name: body.Name, URL: body.URL,
 			TimeoutSeconds: body.TimeoutSeconds, Headers: body.Headers,
 			Transport: body.Transport,
-			Command: body.Command, Args: body.Args, Isolation: body.Isolation,
+			Command:   body.Command, Args: body.Args, Isolation: body.Isolation,
 			MaxInstances: body.MaxInstances,
 		},
 	})
@@ -125,8 +126,11 @@ func (s *Server) handleAdminUpdateMCPServer(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, mcpServerReply(server))
 }
 
-// mergeMaskedHeaders 合并提交的 headers 与当前存储值: 提交值等于当前值
-// 的掩码(maskSecretValue)时保留当前明文, 否则采用提交值(新键/明文更新)。
+// mergeMaskedHeaders 合并提交的 headers 与当前存储值(JSON 编辑契约):
+// 提交值以 *** 结尾 = 掩码声明——必须与当前存储值的掩码一致(保留原明文),
+// 不一致(陈旧回显/并发编辑/伪造)拒绝而非落库(审查 Y3: 原实现把不匹配的
+// 掩码字符串原样存为真实 header, 注入上游后认证必失败); 新键提交掩码值
+// 同样拒绝(新键必须明文, 与 create 路径一致)。非掩码值 = 明文更新/新增。
 func (s *Server) mergeMaskedHeaders(ctx context.Context, id int64, submitted map[string]string) (map[string]string, error) {
 	servers, err := s.mcpServers.ListMCPServers(ctx)
 	if err != nil {
@@ -141,11 +145,18 @@ func (s *Server) mergeMaskedHeaders(ctx context.Context, id int64, submitted map
 	}
 	merged := make(map[string]string, len(submitted))
 	for key, value := range submitted {
-		if strings.HasSuffix(value, "***") && maskSecretValue(current.Headers[key]) == value {
-			merged[key] = current.Headers[key]
-		} else {
-			merged[key] = value
+		if strings.HasSuffix(value, "***") {
+			stored, exists := current.Headers[key]
+			if !exists {
+				return nil, fmt.Errorf("header %q: masked value is not valid for a new key (provide plaintext)", key)
+			}
+			if maskSecretValue(stored) != value {
+				return nil, fmt.Errorf("header %q: masked value does not match the stored secret (stale editor or concurrent change; re-fetch and retry)", key)
+			}
+			merged[key] = stored
+			continue
 		}
+		merged[key] = value
 	}
 	return merged, nil
 }

@@ -248,7 +248,6 @@ func TestAdminMCPMapsStoreErrors(t *testing.T) {
 	}
 }
 
-
 func (s *memoryMCPStore) SetMCPQuotaLimit(_ context.Context, ownerKey, serverID, period string, limitCount int64) error {
 	return nil
 }
@@ -299,5 +298,46 @@ func TestAdminMCPCreateRejectsMaskedHeaders(t *testing.T) {
 	server.handleAdminCreateMCPServer(response, request)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("masked header on create must be rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// TestAdminMCPUpdateRejectsStaleMaskedHeaders(Y3 回归): 提交的掩码值与当前
+// 存储值掩码不一致(陈旧回显/并发编辑/伪造)必须 400 拒绝, 不得把掩码字符串
+// 原样落库成为真实 header(否则注入上游后认证必失败)。新键提交掩码值同样拒绝。
+func TestAdminMCPUpdateRejectsStaleMaskedHeaders(t *testing.T) {
+	store := &memoryMCPStore{server: domain.MCPServer{
+		ID: 1, ServerKey: "tavily", Name: "Tavily", URL: "https://mcp.tavily.com/mcp/",
+		TimeoutSeconds: 30, Headers: map[string]string{"Authorization": "Bearer tvly-secret-12345"},
+		Revision: 1, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}}
+	server := &Server{mcpServers: store}
+	// 陈旧掩码: 真实值掩码是 "Bear***", 提交 "xxxx***" 不匹配 → 400, 且不落库。
+	stale := httptest.NewRequest("PUT", "/v1/admin/mcp-servers/1", strings.NewReader(`{
+		"server_key":"tavily","name":"Tavily","url":"https://mcp.tavily.com/mcp/",
+		"headers":{"Authorization":"xxxx***"},"timeout_seconds":30
+	}`))
+	stale.SetPathValue("mcp_server_id", "1")
+	response := httptest.NewRecorder()
+	server.handleAdminUpdateMCPServer(response, stale)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("stale masked header must be rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+	if store.server.Headers["Authorization"] != "Bearer tvly-secret-12345" {
+		t.Fatalf("stale masked value must not overwrite stored secret, got %q", store.server.Headers["Authorization"])
+	}
+
+	// 新键提交掩码值(该键当前不存在)→ 400, 不得写入。
+	newKey := httptest.NewRequest("PUT", "/v1/admin/mcp-servers/1", strings.NewReader(`{
+		"server_key":"tavily","name":"Tavily","url":"https://mcp.tavily.com/mcp/",
+		"headers":{"x-api-key":"abcd***"},"timeout_seconds":30
+	}`))
+	newKey.SetPathValue("mcp_server_id", "1")
+	response = httptest.NewRecorder()
+	server.handleAdminUpdateMCPServer(response, newKey)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("masked value for a new key must be rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, exists := store.server.Headers["x-api-key"]; exists {
+		t.Fatalf("masked value for new key must not be stored, got %q", store.server.Headers["x-api-key"])
 	}
 }

@@ -753,9 +753,56 @@ func run() error {
 	}
 	sessionScopedConfig := true
 
-	// botTransport 在 transport 装配段(下方)赋值: 此处提前声明供 Scheduler
-	// 的流式转发端口注入(IM_STREAMING_DELIVERY §4.2); 装配段不再重复声明。
+	// Bot transport + lifecycle: when the poller is configured, the Go platform
+	// delegates all channel protocol I/O to the Python Bot Poller (wechat via
+	// GA Core's verified WxBotClient; feishu/dingtalk/qq via their SDK WS
+	// adapters). Go owns encryption + persistence; the Poller owns the
+	// long-lived connections. Without a poller, an in-process loopback
+	// transport is used for dev/test.
+	//
+	// 装配顺序硬约束: 本块必须在 NewScheduler 之前完成——Scheduler 的
+	// Streaming 端口在构造时立即断言 botTransport(值语义, 非延迟引用),
+	// 若先构造 Scheduler 再赋值, 流式转发端口恒为 nil, IM 流式输出
+	// 全链路静默失效(2026-08-11 审查 B1 修复)。
 	var botTransport transport.BotTransportAdapter
+	var botLifecycle application.BotLifecycleService
+	var botPollerClient *poller.Client
+	if pollerURL := strings.TrimSpace(*botPollerURL); pollerURL != "" {
+		if cipher == nil {
+			return fmt.Errorf("--bot-poller-url requires --bot-token-key/BOT_TOKEN_KEY")
+		}
+		webhookURL := strings.TrimSpace(*platformWebhookURL)
+		if webhookURL == "" {
+			webhookURL = fmt.Sprintf("http://%s/v1/im/webhook", *listen)
+		}
+		botPollerClient, err = poller.NewClient(pollerURL, strings.TrimSpace(*botPollerAPISecret))
+		if err != nil {
+			return fmt.Errorf("poller client: %w", err)
+		}
+		if err := botPollerClient.ConfigureInboundCoalescing(ctx, imInboundCoalesceWindowMS); err != nil {
+			return fmt.Errorf("configure poller inbound coalescing: %w", err)
+		}
+		ilinkAdapter, err := transport.NewILinkAdapter(transport.ILinkAdapterConfig{
+			Poller: botPollerClient,
+		})
+		if err != nil {
+			return fmt.Errorf("ilink adapter: %w", err)
+		}
+		botTransport = ilinkAdapter
+		botLifecycle, err = application.NewBotLifecycleService(application.BotLifecycleConfig{
+			Store:              store,
+			Cipher:             cipher,
+			Poller:             botPollerClient,
+			WebhookURL:         webhookURL,
+			RestoreConcurrency: 4,
+		})
+		if err != nil {
+			return fmt.Errorf("bot lifecycle service: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "platform: bot poller transport url=%s webhook=%s\n", pollerURL, webhookURL)
+	} else {
+		botTransport = transport.NewLoopbackTransport()
+	}
 
 	sched, err := application.NewScheduler(application.SchedulerConfig{
 		PlatformInstanceID:       processID,
@@ -795,7 +842,7 @@ func run() error {
 			}
 			return nil
 		}(),
-		Bots: store,
+		Bots:        store,
 		IdleTimeout:              time.Duration(*taskIdleTimeoutSec) * time.Second,
 	})
 	if err != nil {
@@ -830,11 +877,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-
-	// 声明前置: channelSvc 的 Start 闭包引用 botLifecycle(Go 块级作用域
-	// 要求标识符声明先于引用出现)。
-	var botLifecycle application.BotLifecycleService
-	var botPollerClient *poller.Client
 
 	channelSvc, err := application.NewChannelConfigService(application.ChannelConfigServiceConfig{
 		Store:  store,
@@ -874,49 +916,6 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("Sophub service: %w", err)
 		}
-	}
-
-	// Bot transport + lifecycle: when the poller is configured, the Go platform
-	// delegates all channel protocol I/O to the Python Bot Poller (wechat via
-	// GA Core's verified WxBotClient; feishu/dingtalk/qq via their SDK WS
-	// adapters). Go owns encryption + persistence; the Poller owns the
-	// long-lived connections. Without a poller, an in-process loopback
-	// transport is used for dev/test.
-	if pollerURL := strings.TrimSpace(*botPollerURL); pollerURL != "" {
-		if cipher == nil {
-			return fmt.Errorf("--bot-poller-url requires --bot-token-key/BOT_TOKEN_KEY")
-		}
-		webhookURL := strings.TrimSpace(*platformWebhookURL)
-		if webhookURL == "" {
-			webhookURL = fmt.Sprintf("http://%s/v1/im/webhook", *listen)
-		}
-		botPollerClient, err = poller.NewClient(pollerURL, strings.TrimSpace(*botPollerAPISecret))
-		if err != nil {
-			return fmt.Errorf("poller client: %w", err)
-		}
-		if err := botPollerClient.ConfigureInboundCoalescing(ctx, imInboundCoalesceWindowMS); err != nil {
-			return fmt.Errorf("configure poller inbound coalescing: %w", err)
-		}
-		ilinkAdapter, err := transport.NewILinkAdapter(transport.ILinkAdapterConfig{
-			Poller: botPollerClient,
-		})
-		if err != nil {
-			return fmt.Errorf("ilink adapter: %w", err)
-		}
-		botTransport = ilinkAdapter
-		botLifecycle, err = application.NewBotLifecycleService(application.BotLifecycleConfig{
-			Store:              store,
-			Cipher:             cipher,
-			Poller:             botPollerClient,
-			WebhookURL:         webhookURL,
-			RestoreConcurrency: 4,
-		})
-		if err != nil {
-			return fmt.Errorf("bot lifecycle service: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "platform: bot poller transport url=%s webhook=%s\n", pollerURL, webhookURL)
-	} else {
-		botTransport = transport.NewLoopbackTransport()
 	}
 
 	var wechatBindingSvc application.WechatQRBindingService
@@ -981,17 +980,17 @@ func run() error {
 	}
 
 	server, err := api.NewServer(api.ServerConfig{
-		Service:         svc,
-		Users:           userSvc,
-		WechatBinding:   wechatBindingSvc,
+		Service:              svc,
+		Users:                userSvc,
+		WechatBinding:        wechatBindingSvc,
 		ChannelConfigService: channelSvc,
-		Invite:          inviteSvc,
-		Personas:        personaSvc,
-		Router:          routerSvc,
-		Registry:        reg,
-		Policies:        store, // admin command/policy management (migration 0004)
-		RuntimeSettings: store,
-		Sophub:          sophubSvc,
+		Invite:               inviteSvc,
+		Personas:             personaSvc,
+		Router:               routerSvc,
+		Registry:             reg,
+		Policies:             store, // admin command/policy management (migration 0004)
+		RuntimeSettings:      store,
+		Sophub:               sophubSvc,
 		SophubValidator: func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
 			sv, err := llmproxy.NewSophubValidator([]byte(signingKey), store)
 			if err != nil {

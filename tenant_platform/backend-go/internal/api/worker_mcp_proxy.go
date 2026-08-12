@@ -22,8 +22,8 @@ type MCPTarget struct {
 // WorkerMCPProxy 是 Runner 经 Platform 的受控 MCP 代理(Runner 仅 internal
 // 网络, 无公网出口——外部 MCP Server 一律经此代理, 与 Sophub proxy 同模式):
 //   - Runner 不持有任何外部凭据, 只持有短期 capability JWT(audience=ga-mcp-proxy);
-//   - server_id → 目标(URL 或 mcp-gateway 路由)的映射由 Platform 的启用中
-//     MCP 表决定, 即白名单(管理员未启用的 server 一律 404);
+//   - server_id → 目标的映射由 Platform 的启用中 MCP 表决定, 即白名单
+//     (管理员未启用的 server 一律 404);
 //   - 调用按 JTI 原子计量(预算耗尽 429, 无预算 fail-closed 拒绝);
 //   - 仅转发 JSON-RPC 流(Streamable HTTP), 不缓存/不解析内容;
 //   - 转发时注入平台侧持有的凭据头(MCPTarget.Headers, 来自 mcp_servers.headers);
@@ -141,20 +141,6 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "MCP_SERVER_ID_REQUIRED", "server_id is required", tid)
 		return
 	}
-	// 配额强制: 每次调用按 owner(经 sessionKey 解析)对 day+month 周期原子
-	// 扣减, 任一耗尽 → 429(D6/D7; quota nil = 仅测试跳过)。
-	if p.quota != nil {
-		allowed, err := p.quota(r.Context(), claims.Subject, serverID)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "mcp proxy: quota check failed", "server_id", serverID, "error", err)
-			writeErr(w, http.StatusServiceUnavailable, "MCP_QUOTA_UNAVAILABLE", "quota store unavailable", tid)
-			return
-		}
-		if !allowed {
-			writeErr(w, http.StatusTooManyRequests, "MCP_QUOTA_EXCEEDED", "user MCP quota exceeded for this period", tid)
-			return
-		}
-	}
 	target, ok, err := p.resolve(r.Context(), serverID)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "mcp proxy: resolve failed", "server_id", serverID, "error", err)
@@ -170,6 +156,23 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 	if upstreamURL == "" {
 		writeErr(w, http.StatusNotFound, "MCP_SERVER_NOT_FOUND", "MCP server is not enabled or does not exist", tid)
 		return
+	}
+
+	// 配额强制: 每次调用按 owner(经 sessionKey 解析)对 day+month 周期原子
+	// 扣减, 任一耗尽 → 429(D6/D7; quota nil = 仅测试跳过)。
+	// 审查 Y1: 扣减必须发生在 resolve 白名单校验之后——对不存在/未启用
+	// server 的调用不得消耗用户配额(否则 404/拼错 key 会烧掉配额)。
+	if p.quota != nil {
+		allowed, err := p.quota(r.Context(), claims.Subject, serverID)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "mcp proxy: quota check failed", "server_id", serverID, "error", err)
+			writeErr(w, http.StatusServiceUnavailable, "MCP_QUOTA_UNAVAILABLE", "quota store unavailable", tid)
+			return
+		}
+		if !allowed {
+			writeErr(w, http.StatusTooManyRequests, "MCP_QUOTA_EXCEEDED", "user MCP quota exceeded for this period", tid)
+			return
+		}
 	}
 
 	upstream, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, r.Body)

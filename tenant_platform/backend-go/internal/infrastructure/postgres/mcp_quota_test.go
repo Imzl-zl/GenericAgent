@@ -329,6 +329,97 @@ func TestConsumeMCPQuotasDayAndMonth(t *testing.T) {
 	}
 }
 
+// TestConsumeMCPQuotasRejectedDoesNotBurnDay(Y2 回归): month 耗尽导致整体
+// 拒绝时, day 不得被计数——被拒绝的调用不消耗任何周期配额。
+// 旧实现先扣 day 再查 month, 拒绝后 day 已 +1, 会逐步把 day 烧尽。
+func TestConsumeMCPQuotasRejectedDoesNotBurnDay(t *testing.T) {
+	pool := requireDB(t)
+	ctx := context.Background()
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const owner, server = "user-noburn", "server-noburn"
+	if err := store.SetMCPQuotaLimit(ctx, owner, server, "day", 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMCPQuotaLimit(ctx, owner, server, "month", 1); err != nil {
+		t.Fatal(err)
+	}
+	// 第 1 次成功(day=1, month=1)。
+	if ok, err := store.ConsumeMCPQuotas(ctx, owner, server); err != nil || !ok {
+		t.Fatalf("first consume: ok=%v err=%v", ok, err)
+	}
+	// 第 2 次: month 已耗尽 → 拒绝, 且不得烧 day。
+	if ok, err := store.ConsumeMCPQuotas(ctx, owner, server); err != nil || ok {
+		t.Fatalf("second consume: ok=%v err=%v (want false)", ok, err)
+	}
+	// 管理员把月配额提到 100(不再成为瓶颈)。day 限额 5 只被成功调用消耗:
+	// 第 1 次已用 1, 故之后恰好 4 次成功、第 5 次起被拒。若被拒调用烧了
+	// day(旧实现), 则只能再成功 3 次——本断言可区分。
+	if err := store.SetMCPQuotaLimit(ctx, owner, server, "month", 100); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if ok, err := store.ConsumeMCPQuotas(ctx, owner, server); err != nil || !ok {
+			t.Fatalf("consume %d after month raise: ok=%v err=%v (want true)", i+3, ok, err)
+		}
+	}
+	if ok, err := store.ConsumeMCPQuotas(ctx, owner, server); err != nil || ok {
+		t.Fatalf("final consume: ok=%v err=%v (want false: day exhausted by 5 successful calls)", ok, err)
+	}
+}
+
+// TestConsumeMCPQuotasAtomicUnderConcurrency(Y2 并发回归): day+month 双周期
+// 事务扣减在并发下仍精确生效——limit=5 恰 5 成功, 其余整体拒绝。
+func TestConsumeMCPQuotasAtomicUnderConcurrency(t *testing.T) {
+	pool := requireDB(t)
+	ctx := context.Background()
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	const (
+		owner    = "user-combo-concurrent"
+		serverID = "server-combo-concurrent"
+		limit    = 5
+		workers  = 20
+	)
+	if err := store.SetMCPQuotaLimit(ctx, owner, serverID, "day", limit); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMCPQuotaLimit(ctx, owner, serverID, "month", 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	allowed := make([]bool, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ok, err := store.ConsumeMCPQuotas(ctx, owner, serverID)
+			if err != nil {
+				t.Errorf("worker %d: %v", i, err)
+				return
+			}
+			allowed[i] = ok
+		}(i)
+	}
+	wg.Wait()
+
+	success := 0
+	for _, ok := range allowed {
+		if ok {
+			success++
+		}
+	}
+	if success != limit {
+		t.Fatalf("expected exactly %d allowed, got %d", limit, success)
+	}
+}
+
 // 配额 CRUD: 设置/列出/删除。
 func TestMCPQuotaLimitCRUD(t *testing.T) {
 	pool := requireDB(t)

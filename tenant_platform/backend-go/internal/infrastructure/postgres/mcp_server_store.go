@@ -365,18 +365,75 @@ func (s *Store) MCPQuotaAvailable(ctx context.Context, ownerKey, serverID string
 }
 
 // ConsumeMCPQuotas 组合扣减 day + month 两个周期(proxy 每次调用执行):
-// 任一周期耗尽 → false(整体拒绝); 无限额行周期自动放行不计数。
-// 部分扣减副作用: day 成功且 month 耗尽时 day 已计数——计数尽力而为,
-// 拒绝由下一次调度过滤(MCPQuotaAvailable)与月限额兜底。
+// 任一周期耗尽 → false(整体拒绝, 不产生任何用量)。无限额行周期自动放行
+// 不计数。
+//
+// 审查 Y2: 原实现为两个独立语句(先 day 后 month)——day 成功而 month 耗尽
+// 时返回 false 但 day 已 +1, 被拒绝的调用持续烧 day 计数, 可能把 day 配额
+// 烧尽导致后续合法调用被误拒。现改为单事务: 按固定顺序(day→month)对
+// 限额行 FOR UPDATE 串行化同 (owner, server) 的并发扣减, 先整体校验再
+// 整体递增——要么都扣, 要么都不扣, 无部分扣减副作用, 也无死锁
+// (所有事务按相同顺序加锁)。
 func (s *Store) ConsumeMCPQuotas(ctx context.Context, ownerKey, serverID string) (bool, error) {
-	allowed, err := s.ConsumeMCPQuota(ctx, ownerKey, serverID, "day")
-	if err != nil {
-		return false, err
-	}
-	if !allowed {
-		return false, nil
-	}
-	return s.ConsumeMCPQuota(ctx, ownerKey, serverID, "month")
+	var allowed bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		// 1. 固定顺序锁定两个周期的限额行(无限额行 = 默认放行, 不写用量)。
+		limits := map[string]int64{}
+		for _, period := range []string{"day", "month"} {
+			var limit int64
+			err := tx.QueryRow(ctx, `
+SELECT limit_count FROM mcp_quota_limits
+WHERE owner_key = $1 AND server_id = $2 AND period = $3
+FOR UPDATE`, ownerKey, serverID, period).Scan(&limit)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			limits[period] = limit
+		}
+		// 2. 任一有限额周期已耗尽 → 整体拒绝(未产生任何用量)。
+		for period, limit := range limits {
+			var used int64
+			err := tx.QueryRow(ctx, `
+SELECT used_count FROM mcp_quota_usage
+WHERE owner_key = $1 AND server_id = $2 AND period_key = `+quotaPeriodKeyExpr(period)+`
+FOR UPDATE`, ownerKey, serverID).Scan(&used)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if used >= limit {
+				return nil // allowed = false
+			}
+		}
+		// 3. 全部未耗尽 → 两个周期各 +1(仅限有限额行的周期; 限额行已加锁,
+		//    并发下不可能在此处耗尽, ErrNoRows 仅防御)。
+		for period, limit := range limits {
+			var used int64
+			err := tx.QueryRow(ctx, `
+INSERT INTO mcp_quota_usage (owner_key, server_id, period_key, used_count)
+VALUES ($1, $2, `+quotaPeriodKeyExpr(period)+`, 1)
+ON CONFLICT (owner_key, server_id, period_key) DO UPDATE
+SET used_count = mcp_quota_usage.used_count + 1,
+    updated_at = timezone('utc', now())
+WHERE mcp_quota_usage.used_count < $3
+RETURNING used_count
+`, ownerKey, serverID, limit).Scan(&used)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil // 防御: 已耗尽, 整体拒绝
+			}
+			if err != nil {
+				return err
+			}
+		}
+		allowed = true
+		return nil
+	})
+	return allowed, err
 }
 
 // ListMCPQuotaLimits 列出某用户的全部配额限额。

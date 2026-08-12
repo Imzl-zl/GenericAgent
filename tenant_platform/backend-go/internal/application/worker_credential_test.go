@@ -439,7 +439,6 @@ func (f *jtiPersistingStore) SubmitTask(ctx context.Context, cmd domain.SubmitTa
 	panic("unexpected")
 }
 
-
 func (s *jtiPersistingStore) IsApprovedUser(_ context.Context, _ int64) (bool, error) {
 	return true, nil
 }
@@ -622,5 +621,61 @@ func TestIssueProviderCapabilitiesFiltersExhaustedQuota(t *testing.T) {
 	filtered := s.filterMCPServersByQuota(context.Background(), "42", snapshot)
 	if len(filtered.Servers) != 1 || filtered.Servers[0].ServerID != "exa" {
 		t.Fatalf("expected only exa after quota filter, got %+v", filtered.Servers)
+	}
+}
+
+// fakeQuotaServerSource 同时提供 enabled MCP 列表与配额判定(签发路径接线用)。
+type fakeQuotaServerSource struct {
+	servers   []domain.MCPServer
+	available map[string]bool
+}
+
+func (f *fakeQuotaServerSource) ListEnabledMCPServers(context.Context) ([]domain.MCPServer, error) {
+	return append([]domain.MCPServer(nil), f.servers...), nil
+}
+
+func (f *fakeQuotaServerSource) MCPQuotaAvailable(_ context.Context, ownerKey, serverID string) (bool, error) {
+	return f.available[serverID], nil
+}
+
+// TestIssueInitialWorkerCredentialsWiresQuotaFilter(B2 回归): 配额过滤必须
+// 接入签发路径——耗尽 server 不得进入下发的 MCP 快照。此前 filter 仅有
+// 定义与直接单测, 生产调用链(issueInitialWorkerCredentials)未接线。
+func TestIssueInitialWorkerCredentialsWiresQuotaFilter(t *testing.T) {
+	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpSource := &fakeQuotaServerSource{
+		servers: []domain.MCPServer{
+			{ID: 1, ServerKey: "exa", Name: "Exa", URL: "https://mcp.exa.ai/mcp",
+				Transport: domain.MCPTransportHTTP, Enabled: true, Revision: 3, TimeoutSeconds: 30},
+			{ID: 2, ServerKey: "tavily", Name: "Tavily", URL: "https://mcp.tavily.com/mcp/",
+				Transport: domain.MCPTransportHTTP, Enabled: true, Revision: 3, TimeoutSeconds: 30},
+		},
+		available: map[string]bool{"exa": true, "tavily": false},
+	}
+	dir := t.TempDir()
+	s := &scheduler{cfg: SchedulerConfig{
+		PlatformInstanceID: "p1",
+		TokenIssuer:        issuer,
+		LLMProvider:        &fakeLLMProviderSource{providers: []domain.LLMProvider{testProvider(1, 1, domain.ProviderNativeOAI, true)}},
+		LLMProxyAddr:       "http://127.0.0.1:9999",
+		MCPProxyBaseURL:    "http://platform-proxy:8090",
+		MCPServer:          mcpSource,
+		ConfigRoot:         dir,
+		ModelPolicyVersion: "test.v1",
+		Registry:           testPolicyRegistry(t),
+		RuntimeConfigDir: func(sessionKey string, generation uint64) string {
+			return filepath.Join(dir, fmt.Sprintf("%s-g%d", sessionKey, generation))
+		},
+	}}
+	task := domain.Task{ID: "t-quota-wired", SessionKey: "personal:1", RequesterID: 42}
+	set, _, err := s.issueInitialWorkerCredentials(context.Background(), task, 1)
+	if err != nil {
+		t.Fatalf("issueInitialWorkerCredentials: %v", err)
+	}
+	if len(set.MCPSnapshot.Servers) != 1 || set.MCPSnapshot.Servers[0].ServerID != "exa" {
+		t.Fatalf("issued MCP snapshot must contain only the available server, got %+v", set.MCPSnapshot.Servers)
 	}
 }
