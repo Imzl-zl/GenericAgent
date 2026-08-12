@@ -16,7 +16,8 @@
 - **llmproxy 404 兼容修复（2026-08-12，commit fa41761）**：GetProvider 错误语义迁移后 loadBoundProvider 仍查 pgx.ErrNoRows 导致集成测试回归（500 替代 404），已兼容 domain.ErrProviderNotFound；教训：store 错误语义变更是行为变更，必须 grep 全部生产调用者 + 推送前跑集成测试
 - **生产部署（2026-08-12）**：本机（lou@GenericAgent 服务器）compose 项目 genericagent 全套服务，`make build` 后滚动升级 platform+llm-proxy（镜像备份 :local.bak-20260812 回滚预案）；healthz/API 路由全链路验证通过
   - 已知数据问题（非本轮引入）：channel_configs 两条 wechat 绑定（08-08 写入）明文是 iLink 凭据字符串（`xxx@im.bot:yyy`）非 JSON，RestoreActiveBots 恢复时 poller client marshal 失败（日志 ERROR bot_lifecycle: restore channel failed）——良性不阻塞启动，待用户确认后清理/迁移
-- 最后更新：2026-08-12（错误域硬化 + 生产部署）
+- **wechat 频道恢复（2026-08-12）**：channel_configs 两条 wechat 绑定（08-08 写入，明文为 iLink 凭据字符串非 JSON）经格式迁移恢复——重加密为 `{"token": ...}`（备份 /tmp/wechat_plaintext_backup.txt）+ 重建 bot-poller 镜像（生产 poller 一直是旧 /start 契约 bot_token 顶层字段，89081f2 改 config_json 后 8-11 部署未重建 poller，两边失配才导致 marshal 失败）；恢复后两条 restored channel 无 ERROR；清理退役孤儿容器 genericagent-mcp-gateway-1
+- 最后更新：2026-08-12（错误域硬化 + 生产部署 + wechat 恢复）
 
 ## 已完成能力
 
