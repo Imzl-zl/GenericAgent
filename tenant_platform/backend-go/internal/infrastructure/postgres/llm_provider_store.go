@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -49,6 +50,9 @@ func (s *Store) GetProvider(ctx context.Context, id int64) (domain.LLMProvider, 
 	var provider domain.LLMProvider
 	query := `SELECT ` + providerColumns + ` FROM llm_providers WHERE id = $1`
 	err := scanProvider(s.pool.QueryRow(ctx, query, id), &provider)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.LLMProvider{}, domain.ErrProviderNotFound
+	}
 	return provider, err
 }
 
@@ -117,6 +121,9 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, input domain.LLMPr
 		input.RotateAPIKey, input.APIKeyCiphertext, input.APIKeyKeyVersion,
 		string(sessionJSON), string(transportJSON),
 	), &provider)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.LLMProvider{}, domain.ErrProviderNotFound
+	}
 	return provider, err
 }
 
@@ -126,7 +133,7 @@ func (s *Store) SetProviderState(
 	state domain.LLMProviderState,
 ) (domain.LLMProvider, error) {
 	if !state.Valid() {
-		return domain.LLMProvider{}, fmt.Errorf("invalid provider state %q", state)
+		return domain.LLMProvider{}, fmt.Errorf("%w: invalid provider state %q", domain.ErrValidation, state)
 	}
 
 	var provider domain.LLMProvider
@@ -134,6 +141,9 @@ func (s *Store) SetProviderState(
 		query := `SELECT ` + providerColumns + ` FROM llm_providers WHERE id = $1 FOR UPDATE`
 		var current domain.LLMProvider
 		if err := scanProvider(tx.QueryRow(ctx, query, id), &current); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrProviderNotFound
+			}
 			return fmt.Errorf("get provider %d: %w", id, err)
 		}
 		if current.State == state {
@@ -141,7 +151,7 @@ func (s *Store) SetProviderState(
 			return nil
 		}
 		if state == domain.ProviderDisabled && current.IsDefault {
-			return fmt.Errorf("default provider cannot be disabled; set another default first")
+			return domain.ErrProviderStateConflict
 		}
 		update := `UPDATE llm_providers SET
 			state = $2, revision = revision + 1, updated_at = NOW()
@@ -156,10 +166,13 @@ func (s *Store) SetDefaultProvider(ctx context.Context, id int64) error {
 		query := `SELECT ` + providerColumns + ` FROM llm_providers WHERE id = $1 FOR UPDATE`
 		var provider domain.LLMProvider
 		if err := scanProvider(tx.QueryRow(ctx, query, id), &provider); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrProviderNotFound
+			}
 			return fmt.Errorf("get provider %d: %w", id, err)
 		}
 		if !provider.IsActive() {
-			return fmt.Errorf("disabled provider cannot be default")
+			return domain.ErrProviderStateConflict
 		}
 		if provider.IsDefault {
 			return nil
@@ -178,7 +191,7 @@ func (s *Store) DeleteProvider(ctx context.Context, id int64) error {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("provider %d not found", id)
+		return domain.ErrProviderNotFound
 	}
 	return nil
 }

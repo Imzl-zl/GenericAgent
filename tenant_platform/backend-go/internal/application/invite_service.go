@@ -132,20 +132,20 @@ func (s *inviteService) ListInviteCodes(ctx context.Context) ([]domain.InviteCod
 func (s *inviteService) RegisterWithInvite(ctx context.Context, username, password, code string) (domain.User, string, error) {
 	trimmed := strings.TrimSpace(username)
 	if trimmed == "" {
-		return domain.User{}, "", fmt.Errorf("username is required")
+		return domain.User{}, "", fmt.Errorf("%w: username is required", domain.ErrValidation)
 	}
 	if len(trimmed) > MaxUsernameLen {
-		return domain.User{}, "", fmt.Errorf("username must be <= %d bytes", MaxUsernameLen)
+		return domain.User{}, "", fmt.Errorf("%w: username must be <= %d bytes", domain.ErrValidation, MaxUsernameLen)
 	}
 	if len(password) < MinPasswordLen {
-		return domain.User{}, "", fmt.Errorf("password must be >= %d characters", MinPasswordLen)
+		return domain.User{}, "", fmt.Errorf("%w: password must be >= %d characters", domain.ErrValidation, MinPasswordLen)
 	}
 	if code == "" {
-		return domain.User{}, "", fmt.Errorf("invite code is required")
+		return domain.User{}, "", fmt.Errorf("%w: invite code is required", domain.ErrValidation)
 	}
 	now := time.Now().UTC()
 	if err := s.store.CheckInviteCode(ctx, code, now); err != nil {
-		return domain.User{}, "", fmt.Errorf("invalid invite code")
+		return domain.User{}, "", domain.ErrInviteCodeInvalid
 	}
 	passwordHash, err := HashPassword(password)
 	if err != nil {
@@ -174,7 +174,7 @@ func (s *inviteService) RegisterWithInvite(ctx context.Context, username, passwo
 func (s *inviteService) Login(ctx context.Context, username, password string) (domain.User, string, error) {
 	trimmed := strings.TrimSpace(username)
 	if trimmed == "" {
-		return domain.User{}, "", fmt.Errorf("username is required")
+		return domain.User{}, "", fmt.Errorf("%w: username is required", domain.ErrValidation)
 	}
 	if password == "" {
 		return domain.User{}, "", fmt.Errorf("password is required")

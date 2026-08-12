@@ -190,7 +190,7 @@ func (s *Server) handleAdminCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.users.CreateUser(r.Context(), body.Username, body.Password)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "USER_CREATE_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "USER_CREATE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusCreated, userReply(user))
@@ -204,7 +204,7 @@ func (s *Server) handleAdminApproveUser(w http.ResponseWriter, r *http.Request) 
 	}
 	user, err := s.users.ApproveUser(r.Context(), uid)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "USER_APPROVE_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "USER_APPROVE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, userReply(user))
@@ -218,7 +218,7 @@ func (s *Server) handleAdminBlockUser(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.users.BlockUser(r.Context(), uid)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "USER_BLOCK_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "USER_BLOCK_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, userReply(user))

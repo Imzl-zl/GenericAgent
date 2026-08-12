@@ -2,10 +2,12 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
@@ -48,7 +50,7 @@ SELECT EXISTS (
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("invite code is invalid, used, expired, or revoked")
+		return domain.ErrInviteCodeInvalid
 	}
 	return nil
 }
@@ -76,10 +78,13 @@ FROM invite_codes
 WHERE code = $1
 FOR UPDATE
 `, code).Scan(&state, &expiresAt); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrInviteCodeInvalid
+			}
 			return fmt.Errorf("invalid invite code: %w", err)
 		}
 		if state != domain.InviteCodeActive || !now.Before(expiresAt) {
-			return fmt.Errorf("invite code is used, expired, or revoked")
+			return domain.ErrInviteCodeInvalid
 		}
 
 		if err := scanUser(tx.QueryRow(ctx, `
@@ -87,6 +92,11 @@ INSERT INTO users (username, status, password_hash)
 VALUES ($1, 'pending', $2)
 RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 `, username, passwordHash), &user); err != nil {
+			// 唯一键冲突 23505 = 用户名已存在(业务拒绝 → 409)。
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.ErrUsernameExists
+			}
 			return err
 		}
 		// 生命周期不变量: users 行 ⇔ personal workspace 行(见
@@ -132,7 +142,7 @@ UPDATE invite_codes SET state = 'revoked' WHERE code = $1 AND state = 'active'
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("invite code %s not found or not active", code)
+		return domain.ErrInviteNotFound
 	}
 	return nil
 }

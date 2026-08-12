@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -161,4 +162,36 @@ func countWorkspaceRows(t *testing.T, pool *pgxpool.Pool, sessionKey string) int
 		t.Fatal(err)
 	}
 	return n
+}
+
+// TestUserStoreBusinessSentinels(错误域分类, 2026-08 审查): 业务拒绝必须
+// 以 domain 哨兵返回(而非裸 DB 错误/字符串错误), handler 层据此映射
+// 4xx——重复用户名 409, 目标用户不存在 404; 其余 DB 故障保持 500。
+func TestUserStoreBusinessSentinels(t *testing.T) {
+	pool := OpenTestPool(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	const username = "sentinel-user"
+	if _, err := store.CreateUser(ctx, username, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	// 重复用户名 → ErrUsernameExists(唯一键 23505 被归类为业务拒绝)。
+	_, err = store.CreateUser(ctx, username, "hash2")
+	if !errors.Is(err, domain.ErrUsernameExists) {
+		t.Fatalf("duplicate username err = %v, want ErrUsernameExists", err)
+	}
+	// 审批不存在的用户 → ErrUserNotFound(pgx.ErrNoRows 归类为业务拒绝)。
+	_, err = store.ApproveUser(ctx, 999999999)
+	if !errors.Is(err, domain.ErrUserNotFound) {
+		t.Fatalf("approve missing user err = %v, want ErrUserNotFound", err)
+	}
+	// 封禁不存在的用户 → ErrUserNotFound。
+	_, _, err = store.BlockUser(ctx, 999999999)
+	if !errors.Is(err, domain.ErrUserNotFound) {
+		t.Fatalf("block missing user err = %v, want ErrUserNotFound", err)
+	}
 }

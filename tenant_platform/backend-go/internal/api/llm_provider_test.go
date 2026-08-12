@@ -271,7 +271,8 @@ func TestAdminLLMProviderStateLifecycle(t *testing.T) {
 	}
 
 	setDisabledDefault := performProviderCommand(t, srv, "/v1/admin/llm-providers/"+itoa(secondID)+"/default")
-	if setDisabledDefault.Code != http.StatusBadRequest {
+	// 状态冲突(禁用 provider 不可设为默认)→ 409(错误域分类, 2026-08 审查)。
+	if setDisabledDefault.Code != http.StatusConflict {
 		t.Fatalf("disabled default status=%d body=%s", setDisabledDefault.Code, setDisabledDefault.Body.String())
 	}
 	enabled := performProviderCommand(t, srv, "/v1/admin/llm-providers/"+itoa(secondID)+"/enable")

@@ -64,7 +64,7 @@ func (s *Server) handleAdminCreateMCPServer(w http.ResponseWriter, r *http.Reque
 		MaxInstances: body.MaxInstances,
 	})
 	if err != nil {
-		writeMCPStoreError(w, err, "MCP_SERVER_CREATE_FAILED", tid)
+		writeStoreError(w, err, "MCP_SERVER_CREATE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusCreated, mcpServerReply(server))
@@ -125,7 +125,7 @@ func (s *Server) handleAdminUpdateMCPServer(w http.ResponseWriter, r *http.Reque
 		},
 	})
 	if err != nil {
-		writeMCPStoreError(w, err, "MCP_SERVER_UPDATE_FAILED", tid)
+		writeStoreError(w, err, "MCP_SERVER_UPDATE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, mcpServerReply(server))
@@ -178,7 +178,7 @@ func (s *Server) handleAdminDeleteMCPServer(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := s.mcpServers.DeleteMCPServer(r.Context(), id); err != nil {
-		writeMCPStoreError(w, err, "MCP_SERVER_DELETE_FAILED", tid)
+		writeStoreError(w, err, "MCP_SERVER_DELETE_FAILED", tid)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -200,21 +200,10 @@ func (s *Server) handleAdminSetMCPServerEnabled(w http.ResponseWriter, r *http.R
 	}
 	server, err := s.mcpServers.SetMCPServerEnabled(r.Context(), id, enabled)
 	if err != nil {
-		writeMCPStoreError(w, err, "MCP_SERVER_STATE_FAILED", tid)
+		writeStoreError(w, err, "MCP_SERVER_STATE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, mcpServerReply(server))
-}
-
-func writeMCPStoreError(w http.ResponseWriter, err error, code, tid string) {
-	statusCode := http.StatusInternalServerError
-	switch {
-	case errors.Is(err, domain.ErrMCPServerNotFound):
-		statusCode = http.StatusNotFound
-	case errors.Is(err, domain.ErrMCPServerConflict):
-		statusCode = http.StatusConflict
-	}
-	writeErr(w, statusCode, code, err.Error(), tid)
 }
 
 func parseMCPServerID(w http.ResponseWriter, r *http.Request, tid string) (int64, bool) {

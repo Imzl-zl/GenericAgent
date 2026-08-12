@@ -2,10 +2,12 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
@@ -26,6 +28,12 @@ INSERT INTO users (username, status, password_hash)
 VALUES ($1, 'pending', $2)
 RETURNING id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 `, username, nullString(passwordHash)), &u); err != nil {
+			// 唯一键冲突 23505 = 用户名已存在(业务拒绝 → 409);
+			// 其余 DB 错误透传(基础设施故障 → 500)。
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.ErrUsernameExists
+			}
 			return err
 		}
 		wsKey := fmt.Sprintf("personal:%d", u.ID)
@@ -74,6 +82,9 @@ func (s *Store) ApproveUser(ctx context.Context, userID int64) (domain.User, err
 SELECT id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 FROM users WHERE id = $1 FOR UPDATE
 `, userID), &u); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrUserNotFound
+			}
 			return err
 		}
 		if u.Status != domain.UserPending {
@@ -116,6 +127,9 @@ func (s *Store) BlockUser(ctx context.Context, userID int64) (domain.User, []dom
 SELECT id, username, COALESCE(password_hash,''), status, COALESCE(bootstrap_marker,''), created_at, approved_at
 FROM users WHERE id = $1 FOR UPDATE
 `, userID), &u); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrUserNotFound
+			}
 			return err
 		}
 		if u.Status == domain.UserBlocked {

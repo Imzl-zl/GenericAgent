@@ -27,7 +27,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	user, token, err := s.invite.RegisterWithInvite(r.Context(), body.Username, body.Password, body.InviteCode)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "REGISTER_FAILED", err.Error(), tid)
+		// 错误域分类(writeStoreError): 校验/无效码 → 400, 用户名冲突 → 409,
+		// 基础设施故障 → 500(2026-08 审查: 原实现把 DB 故障也映射 400)。
+		writeStoreError(w, err, "REGISTER_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -158,7 +160,7 @@ func (s *Server) handleAdminRevokeInviteCode(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err := s.invite.RevokeInviteCode(r.Context(), code); err != nil {
-		writeErr(w, http.StatusBadRequest, "INVITE_REVOKE_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "INVITE_REVOKE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": true})

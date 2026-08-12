@@ -68,10 +68,10 @@ func NewUserService(cfg UserServiceConfig) (UserService, error) {
 func (s *userService) CreateUser(ctx context.Context, username, password string) (domain.User, error) {
 	trimmed := strings.TrimSpace(username)
 	if trimmed == "" {
-		return domain.User{}, fmt.Errorf("username is required")
+		return domain.User{}, fmt.Errorf("%w: username is required", domain.ErrValidation)
 	}
 	if len(trimmed) > MaxUsernameLen {
-		return domain.User{}, fmt.Errorf("username must be <= %d bytes", MaxUsernameLen)
+		return domain.User{}, fmt.Errorf("%w: username must be <= %d bytes", domain.ErrValidation, MaxUsernameLen)
 	}
 	passwordHash, err := HashPassword(password)
 	if err != nil {
@@ -82,14 +82,14 @@ func (s *userService) CreateUser(ctx context.Context, username, password string)
 
 func (s *userService) ApproveUser(ctx context.Context, userID int64) (domain.User, error) {
 	if userID <= 0 {
-		return domain.User{}, fmt.Errorf("user id must be positive")
+		return domain.User{}, fmt.Errorf("%w: user id must be positive", domain.ErrValidation)
 	}
 	return s.store.ApproveUser(ctx, userID)
 }
 
 func (s *userService) BlockUser(ctx context.Context, userID int64) (domain.User, error) {
 	if userID <= 0 {
-		return domain.User{}, fmt.Errorf("user id must be positive")
+		return domain.User{}, fmt.Errorf("%w: user id must be positive", domain.ErrValidation)
 	}
 	user, affected, err := s.store.BlockUser(ctx, userID)
 	if err != nil {
@@ -121,7 +121,7 @@ func (s *userService) CountApprovedUsers(ctx context.Context) (int, error) {
 
 func (s *userService) ListMyTasks(ctx context.Context, requesterUserID int64, limit int) ([]domain.Task, error) {
 	if requesterUserID <= 0 {
-		return nil, fmt.Errorf("user id must be positive")
+		return nil, fmt.Errorf("%w: user id must be positive", domain.ErrValidation)
 	}
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -131,14 +131,14 @@ func (s *userService) ListMyTasks(ctx context.Context, requesterUserID int64, li
 
 func (s *userService) CountMyTaskStats(ctx context.Context, requesterUserID int64) (map[domain.TaskStatus]int, error) {
 	if requesterUserID <= 0 {
-		return nil, fmt.Errorf("user id must be positive")
+		return nil, fmt.Errorf("%w: user id must be positive", domain.ErrValidation)
 	}
 	return s.store.CountMyTaskStats(ctx, requesterUserID)
 }
 
 func (s *userService) GetUserByID(ctx context.Context, userID int64) (int64, string, domain.UserStatus, error) {
 	if userID <= 0 {
-		return 0, "", "", fmt.Errorf("user id must be positive")
+		return 0, "", "", fmt.Errorf("%w: user id must be positive", domain.ErrValidation)
 	}
 	return s.store.GetUserByID(ctx, userID)
 }

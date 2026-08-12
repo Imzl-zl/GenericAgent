@@ -47,7 +47,7 @@ func (s *Server) handleAdminCreateLLMProvider(w http.ResponseWriter, r *http.Req
 		SessionConfig: body.SessionConfig, TransportConfig: body.TransportConfig,
 	})
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "PROVIDER_CREATE_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "PROVIDER_CREATE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusCreated, llmProviderReply(provider))
@@ -83,7 +83,7 @@ func (s *Server) handleAdminGetLLMProvider(w http.ResponseWriter, r *http.Reques
 	}
 	provider, err := s.llmProviders.GetProvider(r.Context(), id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "PROVIDER_NOT_FOUND", err.Error(), tid)
+		writeStoreError(w, err, "PROVIDER_NOT_FOUND", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, llmProviderReply(provider))
@@ -128,7 +128,7 @@ func (s *Server) handleAdminUpdateLLMProvider(w http.ResponseWriter, r *http.Req
 		RotateAPIKey: rotateKey,
 	})
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "PROVIDER_UPDATE_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "PROVIDER_UPDATE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, llmProviderReply(provider))
@@ -145,7 +145,7 @@ func (s *Server) handleAdminDeleteLLMProvider(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if err := s.llmProviders.DeleteProvider(r.Context(), id); err != nil {
-		writeErr(w, http.StatusBadRequest, "PROVIDER_DELETE_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "PROVIDER_DELETE_FAILED", tid)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -162,7 +162,7 @@ func (s *Server) handleAdminSetDefaultLLMProvider(w http.ResponseWriter, r *http
 		return
 	}
 	if err := s.llmProviders.SetDefaultProvider(r.Context(), id); err != nil {
-		writeErr(w, http.StatusBadRequest, "SET_DEFAULT_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "SET_DEFAULT_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"provider_id": id, "is_default": true})
@@ -192,7 +192,7 @@ func (s *Server) handleAdminSetLLMProviderState(
 	}
 	provider, err := s.llmProviders.SetProviderState(r.Context(), id, state)
 	if err != nil {
-		writeErr(w, http.StatusConflict, "PROVIDER_STATE_FAILED", err.Error(), tid)
+		writeStoreError(w, err, "PROVIDER_STATE_FAILED", tid)
 		return
 	}
 	writeJSON(w, http.StatusOK, llmProviderReply(provider))

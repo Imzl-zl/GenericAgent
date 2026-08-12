@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -8,6 +9,13 @@ import (
 )
 
 const MaxExtraSystemPromptBytes = 64 * 1024
+
+// ErrProviderNotFound 目标 LLM provider 不存在(业务拒绝 → 404,
+// 见 docs/FAILURE_POLICY.zh-CN.md 错误域分类)。
+var ErrProviderNotFound = errors.New("LLM provider not found")
+
+// ErrProviderStateConflict 当前状态不允许该操作(如禁用默认 provider)——409。
+var ErrProviderStateConflict = errors.New("provider state does not allow this operation")
 
 // LLMProviderType selects the native GA Session implementation.
 type LLMProviderType string
