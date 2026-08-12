@@ -12,7 +12,11 @@
 - **企微渠道完成（2026-08-11，commit 3023e3d2）**：WeComAdapter（wecom_aibot_sdk WS）+ 渠道绑定页企业微信卡片 + 流式判定矩阵 + delivery 回复路由（审查 C1 修复）；真实渠道冒烟待用户凭据，流式模式建议保持 off/final_only
 - **MCP 治理完成（2026-08-11，commit 58b27620）**：key 平台侧注入（mcp_servers.headers，proxy 转发注入，worker 快照永不含 key）+ 每用户×每 server×周期配额（proxy 原子扣减 429）+ **mcp-gateway 退役**（stdio transport 整体移除，pandoc 本地化后无业务用途）+ web JSON 直接编辑 + 用户配额面板；集成测试修复（_register_user 冗余直插 workspace，0050 不变量遗留）
 - **推送审查修复完成（2026-08-12，B1/B2/Y1/Y2/Y3/Y5+三轮）**：IM 流式接线（main.go 装配时序）+ MCP 配额调度过滤接入签发路径 + proxy 扣配额后移 resolve + 双周期事务扣减 + 掩码不匹配拒绝 + **proxy JTI 预算后移（validate/consume 拆分，拒绝路径不计量，MCP+Sophub 对称）+ 配额两阶段（预检+条件扣减）**；三轮修复 B2 配额属主分裂（filter 改按 workspace owner，与 proxy 同源）+ 防御哨兵错误码；含回归测试，Go 全量+race 绿
-- 最后更新：2026-08-12（推送审查修复 5 项）
+- **错误域分类硬化完成（2026-08-12，commit 35572e5）**：业务拒绝哨兵化（ErrValidation/ErrUserNotFound/ErrUsernameExists/ErrProviderNotFound 等 6 新哨兵）+ store 23505/ErrNoRows 归类 + api writeStoreError 统一映射（400/404/409/500）+ FAILURE_POLICY.zh-CN.md（错误域分类 + 失败策略矩阵 + 审查闭环约定）；行为变化：用户名冲突 400→409、不存在 404、DB 故障 400→500
+- **llmproxy 404 兼容修复（2026-08-12，commit fa41761）**：GetProvider 错误语义迁移后 loadBoundProvider 仍查 pgx.ErrNoRows 导致集成测试回归（500 替代 404），已兼容 domain.ErrProviderNotFound；教训：store 错误语义变更是行为变更，必须 grep 全部生产调用者 + 推送前跑集成测试
+- **生产部署（2026-08-12）**：本机（lou@GenericAgent 服务器）compose 项目 genericagent 全套服务，`make build` 后滚动升级 platform+llm-proxy（镜像备份 :local.bak-20260812 回滚预案）；healthz/API 路由全链路验证通过
+  - 已知数据问题（非本轮引入）：channel_configs 两条 wechat 绑定（08-08 写入）明文是 iLink 凭据字符串（`xxx@im.bot:yyy`）非 JSON，RestoreActiveBots 恢复时 poller client marshal 失败（日志 ERROR bot_lifecycle: restore channel failed）——良性不阻塞启动，待用户确认后清理/迁移
+- 最后更新：2026-08-12（错误域硬化 + 生产部署）
 
 ## 已完成能力
 
