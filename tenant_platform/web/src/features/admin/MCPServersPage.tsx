@@ -38,6 +38,11 @@ function serverToJSON(server?: MCPServer): string {
     url: server?.url ?? '',
     timeout_seconds: server?.timeout_seconds ?? 30,
   };
+  // 新增模板显式带 transport(http 虽为默认值, 写出来提示字段存在);
+  // 编辑已有 http server 时省略(回显最小化, 与"http 可省略"语义一致)。
+  if (!server) {
+    config.transport = 'http';
+  }
   if (server?.transport && server.transport !== 'http') {
     config.transport = server.transport;
   }
@@ -52,6 +57,24 @@ function serverToJSON(server?: MCPServer): string {
   }
   return JSON.stringify(config, null, 2);
 }
+
+const HTTP_EXAMPLE = `{
+  "server_key": "exa",
+  "name": "Exa",
+  "transport": "http",
+  "url": "https://mcp.exa.ai/mcp",
+  "headers": { "x-api-key": "exa-xxx" },
+  "timeout_seconds": 30
+}`;
+
+const STDIO_EXAMPLE = `{
+  "server_key": "serena",
+  "name": "Serena",
+  "transport": "stdio",
+  "command": "serena",
+  "args": ["start-mcp-server", "--context=agent", "--project-from-cwd"],
+  "timeout_seconds": 60
+}`;
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof ApiClientError ? `${error.code}: ${error.message}` : fallback;
@@ -219,24 +242,26 @@ export function MCPServersPage() {
                 spellCheck={false}
                 value={configText}
                 onChange={(event) => setConfigText(event.target.value)}
-                placeholder={JSON.stringify({
-                  server_key: 'exa',
-                  name: 'Exa',
-                  url: 'https://mcp.exa.ai/mcp',
-                  headers: { 'x-api-key': 'exa-xxx' },
-                  timeout_seconds: 30,
-                }, null, 2)}
               />
             </label>
-            <p className="admin-subtitle provider-form-full">
-              示例：{'{ "headers": { "Authorization": "Bearer tvly-xxx" } }'} 或 {'{ "headers": { "x-api-key": "..." } }'}(两种鉴权头都支持)。
-              编辑已有 key 时保持掩码值(如 "tvly***")不变更，写明文即更新。
-            </p>
-            <p className="admin-subtitle provider-form-full">
-              stdio 示例(mcp.json 主流格式, Worker 沙箱内进程宿主):
-              {'{ "transport": "stdio", "command": "serena", "args": ["start-mcp-server", "--context=agent", "--project-from-cwd"] }'}。
-              http 为默认 transport, 可省略。stdio 调用不经过 Platform proxy, 不参与按调用配额计量。
-            </p>
+            <div className="mcp-examples provider-form-full">
+              <details open>
+                <summary>HTTP 示例（默认 transport，url + headers）</summary>
+                <pre>{HTTP_EXAMPLE}</pre>
+                <p className="admin-subtitle">
+                  headers 支持两种鉴权头：{'{ "Authorization": "Bearer tvly-xxx" }'} 或 {'{ "x-api-key": "..." }'}。
+                  编辑已有 key 时保持掩码值（如 "tvly***"）不变更，写明文即更新。
+                </p>
+              </details>
+              <details>
+                <summary>stdio 示例（Worker 沙箱内进程宿主，不经 proxy、不按调用计量）</summary>
+                <pre>{STDIO_EXAMPLE}</pre>
+                <p className="admin-subtitle">
+                  stdio 调用不经过 Platform proxy，不参与按调用配额计量；
+                  url 需留空、不支持 headers；command 为裸命令名或绝对路径。
+                </p>
+              </details>
+            </div>
             <div className="provider-actions provider-form-full">
               {editing && <Button type="button" variant="ghost" onClick={resetForm}><X size={15} />取消</Button>}
               <Button type="submit" isLoading={isSaving}><Save size={15} />保存</Button>

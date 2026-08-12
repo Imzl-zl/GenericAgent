@@ -203,6 +203,50 @@
   grid-column: 1 / -1;
 }
 
+/* MCP 配置示例(可折叠): 标准多行 JSON 展示, 与输入框同风格。 */
+.mcp-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mcp-examples details {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.mcp-examples summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary, var(--text-muted));
+  user-select: none;
+}
+
+.mcp-examples summary:hover {
+  color: var(--text-primary);
+}
+
+.mcp-examples pre {
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  background: var(--bg-overlay);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.mcp-examples .admin-subtitle {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
 .provider-actions {
   display: flex;
   justify-content: flex-end;
