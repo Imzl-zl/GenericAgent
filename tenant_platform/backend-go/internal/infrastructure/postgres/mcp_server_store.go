@@ -267,6 +267,11 @@ func (s *Store) SetMCPQuotaLimit(ctx context.Context, ownerKey, serverID, period
 // ConsumeMCPQuota 原子扣减周期配额(照搬 ConsumeCapabilityCall 原子模式):
 // 有限额行时首调插行 used=1, 后续 +1; 已到 limit 不再更新并返回 (false, nil)。
 // 无限额行 = 默认放行(D6), 不写用量。
+//
+// 已废弃(2026-08 审查): 生产调用已全部切换到 ConsumeMCPQuotas(day+month
+// 单事务整体扣减, 无部分扣减副作用)。本方法仅存于测试; 单语句路径不锁
+// 限额行, 若与事务版并发调用会破坏串行化不变量——禁止在生产代码中恢复
+// 使用, 如需单周期扣减请走 ConsumeMCPQuotas。
 func (s *Store) ConsumeMCPQuota(ctx context.Context, ownerKey, serverID, period string) (bool, error) {
 	if err := validateQuotaPeriod(period); err != nil {
 		return false, err

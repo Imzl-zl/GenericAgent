@@ -341,3 +341,42 @@ func TestAdminMCPUpdateRejectsStaleMaskedHeaders(t *testing.T) {
 		t.Fatalf("masked value for new key must not be stored, got %q", store.server.Headers["x-api-key"])
 	}
 }
+
+// failingListStore 在 ListMCPServers 上注入基础设施故障(模拟 DB 不可用),
+// 其余操作委托给 memoryMCPStore。
+type failingListStore struct {
+	*memoryMCPStore
+	listErr error
+}
+
+func (f *failingListStore) ListMCPServers(context.Context) ([]domain.MCPServer, error) {
+	return nil, f.listErr
+}
+
+// TestAdminMCPUpdateStoreFailureIs500(2026-08 审查): 掩码合并前的存储读取
+// 失败是基础设施故障 → 500, 不得降级为 400 VALIDATION_ERROR(否则客户端
+// 会把 DB 故障当成自己的输入错误, 无限重试)。
+func TestAdminMCPUpdateStoreFailureIs500(t *testing.T) {
+	store := &failingListStore{
+		memoryMCPStore: &memoryMCPStore{server: domain.MCPServer{
+			ID: 1, ServerKey: "tavily", Name: "Tavily", URL: "https://mcp.tavily.com/mcp/",
+			TimeoutSeconds: 30, Headers: map[string]string{"Authorization": "Bearer tvly-secret-12345"},
+			Revision: 1, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}},
+		listErr: errors.New("db unavailable"),
+	}
+	server := &Server{mcpServers: store}
+	req := httptest.NewRequest("PUT", "/v1/admin/mcp-servers/1", strings.NewReader(`{
+		"server_key":"tavily","name":"Tavily","url":"https://mcp.tavily.com/mcp/",
+		"headers":{"x-api-key":"abcd***"},"timeout_seconds":30
+	}`))
+	req.SetPathValue("mcp_server_id", "1")
+	response := httptest.NewRecorder()
+	server.handleAdminUpdateMCPServer(response, req)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("store failure must map to 500, got %d body=%s", response.Code, response.Body.String())
+	}
+	if body := response.Body.String(); !strings.Contains(body, "MCP_SERVER_UPDATE_FAILED") {
+		t.Fatalf("body = %s, want MCP_SERVER_UPDATE_FAILED", body)
+	}
+}

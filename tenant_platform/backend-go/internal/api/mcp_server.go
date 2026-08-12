@@ -101,11 +101,16 @@ func (s *Server) handleAdminUpdateMCPServer(w http.ResponseWriter, r *http.Reque
 	}
 	// 掩码合并(JSON 编辑契约): 提交值与当前存储值的掩码一致时保留原 key
 	// (secret 惯例: 留空/掩码 = 不变, 明文 = 更新)。掩码不匹配/新键掩码是
-	// 客户端校验错误 → 400(审查 Y3: 拒绝而非落库)。
+	// 客户端校验错误 → 400(审查 Y3: 拒绝而非落库); 存储读取失败是
+	// 基础设施故障 → 500(2026-08 审查: 不得把 DB 故障降级为客户端错误)。
 	if len(body.Headers) > 0 {
 		merged, mergeErr := s.mergeMaskedHeaders(r.Context(), id, body.Headers)
 		if mergeErr != nil {
-			writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", mergeErr.Error(), tid)
+			if errors.Is(mergeErr, errMaskedHeaderValue) {
+				writeErr(w, http.StatusBadRequest, "VALIDATION_ERROR", mergeErr.Error(), tid)
+			} else {
+				writeErr(w, http.StatusInternalServerError, "MCP_SERVER_UPDATE_FAILED", mergeErr.Error(), tid)
+			}
 			return
 		}
 		body.Headers = merged
@@ -131,6 +136,11 @@ func (s *Server) handleAdminUpdateMCPServer(w http.ResponseWriter, r *http.Reque
 // 不一致(陈旧回显/并发编辑/伪造)拒绝而非落库(审查 Y3: 原实现把不匹配的
 // 掩码字符串原样存为真实 header, 注入上游后认证必失败); 新键提交掩码值
 // 同样拒绝(新键必须明文, 与 create 路径一致)。非掩码值 = 明文更新/新增。
+// errMaskedHeaderValue 标记掩码值校验失败(新键掩码/掩码与存储不匹配)——
+// 属客户端校验错误(400); mergeMaskedHeaders 的其他错误(存储读取失败)
+// 是基础设施故障(500), 调用方用 errors.Is 区分。
+var errMaskedHeaderValue = errors.New("masked header value invalid")
+
 func (s *Server) mergeMaskedHeaders(ctx context.Context, id int64, submitted map[string]string) (map[string]string, error) {
 	servers, err := s.mcpServers.ListMCPServers(ctx)
 	if err != nil {
@@ -148,10 +158,10 @@ func (s *Server) mergeMaskedHeaders(ctx context.Context, id int64, submitted map
 		if strings.HasSuffix(value, "***") {
 			stored, exists := current.Headers[key]
 			if !exists {
-				return nil, fmt.Errorf("header %q: masked value is not valid for a new key (provide plaintext)", key)
+				return nil, fmt.Errorf("%w: header %q: masked value is not valid for a new key (provide plaintext)", errMaskedHeaderValue, key)
 			}
 			if maskSecretValue(stored) != value {
-				return nil, fmt.Errorf("header %q: masked value does not match the stored secret (stale editor or concurrent change; re-fetch and retry)", key)
+				return nil, fmt.Errorf("%w: header %q: masked value does not match the stored secret (stale editor or concurrent change; re-fetch and retry)", errMaskedHeaderValue, key)
 			}
 			merged[key] = stored
 			continue

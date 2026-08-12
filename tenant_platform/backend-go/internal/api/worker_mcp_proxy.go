@@ -26,8 +26,11 @@ type MCPTarget struct {
 //     (管理员未启用的 server 一律 404);
 //   - 调用按 JTI 原子计量(预算耗尽 429, 无预算 fail-closed 拒绝);
 //   - 计量语义(审查 Y5): 仅对"调用已发起"的请求消费 JTI 预算——客户端
-//     错误(401/400)、白名单拒绝(404)、配额拒绝(429)与系统故障(503)
-//     路径不消费; 上游调用失败(502)视为已发起, 消费。
+//     错误(401/400)、白名单拒绝(404)、配额预检拒绝(429)与预检前的
+//     系统故障(503)路径不消费; 上游调用失败(502)视为已发起, 消费。
+//     例外(已文档化的白扣边界): 配额扣减阶段(quotaConsume)的故障(503)
+//     与并发竞态拒绝(429)发生在 JTI 消费之后——此时 JTI 已扣而调用未
+//     发起, 属短期预算可接受的一次性白扣(用户配额从不错扣)。
 //   - 仅转发 JSON-RPC 流(Streamable HTTP), 不缓存/不解析内容;
 //   - 转发时注入平台侧持有的凭据头(MCPTarget.Headers, 来自 mcp_servers.headers);
 //   - 配额强制: 每次调用按 owner(经 sessionKey 解析)对 day+month 周期原子
@@ -40,8 +43,10 @@ type WorkerMCPProxy struct {
 	consume  func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error)
 	// quotaCheck 是配额只读预检(MCPQuotaAvailable, 不扣减); quotaConsume
 	// 是配额条件扣减(ConsumeMCPQuotas)。两阶段分离(审查 Y5 二轮): 预检
-	// 在 JTI 消费之前, 扣减在 JTI 消费之后——任一拒绝路径都不产生任何
-	// 扣减副作用(仅极端竞态下 JTI 可能白扣一次, 短期预算可接受)。
+	// 在 JTI 消费之前, 扣减在 JTI 消费之后——预检/白名单/客户端错误拒绝
+	// 路径不产生任何扣减副作用。已文档化的白扣边界: quotaConsume 阶段的
+	// 故障(503)或并发竞态耗尽(429)发生在 JTI 消费之后, JTI 可能白扣一次
+	// (短期预算可接受); 用户配额在任何路径都不被错扣。
 	quotaCheck  func(ctx context.Context, sessionKey, serverID string) (bool, error)
 	quotaConsume func(ctx context.Context, sessionKey, serverID string) (bool, error)
 	client      *http.Client // 30s 响应头超时(挂死服务器快速失败)
@@ -201,8 +206,9 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 配额条件扣减(预检已通过, 仅极端并发竞态下可能在此耗尽——此时
-	// JTI 已消费一次, 属可接受的短期预算白扣; 用户配额从不错扣)。
+	// 配额条件扣减(预检已通过): 并发竞态下可能在此耗尽(429)或存储故障
+	// (503)——此时 JTI 已消费一次, 属已文档化的白扣边界(短期预算可接受);
+	// 用户配额从不错扣(事务整体拒绝/回滚)。
 	if p.quotaConsume != nil {
 		allowed, err := p.quotaConsume(r.Context(), claims.Subject, serverID)
 		if err != nil {
