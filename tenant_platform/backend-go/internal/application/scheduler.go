@@ -139,6 +139,11 @@ type MCPServerSource interface {
 	// (无限额行 = 默认放行; 任一周期耗尽 = 不可用)。调度签发 MCP
 	// capability 前按用户过滤, 耗尽 server 不下发(任务内不可见)。
 	MCPQuotaAvailable(ctx context.Context, ownerKey, serverID string) (bool, error)
+	// GetWorkspaceOwner 解析 session_key → workspace 属主用户 ID。配额
+	// 属主统一 = workspace owner(与 proxy 强制路径同源): requester 可能
+	// 是团队成员(team:<id> workspace), 调度过滤与 proxy 扣减必须同一属主
+	// (审查三轮: 按 RequesterID 过滤会与 proxy 的 owner 扣减分裂)。
+	GetWorkspaceOwner(ctx context.Context, sessionKey string) (int64, error)
 }
 
 type CapabilityStore interface {

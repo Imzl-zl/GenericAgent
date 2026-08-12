@@ -308,6 +308,13 @@ func validateQuotaPeriod(period string) error {
 	return nil
 }
 
+// errQuotaExhaustedInTxn 是 ConsumeMCPQuotas 事务内的哨兵错误: 扣减循环
+// 防御分支(理论上不可达, 限额行已 FOR UPDATE)触发时返回它——withTx 遇
+// error 回滚(全部周期不扣), 外层把哨兵映射回 (false, nil) = 配额耗尽 429
+// 语义, 而不是系统故障 503(审查三轮: 原防御分支先 return nil 提交造成
+// 部分扣减, 后改 return error 又漂移为 503 错误码)。
+var errQuotaExhaustedInTxn = errors.New("quota exhausted in transaction")
+
 // quotaPeriodKeyExpr 生成 UTC 周期键: day='YYYY-MM-DD' / month='YYYY-MM'。
 // 仅接受 validateQuotaPeriod 校验过的 day/month, 无注入面。
 func quotaPeriodKeyExpr(period string) string {
@@ -411,9 +418,9 @@ FOR UPDATE`, ownerKey, serverID).Scan(&used)
 			}
 		}
 		// 3. 全部未耗尽 → 两个周期各 +1(仅限有限额行的周期; 限额行已加锁,
-		//    并发下不可能在此处耗尽, ErrNoRows 仅防御)。防御触发必须返回
-		//    error 触发回滚——返回 nil 会提交事务, 已扣周期生效造成部分扣减
-		//    (审查二轮: 原防御分支 return nil 语义错误)。
+		//    并发下不可能在此处耗尽, ErrNoRows 仅防御)。防御触发返回哨兵
+		//    error 触发回滚(全部周期不扣)——返回 nil 会提交事务造成部分扣减;
+		//    哨兵在外层映射为配额耗尽(429)而非系统故障(503)。
 		for period, limit := range limits {
 			var used int64
 			err := tx.QueryRow(ctx, `
@@ -426,7 +433,7 @@ WHERE mcp_quota_usage.used_count < $3
 RETURNING used_count
 `, ownerKey, serverID, limit).Scan(&used)
 			if errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("quota %s consumed concurrently (limit %d): %w", period, limit, err)
+				return errQuotaExhaustedInTxn
 			}
 			if err != nil {
 				return err
@@ -435,6 +442,10 @@ RETURNING used_count
 		allowed = true
 		return nil
 	})
+	if errors.Is(err, errQuotaExhaustedInTxn) {
+		// 防御触发: 事务已回滚(无部分扣减), 语义 = 配额耗尽(429), 非故障(503)。
+		return false, nil
+	}
 	return allowed, err
 }
 

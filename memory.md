@@ -11,7 +11,7 @@
 - **IM 流式输出完成（2026-08-10，im-streaming-delivery epic 7/7 DONE）**：StreamingSender 可选接口 + scheduler 500ms 节流转发管道 + 飞书消息编辑打字机 + QQ 单聊原生流式 + 群聊收敛（只发最终结果）+ im_streaming_mode 管理开关；真实渠道冒烟待用户凭据
 - **企微渠道完成（2026-08-11，commit 3023e3d2）**：WeComAdapter（wecom_aibot_sdk WS）+ 渠道绑定页企业微信卡片 + 流式判定矩阵 + delivery 回复路由（审查 C1 修复）；真实渠道冒烟待用户凭据，流式模式建议保持 off/final_only
 - **MCP 治理完成（2026-08-11，commit 58b27620）**：key 平台侧注入（mcp_servers.headers，proxy 转发注入，worker 快照永不含 key）+ 每用户×每 server×周期配额（proxy 原子扣减 429）+ **mcp-gateway 退役**（stdio transport 整体移除，pandoc 本地化后无业务用途）+ web JSON 直接编辑 + 用户配额面板；集成测试修复（_register_user 冗余直插 workspace，0050 不变量遗留）
-- **推送审查修复完成（2026-08-12，B1/B2/Y1/Y2/Y3/Y5）**：IM 流式接线（main.go 装配时序）+ MCP 配额调度过滤接入签发路径 + proxy 扣配额后移 resolve + 双周期事务扣减 + 掩码不匹配拒绝 + **proxy JTI 预算后移（validate/consume 拆分，拒绝路径不计量，MCP+Sophub 对称）**；含回归测试，Go 全量+race 绿
+- **推送审查修复完成（2026-08-12，B1/B2/Y1/Y2/Y3/Y5+三轮）**：IM 流式接线（main.go 装配时序）+ MCP 配额调度过滤接入签发路径 + proxy 扣配额后移 resolve + 双周期事务扣减 + 掩码不匹配拒绝 + **proxy JTI 预算后移（validate/consume 拆分，拒绝路径不计量，MCP+Sophub 对称）+ 配额两阶段（预检+条件扣减）**；三轮修复 B2 配额属主分裂（filter 改按 workspace owner，与 proxy 同源）+ 防御哨兵错误码；含回归测试，Go 全量+race 绿
 - 最后更新：2026-08-12（推送审查修复 5 项）
 
 ## 已完成能力
@@ -87,7 +87,7 @@
 
 ## 最近活跃窗口
 
-- 2026-08-12：**推送审查修复（6 项全落地+回归测试）**：B1 main.go transport 装配块前移（含 botLifecycle/botPollerClient 一并提前，channelSvc Start 闭包窗口一并消除）；B2 filterMCPServersByQuota 接入 issueInitialWorkerCredentials（新测试验证签发快照不含耗尽 server）；Y1 proxy quota 后移 resolve（404 不烧配额）；Y2 ConsumeMCPQuotas 单事务双周期（新增不烧 day 回归 + 20 并发恰 limit 成功测试）；Y3 掩码不匹配/新键掩码 400 拒绝；Y5 两 proxy 拆 validateToken/consumeBudget（404/429/400 拒绝路径不烧 JTI，MCP+Sophub 对称）；Go 全量（含 DB）+ race 6 包 + api race 全绿
+- 2026-08-12：**推送审查修复（6 项+三轮 2 项全落地+回归测试）**：B1 main.go transport 装配块前移（含 botLifecycle/botPollerClient 一并提前，channelSvc Start 闭包窗口一并消除）；B2 filterMCPServersByQuota 接入 issueInitialWorkerCredentials（新测试验证签发快照不含耗尽 server）；Y1 proxy quota 后移 resolve（404 不烧配额）；Y2 ConsumeMCPQuotas 单事务双周期（新增不烧 day 回归 + 20 并发恰 limit 成功测试）；Y3 掩码不匹配/新键掩码 400 拒绝；Y5 两 proxy 拆 validateToken/consumeBudget（404/429/400 拒绝路径不烧 JTI，MCP+Sophub 对称）；Go 全量（含 DB）+ race 6 包 + api race 全绿
 - 2026-08-11：**企微渠道全链路落地（3023e3d2）**：WeComAdapter + 注册表 + Web 卡片 + OpenAPI/文档；独立审查抓 C1（channelTypeForTaskSource 缺 wecom 分支→回复错投微信）已修+delivery 路由测试（fake resolver 按 channel_type 匹配真实 store 语义）；M2-M5 小修（前端校验文案/空 sender 归群/首帧占位/失败清理）；poller 52 用例 + Go TDD 全绿；已提交推送 origin/main；残余：真实凭据冒烟（SEND_MSG 流式帧验证）
 - 2026-08-10：**im-streaming-delivery 全部落地**（7/7 DONE）：StreamingSender/StreamReply 接口 + StreamForwarder（500ms 节流合并 + open/append/commit/abort）+ scheduler 接入（Terminal commit + 失败 abort + 群聊收敛）+ 飞书编辑打字机 + QQ 单聊原生流式 + im_streaming_mode 开关 + Web 设置项；migration 0054（conversation_type + stream_final_at + text_value）；全量验证绿（存量失败 4 处与本次无关）；真实渠道冒烟待用户凭据
 - 2026-08-10：**im-channel-binding 全部落地**（6/6 DONE）：migration 0053（bots→channel_configs）+ domain.Bot→ChannelConfig 全库改名 + im-bindings API（user+admin）+ Router 多渠道分桶（Source/ConversationKey）+ poller BotAdapter 注册表（飞书/钉钉/QQ adapter）+ Web 渠道绑定页；契约字段 ilink_user_id→channel_account_id（B3 命名债已清）；全量验证绿（存量失败 4 处与本次无关，base commit 复现）；真实渠道冒烟待用户凭据

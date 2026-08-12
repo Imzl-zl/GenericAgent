@@ -467,3 +467,58 @@ func TestMCPQuotaLimitCRUD(t *testing.T) {
 		t.Fatalf("expected 1 limit after delete, got %d", len(limits))
 	}
 }
+
+// TestConsumeMCPQuotasHighContention(二轮审查压力): 100 并发 × 3 轮,
+// 验证事务锁序下无死锁、无随机失败, 每轮恰 limit 成功(配额精确)。
+func TestConsumeMCPQuotasHighContention(t *testing.T) {
+	pool := requireDB(t)
+	ctx := context.Background()
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	const (
+		owner    = "user-contention"
+		serverID = "server-contention"
+		limit    = 5
+		workers  = 100
+		rounds   = 3
+	)
+	if err := store.SetMCPQuotaLimit(ctx, owner, serverID, "day", limit); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMCPQuotaLimit(ctx, owner, serverID, "month", 10000); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < rounds; round++ {
+		// 每轮重置用量(直插清理: 事务锁序验证的是并发行为, 与表清理无关)。
+		if _, err := pool.Exec(ctx, `DELETE FROM mcp_quota_usage WHERE owner_key = $1 AND server_id = $2`, owner, serverID); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		allowed := make([]bool, workers)
+		errs := make([]error, workers)
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ok, err := store.ConsumeMCPQuotas(ctx, owner, serverID)
+				allowed[i] = ok
+				errs[i] = err
+			}(i)
+		}
+		wg.Wait()
+		success := 0
+		for i, ok := range allowed {
+			if errs[i] != nil {
+				t.Fatalf("round %d worker %d: unexpected error %v (deadlock/contention must not surface as error)", round, i, errs[i])
+			}
+			if ok {
+				success++
+			}
+		}
+		if success != limit {
+			t.Fatalf("round %d: expected exactly %d allowed, got %d", round, limit, success)
+		}
+	}
+}

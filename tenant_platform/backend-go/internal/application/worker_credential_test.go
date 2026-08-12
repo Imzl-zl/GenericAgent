@@ -598,6 +598,18 @@ func (f *fakeQuotaSource) ListEnabledMCPServers(ctx context.Context) ([]domain.M
 	return nil, nil
 }
 
+func (f *fakeQuotaSource) GetWorkspaceOwner(_ context.Context, sessionKey string) (int64, error) {
+	// personal:<uid> 回 uid(个人 workspace 属主 = 用户), 其他回 42(团队属主)。
+	if strings.HasPrefix(sessionKey, "personal:") {
+		var uid int64
+		_, err := fmt.Sscanf(sessionKey, "personal:%d", &uid)
+		if err == nil {
+			return uid, nil
+		}
+	}
+	return 42, nil
+}
+
 func (f *fakeQuotaSource) MCPQuotaAvailable(_ context.Context, ownerKey, serverID string) (bool, error) {
 	if f.available == nil {
 		return true, nil
@@ -618,9 +630,39 @@ func TestIssueProviderCapabilitiesFiltersExhaustedQuota(t *testing.T) {
 		TokenIssuer:     nil, // 不签发 token, 只验证过滤行为
 		MCPProxyBaseURL: "http://platform-proxy:8090",
 	}}
-	filtered := s.filterMCPServersByQuota(context.Background(), "42", snapshot)
+	// 按 sessionKey 过滤(sessionKey → workspace owner 在 filter 内解析)。
+	filtered := s.filterMCPServersByQuota(context.Background(), "personal:1", snapshot)
 	if len(filtered.Servers) != 1 || filtered.Servers[0].ServerID != "exa" {
 		t.Fatalf("expected only exa after quota filter, got %+v", filtered.Servers)
+	}
+}
+
+// TestFilterMCPServersByQuotaUsesWorkspaceOwner(三轮回归): 配额属主必须按
+// workspace owner 解析——团队 workspace(team:<id>)下 requester ≠ owner,
+// 按 requester 过滤会与 proxy 的 owner 扣减分裂。team: 会话解析为属主 42,
+// 配额按 42 判定; personal:1 按用户 1 判定。
+func TestFilterMCPServersByQuotaUsesWorkspaceOwner(t *testing.T) {
+	snapshot := RuntimeMCPSnapshot{Servers: []RuntimeMCPServer{
+		{ServerID: "exa", Name: "Exa", URL: "https://mcp.exa.ai/mcp", TimeoutSeconds: 30},
+		{ServerID: "tavily", Name: "Tavily", URL: "https://mcp.tavily.com/mcp/", TimeoutSeconds: 30},
+	}}
+	quota := &fakeQuotaSource{available: map[string]bool{"exa": true, "tavily": false}}
+
+	s := &scheduler{cfg: SchedulerConfig{
+		MCPServer:       quota,
+		TokenIssuer:     nil,
+		MCPProxyBaseURL: "http://platform-proxy:8090",
+	}}
+	// team: 会话 → 属主 42 → available 按 owner 42 判定(tavily 对 42 耗尽)。
+	filtered := s.filterMCPServersByQuota(context.Background(), "team:abc", snapshot)
+	if len(filtered.Servers) != 1 || filtered.Servers[0].ServerID != "exa" {
+		t.Fatalf("team session: expected only exa (owner 42 quota), got %+v", filtered.Servers)
+	}
+	// personal:2 会话 → 属主 2 → available 按 owner 2 判定(两个 server 都可用)。
+	quota.available = map[string]bool{"exa": true, "tavily": true}
+	filtered = s.filterMCPServersByQuota(context.Background(), "personal:2", snapshot)
+	if len(filtered.Servers) != 2 {
+		t.Fatalf("personal session: expected both servers, got %+v", filtered.Servers)
 	}
 }
 
@@ -632,6 +674,17 @@ type fakeQuotaServerSource struct {
 
 func (f *fakeQuotaServerSource) ListEnabledMCPServers(context.Context) ([]domain.MCPServer, error) {
 	return append([]domain.MCPServer(nil), f.servers...), nil
+}
+
+func (f *fakeQuotaServerSource) GetWorkspaceOwner(_ context.Context, sessionKey string) (int64, error) {
+	if strings.HasPrefix(sessionKey, "personal:") {
+		var uid int64
+		_, err := fmt.Sscanf(sessionKey, "personal:%d", &uid)
+		if err == nil {
+			return uid, nil
+		}
+	}
+	return 42, nil
 }
 
 func (f *fakeQuotaServerSource) MCPQuotaAvailable(_ context.Context, ownerKey, serverID string) (bool, error) {

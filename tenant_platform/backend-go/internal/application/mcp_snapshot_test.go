@@ -15,6 +15,10 @@ func (source *fakeMCPSource) ListEnabledMCPServers(context.Context) ([]domain.MC
 	return append([]domain.MCPServer(nil), source.servers...), nil
 }
 
+func (source *fakeMCPSource) GetWorkspaceOwner(context.Context, string) (int64, error) {
+	return 42, nil
+}
+
 func TestResolveMCPSnapshotChangesWithRevision(t *testing.T) {
 	source := &fakeMCPSource{servers: []domain.MCPServer{{
 		ID: 1, ServerKey: "exa", Name: "Exa", URL: "https://mcp.exa.ai/mcp",

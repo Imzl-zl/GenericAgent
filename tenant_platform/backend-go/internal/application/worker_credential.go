@@ -36,7 +36,6 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 	mcpSnapshot RuntimeMCPSnapshot,
 	runnerGeneration uint64,
 	taskID string,
-	ownerKey string,
 ) (workerCredentialSet, RuntimeConfigFiles, error) {
 	if s.cfg.TokenIssuer == nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, nil
@@ -173,10 +172,21 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 
 // filterMCPServersByQuota 按用户配额过滤快照 server: 无限额行/未耗尽保留,
 // 任一周期耗尽的剔除。配额源不可用时 fail-closed(剔除全部, 不冒泄漏风险)。
-func (s *scheduler) filterMCPServersByQuota(ctx context.Context, ownerKey string, snapshot RuntimeMCPSnapshot) RuntimeMCPSnapshot {
+// 配额属主 = workspace owner(sessionKey → owner_user_id, 与 proxy 强制路径
+// 同源, 审查三轮): requester 可能是团队成员, 按 RequesterID 过滤会与
+// proxy 的 owner 扣减分裂——调度过滤与 proxy 强制必须同一属主。
+func (s *scheduler) filterMCPServersByQuota(ctx context.Context, sessionKey string, snapshot RuntimeMCPSnapshot) RuntimeMCPSnapshot {
 	if s.cfg.MCPServer == nil || len(snapshot.Servers) == 0 {
 		return snapshot
 	}
+	owner, err := s.cfg.MCPServer.GetWorkspaceOwner(ctx, sessionKey)
+	if err != nil {
+		slog.ErrorContext(ctx, "mcp quota owner resolve failed, excluding all servers",
+			"session_key", sessionKey, "error", err)
+		snapshot.Servers = nil
+		return snapshot
+	}
+	ownerKey := strconv.FormatInt(owner, 10)
 	filtered := make([]RuntimeMCPServer, 0, len(snapshot.Servers))
 	for _, server := range snapshot.Servers {
 		available, err := s.cfg.MCPServer.MCPQuotaAvailable(ctx, ownerKey, server.ServerID)
@@ -202,7 +212,6 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	if s.cfg.TokenIssuer == nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, nil
 	}
-	ownerKey := strconv.FormatInt(task.RequesterID, 10)
 	snapshot, err := s.resolveRoutingSnapshot(ctx)
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
@@ -215,8 +224,10 @@ func (s *scheduler) issueInitialWorkerCredentials(
 	// 不下发——任务内不可见, 不会发起注定 429 的调用。配额源不可用时
 	// filter 内部 fail-closed(剔除全部)。签发路径是过滤的唯一生产入口
 	// (2026-08-11 审查 B2: 此前 filter 仅有定义与单测, 未接入调用链)。
-	mcpSnapshot = s.filterMCPServersByQuota(ctx, ownerKey, mcpSnapshot)
-	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, generation, task.ID, ownerKey)
+	// 属主解析在 filter 内部(sessionKey → workspace owner, 与 proxy 同源,
+	// 审查三轮: 团队 workspace 下 RequesterID ≠ owner, 不得按 requester 过滤)。
+	mcpSnapshot = s.filterMCPServersByQuota(ctx, task.SessionKey, mcpSnapshot)
+	set, files, err := s.issueProviderCapabilitiesWithRuntime(ctx, task.SessionKey, snapshot, mcpSnapshot, generation, task.ID)
 	if err != nil {
 		return workerCredentialSet{}, RuntimeConfigFiles{}, err
 	}
