@@ -15,6 +15,9 @@ import { Card } from '../../components/ui/Card';
 import './AdminPages.css';
 
 // JSON 直接编辑(EPIC mcp-governance D4'): 配置 = mcp.json 风格 JSON。
+// transport 支持两种接入方式(主流 mcp.json 兼容):
+//   http  (默认): url + headers(平台侧持有, proxy 注入, 回显掩码);
+//   stdio: command + args(Worker 沙箱内进程宿主, 如 serena)。
 // headers 值回显掩码(前 4 字符 + ***); 编辑时保持掩码 = 后端保留原 key,
 // 填写明文 = 更新; 新增键直接写明文。
 interface ServerConfigJSON {
@@ -23,6 +26,9 @@ interface ServerConfigJSON {
   url: string;
   headers?: Record<string, string>;
   timeout_seconds: number;
+  transport?: 'http' | 'stdio';
+  command?: string;
+  args?: string[];
 }
 
 function serverToJSON(server?: MCPServer): string {
@@ -32,6 +38,15 @@ function serverToJSON(server?: MCPServer): string {
     url: server?.url ?? '',
     timeout_seconds: server?.timeout_seconds ?? 30,
   };
+  if (server?.transport && server.transport !== 'http') {
+    config.transport = server.transport;
+  }
+  if (server?.command) {
+    config.command = server.command;
+  }
+  if (server?.args && server.args.length > 0) {
+    config.args = server.args;
+  }
   if (server?.headers && Object.keys(server.headers).length > 0) {
     config.headers = server.headers;
   }
@@ -107,8 +122,26 @@ export function MCPServersPage() {
       setError(`JSON 解析失败: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
       return;
     }
-    if (!config.server_key || !config.name || !config.url || !config.timeout_seconds) {
-      setError('server_key / name / url / timeout_seconds 均为必填');
+    if (!config.server_key || !config.name || !config.timeout_seconds) {
+      setError('server_key / name / timeout_seconds 均为必填');
+      return;
+    }
+    const transport = config.transport ?? 'http';
+    if (transport === 'stdio') {
+      if (!config.url && !config.command) {
+        setError('stdio 传输必须填写 command(如 serena); url 需留空');
+        return;
+      }
+      if (config.url) {
+        setError('stdio 传输不支持 url(进程在 Worker 沙箱内拉起)');
+        return;
+      }
+      if (config.headers && Object.keys(config.headers).length > 0) {
+        setError('stdio 传输不支持 headers(无 HTTP 请求头)');
+        return;
+      }
+    } else if (!config.url) {
+      setError('http 传输必须填写 url');
       return;
     }
     const input: MCPServerWriteInput = {
@@ -116,7 +149,12 @@ export function MCPServersPage() {
       name: config.name,
       url: config.url,
       timeout_seconds: config.timeout_seconds,
+      transport,
     };
+    if (transport === 'stdio') {
+      input.command = config.command;
+      input.args = config.args ?? [];
+    }
     if (config.headers && Object.keys(config.headers).length > 0) {
       input.headers = config.headers;
     }
@@ -182,17 +220,22 @@ export function MCPServersPage() {
                 value={configText}
                 onChange={(event) => setConfigText(event.target.value)}
                 placeholder={JSON.stringify({
-                  server_key: 'tavily',
-                  name: 'Tavily',
-                  url: 'https://mcp.tavily.com/mcp/',
-                  headers: { Authorization: 'Bearer tvly-xxx' },
+                  server_key: 'exa',
+                  name: 'Exa',
+                  url: 'https://mcp.exa.ai/mcp',
+                  headers: { 'x-api-key': 'exa-xxx' },
                   timeout_seconds: 30,
                 }, null, 2)}
               />
             </label>
             <p className="admin-subtitle provider-form-full">
-              示例：{'{ "headers": { "Authorization": "Bearer tvly-xxx" } }'} 或 {'{ "x-api-key": "..." }'}。
-              编辑已有 key 时保持掩码值（如 "tvly***"）不变更，写明文即更新。
+              示例：{'{ "headers": { "Authorization": "Bearer tvly-xxx" } }'} 或 {'{ "headers": { "x-api-key": "..." } }'}(两种鉴权头都支持)。
+              编辑已有 key 时保持掩码值(如 "tvly***")不变更，写明文即更新。
+            </p>
+            <p className="admin-subtitle provider-form-full">
+              stdio 示例(mcp.json 主流格式, Worker 沙箱内进程宿主):
+              {'{ "transport": "stdio", "command": "serena", "args": ["start-mcp-server", "--context=agent", "--project-from-cwd"] }'}。
+              http 为默认 transport, 可省略。stdio 调用不经过 Platform proxy, 不参与按调用配额计量。
             </p>
             <div className="provider-actions provider-form-full">
               {editing && <Button type="button" variant="ghost" onClick={resetForm}><X size={15} />取消</Button>}
@@ -210,7 +253,7 @@ export function MCPServersPage() {
                 <tbody>{servers.map((server) => (
                   <tr key={server.mcp_server_id}>
                     <td><strong>{server.name}</strong><small>{server.server_key} · REV {server.revision} · <span className={`provider-state ${server.enabled ? 'active' : 'disabled'}`}>{server.enabled ? 'ENABLED' : 'DISABLED'}</span></small></td>
-                    <td>{server.url}</td>
+                    <td>{server.transport === 'stdio' ? `${server.command ?? ''} ${(server.args ?? []).join(' ')}` : server.url}</td>
                     <td><div className="admin-actions provider-row-actions">
                       <button className="icon-button" type="button" title={server.enabled ? '停用' : '启用'} onClick={() => void changeState(server)}>{server.enabled ? <PowerOff size={16} /> : <Power size={16} />}</button>
                       <button className="icon-button" type="button" title="编辑" onClick={() => startEditing(server)}><Pencil size={16} /></button>

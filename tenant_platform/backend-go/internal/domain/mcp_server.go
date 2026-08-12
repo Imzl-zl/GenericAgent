@@ -13,9 +13,13 @@ const (
 	DefaultMCPTimeoutSeconds = 30
 	MaxMCPTimeoutSeconds     = 300
 
-	// MCPTransportHTTP 是 Streamable HTTP 型 MCP Server(唯一 transport,
-	// stdio 已随 mcp-gateway 退役移除——EPIC mcp-governance D5)。
+	// MCPTransportHTTP 是 Streamable HTTP 型 MCP Server(默认)。
 	MCPTransportHTTP = "http"
+	// MCPTransportStdio 是 stdio 型 MCP Server: Worker 沙箱内进程宿主,
+	// JSON-RPC over stdin/stdout(主流 mcp.json 兼容; 2026-08 恢复, 见
+	// mcp_client.py MCPStdioClient)。stdio 调用不经过 Platform proxy,
+	// 不参与 proxy 每调用计量(配额仍按快照签发时 MCPQuotaAvailable 门控)。
+	MCPTransportStdio = "stdio"
 
 	// MCPIsolationShared: 无状态无凭据工具, 跨租户共享进程(如 pandoc)。
 	MCPIsolationShared = "shared"
@@ -24,6 +28,17 @@ const (
 
 	DefaultMCPMaxInstances = 1
 	MaxMCPMaxInstances     = 16
+)
+
+// mcpCommandPattern: 绝对路径或裸命令名(不含空白/引号/重定向/变量展开)。
+// exec.Command 不经 shell 拼接, 此校验是 fail-fast(防手误)而非安全边界;
+// 管理员可信(D1 可信部署), 命令在 Worker 沙箱内执行。
+var mcpCommandPattern = regexp.MustCompile(`^[A-Za-z0-9_./+\-]{1,256}$`)
+
+const (
+	MaxMCPArgs        = 64
+	MaxMCPArgLength   = 256
+	MaxMCPCommandSize = 256
 )
 
 var (
@@ -46,7 +61,6 @@ var mcpReservedHeaders = map[string]struct{}{
 	"trailer":            {},
 	"upgrade":            {},
 }
-
 // MCPQuotaPeriod 是配额周期粒度(day | month)。
 type MCPQuotaPeriod string
 
@@ -90,9 +104,11 @@ type MCPServerCreate struct {
 	// Headers 是 proxy 转发时注入上游的请求头(Authorization/x-api-key 等),
 	// 平台侧持有: 绝不下发 worker 快照, admin API 回显掩码。
 	Headers map[string]string
-	// Transport 接入方式(http; stdio 已随 gateway 退役移除)。
+	// Transport 接入方式: http(默认, Streamable HTTP) | stdio(Worker 沙箱内
+	// 进程宿主)。stdio 调用不经过 Platform proxy, 不参与每调用计量。
 	Transport string
-	// Command/Args 是 stdio 遗留字段(0049 列保留, 恒为空)。
+	// Command/Args 是 stdio 进程的命令与参数(exec.Command 直接执行, 不经
+	// shell); http 下必须为空。
 	Command string
 	Args    []string
 	// Isolation 隔离维度: shared(默认) | workspace(预留, v1 拒绝)。
@@ -134,10 +150,8 @@ func ValidateMCPServerInput(input MCPServerCreate) error {
 	if transport == "" {
 		transport = MCPTransportHTTP
 	}
-	// stdio transport 已随 mcp-gateway 退役整体移除(EPIC mcp-governance D5):
-	// 校验 fail-closed 拒绝, 上层(api/snapshot/proxy)同步清理中。
-	if transport != MCPTransportHTTP {
-		return fmt.Errorf("transport %q is not supported: stdio was removed with mcp-gateway retirement", transport)
+	if transport != MCPTransportHTTP && transport != MCPTransportStdio {
+		return fmt.Errorf("transport must be %q or %q", MCPTransportHTTP, MCPTransportStdio)
 	}
 	for name := range input.Headers {
 		lower := strings.ToLower(strings.TrimSpace(name))
@@ -172,7 +186,7 @@ func ValidateMCPServerInput(input MCPServerCreate) error {
 	switch transport {
 	case MCPTransportHTTP:
 		if strings.TrimSpace(input.Command) != "" || len(input.Args) > 0 {
-			return fmt.Errorf("command/args are not supported (stdio transport was removed)")
+			return fmt.Errorf("command/args are only valid with transport %q", MCPTransportStdio)
 		}
 		parsed, err := url.Parse(strings.TrimSpace(input.URL))
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -180,6 +194,28 @@ func ValidateMCPServerInput(input MCPServerCreate) error {
 		}
 		if parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" {
 			return fmt.Errorf("url must contain no credentials or fragment")
+		}
+	case MCPTransportStdio:
+		if strings.TrimSpace(input.URL) != "" {
+			return fmt.Errorf("url must be empty for transport %q", MCPTransportStdio)
+		}
+		if len(input.Headers) > 0 {
+			return fmt.Errorf("headers are not supported for transport %q (stdio has no HTTP request headers)", MCPTransportStdio)
+		}
+		command := strings.TrimSpace(input.Command)
+		if command == "" {
+			return fmt.Errorf("command is required for transport %q", MCPTransportStdio)
+		}
+		if !mcpCommandPattern.MatchString(command) {
+			return fmt.Errorf("command %q is invalid: use an absolute path or a bare executable name (letters, digits, _, ., /, +, -)", command)
+		}
+		if len(input.Args) > MaxMCPArgs {
+			return fmt.Errorf("args must not exceed %d entries", MaxMCPArgs)
+		}
+		for _, arg := range input.Args {
+			if arg == "" || len(arg) > MaxMCPArgLength || strings.ContainsRune(arg, '\x00') {
+				return fmt.Errorf("each arg must be 1-%d chars without NUL bytes", MaxMCPArgLength)
+			}
 		}
 	}
 	return nil

@@ -137,3 +137,141 @@ def test_runtime_mcp_rejects_invalid_proxy(tmp_path: Path):
         })
         with pytest.raises(MCPConfigError):
             load_runtime_mcp_snapshot(tmp_path)
+
+
+def test_runtime_mcp_parses_stdio_server(tmp_path: Path):
+    _write_runtime_config(tmp_path, {
+        "snapshot_id": "sha256:abc",
+        "servers": [{
+            "server_id": "serena",
+            "name": "Serena",
+            "url": "",
+            "timeout_seconds": 60,
+            "transport": "stdio",
+            "command": "serena",
+            "args": ["start-mcp-server", "--context=agent"],
+        }],
+    })
+
+    snapshot = load_runtime_mcp_snapshot(tmp_path)
+
+    server = snapshot.servers[0]
+    assert server.transport == "stdio"
+    assert server.command == "serena"
+    assert server.args == ("start-mcp-server", "--context=agent")
+
+
+def test_runtime_mcp_omitted_stdio_fields_default_to_http(tmp_path: Path):
+    _write_runtime_config(tmp_path, {
+        "snapshot_id": "sha256:abc",
+        "servers": [{
+            "server_id": "exa",
+            "name": "Exa",
+            "url": "https://mcp.exa.ai/mcp",
+            "timeout_seconds": 30,
+        }],
+    })
+
+    server = load_runtime_mcp_snapshot(tmp_path).servers[0]
+
+    assert server.transport == "http"
+    assert server.command == ""
+    assert server.args == ()
+
+
+@pytest.mark.parametrize("bad_args", [42, "start-mcp-server", [1, 2]])
+def test_runtime_mcp_rejects_non_string_args(tmp_path: Path, bad_args):
+    _write_runtime_config(tmp_path, {
+        "snapshot_id": "x",
+        "servers": [{
+            "server_id": "serena",
+            "name": "Serena",
+            "url": "",
+            "transport": "stdio",
+            "command": "serena",
+            "args": bad_args,
+        }],
+    })
+
+    with pytest.raises(MCPConfigError, match="args must be an array"):
+        load_runtime_mcp_snapshot(tmp_path)
+
+
+def test_runtime_mcp_rejects_stdio_without_command(tmp_path: Path):
+    _write_runtime_config(tmp_path, {
+        "snapshot_id": "x",
+        "servers": [{
+            "server_id": "serena",
+            "name": "Serena",
+            "url": "",
+            "transport": "stdio",
+        }],
+    })
+
+    with pytest.raises(MCPConfigError, match="command is required"):
+        load_runtime_mcp_snapshot(tmp_path)
+
+
+def test_runtime_mcp_mixed_transport_with_proxy_only_affects_http(tmp_path: Path):
+    # 回归(推送审查): proxy 只对 http server 生效——混布快照里 stdio 行若
+    # 携带 proxy_base_url 会触发 MCPServerConfig.validate() 的 stdio 拒绝
+    # 分支, 导致整个快照加载失败(StartSession 直接挂)。compose 部署
+    # (MCPProxyBaseURL 非空)下这是 stdio 恢复的默认配置形态。
+    _write_runtime_config(tmp_path, {
+        "snapshot_id": "sha256:abc",
+        "proxy": {
+            "base_url": "http://platform:8082",
+            "capability_token": "jwt-token",
+        },
+        "servers": [{
+            "server_id": "exa",
+            "name": "Exa",
+            "url": "https://mcp.exa.ai/mcp",
+            "timeout_seconds": 30,
+        }, {
+            "server_id": "serena",
+            "name": "Serena",
+            "url": "",
+            "timeout_seconds": 60,
+            "transport": "stdio",
+            "command": "serena",
+            "args": ["start-mcp-server"],
+        }],
+    })
+
+    snapshot = load_runtime_mcp_snapshot(tmp_path)
+    by_id = {server.server_id: server for server in snapshot.servers}
+
+    http_server = by_id["exa"]
+    assert http_server.proxy_base_url == "http://platform:8082"
+    assert http_server.capability_token == "jwt-token"
+
+    stdio_server = by_id["serena"]
+    assert stdio_server.transport == "stdio"
+    assert stdio_server.proxy_base_url == ""
+    assert stdio_server.capability_token == ""
+    assert stdio_server.command == "serena"
+
+
+def test_runtime_mcp_stdio_only_with_proxy_keeps_stdio_proxy_free(tmp_path: Path):
+    _write_runtime_config(tmp_path, {
+        "snapshot_id": "sha256:def",
+        "proxy": {
+            "base_url": "http://platform:8082",
+            "capability_token": "jwt-token",
+        },
+        "servers": [{
+            "server_id": "serena",
+            "name": "Serena",
+            "url": "",
+            "timeout_seconds": 60,
+            "transport": "stdio",
+            "command": "serena",
+        }],
+    })
+
+    server = load_runtime_mcp_snapshot(tmp_path).servers[0]
+
+    assert server.transport == "stdio"
+    assert server.proxy_base_url == ""
+    assert server.capability_token == ""

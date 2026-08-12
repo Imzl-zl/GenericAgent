@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"strings"
 	"errors"
 	"testing"
 
@@ -134,7 +133,7 @@ func TestMCPServerStoreLifecycleAndRevision(t *testing.T) {
 
 // TestMCPServerMixedTransportRoundTrip 回归: 真实环境 WORKER_START_FAILED
 // (scan NULL into *string)——http server 的 command 列为 NULL, 启用列表必须
-// 能正常扫描 NULL command(0049 遗留列, 0055 后 stdio 已移除)。
+// 能正常扫描 NULL command(0049 列; stdio 恢复后 http 行 command 仍恒 NULL)。
 func TestMCPServerMixedTransportRoundTrip(t *testing.T) {
 	pool := requireDB(t)
 	store, err := NewStore(pool)
@@ -154,13 +153,17 @@ func TestMCPServerMixedTransportRoundTrip(t *testing.T) {
 		t.Fatalf("http server fields: transport=%q command=%q args=%v", httpServer.Transport, httpServer.Command, httpServer.Args)
 	}
 
-	// stdio transport 已移除(EPIC D5): store 层透传 domain 校验, 创建必须拒绝。
-	if _, err := store.CreateMCPServer(ctx, domain.MCPServerCreate{
+	// stdio 恢复(2026-08): Worker 沙箱内进程宿主; store 层透传 domain 校验。
+	stdioServer, err := store.CreateMCPServer(ctx, domain.MCPServerCreate{
 		ServerKey: "pandoc", Name: "Pandoc", Transport: "stdio",
 		Command: "/opt/mcp-tools/mcp-pandoc", Args: []string{"--stdio"},
 		TimeoutSeconds: 60,
-	}); err == nil || !strings.Contains(err.Error(), "stdio") {
-		t.Fatalf("expected stdio rejection, got %v", err)
+	})
+	if err != nil {
+		t.Fatalf("create stdio server: %v", err)
+	}
+	if stdioServer.Transport != domain.MCPTransportStdio || stdioServer.Command != "/opt/mcp-tools/mcp-pandoc" {
+		t.Fatalf("stdio server fields: transport=%q command=%q", stdioServer.Transport, stdioServer.Command)
 	}
 
 	if _, err := store.SetMCPServerEnabled(ctx, httpServer.ID, true); err != nil {

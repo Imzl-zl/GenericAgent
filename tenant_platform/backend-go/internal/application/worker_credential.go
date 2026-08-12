@@ -103,8 +103,8 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 		sophub = &RuntimeSophubProxy{BaseURL: s.cfg.SophubProxyBaseURL, CapabilityToken: sophubToken}
 	}
 	// MCP proxy capability: 与 Sophub 同模式(audience=ga-mcp-proxy)。
-	// 仅在 MCP 快照含 server 且配置了 proxy 地址时签发——Runner 无公网出口,
-	// 外部 MCP Server 必须经 Platform 受控代理(server_id → URL 映射即白名单)。
+	// 仅在 MCP 快照含 server 且配置了 proxy 地址时签发——外部 HTTP MCP
+	// Server 经 Platform 受控代理(key 托管 + 配额计量, 白名单即启用表)。
 	// JTI 纳入同一撤销集合 + 预算计量(无预算 fail-closed, 同审查 F10)。
 	if s.cfg.TokenIssuer != nil && s.cfg.MCPProxyBaseURL != "" && len(mcpSnapshot.Servers) > 0 {
 		mcpBudget := fmt.Sprintf(`{"max_turns":%d}`, maxTurns)

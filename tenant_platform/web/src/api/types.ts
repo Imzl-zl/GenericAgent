@@ -131,7 +131,7 @@ export interface MCPServer {
   transport: 'http' | 'stdio';
   /** 平台侧持有的凭据头(proxy 注入); 回显掩码(值保留前 4 字符 + ***) */
   headers: Record<string, string> | null;
-  /** stdio 遗留字段(已退役, 恒为空) */
+  /** stdio 命令(Worker 沙箱内进程宿主); http 下恒为空 */
   command: string | null;
   args: string[] | null;
   isolation: 'shared' | 'workspace';

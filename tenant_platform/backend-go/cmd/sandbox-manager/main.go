@@ -34,6 +34,7 @@ func main() {
 		network            = flag.String("runner-network", envOr("GA_RUNNER_NETWORK", "runner-control"), "docker network the runner joins (round11 M2: compose internal networks carry the project-name prefix)")
 		workspaces         = flag.String("workspaces-root", envOr("GA_WORKSPACES_ROOT", "/var/lib/ga/workspaces"), "daemon-visible root containing workspaces/<hash>/")
 		workspacesVolume   = flag.String("workspaces-volume", envOr("GA_WORKSPACES_VOLUME", ""), "named volume for workspaces (Compose); empty = bind mount from workspaces-root")
+		pkgCacheVolume     = flag.String("pkg-cache-volume", envOr("GA_PKG_CACHE_VOLUME", ""), "named volume shared across runners for npx/uv/pip package caches; empty = no cache volume (stdio servers re-resolve packages per runner)")
 		memoryTmpl         = flag.String("memory-template", envOr("GA_MEMORY_TEMPLATE", "/ga/memory-template"), "read-only memory template path inside the manager image")
 		idleTTL            = flag.Duration("idle-ttl", 30*time.Minute, "Runner idle TTL(日志参考; 实际空闲回收由 Platform lease 驱动, 见 GA_RUNNER_IDLE_TTL)")
 		absTTL             = flag.Duration("reap-abs-ttl", 24*time.Hour, "absolute orphan TTL: running containers older than this are reaped too (platform-down fallback; active runners under Platform lease are not touched)")
@@ -93,6 +94,7 @@ func main() {
 		Profile:             profile,
 		WorkspacesRoot:      *workspaces,
 		WorkspaceVolume:     *workspacesVolume,
+		PkgCacheVolume:      *pkgCacheVolume,
 		ContainerNamePrefix: *prefix,
 		ManagerID:           *managerID,
 	})

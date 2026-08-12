@@ -48,7 +48,14 @@ type DockerConfig struct {
 	// 非空时用 volume-subpath 挂载工作区子目录, 空则按 WorkspacesRoot 用
 	// bind mount(裸机部署, Manager 与 daemon 同主机)。
 	WorkspaceVolume string
+	// PkgCacheVolume 是跨 Runner 共享的包缓存 named volume(Compose 部署);
+	// 非空时挂到 /var/cache/ga-pkg 并把 npx/uv/pip 缓存目录指向它——stdio
+	// MCP 服务器(npx/uvx 型)首次拉包写入共享缓存, 全租户复用不重复安装。
+	PkgCacheVolume string
 }
+
+// PkgCacheMount 是共享包缓存卷在 Runner 容器内的挂载点。
+const PkgCacheMount = "/var/cache/ga-pkg"
 
 // RunnerSpec is the validated, server-side derived creation request.
 // None of these fields come from business input; only from the authenticated
@@ -248,6 +255,17 @@ func (d *DockerCLI) CreateAndStart(ctx context.Context, spec RunnerSpec) (Runner
 		"--env", "GA_WORKSPACE_TEMP="+LegacyTempMount,
 		"--env", "GA_OVERLAY_ROOT="+RunnerOverlayMount,
 	)
+	// 共享包缓存卷(stdio MCP 的 npx/uv/pip 缓存, 全租户复用): 挂载 + 缓存
+	// 目录 env 固定指向卷内子目录。卷名来自部署配置(GA_PKG_CACHE_VOLUME),
+	// 空 = 不挂(裸机/无 stdio 需求部署)。
+	if d.cfg.PkgCacheVolume != "" {
+		args = append(args,
+			"--mount", "type=volume,source="+d.cfg.PkgCacheVolume+",destination="+PkgCacheMount,
+			"--env", "NPM_CONFIG_CACHE="+PkgCacheMount+"/npm",
+			"--env", "UV_CACHE_DIR="+PkgCacheMount+"/uv",
+			"--env", "PIP_CACHE_DIR="+PkgCacheMount+"/pip",
+		)
+	}
 	// 容器不可变身份(方案 §7): workspace key 与 lease generation 由 Manager
 	// 固定注入, Worker 校验 StartSession/ExecuteTask 请求必须与之匹配, 防
 	// 止误路由/迟到的控制面请求在错误工作区挂载中执行。值来自已认证的

@@ -33,17 +33,22 @@ type RuntimeProviderBinding struct {
 }
 
 type RuntimeMCPServer struct {
-	ServerID       string `json:"server_id"`
-	Name           string `json:"name"`
-	URL            string `json:"url"`
-	TimeoutSeconds int    `json:"timeout_seconds"`
+	ServerID       string   `json:"server_id"`
+	Name           string   `json:"name"`
+	URL            string   `json:"url"`
+	TimeoutSeconds int      `json:"timeout_seconds"`
+	// Transport 接入方式(http | stdio); 省略 = http。stdio 服务器由
+	// Worker 沙箱内进程宿主拉起, 不需要 url/proxy。
+	Transport string   `json:"transport,omitempty"`
+	Command   string   `json:"command,omitempty"`
+	Args      []string `json:"args,omitempty"`
 }
 
 type RuntimeMCPSnapshot struct {
 	ID      string             `json:"snapshot_id"`
 	Servers []RuntimeMCPServer `json:"servers"`
-	// Proxy 非空时, Worker 经 Platform 受控 MCP proxy 访问外部 MCP Server
-	// (Runner 仅 internal 网络无公网出口): server_id → URL 映射即白名单。
+	// Proxy 非空时, Worker 经 Platform 受控 MCP proxy 访问外部 HTTP MCP
+	// Server(key 平台侧持有 + 配额计量): server_id → URL 映射即白名单。
 	Proxy *RuntimeMCPProxy `json:"proxy,omitempty"`
 }
 
@@ -236,6 +241,7 @@ func validateRuntimeMCPSnapshot(snapshot RuntimeMCPSnapshot) error {
 		if err := domain.ValidateMCPServerInput(domain.MCPServerCreate{
 			ServerKey: server.ServerID, Name: server.Name, URL: server.URL,
 			TimeoutSeconds: server.TimeoutSeconds,
+			Transport:      server.Transport, Command: server.Command, Args: server.Args,
 		}); err != nil {
 			return fmt.Errorf("MCP server %q: %w", server.ServerID, err)
 		}

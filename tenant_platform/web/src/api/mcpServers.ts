@@ -8,10 +8,12 @@ interface MCPServerListResponse {
 export interface MCPServerWriteInput {
   server_key: string;
   name: string;
-  transport?: 'http';
+  transport?: 'http' | 'stdio';
   url?: string;
   /** 平台侧持有的凭据头; 更新时掩码值(*** 结尾)保留原 key */
   headers?: Record<string, string>;
+  command?: string;
+  args?: string[];
   timeout_seconds: number;
 }
 

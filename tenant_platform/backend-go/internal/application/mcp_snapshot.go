@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"sort"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -40,19 +39,13 @@ func (s *scheduler) resolveMCPSnapshot(ctx context.Context) (RuntimeMCPSnapshot,
 		if transport == "" {
 			transport = domain.MCPTransportHTTP
 		}
-		// stdio transport 已随 mcp-gateway 退役移除(EPIC D5): 遗留行跳过
-		// 不下发(不合成 gateway URL, 避免空 URL 下发 worker)。
-		if transport != domain.MCPTransportHTTP {
-			slog.Warn("mcp snapshot: stdio server skipped (transport removed)",
-				"server_id", server.ServerKey)
-			continue
-		}
 		fingerprint = append(fingerprint, mcpSnapshotFingerprint{
 			ID: server.ID, ServerID: server.ServerKey, Revision: server.Revision,
 		})
 		runtimeServers = append(runtimeServers, RuntimeMCPServer{
 			ServerID: server.ServerKey, Name: server.Name, URL: server.URL,
 			TimeoutSeconds: server.TimeoutSeconds,
+			Transport:      transport, Command: server.Command, Args: server.Args,
 		})
 	}
 	if len(runtimeServers) == 0 {

@@ -48,6 +48,23 @@ RUN curl -fsSL -o /tmp/pandoc.tar.gz \
         https://github.com/jgm/pandoc/releases/download/3.8.3/pandoc-3.8.3-linux-amd64.tar.gz \
     && tar -xzf /tmp/pandoc.tar.gz -C /usr/local --strip-components=1 \
     && rm /tmp/pandoc.tar.gz
+# stdio MCP 运行时(2026-08-12): npx/uvx 型 MCP server 按需拉包需要 node 与
+# uv; 预装命令型(如 serena)用 pip 即可。固定版本 + sha256 校验(镜像层固定
+# digest 精神)。npx/uvx/pip 缓存目录由 sandbox-manager 运行时注入到共享卷
+# (GA_PKG_CACHE_VOLUME, 全租户复用一份)。
+# node 20 LTS: 官方二进制(apt bookworm 只有 18.x)。
+RUN curl -fsSL -o /tmp/node.tar.xz \
+        https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.xz \
+    && echo "df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d  /tmp/node.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz
+# uv(uvx): Python 生态的按需包运行器。
+RUN curl -fsSL -o /tmp/uv.tar.gz \
+        https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-unknown-linux-gnu.tar.gz \
+    && echo "600cf9a742aca00d292673b16b5acffaa7b8c269a364ad0c2e79498dcb1fe101  /tmp/uv.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/uv.tar.gz -C /tmp \
+    && install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/ \
+    && rm -rf /tmp/uv.tar.gz /tmp/uv-x86_64-unknown-linux-gnu
 COPY tenant_platform/worker-python/pyproject.toml /tmp/worker/pyproject.toml
 COPY tenant_platform/worker-python/src/ /tmp/worker/src/
 RUN pip install --no-cache-dir /tmp/worker \
@@ -71,6 +88,11 @@ COPY tenant_platform/contracts/policy/foundation.v1.json /ga/policy/foundation.v
 # 挂载点:memory/temp 由 Manager 以工作区 subpath 挂载;runner-state 保存运行态。
 RUN mkdir -p /ga/legacy/memory /ga/legacy/temp /ga/runner-state \
     && chown -R 10002:10002 /ga/legacy/memory /ga/legacy/temp /ga/runner-state \
+    # stdio MCP 共享包缓存卷挂载点: 镜像内预建 + chown, 新命名卷首挂时
+    # 以镜像目录(含属主)初始化——否则卷根 root:root, runner 用户写不进
+    # npx/uv/pip 缓存(缓存目录 env 由 sandbox-manager 注入到此处)。
+    && mkdir -p /var/cache/ga-pkg \
+    && chown 10002:10002 /var/cache/ga-pkg \
     && chmod -R a-w /ga/legacy /ga/memory-template /ga/worker-python /usr/local/lib/python3.11 \
     && chmod a-w /ga
 

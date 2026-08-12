@@ -19,8 +19,9 @@ type MCPTarget struct {
 	Headers map[string]string
 }
 
-// WorkerMCPProxy 是 Runner 经 Platform 的受控 MCP 代理(Runner 仅 internal
-// 网络, 无公网出口——外部 MCP Server 一律经此代理, 与 Sophub proxy 同模式):
+// WorkerMCPProxy 是 Runner 经 Platform 的受控 MCP 代理(外部 HTTP MCP
+// Server 一律经此代理, 与 Sophub proxy 同模式; key 平台侧持有 + 配额计量,
+// worker 快照不含任何外部凭据):
 //   - Runner 不持有任何外部凭据, 只持有短期 capability JWT(audience=ga-mcp-proxy);
 //   - server_id → 目标的映射由 Platform 的启用中 MCP 表决定, 即白名单
 //     (管理员未启用的 server 一律 404);

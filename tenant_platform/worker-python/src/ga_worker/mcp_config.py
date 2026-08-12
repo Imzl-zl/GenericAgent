@@ -19,8 +19,10 @@ class MCPConfigError(ValueError):
 class MCPRuntimeSnapshot:
     snapshot_id: str
     servers: tuple[MCPServerConfig, ...]
-    # proxy 非空时, 所有 server 一律经 Platform 受控 MCP proxy 访问
-    # (Runner 仅 internal 网络, 无公网出口): server_id → URL 映射即白名单。
+    # proxy 非空时, http server 一律经 Platform 受控 MCP proxy 访问
+    # (key 平台侧持有 + 配额计量): server_id → URL 映射即白名单。
+    # stdio server 是沙箱内进程宿主, 不携带 proxy 字段(proxy 仅对 http
+    # transport 生效, 混布快照不会因 stdio 行携带 proxy 而校验失败)。
     proxy: "MCPRuntimeProxy | None" = None
 
 
@@ -82,16 +84,33 @@ def load_runtime_mcp_snapshot(config_root: Path) -> MCPRuntimeSnapshot:
             raise MCPConfigError(f"MCP server at index {index} must be an object")
         unknown = set(item) - {
             "server_id", "name", "url", "timeout_seconds",
+            "transport", "command", "args",
         }
         if unknown:
             raise MCPConfigError(f"MCP server at index {index} contains unknown fields: {sorted(unknown)}")
+        raw_args = item.get("args")
+        if raw_args is None:
+            args: tuple[str, ...] = ()
+        elif isinstance(raw_args, list) and all(isinstance(arg, str) for arg in raw_args):
+            args = tuple(raw_args)
+        else:
+            raise MCPConfigError(f"MCP server at index {index}: args must be an array of strings")
+        transport = item.get("transport", "http")
+        if not isinstance(transport, str):
+            raise MCPConfigError(f"MCP server at index {index}: transport must be a string")
+        # proxy 只服务 http transport: stdio 为沙箱内进程宿主, 携带 proxy
+        # 字段会触发 MCPServerConfig.validate() 的 stdio 拒绝分支。
+        use_proxy = bool(proxy) and transport == "http"
         config = MCPServerConfig(
             server_id=item.get("server_id", ""),
             name=item.get("name", ""),
             url=item.get("url", ""),
             timeout_seconds=item.get("timeout_seconds", 30),
-            proxy_base_url=proxy.base_url if proxy else "",
-            capability_token=proxy.capability_token if proxy else "",
+            proxy_base_url=proxy.base_url if use_proxy else "",
+            capability_token=proxy.capability_token if use_proxy else "",
+            transport=transport,
+            command=item.get("command", ""),
+            args=args,
         )
         try:
             config.validate()

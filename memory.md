@@ -10,13 +10,14 @@
 - **IM 多渠道完成（2026-08-10，im-channel-binding epic 6/6 DONE）**：渠道配置统一模型（channel_configs）+ 飞书/钉钉/QQ 接入（poller BotAdapter 注册表）+ im-bindings API + Web 渠道绑定页
 - **IM 流式输出完成（2026-08-10，im-streaming-delivery epic 7/7 DONE）**：StreamingSender 可选接口 + scheduler 500ms 节流转发管道 + 飞书消息编辑打字机 + QQ 单聊原生流式 + 群聊收敛（只发最终结果）+ im_streaming_mode 管理开关；真实渠道冒烟待用户凭据
 - **企微渠道完成（2026-08-11，commit 3023e3d2）**：WeComAdapter（wecom_aibot_sdk WS）+ 渠道绑定页企业微信卡片 + 流式判定矩阵 + delivery 回复路由（审查 C1 修复）；真实渠道冒烟待用户凭据，流式模式建议保持 off/final_only
-- **MCP 治理完成（2026-08-11，commit 58b27620）**：key 平台侧注入（mcp_servers.headers，proxy 转发注入，worker 快照永不含 key）+ 每用户×每 server×周期配额（proxy 原子扣减 429）+ **mcp-gateway 退役**（stdio transport 整体移除，pandoc 本地化后无业务用途）+ web JSON 直接编辑 + 用户配额面板；集成测试修复（_register_user 冗余直插 workspace，0050 不变量遗留）
+- **MCP 治理完成（2026-08-11，commit 58b27620）**：key 平台侧注入（mcp_servers.headers，proxy 转发注入，worker 快照永不含 key）+ 每用户×每 server×周期配额（proxy 原子扣减 429）+ web JSON 直接编辑 + 用户配额面板；集成测试修复（_register_user 冗余直插 workspace，0050 不变量遗留）
+- **MCP stdio 恢复完成（2026-08-12）**：stdio transport 恢复为 **Worker 沙箱内进程宿主**（主流 mcp.json：command/args 直通，预装命令 / npx -y / uvx 全支持）；runner 经 runner-control 出网（可信部署主流模型，撤销 registry 白名单）；npx/uvx/pip 共享缓存卷（GA_PKG_CACHE_VOLUME，全租户复用）；ga-runner 镜像补 node 20 LTS + uv（固定版本+sha256）；HTTP MCP 仍走 proxy（key 托管 + 配额计量）；stdio 调用不按次计量（快照签发配额门控）
 - **推送审查修复完成（2026-08-12，B1/B2/Y1/Y2/Y3/Y5+三轮）**：IM 流式接线（main.go 装配时序）+ MCP 配额调度过滤接入签发路径 + proxy 扣配额后移 resolve + 双周期事务扣减 + 掩码不匹配拒绝 + **proxy JTI 预算后移（validate/consume 拆分，拒绝路径不计量，MCP+Sophub 对称）+ 配额两阶段（预检+条件扣减）**；三轮修复 B2 配额属主分裂（filter 改按 workspace owner，与 proxy 同源）+ 防御哨兵错误码；含回归测试，Go 全量+race 绿
 - **错误域分类硬化完成（2026-08-12，commit 35572e5）**：业务拒绝哨兵化（ErrValidation/ErrUserNotFound/ErrUsernameExists/ErrProviderNotFound 等 6 新哨兵）+ store 23505/ErrNoRows 归类 + api writeStoreError 统一映射（400/404/409/500）+ FAILURE_POLICY.zh-CN.md（错误域分类 + 失败策略矩阵 + 审查闭环约定）；行为变化：用户名冲突 400→409、不存在 404、DB 故障 400→500
 - **llmproxy 404 兼容修复（2026-08-12，commit fa41761）**：GetProvider 错误语义迁移后 loadBoundProvider 仍查 pgx.ErrNoRows 导致集成测试回归（500 替代 404），已兼容 domain.ErrProviderNotFound；教训：store 错误语义变更是行为变更，必须 grep 全部生产调用者 + 推送前跑集成测试
 - **生产部署（2026-08-12）**：本机（lou@GenericAgent 服务器）compose 项目 genericagent 全套服务，`make build` 后滚动升级 platform+llm-proxy（镜像备份 :local.bak-20260812 回滚预案）；healthz/API 路由全链路验证通过
   - 已知数据问题（非本轮引入）：channel_configs 两条 wechat 绑定（08-08 写入）明文是 iLink 凭据字符串（`xxx@im.bot:yyy`）非 JSON，RestoreActiveBots 恢复时 poller client marshal 失败（日志 ERROR bot_lifecycle: restore channel failed）——良性不阻塞启动，待用户确认后清理/迁移
-- **wechat 频道恢复（2026-08-12）**：channel_configs 两条 wechat 绑定（08-08 写入，明文为 iLink 凭据字符串非 JSON）经格式迁移恢复——重加密为 `{"token": ...}`（备份 /tmp/wechat_plaintext_backup.txt）+ 重建 bot-poller 镜像（生产 poller 一直是旧 /start 契约 bot_token 顶层字段，89081f2 改 config_json 后 8-11 部署未重建 poller，两边失配才导致 marshal 失败）；恢复后两条 restored channel 无 ERROR；清理退役孤儿容器 genericagent-mcp-gateway-1
+- **wechat 频道恢复（2026-08-12）**：channel_configs 两条 wechat 绑定（08-08 写入，明文为 iLink 凭据字符串非 JSON）经格式迁移恢复——重加密为 `{"token": ...}`（备份 /tmp/wechat_plaintext_backup.txt）+ 重建 bot-poller 镜像（生产 poller 一直是旧 /start 契约 bot_token 顶层字段，89081f2 改 config_json 后 8-11 部署未重建 poller，两边失配才导致 marshal 失败）；恢复后两条 restored channel 无 ERROR
 - **web 镜像滞后修复（2026-08-12）**：8-11 部署时 web 镜像未重建（停在 08-08 构建），8-10/8-11 的界面改动（IM 渠道绑定页/企微卡片/MCP 治理面板）全缺失，用户看到旧“微信绑定”菜单——重建后含企业微信/渠道绑定/MCP 面板；同批排查：sandbox-manager 镜像旧但代码无改动（无影响）、ga-runner 旧但 0751a6d 仅影响宿主机场景（容器内无影响）。**教训：部署必须全量重建（make build），选择性重建会漏镜像（前有 bot-poller 契约失配，后有 web 界面滞后）**
 - 最后更新：2026-08-12（错误域硬化 + 生产部署 + wechat 恢复 + web 重建）
 
@@ -29,7 +30,7 @@
 - 企微渠道（2026-08-11）：WeComAdapter（wecom_aibot_sdk WebSocket，线程内自管 asyncio loop；入站 chatid/userid 映射——单聊 chatid==userid 判 private，空 sender 保守归群；出站 SEND_MSG markdown 承载纯文本；流式 SEND_MSG+stream 帧）+ 注册表接线 + Web 卡片（Bot ID/Bot Secret 标签，secretLabel 泛化）+ OpenAPI/文档同步
 - IM 流式输出（2026-08-10）：worker Chunk → scheduler 500ms 节流合并 → StreamingSender（飞书=占位消息+PUT 编辑打字机 / QQ 单聊=原生 stream{state,id,index,reset} 帧 / 钉钉微信=仅终态）；群聊统一只发最终结果（conversation_type 判定）；stream_final_at 抑制 delivery 文本重复（文件照发）；im_streaming_mode 管理开关（默认 streaming）
 - sandbox-runner 重构（Round13）：生命周期不变量结构强制、沙箱安全加固、Foundation 垂直 E2E
-- MCP 治理（2026-08-11）：管理员 web 端 mcp.json 风格 JSON 直接编辑（url+headers+timeout，headers 掩码回显/更新保留原 key）；key 平台侧持有（proxy 注入，快照不含 key，日志脱敏）；每用户配额（day/month 原子扣减，无配额行默认放行，调度粗过滤+proxy 精确强制）；stdio transport 与 mcp-gateway 已移除（http 唯一 transport）
+- MCP 治理（2026-08-11）：管理员 web 端 mcp.json 风格 JSON 直接编辑（url+headers+timeout，headers 掩码回显/更新保留原 key）；key 平台侧持有（proxy 注入，快照不含 key，日志脱敏）；每用户配额（day/month 原子扣减，无配额行默认放行，调度粗过滤+proxy 精确强制）；transport = http（默认，proxy 计量）+ stdio（Worker 沙箱内进程宿主，2026-08-12 恢复）
 
 ## 进行中 / 未完成
 
@@ -42,7 +43,7 @@
 
 - **2026-08-12（推送审查修复定案，已落地）**：①main.go 装配时序——transport 块必须在 NewScheduler 之前（Streaming 端口构造时立即断言 botTransport，值语义非延迟引用，先前声明后赋值=恒 nil 流式全链路静默失效）；②MCP 配额调度过滤唯一生产入口=签发路径（resolveMCPSnapshot 后 filterMCPServersByQuota，死代码教训：有定义有单测不等于接入调用链）；③proxy 配额扣减在 resolve 白名单之后（404 不烧配额）；④ConsumeMCPQuotas 单事务双周期（day→month 固定锁序，要么都扣要么都不扣，被拒调用不烧 day）；⑤掩码合并不匹配/新键掩码 → 400 拒绝（不落库）；⑥**proxy 计量原则（Y5）**：JTI 预算只在"调用即将发起"时消费——validate 与 consume 拆分（authenticate 拆 validateToken+consumeBudget），客户端错误/白名单 404/配额 429/系统 503 路径不计量，上游 502 与 fetch 后判定视为已发起；MCP 与 Sophub 两 proxy 对称实现；**配额两阶段（二轮）**：quotaCheck 只读预检先于 JTI 消费、quotaConsume 条件扣减在 JTI 之后——任一拒绝路径零扣减，极端竞态白扣选短期 JTI（用户配额从不错扣）
 
-- **2026-08-11（MCP 治理定案，已落地）**：MCP 配置 = mcp.json 风格 JSON 直接编辑（web 端），存储保留 DB（mcp_servers.headers，无独立 key 字段）；key 平台侧持有（proxy 注入，admin API 掩码回显，更新掩码值保留原 key）；配额 = 每用户 × 每 server × 周期（day/month），proxy 每次调用原子扣减（429 MCP_QUOTA_EXCEEDED），调度层按用户粗过滤耗尽 server；stdio 分发（将来如需）= npx/uvx 共享缓存卷 + 版本固定；pandoc 保持镜像预装 CLI 直调（不启用 MCP 协议）；PDF 引擎保持 pandoc→docx→LibreOffice 渲染式（不引 TeX Live）。设计真值：`.tasks/mcp-governance/` + `tenant_platform/docs/MCP_GATEWAY_DESIGN.zh-CN.md`（已标注退役）
+- **2026-08-11（MCP 治理定案，已落地）**：MCP 配置 = mcp.json 风格 JSON 直接编辑（web 端），存储保留 DB（mcp_servers.headers，无独立 key 字段）；key 平台侧持有（proxy 注入，admin API 掩码回显，更新掩码值保留原 key）；配额 = 每用户 × 每 server × 周期（day/month），proxy 每次调用原子扣减（429 MCP_QUOTA_EXCEEDED），调度层按用户粗过滤耗尽 server；stdio 分发（2026-08-12 已落地）= Worker 沙箱内进程宿主（command/args 直通）+ npx/uvx/pip 共享缓存卷 + runner 出网（撤销 registry 白名单/受控代理：可信部署下过度设计）；pandoc 保持镜像预装 CLI 直调（不启用 MCP 协议）；PDF 引擎保持 pandoc→docx→LibreOffice 渲染式（不引 TeX Live）。设计真值：`.tasks/mcp-governance/`
 
 - **2026-08-11（企微渠道定案，已落地）**：接入形态 = 企业微信智能机器人（wecom_aibot_sdk WebSocket 长连接，与飞书/钉钉/QQ 同模式，无公网回调地址）；凭据 bot_id/secret **复用 app_id/app_secret 存储槽位**（契约字段不变，Web 标签与前端必填文案随渠道泛化）；conversation_type = chatid==userid 判 private（空 sender 保守归群）；出站统一 SEND_MSG（文本用 markdown 承载——SDK 主动发送无 text 类型，被动 reply_stream 依赖入站 req_id 不适合异步 delivery）；流式 = SEND_MSG+stream 帧（协议层与被动 reply_stream 同格式，**待真实凭据实测，未通过前 im_streaming_mode 建议 off/final_only**）；新渠道加入必须同步：Go IsValidChannelType/IsValidSource/channelTypeForTaskSource/StreamForwarder 矩阵 + poller VALID_CHANNEL_TYPES/工厂 + OpenAPI 枚举 + Web ChannelType/卡片
 - CI 门禁分支/PR 级矩阵；集成测试必须真实 Postgres（`-p 1` 串行化规避 flaky）
@@ -80,8 +81,8 @@
 - **微信交付（2026-08-08）**：平台 delivery 层 `cleanIMMarkdown` 降级纯文本是平台职责；文档转换用 runner 镜像本地 pandoc/python-docx，勿恢复 MCP pandoc；`memory-template/wechat_delivery_sop.md` 新工作区自动预置
 - **ga-runner 镜像坑（2026-08-08）**：镜像命名统一 `genericagent-*` 前缀；`docker compose build ga-runner` 产物名固定 `genericagent-ga-runner:local`；sandbox-manager 启动时 fail-fast 校验镜像存在；重建流程 `make build` → `make runner-digest` → 重启 sandbox-manager
 - **runner-control 网络名坑**：实际名 `genericagent_runner-control`，用 `GA_RUNNER_NETWORK` 可配置
-- **MCP 无公网出口架构**：外部 MCP Server 走 Platform 受控 proxy；改 MCP 相关需同时重建 platform + ga-runner 镜像
-- **MCP stdio 链路（2026-08-08）**：stdio server 由 mcp-gateway 常驻服务托管；关键不变量 ①`domain.MCPServerGatewayURL` 唯一合成 ②proxy 转发白名单含 Mcp-Session-Id ③gateway 无状态 ④子进程环境白名单 ⑤锁序 g.mu → pool.mu ⑥max_instances 进程池上限 ⑦熔断后探活固定间隔
+- **MCP 网络（2026-08-12 修订）**：runner 经 runner-control 出网（可信部署主流模型）；外部 HTTP MCP Server 仍走 Platform 受控 proxy（key 托管 + 配额计量）；改 MCP 相关需同时重建 platform + ga-runner 镜像
+- **MCP stdio 链路（2026-08-12 恢复后）**：stdio server 由 Worker 沙箱内 MCPStdioClient 进程宿主（subprocess + 新行分隔 JSON-RPC 2024-11-05）；不变量 ①快照携带 transport/command/args（mcp_config 严格拒绝未知字段）②command 校验=格式层（裸名/绝对路径，无 shell 元字符；管理员可信，无白名单/黑名单）③共享缓存卷 env=NPM_CONFIG_CACHE/UV_CACHE_DIR/PIP_CACHE_DIR（docker_cli 注入）④进程生命周期=deadline 封口 + close 终止（超时回收）⑤stdio 调用不经 proxy：不按次计量，配额只按快照签发门控 ⑥spawn 失败必须包成 MCPRuntimeError（session_lifecycle 捕获列表才有兜底）⑦**proxy 字段只对 http server 生效**（mcp_config use_proxy 分支；stdio 携带 proxy_base_url 会触发校验拒绝→整个快照加载失败，推送审查修复）
 - **runsc DNS 坑**：gVisor netstack 与 Docker 内嵌 DNS 不兼容——manager 注入 `--add-host`（docker inspect 输出是 JSON 数组）
 - **MCP 工具被策略过滤坑**：foundation.v1.json 的 allowed_tools 静态白名单——策略文件加 `mcp:*` 通配，两处过滤逻辑都要支持
 - **部署配置注意**：`PER_REQUESTER_RUNNING_LIMIT`（旧名 PER_TENANT_RUNNING_LIMIT 失效）；`PLATFORM_ADMIN_*`（旧名 PLATFORM_DEV_* 失效）
@@ -93,9 +94,10 @@
 
 ## 最近活跃窗口
 
+- 2026-08-12：**MCP stdio 恢复 + runner 出网 + 并发限额调整（含推送审查修复）**：stdio 端到端恢复（domain 校验放开 + snapshot 签发携带 transport/command/args + worker MCPStdioClient + web 编辑器 + openapi）；runner-control 去 internal（可信部署主流模型，撤销 registry 白名单）；GA_PKG_CACHE_VOLUME 共享缓存卷全链路；ga-runner 镜像加 node 20 LTS + uv（sha256 校验，本地模拟验证 npx/uvx/缓存 env 生效）；并发限额 PER_REQUESTER_RUNNING_LIMIT=2 / MAX_RUNNING_TASKS=5；推送审查修复：proxy 字段仅 http server 生效（stdio 混布快照不再加载失败）+ store command 写回 nullString + proxy resolve 过滤 stdio + 安全测试 3 断言同步 + Dockerfile 预建缓存卷属主；验证：Go 全量+race 绿、worker 132 passed、契约/安全/smoke 41 passed、bot_poller 52、web lint/build 绿
 - 2026-08-12：**推送审查修复（6 项+三轮 2 项全落地+回归测试）**：B1 main.go transport 装配块前移（含 botLifecycle/botPollerClient 一并提前，channelSvc Start 闭包窗口一并消除）；B2 filterMCPServersByQuota 接入 issueInitialWorkerCredentials（新测试验证签发快照不含耗尽 server）；Y1 proxy quota 后移 resolve（404 不烧配额）；Y2 ConsumeMCPQuotas 单事务双周期（新增不烧 day 回归 + 20 并发恰 limit 成功测试）；Y3 掩码不匹配/新键掩码 400 拒绝；Y5 两 proxy 拆 validateToken/consumeBudget（404/429/400 拒绝路径不烧 JTI，MCP+Sophub 对称）；Go 全量（含 DB）+ race 6 包 + api race 全绿
 - 2026-08-11：**企微渠道全链路落地（3023e3d2）**：WeComAdapter + 注册表 + Web 卡片 + OpenAPI/文档；独立审查抓 C1（channelTypeForTaskSource 缺 wecom 分支→回复错投微信）已修+delivery 路由测试（fake resolver 按 channel_type 匹配真实 store 语义）；M2-M5 小修（前端校验文案/空 sender 归群/首帧占位/失败清理）；poller 52 用例 + Go TDD 全绿；已提交推送 origin/main；残余：真实凭据冒烟（SEND_MSG 流式帧验证）
 - 2026-08-10：**im-streaming-delivery 全部落地**（7/7 DONE）：StreamingSender/StreamReply 接口 + StreamForwarder（500ms 节流合并 + open/append/commit/abort）+ scheduler 接入（Terminal commit + 失败 abort + 群聊收敛）+ 飞书编辑打字机 + QQ 单聊原生流式 + im_streaming_mode 开关 + Web 设置项；migration 0054（conversation_type + stream_final_at + text_value）；全量验证绿（存量失败 4 处与本次无关）；真实渠道冒烟待用户凭据
 - 2026-08-10：**im-channel-binding 全部落地**（6/6 DONE）：migration 0053（bots→channel_configs）+ domain.Bot→ChannelConfig 全库改名 + im-bindings API（user+admin）+ Router 多渠道分桶（Source/ConversationKey）+ poller BotAdapter 注册表（飞书/钉钉/QQ adapter）+ Web 渠道绑定页；契约字段 ilink_user_id→channel_account_id（B3 命名债已清）；全量验证绿（存量失败 4 处与本次无关，base commit 复现）；真实渠道冒烟待用户凭据
 - 2026-08-10：IM 多渠道架构落地（3 批提交）：契约 conversation_id + Go 分桶全链路 + /new 桶级化；epic im-channel-session 任务 1-5 DONE、任务 6 砍掉
-- 2026-08-08：MCP Gateway 架构重构（stdio 支持 + 收敛）；2026-08-06：Round17 健康清理 4 commit；Sophub 集成全链路梳理；Round16 修复；Round15 P2-P4 真值源收敛；审查 I-4 鉴权统一；全项目健康/安全审查 11 findings + 14 修复；Round13 收尾；2026-08-06：初始化项目协作文件体系
+- 2026-08-08：MCP stdio 接入与收敛；2026-08-06：Round17 健康清理 4 commit；Sophub 集成全链路梳理；Round16 修复；Round15 P2-P4 真值源收敛；审查 I-4 鉴权统一；全项目健康/安全审查 11 findings + 14 修复；Round13 收尾；2026-08-06：初始化项目协作文件体系

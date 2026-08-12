@@ -89,8 +89,7 @@ def test_one_env_template_contains_every_compose_value() -> None:
 def test_compose_starts_seven_services_and_only_sandbox_manager_receives_docker_socket() -> None:
     services = _compose()["services"]
     # ga-runner 是 scale: 0 服务(只构建不启动), 不算常驻服务。
-    # mcp-gateway 已于 2026-08-11 退役(EPIC mcp-governance D5: pandoc 本地化
-    # 后 stdio transport 整体移除)。
+    # stdio transport 由 Worker 沙箱内进程宿主承载, 无独立常驻服务。
     assert set(services) == {"postgres", "bot-poller", "platform", "web", "llm-proxy", "sandbox-manager", "ga-runner"}
     assert services["ga-runner"].get("scale") == 0, "ga-runner must be scale: 0 (built but not started by up)"
     assert "build" in services["ga-runner"], "ga-runner must be buildable via docker compose build"
@@ -150,8 +149,9 @@ def test_compose_starts_seven_services_and_only_sandbox_manager_receives_docker_
     llm_proxy = services["llm-proxy"]
     assert "ports" not in llm_proxy
     networks = set(llm_proxy.get("networks", []))
-    # 审查 C2: llm-proxy 是唯一持有出站能力的服务(database/runner-control
-    # internal + llm-egress 出站); Runner/Platform 不得接入 llm-egress。
+    # 审查 C2 修订(2026-08-12): llm-proxy 持有 llm-egress 出站能力;
+    # runner-control 已去 internal(可信部署主流模型, stdio MCP 按需拉包),
+    # runner 经其出网; 但 llm-egress 仍仅 llm-proxy 接入。
     assert networks == {"database", "runner-control", "llm-egress"}
     for other in ("platform", "sandbox-manager", "bot-poller", "web"):
         assert "llm-egress" not in services[other].get("networks", []), other
@@ -197,7 +197,9 @@ def test_shared_volume_and_network_names_are_project_scoped_and_consistent() -> 
     assert compose["volumes"]["runner_workspaces"] == {"name": expected_volume}
     expected_network = "${COMPOSE_PROJECT_NAME:-ga}_runner-control"
     assert compose["networks"]["runner-control"]["name"] == expected_network
-    assert compose["networks"]["runner-control"].get("internal") is True
+    # 2026-08-12 修订(stdio MCP 恢复): runner-control 不再 internal——可信
+    # 部署主流模型下 runner 经此出网(npx/uvx 按需拉包); 网络名约定不变。
+    assert compose["networks"]["runner-control"].get("internal") is not True
     manager_env = compose["services"]["sandbox-manager"]["environment"]
     assert manager_env["GA_WORKSPACES_VOLUME"] == "${GA_WORKSPACES_VOLUME:-${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces}"
     values = _env_values()
@@ -214,13 +216,20 @@ def test_application_configuration_uses_named_volumes() -> None:
         "platform_sock",
         # round12 审查(I4): Manager 控制面 nonce 防重放状态卷(跨重启持久化)。
         "manager_state",
+        # 2026-08-12(stdio MCP): npx/uv/pip 共享缓存卷, 全租户复用一份。
+        "ga_pkg_cache",
     }
     # runner_workspaces 显式 name: sandbox-manager 需以 daemon 可解析的卷名
     # 做 volume-subpath 挂载(方案 §7); round11 审查(M2): 卷名带 Compose
-    # 项目名前缀, 避免多套部署共享工作区卷。其余卷保持默认声明。
+    # 项目名前缀, 避免多套部署共享工作区卷。ga_pkg_cache 同款: Manager 按
+    # 卷名创建 Runner 挂载。其余卷保持默认声明。
+    named = {
+        "runner_workspaces": "${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces",
+        "ga_pkg_cache": "${COMPOSE_PROJECT_NAME:-ga}_ga_pkg_cache",
+    }
     for name, value in volumes.items():
-        if name == "runner_workspaces":
-            assert value == {"name": "${COMPOSE_PROJECT_NAME:-ga}_runner_workspaces"}
+        if name in named:
+            assert value == {"name": named[name]}
         else:
             assert not value
 

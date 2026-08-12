@@ -116,6 +116,7 @@ def test_server_config_exposes_only_supported_runtime_fields():
     assert set(MCPServerConfig.__dataclass_fields__) == {
         "server_id", "name", "url", "timeout_seconds",
         "proxy_base_url", "capability_token",
+        "transport", "command", "args",
     }
 
 
@@ -491,3 +492,183 @@ def test_tool_names_are_safely_namespaced_and_invalid_schema_is_rejected(
     })
     with pytest.raises(MCPClientError, match="inputSchema"):
         invalid.initialize()
+
+
+# --- stdio transport (Worker 沙箱内进程宿主, 主流 mcp.json 兼容) ---
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+from ga_worker.mcp_client import MCPDeadlineExceeded, MCPStdioClient  # noqa: E402
+
+FAKE_STDIO_SERVER = r"""
+import json, sys
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fake-stdio", "version": "1.0"},
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "tools": [{
+                "name": "local_search",
+                "description": "Local search",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }],
+        }})
+    elif method == "tools/call":
+        params = message.get("params") or {}
+        arguments = params.get("arguments") or {}
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "content": [{"type": "text", "text": "local:" + str(arguments.get("query", ""))}],
+        }})
+"""
+
+
+@pytest.fixture
+def stdio_server_script(tmp_path):
+    script = tmp_path / "fake_stdio_server.py"
+    script.write_text(FAKE_STDIO_SERVER)
+    return script
+
+
+def test_stdio_client_initialize_list_and_call(stdio_server_script):
+    client = MCPStdioClient(MCPServerConfig(
+        server_id="serena",
+        name="Serena",
+        url="",
+        timeout_seconds=5,
+        transport="stdio",
+        command=sys.executable,
+        args=(str(stdio_server_script),),
+    ))
+    try:
+        tools = client.initialize()
+        assert [tool.name for tool in tools] == ["local_search"]
+        assert tools[0].ga_name == "serena__local_search"
+        assert client.call_tool("local_search", {"query": "GA"}) == "local:GA"
+    finally:
+        client.close()
+    assert client._process is None or client._process.poll() is not None
+
+
+def test_stdio_config_validation():
+    with pytest.raises(ValueError, match="command is required"):
+        MCPServerConfig("x", "X", "", transport="stdio").validate()
+    with pytest.raises(ValueError, match="url must be empty"):
+        MCPServerConfig("x", "X", "https://mcp.exa.ai/mcp", transport="stdio", command="serena").validate()
+    with pytest.raises(ValueError, match="proxy_base_url is not supported"):
+        MCPServerConfig(
+            "x", "X", "", transport="stdio", command="serena",
+            proxy_base_url="http://platform:8082", capability_token="t",
+        ).validate()
+    with pytest.raises(ValueError, match="command/args are only valid"):
+        MCPServerConfig("x", "X", "https://mcp.exa.ai/mcp", command="serena").validate()
+    with pytest.raises(ValueError, match="transport must be"):
+        MCPServerConfig("x", "X", "https://mcp.exa.ai/mcp", transport="sse").validate()
+    # 合法 stdio 配置通过
+    MCPServerConfig(
+        "x", "X", "", transport="stdio", command="serena",
+        args=("start-mcp-server", "--context=agent"),
+    ).validate()
+
+
+def test_stdio_spawn_failure_is_mcp_error():
+    with pytest.raises(MCPClientError, match="spawn failed"):
+        MCPStdioClient(MCPServerConfig(
+            "ghost", "Ghost", "", transport="stdio",
+            command="definitely-not-a-real-command-xyz", timeout_seconds=1,
+        ))
+
+
+def test_stdio_process_exit_is_reported_with_stderr(tmp_path):
+    script = tmp_path / "exit_server.py"
+    script.write_text("import sys\nsys.stderr.write('boom detail\\n')\n")
+    client = MCPStdioClient(MCPServerConfig(
+        "exit", "Exit", "", transport="stdio",
+        command=sys.executable, args=(str(script),), timeout_seconds=2,
+    ))
+    try:
+        with pytest.raises(MCPClientError, match="exited unexpectedly"):
+            client.initialize()
+    finally:
+        client.close()
+    with pytest.raises(MCPClientError, match="closed"):
+        client.call_tool("anything", {})
+
+
+def test_stdio_notifications_and_server_requests_are_skipped(tmp_path):
+    script = tmp_path / "tricky_server.py"
+    script.write_text(r"""
+import json, sys
+
+init_id = None
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    message = json.loads(line.strip())
+    method = message.get("method")
+    if method == "initialize":
+        init_id = message["id"]
+        send({"jsonrpc": "2.0", "id": init_id, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "tricky", "version": "1.0"},
+        }})
+    elif method == "notifications/initialized":
+        # 在下一个读循环前塞入噪音: log 通知 + server -> client 请求
+        # (sampling)。客户端必须在 tools/list 读循环中跳过通知、应答
+        # 请求并继续等到自己的响应。
+        send({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "log line"}})
+        send({"jsonrpc": "2.0", "id": 999, "method": "sampling/createMessage", "params": {}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"tools": [{"name": "t", "inputSchema": {"type": "object"}}]}})
+""")
+    client = MCPStdioClient(MCPServerConfig(
+        "tricky", "Tricky", "", transport="stdio",
+        command=sys.executable, args=(str(script),), timeout_seconds=5,
+    ))
+    try:
+        tools = client.initialize()
+        assert [tool.name for tool in tools] == ["t"]
+    finally:
+        client.close()
+
+
+def test_stdio_deadline_seals_client(tmp_path):
+    script = tmp_path / "slow_server.py"
+    script.write_text("import time\ntime.sleep(30)\n")
+    client = MCPStdioClient(MCPServerConfig(
+        "slow", "Slow", "", transport="stdio",
+        command=sys.executable, args=(str(script),), timeout_seconds=0.1,
+    ))
+    started = time.monotonic()
+    try:
+        with pytest.raises(MCPClientError, match="deadline"):
+            client.initialize()
+        assert time.monotonic() - started < 2
+    finally:
+        client.close()
+    with pytest.raises(MCPClientError, match="closed"):
+        client._request("tools/list", {})

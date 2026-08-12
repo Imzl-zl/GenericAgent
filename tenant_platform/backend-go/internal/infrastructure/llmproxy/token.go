@@ -31,8 +31,8 @@ const (
 	// 与 LLM capability 同签发体系但独立用途(方案 §5.2: Runner 不持有 Sophub Key)。
 	SophubAudience = "ga-sophub-proxy"
 	// MCPAudience 是 Runner → Platform MCP proxy 的 capability audience。
-	// 与 Sophub 同模式: Runner 直连外部 MCP Server 需经 Platform 受控代理
-	// (Runner 仅 internal 网络, 无公网出口), server_id → URL 映射即白名单。
+	// 与 Sophub 同模式: Runner 访问外部 HTTP MCP Server 经 Platform 受控
+	// 代理(key 平台侧持有 + 配额计量), server_id → URL 映射即白名单。
 	MCPAudience = "ga-mcp-proxy"
 	CapabilityType = "ga-llm-cap+jwt"
 	validationLeeway = 30 * time.Second
@@ -507,7 +507,7 @@ func (i *Issuer) IssueSophubToken(sessionKey, taskID string, runnerGeneration ui
 }
 
 // IssueMCPToken 签发 Runner → Platform MCP proxy 的短期 capability
-// (Runner 仅 internal 网络, 外部 MCP Server 一律经 Platform 受控代理)。
+// (外部 HTTP MCP Server 一律经 Platform 受控代理, key 托管 + 配额计量)。
 // 与 Sophub token 同模式: taskID/generation 绑定 + JTI 纳入同一撤销集合,
 // 终态后旧 task 的 MCP token 立即失效; budget 为代理调用预算(无预算拒绝)。
 func (i *Issuer) IssueMCPToken(sessionKey, taskID string, runnerGeneration uint64, ttl time.Duration, budget string) (string, CapabilityClaims, error) {

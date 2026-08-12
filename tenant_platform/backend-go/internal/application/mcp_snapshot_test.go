@@ -70,19 +70,29 @@ func TestResolveMCPSnapshotTreatsNoEnabledServersAsDisabled(t *testing.T) {
 	}
 }
 
-// stdio 遗留行(0049 时代数据)在快照中跳过: gateway 已退役, 不合成 URL。
-func TestResolveMCPSnapshotSkipsStdioLegacyRows(t *testing.T) {
+// stdio 服务器(0049 时代字段)现在随快照下发: Worker 沙箱内进程宿主,
+// 无需合成 gateway URL。
+func TestResolveMCPSnapshotIncludesStdioServers(t *testing.T) {
 	source := &fakeMCPSource{servers: []domain.MCPServer{
 		{ID: 1, ServerKey: "exa", Name: "Exa", URL: "https://mcp.exa.ai/mcp", TimeoutSeconds: 30, Enabled: true, Revision: 1},
-		{ID: 2, ServerKey: "pandoc", Name: "Pandoc", Transport: "stdio", TimeoutSeconds: 60, Enabled: true, Revision: 1},
+		{ID: 2, ServerKey: "serena", Name: "Serena", Transport: "stdio", Command: "serena", Args: []string{"start-mcp-server", "--context=agent"}, TimeoutSeconds: 60, Enabled: true, Revision: 1},
 	}}
 	s := &scheduler{cfg: SchedulerConfig{MCPServer: source}}
 	snapshot, err := s.resolveMCPSnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot.Servers) != 1 || snapshot.Servers[0].ServerID != "exa" {
-		t.Fatalf("expected only http server in snapshot, got %+v", snapshot.Servers)
+	if len(snapshot.Servers) != 2 {
+		t.Fatalf("expected 2 servers in snapshot, got %+v", snapshot.Servers)
+	}
+	var stdio *RuntimeMCPServer
+	for i := range snapshot.Servers {
+		if snapshot.Servers[i].ServerID == "serena" {
+			stdio = &snapshot.Servers[i]
+		}
+	}
+	if stdio == nil || stdio.Transport != "stdio" || stdio.Command != "serena" || len(stdio.Args) != 2 {
+		t.Fatalf("stdio server not carried in snapshot: %+v", snapshot.Servers)
 	}
 }
 

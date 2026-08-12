@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -121,6 +122,60 @@ func TestBuildRuntimeConfigIncludesGlobalMCPSnapshot(t *testing.T) {
 	}
 	if bytes.Contains(document["_platform_mcp"], []byte(`"headers"`)) {
 		t.Fatalf("runtime MCP snapshot exposed unsupported headers: %s", document["_platform_mcp"])
+	}
+}
+
+func TestBuildRuntimeConfigCarriesStdioServerFields(t *testing.T) {
+	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL: "http://127.0.0.1:8081",
+		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
+		MCP: RuntimeMCPSnapshot{ID: "sha256:mcp", Servers: []RuntimeMCPServer{{
+			ServerID: "serena", Name: "Serena", TimeoutSeconds: 60,
+			Transport: "stdio", Command: "serena",
+			Args: []string{"start-mcp-server", "--context=agent"},
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(files.JSON, &document); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot struct {
+		Servers []struct {
+			ServerID string   `json:"server_id"`
+			URL      string   `json:"url"`
+			Transport string  `json:"transport"`
+			Command  string   `json:"command"`
+			Args     []string `json:"args"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal(document["_platform_mcp"], &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Servers) != 1 {
+		t.Fatalf("servers = %+v", snapshot.Servers)
+	}
+	server := snapshot.Servers[0]
+	if server.ServerID != "serena" || server.Transport != "stdio" || server.Command != "serena" ||
+		server.URL != "" || len(server.Args) != 2 || server.Args[1] != "--context=agent" {
+		t.Fatalf("stdio fields not carried: %+v", server)
+	}
+}
+
+func TestBuildRuntimeConfigRejectsInvalidStdioSnapshot(t *testing.T) {
+	provider := domain.LLMProvider{ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test"}
+	_, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL: "http://127.0.0.1:8081",
+		RoutingSnapshotID: "providers", Providers: []RuntimeProviderBinding{{Provider: provider, Token: "token"}},
+		MCP: RuntimeMCPSnapshot{ID: "sha256:mcp", Servers: []RuntimeMCPServer{{
+			ServerID: "bad", Name: "Bad", Transport: "stdio", TimeoutSeconds: 30,
+		}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "command is required") {
+		t.Fatalf("err = %v, want command-required rejection", err)
 	}
 }
 

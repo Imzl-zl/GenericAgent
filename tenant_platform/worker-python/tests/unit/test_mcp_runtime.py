@@ -77,3 +77,56 @@ def test_initialization_failure_closes_clients_already_created():
 
     assert len(created) == 2
     assert all(client.closed for client in created)
+
+
+def test_default_factory_dispatches_stdio_server(tmp_path):
+    # 默认 client_factory 按 transport 分发: stdio 走 MCPStdioClient,
+    # 沙箱内进程宿主完整走通 initialize → catalog。
+    import sys
+
+    from ga_worker.mcp_client import MCPStdioClient
+
+    script = tmp_path / "fake_stdio_server.py"
+    script.write_text(
+        "import json, sys\n"
+        "def send(m): sys.stdout.write(json.dumps(m) + '\\n'); sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    m = json.loads(line.strip())\n"
+        "    if m.get('method') == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':m['id'],'result':{'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'fake','version':'1'}}})\n"
+        "    elif m.get('method') == 'tools/list':\n"
+        "        send({'jsonrpc':'2.0','id':m['id'],'result':{'tools':[{'name':'ping','inputSchema':{'type':'object'}}]}})\n"
+    )
+    snapshot = MCPRuntimeSnapshot(
+        snapshot_id="sha256:3",
+        servers=(
+            MCPServerConfig(
+                "serena", "Serena", "", timeout_seconds=5,
+                transport="stdio", command=sys.executable, args=(str(script),),
+            ),
+        ),
+    )
+
+    catalog, clients = initialize_mcp_catalog(snapshot)
+
+    assert isinstance(clients[0], MCPStdioClient)
+    assert list(catalog) == ["serena__ping"]
+    close_mcp_clients(clients)
+    assert clients[0]._process is None or clients[0]._process.poll() is not None
+
+
+def test_spawn_failure_is_wrapped_as_runtime_error():
+    # stdio 子进程 spawn 失败(命令不存在)必须包装为 MCPRuntimeError,
+    # 否则 session_lifecycle 的捕获列表接不住会直接崩会话启动。
+    snapshot = MCPRuntimeSnapshot(
+        snapshot_id="sha256:4",
+        servers=(
+            MCPServerConfig(
+                "ghost", "Ghost", "", timeout_seconds=1,
+                transport="stdio", command="definitely-not-a-real-command-xyz",
+            ),
+        ),
+    )
+
+    with pytest.raises(MCPRuntimeError, match="ghost"):
+        initialize_mcp_catalog(snapshot)

@@ -1020,6 +1020,11 @@ func run() error {
 					if server.ServerKey != serverID {
 						continue
 					}
+					// stdio server 由 Worker 沙箱内进程宿主承载, 不经 Platform
+					// proxy(无 URL 可拨): 视为白名单外 → 404, 不产生空目标。
+					if server.Transport == domain.MCPTransportStdio {
+						return api.MCPTarget{}, false, nil
+					}
 					return api.MCPTarget{URL: server.URL, Headers: server.Headers}, true, nil
 				}
 				return api.MCPTarget{}, false, nil

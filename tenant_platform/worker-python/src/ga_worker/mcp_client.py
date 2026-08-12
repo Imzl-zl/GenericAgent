@@ -1,4 +1,6 @@
-"""Synchronous unauthenticated Streamable HTTP MCP client for tenant Worker tools."""
+"""MCP clients for tenant Worker tools: Streamable HTTP (via Platform proxy)
+and stdio (process hosted inside the Worker sandbox, mainstream mcp.json
+compatible)."""
 
 from __future__ import annotations
 
@@ -6,6 +8,7 @@ import hashlib
 import json
 import queue
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +23,7 @@ MAX_MCP_TOOL_PAGES = 32
 MAX_MCP_TOOLS = 1024
 MAX_MCP_CATALOG_BYTES = 1024 * 1024
 _NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+MAX_MCP_STDIO_STDERR_LINES = 32
 
 
 class MCPClientError(RuntimeError):
@@ -36,22 +40,43 @@ class MCPServerConfig:
     name: str
     url: str
     timeout_seconds: float = 30.0
-    # proxy_base_url/capability_token 非空时, 请求经 Platform 受控 MCP proxy
-    # 转发(server_id → URL 映射即白名单): 拨号地址改写为
+    # proxy_base_url/capability_token 非空时, http 请求经 Platform 受控 MCP
+    # proxy 转发(server_id → URL 映射即白名单): 拨号地址改写为
     # {proxy_base_url}/v1/worker/mcp/{server_id}, 并携带短期 capability。
     proxy_base_url: str = ""
     capability_token: str = ""
+    # transport: "http"(Streamable HTTP) | "stdio"(Worker 沙箱内进程宿主)。
+    # stdio 服务器用 command/args 拉起, 不需要 url/proxy/headers。
+    transport: str = "http"
+    command: str = ""
+    args: tuple[str, ...] = ()
 
     def validate(self) -> None:
         if not _NAME_RE.fullmatch(self.server_id or ""):
             raise ValueError("server_id must contain only letters, digits, or underscores")
+        if self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if self.transport not in ("http", "stdio"):
+            raise ValueError("transport must be 'http' or 'stdio'")
+        if not isinstance(self.url, str):
+            raise ValueError("url must be a string")
+        if not isinstance(self.command, str):
+            raise ValueError("command must be a string")
+        if self.transport == "stdio":
+            if self.url:
+                raise ValueError("url must be empty for stdio transport")
+            if not self.command.strip():
+                raise ValueError("command is required for stdio transport")
+            if self.proxy_base_url:
+                raise ValueError("proxy_base_url is not supported for stdio transport")
+            return
+        if self.command or self.args:
+            raise ValueError("command/args are only valid for stdio transport")
         parsed = urlparse(self.url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError("url must be an absolute http or https URL")
         if parsed.username or parsed.password or parsed.fragment:
             raise ValueError("url must contain no credentials or fragment")
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
         if self.proxy_base_url:
             parsed_proxy = urlparse(self.proxy_base_url)
             if parsed_proxy.scheme not in ("http", "https") or not parsed_proxy.netloc:
@@ -95,11 +120,15 @@ class MCPTool:
         }
 
 
-class MCPHTTPClient:
-    def __init__(self, config: MCPServerConfig, *, session: requests.Session | None = None):
+class MCPClientBase:
+    """Shared JSON-RPC 2.0 MCP client logic (protocol negotiation, catalog
+    discovery with pagination, tool calls, deadlines).
+
+    Subclasses implement `_request` (transport-specific) and `close`.
+    """
+
+    def __init__(self, config: MCPServerConfig):
         self.config = config
-        self._http = session or requests.Session()
-        self._session_id = ""
         self._protocol_version = MCP_PROTOCOL_VERSION
         self._next_id = 1
         self._lock = threading.Lock()
@@ -194,7 +223,6 @@ class MCPHTTPClient:
 
     def close(self) -> None:
         self._closed = True
-        self._http.close()
 
     def _parse_tool(self, raw: Any) -> MCPTool:
         if not isinstance(raw, dict):
@@ -213,6 +241,51 @@ class MCPHTTPClient:
         if not isinstance(description, str) or not description.strip():
             description = f"MCP tool {name} from {self.config.name or self.config.server_id}"
         return MCPTool(name=name, ga_name=ga_name, description=description, input_schema=schema)
+
+    def _request(
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        *,
+        notification: bool = False,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _operation_deadline(self) -> float:
+        return time.monotonic() + self.config.timeout_seconds
+
+    @staticmethod
+    def _remaining_timeout(deadline: float, operation: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise MCPDeadlineExceeded(f"MCP {operation} deadline exceeded")
+        return remaining
+
+    @staticmethod
+    def _result(response: dict[str, Any], operation: str) -> dict[str, Any]:
+        error = response.get("error")
+        if isinstance(error, dict):
+            raise MCPClientError(f"MCP {operation} failed: {error.get('message') or error}")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise MCPClientError(f"MCP {operation} response missing result")
+        return result
+
+
+class MCPHTTPClient(MCPClientBase):
+    """Streamable HTTP MCP client (MCP 2024-11-05), usually dialed through the
+    Platform MCP proxy so credentials stay platform-side and quotas are
+    enforced per call."""
+
+    def __init__(self, config: MCPServerConfig, *, session: requests.Session | None = None):
+        super().__init__(config)
+        self._http = session or requests.Session()
+        self._session_id = ""
+
+    def close(self) -> None:
+        super().close()
+        self._http.close()
 
     def _request(
         self,
@@ -342,25 +415,201 @@ class MCPHTTPClient:
         finally:
             response.close()
 
-    def _operation_deadline(self) -> float:
-        return time.monotonic() + self.config.timeout_seconds
 
-    @staticmethod
-    def _remaining_timeout(deadline: float, operation: str) -> float:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise MCPDeadlineExceeded(f"MCP {operation} deadline exceeded")
-        return remaining
+class MCPStdioClient(MCPClientBase):
+    """stdio transport MCP client (MCP 2024-11-05): spawns the configured
+    command inside the Worker sandbox and speaks newline-delimited JSON-RPC
+    over stdin/stdout — the mainstream mcp.json format (e.g. serena).
 
-    @staticmethod
-    def _result(response: dict[str, Any], operation: str) -> dict[str, Any]:
-        error = response.get("error")
-        if isinstance(error, dict):
-            raise MCPClientError(f"MCP {operation} failed: {error.get('message') or error}")
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise MCPClientError(f"MCP {operation} response missing result")
-        return result
+    The process inherits the Worker environment (PATH, cwd) so bare command
+    names like `serena` resolve like they do for local clients. stdio calls
+    do not traverse the Platform MCP proxy, so they are not metered per call;
+    quota still gates catalog inclusion at snapshot issuance time.
+    """
+
+    def __init__(self, config: MCPServerConfig, *, cwd: str | None = None):
+        super().__init__(config)
+        self._cwd = cwd
+        self._inbox: queue.Queue[Any] = queue.Queue()
+        self._stderr_lines: list[str] = []
+        self._process: subprocess.Popen | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._spawn()
+
+    def _spawn(self) -> None:
+        command = self.config.command
+        args = list(self.config.args)
+        try:
+            self._process = subprocess.Popen(
+                [command, *args],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=self._cwd,
+            )
+        except OSError as exc:
+            raise MCPClientError(
+                f"MCP stdio spawn failed for {self.config.server_id}: {exc}"
+            ) from exc
+        self._reader_thread = threading.Thread(
+            target=self._read_loop,
+            name=f"mcp-stdio-{self.config.server_id}",
+            daemon=True,
+        )
+        self._reader_thread.start()
+        self._stderr_thread = threading.Thread(
+            target=self._stderr_loop,
+            name=f"mcp-stderr-{self.config.server_id}",
+            daemon=True,
+        )
+        self._stderr_thread.start()
+
+    def _read_loop(self) -> None:
+        # 逐行读取 stdout, 解析为 JSON-RPC 消息放入 inbox; EOF 放 None 哨兵。
+        assert self._process is not None
+        try:
+            for line in self._process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    self._inbox.put(MCPClientError(f"MCP stdio server sent invalid JSON: {exc}"))
+                    return
+                if not isinstance(message, dict):
+                    self._inbox.put(MCPClientError("MCP stdio server message must be a JSON object"))
+                    return
+                self._inbox.put(message)
+            self._inbox.put(None)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._inbox.put(exc)
+
+    def _stderr_loop(self) -> None:
+        # 排空 stderr 防止管道写满阻塞子进程; 只保留最近 N 行供诊断。
+        assert self._process is not None
+        try:
+            for line in self._process.stderr:
+                stripped = line.rstrip("\n")
+                if len(self._stderr_lines) >= MAX_MCP_STDIO_STDERR_LINES:
+                    self._stderr_lines.pop(0)
+                self._stderr_lines.append(stripped)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def _stderr_diagnostics(self, message: str) -> str:
+        if self._stderr_lines:
+            return message + ": " + " | ".join(self._stderr_lines[-5:])
+        return message
+
+    def _write_message(self, payload: dict[str, Any], deadline: float) -> None:
+        self._remaining_timeout(deadline, "stdio write")
+        assert self._process is not None
+        try:
+            assert self._process.stdin is not None
+            self._process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._process.stdin.flush()
+        except BrokenPipeError as exc:
+            raise MCPClientError(
+                self._stderr_diagnostics("MCP stdio process closed stdin")
+            ) from exc
+        except OSError as exc:
+            raise MCPClientError(f"MCP stdio write failed: {exc}") from exc
+
+    def _read_message(self, deadline: float) -> dict[str, Any]:
+        wait = self._remaining_timeout(deadline, "stdio read")
+        try:
+            item = self._inbox.get(timeout=wait)
+        except queue.Empty as exc:
+            raise MCPDeadlineExceeded("MCP stdio read deadline exceeded") from exc
+        if item is None:
+            raise MCPClientError(self._stderr_diagnostics("MCP stdio process exited unexpectedly"))
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def _request(
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        *,
+        notification: bool = False,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise MCPClientError("MCP client is closed")
+        request_id: int | None = None
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if not notification:
+            request_id = self._next_id
+            self._next_id += 1
+            payload["id"] = request_id
+        if params is not None:
+            payload["params"] = params
+        active_deadline = deadline if deadline is not None else self._operation_deadline()
+        try:
+            try:
+                self._write_message(payload, active_deadline)
+            except (MCPDeadlineExceeded, MCPClientError):
+                self.close()
+                raise
+            if notification:
+                return {}
+            while True:
+                message = self._read_message(active_deadline)
+                message_id = message.get("id")
+                if "method" in message and message_id is not None:
+                    # server → client 请求(sampling/roots 等): 客户端 initialize
+                    # 声明无 capabilities, 返回 method-not-found 后继续等响应。
+                    self._write_message({
+                        "jsonrpc": "2.0",
+                        "id": message_id,
+                        "error": {"code": -32601, "message": "method not supported"},
+                    }, active_deadline)
+                    continue
+                if message_id == request_id:
+                    return message
+                if "method" in message:
+                    continue  # server 通知(log 等), 跳过
+                raise MCPClientError(
+                    f"MCP {method} response id mismatch: expected {request_id}, got {message_id!r}"
+                )
+        except (MCPDeadlineExceeded, MCPClientError):
+            # 协议失步/超时/进程退出后客户端不可复用: 封口并回收子进程。
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        super().close()
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        for thread in (self._reader_thread, self._stderr_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=2)
 
 
 def _namespaced_tool_name(server_id: str, remote_name: str) -> str:

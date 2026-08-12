@@ -5,7 +5,7 @@
 - Truth: .tasks/im-streaming-delivery/SUBTASKS.csv
 - Parent: (root epic)
 - Current: 任务 1-7 全部 DONE（除真实渠道冒烟待用户凭据）
-- Latest validation: 全量 go test（18 包 ok，mcpgateway 存量失败）+ race 5 关键包 + 契约 23 + security/smoke 41（六服务 compose 存量失败）+ bot_poller 40 + web lint/build 全绿
+- Latest validation: 全量 go test（18 包 ok，1 存量失败与本次无关）+ race 5 关键包 + 契约 23 + security/smoke 41（六服务 compose 存量失败）+ bot_poller 40 + web lint/build 全绿
 - 残余风险:
   1. **QQ 被动回复 4 次/条限制是否计入流式帧未实证**：实现保守保留 `_MAX_STREAM_APPENDS=2`（open+append×2+commit=4 帧）；若官方流式接口（stream_messages）不计入普通消息回复次数可放宽；真实凭据冒烟验证
   2. **飞书编辑时限**（默认 24h）：超长任务自动退化为补发最终结果（stream_final_at 未置位 → delivery 兜底）
@@ -60,5 +60,5 @@
 - 任务 4: poller /send 扩展 stream_id+stream_action（manager.send_stream + handler 分支，open 响应回 stream_id）+ FeishuAdapter 消息编辑（占位 CreateMessage→message_id→PUT UpdateMessage 全量替换，累积语义）+ _TokenBucket 5 QPS 节流 + ILinkAdapter StreamingSender（poller.StreamAction）+ 单测（Go 3 + Python fake lark 6）
 - 任务 5: QQAdapter 原生流式（单聊）：官方实证（linux.do 2026-03 + easybot SDK）→ stream{state,id,index,reset} 帧序列 + msg_id 被动锚点 + _MAX_STREAM_APPENDS=2 被动回复保护 + 群聊拒绝（基类默认抛错）+ 单测 5（fake botpy _http + 后台 asyncio loop）
 - 任务 6: GET/PUT /v1/admin/settings/im-streaming + OpenAPI（文本插入，契约 23 全绿）+ Web SettingsPage 下拉（streaming/final_only/off）+ api client/types + 单测
-- 任务 7: 集成验证全绿（除存量失败：mcpgateway Windows fakeserver、security 六服务 compose、worker test_worker_rpc_smoke 断言漂移、integration 2 个——与本次无关，base commit 可复现）
+- 任务 7: 集成验证全绿（除存量失败：Windows fakeserver、security 六服务 compose、worker test_worker_rpc_smoke 断言漂移、integration 2 个——与本次无关，base commit 可复现）
 - 设计真值: `tenant_platform/docs/IM_STREAMING_DELIVERY.zh-CN.md`

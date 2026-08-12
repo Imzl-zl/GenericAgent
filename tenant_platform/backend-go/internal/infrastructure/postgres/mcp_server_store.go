@@ -35,7 +35,7 @@ func (s *Store) CreateMCPServer(ctx context.Context, input domain.MCPServerCreat
 	}
 	err = scanMCPServer(s.pool.QueryRow(ctx, query,
 		input.ServerKey, input.Name, input.URL, input.TimeoutSeconds,
-		headersJSON, input.Transport, nil, argsJSON, input.Isolation, input.MaxInstances,
+		headersJSON, input.Transport, nullString(input.Command), argsJSON, input.Isolation, input.MaxInstances,
 	), &server)
 	return server, classifyMCPServerStoreError(err)
 }
@@ -119,7 +119,7 @@ func (s *Store) UpdateMCPServer(ctx context.Context, id int64, input domain.MCPS
 	}
 	err = scanMCPServer(s.pool.QueryRow(ctx, query,
 		id, input.ServerKey, input.Name, input.URL, input.TimeoutSeconds,
-		headersJSON, input.Transport, nil, argsJSON, input.Isolation, input.MaxInstances,
+		headersJSON, input.Transport, nullString(input.Command), argsJSON, input.Isolation, input.MaxInstances,
 	), &server)
 	return server, classifyMCPServerStoreError(err)
 }

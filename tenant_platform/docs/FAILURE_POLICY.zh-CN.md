@@ -1,7 +1,7 @@
 # 失败策略与错误域分类（Failure Policy & Error Taxonomy）
 
 > 状态：设计真值（2026-08-12 落地）。这是横切约定，不属于单个模块——所有层（api / application / infrastructure）新增代码必须遵守。
-> 关联：`MCP_GATEWAY_DESIGN.zh-CN.md`（配额/计量）、`LLM_PROVIDER_ARCHITECTURE.md`（capability/JTI）
+> 关联：`.tasks/mcp-governance/`（MCP 配额/计量）、`LLM_PROVIDER_ARCHITECTURE.md`（capability/JTI）
 > 结论先行：**严重性判定在设计期定死（错误域分类 + 失败策略矩阵），运行时只执行预定策略，不做现场判断。**
 
 ## 1. 错误域分类（Error Taxonomy）
