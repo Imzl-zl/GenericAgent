@@ -35,6 +35,12 @@
 
 ## 进行中 / 未完成
 
+- **思考外泄架构修复（2026-08-12）**：agent_loop 输出分层由 verbose 开关落实（verbose=False 只 yield 用户可见回复，不输出轮次标记/工具行/<summary>；verbose=True 完整转录不变）——不是 worker 正则补丁；实证：三渠道交付文本同源同脏（checkpoint result 铁证），飞书打字机最显眼；新增分层回归测试，已部署（platform + ga-runner digest）
+- **输出分层配套（2026-08-12 审查后补强）**：display 流新增事件信号——agentmain 每轮边界推送 `{'turn': N}`（先冲刷残留文本保证 'next' 不跨轮，outputs=turn_resps[-2:] 兼容 wechatapp 消费）+ 非 verbose 工具活动 `{'tool': name}`（worker 心跳推进信号，防长工具轮被 idle reaper 误收割）；tgapp 轮次协调从解析文本标记改为事件驱动（删 8 处死代码）；qqapp 删 dead on_direct_message_create（频道私信 intent 未订阅）；lark-oapi 约束收窄 >=1.7（LogLevel.WARNING 版本绑定）；Go 流式 open 文本 TrimSpace 防护（'…' 占位不可达）；uv.lock 孤儿文件 gitignore；新增 tests/test_agentmain_stream_events.py
+- **IM 流式真实渠道修复（2026-08-12）**：①worker 侧回复清洗 `ga_worker/reply_clean.py`（Turn 标记/<summary>/🛠️ 工具行/!!!Error 全去除，接入流式 chunk + 终态 final_body，降级为防御层）——飞书/QQ 不再显示思考过程；②QQ 40007「已下发内容前缀不可修改」= open 占位与累积基准不一致 → Go `BeginReply` 携带首段文本 + poller 累积基准对齐（官方文档 replace 前缀契约实证）；已部署（含 ga-runner digest 更新），待用户真实渠道复测
+- **IM 优化一轮审查修复（2026-08-12 复查，已部署+推送）**：①tgapp 纯工具收尾轮全量重复 bug（空会话注入 done 累计文本 → 改为 ✅ 已完成收尾，附件不丢）+ 回归测试 tests/test_tgapp_turn_finalize.py；②conductor 子代理卡片静默退化（非 verbose 无 summary/轮次标记 → subagent 改 verbose=True 恢复卡片语义）；③ga_cli CLI 默认 --verbose（架构注释声明 CLI 属转录表面，分层后默认变静默的偏差）；④pyproject lark-oapi>=1.0→1.7（与 poller Dockerfile 对齐，LogLevel.WARNING 版本绑定）
+- **旧实现漂移清理（2026-08-12）**：runner 创建/校验双面同步（protectedRunnerEnvKeys 补 GA_OVERLAY_ROOT + 4 缓存 env、inspect wantEnv 补 GA_OVERLAY_ROOT、pkg cache env 配套校验）；4 个渠道 SDK 调用面容器内逐项实证（全 PASS）；qqapp.py 旧属性名探测清理；Go 18 包 + poller 52 测试全绿，已部署
+- **IM 真实渠道连通（2026-08-12 修复部署）**：bot-poller 已补 4 渠道 SDK + 修复 botpy/lark_oapi API 兼容；**QQ 已 ready（用户已加 IP 白名单 23.94.23.150，WS 连接成功）、飞书 ws started ✓**；钉钉/企微 SDK API 已静态验证兼容，无凭据未实测
 - im-channel-binding epic 仅剩**真实渠道冒烟**（需用户提供飞书/钉钉/QQ/企微应用凭据；企微重点=SEND_MSG 主动流式帧是否被服务端接受）
 - im-streaming-delivery epic 仅剩**真实渠道冒烟**（需用户提供凭据；重点=飞书编辑链路 + QQ 流式帧序列参数实测）
 - 有意遗留（不产生功能缺陷，已评估）：C5 delivery_service 834 行未拆（纯结构债）；bundle 多文件 SOP 平台侧不支持（sophub 平台已上线 bundle，平台 proxy 有意收窄为 single-file，若需用要加支持）

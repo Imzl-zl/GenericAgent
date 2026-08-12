@@ -52,7 +52,13 @@ def agent_runner_loop(client, system_prompt, user_input, handler, tools_schema,
         if handler.parent.task_dir: turnstr = f'Turn {turn} ...'
         if verbose: turnstr = f'**{turnstr}**'
         if yield_info: yield {'turn': turn}
-        yield f"\n{turnstr}\n\n"
+        # 输出分层(架构): verbose=True 输出完整过程转录(TUI/CLI/桌面等
+        # 展示思考过程的前端); verbose=False 只输出用户可见回复文本
+        # (租户 worker 交付 + 根项目 IM 前端, 用户不应看到轮次标记/工具
+        # 调用等内部过程)。事件 dict({'turn': N})两种模式都发(前端轮次
+        # 协调信号, 非用户文本)。
+        if verbose:
+            yield f"\n{turnstr}\n\n"
         if turn%10 == 0: client.last_tools = ''  # 每10轮重置一次工具描述
         _hook('turn_before', locals())
         _hook('llm_before', locals())
@@ -74,9 +80,17 @@ def agent_runner_loop(client, system_prompt, user_input, handler, tools_schema,
         for ii, tc in enumerate(tool_calls):
             tool_name, args, tid = tc['tool_name'], tc['args'], tc.get('id', '')
             if tool_name == 'no_tool': pass
-            else: 
-                if verbose: yield f"🛠️ Tool: `{tool_name}`  📥 args:\n````text\n{get_pretty_json(args)}\n````\n"
-                else: yield f"🛠️ {tool_name}({_compact_tool_args(tool_name, args)})\n"
+            elif verbose:
+                # 工具调用痕迹是过程转录的一部分: 仅 verbose 输出(IM 交付
+                # 不暴露内部工具调用)。
+                yield f"🛠️ Tool: `{tool_name}`  📥 args:\n````text\n{get_pretty_json(args)}\n````\n"
+            elif yield_info:
+                # 工具活动事件(非用户文本, 供 worker 心跳保活/前端协调):
+                # 非 verbose 的工具执行可能长达数分钟, 若无任何事件,
+                # worker 的推进窗口(150s)到期后心跳停发, 长工具轮会被
+                # idle reaper 误收割。verbose 模式已有完整工具文本流,
+                # 无需事件。
+                yield {'tool': tool_name}
             handler.current_turn = turn
             gen = handler.dispatch(tool_name, args, response, index=ii, tool_num=len(tool_calls))
             try:
@@ -118,16 +132,10 @@ def _clean_content(text):
     text = re.sub(r'```[\s\S]*?```', _shrink_code, text)
     for p in [r'<file_content>[\s\S]*?</file_content>', r'<tool_(?:use|call)>[\s\S]*?</tool_(?:use|call)>', r'(\r?\n){3,}']:
         text = re.sub(p, '\n\n' if '\\n' in p else '', text)
+    # 工作记忆块(<summary>)是系统提示词要求的模型输出, 供 GA 记忆层消费,
+    # 不属于用户可见回复: 非 verbose 分支(用户可见输出)必须剥离。
+    # 语义边界: 假设模型回复正文不会出现字面 <summary> 标签(该标签是系统
+    # 提示词保留给工作记忆块的格式), 出现即视为内部块剥离。
+    text = re.sub(r'<summary>[\s\S]*?</summary>', '', text, flags=re.IGNORECASE)
     return text.strip()
 
-def _compact_tool_args(name, args):
-    a = {k: v for k, v in args.items() if k != '_index'}
-    for k in ('path',): 
-        if k in a: a[k] = os.path.basename(a[k])
-    if name == 'update_working_checkpoint': s = a.get('key_info', ''); return (s[:60]+'...') if len(s)>60 else s
-    if name == 'ask_user':
-        q = str(a.get('question', ''))
-        cs = a.get('candidates') or []
-        if cs: q += '\ncandidates:\n' + '\n'.join(f'- {c}' for c in cs)
-        return q
-    s = json.dumps(a, ensure_ascii=False); return (s[:120]+'...') if len(s)>120 else s

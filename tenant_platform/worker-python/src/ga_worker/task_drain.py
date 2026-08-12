@@ -15,6 +15,7 @@ from genericagent.worker.v1 import worker_pb2
 
 from ga_worker.state import PendingTask, TaskRunState
 from ga_worker.task_terminal import emit_cancel_or_timeout_terminal, emit_output_exceeded_terminal
+from ga_worker.reply_clean import clean_reply_text
 
 # P-M8: named constants (no magic numbers).
 QUEUE_POLL_TIMEOUT_S = 0.1
@@ -135,8 +136,13 @@ def _handle_next_item(
     adapter: Any, task: worker_pb2.TaskEnvelope, state: TaskRunState, item: dict,
 ) -> Iterator[worker_pb2.WorkerEvent]:
     """Handle 'next' chunk. Returns True if should break (output exceeded)."""
-    text = item.get("next") or ""
+    raw = item.get("next") or ""
+    # 过程转录清洗(GA 核心 display 流含 Turn 标记/工具调用/summary):
+    # 租户交付只发用户可见文本; 空清洗结果(纯工具轮)不产生 chunk。
+    text = clean_reply_text(raw)
     turn = int(item.get("turn") or 0)
+    if not text:
+        return False
     if state.count_fn is not None and state.count_fn(text):
         if not state.terminal_emitted:
             state.final_body = text[:max(0, state.max_output)]
@@ -158,7 +164,7 @@ def _handle_done_item(
     from ga_worker.task_terminal import (
         emit_error_terminal, emit_final_terminal, emit_output_exceeded_terminal,
     )
-    state.final_body = item.get("done") or ""
+    state.final_body = clean_reply_text(item.get("done") or "")
     state.final_turn = int(item.get("turn") or 0)
     error_msg = item.get("error")
     error_code = item.get("error_code")

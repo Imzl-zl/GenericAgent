@@ -29,11 +29,14 @@ def _next_msg_seq():
 
 
 def _build_intents():
+    # qq-botpy>=1.0(pyproject 约束): public_messages(1<<25) 同时驱动
+    # on_group_at_message_create 与 on_c2c_message_create(群@ + 单聊)。
+    # 旧属性名(c2c_message/group_at_message 等)在 1.x 不存在, 不再探测。
     try:
-        return botpy.Intents(public_messages=True, direct_message=True)
+        return botpy.Intents(public_messages=True)
     except Exception:
         intents = botpy.Intents.none() if hasattr(botpy.Intents, "none") else botpy.Intents()
-        for attr in ("public_messages", "public_guild_messages", "direct_message", "direct_messages", "c2c_message", "c2c_messages", "group_at_message", "group_at_messages"):
+        for attr in ("public_messages", "public_guild_messages", "direct_message"):
             if hasattr(intents, attr):
                 try:
                     setattr(intents, attr, True)
@@ -55,9 +58,10 @@ def _make_bot_class(app):
 
         async def on_group_at_message_create(self, message: GroupMessage):
             await app.on_message(message, is_group=True)
-
-        async def on_direct_message_create(self, message):
-            await app.on_message(message, is_group=False)
+        # 无 on_direct_message_create: 频道私信(direct_message intent 1<<12)
+        # 未订阅——QQ 开放平台机器人目标面是群@ + C2C 单聊(public_messages
+        # 1<<25 覆盖), 旧代码订阅 direct_message 但 handler 从未生效, 死代码
+        # 已清理; 如需频道私信需另申请频道权限并订阅该 intent。
 
     return QQBot
 

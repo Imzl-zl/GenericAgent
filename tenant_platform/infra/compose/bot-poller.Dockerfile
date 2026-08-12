@@ -11,7 +11,8 @@ RUN groupadd --system --gid 10003 ga-delivery \
     && install -d -o 10002 -g 10002 -m 0700 /home/ga-bot/.wxbot \
     && install -d -o 10002 -g 10003 -m 2770 /var/lib/ga/bot-media \
     && install -d -o 10002 -g 10003 -m 2770 /var/lib/ga/delivery-spool \
-    && pip install --no-cache-dir 'requests>=2.28' 'pycryptodome>=3.19' 'qrcode>=7.4' 'pillow>=9.0'
+    && pip install --no-cache-dir 'requests>=2.28' 'pycryptodome>=3.19' 'qrcode>=7.4' 'pillow>=9.0' \
+    && pip install --no-cache-dir 'qq-botpy>=1.0' 'lark-oapi>=1.7' 'wecom-aibot-sdk>=1.0' 'dingtalk-stream>=0.20'
 
 COPY tenant_platform/bot_poller/poller_server.py /opt/ga/legacy/tenant_platform/bot_poller/poller_server.py
 COPY frontends/wxbot_client.py frontends/wxbot_media.py /opt/ga/legacy/frontends/

@@ -314,7 +314,11 @@ class SubagentPool:
         sid = short_id()
         agent = GenericAgent()
         agent.inc_out = True
-        agent.verbose = False
+        # 子代理卡片(running=最新 <summary> 工作记忆, stopped=末轮文本)是
+        # 展示思考过程的表面——输出分层(2026-08-12)后非 verbose 流不再含
+        # summary/轮次标记, 卡片内容会静默变空/变全量文本; verbose=True
+        # 恢复设计语义(与 desktop/TUI 同类表面一致)。
+        agent.verbose = True
         agent.no_print = True
         if not _select_llm(agent, llm): _apply_desktop_model(agent)
         th = start_agent_runner(agent, f"subagent-{sid}")

@@ -33,7 +33,7 @@ func TestILinkAdapterStreamingSenderLifecycle(t *testing.T) {
 		_, _ = w.Write([]byte(`{"sent":true}`))
 	})
 
-	reply, err := adapter.BeginReply(context.Background(), "bot-1", "oc_conv_1", "task-9")
+	reply, err := adapter.BeginReply(context.Background(), "bot-1", "oc_conv_1", "task-9", "first")
 	if err != nil {
 		t.Fatalf("begin reply: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestILinkAdapterStreamingAbort(t *testing.T) {
 		_, _ = w.Write([]byte(`{"sent":true}`))
 	})
 
-	reply, err := adapter.BeginReply(context.Background(), "bot-1", "target-1", "task-1")
+	reply, err := adapter.BeginReply(context.Background(), "bot-1", "target-1", "task-1", "first")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestILinkAdapterBeginReplyPollerFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := adapter.BeginReply(context.Background(), "bot-1", "target-1", "task-1"); err == nil {
+	if _, err := adapter.BeginReply(context.Background(), "bot-1", "target-1", "task-1", "first"); err == nil {
 		t.Fatal("expected error from poller")
 	}
 }

@@ -773,7 +773,9 @@ class FeishuAdapter(BotAdapter):
             handler = self._build_handler()
             self._ws_client = self._lark.ws.Client(
                 self._app_id, self._app_secret, event_handler=handler,
-                log_level=self._lark.LogLevel.WARN,
+                # lark_oapi 1.7.x LogLevel 枚举成员是 WARNING(非 WARN——
+                # 写 WARN 会 AttributeError('WARN') 导致 WS 启动即崩)。
+                log_level=self._lark.LogLevel.WARNING,
             )
             print(f'[Poller] feishu {self.bot_uuid} ws started', flush=True)
             self._ws_client.start()  # blocking; reconnects internally
@@ -859,6 +861,9 @@ class FeishuAdapter(BotAdapter):
         if not message_id:
             raise RuntimeError('feishu stream open: empty message_id')
         stream_id = uuid.uuid4().hex
+        # 累积基线存 ''(非 '…'): 飞书编辑是全量替换(append PUT 整条), 占位符
+        # 会被后续帧覆盖, 不会残留进终态——与 QQ 的"基准=首帧实际下发内容"
+        # 恰好相反, 差异来自渠道契约(QQ replace 前缀严格, 飞书无前缀约束)。
         with self._stream_lock:
             self._streams[stream_id] = {
                 'target': target, 'message_id': message_id,
@@ -1075,6 +1080,13 @@ class QQAdapter(BotAdapter):
         if not self._app_id or not self._app_secret:
             print(f'[Poller] qq {self.bot_uuid}: app_id/app_secret required', flush=True)
             return
+        # botpy 1.2.x 的 Client.__init__ 直接调 asyncio.get_event_loop()——在
+        # 非主线程无当前事件循环时抛 RuntimeError, 必须先建 loop 并 set。
+        # (主线程可免建; 显式 set 后子线程行为与主线程一致。)
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
         bp = self._botpy
 
         class _QQClient(bp.Client):
@@ -1102,12 +1114,11 @@ class QQAdapter(BotAdapter):
     def _intents():
         try:
             import botpy
-            intents = botpy.Intents(public_guild_messages=False)
-            intents.public_messages = False
-            intents.direct_message = True
-            intents.c2c_message = True
-            intents.group_at_message = True
-            return intents
+            # QQ 开放平台机器人(群@ + C2C 单聊) = 公域消息 intent(1<<25), 同时
+            # 驱动 on_group_at_message_create 与 on_c2c_message_create。
+            # c2c_message/group_at_message 不是 botpy 1.2.x 的有效 flag 名
+            # (赋值即 AttributeError, 被吞后 intents=None → Client 构造崩溃)。
+            return botpy.Intents(public_messages=True)
         except Exception:
             return None
 
@@ -1246,10 +1257,14 @@ class QQAdapter(BotAdapter):
         stream_id = (resp or {}).get('id') or ''
         if not stream_id:
             raise RuntimeError('qq stream open: empty stream id in response')
+        # 首帧内容 = text or '…'——累积基准必须与实际下发内容一致: QQ replace
+        # 模式每帧须以已下发前缀开头(官方契约), 基准漂移即 40007。正常路径
+        # scheduler 的 open 已携带首段文本(text 非空); '…' 仅为无文本兜底。
         with self._stream_lock:
             self._streams[stream_id] = {
                 'openid': target, 'msg_id': msg_id,
-                'msg_seq': msg_seq, 'index': 0, 'text': text or '', 'appends': 0,
+                'msg_seq': msg_seq, 'index': 0,
+                'text': text or '…', 'appends': 0,
             }
         return stream_id
 
@@ -1442,6 +1457,8 @@ class WeComAdapter(BotAdapter):
         if not self._bot_id or not self._secret:
             raise RuntimeError(f'wecom {self.bot_uuid} not configured')
         stream_id = uuid.uuid4().hex
+        # 累积基线存 ''(非 '…'): 企微服务端按 stream_id 合并帧(全量替换语义),
+        # 首帧占位被后续帧覆盖, 不残留进终态(与 QQ replace 前缀严格契约相反)。
         with self._stream_lock:
             self._streams[stream_id] = {'target': target, 'text': text or ''}
         try:

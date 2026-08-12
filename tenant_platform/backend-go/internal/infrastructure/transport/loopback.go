@@ -174,13 +174,13 @@ func (t *LoopbackTransport) recordStream(op StreamOp) {
 
 // BeginReply implements StreamingSender: opens a loopback stream record.
 // The first op (open) is recorded, then a live handle is returned.
-func (t *LoopbackTransport) BeginReply(_ context.Context, botUUID, target, clientID string) (StreamReply, error) {
+func (t *LoopbackTransport) BeginReply(_ context.Context, botUUID, target, clientID, firstText string) (StreamReply, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.sendErr != nil {
 		return nil, t.sendErr
 	}
-	op := StreamOp{BotUUID: botUUID, Target: target, ClientID: clientID, Op: "open"}
+	op := StreamOp{BotUUID: botUUID, Target: target, ClientID: clientID, Op: "open", Text: firstText}
 	t.streams = append(t.streams, op)
 	return &loopbackStreamReply{t: t, botUUID: botUUID, target: target, clientID: clientID}, nil
 }

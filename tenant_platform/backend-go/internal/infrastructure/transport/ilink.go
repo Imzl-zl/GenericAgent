@@ -88,7 +88,7 @@ func (a *ILinkAdapter) MarkMessageIdempotency(_ context.Context, botUUID, messag
 // adapter (Feishu placeholder message / QQ native streaming) owns the channel
 // side stream handle; this adapter only forwards actions over the shared
 // /send channel (no new HTTP endpoints).
-func (a *ILinkAdapter) BeginReply(ctx context.Context, botUUID, target, clientID string) (StreamReply, error) {
+func (a *ILinkAdapter) BeginReply(ctx context.Context, botUUID, target, clientID, firstText string) (StreamReply, error) {
 	if botUUID == "" || target == "" {
 		return nil, errors.New("bot uuid and target are required")
 	}
@@ -96,6 +96,9 @@ func (a *ILinkAdapter) BeginReply(ctx context.Context, botUUID, target, clientID
 		BotUUID:          botUUID,
 		ChannelAccountID: target,
 		StreamAction:     poller.StreamActionOpen,
+		// 首段文本随 open 下发: QQ replace 模式每帧必须以已下发前缀开头,
+		// open 占位(如 '…')与后续累积不一致会 40007(已下发内容前缀不可修改)。
+		Text: firstText,
 	})
 	if err != nil {
 		return nil, err

@@ -72,11 +72,8 @@ _MD_TOKEN_RE = re.compile(
     ),
     re.DOTALL,
 )
-_TURN_MARKER_RE = re.compile(r"^\*{0,2}LLM Running \(Turn (\d+)\) \.\.\.\*{0,2}\s*$")
 _CODE_FENCE_RE = re.compile(r"^\s*(`{3,})(.*)$")
-_TURN_SUMMARY_LIMIT = 160
-_TURN_SUMMARY_RE = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
-_TURN_SUMMARY_SEARCH_STRIP_RE = re.compile(r"`{3,}[\s\S]*?`{3,}|<thinking>[\s\S]*?</thinking>", re.DOTALL)
+
 
 def _make_draft_id():
     return random.randint(1, 2**31 - 1)
@@ -122,46 +119,13 @@ def _markdown_safe_segments(text, limit=None):
 def _line_complete(line):
     return (line or "").endswith(("\n", "\r"))
 
-def _turn_marker_number(line):
-    match = _TURN_MARKER_RE.fullmatch((line or "").strip())
-    return int(match.group(1)) if match else None
-
-def _maybe_partial_turn_marker(line):
-    text = (line or "").strip().lstrip("*")
-    if not text:
-        return False
-    marker_head = "LLM Running (Turn "
-    return marker_head.startswith(text) or text.startswith(marker_head)
 
 def _maybe_partial_code_fence(line):
     return bool(re.match(r"^\s*`{1,}[^`\r\n]*$", line or ""))
 
-def _extract_turn_summary(raw_text):
-    search_text = _TURN_SUMMARY_SEARCH_STRIP_RE.sub("", raw_text or "")
-    match = _TURN_SUMMARY_RE.search(search_text)
-    if not match:
-        return ""
-    summary = re.sub(r"\s+", " ", match.group(1)).strip()
-    if len(summary) > _TURN_SUMMARY_LIMIT:
-        summary = summary[:_TURN_SUMMARY_LIMIT - 3].rstrip() + "..."
-    return summary
-
 def _quote_tag(text):
     safe_text = (text or "").strip().replace(_QUOTE_OPEN_TAG, "").replace(_QUOTE_CLOSE_TAG, "")
     return f"{_QUOTE_OPEN_TAG}{safe_text}{_QUOTE_CLOSE_TAG}"
-
-def _inject_turn_summary(body, summary):
-    if not (body or "").strip() or not (summary or "").strip():
-        return body
-    lines = (body or "").splitlines()
-    if not lines or _turn_marker_number(lines[0]) is None:
-        return body
-    title = lines[0].strip()
-    rest = "\n".join(lines[1:]).strip()
-    summary_line = _quote_tag(summary)
-    if rest:
-        return f"{title}\n\n{summary_line}\n\n{rest}"
-    return f"{title}\n\n{summary_line}"
 
 def _resolve_files(paths):
     files, seen = [], set()
@@ -527,14 +491,18 @@ class _TelegramStreamSession:
         self.active_display = ""
 
     async def _refresh(self, done, send_files):
-        summary = _extract_turn_summary(self.raw_text)
+        # 输出分层后流内无 <summary>/Turn 标记(用户可见文本仅回复正文),
+        # 无需 summary 提取与注入(2026-08-12 清理)。
         cleaned = clean_reply(self.raw_text) if self.raw_text.strip() else ""
         self.files = _files_from_text(cleaned)
-        body = _inject_turn_summary(_render_file_markers(cleaned), summary)
+        body = _render_file_markers(cleaned)
         if done and not body and self.files:
             body = "已生成附件"
         elif done and not body:
-            body = "..."
+            # 任务完成但无最终文本(纯工具轮任务): 占位/草稿绝不作为终态
+            # (Bot API 9.3 sendMessageDraft 语义 + 社区主流一致——流式结束
+            # 必须以正式消息定型), 空内容给完成确认, 不留 "..."/thinking 残留。
+            body = "✅ 已完成"
         segments = _visible_segments(body)
         finalized_target = len(segments) if done else max(len(segments) - 1, 0)
         while self.sent_segments < finalized_target:
@@ -724,7 +692,6 @@ class _TelegramTurnStreamCoordinator:
         self.session = None
         self.pending_line = ""
         self.code_fence_len = 0
-        self.last_turn = 0
 
     async def prime(self):
         await self._ensure_session()
@@ -737,7 +704,7 @@ class _TelegramTurnStreamCoordinator:
         for line in text.splitlines(keepends=True):
             if _line_complete(line):
                 await self._process_line(line)
-            elif _maybe_partial_turn_marker(line) or _maybe_partial_code_fence(line):
+            elif _maybe_partial_code_fence(line):
                 self.pending_line = line
             else:
                 await self._process_line(line)
@@ -747,8 +714,12 @@ class _TelegramTurnStreamCoordinator:
         if self.session is None:
             if done_text:
                 await self._add_to_current(done_text)
-        elif not self.session.raw_text.strip() and done_text:
-            await self.session.finalize(done_text, send_files=False)
+        elif not self.session.raw_text.strip():
+            # 最后一轮是纯工具轮(无正文): 此前各轮文本已随 turn 事件各自定型,
+            # done_text(全量累积)若注入空会话 = 全量重复发送。以完成确认收尾
+            # (占位/草稿不作为终态, 与 _refresh 空终态语义一致); 附件仍按
+            # done_text 全量发送, 不丢文件。
+            await self.session.finalize("✅ 已完成", send_files=False)
             if send_files:
                 await _send_files_from_text(self.root_msg, done_text)
             return
@@ -767,12 +738,13 @@ class _TelegramTurnStreamCoordinator:
             self.session = _TelegramStreamSession(self.root_msg)
             await self.session.prime()
 
-    async def _start_turn(self, marker):
+    async def on_turn(self):
+        # 轮次边界事件(agentmain 在每轮开始时推送, 见 display 流约定):
+        # 上一轮已有正文 → 定型并开新消息; 空轮(纯工具轮)保留当前草稿。
         if self.session is not None and self.session.raw_text.strip():
             await self.session.finalize(send_files=False)
             self.session = None
         await self._ensure_session()
-        await self.session.add_chunk(marker)
 
     async def _add_to_current(self, text):
         if not text:
@@ -781,11 +753,6 @@ class _TelegramTurnStreamCoordinator:
         await self.session.add_chunk(text)
 
     async def _process_line(self, line):
-        turn_no = _turn_marker_number(line)
-        if self.code_fence_len == 0 and turn_no == self.last_turn + 1:
-            self.last_turn = turn_no
-            await self._start_turn(line)
-            return
         await self._add_to_current(line)
         self._update_code_fence(line)
 
@@ -820,6 +787,11 @@ async def _stream(dq, msg):
             except Q.Empty: pass
             done_item = None
             for item in items:
+                if "turn" in item and "next" not in item:
+                    # 轮次边界事件: 定型上一轮消息并开启新一轮草稿
+                    # (agentmain 每轮开始推送, 文本归属精确)。
+                    await stream.on_turn()
+                    continue
                 chunk = item.get("next", "")
                 if chunk:
                     await stream.add_chunk(chunk)

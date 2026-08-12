@@ -13,8 +13,11 @@ type StreamingSender interface {
 	// botUUID identifies the channel config instance; target is the reply
 	// destination (conversation_id; wechat-style single-bucket channels pass
 	// the account id); clientID is the stable idempotency key (same contract
-	// as BotTransportAdapter.SendMessage).
-	BeginReply(ctx context.Context, botUUID, target, clientID string) (StreamReply, error)
+	// as BotTransportAdapter.SendMessage). firstText is the first text
+	// fragment: channels with prefix-strict native streaming (QQ replace mode
+	// requires every frame to start with the already-sent prefix) use it as
+	// the first frame so subsequent appends stay prefix-continuous.
+	BeginReply(ctx context.Context, botUUID, target, clientID, firstText string) (StreamReply, error)
 }
 
 // StreamReply is one open streaming reply handle. Implementations must be

@@ -327,7 +327,7 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 		RunnerConfigMount: "config", RunnerStateMount + "/committed": "state/committed",
 		RunnerStateMount + "/results": "state/results",
 	}
-	if err := validateInspect(good, profile, "/tmp/ws-root", "runner_workspaces", mountSubs); err != nil {
+	if err := validateInspect(good, profile, "/tmp/ws-root", "runner_workspaces", mountSubs, ""); err != nil {
 		t.Fatalf("good inspect rejected: %v", err)
 	}
 
@@ -409,7 +409,7 @@ func TestInspectRunnerRejectsDrift(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bad := deepCopyInspect(good)
 			tc.mutate(&bad)
-			if err := validateInspect(bad, profile, "/tmp/ws-root", "runner_workspaces", mountSubs); err == nil {
+			if err := validateInspect(bad, profile, "/tmp/ws-root", "runner_workspaces", mountSubs, ""); err == nil {
 				t.Fatal("drifted inspect must fail")
 			}
 		})
@@ -462,8 +462,111 @@ func TestValidateInspectSortedMounts(t *testing.T) {
 			LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state",
 			RunnerConfigMount: "config", RunnerStateMount + "/committed": "state/committed",
 			RunnerStateMount + "/results": "state/results",
-		}); err != nil {
+		}, ""); err != nil {
 		t.Fatalf("sorted real-world mounts rejected: %v", err)
+	}
+}
+
+// TestValidateInspectPkgCacheMount 验证配置共享包缓存卷时(compose 部署),
+// 校验接受第 7 个挂载 /var/cache/ga-pkg(独立 named volume, 无 subpath, rw),
+// 且卷名/类型/只读标志逐一精确匹配——防止 409 RUNNER_ENSURE_FAILED。
+func TestValidateInspectPkgCacheMount(t *testing.T) {
+	profile := ValidProfile()
+	profile.AllowRunc = true
+	workspaceHash := strings.Repeat("12", 32)
+	mountSubs := map[string]string{
+		LegacyMemoryMount: "memory", LegacyTempMount: "temp", RunnerStateMount: "state",
+		RunnerConfigMount: "config", RunnerStateMount + "/committed": "state/committed",
+		RunnerStateMount + "/results": "state/results",
+	}
+	base := inspectOutput{
+		ReadOnlyRootFS: true, Running: true, CapDrop: []string{"ALL"}, NoNewPrivileges: true,
+		Networks: []string{"runner-control"}, User: "10002:10002",
+		Image: profile.Image, Runtime: "runc",
+		MemoryBytes: profile.MemoryBytes, CPUQuota: profile.CPUQuota,
+		CPUPeriod: profile.CPUPeriod, PIDsLimit: profile.PIDsLimit,
+		GroupAdd:  []string{strconv.Itoa(profile.ShareGID)},
+		Env:       fixedInspectEnv(workspaceHash),
+		Cmd:       []string{"--listen", "tcp:0.0.0.0:" + strconv.Itoa(RunnerControlPort)},
+		Tmpfs:     []string{RunnerOverlayMount, "/tmp"},
+		TmpfsOpts: map[string]string{
+			"/tmp": "rw,noexec,nosuid,nodev,size=64m",
+			RunnerOverlayMount: "rw,noexec,nosuid,nodev,size=128m",
+		},
+		Labels: map[string]string{
+			"com.genericagent.runner.hash":       workspaceHash,
+			"com.genericagent.runner.generation": "1",
+		},
+	}
+	wsVol := "/var/lib/docker/volumes/runner_workspaces/_data"
+	pkgVol := "/var/lib/docker/volumes/ga_pkg_cache/_data"
+	// 字典序: /ga/... 全部 < /var/cache/ga-pkg, 第 7 个在最后。
+	mounts := []inspectMount{
+		{Type: "volume", Source: wsVol, Destination: LegacyMemoryMount, RW: true},
+		{Type: "volume", Source: wsVol, Destination: LegacyTempMount, RW: true},
+		{Type: "volume", Source: wsVol, Destination: RunnerConfigMount, RW: false},
+		{Type: "volume", Source: wsVol, Destination: RunnerStateMount, RW: true},
+		{Type: "volume", Source: wsVol, Destination: RunnerStateMount + "/committed", RW: false},
+		{Type: "volume", Source: wsVol, Destination: RunnerStateMount + "/results", RW: false},
+		{Type: "volume", Source: pkgVol, Destination: PkgCacheMount, RW: true},
+	}
+	// 与创建路径(docker_cli PkgCacheVolume 分支)配套的缓存 env。
+	pkgEnv := []string{
+		"NPM_CONFIG_CACHE=" + PkgCacheMount + "/npm",
+		"UV_CACHE_DIR=" + PkgCacheMount + "/uv",
+		"UV_TOOL_DIR=" + PkgCacheMount + "/uv-tools",
+		"PIP_CACHE_DIR=" + PkgCacheMount + "/pip",
+	}
+	withPkgEnv := func(o inspectOutput) inspectOutput {
+		o.Env = append(append([]string(nil), o.Env...), pkgEnv...)
+		return o
+	}
+	good := withPkgEnv(base)
+	good.Mounts = mounts
+	good.HostMounts = hostMountsForWorkspace(workspaceHash, "runner_workspaces")
+	if err := validateInspect(good, profile, "/tmp/ws-root", "runner_workspaces", mountSubs, "ga_pkg_cache"); err != nil {
+		t.Fatalf("pkg cache inspect rejected: %v", err)
+	}
+	// 未配置 pkgCacheVolume 时第 7 个挂载必须被拒(数量不匹配)。
+	noPkg := base
+	noPkg.Mounts = mounts
+	noPkg.HostMounts = hostMountsForWorkspace(workspaceHash, "runner_workspaces")
+	if err := validateInspect(noPkg, profile, "/tmp/ws-root", "runner_workspaces", mountSubs, ""); err == nil {
+		t.Fatal("pkg cache mount must be rejected when pkgCacheVolume is unset")
+	}
+	// 卷名错误 / 只读 / 带 subpath / 缓存 env 缺失 / 未启用却设置缓存 env。
+	for name, mutate := range map[string]func(*inspectOutput){
+		"wrong volume": func(o *inspectOutput) {
+			o.Mounts[6].Source = "/var/lib/docker/volumes/other/_data"
+		},
+		"readonly": func(o *inspectOutput) {
+			o.Mounts[6].RW = false
+		},
+		"subpath": func(o *inspectOutput) {
+			o.Mounts[6].VolumeSubpath = workspaceHash
+		},
+		"bind type": func(o *inspectOutput) {
+			o.Mounts[6].Type = "bind"
+		},
+		"cache env missing": func(o *inspectOutput) {
+			o.Env = base.Env // 去掉 4 个缓存 env
+		},
+	} {
+		bad := withPkgEnv(base)
+		bad.Mounts = append([]inspectMount(nil), mounts...)
+		bad.HostMounts = hostMountsForWorkspace(workspaceHash, "runner_workspaces")
+		mutate(&bad)
+		if err := validateInspect(bad, profile, "/tmp/ws-root", "runner_workspaces", mountSubs, "ga_pkg_cache"); err == nil {
+			t.Fatalf("pkg cache drift %q must be rejected", name)
+		}
+	}
+	// 未启用 pkg cache 时缓存 env 不得存在。
+	strayEnv := base
+	strayEnv.Env = append(append([]string(nil), base.Env...), pkgEnv...)
+	strayEnv.Mounts = append([]inspectMount(nil), mounts[:6]...)
+	strayEnv.HostMounts = hostMountsForWorkspace(workspaceHash, "runner_workspaces")
+	if err := validateInspect(strayEnv, profile, "/tmp/ws-root", "runner_workspaces", mountSubs, ""); err == nil {
+		t.Fatal("pkg cache env must be rejected when pkgCacheVolume is unset")
 	}
 }
 
@@ -506,14 +609,14 @@ func TestValidateInspectBindExactSource(t *testing.T) {
 			{Type: "bind", Source: "/ws/" + workspaceHash + "/state/results", Destination: RunnerStateMount + "/results", RW: false},
 		},
 	}
-	if err := validateInspect(good, profile, "/ws", "", mountSubs); err != nil {
+	if err := validateInspect(good, profile, "/ws", "", mountSubs, ""); err != nil {
 		t.Fatalf("bind exact source rejected: %v", err)
 	}
 	// 其他 workspace 的同名子目录必须拒绝。
 	other := strings.Repeat("cd", 32)
 	bad := deepCopyInspect(good)
 	bad.Mounts[0].Source = "/ws/" + other + "/memory"
-	if err := validateInspect(bad, profile, "/ws", "", mountSubs); err == nil {
+	if err := validateInspect(bad, profile, "/ws", "", mountSubs, ""); err == nil {
 		t.Fatal("cross-workspace bind source must be rejected")
 	}
 }

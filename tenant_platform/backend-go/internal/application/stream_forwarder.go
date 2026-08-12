@@ -139,7 +139,10 @@ func (f *StreamForwarder) Enabled() bool {
 // AppendText 累积一条 chunk 文本; 窗口到期时 flush 并转发。调用方在每次
 // 非空 chunk 后调用。now 用于节流判定(测试注入)。
 func (f *StreamForwarder) AppendText(ctx context.Context, text string, now time.Time) {
-	if text == "" || f.failed || !f.Enabled() {
+	// TrimSpace 防护: 纯空白 chunk 不进入缓冲(open 首帧文本必须非空——
+	// 空/纯空白会让 poller 以 '…' 占位开场, QQ replace 前缀契约下占位
+	// 会残留进终态内容)。worker 侧清洗后文本已 strip, 此处是防御边界。
+	if strings.TrimSpace(text) == "" || f.failed || !f.Enabled() {
 		return
 	}
 	if f.batcher.Due(now) {
@@ -165,18 +168,21 @@ func (f *StreamForwarder) flush(ctx context.Context, now time.Time) {
 		return
 	}
 	if !f.open {
-		if err := f.openReply(ctx); err != nil {
+		// open 携带首段文本: 前缀严格渠道(QQ replace 模式)的首帧即该文本,
+		// 后续 append 帧保持前缀连续(官方契约: 每帧须以已下发 SentContent
+		// 开头; 首帧占位与累积不一致会 40007)。open 失败 → frag 随 failed
+		// 弃置, 终态 delivery 补发完整结果。
+		if err := f.openReply(ctx, frag); err != nil {
 			return
 		}
-	}
-	if err := f.reply.Append(ctx, frag); err != nil {
+	} else if err := f.reply.Append(ctx, frag); err != nil {
 		f.abortWith(ctx, "append failed; final result delivered by existing delivery path", err)
 	}
 }
 
 // openReply 解析回复目标并开启流式回复。失败 → 整个流式放弃(日志 + 置
 // failed), 终态 delivery 兜底(无 stream_final_at 标记)。
-func (f *StreamForwarder) openReply(ctx context.Context) error {
+func (f *StreamForwarder) openReply(ctx context.Context, firstText string) error {
 	channelType := channelTypeForTaskSource(f.task.Source)
 	bot, err := f.bots.GetChannelConfigByOwnerAndType(ctx, f.task.RequesterID, channelType)
 	if err != nil || !bot.IsBound() {
@@ -189,7 +195,7 @@ func (f *StreamForwarder) openReply(ctx context.Context) error {
 	if bot.ChannelType != domain.ChannelWechat {
 		replyTarget = f.task.ConversationKey
 	}
-	reply, err := f.streaming.BeginReply(ctx, bot.BotUUID, replyTarget, f.task.ID)
+	reply, err := f.streaming.BeginReply(ctx, bot.BotUUID, replyTarget, f.task.ID, firstText)
 	if err != nil {
 		f.failed = true
 		slog.WarnContext(ctx, "stream: BeginReply failed; falling back to final delivery",

@@ -184,3 +184,6 @@ tenant_platform/infra/compose/memory-template/*.tmp
 
 # worker 集成测试哨兵(测试运行时生成, 不入库)
 .worker_itest_sentinel_do_not_commit
+
+# uv lockfile(未接入 uv 安装链路, 防止误提交孤儿锁定文件)
+uv.lock

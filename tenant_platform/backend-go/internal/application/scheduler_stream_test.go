@@ -81,20 +81,20 @@ func TestDispatchStreamsFeishuChunksAndCommits(t *testing.T) {
 		t.Fatalf("dispatch: %v", err)
 	}
 
-	// 流式记录: open + append(合并) + commit, 无 abort。
+	// 流式记录: open(携带合并首段) + commit, 无 append/abort。
 	ops := loopback.SentStreams()
 	var opsText []string
 	for _, op := range ops {
 		opsText = append(opsText, op.Op+":"+op.Text)
 	}
-	if len(ops) != 3 || ops[0].Op != "open" || ops[1].Op != "append" || ops[2].Op != "commit" {
-		t.Fatalf("stream ops=%v, want open/append/commit", opsText)
+	if len(ops) != 2 || ops[0].Op != "open" || ops[1].Op != "commit" {
+		t.Fatalf("stream ops=%v, want open/commit (merged text carried by open)", opsText)
 	}
 	if ops[0].BotUUID == "" || ops[0].Target != "oc_stream_1" {
 		t.Fatalf("open args=%+v, want target oc_stream_1", ops[0])
 	}
-	if ops[1].Text != "思考中...结果" {
-		t.Fatalf("append text=%q, want merged %q", ops[1].Text, "思考中...结果")
+	if ops[0].Text != "思考中...结果" {
+		t.Fatalf("open firstText=%q, want merged %q", ops[0].Text, "思考中...结果")
 	}
 
 	// 任务成功 + stream_final_at 置位(delivery 文本 part 跳过依据)。
@@ -170,8 +170,8 @@ func TestDispatchStreamAbortsOnFailureTerminal(t *testing.T) {
 	}
 
 	ops := loopback.SentStreams()
-	if len(ops) != 3 || ops[0].Op != "open" || ops[1].Op != "append" || ops[2].Op != "abort" {
-		t.Fatalf("stream ops=%+v, want open/append/abort", ops)
+	if len(ops) != 2 || ops[0].Op != "open" || ops[1].Op != "abort" {
+		t.Fatalf("stream ops=%+v, want open(firstText)/abort", ops)
 	}
 	final, err := store.GetTask(ctx, task.ID)
 	if err != nil {

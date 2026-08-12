@@ -47,16 +47,16 @@ func (r *fakeStreamReply) Abort(_ context.Context) error {
 }
 
 type fakeStreamingSender struct {
-	opens     []struct{ botUUID, target, clientID string }
+	opens     []struct{ botUUID, target, clientID, firstText string }
 	replies   []*fakeStreamReply
 	beginErr  error
 }
 
-func (f *fakeStreamingSender) BeginReply(_ context.Context, botUUID, target, clientID string) (transport.StreamReply, error) {
+func (f *fakeStreamingSender) BeginReply(_ context.Context, botUUID, target, clientID, firstText string) (transport.StreamReply, error) {
 	if f.beginErr != nil {
 		return nil, f.beginErr
 	}
-	f.opens = append(f.opens, struct{ botUUID, target, clientID string }{botUUID, target, clientID})
+	f.opens = append(f.opens, struct{ botUUID, target, clientID, firstText string }{botUUID, target, clientID, firstText})
 	r := &fakeStreamReply{}
 	f.replies = append(f.replies, r)
 	return r, nil
@@ -160,8 +160,12 @@ func TestStreamForwarderThrottleMergesWithinWindow(t *testing.T) {
 		t.Fatalf("open count=%d, want 1", len(sender.opens))
 	}
 	reply := sender.replies[0]
-	if len(reply.appends) != 1 || reply.appends[0] != "abc" {
-		t.Fatalf("first append=%q, want merged %q", strings.Join(reply.appends, "|"), "abc")
+	// open 携带首段合并文本(前缀严格渠道的首帧), 不再 append 一次。
+	if sender.opens[0].firstText != "abc" {
+		t.Fatalf("open firstText=%q, want %q", sender.opens[0].firstText, "abc")
+	}
+	if len(reply.appends) != 0 {
+		t.Fatalf("appends after open=%q, want none (firstText carried by open)", strings.Join(reply.appends, "|"))
 	}
 	if sender.opens[0].botUUID != "bot-feishu" || sender.opens[0].target != "conv-1" || sender.opens[0].clientID != "task-1" {
 		t.Fatalf("open args=%+v", sender.opens[0])
@@ -171,8 +175,8 @@ func TestStreamForwarderThrottleMergesWithinWindow(t *testing.T) {
 	if !f.Commit(ctx, base.Add(700*time.Millisecond)) {
 		t.Fatal("Commit()=false, want true")
 	}
-	if len(reply.appends) != 2 || reply.appends[1] != "d" {
-		t.Fatalf("appends=%q, want [abc d]", strings.Join(reply.appends, "|"))
+	if len(reply.appends) != 1 || reply.appends[0] != "d" {
+		t.Fatalf("appends=%q, want [d]", strings.Join(reply.appends, "|"))
 	}
 	if reply.commits != 1 || reply.aborts != 0 {
 		t.Fatalf("commits=%d aborts=%d, want 1/0", reply.commits, reply.aborts)
@@ -257,7 +261,7 @@ func TestLoopbackTransportStreamRecords(t *testing.T) {
 	lb := transport.NewLoopbackTransport()
 	ctx := context.Background()
 
-	reply, err := lb.BeginReply(ctx, "bot-1", "conv-9", "task-9")
+	reply, err := lb.BeginReply(ctx, "bot-1", "conv-9", "task-9", "first")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +274,7 @@ func TestLoopbackTransportStreamRecords(t *testing.T) {
 
 	ops := lb.SentStreams()
 	want := []transport.StreamOp{
-		{BotUUID: "bot-1", Target: "conv-9", ClientID: "task-9", Op: "open"},
+		{BotUUID: "bot-1", Target: "conv-9", ClientID: "task-9", Op: "open", Text: "first"},
 		{BotUUID: "bot-1", Target: "conv-9", ClientID: "task-9", Op: "append", Text: "frag-1"},
 		{BotUUID: "bot-1", Target: "conv-9", ClientID: "task-9", Op: "commit"},
 	}

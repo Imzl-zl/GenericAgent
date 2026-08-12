@@ -663,7 +663,9 @@ def test_qq_stream_append_cap_protects_ratelimit():
         # open + 2 append + commit = 4 帧。
         assert len(frames) == 4, len(frames)
         assert frames[-1]["input_state"] == 10 and frames[-1]["index"] == 3
-        assert frames[-1]["content_raw"] == "xxxxx"  # 累积全量(内容不丢)
+        # 累积全量(内容不丢); 首帧为 open 实际下发内容('…' 兜底占位)——
+        # QQ replace 模式每帧须以已下发前缀开头, 累积基准=首帧内容(前缀一致)。
+        assert frames[-1]["content_raw"] == "…xxxxx"
     finally:
         runner.stop()
 

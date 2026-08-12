@@ -208,9 +208,33 @@ class GenericAgent:
                         break
                     if consume_file(self.task_dir, '_stop'): self.abort() 
                     if self.stop_sig: break
-                    if isinstance(chunk, dict) and 'turn' in chunk: 
-                        curr_turn = chunk['turn']; turn_resps.append(''); continue
+                    if isinstance(chunk, dict) and 'turn' in chunk:
+                        # 轮次边界事件(输出分层架构的配套信号, 2026-08-12):
+                        # ①先冲刷上一轮残留文本——保证 'next' 不跨轮次边界,
+                        # 前端按 turn 事件切分消息时文本归属精确;
+                        # ②再发 turn 事件(消费方协调轮次/心跳保活)。
+                        # outputs 与 'next' 同构(turn_resps[-2:]), 兼容
+                        # wechatapp 按 outputs[-2] 落定上一轮文本的消费方式。
+                        if last_pos < len(full_resp):
+                            display_queue.put({'next': full_resp[last_pos:] if self.inc_out else full_resp,
+                                               'source': source, 'turn': curr_turn,
+                                               'outputs': turn_resps[-2:]})
+                            last_pos = len(full_resp)
+                        curr_turn = chunk['turn']; turn_resps.append('')
+                        display_queue.put({'turn': curr_turn, 'source': source,
+                                           'outputs': turn_resps[-2:]})
+                        continue
+                    if isinstance(chunk, dict) and 'tool' in chunk:
+                        # 工具活动事件(非用户文本): worker 心跳推进信号
+                        # (长工具轮无文本输出时不至于被 idle reaper 误收割);
+                        # 消费方只认 next/done 键, 此事件安全忽略。
+                        display_queue.put({'tool': chunk['tool'], 'source': source,
+                                           'turn': curr_turn})
+                        continue
                     full_resp += chunk;  turn_resps[-1] += chunk
+                    # 'LLM Running' 条件服务 verbose 路径: 轮次标记文本需立即
+                    # 推给前端(TUI 思考提示); 非 verbose 无标记, 仅靠 >30 字符
+                    # 阈值推进。
                     if len(full_resp) - last_pos > 30 or 'LLM Running' in chunk:
                         display_queue.put({'next': full_resp[last_pos:] if self.inc_out else full_resp, 
                                            'source': source, 'turn': curr_turn, 'outputs': turn_resps[-2:]})

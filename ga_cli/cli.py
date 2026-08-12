@@ -73,7 +73,10 @@ COMMANDS = {
     "cli": {
         "help": "启动 CLI 对话 (agentmain)",
         "desc": "启动命令行交互对话模式，最轻量的使用方式",
-        "cmd": ["python", "{PROJECT_DIR}/agentmain.py"],
+        # 输出分层(2026-08-12): CLI 是展示思考过程的表面(架构注释声明
+        # verbose=True 服务于 TUI/CLI/桌面)——默认 --verbose 保持分层前
+        # 的交互体验(轮次标记/工具痕迹), 否则默认只显示用户可见文本。
+        "cmd": ["python", "{PROJECT_DIR}/agentmain.py", "--verbose"],
     },
     "launch": {
         "help": "启动 webview 桌面壳 (launch.pyw)",

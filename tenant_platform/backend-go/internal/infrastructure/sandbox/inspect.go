@@ -233,7 +233,7 @@ func (d *DockerCLI) Inspect(ctx context.Context, name string) error {
 	// 审查 C1: 顶层 .Mounts 的解析值(实际挂载结果)保留在 out.Mounts,
 	// subpath 关联统一在 validateInspect 的 associateVolumeSubpaths 完成,
 	// 保证解析路径与测试直调路径共用同一逻辑。
-	return validateInspect(out, d.cfg.Profile, d.cfg.WorkspacesRoot, d.cfg.WorkspaceVolume, d.expectedMountSources())
+	return validateInspect(out, d.cfg.Profile, d.cfg.WorkspacesRoot, d.cfg.WorkspaceVolume, d.expectedMountSources(), d.cfg.PkgCacheVolume)
 }
 
 // expectedMountSources 返回每个固定挂载点对应的 workspace 子路径
@@ -274,8 +274,9 @@ func associateVolumeSubpaths(info inspectOutput) inspectOutput {
 // validateInspect enforces the post-create invariants on parsed inspect output.
 // mountSubs: destination -> 期望的 workspace 子路径。workspacesRoot 与
 // workspaceVolume 用于精确校验 source 归属(审查 I10: 不只查尾缀, 必须
-// 匹配当前 workspace hash 的完整路径)。
-func validateInspect(info inspectOutput, profile Profile, workspacesRoot, workspaceVolume string, mountSubs map[string]string) error {
+// 匹配当前 workspace hash 的完整路径)。pkgCacheVolume 非空时额外要求
+// 共享包缓存卷挂载(与 docker_cli 创建路径一致, 否则 409 RUNNER_ENSURE_FAILED)。
+func validateInspect(info inspectOutput, profile Profile, workspacesRoot, workspaceVolume string, mountSubs map[string]string, pkgCacheVolume string) error {
 	info = associateVolumeSubpaths(info)
 	// 审查 R5-I7: 停止/退出(State.Running=false)的容器不得被复用——Runner
 	// 崩溃退出后 EnsureRunner 必须销毁重建, 而不是把死容器当作可用 Worker。
@@ -340,11 +341,29 @@ func validateInspect(info inspectOutput, profile Profile, workspacesRoot, worksp
 		"GA_RUNNER_TLS_CA":    RunnerConfigMount + "/ca.crt",
 		"GA_WORKSPACE_MEMORY": LegacyMemoryMount,
 		"GA_WORKSPACE_TEMP":   LegacyTempMount,
+		"GA_OVERLAY_ROOT":     RunnerOverlayMount,
 	}
 	env := envMap(info.Env)
 	for k, want := range wantEnv {
 		if env[k] != want {
 			return fmt.Errorf("runner env %s = %q, want %q", k, env[k], want)
+		}
+	}
+	// 共享包缓存 env 与挂载配套校验(创建路径 docker_cli 按 PkgCacheVolume
+	// 条件设置): 启用时必须精确指向卷内子目录, 未启用时不得存在。
+	pkgCacheEnv := map[string]string{
+		"NPM_CONFIG_CACHE": PkgCacheMount + "/npm",
+		"UV_CACHE_DIR":     PkgCacheMount + "/uv",
+		"UV_TOOL_DIR":      PkgCacheMount + "/uv-tools",
+		"PIP_CACHE_DIR":    PkgCacheMount + "/pip",
+	}
+	for k, want := range pkgCacheEnv {
+		if pkgCacheVolume != "" {
+			if env[k] != want {
+				return fmt.Errorf("runner env %s = %q, want %q", k, env[k], want)
+			}
+		} else if env[k] != "" {
+			return fmt.Errorf("runner env %s set without pkg cache volume", k)
 		}
 	}
 	// GA_WORKSPACE_KEY / GA_RUNNER_GENERATION 是 per-request 值, 无法从
@@ -398,14 +417,16 @@ func validateInspect(info inspectOutput, profile Profile, workspacesRoot, worksp
 	if !workspaceHashPattern.MatchString(workspaceHash) {
 		return fmt.Errorf("runner missing or invalid workspace hash label: %q", workspaceHash)
 	}
-	// 固定六个挂载: memory/temp/state 读写, config 只读, 且审查 C3:
+	// 固定工作区挂载: memory/temp/state 读写, config 只读, 且审查 C3:
 	// state/committed 与 state/results 必须以只读子挂载遮蔽顶层 rw state
 	// 挂载——Runner 不得删除/替换已提交快照与结果文件。
 	// (审查: attachments 冗余挂载已移除, 附件统一经工作区 temp/——方案 §6)。
+	// pkgCacheVolume 非空时表尾追加共享包缓存卷挂载(见下方分支)。
 	// 注意: info.Mounts 已按 Destination 字典序排序(Inspect 中 sort.Slice),
 	// 本表必须保持与排序后完全相同的顺序, 否则真实 docker inspect 解析路径
 	// 会误报。字典序: /ga/legacy/memory < /ga/legacy/temp < /ga/runner-config
-	// < /ga/runner-state < /ga/runner-state/committed < /ga/runner-state/results。
+	// < /ga/runner-state < /ga/runner-state/committed < /ga/runner-state/results
+	// < /var/cache/ga-pkg(启用时)。
 	expected := []struct {
 		sub, dst string
 		ro       bool
@@ -417,6 +438,15 @@ func validateInspect(info inspectOutput, profile Profile, workspacesRoot, worksp
 		{"state/committed", RunnerStateMount + "/committed", true},
 		{"state/results", RunnerStateMount + "/results", true},
 	}
+	if pkgCacheVolume != "" {
+		// 共享包缓存卷(stdio 运行时 npx/uvx/pip 缓存, compose 部署启用):
+		// 独立 named volume, 无 subpath, 读写。字典序 /var/cache/ga-pkg 在
+		// /ga/runner-state/results 之后, 追加在表尾顺序不变。
+		expected = append(expected, struct {
+			sub, dst string
+			ro       bool
+		}{"", PkgCacheMount, false})
+	}
 	if len(info.Mounts) != len(expected) {
 		return fmt.Errorf("runner mounts = %d, want exactly %d: %+v", len(info.Mounts), len(expected), info.Mounts)
 	}
@@ -427,6 +457,24 @@ func validateInspect(info inspectOutput, profile Profile, workspacesRoot, worksp
 		}
 		if got.Type == "" || got.Source == "" {
 			return fmt.Errorf("runner mount[%d] %q missing type/source", i, want.dst)
+		}
+		if want.sub == "" {
+			// 共享包缓存卷分支: 独立 named volume(非 workspace subpath),
+			// 校验卷名归属 + 无 subpath + 必须 rw。
+			if got.Type != "volume" {
+				return fmt.Errorf("runner mount[%d] %q type = %q, want volume", i, want.dst, got.Type)
+			}
+			wantVol := filepath.ToSlash(filepath.Join("/var/lib/docker/volumes", pkgCacheVolume, "_data"))
+			if source := filepath.ToSlash(got.Source); source != wantVol {
+				return fmt.Errorf("runner mount[%d] %q volume source = %q, want %q", i, want.dst, source, wantVol)
+			}
+			if got.VolumeSubpath != "" {
+				return fmt.Errorf("runner mount[%d] %q volume subpath = %q, want empty", i, want.dst, got.VolumeSubpath)
+			}
+			if !got.RW {
+				return fmt.Errorf("runner mount[%d] %q must be rw", i, want.dst)
+			}
+			continue
 		}
 		// source 归属精确校验(审查 I10): bind 必须为
 		// <workspacesRoot>/<hash>/<sub>, volume 必须为

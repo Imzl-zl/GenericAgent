@@ -101,8 +101,9 @@ func NewDockerCLI(cfg DockerConfig) (*DockerCLI, error) {
 }
 
 // CreateAndStart creates and starts a Runner container with the fixed profile.
-// The only mounts are the five workspace subpaths; the container joins only
-// runner-control; docker.sock is never mounted.
+// The only mounts are the workspace subpaths (plus the optional shared pkg
+// cache volume); the container joins only runner-control; docker.sock is
+// never mounted.
 // protectedRunnerEnvKeys 是 Manager 固定的容器环境变量集合(方案 §7:
 // 安全参数由 Manager 固定)。控制面透传 env 不得覆盖这些键——Docker 对
 // 重复 --env 以最后一个为准, 若允许透传覆盖, 空值 GA_RUNNER_TLS_* 会让
@@ -118,8 +119,15 @@ var protectedRunnerEnvKeys = map[string]struct{}{
 	"GA_RUNNER_TLS_CA":     {},
 	"GA_WORKSPACE_MEMORY":  {},
 	"GA_WORKSPACE_TEMP":    {},
+	"GA_OVERLAY_ROOT":      {},
 	"GA_WORKSPACE_KEY":     {},
 	"GA_RUNNER_GENERATION": {},
+	// 共享包缓存 env(部署级固定, 与 PkgCacheMount 配套): 控制面透传
+	// 不得把 npx/uv/pip 缓存重定向到其他路径(read_only 容器内写不进)。
+	"NPM_CONFIG_CACHE": {},
+	"UV_CACHE_DIR":     {},
+	"UV_TOOL_DIR":      {},
+	"PIP_CACHE_DIR":    {},
 }
 
 // runnerEnvKey 返回 env 条目 "K=V" 的键部分(无 '=' 的条目视为非法)。
