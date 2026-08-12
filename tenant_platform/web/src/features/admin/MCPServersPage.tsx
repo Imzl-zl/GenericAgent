@@ -42,12 +42,30 @@ const HTTP_EXAMPLE = `{
   "timeout_seconds": 30
 }`;
 
-const STDIO_EXAMPLE = `{
+const STDIO_SERENA_EXAMPLE = `{
   "server_key": "serena",
   "name": "Serena",
   "transport": "stdio",
   "command": "serena",
   "args": ["start-mcp-server", "--context=agent", "--project-from-cwd"],
+  "timeout_seconds": 60
+}`;
+
+const STDIO_NPX_EXAMPLE = `{
+  "server_key": "fetch",
+  "name": "Fetch",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-fetch"],
+  "timeout_seconds": 60
+}`;
+
+const STDIO_UVX_EXAMPLE = `{
+  "server_key": "time",
+  "name": "Time",
+  "transport": "stdio",
+  "command": "uvx",
+  "args": ["mcp-server-time"],
   "timeout_seconds": 60
 }`;
 
@@ -251,7 +269,7 @@ export function MCPServersPage() {
               />
             </label>
             <div className="mcp-examples provider-form-full">
-              <details open>
+              <details>
                 <summary>HTTP 示例（默认 transport，url + headers）</summary>
                 <pre>{HTTP_EXAMPLE}</pre>
                 <p className="admin-subtitle">
@@ -260,11 +278,16 @@ export function MCPServersPage() {
                 </p>
               </details>
               <details>
-                <summary>stdio 示例（Worker 沙箱内进程宿主，不经 proxy、不按调用计量）</summary>
-                <pre>{STDIO_EXAMPLE}</pre>
+                <summary>stdio 示例（Worker 沙箱内进程宿主：预装命令 / npx / uvx 全支持）</summary>
+                <p className="admin-subtitle">预装命令型（镜像内已装，如 serena）：</p>
+                <pre>{STDIO_SERENA_EXAMPLE}</pre>
+                <p className="admin-subtitle">npx 按需拉包型（node 20 运行时，缓存写共享卷）：</p>
+                <pre>{STDIO_NPX_EXAMPLE}</pre>
+                <p className="admin-subtitle">uvx 按需拉包型（uv 运行时，缓存写共享卷）：</p>
+                <pre>{STDIO_UVX_EXAMPLE}</pre>
                 <p className="admin-subtitle">
-                  stdio 调用不经过 Platform proxy，不参与按调用配额计量；
-                  url 需留空、不支持 headers；command 为裸命令名或绝对路径。
+                  stdio 调用不经过 Platform proxy，不参与按调用配额计量；url 需留空、不支持 headers；
+                  command 为裸命令名或绝对路径（npx/uvx 拉包缓存全租户共享一份）。
                 </p>
               </details>
             </div>
