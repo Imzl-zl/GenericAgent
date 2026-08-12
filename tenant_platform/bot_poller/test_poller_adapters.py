@@ -203,6 +203,59 @@ def test_qq_c2c_message_maps_openid():
     assert body["conversation_type"] == "private"
 
 
+def test_qq_send_text_uses_memorized_target_kind():
+    """入站目标类型记忆(2026-08-12): 已知 C2C/群目标直接走正确接口,
+    不再先打一次群接口兜底——旧行为每次私聊回复都白打群接口并刷
+    botpy 11255 invalid request 错误日志。"""
+    class _RecorderAPI:
+        def __init__(self):
+            self.calls = []
+
+        async def post_group_message(self, **kw):
+            self.calls.append(("group", kw))
+
+        async def post_c2c_message(self, **kw):
+            self.calls.append(("c2c", kw))
+
+    runner = _LoopRunner()
+    try:
+        api = _RecorderAPI()
+        adapter = poller_server.QQAdapter("qq-bot", {"app_id": "a", "app_secret": "s"}, "http://p/webhook")
+        adapter._client = type("C", (), {"loop": runner.loop, "api": api})()
+        _capture(adapter)  # 打桩 post_webhook, 入站处理不发真实 HTTP
+
+        # 已知 C2C 目标: 直发 c2c, 不试群。
+        adapter._handle_message(_QQC2CMessage("msg-c1", "openid_7", "在吗"), is_group=False)
+        adapter.send_text("openid_7", "你好")
+        assert api.calls == [("c2c", {"openid": "openid_7", "msg_type": 0, "content": "你好"})]
+
+        # 已知群目标: 直发群。
+        api.calls.clear()
+        adapter._handle_message(_QQGroupMessage("msg-g1", "group_openid_9", "member_openid_1", "大家好"), is_group=True)
+        adapter.send_text("group_openid_9", "大家好呀")
+        assert api.calls == [("group", {"group_openid": "group_openid_9", "msg_type": 2, "markdown": {"content": "大家好呀"}})]
+
+        # 未知目标: 先群后单聊兑底(既有语义)。
+        class _FailGroupAPI:
+            def __init__(self):
+                self.calls = []
+
+            async def post_group_message(self, **kw):
+                self.calls.append(("group", kw))
+                raise RuntimeError("invalid request")
+
+            async def post_c2c_message(self, **kw):
+                self.calls.append(("c2c", kw))
+
+        api2 = _FailGroupAPI()
+        adapter2 = poller_server.QQAdapter("qq-bot2", {"app_id": "a", "app_secret": "s"}, "http://p/webhook")
+        adapter2._client = type("C", (), {"loop": runner.loop, "api": api2})()
+        adapter2.send_text("brand_new_openid", "hi")
+        assert [c[0] for c in api2.calls] == ["group", "c2c"]
+    finally:
+        runner.stop()
+
+
 # ---------------------------------------------------------------------------
 # BotManager 注册表: channel_type → adapter 工厂 + /send 路由 + 幂等 start。
 # ---------------------------------------------------------------------------

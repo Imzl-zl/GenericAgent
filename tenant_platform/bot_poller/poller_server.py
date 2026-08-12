@@ -1065,6 +1065,14 @@ class QQAdapter(BotAdapter):
         # 流式状态: stream_id -> {openid, msg_id, msg_seq, index, text, appends}
         self._streams = {}
         self._stream_lock = threading.Lock()
+        # 入站目标类型记忆: conversation_id -> 'group' | 'c2c'。QQ 的
+        # group_openid 与 C2C openid 格式上无法区分, send_text 默认先试群
+        # 再退单聊——每次私聊回复都白打一次群接口(实测 botpy 刷 11255
+        # invalid request 错误日志)。已知目标直接走正确接口, 未知目标保持
+        # 先群后单聊兜底。
+        self._target_kinds = {}
+        # 记忆上限: 超限直接清空重学(最坏一次无效尝试, 防长期运行内存增长)。
+        self._target_kinds_max = 512
         # 最近一条 C2C 入站消息 id(被动回复 msg_id; 无则主动消息流式)。
         self._last_c2c_msg_id = ''
         try:
@@ -1141,6 +1149,10 @@ class QQAdapter(BotAdapter):
             if not is_group and message_id:
                 # 流式被动回复锚点(单聊 4 次/条限制下的 msg_id+msg_seq 去重)。
                 self._last_c2c_msg_id = message_id
+            with self._stream_lock:
+                if len(self._target_kinds) >= self._target_kinds_max:
+                    self._target_kinds.clear()
+                self._target_kinds[conversation_id] = 'group' if is_group else 'c2c'
             self.post_webhook(self.webhook_body(
                 channel_account_id=channel_account_id,
                 conversation_id=conversation_id,
@@ -1158,6 +1170,20 @@ class QQAdapter(BotAdapter):
         # conversation_id 决定(先试群再退 C2C)。botpy 出站是异步 API,
         # 调度到 bot 自身事件循环。
         async def _send():
+            with self._stream_lock:
+                kind = self._target_kinds.get(target)
+            if kind == 'group':
+                await self._client.api.post_group_message(
+                    group_openid=target, msg_type=2,
+                    markdown={'content': text[:2000]},
+                )
+                return
+            if kind == 'c2c':
+                await self._client.api.post_c2c_message(
+                    openid=target, msg_type=0, content=text[:2000],
+                )
+                return
+            # 未知目标(如主动发起/历史目标): 先群后单聊兜底。
             try:
                 await self._client.api.post_group_message(
                     group_openid=target, msg_type=2,

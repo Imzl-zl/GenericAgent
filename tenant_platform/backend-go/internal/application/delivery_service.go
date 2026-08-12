@@ -577,7 +577,12 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 		} else if len(markers) > 0 {
 			out.Text = "任务完成，请查收文件。"
 		} else {
-			out.Text = "任务完成。"
+			// 空结果防护(2026-08-12 生产实证): 上游模型退化响应(仅
+			// summary/thinking 或空白)被 GA 当正常完成时结果体为空——
+			// 不再用"任务完成。"伪装成正常交付, 明确提示用户可重试。
+			// (worker 侧 EMPTY_RESULT 失败路径已拦大部分; 此处兜底历史
+			// 任务/流式失败等其余空体成功场景。)
+			out.Text = "任务已完成，但模型没有返回可显示的内容(可能是上游模型异常)，请重试。"
 		}
 		// 审查 R5-I3: 文件内容在任务成功事务时已快照入 task_delivery_files
 		// (与成功状态原子提交); 发送时直接使用快照, 不再重新解析 workspace
@@ -812,9 +817,6 @@ func userVisibleTaskResult(raw string) string {
 		}
 	}
 	fallback := strings.TrimSpace(raw)
-	if fallback == "" {
-		return "任务已完成"
-	}
 	return fallback
 }
 

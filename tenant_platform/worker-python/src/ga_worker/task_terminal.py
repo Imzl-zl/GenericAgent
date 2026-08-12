@@ -176,6 +176,21 @@ def emit_final_terminal(
             yield worker_pb2.WorkerEvent(terminal=term)
             state.terminal_emitted = True
             return
+        if not state.final_body:
+            # 空结果防护(2026-08-12 生产实证): GA 退化响应(仅 summary/thinking
+            # 或空白)若被当作正常完成, final_body 为空——静默 TASK_SUCCEEDED
+            # 会让平台回"任务完成：任务已完成"而用户没得到任何回答。显式失败
+            # 让用户看到明确原因并可重试; 有文件产出的纯工具任务不受影响
+            # (文件 marker 已由 append_missing_file_markers 写入 body)。
+            term = adapter._terminal(
+                task.task_id, worker_pb2.TASK_FAILED,
+                user_message="模型没有返回可显示的内容(可能是上游模型异常), 请重试",
+                error_code="EMPTY_RESULT", result_body="",
+            )
+            adapter._record_completed(task, term, "", state.display_history, state.agent)
+            yield worker_pb2.WorkerEvent(terminal=term)
+            state.terminal_emitted = True
+            return
         term = adapter._terminal(
             task.task_id, worker_pb2.TASK_SUCCEEDED,
             user_message=state.final_body, result_body=state.final_body,

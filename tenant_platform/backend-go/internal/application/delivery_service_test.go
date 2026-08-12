@@ -57,6 +57,47 @@ func TestDeliveryServiceSendsWeComTaskCompleteToWeComBot(t *testing.T) {
 	}
 }
 
+// TestDeliveryServiceEmptyResultBodyIsNotFabricated 空结果防护(2026-08-12 生产实证):
+// 上游模型退化响应被 GA 当正常完成时, 结果体为空——不得用"任务完成。"/
+// "任务已完成"伪装成正常交付, 必须明确提示用户可重试。
+func TestDeliveryServiceEmptyResultBodyIsNotFabricated(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("")}
+
+	delivery := domain.Delivery{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}
+	deps.store.pending = []domain.Delivery{delivery}
+
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sent) != 1 {
+		t.Fatalf("expected 1 sent, got %d", len(deps.transport.sent))
+	}
+	if deps.transport.sent[0].Text != "任务已完成，但模型没有返回可显示的内容(可能是上游模型异常)，请重试。" {
+		t.Fatalf("unexpected text: %q", deps.transport.sent[0].Text)
+	}
+}
+
+// TestDeliveryServiceWhitespaceOnlyResultBodyIsNotFabricated 纯空白结果体同样不得伪装。
+func TestDeliveryServiceWhitespaceOnlyResultBodyIsNotFabricated(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("   \n\n  ")}
+
+	delivery := domain.Delivery{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}
+	deps.store.pending = []domain.Delivery{delivery}
+
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sent) != 1 || deps.transport.sent[0].Text != "任务已完成，但模型没有返回可显示的内容(可能是上游模型异常)，请重试。" {
+		t.Fatalf("unexpected text deliveries: %+v", deps.transport.sent)
+	}
+}
+
 func TestDeliveryServiceAcksTaskComplete(t *testing.T) {
 	ctx, svc, deps := setupDeliveryService(t)
 	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}

@@ -35,6 +35,8 @@
 
 ## 进行中 / 未完成
 
+- **空结果静默成功修复（2026-08-12，已编码待部署）**：生产实证 QQ/飞书 14:16 收到"任务完成：任务已完成"无实际回答——上游（newapi relay/deepseek-v4-flash）退化响应（仅 summary/thinking 或空白 content）被 GA `do_no_tool` 当作正常完成（thinking 非空不算空白、`_empty_ct` 不计数），空 body 走 delivery 兜底文案；微信 14:18/14:25 同上游恢复后正常。四层修复：①ga.py do_no_tool 剥 summary/thinking 后无可见文本=空白（计 _empty_ct，3 次 LLM_FAILED）；②llmcore MixinSession 空结果（无 text/tool_use 产出）自动切换下个 session（原生降级能力此前只对 !!!Error 生效）；③worker emit_final_terminal 空 body 且无文件 → TASK_FAILED EMPTY_RESULT（中文提示）；④Go delivery 空结果不再伪装"任务完成。"（诚实文案提示重试），userVisibleTaskResult 空 fallback 不再造"任务已完成"；⑤poller QQAdapter 入站目标类型记忆（C2C/群直发，消灭私聊回复每次白打群接口刷 11255 错误日志）；测试：根 26 / worker 143 / poller 53 / Go 全量含 DB 绿；待部署（ga-runner+platform+bot-poller 三镜像重建）
+
 - **思考外泄架构修复（2026-08-12）**：agent_loop 输出分层由 verbose 开关落实（verbose=False 只 yield 用户可见回复，不输出轮次标记/工具行/<summary>；verbose=True 完整转录不变）——不是 worker 正则补丁；实证：三渠道交付文本同源同脏（checkpoint result 铁证），飞书打字机最显眼；新增分层回归测试，已部署（platform + ga-runner digest）
 - **输出分层配套（2026-08-12 审查后补强）**：display 流新增事件信号——agentmain 每轮边界推送 `{'turn': N}`（先冲刷残留文本保证 'next' 不跨轮，outputs=turn_resps[-2:] 兼容 wechatapp 消费）+ 非 verbose 工具活动 `{'tool': name}`（worker 心跳推进信号，防长工具轮被 idle reaper 误收割）；tgapp 轮次协调从解析文本标记改为事件驱动（删 8 处死代码）；qqapp 删 dead on_direct_message_create（频道私信 intent 未订阅）；lark-oapi 约束收窄 >=1.7（LogLevel.WARNING 版本绑定）；Go 流式 open 文本 TrimSpace 防护（'…' 占位不可达）；uv.lock 孤儿文件 gitignore；新增 tests/test_agentmain_stream_events.py
 - **IM 流式真实渠道修复（2026-08-12）**：①worker 侧回复清洗 `ga_worker/reply_clean.py`（Turn 标记/<summary>/🛠️ 工具行/!!!Error 全去除，接入流式 chunk + 终态 final_body，降级为防御层）——飞书/QQ 不再显示思考过程；②QQ 40007「已下发内容前缀不可修改」= open 占位与累积基准不一致 → Go `BeginReply` 携带首段文本 + poller 累积基准对齐（官方文档 replace 前缀契约实证）；已部署（含 ga-runner digest 更新），待用户真实渠道复测
@@ -101,6 +103,7 @@
 
 ## 最近活跃窗口
 
+- 2026-08-12：**空结果静默成功诊断+修复（见进行中）**：生产实证链路 = 任务 4e0172b4/7beb70d6 result_digest 为空串 sha256 + committed bundle body len=0 + messages 出站"任务完成：任务已完成" + task_events 零 chunk；教训："任务完成"类文案回包先查 result digest/committed bundle，勿直接归因渠道/流式
 - 2026-08-12：**MCP stdio 恢复 + runner 出网 + 并发限额调整（含推送审查修复）**：stdio 端到端恢复（domain 校验放开 + snapshot 签发携带 transport/command/args + worker MCPStdioClient + web 编辑器 + openapi）；runner-control 去 internal（可信部署主流模型，撤销 registry 白名单）；GA_PKG_CACHE_VOLUME 共享缓存卷全链路；ga-runner 镜像加 node 20 LTS + uv（sha256 校验，本地模拟验证 npx/uvx/缓存 env 生效）；并发限额 PER_REQUESTER_RUNNING_LIMIT=2 / MAX_RUNNING_TASKS=5；推送审查修复：proxy 字段仅 http server 生效（stdio 混布快照不再加载失败）+ store command 写回 nullString + proxy resolve 过滤 stdio + 安全测试 3 断言同步 + Dockerfile 预建缓存卷属主；验证：Go 全量+race 绿、worker 132 passed、契约/安全/smoke 41 passed、bot_poller 52、web lint/build 绿
 - 2026-08-12：**推送审查修复（6 项+三轮 2 项全落地+回归测试）**：B1 main.go transport 装配块前移（含 botLifecycle/botPollerClient 一并提前，channelSvc Start 闭包窗口一并消除）；B2 filterMCPServersByQuota 接入 issueInitialWorkerCredentials（新测试验证签发快照不含耗尽 server）；Y1 proxy quota 后移 resolve（404 不烧配额）；Y2 ConsumeMCPQuotas 单事务双周期（新增不烧 day 回归 + 20 并发恰 limit 成功测试）；Y3 掩码不匹配/新键掩码 400 拒绝；Y5 两 proxy 拆 validateToken/consumeBudget（404/429/400 拒绝路径不烧 JTI，MCP+Sophub 对称）；Go 全量（含 DB）+ race 6 包 + api race 全绿
 - 2026-08-11：**企微渠道全链路落地（3023e3d2）**：WeComAdapter + 注册表 + Web 卡片 + OpenAPI/文档；独立审查抓 C1（channelTypeForTaskSource 缺 wecom 分支→回复错投微信）已修+delivery 路由测试（fake resolver 按 channel_type 匹配真实 store 语义）；M2-M5 小修（前端校验文案/空 sender 归群/首帧占位/失败清理）；poller 52 用例 + Go TDD 全绿；已提交推送 origin/main；残余：真实凭据冒烟（SEND_MSG 流式帧验证）

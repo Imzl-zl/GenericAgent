@@ -60,6 +60,8 @@
 
 ## IM 渠道能力（稳定事实）
 
+- **空结果静默成功坑（2026-08-12 实证）**：上游模型退化响应（仅 `<summary>`/thinking 或空白 content）会被 GA 当正常完成提交空结果（thinking 非空不算 blank，`_empty_ct` 不计数）——平台回"任务完成：任务已完成"而用户没得到回答，**不是渠道/流式问题**。判断方法：查 tasks.result_digest（空串 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855）与 committed bundle body。防护四层（已落地）：do_no_tool 剥 summary/thinking 判可见文本 + MixinSession 空结果切换 session + worker EMPTY_RESULT + delivery 诚实文案。
+- **模型自动降级切换 = GA 原生 MixinSession**（llmcore）：mykey 配 `mixin_*` 键（llm_nos 按顺序选 session），`!!!Error:`/流异常/空结果（2026-08-12 补）自动切下一个，成功回弹（spring_back 300s），每 session 重试 max_retries；平台侧 `runtime_config.go` 在 >1 provider 时自动写 `mixin_config.llm_nos`（默认 provider 必须排第一，resolveRoutingSnapshot 强制）——**只需在平台 web 添加 ≥2 个 provider 即自动启用**；只配 1 个 provider 时无 mixin。provider 变量名 `platform_native_<oai|claude>_provider_<id>_config` 与 GA resolve_session 的 'native'/'claude'/'oai' 名字解析对齐；native_oai/native_claude 可混配（NativeOAISession 继承 NativeClaudeSession，同组校验通过）。
 - **微信 Bot（iLink）只能个人自用**：仅私聊、不能加群、无"多个好友/客服"场景——`wxbot_client.py` 消息模型只有 `from_user_id/to_user_id`，无群概念；对话单元固定单桶（`wechat:me`）。平台侧微信 bot ↔ 用户 1:1（QR 扫码绑定）。设计多 IM 时勿把微信当客服机器人模型。
 - 可群聊渠道：QQ（`qqapp.py` `group_openid`）、Telegram（chat 模型天然支持）、钉钉（`dingtalkapp.py` `conversation_type=="2"` → `group:{id}`）、企微（`wecomapp.py` `chatid`）、飞书（`fsapp.py`）。
 - 数据模型定案：隔离单元 = workspace（personal/team），memory/SOP/项目文件全共享；**对话上下文按"对话单元"（渠道×群/对端）分桶**，`/new` 清当前桶；桶 key = `channel:chat_id`。设计真值：`tenant_platform/docs/IM_CHANNEL_ARCHITECTURE.zh-CN.md`。

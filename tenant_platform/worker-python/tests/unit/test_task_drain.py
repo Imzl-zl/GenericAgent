@@ -60,7 +60,7 @@ def _fake_adapter():
         def _terminal(self, task_id, status, user_message="", error_code="", result_body=None):
             term = worker_pb2.Terminal(task_id=task_id, status=status, user_message=user_message)
             if error_code:
-                term.error.CopyFrom(worker_pb2.TerminalError(code=error_code))
+                term.error.CopyFrom(worker_pb2.ErrorEnvelope(code=error_code))
             self.terminals.append(term)
             return term
 
@@ -85,3 +85,37 @@ def test_drain_queue_item_receipt_refreshes_progress_window():
     events = list(task_drain.drain_display_queue(adapter, task, pending, state, q))
     assert time.monotonic() - state.last_progress_at < 1.0, "item receipt must refresh last_progress_at"
     assert any(e.HasField("terminal") for e in events)
+
+
+def test_empty_final_body_maps_to_empty_result_failure():
+    """空结果防护(2026-08-12 生产实证): GA 退化响应被当正常完成时
+    final_body 为空——不得静默 TASK_SUCCEEDED, 必须显式 EMPTY_RESULT
+    失败, 否则平台回"任务完成：任务已完成"而用户没得到实际回答。"""
+    from ga_worker import task_terminal
+
+    adapter = _fake_adapter()
+    task = worker_pb2.TaskEnvelope(task_id="t1")
+    pending = PendingTask(task_id="t1", request=None)
+    state = TaskRunState(pending=pending, agent=None)
+    events = list(task_terminal.emit_final_terminal(adapter, task, state))
+    terminals = [e.terminal for e in events if e.HasField("terminal")]
+    assert len(terminals) == 1
+    assert terminals[0].status == worker_pb2.TASK_FAILED
+    assert terminals[0].error.code == "EMPTY_RESULT"
+    assert state.terminal_emitted is True
+
+
+def test_final_body_with_file_markers_not_flagged_empty():
+    """纯工具任务(文件 marker 入 body)不得被空结果防护误伤。"""
+    from ga_worker import task_terminal
+
+    adapter = _fake_adapter()
+    task = worker_pb2.TaskEnvelope(task_id="t1")
+    pending = PendingTask(task_id="t1", request=None)
+    state = TaskRunState(pending=pending, agent=None)
+    state.final_body = "[FILE:outputs/report.docx]"
+    events = list(task_terminal.emit_final_terminal(adapter, task, state))
+    terminals = [e.terminal for e in events if e.HasField("terminal")]
+    assert len(terminals) == 1
+    assert terminals[0].status == worker_pb2.TASK_SUCCEEDED
+

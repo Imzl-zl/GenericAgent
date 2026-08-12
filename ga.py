@@ -701,7 +701,17 @@ class GenericAgentHandler(BaseHandler):
         if not response or (not content.strip() and not thinking.strip()):
             yield "[Warn] LLM returned an empty response. Retrying...\n"
             return self._retry_or_exit("[System] Blank response, regenerate and tooluse")
-        if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[-100:] or content.endswith('</summary>'):
+        # 空结果防护(2026-08-12 生产实证): <summary> 是系统提示词要求的工作
+        # 记忆块、<thinking> 是思考过程——都不属于用户可见回复。模型若只输出
+        # 这两者(或只含空白), 此前会被当作正常完成提交(空结果 TASK_SUCCEEDED),
+        # 用户收到"任务完成"却没有任何实际回答。视为空白响应计入 _empty_ct
+        # 重试, 连续 3 次走结构化 LLM_FAILED(替代原来仅靠 endswith('</summary>')
+        # 的窄启发式, 该条件已被本检查完全覆盖)。
+        visible = re.sub(r"<(?:summary|thinking)>[\s\S]*?</(?:summary|thinking)>", "", content, flags=re.IGNORECASE).strip()
+        if not visible:
+            yield "[Warn] LLM returned no user-visible content. Retrying...\n"
+            return self._retry_or_exit("[System] Blank response, regenerate and tooluse")
+        if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[-100:]:
             # 审查 D5: 传输/HTTP/解析故障(!!!Error:/流异常)是致命错误, 3 次
             # 后必须标记 LLM_FAILED, 不能让故障响应被当作成功完成任务。
             return self._retry_or_exit("[System] Incomplete response. Regenerate and tooluse.")

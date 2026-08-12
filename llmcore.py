@@ -1036,6 +1036,24 @@ def tryparse(json_str):
     if '}' in json_str: json_str = json_str[:json_str.rfind('}') + 1]
     return json.loads(json_str)
 
+def _has_visible_output(blocks):
+    """判定一次 LLM 调用的产出是否有用户可见内容(供 MixinSession 空结果切换)。
+
+    text 块(含 summary-only, 语义由上层判定)与 tool_use 块都算产出;
+    thinking 块是思考过程, 不算。空列表/仅 thinking = 退化响应。
+    """
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            return True
+        if b.get('type') == 'tool_use':
+            return True
+        if b.get('type') == 'text':
+            t = b.get('text', '')
+            if isinstance(t, str) and t.strip():
+                return True
+    return False
+
+
 class MixinSession:
     """A Session facade backed by multiple routed transport sessions."""
     _TRANSPORT_OVERRIDES = frozenset({
@@ -1114,14 +1132,23 @@ class MixinSession:
                     yield chunk; yielded = True
             except StopIteration as e: return_val = e.value or []
             is_err = test_error(last_chunk)
-            if not is_err:
+            # 空结果防护(2026-08-12 生产实证): 上游退化响应(仅 thinking/
+            # 空白 content, 无 text 无 tool_use)不是 !!!Error, 但同样需要切
+            # 换 session——否则空结果会被 GA 当作正常完成, 用户收到"任务完成"
+            # 却没有实际回答。summary-only 文本块仍是 text(本层放行, 由
+            # agent 的 do_no_tool 可见文本检查兜底)。
+            empty_out = not is_err and not _has_visible_output(return_val)
+            if not is_err and not empty_out:
                 if attempt > 0: self._cur_idx = idx; self._switched_at = time.time()
                 elif isinstance(last_chunk, str) and '[!!! 流异常中断' in last_chunk and n > 1:
                     self._cur_idx = (idx + 1) % n; self._switched_at = time.time()
                     print(f'[MixinSession] Partial failure, next call → s{self._cur_idx} ({self.current.name})')
                 return return_val
             if attempt >= self._retries:
-                yield last_chunk; return return_val
+                # 所有 session 均已重试: 错误场景保留错误文本(调用方展示),
+                # 空场景返回空结果(agent 空白重试逻辑兜底, 连续 3 次 LLM_FAILED)。
+                if is_err: yield last_chunk
+                return return_val
             nxt = (base + attempt + 1) % n
             if nxt == base:
                 rnd = (attempt + 1) // n
@@ -1129,7 +1156,8 @@ class MixinSession:
                 print(f'[MixinSession] {last_chunk[:80]}, round {rnd} exhausted, retry in {delay:.1f}s')
                 time.sleep(delay)
             else:
-                print(f'[MixinSession] {last_chunk[:80]}, retry {attempt+1}/{self._retries} (s{idx}→s{nxt})')
+                reason = f'empty output from s{idx} ({session.name})' if empty_out else f'{last_chunk[:80]}'
+                print(f'[MixinSession] {reason}, retry {attempt+1}/{self._retries} (s{idx}→s{nxt})')
 
 THINKING_PROMPT_ZH = """
 ### 行动规范（持续有效）
