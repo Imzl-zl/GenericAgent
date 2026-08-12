@@ -25,6 +25,9 @@ type MCPTarget struct {
 //   - server_id → 目标的映射由 Platform 的启用中 MCP 表决定, 即白名单
 //     (管理员未启用的 server 一律 404);
 //   - 调用按 JTI 原子计量(预算耗尽 429, 无预算 fail-closed 拒绝);
+//   - 计量语义(审查 Y5): 仅对"调用已发起"的请求消费 JTI 预算——客户端
+//     错误(401/400)、白名单拒绝(404)、配额拒绝(429)与系统故障(503)
+//     路径不消费; 上游调用失败(502)视为已发起, 消费。
 //   - 仅转发 JSON-RPC 流(Streamable HTTP), 不缓存/不解析内容;
 //   - 转发时注入平台侧持有的凭据头(MCPTarget.Headers, 来自 mcp_servers.headers);
 //   - 配额强制: 每次调用按 owner(经 sessionKey 解析)对 day+month 周期原子
@@ -69,8 +72,9 @@ func NewWorkerMCPProxy(
 	}
 }
 
-// authenticate 校验 capability 并按 JTI 原子消费预算(审查 F10 同款 fail-closed)。
-func (p *WorkerMCPProxy) authenticate(w http.ResponseWriter, r *http.Request) (llmproxy.CapabilityClaims, int) {
+// validateToken 只校验 capability, 不消费预算: Bearer 解析 + 签名/在线
+// 校验 + audience/operation。返回 claims 与状态码(0 = 放行)。
+func (p *WorkerMCPProxy) validateToken(r *http.Request) (llmproxy.CapabilityClaims, int) {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	token, ok := strings.CutPrefix(auth, "Bearer ")
 	if !ok || strings.TrimSpace(token) == "" {
@@ -84,22 +88,30 @@ func (p *WorkerMCPProxy) authenticate(w http.ResponseWriter, r *http.Request) (l
 	if !claims.VerifyAudience(llmproxy.MCPAudience, true) || claims.Operation != "mcp" {
 		return llmproxy.CapabilityClaims{}, http.StatusUnauthorized
 	}
-	if p.consume != nil {
-		maxCalls, ok := llmproxy.ParseBudgetMaxTurns(claims.Budget)
-		if !ok {
-			return llmproxy.CapabilityClaims{}, http.StatusForbidden
-		}
-		allowed, err := p.consume(r.Context(), llmproxy.HashJTI(claims.ID), maxCalls)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "mcp proxy: budget counter failed",
-				"jti", claims.ID, "err", err)
-			return llmproxy.CapabilityClaims{}, http.StatusServiceUnavailable
-		}
-		if !allowed {
-			return llmproxy.CapabilityClaims{}, http.StatusTooManyRequests
-		}
-	}
 	return claims, 0
+}
+
+// consumeBudget 按 JTI 原子消费预算(审查 F10 同款 fail-closed)。
+// 只应在调用即将发起时调用: 白名单/配额/客户端错误拒绝路径不得消费
+// (审查 Y5——原 authenticate 合一, resolve 404 与配额 429 也烧 JTI)。
+func (p *WorkerMCPProxy) consumeBudget(r *http.Request, claims llmproxy.CapabilityClaims) int {
+	if p.consume == nil {
+		return 0
+	}
+	maxCalls, ok := llmproxy.ParseBudgetMaxTurns(claims.Budget)
+	if !ok {
+		return http.StatusForbidden
+	}
+	allowed, err := p.consume(r.Context(), llmproxy.HashJTI(claims.ID), maxCalls)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "mcp proxy: budget counter failed",
+			"jti", claims.ID, "err", err)
+		return http.StatusServiceUnavailable
+	}
+	if !allowed {
+		return http.StatusTooManyRequests
+	}
+	return 0
 }
 
 func writeMCPAuthFailure(w http.ResponseWriter, status int, tid string) {
@@ -131,7 +143,7 @@ var mcpProxyHopHeaders = map[string]struct{}{
 // JSON-RPC 请求体原样转发到已启用 MCP Server 的真实 URL, 响应(含 SSE)流式回传。
 func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
-	claims, status := p.authenticate(w, r)
+	claims, status := p.validateToken(r)
 	if status != 0 {
 		writeMCPAuthFailure(w, status, tid)
 		return
@@ -173,6 +185,13 @@ func (p *WorkerMCPProxy) ServeProxy(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, "MCP_QUOTA_EXCEEDED", "user MCP quota exceeded for this period", tid)
 			return
 		}
+	}
+
+	// 调用即将发起: 消费 JTI 预算(审查 Y5——配额 429 与 404 路径不消费,
+	// 上游调用失败 502 视为已发起, 消费)。
+	if status := p.consumeBudget(r, claims); status != 0 {
+		writeMCPAuthFailure(w, status, tid)
+		return
 	}
 
 	upstream, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, r.Body)

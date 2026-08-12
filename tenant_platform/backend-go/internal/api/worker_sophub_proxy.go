@@ -37,10 +37,9 @@ func NewWorkerSophubProxy(
 	return &WorkerSophubProxy{search: search, fetch: fetch, validate: validate, consume: consume}
 }
 
-// authenticate 校验 capability 并按 JTI 原子消费预算(审查 F10)。
-// 返回 claims 与状态码: 0 = 放行; 非 0 = 已写出错误响应, 调用方直接返回。
-// 预算缺失/非法时 fail-closed 拒绝。
-func (p *WorkerSophubProxy) authenticate(w http.ResponseWriter, r *http.Request) (llmproxy.CapabilityClaims, int) {
+// validateToken 只校验 capability, 不消费预算: Bearer 解析 + 签名/在线
+// 校验 + audience/operation。返回 claims 与状态码(0 = 放行)。
+func (p *WorkerSophubProxy) validateToken(r *http.Request) (llmproxy.CapabilityClaims, int) {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	token, ok := strings.CutPrefix(auth, "Bearer ")
 	if !ok || strings.TrimSpace(token) == "" {
@@ -54,23 +53,32 @@ func (p *WorkerSophubProxy) authenticate(w http.ResponseWriter, r *http.Request)
 	if !claims.VerifyAudience(llmproxy.SophubAudience, true) || claims.Operation != "sophub" {
 		return llmproxy.CapabilityClaims{}, http.StatusUnauthorized
 	}
-	if p.consume != nil {
-		maxCalls, ok := llmproxy.ParseBudgetMaxTurns(claims.Budget)
-		if !ok {
-			// fail-closed(审查 F10): 无预算的 token 不允许调用代理。
-			return llmproxy.CapabilityClaims{}, http.StatusForbidden
-		}
-		allowed, err := p.consume(r.Context(), llmproxy.HashJTI(claims.ID), maxCalls)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "sophub proxy: budget counter failed",
-				"jti", claims.ID, "err", err)
-			return llmproxy.CapabilityClaims{}, http.StatusServiceUnavailable
-		}
-		if !allowed {
-			return llmproxy.CapabilityClaims{}, http.StatusTooManyRequests
-		}
-	}
 	return claims, 0
+}
+
+// consumeBudget 按 JTI 原子消费预算(审查 F10 同款 fail-closed)。
+// 只应在调用即将发起时调用: 客户端错误(401/400)与系统故障(503)路径
+// 不消费(审查 Y5——原 authenticate 合一, 参数校验 400 也烧 JTI);
+// 上游调用失败(502)与 fetch 后判定(403)视为已发起, 消费。
+func (p *WorkerSophubProxy) consumeBudget(r *http.Request, claims llmproxy.CapabilityClaims) int {
+	if p.consume == nil {
+		return 0
+	}
+	maxCalls, ok := llmproxy.ParseBudgetMaxTurns(claims.Budget)
+	if !ok {
+		// fail-closed(审查 F10): 无预算的 token 不允许调用代理。
+		return http.StatusForbidden
+	}
+	allowed, err := p.consume(r.Context(), llmproxy.HashJTI(claims.ID), maxCalls)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "sophub proxy: budget counter failed",
+			"jti", claims.ID, "err", err)
+		return http.StatusServiceUnavailable
+	}
+	if !allowed {
+		return http.StatusTooManyRequests
+	}
+	return 0
 }
 
 // writeAuthFailure 把 authenticate 返回的状态码转成标准错误响应。
@@ -90,13 +98,19 @@ func writeAuthFailure(w http.ResponseWriter, status int, tid string) {
 // ServeSearch 实现 GET /v1/worker/sophub/search?q=...
 func (p *WorkerSophubProxy) ServeSearch(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
-	if _, status := p.authenticate(w, r); status != 0 {
+	claims, status := p.validateToken(r)
+	if status != 0 {
 		writeAuthFailure(w, status, tid)
 		return
 	}
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if query == "" {
 		writeErr(w, http.StatusBadRequest, "INVALID_QUERY", "q is required", tid)
+		return
+	}
+	// 调用即将发起: 消费 JTI 预算(审查 Y5——参数校验 400 不消费)。
+	if status := p.consumeBudget(r, claims); status != 0 {
+		writeAuthFailure(w, status, tid)
 		return
 	}
 	result, err := p.search(r.Context(), query, 1, 24)
@@ -111,13 +125,20 @@ func (p *WorkerSophubProxy) ServeSearch(w http.ResponseWriter, r *http.Request) 
 // 仅返回公开 approved markdown 内容; 落盘由 Worker 在工作区完成。
 func (p *WorkerSophubProxy) ServeInstall(w http.ResponseWriter, r *http.Request) {
 	tid := traceID()
-	if _, status := p.authenticate(w, r); status != 0 {
+	claims, status := p.validateToken(r)
+	if status != 0 {
 		writeAuthFailure(w, status, tid)
 		return
 	}
 	remoteID := strings.TrimSpace(r.URL.Query().Get("id"))
 	if remoteID == "" {
 		writeErr(w, http.StatusBadRequest, "INVALID_SOP_ID", "id is required", tid)
+		return
+	}
+	// 调用即将发起: 消费 JTI 预算(审查 Y5——参数校验 400 不消费; fetch
+	// 后 403 判定视为已发起, 消费)。
+	if status := p.consumeBudget(r, claims); status != 0 {
+		writeAuthFailure(w, status, tid)
 		return
 	}
 	sop, err := p.fetch(r.Context(), remoteID)

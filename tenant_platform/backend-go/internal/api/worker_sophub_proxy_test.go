@@ -237,4 +237,55 @@ func TestWorkerSophubInternalHandlerOnlyExposesSophubRoutes(t *testing.T) {
 	}
 }
 
+// TestWorkerSophubClientErrorDoesNotConsumeBudget(Y5 回归): 参数校验失败
+// (400)是客户端错误, 不得消费 JTI 预算——预算只在调用即将发起时扣。
+// 原 authenticate 校验与计量合一, q/id 为空也烧预算。
+func TestWorkerSophubClientErrorDoesNotConsumeBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		code string
+	}{
+		{"search without q", "/v1/worker/sophub/search", "INVALID_QUERY"},
+		{"install without id", "/v1/worker/sophub/install", "INVALID_SOP_ID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			consumeCalls := 0
+			proxy := NewWorkerSophubProxy(
+				func(ctx context.Context, query string, page, pageSize int) (domain.SophubSearchResult, error) {
+					t.Fatal("search must not be invoked on client error")
+					return domain.SophubSearchResult{}, nil
+				},
+				func(ctx context.Context, remoteID string) (domain.SophubRemoteSOP, error) {
+					t.Fatal("fetch must not be invoked on client error")
+					return domain.SophubRemoteSOP{}, nil
+				},
+				func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+					return llmproxy.CapabilityClaims{
+						Operation: "sophub", Budget: `{"max_turns":3}`,
+						RegisteredClaims: jwt.RegisteredClaims{Audience: jwt.ClaimStrings{llmproxy.SophubAudience}},
+					}, nil
+				},
+				func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error) {
+					consumeCalls++
+					return true, nil
+				},
+			)
+			req := httptest.NewRequest("GET", tc.path, nil)
+			req.Header.Set("Authorization", "Bearer t")
+			rec := httptest.NewRecorder()
+			NewWorkerSophubHandler(proxy).ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code = %d, want 400", rec.Code)
+			}
+			if consumeCalls != 0 {
+				t.Fatalf("JTI budget must not be consumed on client error, got %d calls", consumeCalls)
+			}
+			if body := rec.Body.String(); !strings.Contains(body, tc.code) {
+				t.Fatalf("body = %s, want code %s", body, tc.code)
+			}
+		})
+	}
+}
+
 func boolPtr(v bool) *bool { return &v }

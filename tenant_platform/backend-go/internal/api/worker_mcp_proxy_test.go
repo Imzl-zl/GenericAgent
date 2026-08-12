@@ -359,10 +359,10 @@ func TestWorkerMCPQuotaRejectsExhausted(t *testing.T) {
 }
 
 // TestWorkerMCPQuotaNotConsumedOnUnknownServer(Y1 回归): 对不存在/未启用
-// server 的调用(404)不得消耗用户配额——配额扣减必须发生在 resolve 白名单
-// 校验之后。原实现在 resolve 前扣减, 拼错 server_key 会烧掉配额。
+// server 的调用(404)不得消耗用户配额与 JTI 预算——扣减必须发生在 resolve
+// 白名单校验之后。原实现在 resolve 前扣配额、authenticate 合一烧 JTI。
 func TestWorkerMCPQuotaNotConsumedOnUnknownServer(t *testing.T) {
-	quotaCalls := 0
+	quotaCalls, consumeCalls := 0, 0
 	proxy := NewWorkerMCPProxy(
 		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
 			return MCPTarget{}, false, nil // 不存在
@@ -376,7 +376,10 @@ func TestWorkerMCPQuotaNotConsumedOnUnknownServer(t *testing.T) {
 				},
 			}, nil
 		},
-		nil,
+		func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error) {
+			consumeCalls++
+			return true, nil
+		},
 		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
 			quotaCalls++
 			return true, nil
@@ -392,5 +395,51 @@ func TestWorkerMCPQuotaNotConsumedOnUnknownServer(t *testing.T) {
 	}
 	if quotaCalls != 0 {
 		t.Fatalf("quota must not be consumed for an unknown server, got %d calls", quotaCalls)
+	}
+	if consumeCalls != 0 {
+		t.Fatalf("JTI budget must not be consumed for an unknown server, got %d calls", consumeCalls)
+	}
+}
+
+// TestWorkerMCPBudgetNotConsumedOnQuotaRejected(Y5 回归): 用户配额耗尽
+// (429)时 JTI 预算不得消费——拒绝路径不计量, 预算只在调用即将发起时扣。
+func TestWorkerMCPBudgetNotConsumedOnQuotaRejected(t *testing.T) {
+	consumeCalls := 0
+	proxy := NewWorkerMCPProxy(
+		func(ctx context.Context, serverID string) (MCPTarget, bool, error) {
+			return MCPTarget{URL: "https://mcp.example.com/mcp"}, true, nil
+		},
+		func(ctx context.Context, token string) (llmproxy.CapabilityClaims, error) {
+			return llmproxy.CapabilityClaims{
+				Operation: "mcp", Budget: `{"max_turns":100}`,
+				RegisteredClaims: jwt.RegisteredClaims{
+					ID: "jti-1", Subject: "personal:42",
+					Audience: jwt.ClaimStrings{llmproxy.MCPAudience},
+				},
+			}, nil
+		},
+		func(ctx context.Context, jtiHash [32]byte, maxCalls int64) (bool, error) {
+			consumeCalls++
+			return true, nil
+		},
+		func(ctx context.Context, sessionKey, serverID string) (bool, error) {
+			return false, nil // 用户配额耗尽
+		},
+	)
+	req := httptest.NewRequest("POST", "/v1/worker/mcp/exa", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer good-token")
+	rec := httptest.NewRecorder()
+	NewWorkerMCPHandler(proxy).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429", rec.Code)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["code"] != "MCP_QUOTA_EXCEEDED" {
+		t.Fatalf("code field = %v, want MCP_QUOTA_EXCEEDED", body["code"])
+	}
+	if consumeCalls != 0 {
+		t.Fatalf("JTI budget must not be consumed when quota rejects, got %d calls", consumeCalls)
 	}
 }
