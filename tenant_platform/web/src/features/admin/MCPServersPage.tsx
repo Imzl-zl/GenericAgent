@@ -31,33 +31,8 @@ interface ServerConfigJSON {
   args?: string[];
 }
 
-function serverToJSON(server?: MCPServer): string {
-  const config: ServerConfigJSON = {
-    server_key: server?.server_key ?? '',
-    name: server?.name ?? '',
-    url: server?.url ?? '',
-    timeout_seconds: server?.timeout_seconds ?? 30,
-  };
-  // 新增模板显式带 transport(http 虽为默认值, 写出来提示字段存在);
-  // 编辑已有 http server 时省略(回显最小化, 与"http 可省略"语义一致)。
-  if (!server) {
-    config.transport = 'http';
-  }
-  if (server?.transport && server.transport !== 'http') {
-    config.transport = server.transport;
-  }
-  if (server?.command) {
-    config.command = server.command;
-  }
-  if (server?.args && server.args.length > 0) {
-    config.args = server.args;
-  }
-  if (server?.headers && Object.keys(server.headers).length > 0) {
-    config.headers = server.headers;
-  }
-  return JSON.stringify(config, null, 2);
-}
-
+// 新增时的默认模板 = 完整 HTTP 示例(与下方折叠示例同源), 直接改字段即可用;
+// 避免空模板让用户困惑"到底填什么"。示例值明显是占位, 管理员按需修改。
 const HTTP_EXAMPLE = `{
   "server_key": "exa",
   "name": "Exa",
@@ -75,6 +50,33 @@ const STDIO_EXAMPLE = `{
   "args": ["start-mcp-server", "--context=agent", "--project-from-cwd"],
   "timeout_seconds": 60
 }`;
+
+function serverToJSON(server?: MCPServer): string {
+  // 新增: 默认填入完整 HTTP 示例(直接改 server_key/url/headers 即可保存)。
+  if (!server) {
+    return HTTP_EXAMPLE;
+  }
+  const config: ServerConfigJSON = {
+    server_key: server?.server_key ?? '',
+    name: server?.name ?? '',
+    url: server?.url ?? '',
+    timeout_seconds: server?.timeout_seconds ?? 30,
+  };
+  // 编辑已有 http server 时省略 transport 字段(回显最小化, 与"http 可省略"语义一致)。
+  if (server?.transport && server.transport !== 'http') {
+    config.transport = server.transport;
+  }
+  if (server?.command) {
+    config.command = server.command;
+  }
+  if (server?.args && server.args.length > 0) {
+    config.args = server.args;
+  }
+  if (server?.headers && Object.keys(server.headers).length > 0) {
+    config.headers = server.headers;
+  }
+  return JSON.stringify(config, null, 2);
+}
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof ApiClientError ? `${error.code}: ${error.message}` : fallback;
@@ -236,6 +238,10 @@ export function MCPServersPage() {
           <form className="provider-form" onSubmit={submit}>
             <label className="input-wrapper provider-form-full">
               <span className="input-label">配置 JSON</span>
+              <p className="admin-subtitle" style={{ marginTop: 0, marginBottom: 6 }}>
+                新增时已默认填入完整 HTTP 示例，直接修改 server_key / name / url / headers 即可保存；
+                stdio 接入参考下方示例。
+              </p>
               <textarea
                 className="input-field mcp-json-editor"
                 rows={14}
