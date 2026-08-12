@@ -205,7 +205,10 @@ func (s *Server) loadBoundProvider(
 ) (domain.LLMProvider, bool) {
 	provider, err := s.cfg.ProviderSource.GetProvider(r.Context(), claims.ProviderID)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
+		// 404 判定兼容两种来源: store 曾返回 pgx.ErrNoRows, 现统一返回
+		// domain.ErrProviderNotFound(错误域分类, 2026-08-12)——两者都
+		// 是业务拒绝(目标 provider 不存在), 其余错误是基础设施故障 500。
+		if !errors.Is(err, pgx.ErrNoRows) && !errors.Is(err, domain.ErrProviderNotFound) {
 			slog.ErrorContext(r.Context(), "llmproxy: provider lookup failed", "provider_id", claims.ProviderID)
 			writeError(w, http.StatusInternalServerError, "PROVIDER_LOOKUP_FAILED", "provider lookup failed")
 			return domain.LLMProvider{}, false
