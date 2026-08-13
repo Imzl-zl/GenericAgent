@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
 )
@@ -28,6 +29,45 @@ var nativeResponseHeaderAllowlist = map[string]struct{}{
 }
 
 const sanitizedUpstreamErrorBody = "{\"code\":\"UPSTREAM_ERROR\",\"message\":\"upstream request failed\"}\n"
+
+// maxUpstreamErrorBodyBytes 是保留的上游错误体读上限(安全截断)。
+const maxUpstreamErrorBodyBytes = 1024
+
+// cleanUpstreamErrorBody 清洗上游错误体: 剥离控制字符 + 安全截断(UTF-8
+// 安全边界), 空结果返回 ""。错误体通常只含 message/code, 不含凭据。
+func cleanUpstreamErrorBody(raw []byte) string {
+	s := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, string(raw))
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	const maxLen = 400
+	if len(s) <= maxLen {
+		return s
+	}
+	// 按 rune 截断, 不切断多字节字符。
+	truncated := s[:maxLen]
+	for len(truncated) > 0 && !utf8.ValidString(truncated) {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated + "..."
+}
+
+// redactURL 去掉 query(可能含敏感参数), 只留 scheme/host/path。
+func redactURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	cp := *u
+	cp.RawQuery = ""
+	cp.Fragment = ""
+	return cp.String()
+}
 
 type proxyRequestContext struct {
 	Claims   CapabilityClaims
@@ -99,7 +139,14 @@ func sanitizeUpstreamResponse(response *http.Response) error {
 	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
 		return nil
 	}
+	// 2026-08-14 架构改进(可观测性): 上游错误体只进服务端日志(清洗截断),
+	// 不透传给 GA——上游错误体可能含账号/配额等敏感信息(测试 mock 即含
+	// account/quota), 原"不透传"设计是安全边界, 保留; 排障看 llm-proxy 日志。
+	var errBody string
 	if response.Body != nil {
+		if raw, err := io.ReadAll(io.LimitReader(response.Body, maxUpstreamErrorBodyBytes)); err == nil {
+			errBody = cleanUpstreamErrorBody(raw)
+		}
 		_ = response.Body.Close()
 	}
 	response.Body = io.NopCloser(strings.NewReader(sanitizedUpstreamErrorBody))
@@ -114,6 +161,8 @@ func sanitizeUpstreamResponse(response *http.Response) error {
 			"provider_id", requestContext.Provider.ID,
 			"provider_revision", requestContext.Provider.Revision,
 			"status", response.StatusCode,
+			"upstream", redactURL(response.Request.URL),
+			"error_body", errBody,
 		)
 	}
 	return nil

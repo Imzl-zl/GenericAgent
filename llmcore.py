@@ -1203,8 +1203,15 @@ class NativeToolClient:
         for tid in self._pending_tool_ids:
             if tid not in tr_id_set: tool_result_blocks.append({"type": "tool_result", "tool_use_id": tid, "content": ""})
         self._pending_tool_ids = []
-        # Filter whitespace-only text blocks that cause 400 on strict API proxies
-        filtered_content = [c for c in combined_content if c.get("text", "").strip()]
+        # Filter whitespace-only text blocks that cause 400 on strict API proxies.
+        # 2026-08-14 架构修复(生产实证: 图片任务模型永远看不到图): 原过滤
+        # 用 c.get("text", "") 判断——image_url/image 块没有 text 字段, 被判
+        # 为空白块整个丢弃, 多模态注入被静默吞掉(GA 日志有 injected, 模型
+        # 首轮却没有图)。必须显式保留非 text 块。
+        filtered_content = [
+            c for c in combined_content
+            if c.get("type") in ("image_url", "image") or c.get("text", "").strip()
+        ]
         final_content = tool_result_blocks + filtered_content
         if not final_content: final_content = [{"type": "text", "text": "."}]
         merged = {"role": "user", "content": final_content}

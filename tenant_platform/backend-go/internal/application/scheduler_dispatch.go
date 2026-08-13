@@ -377,6 +377,10 @@ func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr e
 		return err
 	}
 	req := &workerv1.ExecuteTaskRequest{Task: workerTaskEnvelope(taskRow, entry.runnerGeneration, controlJTIFor(entry.credentials))}
+	// 2026-08-14 媒体链路可观测性(架构改进): 任务媒体清单随 envelope 下发,
+	// 此前链路黑盒, 图片注入失败无法定位是发送侧还是接收侧。
+	slog.Info("scheduler: dispatching task envelope",
+		"task_id", taskRow.ID, "media_count", len(taskRow.Media))
 
 	taskDeadline := time.Now().Add(s.cfg.MaxTaskWallClock)
 	executeCtx, cancelExecute := context.WithTimeout(ctx, s.cfg.MaxTaskWallClock)

@@ -63,6 +63,9 @@ def put_task_and_wrap_handler(
     # put_task(images=...) 注入模型首轮 content blocks——不再依赖 prompt
     # 文本路径解析(旧链路仅文本提示, 模型看不到图片内容)。
     images = [m.relative_path for m in (task.media or [])]
+    # 2026-08-14 媒体链路可观测性(架构改进): 记录 worker 收到的媒体清单与
+    # 注入路径参数——此前图片注入失败时发送侧/接收侧黑盒, 无法定位。
+    print(f'[Worker] put_task task={task.task_id} media_count={len(task.media or [])} images={images}', flush=True)
     display_q = agent.put_task(task.prompt, source=task.source or "user", images=images)
     for _ in range(HANDLER_WRAP_RETRIES):
         h = getattr(agent, "handler", None)
