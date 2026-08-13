@@ -1,7 +1,7 @@
 # IM 渠道绑定（IM Channel Binding）
 
 > 状态：设计稿（2026-08-10，待用户确认后实施）
-> 关联：`IM_CHANNEL_ARCHITECTURE.zh-CN.md`（会话模型：workspace 共享 + 对话单元分桶，已落地）、`bot-poller-auth.md`
+> 关联：`IM_CHANNEL_ARCHITECTURE.zh-CN.md`（会话模型：workspace 共享 + 对话单元分桶，已落地）、`IM_MEDIA_ARCHITECTURE.zh-CN.md`（媒体管道：入站理解已落地/出站发送设计稿）、`bot-poller-auth.md`
 > 目标：接入飞书/钉钉/QQ 渠道；Web 菜单"微信绑定"改为通用渠道绑定页，可配置各渠道。
 
 ## 1. 现状与差距

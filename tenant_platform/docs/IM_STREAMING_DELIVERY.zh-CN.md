@@ -1,7 +1,7 @@
 # IM 流式输出（IM Streaming Delivery）
 
 > 状态：设计稿（2026-08-10，渠道能力矩阵为官方文档实证，待用户确认后实施）
-> 关联：`IM_CHANNEL_ARCHITECTURE.zh-CN.md`（会话模型）、`IM_CHANNEL_BINDING.zh-CN.md`（渠道绑定/Adapter 注册表）
+> 关联：`IM_CHANNEL_ARCHITECTURE.zh-CN.md`（会话模型）、`IM_CHANNEL_BINDING.zh-CN.md`（渠道绑定/Adapter 注册表）、`IM_MEDIA_ARCHITECTURE.zh-CN.md`（媒体管道：出站媒体与流式同属 delivery 面）
 > 结论先行：**管道已通（worker→platform Chunk 事件流），缺 platform→IM 转发；流式实现方式按渠道分档（飞书=消息编辑、QQ 单聊=原生流式接口、钉钉=限速分片、微信=非流），不是统一代码路径。**
 
 ## 1. 背景与现状
