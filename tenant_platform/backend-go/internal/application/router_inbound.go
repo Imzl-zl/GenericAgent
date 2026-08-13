@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
@@ -41,12 +42,21 @@ func (r *router) persistInboundMedia(ctx context.Context, msg IncomingMessage, b
 	return nil
 }
 
-// inferMessageType maps media presence to a coarse type. The Poller does not
-// currently forward the iLink item type, so all media is labelled "file".
-// Upgrading the webhook body to carry item type will enable image/voice/video.
-func inferMessageType(mediaPaths []string) string {
+// inferMessageType maps media presence to a coarse type. The Poller forwards
+// media content_type in media_items(2026-08-13 审查 D5): image/* → image,
+// video/* → video, 其余 file(无 media_items 时回退旧路径式判断)。
+func inferMessageType(mediaPaths []string, mediaItems []IncomingMediaItem) string {
 	if len(mediaPaths) == 0 {
 		return domain.MessageTypeText
+	}
+	for _, item := range mediaItems {
+		ct := strings.ToLower(item.ContentType)
+		switch {
+		case strings.HasPrefix(ct, "image/"):
+			return domain.MessageTypeImage
+		case strings.HasPrefix(ct, "video/"):
+			return domain.MessageTypeVideo
+		}
 	}
 	return domain.MessageTypeFile
 }

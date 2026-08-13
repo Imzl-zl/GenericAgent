@@ -42,8 +42,12 @@ type SessionFileRef struct {
 	Direction    string    `json:"direction"`
 	// SizeBytes 是文件字节数(2026-08-13 多模态链路: 随任务媒体清单持久化,
 	// GA 据此做注入体积上限判断)。
-	SizeBytes int64     `json:"size_bytes,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	SizeBytes int64 `json:"size_bytes,omitempty"`
+	// ContentType 是渠道侧/下载器推断的 MIME(2026-08-13 审查 D5): 路由时
+	// 从 webhook media_items 按序补入, 随任务媒体清单持久化/下发; 可空
+	// (回退扩展名推断)。
+	ContentType string    `json:"content_type,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // SessionFiles manages per-session file sandboxes for inbound attachments and generated outputs.

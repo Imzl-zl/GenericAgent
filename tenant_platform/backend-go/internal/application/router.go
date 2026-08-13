@@ -541,7 +541,7 @@ func (r *router) claimInboundMessage(ctx context.Context, msg IncomingMessage, b
 		BotID:       bot.ID,
 		SessionKey:  inboundSessionKey,
 		MessageID:   msg.MessageID,
-		MessageType: inferMessageType(msg.MediaPaths),
+		MessageType: inferMessageType(msg.MediaPaths, msg.MediaItems),
 		Content:     msg.Text,
 		MediaPath:   mediaPath,
 	})

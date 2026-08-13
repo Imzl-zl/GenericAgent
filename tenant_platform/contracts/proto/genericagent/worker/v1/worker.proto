@@ -82,11 +82,15 @@ message TaskEnvelope {
 
 // MediaItem 是任务入站媒体的一条元数据(workspace 相对路径语义)。
 // relative_path 相对会话沙箱根(temp/), GA 从该路径读文件并 base64 注入。
+// content_type 是渠道侧/下载器推断的 MIME(2026-08-13 审查 D5): 飞书 image
+// 无扩展名时靠魔数嗅探落盘, GA 注入层按扩展名判断——content_type 提供
+// 准确类型, Phase C 视频抽帧据此分派; 可空(回退扩展名推断)。
 message MediaItem {
   string alias = 1;          // 会话文件别名, 如 F005
   string original_name = 2;  // 用户侧原始文件名
   string relative_path = 3;  // 相对会话根, 如 attachments/F005_x.jpg
   int64 size_bytes = 4;      // 文件字节数
+  string content_type = 5;   // MIME, 如 image/jpeg; 可空
 }
 
 message ExecuteTaskRequest { TaskEnvelope task = 1; }

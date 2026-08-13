@@ -18,6 +18,10 @@ type TaskMedia struct {
 	OriginalName string `json:"original_name"`
 	RelativePath string `json:"relative_path"`
 	SizeBytes    int64  `json:"size_bytes"`
+	// ContentType 是渠道侧/下载器推断的 MIME(2026-08-13 审查 D5):
+	// 飞书 image 无扩展名时靠魔数嗅探落盘, GA 注入层按扩展名判断——
+	// content_type 提供准确类型, Phase C 视频抽帧据此分派; 可空。
+	ContentType string `json:"content_type,omitempty"`
 }
 
 type SubmitTaskCommand struct {

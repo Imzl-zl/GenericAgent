@@ -252,6 +252,11 @@ func validateTaskMedia(media []domain.TaskMedia) error {
 		if m.SizeBytes < 0 {
 			return fmt.Errorf("media[%d] size_bytes must be non-negative", i)
 		}
+		// 2026-08-13 审查 D5: content_type 可空, 非空时仅限长度(流入
+		// TaskEnvelope/提示上下文, 超长拒绝)。
+		if len(m.ContentType) > 255 {
+			return fmt.Errorf("media[%d] content_type exceeds 255 bytes", i)
+		}
 	}
 	return nil
 }

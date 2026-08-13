@@ -249,6 +249,10 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 			return nil, RouterResult{}, fmt.Errorf("stage session files: %w", err)
 		}
 		importedRefs = currentRefs
+		// 2026-08-13 审查 D5: 渠道侧准确的 content_type(webhook media_items)
+		// 按序补入 refs(与 MediaPaths 同序构造, poller 保证), 随任务媒体
+		// 清单持久化/下发——飞书 image 等无扩展名场景不靠文件名重猜。
+		applyInboundContentTypes(currentRefs, msg.MediaItems)
 		recentRefs, err := r.sessionFiles.Recent(sessionKey, 8)
 		if err != nil {
 			// round13 审查(X3): 附件已导入成功而 Recent 失败时, 必须回滚本次
@@ -297,7 +301,7 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 			BotID:       bot.ID,
 			SessionKey:  inboundSessionKey,
 			MessageID:   msg.MessageID,
-			MessageType: inferMessageType(msg.MediaPaths),
+			MessageType: inferMessageType(msg.MediaPaths, msg.MediaItems),
 			Content:     msg.Text,
 		})
 		if err != nil {
@@ -333,6 +337,17 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	// "收到" plus an async "正在处理" duplicate.
 	reply := "✓ 收到，正在处理您的任务..."
 	return msgRow, RouterResult{Action: ActionTaskCreated, Reply: reply, UserID: bot.OwnerID}, nil
+}
+
+// applyInboundContentTypes 把 webhook media_items 的 content_type 按序补入
+// 导入的附件 refs(2026-08-13 审查 D5)。media_items 与 media_paths 由 Poller
+// 同序构造; 长度不匹配时越界部分留空(回退扩展名推断)。
+func applyInboundContentTypes(refs []SessionFileRef, items []IncomingMediaItem) {
+	for i := range refs {
+		if i < len(items) && items[i].ContentType != "" {
+			refs[i].ContentType = items[i].ContentType
+		}
+	}
 }
 
 // rollbackImportedAttachments 回滚本次消息导入的附件(best-effort,
