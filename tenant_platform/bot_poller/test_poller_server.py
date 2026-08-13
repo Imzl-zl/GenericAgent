@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import re
 import threading
+import time
 
 import requests
 
@@ -481,3 +483,40 @@ def test_coalesces_reversed_batch_order():
     assert ready[0]["message_id"].startswith("coalesced:")
     assert ready[0]["media_paths"] == ["b1/resume.docx"]
     assert ready[0]["text"] == "整理一下"
+
+
+# ---------------------------------------------------------------------------
+# 媒体留存清扫(2026-08-13 审查 I4/D7): media_root 按 mtime 90d 清扫。
+# ---------------------------------------------------------------------------
+
+def test_media_sweep_removes_expired_keeps_fresh(tmp_path):
+    manager = poller_server.BotManager(media_root=str(tmp_path))
+    bot_dir = tmp_path / "bot-1"
+    bot_dir.mkdir()
+    old = bot_dir / "old.jpg"
+    fresh = bot_dir / "fresh.jpg"
+    old.write_bytes(b"x")
+    fresh.write_bytes(b"x")
+    past = time.time() - 91 * 86400
+    os.utime(old, (past, past))
+
+    removed = manager._sweep_media(90)
+    assert removed == 1
+    assert not old.exists()
+    assert fresh.exists()
+
+
+def test_media_sweep_reclaims_empty_bot_dir(tmp_path):
+    manager = poller_server.BotManager(media_root=str(tmp_path))
+    bot_dir = tmp_path / "bot-2"
+    bot_dir.mkdir()
+    (bot_dir / "gone.jpg").write_bytes(b"x")
+    past = time.time() - 91 * 86400
+    os.utime(bot_dir / "gone.jpg", (past, past))
+    manager._sweep_media(90)
+    assert not bot_dir.exists()  # 文件清空后目录回收
+
+
+def test_media_sweep_without_root_is_noop():
+    manager = poller_server.BotManager(media_root=None)
+    assert manager._sweep_media(90) == 0

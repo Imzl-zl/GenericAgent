@@ -32,6 +32,9 @@ const (
 	// deliveryFilesRetention 是 task_delivery_files 快照的审计保留期
 	// (审查 R5-I3: 内容随 outbox 保留, 定期清理防无界增长)。
 	deliveryFilesRetention = 30 * 24 * time.Hour
+	// mediaAssetsRetention 是 media_assets 审计行保留期(2026-08-13 审查
+	// I4/D7: 媒体字节=用户隐私数据; 90d 与 poller media_root 清扫对齐)。
+	mediaAssetsRetention = 90 * 24 * time.Hour
 	// maxDeliveryConcurrency caps in-flight process() calls within one tick.
 	// Each call may block up to deliverySendTimeout on iLink send, so a batch
 	// of 8 with concurrency 4 finishes in ~2 send-windows worst case instead
@@ -262,6 +265,15 @@ func (s *deliveryService) tick(ctx context.Context) error {
 		// 同保留期, 按 mtime 清扫 capture/ 子目录(DB 行删除后文件独立过期)。
 		if n := cleanupSpoolCaptureDir(s.snapshotDir, now.Add(-deliveryFilesRetention)); n > 0 {
 			slog.InfoContext(ctx, "delivery: cleaned expired spool capture files", "count", n)
+		}
+		// 2026-08-13 审查 I4/D7: 媒体审计行(media_assets, 入站/出站)90d
+		// 保留期——媒体字节=用户隐私数据, 审计明细不无限积累。
+		if s.cfg.Messages != nil {
+			if n, err := s.cfg.Messages.DeleteExpiredMediaAssets(ctx, now.Add(-mediaAssetsRetention)); err != nil {
+				slog.ErrorContext(ctx, "delivery: delete expired media assets failed", "error", err)
+			} else if n > 0 {
+				slog.InfoContext(ctx, "delivery: deleted expired media assets", "count", n)
+			}
 		}
 	}
 	deliveries, err := s.cfg.Store.ClaimPendingDeliveries(ctx, s.cfg.MaxBatch, s.cfg.ClaimLease, s.cfg.RetryWindow, now)

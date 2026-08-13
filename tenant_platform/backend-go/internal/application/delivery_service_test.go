@@ -652,6 +652,20 @@ type fakeMessageStore struct {
 
 func (s *fakeMessageStore) DeleteInboundMessage(_ context.Context, _ int64, _ string) error { return nil }
 
+func (s *fakeMessageStore) DeleteExpiredMediaAssets(_ context.Context, before time.Time) (int64, error) {
+	var removed int64
+	kept := s.assets[:0]
+	for _, a := range s.assets {
+		if a.CreatedAt.Before(before) {
+			removed++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	s.assets = kept
+	return removed, nil
+}
+
 func (s *fakeMessageStore) InsertInboundMessage(_ context.Context, m domain.Message) (domain.Message, error) {
 	if s.inErr != nil {
 		return domain.Message{}, s.inErr
@@ -914,5 +928,27 @@ func TestMediaTypeForPath(t *testing.T) {
 		if got := mediaTypeForPath(c.path); got != c.want {
 			t.Errorf("mediaTypeForPath(%q) = %q, want %q", c.path, got, c.want)
 		}
+	}
+}
+
+func TestDeleteExpiredMediaAssetsRetention(t *testing.T) {
+	if mediaAssetsRetention <= 0 || mediaAssetsRetention >= 365*24*time.Hour {
+		t.Fatalf("mediaAssetsRetention out of range: %v", mediaAssetsRetention)
+	}
+	ctx, _, deps := setupDeliveryService(t)
+	old := domain.MediaAsset{UserID: 1, BotID: 1, StoragePath: "bot/old.jpg",
+		CreatedAt: time.Now().Add(-mediaAssetsRetention - time.Hour)}
+	fresh := domain.MediaAsset{UserID: 1, BotID: 1, StoragePath: "bot/fresh.jpg",
+		CreatedAt: time.Now()}
+	deps.messages.assets = append(deps.messages.assets, old, fresh)
+	n, err := deps.messages.DeleteExpiredMediaAssets(ctx, time.Now().Add(-mediaAssetsRetention))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("removed %d, want 1", n)
+	}
+	if len(deps.messages.assets) != 1 || deps.messages.assets[0].StoragePath != "bot/fresh.jpg" {
+		t.Fatal("fresh asset must be kept")
 	}
 }

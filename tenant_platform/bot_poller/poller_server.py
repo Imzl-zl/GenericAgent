@@ -109,6 +109,13 @@ WEBHOOK_RETRY_BASE_SECONDS = 2.0
 WEBHOOK_RETRY_CAP_SECONDS = 60.0
 MAX_INBOUND_COALESCE_WINDOW_MS = 5000
 MAX_COALESCED_MESSAGES = 8
+# 入站媒体字节保留期(2026-08-13 审查 I4/D7): 媒体=用户隐私数据,
+# media_root/<bot_uuid>/ 下的下载文件按 mtime 周期性清扫, 与 Go 侧
+# media_assets 审计行 90d 保留期对齐。env 可调。
+MEDIA_RETENTION_DAYS = _env_int('BOT_POLLER_MEDIA_RETENTION_DAYS', 90)
+# 清扫节流(daemon 线程每 60s tick 检查, 满 24h 执行一次)。
+MEDIA_SWEEP_TICK_SECONDS = 60
+MEDIA_SWEEP_INTERVAL_SECONDS = 24 * 3600
 
 def _parse_listen_addr(listen):
     """Parse 'host:port' into (host, port_int). Raises ValueError on bad input."""
@@ -2023,6 +2030,10 @@ class BotManager:
 
     配置来源 = 平台热推(/start /stop), 复用既有配置热更新链路
     (IM_CHANNEL_BINDING §5): 新增/更新/解绑由 Go 控制面触发连接重载。
+
+    media_root 留存(2026-08-13 审查 I4/D7): 入站媒体下载文件按 mtime
+    周期性清扫(默认 90 天, BOT_POLLER_MEDIA_RETENTION_DAYS 可调)——
+    媒体字节=用户隐私数据, 不无限积累。daemon 线程 60s tick / 24h 执行。
     """
 
     def __init__(self, media_root=None, webhook_secret='', inbound_coalesce_window_ms=0):
@@ -2034,6 +2045,56 @@ class BotManager:
         self._webhook_secret = webhook_secret or ''
         if media_root:
             os.makedirs(media_root, exist_ok=True)
+        # 媒体留存清扫 daemon(仅配置了 media_root 时启动)。
+        self._sweep_thread = None
+        if media_root:
+            self._sweep_thread = threading.Thread(
+                target=self._sweep_loop, daemon=True, name='media-sweep')
+            self._sweep_thread.start()
+
+    def _sweep_loop(self):
+        """周期清扫 media_root 下超过保留期的媒体文件(24h 节流)。"""
+        next_sweep = time.monotonic() + MEDIA_SWEEP_INTERVAL_SECONDS
+        while True:
+            time.sleep(MEDIA_SWEEP_TICK_SECONDS)
+            if time.monotonic() < next_sweep:
+                continue
+            next_sweep = time.monotonic() + MEDIA_SWEEP_INTERVAL_SECONDS
+            try:
+                removed = self._sweep_media(MEDIA_RETENTION_DAYS)
+                if removed:
+                    print(f'[Poller] media sweep removed {removed} expired file(s) '
+                          f'(>{MEDIA_RETENTION_DAYS}d)', flush=True)
+            except Exception as exc:
+                print(f'[Poller] media sweep err: {exc}', flush=True)
+
+    def _sweep_media(self, retention_days):
+        """删除 media_root/<bot_uuid>/ 下 mtime 超过保留期的文件; 返回删除数。
+
+        只删 media_root 直接子目录(bot_uuid)内的普通文件, 不递归进入
+        任意深层目录(防误删)。空 bot 目录顺带回收。幂等。"""
+        if not self._media_root or not os.path.isdir(self._media_root):
+            return 0
+        cutoff = time.time() - retention_days * 86400
+        removed = 0
+        for bot_dir_name in os.listdir(self._media_root):
+            bot_dir = os.path.join(self._media_root, bot_dir_name)
+            if not os.path.isdir(bot_dir):
+                continue
+            try:
+                for name in os.listdir(bot_dir):
+                    path = os.path.join(bot_dir, name)
+                    try:
+                        if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                            os.remove(path)
+                            removed += 1
+                    except OSError:
+                        pass
+                if not os.listdir(bot_dir):
+                    os.rmdir(bot_dir)  # 空目录回收
+            except OSError:
+                continue
+        return removed
 
     def configure_inbound_coalescing(self, window_ms):
         window_ms = int(window_ms)

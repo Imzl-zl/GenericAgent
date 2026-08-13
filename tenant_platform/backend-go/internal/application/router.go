@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -109,6 +110,10 @@ type MessageStore interface {
 	InsertOutboundMessage(ctx context.Context, m domain.Message) (domain.Message, error)
 	HasOutboundMessage(ctx context.Context, taskID, messageType, content, mediaPath string) (bool, error)
 	InsertMediaAsset(ctx context.Context, m domain.MediaAsset) (domain.MediaAsset, error)
+	// DeleteExpiredMediaAssets 删除超过保留期的媒体审计行(2026-08-13 审查
+	// I4/D7: 媒体字节=用户隐私数据, 审计行定保留期 90d, 与 delivery 文件
+	// 快照 30d 清理同模式)。返回删除行数。
+	DeleteExpiredMediaAssets(ctx context.Context, before time.Time) (int64, error)
 }
 
 // CommandRegistry supplies the admin-configurable command list.

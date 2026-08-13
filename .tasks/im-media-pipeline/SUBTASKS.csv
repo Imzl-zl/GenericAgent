@@ -13,7 +13,7 @@ T4.1,T4,BotAdapter.send_media 模板方法 + BotManager.send 改显式接口 + �
 T4.2,T4,QQ 分片上传(预上传→PUT→完成→msg_type=7) + 主动消息路径 + per-target 频控,done,分片参数待真实凭据实测
 T4.3,T4,飞书 im/v1 images+files / 钉钉 media/upload / 企微 media/upload 适配,done,钉钉 file/video downloadCode 流未实现(fail-closed); 企微 token 端点待实测
 T4.4,T4,Go delivery MIME 分发: transport.SendFile 加 mediaType + mediaTypeForPath,done,ILink/Loopback/fakeTransport 同步
-T5,,Phase C 前置: 出站存储改 spool 引用(DB 只存路径/摘要) + per-type 上限,done,migration 0057 spool_path + capture 流式复制 + per-type 上限(image 20M/video 100M/file 8M, 聚合 256M) + delivery 直接发 spool + 30d mtime 清扫; 存量 content 行兼容
+T5,,Phase C 前置: 出站存储改 spool 引用(DB 只存路径/摘要) + per-type 上限,done,migration 0057 spool_path + capture 流式复制 + per-type 上限(image 20M/video 100M/file 8M
 T6,,MediaItem.content_type 字段(proto 变更窗口,done,MediaItem.content_type=5 + generate_bindings + Go 链路透传 + inferMessageType 分 image/video; 契约测试自动比对通过
-T7,,媒体留存策略: poller media_root 清理 + media_assets 保留期(决策 D7),blocked,
+T7,,媒体留存策略: poller media_root 清理 + media_assets 保留期(决策 D7),done,Go: media_assets 90d 保留期(delivery tick 24h 节流清理) + poller media_root 90d mtime 清扫(daemon 24h, BOT_POLLER_MEDIA_RETENTION_DAYS 可调); 与 spool 30d 清扫同模式
 T8,,Phase B: 生图 image_gen + llm-proxy llm.image(决策 D6),blocked,可推迟

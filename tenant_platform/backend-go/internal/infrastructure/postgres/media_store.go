@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -55,7 +56,6 @@ RETURNING id, user_id, bot_id, COALESCE(message_id, 0), file_name, storage_path,
 	return out, nil
 }
 
-
 func scanMediaAsset(row pgx.Row, m *domain.MediaAsset) error {
 	var direction string
 	err := row.Scan(&m.ID, &m.UserID, &m.BotID, &m.MessageID, &m.FileName,
@@ -66,4 +66,16 @@ func scanMediaAsset(row pgx.Row, m *domain.MediaAsset) error {
 	}
 	m.Direction = domain.MessageDirection(direction)
 	return nil
+}
+
+// DeleteExpiredMediaAssets 删除超过保留期的媒体审计行(2026-08-13 审查
+// I4/D7: 媒体字节=用户隐私数据, 审计行 90d 保留期)。返回删除行数。
+func (s *Store) DeleteExpiredMediaAssets(ctx context.Context, before time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+DELETE FROM media_assets WHERE created_at < $1
+`, before)
+	if err != nil {
+		return 0, fmt.Errorf("delete expired media assets: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
