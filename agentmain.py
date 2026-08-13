@@ -245,7 +245,7 @@ class GenericAgent:
                 done_item = {'done': full_resp, 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()}
                 if runner_result.get('result') == 'MAX_TURNS_EXCEEDED':
                     done_item.update({
-                        'error': f'agent reached configured turn limit ({curr_turn}) before completing the task',
+                        'error': '任务超出最大轮数仍未完成，已停止（可能是任务过于复杂或上游模型异常），请重试或拆分后再试',
                         'error_code': 'MAX_TURNS_EXCEEDED',
                     })
                 elif isinstance(runner_result.get('data'), dict) and runner_result.get('data', {}).get('result') == 'LLM_FAILED':
@@ -256,9 +256,11 @@ class GenericAgent:
                     # {'result':'EXITED','data':...}, LLM_FAILED 嵌套在 data 内;
                     # data 也可能是任意对象(如正常完成时 do_no_tool 的 response),
                     # 故必须先用 isinstance 判定再读取(勿改回顶层判定)。
+                    # 2026-08-13: 用户可见文案不再透传"给模型的英文指令"
+                    # (如 [System] Incomplete response...), 统一为友好中文。
                     _llm_fail = runner_result.get('data') or {}
                     done_item.update({
-                        'error': _llm_fail.get('msg') or 'LLM repeatedly failed to produce a valid response',
+                        'error': '模型连续多次未返回有效内容（可能是上游模型异常或繁忙），请重试或稍后再试',
                         'error_code': 'LLM_FAILED',
                     })
                 display_queue.put(done_item)

@@ -97,7 +97,7 @@ def test_max_turns_exceeded_is_reported_to_worker(monkeypatch):
 
     assert item["done"] == "partial output"
     assert item["error_code"] == "MAX_TURNS_EXCEEDED"
-    assert "turn limit" in item["error"]
+    assert "最大轮数" in item["error"]
     assert not runner.is_alive()
 
 
@@ -147,7 +147,7 @@ def test_llm_failed_nested_in_data_is_reported_to_worker(monkeypatch):
 
     assert item["done"] == "partial output"
     assert item["error_code"] == "LLM_FAILED"
-    assert "repeated transport failures" in item["error"]
+    assert "模型连续多次未返回有效内容" in item["error"]
     assert not runner.is_alive()
 
 
