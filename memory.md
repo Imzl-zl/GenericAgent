@@ -20,7 +20,7 @@
   - 已知数据问题（非本轮引入）：channel_configs 两条 wechat 绑定（08-08 写入）明文是 iLink 凭据字符串（`xxx@im.bot:yyy`）非 JSON，RestoreActiveBots 恢复时 poller client marshal 失败（日志 ERROR bot_lifecycle: restore channel failed）——良性不阻塞启动，待用户确认后清理/迁移
 - **wechat 频道恢复（2026-08-12）**：channel_configs 两条 wechat 绑定（08-08 写入，明文为 iLink 凭据字符串非 JSON）经格式迁移恢复——重加密为 `{"token": ...}`（备份 /tmp/wechat_plaintext_backup.txt）+ 重建 bot-poller 镜像（生产 poller 一直是旧 /start 契约 bot_token 顶层字段，89081f2 改 config_json 后 8-11 部署未重建 poller，两边失配才导致 marshal 失败）；恢复后两条 restored channel 无 ERROR
 - **web 镜像滞后修复（2026-08-12）**：8-11 部署时 web 镜像未重建（停在 08-08 构建），8-10/8-11 的界面改动（IM 渠道绑定页/企微卡片/MCP 治理面板）全缺失，用户看到旧“微信绑定”菜单——重建后含企业微信/渠道绑定/MCP 面板；同批排查：sandbox-manager 镜像旧但代码无改动（无影响）、ga-runner 旧但 0751a6d 仅影响宿主机场景（容器内无影响）。**教训：部署必须全量重建（make build），选择性重建会漏镜像（前有 bot-poller 契约失配，后有 web 界面滞后）**
-- 最后更新：2026-08-12（错误域硬化 + 生产部署 + wechat 恢复 + web 重建）
+- 最后更新：2026-08-13（时区统一北京时间 + 渠道切换答疑）
 
 ## 已完成能力
 
@@ -103,6 +103,8 @@
 
 ## 最近活跃窗口
 
+- 2026-08-13：**时区统一修复（北京时间）**：根因=服务器 Etc/UTC（美国 VPS 默认，非美东/美西），GA 的 Today/日志时间戳全 UTC，模型感知时间比国内慢 8h。修复：ga-runner 镜像 ENV TZ=Asia/Shanghai（zoneinfo base 自带，新 digest 3b2f35d6 已生效）+ compose 四服务（platform/bot-poller/llm-proxy/sandbox-manager）加 TZ env；**坑：alpine/docker:27-cli（golang 镜像）无 zoneinfo，TZ 环境变量静默失效仍 UTC** → 两个 Dockerfile 补 apk tzdata 重建后生效；postgres 故意不加（DB 存储 Go 侧 .UTC() 不变，web 前端 toLocaleString 浏览器本地化）；已滚动重启 5 服务 healthz 全绿。同批答疑：渠道默认 new 无配置问题——llm_nos 顺序 = is_default DESC,id ASC（默认强制第一），mixin spring_back=300s 防抖窗口内切换后直接走 go 不回弹，用户观察"一直用 go"系 00:45 new-api 停机切换后窗口内连续消息所致，间隔 >5min 自动回弹 new
+- 2026-08-13：**并发参数实测调优（GA_RUNNER_MAX_ACTIVE 2→4）**：1panel 监控实证双微信任务（personal:1/personal:78 并行零排队）CPU 峰值 14%、内存增量仅 130MB（每 runner 实际 ~65MB，1GB 是护栏非占用）；GA_RUNNER_MAX_ACTIVE 仅 platform 读（lease 事务容量，sandbox-manager 不读），.env 两处已同步+语义注释；mixin 自动切换实证（00:45 双 provider 交替重试 10 次全 502 → LLM_FAILED，系用户更新 new-api 停机所致，非系统问题）；LLM_FAILED/MAX_TURNS 文案中文化；QQ 流式帧成功日志落地（open/commit 帧服务端 id 回传验证通过）
 - 2026-08-12：**空结果防护已部署（2cc4f79）**：make build 全量重建（:local + :2cc4f79，备份 :local.bak-emptyfix-20260812 三个镜像）+ runner-digest 更新（新 sha256:1f3e9b0d 已生效）+ 滚动重启 platform/sandbox-manager/bot-poller；healthz 全绿、QQ WS ready、飞书 WS started、平台日志 0 error；待用户真实渠道发消息复测（含退化响应时的明确报错）
 
 - 2026-08-12：**空结果静默成功诊断+修复（见进行中）**：生产实证链路 = 任务 4e0172b4/7beb70d6 result_digest 为空串 sha256 + committed bundle body len=0 + messages 出站"任务完成：任务已完成" + task_events 零 chunk；教训："任务完成"类文案回包先查 result digest/committed bundle，勿直接归因渠道/流式

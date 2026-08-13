@@ -11,6 +11,9 @@ COPY tenant_platform/backend-go/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w -buildid=' -o /out/ga-sandbox-manager ./cmd/sandbox-manager
 
 FROM docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+# tzdata(2026-08-13): compose 注入 TZ=Asia/Shanghai 需要 zoneinfo,
+# 否则 glibc/musl 回退 UTC, TZ 静默失效(实测 docker:27-cli 无 zoneinfo)。
+RUN apk add --no-cache tzdata
 COPY --from=build /out/ga-sandbox-manager /usr/local/bin/ga-sandbox-manager
 # 以 root 运行: 需要 chown 工作区目录(固定 Runner UID/GID)与访问 Docker socket。
 # 容器仍受 read_only + cap_drop ALL 约束; compose 仅追加 CHOWN/DAC 能力。

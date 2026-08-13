@@ -10,7 +10,9 @@ COPY tenant_platform/backend-go/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w -buildid=' -o /out/ga-llm-proxy ./cmd/llm-proxy
 
 FROM alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1
-RUN apk add --no-cache ca-certificates && adduser -D -u 10001 -g 10001 llmproxy
+# tzdata(2026-08-13): compose 注入 TZ=Asia/Shanghai 需要 zoneinfo,
+# 否则 musl 回退 UTC, TZ 静默失效(实测 alpine:3.19 无 zoneinfo)。
+RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 -g 10001 llmproxy
 COPY --from=build --chown=10001:10001 /out/ga-llm-proxy /usr/local/bin/ga-llm-proxy
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/ga-llm-proxy"]

@@ -55,6 +55,8 @@ services:
     group_add:
       - "10003"
     environment:
+      # 时区固定北京时间(2026-08-13): 日志/时间戳统一, 与 ga-runner 镜像 TZ 一致。
+      TZ: Asia/Shanghai
       BOT_POLLER_LISTEN: ${BOT_POLLER_LISTEN}
       BOT_POLLER_MEDIA_DIR: ${BOT_POLLER_MEDIA_DIR}
       BOT_POLLER_API_SECRET: ${BOT_POLLER_API_SECRET}
@@ -101,6 +103,8 @@ services:
     group_add:
       - "10003"
     environment:
+      # 时区固定北京时间(2026-08-13): 日志/时间戳统一(存储仍 UTC, Go 侧明确 .UTC())。
+      TZ: Asia/Shanghai
       DATABASE_URL: ${DATABASE_URL}
       BOT_TOKEN_KEY: ${BOT_TOKEN_KEY}
       # 微信绑定(iLink)开关: 空值 = 路由仍注册但返回 501 FEATURE_DISABLED。
@@ -202,6 +206,8 @@ services:
     init: true
     user: "10001:10001"
     environment:
+      # 时区固定北京时间(2026-08-13): 日志/时间戳统一(存储仍 UTC)。
+      TZ: Asia/Shanghai
       DATABASE_URL: ${DATABASE_URL}
       LLM_PROXY_CAPABILITY_SIGNING_KEY: ${LLM_PROXY_CAPABILITY_SIGNING_KEY}
       LLM_PROXY_LISTEN: ${LLM_PROXY_LISTEN:-0.0.0.0:8081}
@@ -266,6 +272,8 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
+      # 时区固定北京时间(2026-08-13): 日志/时间戳统一(runner 容器 TZ 由镜像 ENV 固定)。
+      TZ: Asia/Shanghai
       GA_RUNNER_IMAGE: ${GA_RUNNER_IMAGE:-genericagent-ga-runner:local}
       # round11 M2: 内部网络带项目名前缀, manager 必须按实际网络名创建 Runner。
       GA_RUNNER_NETWORK: ${GA_RUNNER_NETWORK:-${COMPOSE_PROJECT_NAME:-ga}_runner-control}

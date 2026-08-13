@@ -22,7 +22,10 @@ ENV PYTHONUNBUFFERED=1 \
     GA_MEMORY_TEMPLATE=/ga/memory-template \
     GA_DISABLE_HOST_BROWSER=1 \
     # Round8 审查: inline_eval 在 Worker 进程内执行, 绕过进程组清理, Runner 禁用。
-    GA_DISABLE_INLINE_EVAL=1
+    GA_DISABLE_INLINE_EVAL=1 \
+    # 时区固定北京时间(2026-08-13): GA 的 Today/日志/记忆时间戳跟随容器 TZ;
+    # 服务器为 UTC, 不设则 GA 感知时间比国内慢 8 小时。zoneinfo 由 base 镜像自带。
+    TZ=Asia/Shanghai
 
 # 固定非 root Runner UID/GID(部署 profile 与 Manager 预置目录所有权一致)。
 RUN groupadd --system --gid 10002 ga-runner \
