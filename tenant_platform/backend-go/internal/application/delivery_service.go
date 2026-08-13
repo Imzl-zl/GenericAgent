@@ -409,7 +409,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				// (safefs 限长读取 + 普通文件校验), tmp 位于 Platform 私有
 				// 目录(0700), 直接发送, 无需二次快照。
 				if file.snapshotContent {
-					return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey))
+					return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.relPath))
 				}
 				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
 				// 后复制到 Platform 私有快照, transport 发送不可变快照,
@@ -419,7 +419,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 					return snapErr
 				}
 				defer os.Remove(snap)
-				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, replyTarget, snap, file.displayName, deliveryClientID(partKey))
+				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, replyTarget, snap, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.relPath))
 			},
 			sendErrorCode: "SEND_FILE_FAILED",
 		})
@@ -722,6 +722,21 @@ func stripControlChars(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// mediaTypeForPath 按扩展名推断出站媒体类型(IM_MEDIA_ARCHITECTURE §5.1 A2:
+// delivery 按 MIME 分发 image/video/file, poller 按 msg_type 走渠道上传)。
+// 未知扩展名回退 "file"(保守, 与 poller /send 默认一致)。
+func mediaTypeForPath(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp":
+		return "image"
+	case ".mp4", ".mov", ".avi", ".mkv", ".webm":
+		return "video"
+	default:
+		return "file"
+	}
 }
 
 // deliverableSnapshotBase 返回写入 Platform 私有快照目录的服务端可信

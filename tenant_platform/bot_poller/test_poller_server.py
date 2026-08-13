@@ -323,7 +323,7 @@ def test_zero_window_disables_aggregation():
 
 # 审查 R5-I10: /send 的 file_name 必须透传到 WxBotClient.send_file——显示名
 # 由 Platform 显式传入, 不能回退到快照临时路径 basename(含 marker hash 前缀)。
-def test_send_passes_explicit_file_name_to_client(monkeypatch):
+def test_send_passes_explicit_file_name_to_client(monkeypatch, tmp_path):
     class Client:
         def __init__(self):
             self.calls = []
@@ -340,13 +340,17 @@ def test_send_passes_explicit_file_name_to_client(monkeypatch):
     adapter.client = Client()
     manager._adapters["b1"] = adapter
 
-    manager.send("b1", "u1", "", msg_type="file", file_path="/tmp/abc123_report.docx", file_name="report.docx")
-    assert adapter.client.calls == [("u1", "/tmp/abc123_report.docx", "", "report.docx", "")]
+    docx = tmp_path / "report.docx"
+    docx.write_bytes(b"doc")
+    manager.send("b1", "u1", "", msg_type="file", file_path=str(docx), file_name="report.docx")
+    assert adapter.client.calls == [("u1", str(docx), "", "report.docx", "")]
 
     # 未传 file_name 时回退为空串(客户端侧回退本地 basename), 不报错。
+    other = tmp_path / "other.docx"
+    other.write_bytes(b"doc")
     adapter.client.calls.clear()
-    manager.send("b1", "u1", "", msg_type="file", file_path="/tmp/abc123_other.docx")
-    assert adapter.client.calls == [("u1", "/tmp/abc123_other.docx", "", "", "")]
+    manager.send("b1", "u1", "", msg_type="file", file_path=str(other))
+    assert adapter.client.calls == [("u1", str(other), "", "", "")]
 
     # round9 审查: client_id 透传到客户端(稳定幂等键)。
     adapter.client.calls.clear()

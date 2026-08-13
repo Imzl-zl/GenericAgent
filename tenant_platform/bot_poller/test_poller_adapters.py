@@ -262,7 +262,7 @@ def test_qq_send_text_uses_memorized_target_kind():
 # BotManager 注册表: channel_type → adapter 工厂 + /send 路由 + 幂等 start。
 # ---------------------------------------------------------------------------
 
-def test_manager_registry_factories_and_send_routing(monkeypatch):
+def test_manager_registry_factories_and_send_routing(monkeypatch, tmp_path):
     manager = poller_server.BotManager(media_root=None)
     # 用桩替换各 adapter 的连接循环: 注册表测试不建立真实 SDK 连接。
     started = []
@@ -334,11 +334,21 @@ def test_manager_registry_factories_and_send_routing(monkeypatch):
     except KeyError:
         pass
 
-    # 非微信渠道 send_file 未实现 → 明确报错(不静默)。
+    # 未实现渠道的出站媒体 → 明确报错(不静默, 决策 A3 fail-closed)。
+    # 钉钉 file/video 需 downloadCode 上传流(待实测): NotImplementedError。
+    docx = tmp_path / "x.docx"
+    docx.write_bytes(b"doc")
     try:
-        manager.send("b-fs", "oc_1", "", msg_type="file", file_path="/tmp/x")
-        raise AssertionError("feishu send_file must raise")
+        manager.send("b-dt", "cid_1", "", msg_type="file", file_path=str(docx))
+        raise AssertionError("dingtalk send_file must raise")
     except NotImplementedError:
+        pass
+
+    # 文件不存在: send_media 防御校验直接拒绝(Go spool 保证真实存在)。
+    try:
+        manager.send("b-fs", "oc_1", "", msg_type="image", file_path="/tmp/definitely-missing.png")
+        raise AssertionError("missing file must raise")
+    except ValueError:
         pass
 
 

@@ -18,7 +18,9 @@ type BotTransportAdapter interface {
 	// SendFile delivers a file reply to the bound user via the bot.
 	// fileName 是用户可见的显示文件名(审查 R5-I10): 不得从 filePath 的
 	// basename 推导——快照临时文件名含 marker hash 前缀, 会暴露给用户。
-	SendFile(ctx context.Context, botUUID, channelAccountID, filePath, fileName, clientID string) error
+	// mediaType 是出站媒体类型("image"|"video"|"file", IM_MEDIA_ARCH
+	// §5.1 A2: delivery 按 MIME 分发); 空字符串回退 "file"。
+	SendFile(ctx context.Context, botUUID, channelAccountID, filePath, fileName, clientID, mediaType string) error
 
 	// CheckMessageIdempotency 只读检查 (botUUID, messageID) 是否已成功处理过
 	// (Round8 审查: 与 Mark 拆分, 避免失败路径提前消费消息)。

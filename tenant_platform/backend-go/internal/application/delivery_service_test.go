@@ -611,7 +611,7 @@ func (t *fakeTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, tex
 	return nil
 }
 
-func (t *fakeTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath, fileName, clientID string) error {
+func (t *fakeTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePath, fileName, clientID, mediaType string) error {
 	if t.fileErr != nil {
 		return t.fileErr
 	}
@@ -891,5 +891,28 @@ A | 技术基础
 链接 示例 保留文本`
 	if got := cleanIMMarkdown(in); got != want {
 		t.Errorf("cleanIMMarkdown mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestMediaTypeForPath(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"outputs/a.jpg", "image"},
+		{"outputs/sub/photo.PNG", "image"},
+		{"outputs/a.gif", "image"},
+		{"outputs/a.webp", "image"},
+		{"outputs/clip.mp4", "video"},
+		{"outputs/clip.mov", "video"},
+		{"outputs/clip.MKV", "video"},
+		{"outputs/report.docx", "file"},
+		{"outputs/data.json", "file"},
+		{"outputs/noext", "file"},
+	}
+	for _, c := range cases {
+		if got := mediaTypeForPath(c.path); got != c.want {
+			t.Errorf("mediaTypeForPath(%q) = %q, want %q", c.path, got, c.want)
+		}
 	}
 }

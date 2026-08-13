@@ -125,6 +125,9 @@ MSG_TYPE_VIDEO = 'video'
 MSG_TYPE_FILE = 'file'
 _VALID_MSG_TYPES = {MSG_TYPE_TEXT, MSG_TYPE_IMAGE, MSG_TYPE_VIDEO, MSG_TYPE_FILE}
 
+# 出站媒体类型(与 /send msg_type 对齐, IM_MEDIA_ARCHITECTURE §5.1 A1)。
+VALID_MEDIA_TYPES = (MSG_TYPE_IMAGE, MSG_TYPE_FILE, MSG_TYPE_VIDEO)
+
 
 def _message_time_ms(msg, fallback_ms):
     for key in ('create_time_ms', 'create_time', 'timestamp', 'message_time'):
@@ -383,6 +386,41 @@ class BotAdapter(ABC):
         """Send a text reply to target (微信=ilink_user_id, 新渠道=对话单元)。"""
     def send_file(self, target, file_path, file_name='', client_id=''):
         raise NotImplementedError(f'send_file not supported by {self.channel_type} adapter')
+
+    # -- 出站媒体统一接口(IM_MEDIA_ARCHITECTURE §5.1 A1) -------------------
+    # media_type ∈ image|file|video。基类提供分发骨架 + 防御校验; 子类实现
+    # "上传 + 发送"薄适配(_send_image/_send_file/_send_video)。不支持/未实现
+    # 抛 NotImplementedError → Go 侧 delivery 走既有错误路径(fail-closed,
+    # 决策 A3: 不静默降级文本)。
+    # media_size_limit: 防御性单文件上限, 对齐 Go defaultMaxDeliverableBytes
+    # (8MiB, delivery_safety.go)——捕获层已限, 此处纵深防御。
+    media_size_limit = 8 << 20
+
+    def send_media(self, target, file_path, media_type, file_name='', client_id=''):
+        """统一出站媒体入口: 校验 → 按 media_type 分发到 _send_*。"""
+        if media_type not in VALID_MEDIA_TYPES:
+            raise ValueError(f'unsupported media_type: {media_type}')
+        if not file_path or not os.path.isfile(file_path):
+            raise ValueError(f'media file not found: {file_path}')
+        if self.media_size_limit > 0 and os.path.getsize(file_path) > self.media_size_limit:
+            raise ValueError(
+                f'media {file_path} exceeds size limit {self.media_size_limit}')
+        handler = {'image': self._send_image,
+                   'file': self._send_file,
+                   'video': self._send_video}[media_type]
+        return handler(target, file_path, file_name=file_name, client_id=client_id)
+
+    def _send_image(self, target, file_path, file_name='', client_id=''):
+        raise NotImplementedError(
+            f'send_media(image) not supported by {self.channel_type} adapter')
+
+    def _send_file(self, target, file_path, file_name='', client_id=''):
+        raise NotImplementedError(
+            f'send_media(file) not supported by {self.channel_type} adapter')
+
+    def _send_video(self, target, file_path, file_name='', client_id=''):
+        raise NotImplementedError(
+            f'send_media(video) not supported by {self.channel_type} adapter')
 
     # -- IM 流式输出(IM_STREAMING_DELIVERY §4.3) ---------------------------
     # 非流渠道(钉钉/微信)不实现: 基类默认抛错, Go 侧 BeginReply 失败后
@@ -650,6 +688,17 @@ class WeChatAdapter(BotAdapter):
     def send_video(self, target, file_path, client_id=''):
         self.client.send_video(target, file_path, context_token='', client_id=client_id)
 
+    # 统一出站媒体接口(IM_MEDIA_ARCHITECTURE §5.1 A1): iLink 直传无上传步骤,
+    # 复用既有 send_*。旧 send_file/send_image/send_video 签名保留兼容。
+    def _send_image(self, target, file_path, file_name='', client_id=''):
+        self.send_image(target, file_path, client_id=client_id)
+
+    def _send_file(self, target, file_path, file_name='', client_id=''):
+        self.send_file(target, file_path, file_name=file_name, client_id=client_id)
+
+    def _send_video(self, target, file_path, file_name='', client_id=''):
+        self.send_video(target, file_path, client_id=client_id)
+
 
 
 class FeishuAdapter(BotAdapter):
@@ -767,9 +816,9 @@ class FeishuAdapter(BotAdapter):
         返回二进制 bytes。走独立 API client(与出站同源, WS 通道只收不发)。
         resource_type: 'image' | 'file'(音频/视频/文件均走 file)。
         """
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        v1 = self._lark.api.im.v1
         api = self._ensure_api_client()
-        req = (GetMessageResourceRequest.builder()
+        req = (v1.GetMessageResourceRequest.builder()
                .message_id(message_id)
                .file_key(file_key)
                .type(resource_type)
@@ -822,28 +871,73 @@ class FeishuAdapter(BotAdapter):
             raise RuntimeError(f'feishu {self.bot_uuid} not configured')
         # 出站走独立 API client(WS 通道只收不发的官方用法): 回复目标 =
         # chat_id(p2p/group 统一)。
-        from lark_oapi import Client as LarkAPIClient
-        from lark_oapi.api.im.v1 import (
-            CreateMessageRequest, CreateMessageRequestBody,
-        )
-        api = self._api_client
-        if api is None:
-            api = LarkAPIClient.builder()\
-                .app_id(self._app_id)\
-                .app_secret(self._app_secret)\
-                .build()
-            self._api_client = api
-        request = CreateMessageRequest.builder() \
+        self._send_content_message(target, 'text', {'text': text})
+
+    def _send_content_message(self, target, msg_type, content):
+        """飞书消息发送通用(出站 API client)。content 为消息 content JSON dict。"""
+        if not self._app_id or not self._app_secret:
+            raise RuntimeError(f'feishu {self.bot_uuid} not configured')
+        v1 = self._lark.api.im.v1
+        api = self._ensure_api_client()
+        request = v1.CreateMessageRequest.builder() \
             .receive_id_type('chat_id') \
-            .request_body(CreateMessageRequestBody.builder()
+            .request_body(v1.CreateMessageRequestBody.builder()
                           .receive_id(target)
-                          .msg_type('text')
-                          .content(json.dumps({'text': text}, ensure_ascii=False))
+                          .msg_type(msg_type)
+                          .content(json.dumps(content, ensure_ascii=False))
                           .build()) \
             .build()
         resp = api.im.v1.message.create(request)
         if not resp.success():
             raise RuntimeError(f'feishu send failed: code={resp.code} msg={resp.msg}')
+
+    # -- 出站媒体统一接口(IM_MEDIA_ARCHITECTURE §5.1 A1 / §3.2) -----------
+    # 上传: 图片 im/v1/images、文件/视频 im/v1/files 拿 key → 消息 content。
+    def _upload_image(self, file_path):
+        v1 = self._lark.api.im.v1
+        api = self._ensure_api_client()
+        with open(file_path, 'rb') as f:
+            req = (v1.CreateImageRequest.builder()
+                   .file(f)
+                   .request_body(v1.CreateImageRequestBody.builder()
+                                 .image_type('message').build())
+                   .build())
+            resp = api.im.v1.image.create(req)
+        if not resp.success():
+            raise RuntimeError(f'feishu image upload failed: code={resp.code} msg={resp.msg}')
+        image_key = str(getattr(getattr(resp, 'data', None), 'image_key', '') or '')
+        if not image_key:
+            raise RuntimeError('feishu image upload returned empty image_key')
+        return image_key
+
+    def _upload_file(self, file_path, file_name):
+        v1 = self._lark.api.im.v1
+        api = self._ensure_api_client()
+        with open(file_path, 'rb') as f:
+            req = (v1.CreateFileRequest.builder()
+                   .file(f)
+                   .request_body(v1.CreateFileRequestBody.builder()
+                                 .file_type('stream')
+                                 .file_name(file_name or os.path.basename(file_path))
+                                 .build())
+                   .build())
+            resp = api.im.v1.file.create(req)
+        if not resp.success():
+            raise RuntimeError(f'feishu file upload failed: code={resp.code} msg={resp.msg}')
+        file_key = str(getattr(getattr(resp, 'data', None), 'file_key', '') or '')
+        if not file_key:
+            raise RuntimeError('feishu file upload returned empty file_key')
+        return file_key
+
+    def _send_image(self, target, file_path, file_name='', client_id=''):
+        self._send_content_message(target, 'image', {'image_key': self._upload_image(file_path)})
+
+    def _send_file(self, target, file_path, file_name='', client_id=''):
+        self._send_content_message(target, 'file', {'file_key': self._upload_file(file_path, file_name)})
+
+    def _send_video(self, target, file_path, file_name='', client_id=''):
+        # 飞书视频消息 = msg_type 'media'(content file_key 同上传, 待真实凭据实测)。
+        self._send_content_message(target, 'media', {'file_key': self._upload_file(file_path, file_name)})
 
     # -- IM 流式输出: 消息编辑打字机 ----------------------------------------
     # 语义(IM_STREAMING_DELIVERY §4.3): open 发占位消息取 message_id;
@@ -1093,6 +1187,11 @@ class DingTalkAdapter(BotAdapter):
         self._send_via_api(target, text)
 
     def _send_via_api(self, conversation_id, text):
+        self._send_via_api_key(conversation_id, 'sampleText', {'content': text})
+
+    def _send_via_api_key(self, conversation_id, msg_key, msg_param):
+        """钉钉机器人发送通用(v1.0 robot/groupMessages/send, 群/单聊统一
+        target=conversationId)。msg_param 为消息参数 dict(内部 JSON 序列化)。"""
         import requests
         token = self._access_token()
         if not token:
@@ -1102,8 +1201,8 @@ class DingTalkAdapter(BotAdapter):
         payload = {
             'robotCode': self._app_key,
             'openConversationId': conversation_id,
-            'msgKey': 'sampleText',
-            'msgParam': json.dumps({'content': text}, ensure_ascii=False),
+            'msgKey': msg_key,
+            'msgParam': json.dumps(msg_param, ensure_ascii=False),
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=20)
         if resp.status_code != 200:
@@ -1111,6 +1210,42 @@ class DingTalkAdapter(BotAdapter):
         body = resp.json() if 'json' in resp.headers.get('content-type', '') else {}
         if body.get('errcode') not in (None, 0):
             raise RuntimeError(f'dingtalk send errcode={body.get("errcode")}')
+
+    def _upload_media(self, file_path, media_type):
+        """钉钉媒体上传(oapi/media/upload, 企业内部应用) → media_id。"""
+        import requests
+        token = self._access_token()
+        if not token:
+            raise RuntimeError('dingtalk access token failed')
+        with open(file_path, 'rb') as f:
+            resp = requests.post(
+                'https://oapi.dingtalk.com/media/upload',
+                params={'access_token': token, 'type': media_type},
+                files={'media': f}, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f'dingtalk media upload HTTP {resp.status_code}: {resp.text[:200]}')
+        data = resp.json()
+        if data.get('errcode') not in (None, 0):
+            raise RuntimeError(f'dingtalk media upload errcode={data.get("errcode")}')
+        media_id = str(data.get('media_id') or '')
+        if not media_id:
+            raise RuntimeError('dingtalk media upload returned empty media_id')
+        return media_id
+
+    # -- 出站媒体统一接口(IM_MEDIA_ARCHITECTURE §5.1 A1 / §3.2) -----------
+    def _send_image(self, target, file_path, file_name='', client_id=''):
+        # sampleImageMsg photo=media_id(机器人图片消息)。
+        self._send_via_api_key(target, 'sampleImageMsg', {'photo': self._upload_media(file_path, 'image')})
+
+    def _send_file(self, target, file_path, file_name='', client_id=''):
+        # 钉钉机器人文件消息 = sampleFileMsg{fileName,fileType,fileSize,downloadCode},
+        # downloadCode 需上传到钉钉存储(端点未确认, 审查 S4 同款待实测)——
+        # 先 fail-closed 走既有 delivery 错误路径, 不静默降级(决策 A3)。
+        raise NotImplementedError('dingtalk file send requires downloadCode upload flow (待实测)')
+
+    def _send_video(self, target, file_path, file_name='', client_id=''):
+        # 视频 = sampleVideoMsg{downloadCode...}, 同上待实测。
+        raise NotImplementedError('dingtalk video send requires downloadCode upload flow (待实测)')
 
     def _access_token(self):
         import requests
@@ -1333,6 +1468,123 @@ class QQAdapter(BotAdapter):
             raise RuntimeError(f'qq {self.bot_uuid} event loop unavailable')
         fut = asyncio.run_coroutine_threadsafe(_send(), loop)
         fut.result(timeout=30)
+
+    # -- 出站媒体统一接口(IM_MEDIA_ARCHITECTURE §5.1 A1 / §3.2) -----------
+    # QQ 富媒体: 先上传拿 file_info(官方: 整文件上传需公网 URL 不可用→分片;
+    # 单聊/群聊上传不互通; file_info 有 TTL 故在发送时刻上传——审查 B2)。
+    # 异步 delivery 必超被动窗口(msg_id 5 分钟有效, 错误码 304103)→ 主动
+    # 消息路径(审查 B5), 消耗主动频次(单聊 20 QPM/单关系)——per-target
+    # 令牌桶预算, 超限 fail-closed 走 delivery 重试。
+
+    #: 主动消息频控: 单聊 20 QPM(官方 overview 渠道矩阵)。留 25% 余量。
+    _QQ_ACTIVE_QPM = 15
+    _qq_send_buckets = {}  # target -> _TokenBucket(每关系独立预算)
+    _qq_buckets_max = 512
+
+    def _qq_bucket(self, target):
+        with self._stream_lock:
+            if len(self._qq_send_buckets) >= self._qq_buckets_max:
+                self._qq_send_buckets.clear()
+            bucket = self._qq_send_buckets.get(target)
+            if bucket is None:
+                bucket = _TokenBucket(capacity=self._QQ_ACTIVE_QPM,
+                                      refill_per_sec=self._QQ_ACTIVE_QPM / 60.0)
+                self._qq_send_buckets[target] = bucket
+            return bucket
+
+    def _qq_request(self, method, route_template, target, payload=None):
+        """调度 botpy 内部 _http.request 到事件循环(Route 模式, 与
+        _send_stream_frame 同构)。route_template 含 {openid} 或
+        {group_openid} 占位。限流(429/50002)抛 _QQRateLimited。"""
+        async def _call():
+            from botpy.http import Route
+            route = Route(method, route_template, openid=target, group_openid=target)
+            if payload is not None:
+                return await self._client.api._http.request(route, json=payload)
+            return await self._client.api._http.request(route)
+        loop = getattr(self._client, 'loop', None)
+        if loop is None or loop.is_closed():
+            raise RuntimeError(f'qq {self.bot_uuid} event loop unavailable')
+        fut = asyncio.run_coroutine_threadsafe(_call(), loop)
+        resp = fut.result(timeout=120)
+        if isinstance(resp, dict) and _is_qq_rate_limit(resp):
+            raise _QQRateLimited(resp)
+        return resp or {}
+
+    def _upload_media(self, target, file_path, file_name, file_type):
+        """QQ 分片上传 → file_info(官方 rich-media 文档: 分片无需公网 URL;
+        upload_prepare 10 QPS; upload_config 默认 concurrency=1 串行即可)。
+
+        file_type(官方 upload_prepare): 1=图片 2=视频 3=语音 4=文件。
+        单聊端点 /v2/users/{openid}/upload_prepare, 群聊
+        /v2/groups/{group_openid}/upload_prepare(不互通, 按目标类型选)。
+        """
+        import hashlib as _hl
+        size = os.path.getsize(file_path)
+        with open(file_path, 'rb') as f:
+            whole = f.read()
+        md5 = _hl.md5(whole).hexdigest()
+        sha1 = _hl.sha1(whole).hexdigest()
+        md5_10m = _hl.md5(whole[:10002432]).hexdigest()
+        with self._stream_lock:
+            kind = self._target_kinds.get(target)
+        if kind == 'group':
+            prepare_tpl = '/v2/groups/{group_openid}/upload_prepare'
+            finish_tpl = '/v2/groups/{group_openid}/upload_finish'
+        else:
+            prepare_tpl = '/v2/users/{openid}/upload_prepare'
+            finish_tpl = '/v2/users/{openid}/upload_finish'
+        prepare = self._qq_request('POST', prepare_tpl, target, {
+            'file_type': file_type, 'file_size': str(size),
+            'file_name': file_name or os.path.basename(file_path),
+            'md5': md5, 'sha1': sha1, 'md5_10m': md5_10m,
+        })
+        upload_id = str(prepare.get('upload_id') or '')
+        parts = prepare.get('parts') or []
+        block_size = int(prepare.get('block_size') or 0) or 5 * 1024 * 1024
+        if not upload_id or not parts:
+            raise RuntimeError('qq upload_prepare returned no upload_id/parts')
+        for part in parts:
+            idx = int(part.get('index', -1))
+            if idx < 0:
+                continue
+            chunk = whole[idx * block_size:(idx + 1) * block_size]
+            presigned = str(part.get('presigned_url') or '')
+            if not presigned:
+                raise RuntimeError(f'qq upload part {idx} missing presigned_url')
+            resp = requests.put(presigned, data=chunk, timeout=300)
+            resp.raise_for_status()
+        finish = self._qq_request('POST', finish_tpl, target, {'upload_id': upload_id})
+        file_info = str(finish.get('file_info') or '')
+        if not file_info:
+            raise RuntimeError('qq upload_finish returned empty file_info')
+        return file_info
+
+    def _send_media_message(self, target, file_info):
+        """主动媒体消息(msg_type=7 media.file_info)。频控: per-target 令牌桶,
+        超限 fail-closed(抛错 → Go delivery 重试)。"""
+        if not self._qq_bucket(target).acquire(timeout=5.0):
+            raise RuntimeError(f'qq active media rate limited for {target} (15 QPM)')
+        with self._stream_lock:
+            kind = self._target_kinds.get(target)
+        payload = {'msg_type': 7, 'media': {'file_info': file_info}}
+        if kind == 'group':
+            self._qq_request('POST', '/v2/groups/{group_openid}/messages',
+                             target, payload)
+        else:
+            self._qq_request('POST', '/v2/users/{openid}/messages', target, payload)
+
+    def _send_image(self, target, file_path, file_name='', client_id=''):
+        file_info = self._upload_media(target, file_path, file_name, file_type=1)
+        self._send_media_message(target, file_info)
+
+    def _send_file(self, target, file_path, file_name='', client_id=''):
+        file_info = self._upload_media(target, file_path, file_name, file_type=4)
+        self._send_media_message(target, file_info)
+
+    def _send_video(self, target, file_path, file_name='', client_id=''):
+        file_info = self._upload_media(target, file_path, file_name, file_type=2)
+        self._send_media_message(target, file_info)
 
     # -- IM 流式输出: 单聊原生流式接口 -------------------------------------
     # 语义(IM_STREAMING_DELIVERY §4.3): open 发首帧(stream.id=null)拿
@@ -1668,6 +1920,43 @@ class WeComAdapter(BotAdapter):
         self._run_coro(self._client.send_message(
             target, {'msgtype': 'markdown', 'markdown': {'content': text}}))
 
+    # -- 出站媒体统一接口(IM_MEDIA_ARCHITECTURE §5.1 A1 / §3.2) -----------
+    # 上传: qyapi cgi-bin/media/upload(官方 developer.work.weixin.qq.com
+    # /document/path/90253, 智能机器人同族) → media_id; 发送: SEND_MSG
+    # media 类型(SDK SendMsgBody 支持 media, 帧结构待真实凭据实测)。
+    def _upload_media(self, file_path, media_type):
+        token = self._client_access_token()
+        if not token:
+            raise RuntimeError('wecom media upload: access token unavailable '
+                               '(SDK token endpoint 待实测)')
+        with open(file_path, 'rb') as f:
+            resp = requests.post(
+                'https://qyapi.weixin.qq.com/cgi-bin/media/upload',
+                params={'access_token': token, 'type': media_type},
+                files={'media': f}, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f'wecom media upload HTTP {resp.status_code}: {resp.text[:200]}')
+        data = resp.json()
+        if data.get('errcode') not in (None, 0):
+            raise RuntimeError(f'wecom media upload errcode={data.get("errcode")}')
+        media_id = str(data.get('media_id') or '')
+        if not media_id:
+            raise RuntimeError('wecom media upload returned empty media_id')
+        return media_id
+
+    def _send_media_message(self, target, media_id):
+        self._run_coro(self._client.send_message(
+            target, {'msgtype': 'media', 'media': {'media_id': media_id}}))
+
+    def _send_image(self, target, file_path, file_name='', client_id=''):
+        self._send_media_message(target, self._upload_media(file_path, 'image'))
+
+    def _send_file(self, target, file_path, file_name='', client_id=''):
+        self._send_media_message(target, self._upload_media(file_path, 'file'))
+
+    def _send_video(self, target, file_path, file_name='', client_id=''):
+        self._send_media_message(target, self._upload_media(file_path, 'video'))
+
     # -- IM 流式输出: SEND_MSG + stream 帧 ----------------------------------
     # 语义(IM_STREAMING_DELIVERY §4.3 对齐): open 发首帧(finish=False);
     # append 累积文本后发增量帧(服务端按 stream_id 合并); commit 发终帧
@@ -1828,18 +2117,11 @@ class BotManager:
             return
         if not file_path:
             raise ValueError(f'file_path is required for msg_type={msg_type}')
-        if msg_type == MSG_TYPE_IMAGE:
-            if not hasattr(adapter, 'send_image'):
-                raise ValueError(f'msg_type={msg_type} not supported by {adapter.channel_type}')
-            adapter.send_image(channel_account_id, file_path, client_id=client_id)
-        elif msg_type == MSG_TYPE_VIDEO:
-            if not hasattr(adapter, 'send_video'):
-                raise ValueError(f'msg_type={msg_type} not supported by {adapter.channel_type}')
-            adapter.send_video(channel_account_id, file_path, client_id=client_id)
-        elif msg_type == MSG_TYPE_FILE:
-            adapter.send_file(channel_account_id, file_path, file_name=file_name, client_id=client_id)
-        else:
-            raise ValueError(f'unsupported msg_type: {msg_type}')
+        # 统一出站媒体接口(IM_MEDIA_ARCHITECTURE §5.1 A1): msg_type 即
+        # media_type(image|file|video)。未实现渠道抛 NotImplementedError →
+        # /send 500 → Go delivery 重试/死信(fail-closed, 决策 A3)。
+        adapter.send_media(channel_account_id, file_path, msg_type,
+                           file_name=file_name, client_id=client_id)
 
     def send_stream(self, bot_uuid, stream_id, action, target='', text=''):
         """IM 流式出站(IM_STREAMING_DELIVERY §4.2): /send 扩展 stream_action。

@@ -52,14 +52,17 @@ func (a *ILinkAdapter) SendMessage(ctx context.Context, botUUID, channelAccountI
 	})
 }
 
-func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, channelAccountID, filePath, fileName, clientID string) error {
+func (a *ILinkAdapter) SendFile(ctx context.Context, botUUID, channelAccountID, filePath, fileName, clientID, mediaType string) error {
 	if botUUID == "" || channelAccountID == "" || filePath == "" {
 		return errors.New("bot uuid, channel account id, and file path are required")
+	}
+	if mediaType == "" {
+		mediaType = poller.MsgTypeFile
 	}
 	return a.poller.SendMessage(ctx, poller.SendMessageRequest{
 		BotUUID:          botUUID,
 		ChannelAccountID: channelAccountID,
-		MsgType:          poller.MsgTypeFile,
+		MsgType:          mediaType,
 		FilePath:         filePath,
 		FileName:         fileName,
 		ClientID:         clientID,

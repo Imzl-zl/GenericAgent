@@ -15,11 +15,12 @@ type SentMessage struct {
 }
 
 type SentFile struct {
-	BotUUID     string
+	BotUUID          string
 	ChannelAccountID string
-	FilePath    string
-	FileName    string
-	ClientID    string
+	FilePath         string
+	FileName         string
+	ClientID         string
+	MediaType        string
 }
 
 // LoopbackTransport is an in-memory BotTransportAdapter for tests and dev
@@ -57,13 +58,13 @@ func (t *LoopbackTransport) SendMessage(_ context.Context, botUUID, channelAccou
 	return nil
 }
 
-func (t *LoopbackTransport) SendFile(_ context.Context, botUUID, channelAccountID, filePath, fileName, clientID string) error {
+func (t *LoopbackTransport) SendFile(_ context.Context, botUUID, channelAccountID, filePath, fileName, clientID, mediaType string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.sendErr != nil {
 		return t.sendErr
 	}
-	t.sentFiles = append(t.sentFiles, SentFile{BotUUID: botUUID, ChannelAccountID: channelAccountID, FilePath: filePath, FileName: fileName, ClientID: clientID})
+	t.sentFiles = append(t.sentFiles, SentFile{BotUUID: botUUID, ChannelAccountID: channelAccountID, FilePath: filePath, FileName: fileName, ClientID: clientID, MediaType: mediaType})
 	return nil
 }
 
