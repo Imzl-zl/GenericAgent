@@ -45,6 +45,8 @@ RUN apt-get update \
         libreoffice-writer libreoffice-calc \
         fonts-noto-cjk \
         ca-certificates curl \
+        # 2026-08-13: rapidocr-onnxruntime(GA 自带 OCR 工具)依赖 opencv → libGL/libglib。
+        libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 # pandoc 官方二进制(apt 版 2.17 无 xlsx 输入; 3.8+ 官方支持)。
 RUN curl -fsSL -o /tmp/pandoc.tar.gz \
@@ -75,6 +77,10 @@ COPY tenant_platform/worker-python/pyproject.toml /tmp/worker/pyproject.toml
 COPY tenant_platform/worker-python/src/ /tmp/worker/src/
 RUN pip install --no-cache-dir /tmp/worker \
         'python-docx>=1.1' 'openpyxl>=3.1' 'pypdf>=4.0' \
+        # 2026-08-13: 多模态图片任务基础库(模型经 code_run 读图/取尺寸/转格式)。
+        'pillow>=10.0' \
+        # 2026-08-13: GA 自带 OCR 工具(memory/ocr_utils.py, rapidocr 引擎)依赖。
+        'numpy>=1.26' 'rapidocr-onnxruntime>=1.3' \
     && rm -rf /tmp/worker
 
 # GA 原生代码与 assets(只读层)。

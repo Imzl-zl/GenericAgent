@@ -15,6 +15,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 # 不能存 Popen 对象再 getpgid: 父进程退出后 getpgid(pid) 抛 ProcessLookupError,
 # 但组内后台子进程可能仍存活, 无法再定位进程组。无 getpgid 的平台(Windows)
 # 回退登记 Popen 对象。
+# 2026-08-13: code_run shell 风格脚本特征检测(见 code_run 内降级逻辑)。
+# 行首命令 + 紧跟空白/分号/管道 → shell 语法; 匹配 python3 -c / pip install /
+# cd x && / apt / sudo / curl / wget / echo 等。Python 合法调用(echo(/ls(/cd()
+# 等)不命中(后跟 '(' 不在字符集内)。
+_SHELL_STYLE_RE = re.compile(r'^(?:\s*#!\S*|\s*(?:python3?|pip\d?|uvx?|apt(?:-get)?|sudo|bash|sh\b|curl|wget|cd\s+\S+\s*&&|export\s+|echo\s+|ls\b|mkdir\b|rm\b|cp\b|mv\b|chmod\b|chown\b|source\s+|which\s+)[\s;|])', re.M)
 _code_run_pgids: set = set()  # POSIX: int pgid
 _code_run_procs: set = set()  # 无进程组语义平台: Popen 回退
 _code_run_pids_lock = threading.Lock()
@@ -211,6 +216,14 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
     preview = (code[:60].replace('\n', ' ') + '...') if len(code) > 60 else code.strip()
     yield f"[Action] Running {code_type} in {os.path.basename(cwd)}: {preview}\n"
     cwd = cwd or os.path.join(script_dir, 'temp'); tmp_path = None
+    # 2026-08-13 生产实证: 部分模型(如 agnes-2.5-flash)在 code_run 的
+    # script 参数里生成 shell 命令(python3 -c/pip install/&& 等), 按纯
+    # Python 写入 .py 文件必然 SyntaxError, agent 反复重试直到任务超时
+    # (生产 307s task timeout 根因)。检测明显 shell 特征自动降级 bash,
+    # 让错误脚本至少能执行并返回真实报错。
+    if code_type in ["python", "py"] and _SHELL_STYLE_RE.search(code):
+        print(f"[code_run] shell-style script detected, falling back to bash")
+        code_type = "bash"
     if code_type in ["python", "py"]:
         tmp_file = tempfile.NamedTemporaryFile(suffix=".ai.py", delete=False, mode='w', encoding='utf-8', dir=code_cwd)
         cr_header = os.path.join(script_dir, 'assets', 'code_run_header.py')

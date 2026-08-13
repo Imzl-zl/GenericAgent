@@ -1,4 +1,4 @@
-import json, re, os
+import json, re, os, base64
 from dataclasses import dataclass
 from typing import Any, Optional
 try: from plugins.hooks import trigger as _hook
@@ -39,11 +39,62 @@ def get_pretty_json(data):
         data = data.copy(); data["script"] = data["script"].replace("; ", ";\n  ")
     return json.dumps(data, indent=2, ensure_ascii=False).replace('\\n', '\n')
 
+# 2026-08-13: 附件图片直传多模态模型(生产实证: agnes-2.5-flash 收不到
+# 图片内容只能靠 code_run 瞎折腾, 反复生成 shell 脚本 SyntaxError 直到
+# 任务超时)。把 prompt 里引用的 attachments/*.图片 base64 编码为
+# image_url 块注入第一轮 user content——NativeOAISession 通道原生支持
+# (llmcore _msgs_claude2oai 保留 image_url), 旧 ToolClient 文本协议降级
+# 为字符串(不崩但看不到图)。限制: 单图 <=3MB, 最多 3 张, 防 context 撑爆。
+_ATTACH_IMG_RE = re.compile(r'(attachments/[^\s\],]+?\.(?:jpg|jpeg|png|gif|webp|bmp))', re.I)
+_ATTACH_IMG_MAX_BYTES = 3 * 1024 * 1024
+_ATTACH_IMG_MAX_COUNT = 3
+
+def _inject_attachment_images(user_text):
+    if not isinstance(user_text, str):
+        return user_text
+    # 附件根: 优先 GA 的 temp 目录(平台/桌面统一, 进程 cwd 可能是 /ga/legacy
+    # 而不是 temp, 相对路径会解析错位——2026-08-13 生产实证); 回退 cwd。
+    attach_base = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp')
+    picked, seen = [], set()
+    for m in _ATTACH_IMG_RE.finditer(user_text):
+        rel = m.group(1)
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if len(picked) >= _ATTACH_IMG_MAX_COUNT:
+            break
+        candidates = [os.path.join(attach_base, rel), os.path.join(os.getcwd(), rel)]
+        full = next((p for p in candidates if os.path.isfile(p)), None)
+        if full is None:
+            continue
+        try:
+            if os.path.getsize(full) <= _ATTACH_IMG_MAX_BYTES:
+                picked.append((rel, full))
+        except OSError:
+            continue
+    if not picked:
+        return user_text
+    blocks = [{"type": "text", "text": user_text}]
+    for rel, full in picked:
+        ext = os.path.splitext(rel)[1].lstrip('.').lower()
+        mime = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+                'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp'}.get(ext, 'image/jpeg')
+        try:
+            with open(full, 'rb') as f:
+                b64 = base64.b64encode(f.read()).decode('ascii')
+        except OSError:
+            continue
+        blocks.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    print(f"[Attach] injected {len(blocks) - 1} image block(s) into first turn")
+    return blocks
+
+
 def agent_runner_loop(client, system_prompt, user_input, handler, tools_schema, 
                       max_turns=40, verbose=True, initial_user_content=None, yield_info=False):
+    user_content = initial_user_content if initial_user_content is not None else _inject_attachment_images(user_input)
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": initial_user_content if initial_user_content is not None else user_input}
+        {"role": "user", "content": user_content}
     ]
     turn = 0;  handler.max_turns = max_turns
     _hook('agent_before', locals())
