@@ -12,4 +12,7 @@ const (
 	MaxSourceLen            = 64
 	MaxSourceInstanceLen    = 128
 	MaxMessageIDLen         = 256
+	// MaxTaskMediaCount 是单任务入站媒体清单条数上限(2026-08-13 多模态
+	// 链路): 防恶意超长清单撑爆 TaskEnvelope/GA 首轮 payload。
+	MaxTaskMediaCount = 16
 )

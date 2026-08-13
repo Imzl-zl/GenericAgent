@@ -49,44 +49,109 @@ _ATTACH_IMG_RE = re.compile(r'(attachments/[^\s\],]+?\.(?:jpg|jpeg|png|gif|webp|
 _ATTACH_IMG_MAX_BYTES = 3 * 1024 * 1024
 _ATTACH_IMG_MAX_COUNT = 3
 
-def _inject_attachment_images(user_text):
+# 附件根: 优先 GA 的 temp 目录(平台/桌面统一, 进程 cwd 可能是 /ga/legacy
+# 而不是 temp, 相对路径会解析错位——2026-08-13 生产实证); 回退 cwd。
+_ATTACH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp')
+_IMG_MIME = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+             'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp'}
+
+
+def _resolve_attach_path(rel):
+    for base in (_ATTACH_BASE, os.getcwd()):
+        p = os.path.join(base, rel)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _image_block_from_file(full, rel):
+    """读图片文件 → image_url block。PIL 可用时降采样(最长边 1568px,
+    对齐主流视觉 token 成本控制——Claude Code 同款策略), 失败/无 PIL
+    时原样 base64。返回 (block, injected_bytes) 或 (None, 0)。"""
+    ext = os.path.splitext(rel)[1].lstrip('.').lower()
+    mime = _IMG_MIME.get(ext, 'image/jpeg')
+    try:
+        with open(full, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        return None, 0
+    data = raw
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        longest = max(img.size)
+        if longest > 1568:
+            ratio = 1568.0 / longest
+            img = img.resize((max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+                             Image.LANCZOS)
+        if img.mode in ('RGBA', 'P', 'LA'):
+            img = img.convert('RGB')
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=85)
+        data = buf.getvalue()
+        mime = 'image/jpeg'
+    except Exception:
+        pass  # 无 PIL/解码失败: 原样透传, 由上游决定
+    b64 = base64.b64encode(data).decode('ascii')
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}, len(data)
+
+
+def media_content_blocks(user_text, image_paths=None):
+    """结构化媒体注入(2026-08-13 多模态链路定案):
+
+    - image_paths: 显式媒体路径列表(相对 GA temp 或绝对路径)——主路径,
+      来自 GA 原生 put_task(images=...)(worker 经 TaskEnvelope.media 契约
+      传递, 平台/桌面/CLI 统一)。
+    - 无显式路径时回退: 从 user_text 正则提取 attachments/ 图片引用(兼容
+      旧调用方/纯文本路径约定, 兜底层)。
+    - 返回 list[blocks](text + image_url) 或原字符串(无图时); 非图片
+      扩展名/超限文件跳过。扩展音频/视频/PDF 时在此加分支, 链路不动。
+    """
     if not isinstance(user_text, str):
         return user_text
-    # 附件根: 优先 GA 的 temp 目录(平台/桌面统一, 进程 cwd 可能是 /ga/legacy
-    # 而不是 temp, 相对路径会解析错位——2026-08-13 生产实证); 回退 cwd。
-    attach_base = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp')
-    picked, seen = [], set()
-    for m in _ATTACH_IMG_RE.finditer(user_text):
-        rel = m.group(1)
-        if rel in seen:
-            continue
-        seen.add(rel)
+    refs = list(image_paths or [])
+    if not refs:
+        refs, seen = [], set()
+        for m in _ATTACH_IMG_RE.finditer(user_text):
+            rel = m.group(1)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            refs.append(rel)
+    picked = []
+    for rel in refs:
         if len(picked) >= _ATTACH_IMG_MAX_COUNT:
             break
-        candidates = [os.path.join(attach_base, rel), os.path.join(os.getcwd(), rel)]
-        full = next((p for p in candidates if os.path.isfile(p)), None)
+        full = _resolve_attach_path(rel)
         if full is None:
             continue
         try:
-            if os.path.getsize(full) <= _ATTACH_IMG_MAX_BYTES:
-                picked.append((rel, full))
+            if os.path.getsize(full) > _ATTACH_IMG_MAX_BYTES:
+                continue
         except OSError:
             continue
+        if os.path.splitext(rel)[1].lstrip('.').lower() not in _IMG_MIME:
+            continue
+        picked.append((rel, full))
     if not picked:
         return user_text
     blocks = [{"type": "text", "text": user_text}]
+    injected = 0
     for rel, full in picked:
-        ext = os.path.splitext(rel)[1].lstrip('.').lower()
-        mime = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-                'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp'}.get(ext, 'image/jpeg')
-        try:
-            with open(full, 'rb') as f:
-                b64 = base64.b64encode(f.read()).decode('ascii')
-        except OSError:
-            continue
-        blocks.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-    print(f"[Attach] injected {len(blocks) - 1} image block(s) into first turn")
+        block, n = _image_block_from_file(full, rel)
+        if block is not None:
+            blocks.append(block)
+            injected += n
+    if len(blocks) == 1:
+        return user_text
+    print(f"[Attach] injected {len(blocks) - 1} image block(s) ({injected} bytes) into first turn")
     return blocks
+
+
+# 兼容别名: 旧调用方(2026-08-13 补丁版)仍可用; 新代码走 media_content_blocks。
+_inject_attachment_images = media_content_blocks
 
 
 def agent_runner_loop(client, system_prompt, user_input, handler, tools_schema, 

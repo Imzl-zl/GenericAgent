@@ -8,6 +8,18 @@ import (
 
 // SubmitTaskCommand is the validated carrier for enqueuing a task.
 // MessageID becomes message_idempotency_key; callers cannot supply a second dedupe value.
+// TaskMedia 是任务入站媒体清单的一项（2026-08-13 多模态链路定案）:
+// 路由时 ImportInbound 得到的附件元数据，随任务持久化并经
+// TaskEnvelope.media 契约结构化下发 Worker，使 GA 能把图片作为多模态
+// content block 注入模型首轮——不再依赖 prompt 文本路径解析。
+// RelativePath 相对会话沙箱根（workspace temp/）。
+type TaskMedia struct {
+	Alias        string `json:"alias"`
+	OriginalName string `json:"original_name"`
+	RelativePath string `json:"relative_path"`
+	SizeBytes    int64  `json:"size_bytes"`
+}
+
 type SubmitTaskCommand struct {
 	SessionKey        string
 	RequesterUserID   int64
@@ -17,6 +29,8 @@ type SubmitTaskCommand struct {
 	Prompt            string
 	PersonaSnapshot   []string
 	ToolPolicyVersion string
+	// Media 是本次任务入站媒体清单（结构化传递，见 TaskMedia）。
+	Media []TaskMedia
 	// ConversationKey 是渠道内对话单元标识(对端/群 ID); 空 = 该渠道默认桶
 	// (微信个人自用单桶 / 非渠道入口)。分桶见 IM_CHANNEL_ARCHITECTURE §3。
 	ConversationKey string
@@ -145,6 +159,8 @@ type Task struct {
 	Prompt        string
 	PersonaSnapshot       []string
 	ToolPolicyVersion     string
+	// Media 是本次任务入站媒体清单（2026-08-13 多模态链路，见 TaskMedia）。
+	Media []TaskMedia
 	ClaimOwner            string
 	ClaimLeaseUntil       time.Time
 	SessionSequence       int64

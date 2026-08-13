@@ -72,6 +72,21 @@ message TaskEnvelope {
   // 单桶; 非渠道入口如 sessions API 同样归 default）。桶 key 归一化唯一实现
   // 在 worker 侧: f"{source}:{conversation_id or 'default'}"。
   string conversation_id = 14;
+  // media 是本次任务的入站媒体(结构化传递, 2026-08-13 定案):
+  // Platform 路由时 ImportInbound 得到的附件清单随任务持久化(tasks.media),
+  // dispatch 原样下发; Worker 据此调用 GA put_task(images=...) 将媒体作为
+  // 多模态 content block 注入模型首轮——不再依赖 prompt 文本路径约定。
+  // 空列表 = 无媒体; 非图片媒体由 Worker/GA 按扩展名降级处理。
+  repeated MediaItem media = 15;
+}
+
+// MediaItem 是任务入站媒体的一条元数据(workspace 相对路径语义)。
+// relative_path 相对会话沙箱根(temp/), GA 从该路径读文件并 base64 注入。
+message MediaItem {
+  string alias = 1;          // 会话文件别名, 如 F005
+  string original_name = 2;  // 用户侧原始文件名
+  string relative_path = 3;  // 相对会话根, 如 attachments/F005_x.jpg
+  int64 size_bytes = 4;      // 文件字节数
 }
 
 message ExecuteTaskRequest { TaskEnvelope task = 1; }

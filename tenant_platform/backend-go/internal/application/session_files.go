@@ -40,7 +40,10 @@ type SessionFileRef struct {
 	OriginalName string    `json:"original_name"`
 	RelativePath string    `json:"relative_path"`
 	Direction    string    `json:"direction"`
-	CreatedAt    time.Time `json:"created_at"`
+	// SizeBytes 是文件字节数(2026-08-13 多模态链路: 随任务媒体清单持久化,
+	// GA 据此做注入体积上限判断)。
+	SizeBytes int64     `json:"size_bytes,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // SessionFiles manages per-session file sandboxes for inbound attachments and generated outputs.
@@ -234,6 +237,11 @@ func (m *sessionFilesManager) ImportInbound(sessionKey string, sourcePaths []str
 			RelativePath: rel,
 			Direction:    "inbound",
 			CreatedAt:    time.Now().UTC(),
+		}
+		// 复制完成后 stat 目标拿真实字节数(复制带 maxInboundMediaBytes 上限,
+		// 以落盘结果为准)。
+		if info, statErr := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); statErr == nil {
+			ref.SizeBytes = info.Size()
 		}
 		manifest.Files = append(manifest.Files, ref)
 		imported = append(imported, ref)

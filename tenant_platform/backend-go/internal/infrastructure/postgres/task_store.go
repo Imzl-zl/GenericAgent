@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -167,25 +168,37 @@ SELECT COALESCE(MAX(session_sequence), 0) + 1 FROM tasks WHERE session_key = $1
 
 		taskID := uuid.NewString()
 		idemKey := cmd.MessageID
+		mediaRaw, err := json.Marshal(cmd.Media)
+		if err != nil {
+			return fmt.Errorf("marshal task media: %w", err)
+		}
+		if len(cmd.Media) > 0 {
+			if err := validateTaskMedia(cmd.Media); err != nil {
+				return err
+			}
+		}
 		row := tx.QueryRow(ctx, `
 INSERT INTO tasks (
   id, workspace_id, session_key, session_sequence, requester_user_id,
   source, source_instance_id, message_id, message_idempotency_key, conversation_key,
   conversation_type,
   prompt, persona_snapshot, tool_policy_version, prompt_bytes, persona_bytes,
+  media,
   status, fresh_session
 ) VALUES (
   $1,$2,$3,$4,$5,
   $6,$7,$8,$9,$10,
   $11,
   $12,$13::jsonb,$14,$15,$16,
-  'queued', $17
+  $17::jsonb,
+  'queued', $18
 )
 ON CONFLICT (source, source_instance_id, message_idempotency_key) DO NOTHING
 RETURNING `+taskSelectColumns, taskID, workspaceID, cmd.SessionKey, nextSeq, requester,
 			cmd.Source, cmd.SourceInstanceID, cmd.MessageID, idemKey, cmd.ConversationKey,
 			domain.NormalizeConversationType(cmd.ConversationType),
 			cmd.Prompt, string(personaRaw), cmd.ToolPolicyVersion, promptBytes, personaBytes,
+			string(mediaRaw),
 			freshSession,
 		)
 		t, scanErr := scanTask(row)

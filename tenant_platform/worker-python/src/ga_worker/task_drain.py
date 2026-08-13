@@ -58,7 +58,12 @@ def put_task_and_wrap_handler(
 ) -> queue.Queue:
     from ga_worker.legacy_instrument import install_handler_print_counter
     agent = state.agent
-    display_q = agent.put_task(task.prompt, source=task.source or "user")
+    # 2026-08-13 多模态链路: TaskEnvelope.media 是本次任务入站媒体清单
+    # (Platform 路由时 ImportInbound 结构化持久化, 契约字段), 经 GA 原生
+    # put_task(images=...) 注入模型首轮 content blocks——不再依赖 prompt
+    # 文本路径解析(旧链路仅文本提示, 模型看不到图片内容)。
+    images = [m.relative_path for m in (task.media or [])]
+    display_q = agent.put_task(task.prompt, source=task.source or "user", images=images)
     for _ in range(HANDLER_WRAP_RETRIES):
         h = getattr(agent, "handler", None)
         if h is not None and not getattr(h, "_adapter_print_wrapped", False):

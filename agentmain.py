@@ -7,7 +7,7 @@ elif hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(errors='replace'
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from llmcore import reload_mykeys, ToolClient, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession, resolve_client
-from agent_loop import agent_runner_loop
+from agent_loop import agent_runner_loop, media_content_blocks
 try:
     from plugins.hooks import discover_and_load; discover_and_load()
 except Exception: pass
@@ -163,6 +163,10 @@ class GenericAgent:
                 self.task_queue.task_done()
                 continue
             raw_query, source, display_queue = task["query"], task["source"], task["output"]
+            # 2026-08-13 多模态链路: put_task(images=...) 结构化媒体参数补完
+            # (GA 原生设计意图, 此前为死参数)。run() 消费后经
+            # media_content_blocks 把图片作为 content block 注入模型首轮。
+            task_images = task.get("images") or []
             raw_query = self._handle_slash_cmd(raw_query, display_queue)
             if raw_query is None:
                 self.task_queue.task_done(); continue
@@ -196,7 +200,9 @@ class GenericAgent:
                 self.llmclient.backend.stream = False
                 self.llmclient.backend.read_timeout = max(self.llmclient.backend.read_timeout, 1200)
             gen = agent_runner_loop(self.llmclient, sys_prompt, raw_query, handler, TOOLS_SCHEMA, 
-                                    max_turns=180, verbose=self.verbose, yield_info=True)
+                                    max_turns=180, verbose=self.verbose, yield_info=True,
+                                    initial_user_content=(
+                                        media_content_blocks(raw_query, task_images) if task_images else None))
             try:
                 full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = []
                 runner_result = {}

@@ -240,9 +240,11 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 	sessionKey := inboundSessionKey
 	// round11 审查(I1): importedRefs 记录本次导入的附件, 任务提交失败时
 	// 回滚(附件写入先于授权/幂等事务, 失败必须清理防止未授权残留)。
-	var importedRefs []SessionFileRef
+	// currentRefs 另用于任务媒体清单持久化(2026-08-13 多模态链路)。
+	var importedRefs, currentRefs []SessionFileRef
 	if r.sessionFiles != nil {
-		currentRefs, err := r.sessionFiles.ImportInbound(sessionKey, msg.MediaPaths)
+		var err error
+		currentRefs, err = r.sessionFiles.ImportInbound(sessionKey, msg.MediaPaths)
 		if err != nil {
 			return nil, RouterResult{}, fmt.Errorf("stage session files: %w", err)
 		}
@@ -281,6 +283,10 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 			Prompt:            prompt,
 			PersonaSnapshot:   []string{},
 			ToolPolicyVersion: userPolicy,
+			// 2026-08-13 多模态链路: 本次导入附件清单结构化随任务持久化
+			// (经 TaskEnvelope.media 契约下发 Worker), 不再依赖 prompt
+			// 文本路径解析。
+			Media: toTaskMedia(currentRefs),
 			// 分桶(IM_CHANNEL_ARCHITECTURE §3): Source=渠道, ConversationKey=
 			// 对话单元 ID(微信恒空=默认桶)。
 			ConversationKey: msg.ConversationID,

@@ -15,6 +15,9 @@ import os
 import tempfile
 
 from ga import _SHELL_STYLE_RE
+from agent_loop import media_content_blocks
+
+# 兼容别名(2026-08-13 重构后旧名仍可用)
 from agent_loop import _inject_attachment_images
 
 _1PX_PNG = bytes.fromhex(
@@ -98,5 +101,60 @@ class TestAttachmentImageInjection:
             assert isinstance(out, list)
             images = [b for b in out if b["type"] == "image_url"]
             assert len(images) == 3  # 上限 3 张
+        finally:
+            os.chdir(cwd)
+
+    def test_explicit_images_paths_structured(self):
+        """结构化主路径: put_task(images=[...]) 显式路径 → content blocks。"""
+        cwd = os.getcwd()
+        try:
+            tmp = self._setup()
+            os.chdir(tmp)
+            out = media_content_blocks("看图", ["attachments/F001_test.png"])
+            assert isinstance(out, list)
+            assert out[0]["type"] == "text" and out[0]["text"] == "看图"
+            assert out[1]["type"] == "image_url"
+            assert out[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        finally:
+            os.chdir(cwd)
+
+    def test_explicit_missing_file_falls_back_to_text(self):
+        out = media_content_blocks("看图", ["attachments/F999_missing.png"])
+        assert isinstance(out, str)  # 显式路径缺失时保留文本, 不崩
+
+    def test_explicit_non_image_skipped(self):
+        cwd = os.getcwd()
+        try:
+            tmp = tempfile.mkdtemp()
+            os.makedirs(os.path.join(tmp, "attachments"))
+            with open(os.path.join(tmp, "attachments", "F001_note.txt"), "w") as f:
+                f.write("hello")
+            os.chdir(tmp)
+            out = media_content_blocks("读文件", ["attachments/F001_note.txt"])
+            assert isinstance(out, str)  # 非图片扩展名跳过
+        finally:
+            os.chdir(cwd)
+
+    def test_resize_downsample_with_pil(self):
+        """PIL 可用时超长边图片被降采样(最长边 1568), 控制视觉 token 成本。"""
+        try:
+            from PIL import Image
+        except ImportError:
+            return  # 无 PIL 环境跳过
+        cwd = os.getcwd()
+        try:
+            tmp = tempfile.mkdtemp()
+            os.makedirs(os.path.join(tmp, "attachments"))
+            big = Image.new("RGB", (3200, 200), (255, 0, 0))
+            big.save(os.path.join(tmp, "attachments", "F001_wide.jpg"), "JPEG")
+            os.chdir(tmp)
+            out = media_content_blocks("看图", ["attachments/F001_wide.jpg"])
+            assert isinstance(out, list)
+            url = out[1]["image_url"]["url"]
+            assert url.startswith("data:image/jpeg;base64,")
+            # 解码回图片验证最长边 ≤ 1568
+            import io
+            img = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+            assert max(img.size) <= 1568
         finally:
             os.chdir(cwd)

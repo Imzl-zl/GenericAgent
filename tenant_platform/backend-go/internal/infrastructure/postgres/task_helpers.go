@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ id, workspace_id::text, session_key, session_sequence, requester_user_id,
 source, source_instance_id, message_id, message_idempotency_key, conversation_key,
 conversation_type, stream_final_at,
 prompt, persona_snapshot, tool_policy_version, prompt_bytes, persona_bytes,
+COALESCE(media::text,'[]'),
 status, COALESCE(claim_owner,''), claim_lease_until,
 COALESCE(worker_instance_id,''), worker_dispatch_started_at, cancel_requested_at,
 snapshot_id::text, COALESCE(snapshot_checksum,''), COALESCE(result_ref,''), COALESCE(result_digest,''),
@@ -43,6 +45,7 @@ type scannable interface {
 func scanTask(row scannable) (domain.Task, error) {
 	var t domain.Task
 	var personaRaw []byte
+	var mediaRaw []byte
 	var leaseUntil *time.Time
 	var snapshotID *string
 	var dispatchAt, cancelAt, startedAt, succeededAt, terminalAt *time.Time
@@ -51,6 +54,7 @@ func scanTask(row scannable) (domain.Task, error) {
 		&t.Source, &t.SourceInstanceID, &t.MessageID, &t.MessageIdempotencyKey,
 		&t.ConversationKey, &t.ConversationType, &t.StreamFinalAt,
 		&t.Prompt, &personaRaw, &t.ToolPolicyVersion, &t.PromptBytes, &t.PersonaBytes,
+		&mediaRaw,
 		&t.Status, &t.ClaimOwner, &leaseUntil,
 		&t.WorkerInstanceID, &dispatchAt, &cancelAt,
 		&snapshotID, &t.SnapshotChecksum, &t.ResultRef, &t.ResultDigest,
@@ -74,6 +78,11 @@ func scanTask(row scannable) (domain.Task, error) {
 	if len(personaRaw) > 0 {
 		if err := json.Unmarshal(personaRaw, &t.PersonaSnapshot); err != nil {
 			return domain.Task{}, fmt.Errorf("persona_snapshot: %w", err)
+		}
+	}
+	if len(mediaRaw) > 0 && string(mediaRaw) != "[]" {
+		if err := json.Unmarshal(mediaRaw, &t.Media); err != nil {
+			return domain.Task{}, fmt.Errorf("task media: %w", err)
 		}
 	}
 	if t.PersonaSnapshot == nil {
@@ -218,6 +227,31 @@ func validateSubmit(cmd domain.SubmitTaskCommand) error {
 	}
 	if cmd.PersonaSnapshot == nil {
 		return fmt.Errorf("persona_snapshot is required")
+	}
+	if err := validateTaskMedia(cmd.Media); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTaskMedia 校验任务入站媒体清单(2026-08-13 多模态链路):
+// relative_path 必须相对会话沙箱根且不含路径穿越, 大小非负, 条数有上限
+// (防恶意超长清单撑爆 TaskEnvelope/GA 首轮 payload)。
+func validateTaskMedia(media []domain.TaskMedia) error {
+	if len(media) > domain.MaxTaskMediaCount {
+		return fmt.Errorf("task media exceeds max count (%d > %d)", len(media), domain.MaxTaskMediaCount)
+	}
+	for i, m := range media {
+		if strings.TrimSpace(m.RelativePath) == "" {
+			return fmt.Errorf("media[%d] relative_path is required", i)
+		}
+		clean := path.Clean(m.RelativePath)
+		if clean != m.RelativePath || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+			return fmt.Errorf("media[%d] relative_path %q must be a clean relative path", i, m.RelativePath)
+		}
+		if m.SizeBytes < 0 {
+			return fmt.Errorf("media[%d] size_bytes must be non-negative", i)
+		}
 	}
 	return nil
 }

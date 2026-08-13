@@ -134,8 +134,30 @@ func (s *scheduler) finalizeTaskDeadline(ctx context.Context, task domain.Task) 
 	return context.DeadlineExceeded
 }
 
+// toTaskMedia 把路由时 ImportInbound 的附件清单(SessionFileRef, 含
+// workspace 相对路径/别名)转为任务媒体清单(2026-08-13 多模态链路定案)。
+// 仅入站媒体参与(模型首轮可感知); 出站文件(outputs/)是工具产物, 不注入。
+func toTaskMedia(refs []SessionFileRef) []domain.TaskMedia {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]domain.TaskMedia, 0, len(refs))
+	for _, ref := range refs {
+		if ref.Direction != "inbound" {
+			continue
+		}
+		out = append(out, domain.TaskMedia{
+			Alias:        ref.Alias,
+			OriginalName: ref.OriginalName,
+			RelativePath: ref.RelativePath,
+			SizeBytes:    ref.SizeBytes,
+		})
+	}
+	return out
+}
+
 func workerTaskEnvelope(task domain.Task, runnerGeneration uint64, capabilityJTI string) *workerv1.TaskEnvelope {
-	return &workerv1.TaskEnvelope{
+	env := &workerv1.TaskEnvelope{
 		TaskId:            task.ID,
 		SessionKey:        task.SessionKey,
 		RequesterUserId:   task.RequesterID,
@@ -149,6 +171,17 @@ func workerTaskEnvelope(task domain.Task, runnerGeneration uint64, capabilityJTI
 		RunnerGeneration:  runnerGeneration,
 		CapabilityJti:     capabilityJTI,
 	}
+	// 2026-08-13 多模态链路: 任务入站媒体结构化下发(tasks.media 持久化 →
+	// TaskEnvelope.media 契约 → Worker put_task images)。
+	for _, m := range task.Media {
+		env.Media = append(env.Media, &workerv1.MediaItem{
+			Alias:        m.Alias,
+			OriginalName: m.OriginalName,
+			RelativePath: m.RelativePath,
+			SizeBytes:    m.SizeBytes,
+		})
+	}
+	return env
 }
 
 func (s *scheduler) dispatch(ctx context.Context, task domain.Task) (returnErr error) {
