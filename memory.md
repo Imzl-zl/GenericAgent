@@ -103,6 +103,8 @@
 
 ## 最近活跃窗口
 
+- 2026-08-12：**空结果防护已部署（2cc4f79）**：make build 全量重建（:local + :2cc4f79，备份 :local.bak-emptyfix-20260812 三个镜像）+ runner-digest 更新（新 sha256:1f3e9b0d 已生效）+ 滚动重启 platform/sandbox-manager/bot-poller；healthz 全绿、QQ WS ready、飞书 WS started、平台日志 0 error；待用户真实渠道发消息复测（含退化响应时的明确报错）
+
 - 2026-08-12：**空结果静默成功诊断+修复（见进行中）**：生产实证链路 = 任务 4e0172b4/7beb70d6 result_digest 为空串 sha256 + committed bundle body len=0 + messages 出站"任务完成：任务已完成" + task_events 零 chunk；教训："任务完成"类文案回包先查 result digest/committed bundle，勿直接归因渠道/流式
 - 2026-08-12：**MCP stdio 恢复 + runner 出网 + 并发限额调整（含推送审查修复）**：stdio 端到端恢复（domain 校验放开 + snapshot 签发携带 transport/command/args + worker MCPStdioClient + web 编辑器 + openapi）；runner-control 去 internal（可信部署主流模型，撤销 registry 白名单）；GA_PKG_CACHE_VOLUME 共享缓存卷全链路；ga-runner 镜像加 node 20 LTS + uv（sha256 校验，本地模拟验证 npx/uvx/缓存 env 生效）；并发限额 PER_REQUESTER_RUNNING_LIMIT=2 / MAX_RUNNING_TASKS=5；推送审查修复：proxy 字段仅 http server 生效（stdio 混布快照不再加载失败）+ store command 写回 nullString + proxy resolve 过滤 stdio + 安全测试 3 断言同步 + Dockerfile 预建缓存卷属主；验证：Go 全量+race 绿、worker 132 passed、契约/安全/smoke 41 passed、bot_poller 52、web lint/build 绿
 - 2026-08-12：**推送审查修复（6 项+三轮 2 项全落地+回归测试）**：B1 main.go transport 装配块前移（含 botLifecycle/botPollerClient 一并提前，channelSvc Start 闭包窗口一并消除）；B2 filterMCPServersByQuota 接入 issueInitialWorkerCredentials（新测试验证签发快照不含耗尽 server）；Y1 proxy quota 后移 resolve（404 不烧配额）；Y2 ConsumeMCPQuotas 单事务双周期（新增不烧 day 回归 + 20 并发恰 limit 成功测试）；Y3 掩码不匹配/新键掩码 400 拒绝；Y5 两 proxy 拆 validateToken/consumeBudget（404/429/400 拒绝路径不烧 JTI，MCP+Sophub 对称）；Go 全量（含 DB）+ race 6 包 + api race 全绿

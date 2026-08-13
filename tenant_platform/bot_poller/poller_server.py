@@ -1246,6 +1246,7 @@ class QQAdapter(BotAdapter):
                     resp = await self._client.api._http.request(route, json=payload)
                     if isinstance(resp, dict) and _is_qq_rate_limit(resp):
                         raise _QQRateLimited(resp)
+                    print(f'[Poller] qq stream frame ok state={state} index={index} len={len(text)} sid={stream_msg_id or "-"} resp_id={(resp or {}).get("id", "-") if isinstance(resp, dict) else "-"}', flush=True)
                     return resp or {}
                 except _QQRateLimited:
                     if attempt >= 2:
