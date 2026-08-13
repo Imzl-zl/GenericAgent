@@ -804,6 +804,14 @@ func run() error {
 		botTransport = transport.NewLoopbackTransport()
 	}
 
+	// 2026-08-13 审查 B4/T5: delivery spool 共享卷在 scheduler 捕获侧与
+	// delivery 发送侧之间共享(同一 GA_DELIVERY_SPOOL_DIR, compose 同卷
+	// Platform rw / Poller ro)。
+	deliverySpoolDir, err := application.ResolveDeliverySpoolDir()
+	if err != nil {
+		return fmt.Errorf("delivery spool dir: %w", err)
+	}
+
 	sched, err := application.NewScheduler(application.SchedulerConfig{
 		PlatformInstanceID:       processID,
 		ClaimLease:               *claimLease,
@@ -812,6 +820,7 @@ func run() error {
 		Registry:                 reg,
 		Coordinator:              coord,
 		SessionFiles:             sessionFiles,
+		DeliverySpoolDir:         deliverySpoolDir,
 		Runtime:                  runtime,
 		ConfigRoot:               boot.ConfigRoot,
 		SessionScopedConfig:      sessionScopedConfig,

@@ -107,11 +107,12 @@ func (s *scheduler) completeSuccess(ctx context.Context, task domain.Task, termi
 		return err
 	}
 	resultBytes := len(payload.Body)
-	// 审查 R5-I3: 成功事务前捕获 [FILE:...] 输出文件的安全快照——内容必须
-	// 绑定到任务完成时刻(Worker 仍持有串行槽), 否则同 Runner 下一条任务
+	// 审查 R5-I3 + 2026-08-13 审查 B4/T5: 成功事务前捕获 [FILE:...] 输出文件
+	// (spool 引用化: 流式复制到 delivery spool 卷, DB 只存路径/摘要)——内容
+	// 必须绑定到任务完成时刻(Worker 仍持有串行槽), 否则同 Runner 下一条任务
 	// 可能覆盖/删除同名输出, 异步 delivery 会交付错误内容。捕获失败
 	// fail-closed: 声明了文件却无法交付的任务不得标记成功。
-	deliveryFiles, err := captureTaskDeliverableFiles(ctx, s.cfg.SessionFiles, task.SessionKey, string(payload.Body))
+	deliveryFiles, err := captureTaskDeliverableFiles(ctx, s.cfg.SessionFiles, task.SessionKey, s.cfg.DeliverySpoolDir, string(payload.Body))
 	if err != nil {
 		s.destroyTaskWorkerLocked(task.SessionKey, entry)
 		_ = s.finalizeOrFail(ctx, task, domain.TaskFailed, domain.DeliveryTaskFailed,

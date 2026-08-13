@@ -403,14 +403,15 @@ RETURNING `+taskSelectColumns, taskID, snapshotID, checksum, resultRef, resultDi
 		if err := insertDelivery(ctx, tx, tt.ID, domain.DeliveryTaskComplete, resultRef, resultDigest, "", "", ""); err != nil {
 			return err
 		}
-		// 审查 R5-I3: 输出文件快照与成功事务原子绑定。
-		// delivery_id 与 insertDelivery 的 StableDeliveryID 一致。
+		// 审查 R5-I3 + 2026-08-13 审查 B4/T5: 输出文件快照与成功事务原子绑定。
+		// spool 引用化后新行 content 为空、spool_path 非空(流式复制到共享卷);
+		// 存量行 content 兼容。delivery_id 与 insertDelivery 的 StableDeliveryID 一致。
 		for _, f := range deliveryFiles {
 			if _, err := tx.Exec(ctx, `
-INSERT INTO task_delivery_files (delivery_id, marker, file_name, rel_path, content, digest, size_bytes)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO task_delivery_files (delivery_id, marker, file_name, rel_path, content, digest, size_bytes, spool_path)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (delivery_id, marker) DO NOTHING
-`, domain.StableDeliveryID(tt.ID, domain.DeliveryTaskComplete), f.Marker, f.FileName, f.RelPath, f.Content, f.Digest, f.SizeBytes); err != nil {
+`, domain.StableDeliveryID(tt.ID, domain.DeliveryTaskComplete), f.Marker, f.FileName, f.RelPath, f.Content, f.Digest, f.SizeBytes, f.SpoolPath); err != nil {
 				return fmt.Errorf("insert delivery file %q: %w", f.Marker, err)
 			}
 		}

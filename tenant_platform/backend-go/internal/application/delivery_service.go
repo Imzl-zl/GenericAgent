@@ -186,21 +186,34 @@ func NewDeliveryService(cfg DeliveryServiceConfig) (DeliveryService, error) {
 	// Poller ro 挂载同一卷)——旧实现把快照写在 Platform /tmp(独立 tmpfs),
 	// 而 Poller 在另一容器按绝对路径读文件, DOCX/PDF/XLSX 交付必然失败。
 	// 未配置 env(单元测试/loopback)时保持私有临时目录。
-	snapshotDir := strings.TrimSpace(os.Getenv("GA_DELIVERY_SPOOL_DIR"))
-	var err error
-	if snapshotDir == "" {
-		snapshotDir, err = os.MkdirTemp("", "ga-delivery-*")
-		if err != nil {
-			return nil, fmt.Errorf("create deliverable snapshot dir: %w", err)
-		}
-	} else if err := os.MkdirAll(snapshotDir, 0o2770); err != nil {
-		return nil, fmt.Errorf("create delivery spool dir %s: %w", snapshotDir, err)
+	// 2026-08-13 审查 B4/T5: 同一 spool 目录承载捕获期文件引用
+	// (capture/ 子目录, scheduler 侧写入)——delivery 与 capture 必须同卷。
+	snapshotDir, err := ResolveDeliverySpoolDir()
+	if err != nil {
+		return nil, err
 	}
 	return &deliveryService{
 		cfg:              cfg,
 		unjournaledParts: make(map[string]struct{}),
 		snapshotDir:      snapshotDir,
 	}, nil
+}
+
+// resolveDeliverySpoolDir 解析 delivery spool 共享卷根(GA_DELIVERY_SPOOL_DIR)。
+// 空 env(单元测试/loopback)回退 Platform 私有临时目录。scheduler 捕获侧与
+// delivery 发送侧共用同一目录(compose 同卷挂载)。
+func ResolveDeliverySpoolDir() (string, error) {
+	snapshotDir := strings.TrimSpace(os.Getenv("GA_DELIVERY_SPOOL_DIR"))
+	var err error
+	if snapshotDir == "" {
+		snapshotDir, err = os.MkdirTemp("", "ga-delivery-*")
+		if err != nil {
+			return "", fmt.Errorf("create deliverable snapshot dir: %w", err)
+		}
+	} else if err := os.MkdirAll(snapshotDir, 0o2770); err != nil {
+		return "", fmt.Errorf("create delivery spool dir %s: %w", snapshotDir, err)
+	}
+	return snapshotDir, nil
 }
 
 // Recover returns stuck sending rows to pending and dead-letters expired rows.
@@ -245,6 +258,11 @@ func (s *deliveryService) tick(ctx context.Context) error {
 		} else if n > 0 {
 			slog.InfoContext(ctx, "delivery: deleted expired delivery file snapshots", "count", n)
 		}
+		// 2026-08-13 审查 B4/T5: spool 引用文件(捕获期持久快照)与 DB 行
+		// 同保留期, 按 mtime 清扫 capture/ 子目录(DB 行删除后文件独立过期)。
+		if n := cleanupSpoolCaptureDir(s.snapshotDir, now.Add(-deliveryFilesRetention)); n > 0 {
+			slog.InfoContext(ctx, "delivery: cleaned expired spool capture files", "count", n)
+		}
 	}
 	deliveries, err := s.cfg.Store.ClaimPendingDeliveries(ctx, s.cfg.MaxBatch, s.cfg.ClaimLease, s.cfg.RetryWindow, now)
 	if err != nil {
@@ -286,6 +304,12 @@ var errDeliveryMemberRemoved = errors.New("requester is no longer an approved te
 // 成功后立即 defer 调用——文本/前序文件发送失败时其余快照同样清理。
 func removePayloadFiles(payload deliveryPayload) {
 	for _, f := range payload.Files {
+		// 2026-08-13 审查 B4/T5: 捕获期 spool 文件(spoolPath 非空)是任务
+		// 成功事务绑定的持久快照, 必须保留(重试/审计), 由 30d mtime 清扫
+		// 回收——这里只清理 buildPayload 本次物化的临时副本。
+		if f.spoolPath != "" {
+			continue
+		}
 		_ = os.Remove(f.absPath)
 		_ = os.Remove(filepath.Dir(f.absPath))
 	}
@@ -542,12 +566,13 @@ func (s *deliveryService) clearUnjournaledPart(key string) {
 }
 
 type deliveryFile struct {
-	absPath         string // 可发送文件的完整路径(Platform 私有快照)
+	absPath         string // 可发送文件的完整路径(Platform 私有快照或捕获期 spool)
 	root            string // absPath 的受限根(OpenBeneath 用)
 	relPath         string // root 相对路径(OpenBeneath 用)
 	displayName     string
 	auditPath       string // workspace 内相对路径(消息媒体审计, 审查 R5-I3)
-	snapshotContent bool   // true = 内容来自成功事务捕获的 DB 快照, 直接发送
+	snapshotContent bool   // true = 内容来自成功事务捕获, 直接发送
+	spoolPath       string // 非空 = 捕获期 spool 引用(保留, 不随 payload 清理)
 }
 
 type deliveryPayload struct {
@@ -599,12 +624,39 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 		}
 		out.Files = make([]deliveryFile, 0, len(files))
 		for _, f := range files {
-			// 快照内容写入 Platform 私有临时文件(发送后删除)。文件名用
-			// 服务端可信的 relPath basename(审查 C1: FileName 源于 Runner
-			// 可写的 manifest, 不得进入路径拼接), 子目录按 delivery 隔离避免
-			// 并发同名覆盖; marker 哈希前缀区分同 basename 的不同输出文件
-			// (如 outputs/a.docx 与 outputs/sub/a.docx)。用户可见名单独经
-			// sanitizeDeliverableDisplayName 清洗。
+			if f.SpoolPath != "" {
+				// spool 引用(2026-08-13 审查 B4/T5): 文件内容在任务成功事务时
+				// 已流式复制到共享卷(Platform rw / Poller ro), 发送前 Lstat
+				// 校验普通文件 + 类型上限(防卷被篡改, 纵深防御)。
+				spoolAbs := filepath.Join(s.snapshotDir, filepath.FromSlash(f.SpoolPath))
+				info, err := os.Lstat(spoolAbs)
+				if err != nil {
+					removePayloadFiles(out)
+					return deliveryPayload{}, fmt.Errorf("stat spool file %q: %w", f.SpoolPath, err)
+				}
+				if !info.Mode().IsRegular() {
+					removePayloadFiles(out)
+					return deliveryPayload{}, fmt.Errorf("spool file %q is not a regular file", f.SpoolPath)
+				}
+				if info.Size() > deliverableMaxBytes(f.RelPath) {
+					removePayloadFiles(out)
+					return deliveryPayload{}, fmt.Errorf("spool file %q exceeds size limit", f.SpoolPath)
+				}
+				out.Files = append(out.Files, deliveryFile{
+					absPath:         spoolAbs,
+					displayName:     sanitizeDeliverableDisplayName(f.FileName, f.RelPath),
+					auditPath:       f.RelPath,
+					snapshotContent: true,
+					spoolPath:       f.SpoolPath,
+				})
+				continue
+			}
+			// 存量行(content 快照, 30d 保留期内): 写入 Platform 私有临时文件
+			// (发送后删除)。文件名用服务端可信的 relPath basename(审查 C1:
+			// FileName 源于 Runner 可写的 manifest, 不得进入路径拼接), 子目录
+			// 按 delivery 隔离避免并发同名覆盖; marker 哈希前缀区分同 basename
+			// 的不同输出文件(如 outputs/a.docx 与 outputs/sub/a.docx)。用户
+			// 可见名单独经 sanitizeDeliverableDisplayName 清洗。
 			dir := filepath.Join(s.snapshotDir, deliveryFileKey(d.DeliveryID))
 			if err := os.MkdirAll(dir, 0o2770); err != nil {
 				removePayloadFiles(out)
@@ -696,6 +748,51 @@ func teamSessionKey(sessionKey string) (string, bool) {
 	return id, true
 }
 
+
+// cleanupSpoolCaptureDir 删除 delivery spool capture/ 下早于 before 的
+// 文件与空目录(2026-08-13 审查 B4/T5): 捕获期 spool 文件是持久快照, 与
+// task_delivery_files 行同 30d 保留期——DB 行由 DeleteExpiredDeliveryFiles
+// 删除, 文件按 mtime 独立过期。返回删除文件数。错误仅记日志(不阻塞 tick)。
+func cleanupSpoolCaptureDir(spoolDir string, before time.Time) int {
+	captureRoot := filepath.Join(spoolDir, "capture")
+	entries, err := os.ReadDir(captureRoot)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.ErrorContext(context.Background(), "delivery: spool capture dir read failed", "error", err)
+		}
+		return 0
+	}
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		taskDir := filepath.Join(captureRoot, entry.Name())
+		files, err := os.ReadDir(taskDir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().Before(before) {
+				if err := os.Remove(filepath.Join(taskDir, f.Name())); err == nil {
+					removed++
+				}
+			}
+		}
+		// 空任务目录一并回收。
+		if remaining, err := os.ReadDir(taskDir); err == nil && len(remaining) == 0 {
+			_ = os.Remove(taskDir)
+		}
+	}
+	return removed
+}
 
 // deliveryFileKey 把 delivery_id(含 ':' 等非文件名字符)转为安全文件名前缀。
 func deliveryFileKey(deliveryID string) string {

@@ -35,7 +35,14 @@ type DeliveryFile struct {
 	RelPath   string // workspace 内相对路径(消息媒体审计用)
 	Digest    string // sha256:hex
 	SizeBytes int64
-	Content   []byte // 内容快照(发送时写入 Platform 私有临时文件)
+	// SpoolPath 是 delivery spool 卷内相对路径(2026-08-13 审查 B4/T5):
+	// 成功事务时文件流式复制到 GA_DELIVERY_SPOOL_DIR(Platform rw / Poller
+	// ro 同卷), DB 不再存字节——发送时直接读 spool。空 = 存量行(content
+	// 快照兼容, 30d 保留期内自然过期)。
+	SpoolPath string
+	// Content 是内容快照(发送时写入 Platform 私有临时文件)。spool 引用化
+	// 后新写入行 Content 为空, 仅存量行/测试使用。
+	Content []byte
 }
 
 // Delivery is a durable terminal delivery outbox row.

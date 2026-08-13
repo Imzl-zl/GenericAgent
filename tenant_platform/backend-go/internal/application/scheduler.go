@@ -45,6 +45,11 @@ type SchedulerConfig struct {
 	// SessionFiles 供成功事务前捕获 [FILE:...] 输出文件快照(审查 R5-I3);
 	// nil(loopback 未接线)时跳过捕获, 成功事务不绑定文件内容。
 	SessionFiles SessionFiles
+	// DeliverySpoolDir 是 delivery spool 共享卷根(GA_DELIVERY_SPOOL_DIR,
+	// Platform rw / Bot Poller ro 同卷): 成功事务时输出文件流式复制到
+	// <spool>/capture/, DB 只存相对路径(2026-08-13 审查 B4/T5)。空 =
+	// 回退内存快照(测试/loopback)。
+	DeliverySpoolDir string
 	// Runtime creates a Worker instance for a session. Required.
 	Runtime worker.WorkerRuntime
 	// ConfigRoot holds the token-only runtime JSON and fixed mykey.py loader.

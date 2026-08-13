@@ -106,10 +106,11 @@ WHERE d.task_id = t.id
 }
 
 // LoadDeliveryFiles 返回 task_complete delivery 绑定的输出文件快照
-// (审查 R5-I3): 内容在任务成功事务时捕获, 发送时不再解析 workspace 路径。
+// (审查 R5-I3 + 2026-08-13 审查 B4/T5): spool 引用化后优先 spool_path
+// (内容在共享卷), 存量行回退 content 快照; 发送时不再解析 workspace 路径。
 func (s *Store) LoadDeliveryFiles(ctx context.Context, deliveryID string) ([]domain.DeliveryFile, error) {
 	rows, err := s.pool.Query(ctx, `
-SELECT marker, file_name, rel_path, content, digest, size_bytes
+SELECT marker, file_name, rel_path, content, digest, size_bytes, spool_path
 FROM task_delivery_files
 WHERE delivery_id = $1
 ORDER BY marker
@@ -121,7 +122,7 @@ ORDER BY marker
 	var out []domain.DeliveryFile
 	for rows.Next() {
 		var f domain.DeliveryFile
-		if err := rows.Scan(&f.Marker, &f.FileName, &f.RelPath, &f.Content, &f.Digest, &f.SizeBytes); err != nil {
+		if err := rows.Scan(&f.Marker, &f.FileName, &f.RelPath, &f.Content, &f.Digest, &f.SizeBytes, &f.SpoolPath); err != nil {
 			return nil, fmt.Errorf("scan delivery file: %w", err)
 		}
 		out = append(out, f)

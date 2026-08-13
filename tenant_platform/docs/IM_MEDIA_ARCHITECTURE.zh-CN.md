@@ -119,7 +119,7 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
   - 企微：`media/upload` 拿 `media_id` → 消息。
 - [ ] 决策 A2：**delivery 按 MIME 分发**：`content_type` 前缀 `image/` → `send_media(image)`；`video/` → `send_media(video)`；其余 → `send_media(file)`。失败语义沿用 `SEND_FILE_FAILED` 兜底（delivery 重试/死信既有路径）。
 - [ ] 决策 A3：**上传失败语义**：上传 API 失败 = 发送失败（fail-closed），走既有 delivery 错误路径；不静默降级文本（媒体是用户明确期望的产物）。
-- [ ] 决策 A4：**大小上限**：沿用 `defaultMaxDeliverableBytes`；超限媒体发送失败并诚实提示（与空结果文案同原则）。
+- [x] 决策 A4：**大小上限**：~~沿用 `defaultMaxDeliverableBytes`~~（2026-08-13 审查 B4/T5 已落地）：出站文件存储 **spool 引用化**（migration 0057）——成功事务时文件流式复制到 delivery spool 共享卷（`GA_DELIVERY_SPOOL_DIR`，Platform rw / Poller ro），`task_delivery_files` 只存 spool 相对路径 + digest，不再存 BYTEA 字节；上限按媒体类型分化：**image ≤20MiB / video ≤100MiB（Phase C 视频）/ 其余 ≤8MiB**，任务聚合 ≤256MiB；超限媒体发送失败并诚实提示（与空结果文案同原则）。
 
 ## 6. 生图能力（Phase B，设计稿）
 
