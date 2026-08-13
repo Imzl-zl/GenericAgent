@@ -1,0 +1,19 @@
+id,parent,title,status,notes
+T0,,架构审查(2026-08-13) 只读审查: 5 阻断/6 重要/5 建议 + D1-D7 决策点,done,审查报告已交付; 用户拍板按推荐实施
+T1,,四渠道入站媒体提取(阻断 B1): 公共下载器 + QQ/飞书/钉钉/企微 adapter,done,media_downloader.py + poller_server 4 adapter + test_poller_inbound_media.py (70 tests 绿)
+T1.1,T1,公共下载器 media_downloader.py(URL 直下/host 白名单/魔数嗅探/原子落盘/media_items),done,
+T1.2,T1,QQAdapter attachments[].url 直下(QQ_MEDIA_HOSTS 白名单),done,
+T1.3,T1,FeishuAdapter image_key/file_key → resources API(message_id+file_key 匹配),done,
+T1.4,T1,DingTalkAdapter downloadCode → /v1.0/robot/messageFiles/download + 语音 ASR 注入,done,待真实凭据实测(端点官方文档实证)
+T1.5,T1,WeComAdapter 直链 URL / media_id → media/get(token 探测式),done,SDK token 端点待实测
+T2,,GA 注入限额对齐(阻断 B3): base64 总量预算 3.5MB(llm-proxy 4MiB),done,agent_loop.py _ATTACH_IMG_B64_BUDGET
+T3,,文档修订(审查结论写回): 渠道限定/QQ 主动路径/分片定案/Phase A-0/残余风险,done,IM_MEDIA_ARCHITECTURE.zh-CN.md
+T4,,Phase A: 出站媒体统一 send_media + 5 渠道上传适配(QQ 分片) + delivery MIME 分发,blocked,前置: 8MiB/bytea 决策(D2); QQ 频控实测
+T4.1,T4,BotAdapter.send_media 模板方法 + BotManager.send 分发改显式接口,blocked,
+T4.2,T4,QQ 分片上传(预上传→PUT→完成) + 主动消息路径 + 频控预算,blocked,需真实凭据实测
+T4.3,T4,飞书 im/v1/images+files / 钉钉 / 企微 media 上传适配,blocked,
+T4.4,T4,Go delivery MIME 分发 + MediaAsset.ContentType 去硬编码,blocked,
+T5,,Phase C 前置: 出站存储改 spool 引用(DB 只存路径/摘要) + per-type 上限,blocked,决策 D2
+T6,,MediaItem.content_type 字段(proto 变更窗口, 决策 D5),blocked,generate_bindings + 契约测试
+T7,,媒体留存策略: poller media_root 清理 + media_assets 保留期(决策 D7),blocked,
+T8,,Phase B: 生图 image_gen + llm-proxy llm.image(决策 D6),blocked,可推迟

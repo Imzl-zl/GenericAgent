@@ -96,11 +96,12 @@ def test_wecom_non_text_message_passthrough():
     adapter = _make_adapter()
     posted = _capture(adapter)
 
+    # 非文本消息且未配置 media_root: 媒体无从下载, 丢弃不投递(审查 B1,
+    # 不再回误导性的空文本 → 平台 "empty message ignored")。
+    # 配置 media_root 且下载成功时见 test_poller_inbound_media.py。
     adapter._handle_wecom_message(_frame("image"))
 
-    assert len(posted) == 1
-    assert posted[-1]["text"] == ""
-    assert posted[-1]["message_id"] == "msg_1"
+    assert len(posted) == 0
 
 
 # ---------------------------------------------------------------------------

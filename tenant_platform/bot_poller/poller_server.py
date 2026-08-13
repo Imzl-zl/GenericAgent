@@ -44,19 +44,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-# Make frontends/ importable for wxbot_client and wxbot_media.
+# Make frontends/ importable for wxbot_client and wxbot_media, and make
+# bot_poller/ importable for media_downloader (sibling module).
 # _POLLER_DIR = tenant_platform/bot_poller
 # _LEGACY_ROOT = GenericAgent (two levels up)
 # _FRONTENDS_DIR = GenericAgent/frontends (where wxbot_client.py and wxbot_media.py live)
 _POLLER_DIR = os.path.dirname(os.path.abspath(__file__))
 _LEGACY_ROOT = os.path.dirname(os.path.dirname(_POLLER_DIR))
 _FRONTENDS_DIR = os.path.join(_LEGACY_ROOT, 'frontends')
-for _p in (_FRONTENDS_DIR, _LEGACY_ROOT):
+for _p in (_POLLER_DIR, _FRONTENDS_DIR, _LEGACY_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import media_downloader as media_dl  # noqa: E402
 from wxbot_client import WxBotClient, AuthExpired  # noqa: E402
 from wxbot_media import download_media  # noqa: E402
+
+# 扩展名 → MIME 映射迁移至 media_downloader(多渠道共用, 2026-08-13 审查
+# 收敛): 保留名字兼容 WeChatAdapter._collect_media_items 与既有测试。
+_EXT_CONTENT_TYPES = media_dl.EXT_CONTENT_TYPES
+
+
+def _guess_content_type(file_name):
+    """Infer MIME type from file extension. Defaults to octet-stream."""
+    return media_dl.guess_content_type(file_name)
 
 POLL_TIMEOUT = 30
 WEBHOOK_TIMEOUT = 10
@@ -98,37 +109,6 @@ WEBHOOK_RETRY_BASE_SECONDS = 2.0
 WEBHOOK_RETRY_CAP_SECONDS = 60.0
 MAX_INBOUND_COALESCE_WINDOW_MS = 5000
 MAX_COALESCED_MESSAGES = 8
-
-# Map file extension to MIME content_type. Used to populate media_assets
-# metadata when the Poller forwards inbound media to the platform webhook.
-# iLink does not surface a content_type field in item_list, so we infer from
-# the file_name returned by wxbot_media.download_media.
-_EXT_CONTENT_TYPES = {
-    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-    '.gif': 'image/gif', '.bmp': 'image/bmp', '.webp': 'image/webp',
-    '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo',
-    '.pdf': 'application/pdf',
-    '.doc': 'application/msword',
-    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    '.xls': 'application/vnd.ms-excel',
-    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    '.ppt': 'application/vnd.ms-powerpoint',
-    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    '.zip': 'application/zip', '.rar': 'application/x-rar-compressed',
-    '.7z': 'application/x-7z-compressed', '.tar': 'application/x-tar',
-    '.gz': 'application/gzip',
-    '.silk': 'audio/silk', '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
-    '.m4a': 'audio/mp4', '.aac': 'audio/aac',
-    '.txt': 'text/plain', '.md': 'text/markdown',
-    '.csv': 'text/csv', '.json': 'application/json',
-}
-
-
-def _guess_content_type(file_name):
-    """Infer MIME type from file extension. Defaults to octet-stream."""
-    ext = os.path.splitext(file_name)[1].lower()
-    return _EXT_CONTENT_TYPES.get(ext, 'application/octet-stream')
-
 
 def _parse_listen_addr(listen):
     """Parse 'host:port' into (host, port_int). Raises ValueError on bad input."""
@@ -736,19 +716,72 @@ class FeishuAdapter(BotAdapter):
         if not message_id:
             return
         text = ''
-        if getattr(message, 'message_type', '') == 'text':
+        media_paths, media_items = [], []
+        mtype = getattr(message, 'message_type', '') or ''
+        if mtype == 'text':
             try:
                 content = json.loads(getattr(message, 'content', '') or '{}')
                 text = str(content.get('text', ''))
             except (ValueError, TypeError):
                 text = ''
+        elif mtype in ('image', 'file', 'audio', 'media') and self._media_dir:
+            # 入站媒体提取(IM_MEDIA_ARCHITECTURE §3.1): image → image_key;
+            # file/audio/media(视频) → file_key。下载走
+            # GET /im/v1/messages/{message_id}/resources/{file_key}?type=…
+            # (官方: file_key 与 message_id 必须匹配, ≤100MB, 审查 S5)。
+            try:
+                content = json.loads(getattr(message, 'content', '') or '{}')
+            except (ValueError, TypeError):
+                content = {}
+            file_key = str(content.get('image_key') or content.get('file_key') or '')
+            file_name = str(content.get('file_name') or '') or file_key
+            resource_type = 'image' if mtype == 'image' else 'file'
+            if file_key and message_id:
+                try:
+                    data = self._download_resource(message_id, file_key, resource_type)
+                    if data:
+                        path = media_dl.save_bytes_bounded(
+                            data, self._media_dir, file_name=file_name)
+                        media_paths.append(path)
+                        media_items.append(media_dl.build_media_item(
+                            path, self._media_root, file_name))
+                except Exception as exc:
+                    print(f'[Poller] feishu media dl err ({self.bot_uuid}): {exc}', flush=True)
+        if not text and not media_paths:
+            # 无文本且媒体提取失败(下载/落盘异常): 丢弃并记日志, 不回
+            # 误导性的 "empty message ignored"(审查 B1 统一行为)。
+            return
         self.post_webhook(self.webhook_body(
             channel_account_id=sender_id,
             conversation_id=chat_id,  # p2p/group 统一 chat_id
             message_id=message_id,
             text=text,
+            media_paths=media_paths,
+            media_items=media_items,
             conversation_type=self._conversation_type(data),
         ))
+
+    def _download_resource(self, message_id, file_key, resource_type):
+        """飞书消息资源下载: GET /im/v1/messages/{id}/resources/{key}?type=…。
+
+        返回二进制 bytes。走独立 API client(与出站同源, WS 通道只收不发)。
+        resource_type: 'image' | 'file'(音频/视频/文件均走 file)。
+        """
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        api = self._ensure_api_client()
+        req = (GetMessageResourceRequest.builder()
+               .message_id(message_id)
+               .file_key(file_key)
+               .type(resource_type)
+               .build())
+        resp = api.im.v1.message.get_resource(req)
+        if not resp.success():
+            raise RuntimeError(
+                f'feishu resource get failed: code={resp.code} msg={resp.msg}')
+        data = getattr(resp, 'file', None) or b''
+        if not data:
+            raise RuntimeError('feishu resource get returned empty body')
+        return data
 
     @staticmethod
     def _conversation_type(data):
@@ -960,7 +993,7 @@ class DingTalkAdapter(BotAdapter):
             async def process(self, message):
                 try:
                     chatbot_msg = ChatbotMessage.from_dict(message.data)
-                    self._adapter._handle_chatbot_message(chatbot_msg)
+                    self._adapter._handle_chatbot_message(chatbot_msg, message.data)
                 except Exception as exc:
                     print(f'[Poller] dingtalk {self._adapter.bot_uuid} callback error: {exc}', flush=True)
                 return dt.AckMessage.STATUS_OK, 'OK'
@@ -973,12 +1006,35 @@ class DingTalkAdapter(BotAdapter):
         except Exception as exc:
             print(f'[Poller] dingtalk {self.bot_uuid} stream error: {exc}', flush=True)
 
-    def _handle_chatbot_message(self, chatbot_msg):
+    def _handle_chatbot_message(self, chatbot_msg, raw_data=None):
         """钉钉入站消息 → webhook body。conversation_id = conversationId
-        (群/单聊统一), 平台只推 @ 消息(硬规则, 无需本侧过滤)。"""
+        (群/单聊统一), 平台只推 @ 消息(硬规则, 无需本侧过滤)。
+
+        媒体提取(IM_MEDIA_ARCHITECTURE §3.1): picture/file/video/audio
+        消息 content 带 downloadCode(官方: 临时下载码), 经
+        POST /v1.0/robot/messageFiles/download 换文件字节; 语音消息带
+        官方 ASR 文本 recognition, 直接注入 prompt(审查 S2)。"""
         text = getattr(getattr(chatbot_msg, 'text', None), 'content', '') or ''
         text = text.strip()
-        if not text:
+        media_paths, media_items = [], []
+        raw = raw_data if isinstance(raw_data, dict) else {}
+        msgtype = str(raw.get('msgtype') or '')
+        content = raw.get('content')
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (ValueError, TypeError):
+                content = {}
+        if isinstance(content, dict) and self._media_dir:
+            try:
+                media_paths, media_items, asr_text = self._extract_media(
+                    msgtype, content, str(getattr(chatbot_msg, 'conversation_id', '') or ''))
+                if asr_text and not text:
+                    # 语音官方 ASR: 免费转写文本直接进 prompt(零成本高价值)。
+                    text = f'[语音消息转写] {asr_text}'
+            except Exception as exc:
+                print(f'[Poller] dingtalk media dl err ({self.bot_uuid}): {exc}', flush=True)
+        if not text and not media_paths:
             return
         self.post_webhook(self.webhook_body(
             channel_account_id=str(
@@ -987,11 +1043,50 @@ class DingTalkAdapter(BotAdapter):
             conversation_id=str(getattr(chatbot_msg, 'conversation_id', '') or ''),
             message_id=str(getattr(chatbot_msg, 'message_id', '') or ''),
             text=text,
+            media_paths=media_paths,
+            media_items=media_items,
             # 钉钉会话形态: conversation_type=='2' = 群(IM_CHANNEL_BINDING §2)。
             conversation_type=('group'
                                if str(getattr(chatbot_msg, 'conversation_type', '') or '') == '2'
                                else 'private'),
         ))
+
+    def _extract_media(self, msgtype, content, conversation_id):
+        """钉钉 downloadCode → 文件字节 → 落盘。返回 (media_paths, media_items, asr_text)。
+
+        官方(open.dingtalk.com/document/orgapp/download-the-file-content-of-the-
+        robot-receiving-message): 图片 picture / 文件 file(fileName) / 视频
+        video(videoType) / 语音 audio(recognition=官方 ASR)。端点:
+        POST /v1.0/robot/messageFiles/download
+        body {robotCode, downloadCode, openConversationId} → 二进制流。
+        """
+        download_code = str(content.get('downloadCode') or '')
+        if not download_code:
+            return [], [], ''
+        file_name = str(content.get('fileName') or '')
+        ext = {'picture': '', 'video': '.mp4'}.get(msgtype, '')
+        asr_text = str(content.get('recognition') or '')
+        import requests as _requests
+        token = self._access_token()
+        if not token:
+            raise RuntimeError('dingtalk media download: access token failed')
+        resp = _requests.post(
+            'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
+            json={'robotCode': self._app_key,
+                  'downloadCode': download_code,
+                  'openConversationId': conversation_id},
+            headers={'x-acs-dingtalk-access-token': token},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f'dingtalk media download HTTP {resp.status_code}: {resp.text[:200]}')
+        data = resp.content
+        if not data:
+            raise RuntimeError('dingtalk media download returned empty body')
+        path = media_dl.save_bytes_bounded(
+            data, self._media_dir, file_name=file_name, ext=ext)
+        return [path], [media_dl.build_media_item(path, self._media_root, file_name)], asr_text
 
     def send_text(self, target, text, client_id=''):
         # 回复: 直接调用机器人开放 API(target = conversationId, 群/单聊统一)。
@@ -1153,15 +1248,52 @@ class QQAdapter(BotAdapter):
                 if len(self._target_kinds) >= self._target_kinds_max:
                     self._target_kinds.clear()
                 self._target_kinds[conversation_id] = 'group' if is_group else 'c2c'
+            # 入站媒体提取(IM_MEDIA_ARCHITECTURE §3.1): 官方事件
+            # attachments[] 直带下载 URL(带 rkey 时效)——事件到达即下载
+            # (URL 过期后无法重试), 失败丢弃媒体保留文本(与微信同语义)。
+            media_paths, media_items = self._extract_attachments(message)
+            if not content and not media_paths:
+                # 无文本且媒体提取失败(下载/落盘异常): 丢弃并记日志, 不回
+                # 误导性的 "empty message ignored"(审查 B1 统一行为)。
+                return
             self.post_webhook(self.webhook_body(
                 channel_account_id=channel_account_id,
                 conversation_id=conversation_id,
                 message_id=message_id,
                 text=content,
+                media_paths=media_paths,
+                media_items=media_items,
                 conversation_type='group' if is_group else 'private',
             ))
         except Exception as exc:
             print(f'[Poller] qq {self.bot_uuid} handle error: {exc}', flush=True)
+
+    def _extract_attachments(self, message):
+        """QQ 入站附件提取: attachments[].url 直下(host 白名单 + 大小上限)。
+
+        返回 (media_paths, media_items); 单条失败丢弃该条(日志), 不阻塞
+        文本消息——与微信 download_media 失败语义一致(IM_MEDIA_ARCH §11)。
+        """
+        media_paths, media_items = [], []
+        if not self._media_dir:
+            return media_paths, media_items
+        for att in (getattr(message, 'attachments', None) or []):
+            url = str(getattr(att, 'url', '') or '')
+            if not url:
+                continue
+            file_name = str(getattr(att, 'filename', '') or '')
+            content_type = str(getattr(att, 'content_type', '') or '') or None
+            try:
+                path = media_dl.download_url_bounded(
+                    url, self._media_dir, file_name=file_name,
+                    allowed_hosts=media_dl.QQ_MEDIA_HOSTS)
+                if path:
+                    media_paths.append(path)
+                    media_items.append(media_dl.build_media_item(
+                        path, self._media_root, file_name, content_type))
+            except Exception as exc:
+                print(f'[Poller] qq media dl err ({self.bot_uuid}): {exc}', flush=True)
+        return media_paths, media_items
 
     def send_text(self, target, text, client_id=''):
         if self._client is None:
@@ -1403,18 +1535,85 @@ class WeComAdapter(BotAdapter):
         sender_id = str((body.get('from') or {}).get('userid', '') or '')
         chat_id = str(body.get('chatid') or '') or sender_id
         text = ''
-        if body.get('msgtype') == 'text':
+        media_paths, media_items = [], []
+        msgtype = str(body.get('msgtype') or '')
+        if msgtype == 'text':
             text = str((body.get('text') or {}).get('content', '') or '')
+        elif msgtype in ('image', 'file', 'voice', 'video') and self._media_dir:
+            # 入站媒体提取(IM_MEDIA_ARCHITECTURE §3.1): 媒体消息带 media_id
+            # (部分类型另带直链 URL)。下载失败丢弃媒体保留文本(与微信同语义)。
+            try:
+                media_paths, media_items = self._extract_media(
+                    msgtype, body.get(msgtype))
+            except Exception as exc:
+                print(f'[Poller] wecom media dl err ({self.bot_uuid}): {exc}', flush=True)
         # 单聊 chatid == 发送者 userid(SDK 文档: 单聊会话 ID = userid);
         # sender 缺失时保守归群(空==空不得判为私聊)。
         conversation_type = 'private' if sender_id and chat_id == sender_id else 'group'
+        if not text and not media_paths:
+            return
         self.post_webhook(self.webhook_body(
             channel_account_id=sender_id,
             conversation_id=chat_id,
             message_id=message_id,
             text=text,
+            media_paths=media_paths,
+            media_items=media_items,
             conversation_type=conversation_type,
         ))
+
+    def _extract_media(self, msgtype, media):
+        """企微入站媒体: 优先回调直链 URL(若有), 否则 media_id 走
+        GET qyapi.weixin.qq.com/cgi-bin/media/get?access_token=&media_id=
+        (官方 developer.work.weixin.qq.com/document/path/90254, media_id 3 天
+        有效、企业内应用共享)。返回 (media_paths, media_items)。
+
+        access_token 来源依赖智能机器人凭据(bot_id/secret, 非 corpid/secret):
+        SDK 连接已换取 token 时探测复用; 未确认的 token 端点在真实凭据冒烟
+        时补齐(审查 S4 同款残余风险)。"""
+        if not isinstance(media, dict):
+            return [], []
+        media_id = str(media.get('media_id') or '')
+        direct_url = str(media.get('image_url') or media.get('voice_url')
+                         or media.get('video_url') or '')
+        file_name = str(media.get('filename') or media.get('file_name') or '')
+        if direct_url:
+            path = media_dl.download_url_bounded(
+                direct_url, self._media_dir, file_name=file_name,
+                allowed_hosts=media_dl.WECOM_MEDIA_HOSTS)
+            if path:
+                return [path], [media_dl.build_media_item(
+                    path, self._media_root, file_name)]
+        if not media_id:
+            return [], []
+        token = self._client_access_token()
+        if not token:
+            raise RuntimeError('wecom media download: access token unavailable '
+                               '(SDK token endpoint 待真实凭据实测)')
+        resp = requests.get(
+            'https://qyapi.weixin.qq.com/cgi-bin/media/get',
+            params={'access_token': token, 'media_id': media_id},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f'wecom media get HTTP {resp.status_code}: {resp.text[:200]}')
+        data = resp.content
+        if not data:
+            raise RuntimeError('wecom media get returned empty body')
+        path = media_dl.save_bytes_bounded(data, self._media_dir, file_name=file_name)
+        return [path], [media_dl.build_media_item(path, self._media_root, file_name)]
+
+    def _client_access_token(self):
+        """企微智能机器人 access_token(媒体下载用): 探测 SDK 连接后缓存的
+        token(属性名随 SDK 版本); 无则返回 ''(调用方按未实现降级)。"""
+        if self._client is None:
+            return ''
+        for attr in ('access_token', 'token', '_token', 'bot_access_token'):
+            value = getattr(self._client, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        return ''
 
     # -- 生命周期 ----------------------------------------------------------
     def _run(self):

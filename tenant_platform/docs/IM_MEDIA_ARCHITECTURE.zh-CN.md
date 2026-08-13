@@ -25,7 +25,6 @@
 - **文件模式与消息模式并存且正交**：媒体同时存在于 workspace（工具可读/可存档/可导出）与模型上下文（模型可感知）；工具层视觉（OCR/vision）是 fallback，不是主路径（与 Claude Code / Codex / LangChain 主流一致）。
 
 ## 3. 渠道媒体机制矩阵（官方文档实证，2026-08-13）
-
 ### 3.1 入站（事件 → 字节）
 
 | 渠道 | 官方机制 | 获取方式 | 复杂度 |
@@ -54,7 +53,9 @@
 
 **推论**：出站媒体能力各平台都具备，差异只在"上传 API"（QQ file_info / 飞书 key / 钉钉/企微 media_id / 微信直传）——同样是"一套公共 + 每渠道薄适配"。
 
-## 4. 入站媒体链路（已落地 2026-08-13）
+**补充（2026-08-13 架构审查 B5，QQ 出站主动消息路径）**：QQ 被动回复锚点 `msg_id` **5 分钟内有效**（官方 v2_users_user_openid_messages.post：msg_id"5 分钟内有效"、错误码 304103），另有"每条用户消息 60 分钟限回 4 次"约束。本平台 delivery 是任务终态后的异步推送（任务可达 45 分钟），必然超窗——**QQ 媒体发送实际走主动消息路径**（`srv_send_msg=true` 上传直发或上传后主动 send），消耗主动频次（单聊 10 QPS / 20 QPM、日 1000/用户），且 C2C 主动消息要求用户近期有交互。实现时必须设计主动路径 + adapter 内频控预算（复用 `_TokenBucket`/`_QQRateLimited` 先例）。
+
+## 4. 入站媒体链路（2026-08-13 已落地；渠道覆盖：**微信**为主链路实证，**QQ/飞书/钉钉/企微**入站提取 2026-08-13 架构审查后补齐——同链路复用，钉钉/企微下载 API 待真实凭据实测）
 
 ```
 渠道事件 → adapter 提取媒体引用 → 落盘 media_root/bot_uuid/ → media_paths + media_items
@@ -112,7 +113,7 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
   ```
   - 基类提供：MIME 推断、大小上限校验、按渠道上传 API 的公共骨架。
   - 微信：复用现有 `send_image/send_video/send_file`（iLink 直传，无上传步骤）。
-  - QQ：上传（整文件/分片）拿 `file_info`（注意单聊/群聊上传不互通 + TTL）→ `msg_type=7 media`。
+  - **QQ：分片上传（定案，2026-08-13 审查 B2）**——官方"整文件上传"需传入**公网可访问 URL**（Poller 无公网入口，不可用）；分片上传（预上传 → 分片 PUT → 完成合并）无需公网 CDN，是唯一可选路径。注意单聊/群聊上传**不互通**（独立端点 `/v2/users/{openid}/files` 与 `/v2/groups/{group_openid}/files`）+ `file_info` 有 TTL，上传必须在发送时刻执行（不在任务终态捕获时）。小文件可评估 `srv_send_msg=true` 上传直发（占用主动消息频次）。
   - 飞书：`im/v1/images`（图片）/`im/v1/files`（文件）上传拿 key → 消息 content。
   - 钉钉：`media/upload` 拿 `mediaId` → 消息 `msgtype=image|file`。
   - 企微：`media/upload` 拿 `media_id` → 消息。
@@ -162,7 +163,7 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
 
 | 能力 | 状态 | 落点 |
 |---|---|---|
-| 入站理解（图片） | ✅ 已落地 | §4 |
+| 入站理解（图片） | ✅ 已落地（微信 2026-08-13；QQ/飞书/钉钉/企微提取 2026-08-13 审查补齐，钉钉/企微下载 API 待实测） | §4 |
 | code_run 防护 + OCR 依赖 | ✅ 已落地 | §4.3 |
 | 出站发送（文件/图/视频） | ❌ 仅微信通；飞书/QQ/钉钉/企微 `send_file` 为 `NotImplementedError` | §5 Phase A |
 | 生图 | ❌ GA 无原生；llm-proxy 仅 chat 路径 | §6 Phase B |
@@ -173,7 +174,8 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
 
 | 期 | 内容 | 验收 |
 |---|---|---|
-| Phase A | 出站媒体统一：基类 `send_media` + 5 渠道上传适配 + delivery MIME 分发 | 微信/QQ/飞书各发 docx/图片/视频成功；失败路径诚实提示 |
+| Phase A-0（前置，2026-08-13 审查阻断项） | ①四渠道入站媒体提取（QQ URL 直下 / 飞书 resources API / 钉钉 downloadCode / 企微 media_id+直链，公共下载器 `bot_poller/media_downloader.py`）——✅ 已实施；②GA 注入 base64 总量预算（对齐 llm-proxy 4MiB 上限）——✅ 已实施；③文档修订（本稿）——✅ | poller 单测 + 真实渠道冒烟（钉钉/企微下载 API 端点待凭据实测） |
+| Phase A | 出站媒体统一：基类 `send_media` + 5 渠道上传适配（QQ=分片定案）+ delivery MIME 分发 | 微信/QQ/飞书各发 docx/图片/视频成功；失败路径诚实提示 |
 | Phase B | 生图：`image_gen` 工具 + llm-proxy `images/generations` 代理 + capability `llm.image` + GA ImageGenClient | 模型画图 → 用户 IM 收到图（各渠道） |
 | Phase C | 视频：镜像补 ffmpeg + 入站抽帧注入 + 出站 `send_media(video)` | 用户发视频可分析；GA 可发视频 |
 
@@ -184,3 +186,8 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
 - 各渠道上传 API（QQ file_info 分片、钉钉/企微 media 上传）需真实凭据实测（mock 只覆盖请求形状）。
 - QQ 附件下载 URL 有时效（`rkey`），下载失败需按事件级重试语义处理（poller 已有 InboundCoalescingBuffer，媒体下载失败策略沿用：丢弃该媒体并记录，不阻塞文本消息）。
 - 生图模型按 provider 配置独立，需 llm-proxy 能力扩展同步安全审查（JTI 预算、白名单、模型匹配，同 chat 路径）。
+- **QQ 出站主动消息路径（审查 B5）**：异步 delivery 必超被动窗口（msg_id 5 分钟），媒体发送走主动消息——频控预算（单聊 20 QPM、日 1000/用户）与 C2C"用户近期交互"约束需 adapter 内实现并实测。
+- **钉钉/企微入站下载端点（审查 S4）**：钉钉 `POST /v1.0/robot/messageFiles/download`、企微 `media/get`（access_token 来源 = 智能机器人凭据，SDK token 端点未确认）——代码已按官方文档实现，真实凭据冒烟时验证。
+- **出站 8MiB 捕获上限 + task_delivery_files 存内容字节（审查 B4）**：Phase C 视频前必须改为 spool 引用模式（DB 只存路径/摘要），并按 media_type 分化上限；Phase A 图片沿用 8MiB 可接受。
+- **媒体留存（审查 I4）**：poller media_root 无清理、media_assets/tasks.media 无保留期——待定 90d + 容量上限清理策略。
+- **图片跨任务不保留（审查 I3）**：checkpoint 256KB 历史预算与 GA trim 会把含 base64 图片的消息从头部裁掉——图片只活单任务，为显式接受的 v1 语义（后续 file_id 引用方案再解决）；`_sanitize_leading_user_msg` 丢图时无占位提示，建议后续补 `[图片内容已省略]`。

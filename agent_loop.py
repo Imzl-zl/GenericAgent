@@ -48,6 +48,11 @@ def get_pretty_json(data):
 _ATTACH_IMG_RE = re.compile(r'(attachments/[^\s\],]+?\.(?:jpg|jpeg|png|gif|webp|bmp))', re.I)
 _ATTACH_IMG_MAX_BYTES = 3 * 1024 * 1024
 _ATTACH_IMG_MAX_COUNT = 3
+# 图片 base64 总量预算(2026-08-13 架构审查 B3): llm-proxy 请求体上限
+# MaxWorkerRequestBytes=4MiB(handler.go), base64 膨胀 ~4/3——单图 3MB 已
+# 触顶、多图必超限(413 BODY_TOO_LARGE)。注入层按估算 base64 总量贪婪选取
+# (3.5MB 预算 = 4MB 上限留 ~0.5MB JSON/文本余量), 超出部分跳过(日志)。
+_ATTACH_IMG_B64_BUDGET = 3_500_000
 
 # 附件根: 优先 GA 的 temp 目录(平台/桌面统一, 进程 cwd 可能是 /ga/legacy
 # 而不是 temp, 相对路径会解析错位——2026-08-13 生产实证); 回退 cwd。
@@ -121,6 +126,7 @@ def media_content_blocks(user_text, image_paths=None):
             seen.add(rel)
             refs.append(rel)
     picked = []
+    b64_budget = _ATTACH_IMG_B64_BUDGET
     for rel in refs:
         if len(picked) >= _ATTACH_IMG_MAX_COUNT:
             break
@@ -128,12 +134,20 @@ def media_content_blocks(user_text, image_paths=None):
         if full is None:
             continue
         try:
-            if os.path.getsize(full) > _ATTACH_IMG_MAX_BYTES:
+            size = os.path.getsize(full)
+            if size > _ATTACH_IMG_MAX_BYTES:
                 continue
         except OSError:
             continue
         if os.path.splitext(rel)[1].lstrip('.').lower() not in _IMG_MIME:
             continue
+        # 估算 base64 体积(4/3 膨胀 + 块开销), 总量预算内才入选(llm-proxy
+        # 4MiB 请求上限对齐, 审查 B3)。
+        est = size * 4 // 3 + 64
+        if est > b64_budget:
+            print(f'[Attach] skip {rel}: base64 est {est} exceeds remaining budget {b64_budget}')
+            continue
+        b64_budget -= est
         picked.append((rel, full))
     if not picked:
         return user_text

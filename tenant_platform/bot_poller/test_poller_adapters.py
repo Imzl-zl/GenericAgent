@@ -87,11 +87,13 @@ def test_feishu_p2p_and_non_text_messages():
         "om_4", "oc_x", "text", json.dumps({"text": "x"}), chat_type="")))
     assert posted[-1]["conversation_type"] == "private"
 
-    # 非文本消息(image 等): 文本为空但消息仍透传(平台可看到 media 提示)。
+    # 非文本消息(image 等)且未配置 media_root: 媒体无从下载, 丢弃不投递
+    # (不再回误导性的空文本 → 平台 "empty message ignored", 审查 B1)。
+    # 配置 media_root 且下载成功时见 test_poller_inbound_media.py。
+    before = len(posted)
     adapter._handle_feishu_message(_FeishuData(_FeishuMessage(
         "om_3", "oc_group_xyz", "image", '{"image_key":"img_1"}')))
-    assert posted[-1]["text"] == ""
-    assert posted[-1]["message_id"] == "om_3"
+    assert len(posted) == before
 
     # 无 message_id 的消息被丢弃。
     before = len(posted)
