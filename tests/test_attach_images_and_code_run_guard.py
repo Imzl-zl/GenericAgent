@@ -158,3 +158,22 @@ class TestAttachmentImageInjection:
             assert max(img.size) <= 1568
         finally:
             os.chdir(cwd)
+
+    def test_budget_skip_appends_placeholder(self):
+        """base64 预算超限跳过的图片必须向用户显式占位(失败诚实,
+        2026-08-14 审查 S1)——>2.62MiB 单图 base64 估算超 3.5MB 预算被跳过。"""
+        cwd = os.getcwd()
+        try:
+            tmp = tempfile.mkdtemp()
+            os.makedirs(os.path.join(tmp, "attachments"))
+            # 3MB 图片: est = 3*4/3+64 > 3.5MB 预算 → 跳过(超单图上限内,
+            # 但超 base64 总量预算, 正是审查 B3 的冲突场景)。
+            with open(os.path.join(tmp, "attachments", "F001_big.jpg"), "wb") as f:
+                f.write(b"\xff\xd8\xff" + b"x" * (3 * 1024 * 1024))
+            os.chdir(tmp)
+            out = media_content_blocks("看图", ["attachments/F001_big.jpg"])
+            assert isinstance(out, str)
+            assert "[图片已跳过：超出模型输入预算" in out
+            assert out.startswith("看图")
+        finally:
+            os.chdir(cwd)

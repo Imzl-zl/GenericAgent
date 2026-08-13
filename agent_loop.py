@@ -126,6 +126,7 @@ def media_content_blocks(user_text, image_paths=None):
             seen.add(rel)
             refs.append(rel)
     picked = []
+    skipped = []  # (rel, 原因)——预算/大小跳过时向用户显式占位(失败诚实, 2026-08-14 审查 S1)
     b64_budget = _ATTACH_IMG_B64_BUDGET
     for rel in refs:
         if len(picked) >= _ATTACH_IMG_MAX_COUNT:
@@ -136,6 +137,7 @@ def media_content_blocks(user_text, image_paths=None):
         try:
             size = os.path.getsize(full)
             if size > _ATTACH_IMG_MAX_BYTES:
+                skipped.append((rel, f'{size} bytes > 3MB single-image cap'))
                 continue
         except OSError:
             continue
@@ -146,12 +148,17 @@ def media_content_blocks(user_text, image_paths=None):
         est = size * 4 // 3 + 64
         if est > b64_budget:
             print(f'[Attach] skip {rel}: base64 est {est} exceeds remaining budget {b64_budget}')
+            skipped.append((rel, f'base64 est {est} > remaining budget {b64_budget}'))
             continue
         b64_budget -= est
         picked.append((rel, full))
+    placeholder = ''
+    if skipped:
+        # 用户发了图但模型看不到: 显式占位而非静默忽略(设计原则 6 失败诚实)。
+        placeholder = '\n\n[图片已跳过：超出模型输入预算，图片内容未提供给模型]'
     if not picked:
-        return user_text
-    blocks = [{"type": "text", "text": user_text}]
+        return user_text if not placeholder else user_text + placeholder
+    blocks = [{"type": "text", "text": user_text + placeholder}]
     injected = 0
     for rel, full in picked:
         block, n = _image_block_from_file(full, rel)

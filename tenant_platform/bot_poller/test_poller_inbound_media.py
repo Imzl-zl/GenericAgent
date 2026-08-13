@@ -97,6 +97,64 @@ def test_download_url_bounded_size_cap_and_atomic_write(monkeypatch, tmp_path):
     assert path2 == path
 
 
+def test_download_url_bounded_streaming_size_cap_and_tmp_cleanup(monkeypatch, tmp_path):
+    """无 Content-Length 时按流式累计上限中断, 且不留临时文件
+    (2026-08-14 审查 I4: 流式落盘, 内存峰值=缓冲块)。"""
+    class _Resp:
+        headers = {}  # 无 Content-Length: 走累计上限
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield b"a" * 512
+            yield b"b" * 512
+            yield b"c" * 512
+
+    monkeypatch.setattr(media_dl.requests, "get", lambda url, **kw: _Resp())
+    with pytest.raises(ValueError, match="exceeded"):
+        media_dl.download_url_bounded(
+            "https://multimedia.nt.qq.com.cn/download?appid=1&fileid=2&rkey=3",
+            str(tmp_path), file_name="photo.jpg",
+            allowed_hosts=media_dl.QQ_MEDIA_HOSTS, max_bytes=1024)
+    # 失败路径无残留临时文件(原子性)。
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_url_bounded_sniffs_ext_from_stream_head(monkeypatch, tmp_path):
+    """魔数嗅探用流头部字节(落盘名在流结束后确定, 语义与 save 一致)。"""
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 200
+
+    class _Resp:
+        headers = {"Content-Length": str(len(png))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield png[:7]
+            yield png[7:]
+
+    monkeypatch.setattr(media_dl.requests, "get", lambda url, **kw: _Resp())
+    path = media_dl.download_url_bounded(
+        "https://multimedia.nt.qq.com.cn/download?appid=1&fileid=2&rkey=3",
+        str(tmp_path), file_name="img_v2_key",
+        allowed_hosts=media_dl.QQ_MEDIA_HOSTS)
+    assert path.endswith(".png")  # 跨 chunk 边界嗅探(前 16 字节累积)
+
+
 def test_save_bytes_bounded_sniffs_extension(tmp_path):
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
     path = media_dl.save_bytes_bounded(png, str(tmp_path), file_name="img_v2_key")

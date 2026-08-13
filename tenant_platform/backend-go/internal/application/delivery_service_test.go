@@ -952,3 +952,30 @@ func TestDeleteExpiredMediaAssetsRetention(t *testing.T) {
 		t.Fatal("fresh asset must be kept")
 	}
 }
+
+// TestDeliveryServiceSpoolPathCannotEscapeSnapshotDir 验证 DB 读出的
+// SpoolPath 含路径穿越时(纵深防御, 2026-08-14 审查 S2: 值虽由构造保证
+// 安全, 但防污染行把读取引到 spool 根外) buildPayload 拒绝该 delivery,
+// 不发送任何内容, 走 PAYLOAD_BUILD_FAILED 死信。
+func TestDeliveryServiceSpoolPathCannotEscapeSnapshotDir(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("see [FILE:outputs/ok.png]")}
+	deps.store.files = []domain.DeliveryFile{{
+		Marker: "outputs/ok.png", FileName: "ok.png",
+		RelPath: "outputs/ok.png", Digest: "sha256:b", SizeBytes: 3,
+		SpoolPath: "../../escape.png", // 恶意/污染行: 逃逸 spool 根
+	}}
+	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}}
+
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sentFiles) != 0 {
+		t.Fatalf("expected no sent files for escaping spool path, got %d", len(deps.transport.sentFiles))
+	}
+	if len(deps.store.deadLetters) != 1 || deps.store.deadLetters[0].Code != "PAYLOAD_BUILD_FAILED" {
+		t.Fatalf("expected PAYLOAD_BUILD_FAILED dead-letter, got %+v", deps.store.deadLetters)
+	}
+}

@@ -15,6 +15,9 @@ RUN groupadd --system --gid 10003 ga-delivery \
     && pip install --no-cache-dir 'qq-botpy>=1.0' 'lark-oapi>=1.7' 'wecom-aibot-sdk>=1.0' 'dingtalk-stream>=0.20'
 
 COPY tenant_platform/bot_poller/poller_server.py /opt/ga/legacy/tenant_platform/bot_poller/poller_server.py
+# 2026-08-14 审查 B1: poller_server 顶层 import media_downloader, 镜像缺此文件
+# 会 ModuleNotFoundError 启动即崩(此前单测跑源码树未暴露)。
+COPY tenant_platform/bot_poller/media_downloader.py /opt/ga/legacy/tenant_platform/bot_poller/media_downloader.py
 COPY frontends/wxbot_client.py frontends/wxbot_media.py /opt/ga/legacy/frontends/
 RUN chmod -R a-w /opt/ga/legacy
 

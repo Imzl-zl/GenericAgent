@@ -84,6 +84,34 @@ def test_send_media_size_limit_enforced(tmp_path):
         adapter.send_media("u1", str(big), "image")
 
 
+def test_send_media_size_limit_per_type(tmp_path):
+    """默认按 media_type 分档(2026-08-14 审查 I2): image ≤20MiB /
+    video ≤100MiB / file ≤8MiB——对齐 Go delivery_capture per-type 上限。"""
+    adapter = _StubAdapter()
+
+    def _sparse(name, size):
+        p = tmp_path / name
+        with open(p, "wb") as f:
+            f.truncate(size)  # 稀疏文件: 不占真实字节
+        return p
+
+    # file 类型 9MiB 拒绝(>8MiB), 同一文件按 image 放行(≤20MiB)。
+    f9 = _sparse("f9.bin", 9 << 20)
+    with pytest.raises(ValueError, match="size limit"):
+        adapter.send_media("u1", str(f9), "file")
+    adapter.send_media("u1", str(f9), "image")
+    # image 21MiB 拒绝(>20MiB)。
+    img21 = _sparse("img21.jpg", 21 << 20)
+    with pytest.raises(ValueError, match="size limit"):
+        adapter.send_media("u1", str(img21), "image")
+    # video 21MiB 放行(≤100MiB), 101MiB 拒绝。
+    adapter.send_media("u1", str(img21), "video")
+    v101 = _sparse("v101.mp4", 101 << 20)
+    with pytest.raises(ValueError, match="size limit"):
+        adapter.send_media("u1", str(v101), "video")
+    assert adapter.calls[-1] == ("video", "u1", str(img21), "")
+
+
 def test_send_media_unimplemented_raises_not_implemented(tmp_path):
     class _NoMediaAdapter(poller_server.BotAdapter):
         channel_type = 'stub'
@@ -158,11 +186,14 @@ def _sync_qq(monkeypatch):
 
 
 def test_qq_media_upload_chunked_and_sent_active(tmp_path, monkeypatch):
+    """官方 4 步分片流程(2026-08-14 审查 B2): prepare → 逐片 PUT →
+    逐片 upload_part_finish → /files 合并 → msg_type=7 主动消息。"""
     _sync_qq(monkeypatch)
     file_bytes = b"y" * 200
     media_file = tmp_path / "pic.jpg"
     media_file.write_bytes(file_bytes)
     presigned_hits = []
+    part_finishes = []
 
     def handler(method, path, body):
         if path == "/v2/users/ou_1/upload_prepare":
@@ -173,8 +204,13 @@ def test_qq_media_upload_chunked_and_sent_active(tmp_path, monkeypatch):
             return {"upload_id": "up_1", "block_size": 64,
                     "parts": [{"index": i, "presigned_url": f"https://cos.example.com/p{i}"}
                               for i in range(4)]}
-        if path == "/v2/users/ou_1/upload_finish":
-            assert body == {"upload_id": "up_1"}
+        if path == "/v2/users/ou_1/upload_part_finish":
+            part_finishes.append(body)
+            return {}
+        if path == "/v2/users/ou_1/files":
+            # 官方合并端点: 携带 upload_id + file_type + file_name + srv_send_msg
+            assert body == {"upload_id": "up_1", "file_type": 1,
+                            "file_name": "pic.jpg", "srv_send_msg": False}
             return {"file_info": "FI_1"}
         if path == "/v2/users/ou_1/messages":
             assert body == {"msg_type": 7, "media": {"file_info": "FI_1"}}
@@ -192,10 +228,50 @@ def test_qq_media_upload_chunked_and_sent_active(tmp_path, monkeypatch):
     assert len(presigned_hits) == 4
     assert presigned_hits[0][1] == 64
     assert presigned_hits[-1][1] == 8
+    # 每片 PUT 后必须 upload_part_finish(官方第 3 步)。
+    assert len(part_finishes) == 4
+    assert part_finishes[0]["part_index"] == 0 and part_finishes[0]["block_size"] == "64"
+    assert part_finishes[-1]["part_index"] == 3 and part_finishes[-1]["block_size"] == "8"
+    assert part_finishes[0]["upload_id"] == "up_1" and part_finishes[0]["md5"]
     http = adapter._client.api._http
     assert http.calls[0][0] == "POST" and http.calls[0][1].endswith("/upload_prepare")
     assert http.calls[-1][1].endswith("/messages")
     assert http.calls[-1][2]["media"]["file_info"] == "FI_1"
+
+
+def test_qq_media_part_block_size_slicing(tmp_path, monkeypatch):
+    """逐片 block_size 优先于响应级(官方 parts[].block_size); 偏移按响应级
+    block_size 递增(index 从 0 起)。"""
+    _sync_qq(monkeypatch)
+    media_file = tmp_path / "vid.mp4"
+    media_file.write_bytes(bytes(range(256)))
+    part_sizes = []
+
+    def handler(method, path, body):
+        if path == "/v2/users/ou_1/upload_prepare":
+            return {"upload_id": "up_1", "block_size": 100,
+                    "parts": [{"index": 0, "presigned_url": "https://cos.example.com/p0",
+                                "block_size": 100},
+                               {"index": 1, "presigned_url": "https://cos.example.com/p1",
+                                "block_size": 100},
+                               {"index": 2, "presigned_url": "https://cos.example.com/p2",
+                                "block_size": 56}]}
+        if path == "/v2/users/ou_1/upload_part_finish":
+            return {}
+        if path == "/v2/users/ou_1/files":
+            return {"file_info": "FI_1"}
+        if path == "/v2/users/ou_1/messages":
+            return {}
+        raise AssertionError(f"unexpected qq route {method} {path}")
+
+    def fake_put(url, data, timeout):
+        part_sizes.append(len(data))
+        return type("R", (), {"raise_for_status": lambda self: None})()
+
+    monkeypatch.setattr(poller_server.requests, "put", fake_put)
+    adapter = _qq_adapter(tmp_path, handler)
+    adapter._send_video("ou_1", str(media_file), file_name="vid.mp4")
+    assert part_sizes == [100, 100, 56]  # 最后一片按逐片 block_size 截断
 
 
 def test_qq_media_group_endpoints(tmp_path, monkeypatch):
@@ -207,7 +283,9 @@ def test_qq_media_group_endpoints(tmp_path, monkeypatch):
         if path == "/v2/groups/grp_1/upload_prepare":
             return {"upload_id": "up_g", "block_size": 5 * 1024 * 1024,
                     "parts": [{"index": 0, "presigned_url": "https://cos.example.com/g0"}]}
-        if path == "/v2/groups/grp_1/upload_finish":
+        if path == "/v2/groups/grp_1/upload_part_finish":
+            return {}
+        if path == "/v2/groups/grp_1/files":
             return {"file_info": "FI_G"}
         if path == "/v2/groups/grp_1/messages":
             assert body == {"msg_type": 7, "media": {"file_info": "FI_G"}}
@@ -231,6 +309,43 @@ def test_qq_media_group_endpoints(tmp_path, monkeypatch):
     assert all("/groups/" in c[1] for c in http.calls)
 
 
+def test_qq_media_unknown_kind_falls_back_group_then_c2c(tmp_path, monkeypatch):
+    """未知目标(重启后 _target_kinds 清空/多实例): 先试群再退单聊,
+    send_text 同款兜底(2026-08-14 审查 I3)。"""
+    _sync_qq(monkeypatch)
+    media_file = tmp_path / "pic.jpg"
+    media_file.write_bytes(b"x" * 32)
+    group_tried = []
+
+    def handler(method, path, body):
+        if path == "/v2/groups/grp_1/upload_prepare":
+            group_tried.append(True)
+            raise RuntimeError("invalid target")
+        if path == "/v2/users/grp_1/upload_prepare":
+            return {"upload_id": "up_1", "block_size": 64,
+                    "parts": [{"index": 0, "presigned_url": "https://cos.example.com/p0"}]}
+        if path == "/v2/users/grp_1/upload_part_finish":
+            return {}
+        if path == "/v2/users/grp_1/files":
+            return {"file_info": "FI_1"}
+        if path == "/v2/users/grp_1/messages":
+            return {}
+        raise AssertionError(f"unexpected qq route {method} {path}")
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(poller_server.requests, "put", lambda url, data, timeout: _Resp())
+    adapter = _qq_adapter(tmp_path, handler)
+    # target 未知(不在 _target_kinds): 先打群端点失败 → 退 C2C 成功。
+    adapter._target_kinds.pop("grp_1", None)
+    adapter._send_image("grp_1", str(media_file), file_name="pic.jpg")
+    assert group_tried == [True]
+    http = adapter._client.api._http
+    assert http.calls[-1][1] == "/v2/users/grp_1/messages"
+
+
 def test_qq_media_rate_limit_fail_closed(tmp_path, monkeypatch):
     _sync_qq(monkeypatch)
     media_file = tmp_path / "pic.jpg"
@@ -240,7 +355,9 @@ def test_qq_media_rate_limit_fail_closed(tmp_path, monkeypatch):
         if path.endswith("/upload_prepare"):
             return {"upload_id": "up_1", "block_size": 64,
                     "parts": [{"index": 0, "presigned_url": "https://cos.example.com/p0"}]}
-        if path.endswith("/upload_finish"):
+        if path.endswith("/upload_part_finish"):
+            return {}
+        if path.endswith("/files"):
             return {"file_info": "FI_1"}
         return {}
 

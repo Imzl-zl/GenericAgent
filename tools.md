@@ -22,6 +22,8 @@
 
 定向验证：
 - 集成测试前先设 `TEST_DATABASE_URL`（真实 PostgreSQL）；缺失时集成测试显式失败
+- **本机测试库（2026-08-14 实证）：`ga-test-pg` 容器（独立容器，非 compose），`127.0.0.1:55433`，用户/密码/库均 `test`：`export TEST_DATABASE_URL='postgresql://test:test@127.0.0.1:55433/test?sslmode=disable'`——不设此变量跑 Go 集成测试会大面积假失败（勿当成回归）
+- **集成测试 E2E 依赖（CI 单独装，不在 pyproject）：`uv pip install 'psycopg[binary]' psutil`**（psycopg 播种旧实例数据、psutil 验 worker 进程隔离）；缺失时对应场景 ModuleNotFoundError 失败
 - 集成测试直插 workspace 必须幂等（`ON CONFLICT (session_key) DO NOTHING`）——注册路径已自动建行（0050 不变量）；`_register_user` 先例
 - 契约绑定测试：`tenant_platform/tests/contract`（import worker-python 生成代码，需 protobuf/grpcio）
 - 安全测试：`tenant_platform/tests/security`（子进程调用 go test 验证 Worker 无真实密钥）

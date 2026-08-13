@@ -399,9 +399,12 @@ class BotAdapter(ABC):
     # "上传 + 发送"薄适配(_send_image/_send_file/_send_video)。不支持/未实现
     # 抛 NotImplementedError → Go 侧 delivery 走既有错误路径(fail-closed,
     # 决策 A3: 不静默降级文本)。
-    # media_size_limit: 防御性单文件上限, 对齐 Go defaultMaxDeliverableBytes
-    # (8MiB, delivery_safety.go)——捕获层已限, 此处纵深防御。
-    media_size_limit = 8 << 20
+    # media_size_limit: 防御性单文件上限, 对齐 Go delivery_safety per-type
+    # 上限(delivery_capture.go maxDeliverableBytesByType: image ≤20MiB /
+    # video ≤100MiB / file ≤8MiB——捕获层已限, 此处按类型分档的纵深防御,
+    # 决策 A4/T5)。None = 按 media_type 分档; 子类/测试可覆盖为固定值。
+    media_size_limit = None
+    _MEDIA_SIZE_LIMITS = {'image': 20 << 20, 'video': 100 << 20, 'file': 8 << 20}
 
     def send_media(self, target, file_path, media_type, file_name='', client_id=''):
         """统一出站媒体入口: 校验 → 按 media_type 分发到 _send_*。"""
@@ -409,9 +412,12 @@ class BotAdapter(ABC):
             raise ValueError(f'unsupported media_type: {media_type}')
         if not file_path or not os.path.isfile(file_path):
             raise ValueError(f'media file not found: {file_path}')
-        if self.media_size_limit > 0 and os.path.getsize(file_path) > self.media_size_limit:
+        limit = self.media_size_limit
+        if limit is None:
+            limit = self._MEDIA_SIZE_LIMITS.get(media_type, 8 << 20)
+        if limit > 0 and os.path.getsize(file_path) > limit:
             raise ValueError(
-                f'media {file_path} exceeds size limit {self.media_size_limit}')
+                f'media {file_path} exceeds size limit {limit}')
         handler = {'image': self._send_image,
                    'file': self._send_file,
                    'video': self._send_video}[media_type]
@@ -1518,80 +1524,163 @@ class QQAdapter(BotAdapter):
             raise _QQRateLimited(resp)
         return resp or {}
 
-    def _upload_media(self, target, file_path, file_name, file_type):
-        """QQ 分片上传 → file_info(官方 rich-media 文档: 分片无需公网 URL;
-        upload_prepare 10 QPS; upload_config 默认 concurrency=1 串行即可)。
+    def _media_endpoint_sets(self, target):
+        """按目标类型返回 QQ 富媒体端点组(官方: 单聊/群聊上传不互通)。
 
-        file_type(官方 upload_prepare): 1=图片 2=视频 3=语音 4=文件。
-        单聊端点 /v2/users/{openid}/upload_prepare, 群聊
-        /v2/groups/{group_openid}/upload_prepare(不互通, 按目标类型选)。
+        每组 = (prepare, part_finish, files, messages) 四端点模板。已知目标
+        只返回对应组; 未知目标先群后单聊兜底(send_text 同款语义, 审查 I3)——
+        群目标打 C2C 端点或反之都会失败, 兜底保证 poller 重启/多实例后
+        媒体交付仍可用。上传与发送必须同组(单聊上传的 file_info 只能发
+        单聊, 官方 rich-media 文档)。
+        """
+        with self._stream_lock:
+            kind = self._target_kinds.get(target)
+        group = (
+            '/v2/groups/{group_openid}/upload_prepare',
+            '/v2/groups/{group_openid}/upload_part_finish',
+            '/v2/groups/{group_openid}/files',
+            '/v2/groups/{group_openid}/messages',
+        )
+        c2c = (
+            '/v2/users/{openid}/upload_prepare',
+            '/v2/users/{openid}/upload_part_finish',
+            '/v2/users/{openid}/files',
+            '/v2/users/{openid}/messages',
+        )
+        if kind == 'group':
+            return [group]
+        if kind == 'c2c':
+            return [c2c]
+        return [group, c2c]
+
+    def _upload_media(self, target, file_path, file_name, file_type):
+        """QQ 分片上传 → (file_info, send_tpl)(官方 4 步流程, 2026-08-14 审查 B2)。
+
+        官方(rich-media 文档): ① upload_prepare 拿 upload_id/block_size/各片
+        presigned_url → ② 逐片 PUT → ③ 每片 PUT 成功后 upload_part_finish
+        (upload_id/part_index/block_size/md5) → ④ 全部分片完成后 POST
+        .../files {upload_id, file_type, file_name, srv_send_msg=false}
+        合并 → file_info。
+
+        md5/sha1/md5_10m 单遍流式计算(内存峰值 = 单分片缓冲, 审查 I4);
+        md5_10m 官方明示为文件前 10002432 字节(约 9.54MB)的 MD5。
+        upload_prepare 10 QPS、part_finish 10 QPS——串行天然满足, 不加桶。
+        file_info 有 TTL, 必须在发送时刻上传(设计 B2)。
         """
         import hashlib as _hl
         size = os.path.getsize(file_path)
+        md5 = _hl.md5()
+        sha1 = _hl.sha1()
+        md5_10m = _hl.md5()
+        _md5_10m_remaining = 10002432
         with open(file_path, 'rb') as f:
-            whole = f.read()
-        md5 = _hl.md5(whole).hexdigest()
-        sha1 = _hl.sha1(whole).hexdigest()
-        md5_10m = _hl.md5(whole[:10002432]).hexdigest()
-        with self._stream_lock:
-            kind = self._target_kinds.get(target)
-        if kind == 'group':
-            prepare_tpl = '/v2/groups/{group_openid}/upload_prepare'
-            finish_tpl = '/v2/groups/{group_openid}/upload_finish'
-        else:
-            prepare_tpl = '/v2/users/{openid}/upload_prepare'
-            finish_tpl = '/v2/users/{openid}/upload_finish'
-        prepare = self._qq_request('POST', prepare_tpl, target, {
-            'file_type': file_type, 'file_size': str(size),
-            'file_name': file_name or os.path.basename(file_path),
-            'md5': md5, 'sha1': sha1, 'md5_10m': md5_10m,
-        })
-        upload_id = str(prepare.get('upload_id') or '')
-        parts = prepare.get('parts') or []
-        block_size = int(prepare.get('block_size') or 0) or 5 * 1024 * 1024
-        if not upload_id or not parts:
-            raise RuntimeError('qq upload_prepare returned no upload_id/parts')
-        for part in parts:
-            idx = int(part.get('index', -1))
-            if idx < 0:
-                continue
-            chunk = whole[idx * block_size:(idx + 1) * block_size]
-            presigned = str(part.get('presigned_url') or '')
-            if not presigned:
-                raise RuntimeError(f'qq upload part {idx} missing presigned_url')
-            resp = requests.put(presigned, data=chunk, timeout=300)
-            resp.raise_for_status()
-        finish = self._qq_request('POST', finish_tpl, target, {'upload_id': upload_id})
-        file_info = str(finish.get('file_info') or '')
-        if not file_info:
-            raise RuntimeError('qq upload_finish returned empty file_info')
-        return file_info
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                md5.update(chunk)
+                sha1.update(chunk)
+                if _md5_10m_remaining > 0:
+                    take = min(_md5_10m_remaining, len(chunk))
+                    md5_10m.update(chunk[:take])
+                    _md5_10m_remaining -= take
+        last_exc = None
+        for prepare_tpl, part_finish_tpl, files_tpl, send_tpl in self._media_endpoint_sets(target):
+            try:
+                prepare = self._qq_request('POST', prepare_tpl, target, {
+                    'file_type': file_type, 'file_size': str(size),
+                    'file_name': file_name or os.path.basename(file_path),
+                    'md5': md5.hexdigest(), 'sha1': sha1.hexdigest(),
+                    'md5_10m': md5_10m.hexdigest(),
+                })
+                upload_id = str(prepare.get('upload_id') or '')
+                parts = prepare.get('parts') or []
+                block_size = int(prepare.get('block_size') or 0) or 5 * 1024 * 1024
+                if not upload_id or not parts:
+                    raise RuntimeError('qq upload_prepare returned no upload_id/parts')
+                for part in parts:
+                    idx = int(part.get('index', -1))
+                    if idx < 0:
+                        continue
+                    presigned = str(part.get('presigned_url') or '')
+                    if not presigned:
+                        raise RuntimeError(f'qq upload part {idx} missing presigned_url')
+                    # 切片: 偏移按响应级 block_size 递增(index 从 0 起, 官方);
+                    # 单片长度优先逐片 block_size(官方 parts[].block_size)。
+                    part_block = int(part.get('block_size') or 0) or block_size
+                    offset = idx * block_size
+                    length = min(part_block, max(0, size - offset))
+                    if length <= 0:
+                        raise RuntimeError(f'qq upload part {idx} offset out of range')
+                    part_md5 = _hl.md5()
+                    with open(file_path, 'rb') as f:
+                        f.seek(offset)
+                        data = f.read(length)
+                    part_md5.update(data)
+                    self._put_part_with_retry(presigned, data, idx)
+                    # ③ 每片完成确认(官方: PUT 成功后必须通知, 否则合并失败)。
+                    self._qq_request('POST', part_finish_tpl, target, {
+                        'upload_id': upload_id, 'part_index': idx,
+                        'block_size': str(length), 'md5': part_md5.hexdigest(),
+                    })
+                # ④ 合并: .../files {upload_id, file_type, file_name, srv_send_msg}
+                # (srv_send_msg=false 仅上传不直发, 发送走 _send_media_message
+                # 统一频控; 官方上传接口频率限制 50 QPS)。
+                finish = self._qq_request('POST', files_tpl, target, {
+                    'upload_id': upload_id,
+                    'file_type': file_type,
+                    'file_name': file_name or os.path.basename(file_path),
+                    'srv_send_msg': False,
+                })
+                file_info = str(finish.get('file_info') or '')
+                if not file_info:
+                    raise RuntimeError('qq upload merge returned empty file_info')
+                return file_info, send_tpl
+            except _QQRateLimited:
+                raise  # 限流是频控信号, 换端点无意义(fail-closed)
+            except Exception as exc:
+                # 未知目标端点不匹配(如群目标打 C2C 端点): 尝试下一组;
+                # 已知目标只有一组, 异常原样上抛不掩盖。
+                last_exc = exc
+        raise RuntimeError(f'qq media upload failed: {last_exc}')
 
-    def _send_media_message(self, target, file_info):
-        """主动媒体消息(msg_type=7 media.file_info)。频控: per-target 令牌桶,
-        超限 fail-closed(抛错 → Go delivery 重试)。"""
+    @staticmethod
+    def _put_part_with_retry(presigned, data, part_idx):
+        """分片 PUT 到预签名 URL(官方 upload_config.retry_timeout=300s 语义的
+        有界版): 最多 3 次退避重试, 仍失败抛错(整体上传失败 → delivery 重试)。
+        PUT 幂等(同一 presigned_url 重 PUT 同内容)。"""
+        last_exc = None
+        for attempt in range(3):
+            try:
+                resp = requests.put(presigned, data=data, timeout=300)
+                resp.raise_for_status()
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(1 * (2 ** attempt))
+        raise RuntimeError(f'qq upload part {part_idx} failed after retries: {last_exc}')
+
+    def _send_media_message(self, target, file_info, send_tpl):
+        """主动媒体消息(msg_type=7 media.file_info, 官方)。频控: per-target
+        令牌桶, 超限 fail-closed(抛错 → Go delivery 重试)。send_tpl 必须与
+        上传同场景(单聊/群聊 file_info 不互通)。"""
         if not self._qq_bucket(target).acquire(timeout=5.0):
             raise RuntimeError(f'qq active media rate limited for {target} (15 QPM)')
-        with self._stream_lock:
-            kind = self._target_kinds.get(target)
-        payload = {'msg_type': 7, 'media': {'file_info': file_info}}
-        if kind == 'group':
-            self._qq_request('POST', '/v2/groups/{group_openid}/messages',
-                             target, payload)
-        else:
-            self._qq_request('POST', '/v2/users/{openid}/messages', target, payload)
+        self._qq_request('POST', send_tpl, target,
+                         {'msg_type': 7, 'media': {'file_info': file_info}})
 
     def _send_image(self, target, file_path, file_name='', client_id=''):
-        file_info = self._upload_media(target, file_path, file_name, file_type=1)
-        self._send_media_message(target, file_info)
+        file_info, send_tpl = self._upload_media(target, file_path, file_name, file_type=1)
+        self._send_media_message(target, file_info, send_tpl)
 
     def _send_file(self, target, file_path, file_name='', client_id=''):
-        file_info = self._upload_media(target, file_path, file_name, file_type=4)
-        self._send_media_message(target, file_info)
+        file_info, send_tpl = self._upload_media(target, file_path, file_name, file_type=4)
+        self._send_media_message(target, file_info, send_tpl)
 
     def _send_video(self, target, file_path, file_name='', client_id=''):
-        file_info = self._upload_media(target, file_path, file_name, file_type=2)
-        self._send_media_message(target, file_info)
+        file_info, send_tpl = self._upload_media(target, file_path, file_name, file_type=2)
+        self._send_media_message(target, file_info, send_tpl)
 
     # -- IM 流式输出: 单聊原生流式接口 -------------------------------------
     # 语义(IM_STREAMING_DELIVERY §4.3): open 发首帧(stream.id=null)拿

@@ -160,28 +160,54 @@ def save_bytes_bounded(data, dest_dir, *, file_name='', ext='', max_bytes=MAX_ME
 
 def download_url_bounded(url, dest_dir, *, file_name='', ext='', allowed_hosts=None,
                          max_bytes=MAX_MEDIA_BYTES, timeout=60):
-    """URL 直下(QQ 等): https + host 白名单 + 大小上限 + 原子落盘。
+    """URL 直下(QQ 等): https + host 白名单 + 大小上限 + 流式落盘 + 原子替换。
 
-    返回落盘绝对路径; 失败抛异常(调用方按"丢弃媒体保留文本"降级)。
-    Content-Length 预检 + 流式累计上限(与 wxbot_media._download_bounded 同构)。
+    与 save_bytes_bounded 同语义: 落盘名 = 内容 hash 前缀 + 清洗名, 同内容
+    重试复用已有落盘(不产生重复残留)。流式写入临时文件, 内存峰值 = 缓冲块
+    (2026-08-14 审查 I4: 原实现先整读再落盘, 100MB 媒体 2x 内存峰值,
+    poller 512m 限下并发大文件有 OOM 风险)。失败抛异常(调用方按
+    "丢弃媒体保留文本"降级)。Content-Length 预检 + 流式累计上限
+    (与 wxbot_media._download_bounded 同构)。
     """
     _validate_url(url, allowed_hosts)
     os.makedirs(dest_dir, exist_ok=True)
     headers = {'User-Agent': 'GenericAgent-bot-poller'}
-    with requests.get(url, headers=headers, timeout=timeout, stream=True) as resp:
-        resp.raise_for_status()
-        clen = resp.headers.get('Content-Length')
-        if clen and int(clen) > max_bytes:
-            raise ValueError(f'media too large: Content-Length={clen}')
-        chunks = []
-        total = 0
-        for chunk in resp.iter_content(chunk_size=_DL_CHUNK):
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError(f'media exceeded {max_bytes} bytes')
-            chunks.append(chunk)
-    return save_bytes_bounded(b''.join(chunks), dest_dir,
-                              file_name=file_name, ext=ext, max_bytes=max_bytes)
+    tmp_path = None
+    try:
+        with requests.get(url, headers=headers, timeout=timeout, stream=True) as resp:
+            resp.raise_for_status()
+            clen = resp.headers.get('Content-Length')
+            if clen and int(clen) > max_bytes:
+                raise ValueError(f'media too large: Content-Length={clen}')
+            tmp_path = os.path.join(dest_dir, f'.dl-{uuid.uuid4().hex[:8]}.tmp')
+            digest = hashlib.md5()
+            total = 0
+            head = b''  # 前 16 字节供魔数嗅探(落盘名在流结束后才确定)
+            with open(tmp_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=_DL_CHUNK):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f'media exceeded {max_bytes} bytes')
+                    digest.update(chunk)
+                    if len(head) < 16:
+                        head += chunk[:16 - len(head)]
+                    f.write(chunk)
+        ext = _resolve_ext(head, file_name, ext)
+        safe = safe_filename(file_name, ext)
+        path = os.path.join(dest_dir, f'{digest.hexdigest()[:10]}_{safe}')
+        if os.path.exists(path):
+            os.unlink(tmp_path)  # 同内容复用(与 save_bytes_bounded 一致)
+            tmp_path = None
+            return path
+        os.replace(tmp_path, path)
+        tmp_path = None
+        return path
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def build_media_item(path, media_root, file_name='', content_type=None):

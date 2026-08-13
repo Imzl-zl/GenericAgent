@@ -640,7 +640,15 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 				// spool 引用(2026-08-13 审查 B4/T5): 文件内容在任务成功事务时
 				// 已流式复制到共享卷(Platform rw / Poller ro), 发送前 Lstat
 				// 校验普通文件 + 类型上限(防卷被篡改, 纵深防御)。
-				spoolAbs := filepath.Join(s.snapshotDir, filepath.FromSlash(f.SpoolPath))
+				// 2026-08-14 审查 S2: SpoolPath 虽由构造保证安全(deliveryFileKey
+				// 清洗 + marker hash), 仍对 DB 读出的值做 Clean + 逃逸前缀校验
+				// (防污染行/误写把读取引到 spool 根外)。
+				clean := filepath.Clean(filepath.FromSlash(f.SpoolPath))
+				if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
+					removePayloadFiles(out)
+					return deliveryPayload{}, fmt.Errorf("spool file %q escapes spool root", f.SpoolPath)
+				}
+				spoolAbs := filepath.Join(s.snapshotDir, clean)
 				info, err := os.Lstat(spoolAbs)
 				if err != nil {
 					removePayloadFiles(out)

@@ -22,9 +22,21 @@ B4 8MiB+bytea / B5 QQ 主动消息路径）与重要项（I2 content_type、I4 �
 
 - 钉钉入站 `POST /v1.0/robot/messageFiles/download`、企微入站 `media/get`（智能机器人 token 端点未确认，探测式）
 - 钉钉出站 file/video（sampleFileMsg 需 downloadCode 上传流，暂 NotImplementedError fail-closed）
-- QQ 分片上传参数（upload_prepare/upload_finish 字段）与主动消息频控实测
+- **QQ 分片上传（2026-08-14 审查已按官方 4 步修正：upload_prepare → 逐片 PUT → upload_part_finish → /files 合并）与主动消息频控实测（重点验：分片 index 从 0 起、逐片 block_size 切片偏移）**
 - 飞书 media（视频）消息类型实测
-- 部署：**必须 make build 全量重建**（bot-poller + platform 必重建；ga-runner 本轮无改动）
+- 部署：**必须 make build 全量重建**（bot-poller + platform 必重建；ga-runner 内嵌 worker-python/src——2026-08-14 起 content_type 已透传下发，ga-runner 需一并重建以消费新契约）
+
+## 2026-08-14 审查修复（上轮变更集复查结论落地）
+
+| 项 | 内容 | 提交前验证 |
+|---|---|---|
+| B1 | bot-poller 镜像补 `COPY media_downloader.py`（此前容器启动 ModuleNotFoundError 即崩） | Dockerfile 已补 |
+| B2 | QQ 分片上传按官方 4 步重写：逐片 PUT 后 `upload_part_finish` + `POST .../files` 合并（upload_id/file_type/file_name/srv_send_msg=false）；`md5_10m` 官方值 10002432 字节确认正确；未知目标端点组先群后单聊兜底（I3）；分片 PUT 3 次退避重试 + 逐片 block_size（S3） | test_poller_outbound_media 4 步 mock + 兜底 + 切片单测 |
+| I1 | `toTaskMedia`/`workerTaskEnvelope` 补 ContentType 透传（此前契约字段空转，Phase C 前置失效） | scheduler_dispatch_test.go 透传断言 |
+| I2 | poller `send_media` 大小上限按 media_type 分档（image 20M/video 100M/file 8M，对齐 Go per-type；固定值覆盖兼容） | per-type 上限单测 |
+| I4 | `download_url_bounded` 改流式落盘（内存峰值=缓冲块，失败无 tmp 残留）；QQ 上传单遍流式哈希 | 流式/嗅探/清理单测 |
+| S1 | GA 图片超预算跳过时向用户显式占位（失败诚实） | 根测试占位断言 |
+| S2 | `buildPayload` spool 路径 Clean + 逃逸前缀校验（纵深防御） | 逃逸死信单测 |
 
 ## 有意推迟（决策 D6）
 

@@ -151,6 +151,10 @@ func toTaskMedia(refs []SessionFileRef) []domain.TaskMedia {
 			OriginalName: ref.OriginalName,
 			RelativePath: ref.RelativePath,
 			SizeBytes:    ref.SizeBytes,
+			// 2026-08-14 审查 I1: 渠道侧准确 MIME(webhook media_items, 飞书
+			// image 等无扩展名场景)随任务媒体清单透传——此前在此丢失, 契约
+			// 字段空转, Phase C 视频抽帧分派失效。
+			ContentType: ref.ContentType,
 		})
 	}
 	return out
@@ -179,6 +183,8 @@ func workerTaskEnvelope(task domain.Task, runnerGeneration uint64, capabilityJTI
 			OriginalName: m.OriginalName,
 			RelativePath: m.RelativePath,
 			SizeBytes:    m.SizeBytes,
+			// 2026-08-14 审查 I1: content_type 随契约下发(与 toTaskMedia 同步补齐)。
+			ContentType: m.ContentType,
 		})
 	}
 	return env
