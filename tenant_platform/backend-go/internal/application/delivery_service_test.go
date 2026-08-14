@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -600,7 +601,7 @@ type transportRecord struct {
 }
 
 type fileTransportRecord struct {
-	BotUUID, ChannelAccountID, FilePath, FileName, ClientID string
+	BotUUID, ChannelAccountID, FilePath, FileName, ClientID, MediaType string
 }
 
 func (t *fakeTransport) SendMessage(_ context.Context, botUUID, ilinkUserID, text, clientID string) error {
@@ -618,7 +619,7 @@ func (t *fakeTransport) SendFile(_ context.Context, botUUID, ilinkUserID, filePa
 	if t.err != nil {
 		return t.err
 	}
-	t.sentFiles = append(t.sentFiles, fileTransportRecord{BotUUID: botUUID, ChannelAccountID: ilinkUserID, FilePath: filePath, FileName: fileName, ClientID: clientID})
+	t.sentFiles = append(t.sentFiles, fileTransportRecord{BotUUID: botUUID, ChannelAccountID: ilinkUserID, FilePath: filePath, FileName: fileName, ClientID: clientID, MediaType: mediaType})
 	return nil
 }
 
@@ -950,6 +951,40 @@ func TestDeleteExpiredMediaAssetsRetention(t *testing.T) {
 	}
 	if len(deps.messages.assets) != 1 || deps.messages.assets[0].StoragePath != "bot/fresh.jpg" {
 		t.Fatal("fresh asset must be kept")
+	}
+}
+
+// TestDeliveryServiceSpoolMediaTypeUsesRelPath 回归(2026-08-14 事故根因):
+// spool 引用行此前漏设 deliveryFile.relPath → mediaTypeForPath("") 回退
+// "file" → 生成图全部走 file_item 原始上传 → CDN 节流超时 → 死信, 用户
+// 永远收不到图。spool 行的媒体类型必须来自 DB rel_path(.png → image)。
+func TestDeliveryServiceSpoolMediaTypeUsesRelPath(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("see [FILE:outputs/ok.png]")}
+	spoolAbs := filepath.Join(svc.snapshotDir, "capture", "t1", "hash_ok.png")
+	if err := os.MkdirAll(filepath.Dir(spoolAbs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(spoolAbs, []byte("png"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	deps.store.files = []domain.DeliveryFile{{
+		Marker: "outputs/ok.png", FileName: "ok.png",
+		RelPath: "outputs/ok.png", Digest: "sha256:b", SizeBytes: 3,
+		SpoolPath: "capture/t1/hash_ok.png",
+	}}
+	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}}
+
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sentFiles) != 1 {
+		t.Fatalf("expected 1 file delivery, got %+v", deps.transport.sentFiles)
+	}
+	if got := deps.transport.sentFiles[0].MediaType; got != "image" {
+		t.Fatalf("spool png media type = %q, want image (root cause 2026-08-14)", got)
 	}
 }
 

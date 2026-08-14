@@ -675,6 +675,11 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 				}
 				out.Files = append(out.Files, deliveryFile{
 					absPath:         spoolAbs,
+					// 2026-08-14 事故根因(交付死信): 此处漏设 relPath → 发送时
+					// mediaTypeForPath(file.relPath) 对空串回退 "file" → 图片
+					// 全部走 file_item 原始 1.4MB 上传 → CDN 节流超时 → 死信。
+					// relPath 同时承载媒体类型分类源(OpenBeneath 仅快照分支用)。
+					relPath:         filepath.FromSlash(f.RelPath),
 					displayName:     sanitizeDeliverableDisplayName(f.FileName, f.RelPath),
 					auditPath:       f.RelPath,
 					snapshotContent: true,
