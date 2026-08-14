@@ -702,6 +702,10 @@ func TestCompleteSucceededPersistsDeliveryFiles(t *testing.T) {
 	files := []domain.DeliveryFile{
 		{Marker: "outputs/report.docx", FileName: "report.docx", RelPath: "outputs/report.docx",
 			Content: []byte("final-content"), Digest: "sha256:abc", SizeBytes: 13},
+		// spool 引用行(2026-08-14 修复回归): Content 为 nil、SpoolPath 非空——
+		// 插入必须落空 bytea(COALESCE), 否则 content NOT NULL 违反→成功事务回滚。
+		{Marker: "outputs/image.png", FileName: "image.png", RelPath: "outputs/image.png",
+			Digest: "sha256:def", SizeBytes: 5, SpoolPath: "capture/k/image_abc.png"},
 	}
 	final, err := store.CompleteSucceeded(ctx, claimed.ID, "p1", snapshotID,
 		"snapshot:df", "sha256:bundle", "result:df", "sha256:result", 5, files)
@@ -711,13 +715,19 @@ func TestCompleteSucceededPersistsDeliveryFiles(t *testing.T) {
 	if final.Status != domain.TaskSucceeded {
 		t.Fatalf("status = %s", final.Status)
 	}
-	// LoadDeliveryFiles 必须返回快照。
+	// LoadDeliveryFiles 必须返回快照(ORDER BY marker: image.png 在前)。
 	got, err := store.LoadDeliveryFiles(ctx, domain.StableDeliveryID(task.ID, domain.DeliveryTaskComplete))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || string(got[0].Content) != "final-content" || got[0].Marker != "outputs/report.docx" {
+	if len(got) != 2 {
 		t.Fatalf("delivery files = %+v", got)
+	}
+	if got[0].Marker != "outputs/image.png" || got[0].SpoolPath != "capture/k/image_abc.png" || len(got[0].Content) != 0 {
+		t.Fatalf("spool delivery file = %+v", got[0])
+	}
+	if got[1].Marker != "outputs/report.docx" || string(got[1].Content) != "final-content" {
+		t.Fatalf("content delivery file = %+v", got[1])
 	}
 }
 
