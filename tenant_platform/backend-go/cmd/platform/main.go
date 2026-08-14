@@ -1133,7 +1133,7 @@ func run() error {
 			TeamMembership: store, // 审查 R5-I4: 团队任务交付前校验发起人成员资格
 			PollInterval:   2 * time.Second,
 			ClaimLease:     30 * time.Second,
-			RetryWindow:    5 * time.Minute,
+			RetryWindow:    30 * time.Minute,
 		}
 		deliverySvc, err = application.NewDeliveryService(deliveryCfg)
 		if err != nil {

@@ -194,9 +194,19 @@ class WxBotClient:
         url = upload_url.strip() if upload_url else f'{CDN_BASE}/upload?encrypted_query_param={quote(upload_param)}&filekey={filekey}'
         data = self._enc(raw, aes_key)
         last_err = None
+        # 2026-08-14 生产事故修复(微信生图交付死信): CDN 瞬时故障(握手挂起/
+        # SSLEOFError)时, 单一 timeout 同时覆盖连接与传输, 连接层故障最长
+        # 阻塞 timeout×3 次, 远超 Go delivery /send 预算(15s→90s) → 8 次重试
+        # 全部超时 → 死信, 用户永远收不到图。拆分超时: 连接层(TCP+TLS 握手)
+        # 10s 快速失败, 传输层保留长读超时; 失败退避 1/3s, 单次 /send 最坏
+        # ~33s, 落在 Go 侧媒体预算(90s)内, 重试窗口内有机会成功。
+        connect_timeout = min(10, max(1, timeout))
+        read_timeout = max(30, timeout)
         for attempt in range(1, 4):
             try:
-                r = requests.post(url, data=data, headers={'Content-Type': 'application/octet-stream', 'User-Agent': UA}, timeout=timeout)
+                r = requests.post(url, data=data,
+                                  headers={'Content-Type': 'application/octet-stream', 'User-Agent': UA},
+                                  timeout=(connect_timeout, read_timeout))
                 if 400 <= r.status_code < 500:
                     raise RuntimeError(f'CDN upload client error {r.status_code}: {r.headers.get("x-error-message") or r.text[:300]}')
                 if r.status_code != 200:
@@ -210,6 +220,7 @@ class WxBotClient:
                 last_err = e
                 if 'client error' in str(e) or attempt >= 3:
                     break
+                time.sleep(3 ** (attempt - 1))  # 1s, 3s 退避
                 print(f'[WX] CDN upload retry {attempt}: {e}', file=sys.__stdout__)
         raise last_err
 

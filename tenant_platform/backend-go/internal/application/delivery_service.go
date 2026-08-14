@@ -27,7 +27,7 @@ import (
 const (
 	defaultDeliveryPollInterval = 2 * time.Second
 	defaultDeliveryClaimLease   = 30 * time.Second
-	defaultDeliveryRetryWindow  = 5 * time.Minute
+	defaultDeliveryRetryWindow  = 30 * time.Minute
 	defaultDeliveryMaxBatch     = 8
 	// deliveryFilesRetention 是 task_delivery_files 快照的审计保留期
 	// (审查 R5-I3: 内容随 outbox 保留, 定期清理防无界增长)。
@@ -46,10 +46,17 @@ const (
 	minDeliveryBackoff     = time.Second
 	maxDeliveryBackoff     = 5 * time.Minute
 	deliverySendTimeout    = 15 * time.Second
+	// deliveryMediaSendTimeout 是媒体(文件/图片/视频)单次发送预算(2026-08-14
+	// 生产事故修复: 微信生图交付死信)。iLink CDN 上传(US→微信 CDN, AES 加密
+	// 整文件)正常 1-5s, 但连接层瞬时故障时旧逻辑挂到 read timeout(120s×3
+	// 次)才失败——远超文本 15s 预算, 8 次重试全部撞同一窗口 → 死信。现在
+	// poller 侧连接超时 10s 快速失败(退避 1/3s, 最坏 ~33s), 此处给媒体
+	// 90s 预算: 快速失败路径完全落在预算内, 慢传输也有足够余量。
+	deliveryMediaSendTimeout = 90 * time.Second
 	// maxDeliveryAttempts is a hard cap independent of the retry window. The
-	// 5-minute window already bounds attempts to ~8-10 under exponential
-	// backoff, but a clock anomaly or a task with NULL terminal_at (zero
-	// deadline) would otherwise retry forever. Pattern: SQS maxReceiveCount.
+	// 30-minute window already bounds attempts under exponential backoff, but a
+	// clock anomaly or a task with NULL terminal_at (zero deadline) would
+	// otherwise retry forever. Pattern: SQS maxReceiveCount.
 	maxDeliveryAttempts = 10
 )
 
@@ -445,7 +452,9 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				// (safefs 限长读取 + 普通文件校验), tmp 位于 Platform 私有
 				// 目录(0700), 直接发送, 无需二次快照。
 				if file.snapshotContent {
-					return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.relPath))
+					mediaCtx, mcancel := context.WithTimeout(ctx, deliveryMediaSendTimeout)
+					defer mcancel()
+					return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.relPath))
 				}
 				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
 				// 后复制到 Platform 私有快照, transport 发送不可变快照,
@@ -455,7 +464,9 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 					return snapErr
 				}
 				defer os.Remove(snap)
-				return s.cfg.Transport.SendFile(sendCtx, bot.BotUUID, replyTarget, snap, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.relPath))
+				mediaCtx, mcancel := context.WithTimeout(ctx, deliveryMediaSendTimeout)
+				defer mcancel()
+				return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, snap, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.relPath))
 			},
 			sendErrorCode: "SEND_FILE_FAILED",
 		})
