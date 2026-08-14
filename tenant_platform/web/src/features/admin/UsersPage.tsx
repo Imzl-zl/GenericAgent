@@ -114,7 +114,7 @@ export function UsersPage() {
       <header className="admin-header animate-fade-in-up">
         <div>
           <h1>用户审批</h1>
-          <p className="admin-subtitle">批准、封禁与管理平台用户</p>
+          <p className="admin-subtitle">批准、封禁与管理平台用户 · 待审批 {isLoading ? '...' : users.length} 人</p>
         </div>
         <Button variant="secondary" onClick={loadUsers} disabled={isLoading}>刷新</Button>
       </header>

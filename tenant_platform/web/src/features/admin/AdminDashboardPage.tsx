@@ -58,12 +58,14 @@ export function AdminDashboardPage() {
           <p className="admin-metric-value">
             {isLoading ? '...' : stats?.pending_users ?? 0}
           </p>
+          <p className="admin-metric-desc">与「用户审批」页列表一致</p>
         </Card>
         <Card className="animate-fade-in-up animate-delay-2">
           <p className="admin-metric-label">已批准用户</p>
           <p className="admin-metric-value accent">
             {isLoading ? '...' : stats?.approved_users ?? 0}
           </p>
+          <p className="admin-metric-desc">累计数，含系统自建账号（bootstrap、内置管理员）</p>
         </Card>
         <Card className="animate-fade-in-up animate-delay-3">
           <p className="admin-metric-label">运行中任务</p>
