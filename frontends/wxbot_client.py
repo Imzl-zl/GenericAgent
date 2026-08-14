@@ -300,7 +300,75 @@ class WxBotClient:
         return self._send_media(to_user_id, file_path, 3, ITEM_FILE, 'file_item', context_token, file_name=file_name, client_id=client_id)
 
     def send_image(self, to_user_id, file_path, context_token='', client_id=None):
-        return self._send_media(to_user_id, file_path, 1, ITEM_IMAGE, 'image_item', context_token, client_id=client_id)
+        # 2026-08-14 生产事故修复(微信生图交付死信, 根因之二): 本服务器
+        # (海外)→微信 C2C CDN 大文件上传被限速 ~20KB/s 且连接 ~30s 被杀,
+        # >~500KB 的静态图上传必失败(1.3-1.6MB 的生成图全部 dead-letter)。
+        # 交付侧透明适配: 超限静态图(png/jpeg/webp/bmp, 非动图)转 JPEG
+        # 并按质量/尺寸迭代缩到 ≤400KB 再上传——IM 场景视觉无损, 用户无感。
+        # GIF(动图)不转换(丢动画), 由生成端 size/质量控制。
+        adapted = self._fit_static_image_for_upload(file_path)
+        if adapted is None:
+            return self._send_media(to_user_id, file_path, 1, ITEM_IMAGE, 'image_item', context_token, client_id=client_id)
+        try:
+            return self._send_media(to_user_id, str(adapted), 1, ITEM_IMAGE, 'image_item', context_token, client_id=client_id)
+        finally:
+            try:
+                adapted.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    #: 微信 CDN 上传安全上限(实测节流阈值 ~450KB, 留余量)。
+    _IMAGE_UPLOAD_MAX_BYTES = 400 * 1024
+    _STATIC_IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+
+    def _fit_static_image_for_upload(self, file_path):
+        """超限静态图 → 临时 JPEG(≤400KB), 返回 Path; 无需转换返回 None。
+        失败(非图片/编码异常)返回 None, 由调用方走原图(错误语义不变)。"""
+        fp = Path(file_path)
+        try:
+            if fp.suffix.lower() not in self._STATIC_IMAGE_EXTS:
+                return None
+            if fp.stat().st_size <= self._IMAGE_UPLOAD_MAX_BYTES:
+                return None
+            from io import BytesIO
+            from PIL import Image
+            im = Image.open(fp)
+            im.load()
+            if getattr(im, 'is_animated', False):
+                return None  # 动图不转
+        except Exception:
+            return None
+        out = fp.with_name(f'.fit_{fp.stem}_{os.getpid()}.jpg')
+        try:
+            bio = BytesIO()
+            # 迭代压缩: q90→55 逐档降质, 仍超限再降采样 0.8^N。
+            buf = None
+            for quality in (90, 80, 70, 60, 55):
+                bio.seek(0); bio.truncate()
+                rgb = im.convert('RGB')
+                rgb.save(bio, format='JPEG', quality=quality)
+                if bio.tell() <= self._IMAGE_UPLOAD_MAX_BYTES:
+                    buf = bio.getvalue(); break
+            if buf is None:
+                scale, cur = 0.9, im
+                while scale > 0.3:
+                    w, h = int(im.width * scale), int(im.height * scale)
+                    cur = im.resize((w, h), Image.LANCZOS)
+                    bio.seek(0); bio.truncate()
+                    cur.convert('RGB').save(bio, format='JPEG', quality=70)
+                    if bio.tell() <= self._IMAGE_UPLOAD_MAX_BYTES:
+                        buf = bio.getvalue(); break
+                    scale -= 0.15
+            if buf is None:
+                return None
+            out.write_bytes(buf)
+            return out
+        except Exception:
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
 
     def send_video(self, to_user_id, file_path, context_token='', client_id=None):
         return self._send_media(to_user_id, file_path, 2, ITEM_VIDEO, 'video_item', context_token, client_id=client_id)

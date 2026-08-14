@@ -179,6 +179,73 @@ def test_file_upload_key_is_random_hex_not_filename(tmp_path):
     assert re.fullmatch(r"[0-9a-f]{32}", body["filekey"])
 
 
+def test_fit_static_image_for_upload_compresses_oversized_png(tmp_path):
+    """2026-08-14 生产事故回归: 微信 CDN 大文件上传被限速/断连, 超限静态图
+    必须在交付侧转 JPEG 压缩到 ≤400KB 再上传。超限 PNG → 合规 JPEG;
+    小图/非图片/动图不转换返回 None。"""
+    from PIL import Image
+
+    client = WxBotClient(token="test", persist=False)
+    big = tmp_path / "big.png"
+    # 1024x1024 噪声 PNG ≈ 1.4MB, 必然超限(稀疏噪声会被 PNG 压缩, 必须逐像素随机)
+    import random
+    im = Image.frombytes("RGB", (1024, 1024), random.Random(42).randbytes(1024 * 1024 * 3))
+    im.save(big, format="PNG")
+    assert big.stat().st_size > client._IMAGE_UPLOAD_MAX_BYTES
+
+    out = client._fit_static_image_for_upload(str(big))
+    assert out is not None, "oversized png must be adapted"
+    try:
+        assert out.stat().st_size <= client._IMAGE_UPLOAD_MAX_BYTES
+        with Image.open(str(out)) as adapted:
+            assert adapted.format == "JPEG"
+    finally:
+        out.unlink(missing_ok=True)
+
+    # 小图不转换
+    small = tmp_path / "small.png"
+    Image.new("RGB", (64, 64), (10, 20, 30)).save(small, format="PNG")
+    assert client._fit_static_image_for_upload(str(small)) is None
+
+    # 非图片/不存在 → None(调用方回退原图, 错误语义不变)
+    assert client._fit_static_image_for_upload(str(tmp_path / "nope.bin")) is None
+    assert client._fit_static_image_for_upload(str(tmp_path / "missing.png")) is None
+
+
+def test_send_image_adapts_oversized_static_image(tmp_path):
+    """send_image 对超限静态图走适配路径(JPEG ≤400KB), 协议调用面不变。"""
+    from PIL import Image
+
+    client = WxBotClient(token="test", persist=False)
+    big = tmp_path / "big.png"
+    import random
+    Image.frombytes("RGB", (1024, 1024), random.Random(7).randbytes(1024 * 1024 * 3)).save(big, format="PNG")
+    assert big.stat().st_size > client._IMAGE_UPLOAD_MAX_BYTES
+
+    calls = []
+    uploaded = []
+
+    def fake_post(ep, body, timeout=15):
+        calls.append(ep)
+        if ep == "ilink/bot/getuploadurl":
+            return {"upload_param": "UP", "upload_full_url": ""}
+        if ep == "ilink/bot/sendmessage":
+            assert "image_item" in body["msg"]["item_list"][0]
+            return {"errcode": 0}
+        raise AssertionError(ep)
+
+    client._post = fake_post
+    client._upload = lambda *a, **k: uploaded.append(a[2]) or {
+        "encrypt_query_param": "EQ", "aes_key": "x", "encrypt_type": 1}
+
+    client.send_image("u1", str(big), context_token="ctx")
+    assert calls == ["ilink/bot/getuploadurl", "ilink/bot/sendmessage"]
+    assert len(uploaded) == 1
+    raw = uploaded[0]
+    assert len(raw) <= client._IMAGE_UPLOAD_MAX_BYTES
+    assert raw[:2] == b"\xff\xd8", "adapted upload must be JPEG"
+
+
 def test_run_coalesces_across_polls_and_uses_deadline_as_request_timeout(monkeypatch):
     clock = [1.0]
 
