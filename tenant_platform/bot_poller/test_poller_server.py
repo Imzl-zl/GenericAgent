@@ -306,7 +306,8 @@ def test_stop_does_not_commit_cursor_for_pending_debounce_message():
     )
     adapter.thread = Thread()
     adapter.client = Client()
-    adapter.coalescer.push([_body("m1") | {"updates_buf": "cursor-after-pending"}], now_ms=1000)
+    # 审查 I-3: 合并缓冲统一到基类 _coalescer(微信不再自建)。
+    adapter._coalescer.push([_body("m1") | {"updates_buf": "cursor-after-pending"}], now_ms=1000)
     manager._adapters["b1"] = adapter
 
     returned_cursor = manager.stop("b1")
@@ -520,3 +521,97 @@ def test_media_sweep_reclaims_empty_bot_dir(tmp_path):
 def test_media_sweep_without_root_is_noop():
     manager = poller_server.BotManager(media_root=None)
     assert manager._sweep_media(90) == 0
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-14 审查 I-3: 入站合并投递统一到基类(四渠道 + 微信共用)
+# ---------------------------------------------------------------------------
+
+class _DeliverAdapter(poller_server.BotAdapter):
+    """最小事件渠道适配器: 只验证基类合并投递语义。"""
+
+    channel_type = "test"
+
+    def _run(self):
+        pass
+
+    def send_text(self, target, text, client_id=''):
+        pass
+
+
+def test_deliver_inbound_zero_window_posts_immediately(monkeypatch):
+    adapter = _DeliverAdapter("b1", "http://platform/webhook",
+                              coalesce_window_provider=lambda: 0)
+    posted = []
+    monkeypatch.setattr(adapter, "post_webhook", lambda body: posted.append(body))
+    adapter.deliver_inbound([_body("m1", "第一段")], now_ms=1000)
+    adapter.deliver_inbound([_body("m2", "第二段", at_ms=1100)], now_ms=1100)
+    assert [b["message_id"] for b in posted] == ["m1", "m2"]  # 零延迟, 不合并
+
+
+def test_deliver_inbound_coalesces_adjacent_and_flushes_on_timer(monkeypatch):
+    window_ms = 300
+    adapter = _DeliverAdapter("b1", "http://platform/webhook",
+                              coalesce_window_provider=lambda: window_ms)
+    posted = []
+    monkeypatch.setattr(adapter, "post_webhook", lambda body: posted.append(body))
+    now = int(time.time() * 1000)
+    # 图消息 + 相邻文本消息(同一会话): 合并为一组, 不立即投递。
+    adapter.deliver_inbound([_body("m1", "", at_ms=now, media="attachments/F001_x.png")], now_ms=now)
+    adapter.deliver_inbound([_body("m2", "这是啥", at_ms=now + 50)], now_ms=now + 50)
+    assert posted == []
+    # 窗口到期(定时器)整组 flush: 文本 + 媒体合并在同一 body。
+    deadline = now + window_ms + 1000
+    for _ in range(100):
+        if posted:
+            break
+        time.sleep(0.05)
+    assert len(posted) == 1
+    merged = posted[0]
+    assert merged["message_id"].startswith("coalesced:")
+    assert merged["text"] == "这是啥"
+    assert merged["media_paths"] == ["attachments/F001_x.png"]
+    assert merged["source_message_ids"] == ["m1", "m2"]
+
+
+def test_deliver_inbound_command_message_never_delayed(monkeypatch):
+    adapter = _DeliverAdapter("b1", "http://platform/webhook",
+                              coalesce_window_provider=lambda: 300)
+    posted = []
+    monkeypatch.setattr(adapter, "post_webhook", lambda body: posted.append(body))
+    now = int(time.time() * 1000)
+    adapter.deliver_inbound([_body("m1", "/session.max_turns=8")], now_ms=now)
+    assert [b["message_id"] for b in posted] == ["m1"]  # 命令立即 flush
+
+
+def test_deliver_inbound_different_conversations_never_merge(monkeypatch):
+    adapter = _DeliverAdapter("b1", "http://platform/webhook",
+                              coalesce_window_provider=lambda: 300)
+    posted = []
+    monkeypatch.setattr(adapter, "post_webhook", lambda body: posted.append(body))
+    now = int(time.time() * 1000)
+    body1 = _body("m1", "甲图", at_ms=now, media="attachments/F001_a.png")
+    body1["conversation_id"] = "conv-a"
+    body2 = _body("m2", "乙问", at_ms=now + 50)
+    body2["conversation_id"] = "conv-b"
+    adapter.deliver_inbound([body1], now_ms=now)
+    adapter.deliver_inbound([body2], now_ms=now + 50)
+    deadline = now + 300 + 1000
+    for _ in range(100):
+        if len(posted) == 2:
+            break
+        time.sleep(0.05)
+    assert len(posted) == 2  # 不同会话各自成组
+    assert [b["message_id"] for b in posted] == ["m1", "m2"]
+
+
+def test_deliver_inbound_stop_cancels_flush_timer():
+    adapter = _DeliverAdapter("b1", "http://platform/webhook",
+                              coalesce_window_provider=lambda: 300)
+    now = int(time.time() * 1000)
+    adapter.deliver_inbound([_body("m1", "待合并")], now_ms=now)
+    assert adapter._flush_timer is not None
+    adapter.stop()
+    assert adapter._flush_timer is None
+    # 定时器已取消: pending 不再投递(无 post_webhook 路径可触发)。
+    assert adapter._coalescer.flush_all() != []  # 数据仍在缓冲中, 由下次启动承接

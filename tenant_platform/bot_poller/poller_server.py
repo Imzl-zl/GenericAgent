@@ -352,7 +352,8 @@ class BotAdapter(ABC):
     #: 钉钉/微信不实现(非流渠道保持 SendMessage)。
     stream_supported = False
 
-    def __init__(self, bot_uuid, webhook_url, media_root=None, webhook_secret=''):
+    def __init__(self, bot_uuid, webhook_url, media_root=None, webhook_secret='',
+                 coalesce_window_provider=None):
         self.bot_uuid = bot_uuid
         self.webhook_url = webhook_url
         self.stop_event = threading.Event()
@@ -365,6 +366,53 @@ class BotAdapter(ABC):
         if media_root:
             self._media_dir = os.path.join(media_root, bot_uuid)
             os.makedirs(self._media_dir, exist_ok=True)
+        # 入站窗口合并(2026-08-14 审查 I-3): 全部渠道共用同一缓冲语义——
+        # 窗口内同一会话相邻消息(图 + 后续文本)合并为一个任务, 修复
+        # “图消息与后续文本拆成两个任务、文本任务 media=null”的追问语义
+        # 断裂。窗口 = 平台 im_inbound_coalesce_window_ms(默认 2500ms,
+        # 微信已在用)。事件渠道(QQ/飞书/钉钉/企微)由定时器驱动窗口到期
+        # flush, 微信由长轮询循环驱动(无定时器竞态)。所有 flush 路径共用
+        # _flush_lock, 防并发双投。命令消息 push 即 flush 不延迟。
+        self._coalesce_window_provider = coalesce_window_provider
+        self._coalescer = InboundCoalescingBuffer(0)
+        self._flush_lock = threading.Lock()
+        self._flush_timer = None
+
+    def _arm_flush_timer(self):
+        """按窗口剩余时间启动/重置 flush 定时器(事件渠道专用)。"""
+        delay = self._coalescer.timeout_seconds(int(time.time() * 1000))
+        if delay is None:
+            return
+        if self._flush_timer is not None:
+            self._flush_timer.cancel()
+        self._flush_timer = threading.Timer(delay, self._flush_tick)
+        self._flush_timer.daemon = True
+        self._flush_timer.start()
+
+    def _flush_tick(self):
+        """定时器到期: 锁内取到期组, 锁外投递(避免持锁网络阻塞)。"""
+        with self._flush_lock:
+            self._flush_timer = None
+            ready = self._coalescer.flush_due(int(time.time() * 1000))
+        for body in ready:
+            self.post_webhook(body)
+
+    def deliver_inbound(self, bodies, now_ms=None):
+        """入站 body(s) 投递: 窗口合并 → 定时 flush → post_webhook。
+
+        window<=0 时等价于直接逐条投递(零延迟, 与旧行为一致); window>0
+        时窗口内相邻消息合并为一组, 窗口到期整组投递。微信 _dispatch_batch
+        与四渠道事件处理共用此入口(微信另有长轮询循环驱动 flush)。"""
+        with self._flush_lock:
+            window = int(self._coalesce_window_provider() or 0) if self._coalesce_window_provider else 0
+            self._coalescer.set_window(window)
+            now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+            ready = self._coalescer.push(bodies, now)
+            ready.extend(self._coalescer.flush_due(now))
+            if window > 0 and self._coalescer.timeout_seconds(now) is not None:
+                self._arm_flush_timer()
+        for body in ready:
+            self.post_webhook(body)
 
     # -- 生命周期 ----------------------------------------------------------
     def start(self):
@@ -379,6 +427,10 @@ class BotAdapter(ABC):
         committed updates_buf for wechat ('' for other channels)."""
         self.stop_event.set()
         self.webhook_idle.wait(timeout=WEBHOOK_TIMEOUT + 1)
+        with self._flush_lock:
+            if self._flush_timer is not None:
+                self._flush_timer.cancel()
+                self._flush_timer = None
         if self.thread is not None:
             self.thread.join(timeout=5)
         return ''
@@ -561,26 +613,28 @@ class WeChatAdapter(BotAdapter):
 
     def __init__(self, bot_uuid, config, webhook_url, *, base_url='', updates_buf='',
                  media_root=None, webhook_secret='', coalesce_window_provider=None):
-        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret,
+                         coalesce_window_provider=coalesce_window_provider)
         token = (config or {}).get('token') or ''
         self.client = WxBotClient(token=token, persist=False, base_url=base_url or None)
         self.committed_updates_buf = updates_buf or getattr(self.client, 'updates_buf', '') or ''
-        self.coalescer = InboundCoalescingBuffer(
-            coalesce_window_provider() if coalesce_window_provider else 0
-        )
-        self._coalesce_window_provider = coalesce_window_provider
+        # 合并缓冲由基类统一(_coalescer, 审查 I-3): 微信由长轮询循环驱动
+        # flush + 定时器双保险(锁保证不双投)。
 
     def _run(self):
         """Long-poll loop. Exits on stop_event or AuthExpired."""
         seen = _DedupWindow(maxlen=2000)
         while not self.stop_event.is_set():
             try:
-                if self._coalesce_window_provider:
-                    self.coalescer.set_window(self._coalesce_window_provider())
                 now_ms = int(time.time() * 1000)
-                for body in self.coalescer.flush_due(now_ms):
+                ready = []
+                with self._flush_lock:
+                    if self._coalesce_window_provider:
+                        self._coalescer.set_window(self._coalesce_window_provider())
+                    ready = self._coalescer.flush_due(now_ms)
+                    request_timeout = self._coalescer.timeout_seconds(now_ms)
+                for body in ready:
                     self.post_webhook(body)
-                request_timeout = self.coalescer.timeout_seconds(now_ms)
                 messages = self.client.get_updates(
                     POLL_TIMEOUT, request_timeout=request_timeout
                 )
@@ -599,12 +653,8 @@ class WeChatAdapter(BotAdapter):
             body = self._prepare_webhook_body(msg, seen, received_at_ms)
             if body is not None:
                 bodies.append(body)
-        if self._coalesce_window_provider:
-            self.coalescer.set_window(self._coalesce_window_provider())
-        ready = self.coalescer.push(bodies, received_at_ms)
-        ready.extend(self.coalescer.flush_due(received_at_ms))
-        for body in ready:
-            self.post_webhook(body)
+        # 审查 I-3: 统一走基类合并投递(与四渠道同语义)。
+        self.deliver_inbound(bodies, received_at_ms)
 
     def _prepare_webhook_body(self, msg, seen, fallback_time_ms):
         """Download media and build one platform webhook body."""
@@ -683,10 +733,7 @@ class WeChatAdapter(BotAdapter):
         self.post_webhook(body, max_attempts=5)
 
     def stop(self):
-        self.stop_event.set()
-        self.webhook_idle.wait(timeout=WEBHOOK_TIMEOUT + 1)
-        if self.thread is not None:
-            self.thread.join(timeout=5)
+        super().stop()
         return self.committed_updates_buf
 
     def send_text(self, target, text, client_id=''):
@@ -733,8 +780,10 @@ class FeishuAdapter(BotAdapter):
     #: 由 commit 最后一次更新一次性送达(打字机冻结, 内容不丢)。
     _MAX_STREAM_EDITS = 18
 
-    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret=''):
-        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret='',
+                 coalesce_window_provider=None):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret,
+                         coalesce_window_provider=coalesce_window_provider)
         self._app_id = (config or {}).get('app_id') or ''
         self._app_secret = (config or {}).get('app_secret') or ''
         self._ws_client = None
@@ -813,7 +862,7 @@ class FeishuAdapter(BotAdapter):
             # 无文本且媒体提取失败(下载/落盘异常): 丢弃并记日志, 不回
             # 误导性的 "empty message ignored"(审查 B1 统一行为)。
             return
-        self.post_webhook(self.webhook_body(
+        self.deliver_inbound([self.webhook_body(
             channel_account_id=sender_id,
             conversation_id=chat_id,  # p2p/group 统一 chat_id
             message_id=message_id,
@@ -821,7 +870,7 @@ class FeishuAdapter(BotAdapter):
             media_paths=media_paths,
             media_items=media_items,
             conversation_type=self._conversation_type(data),
-        ))
+        )])
 
     def _download_resource(self, message_id, file_key, resource_type):
         """飞书消息资源下载: GET /im/v1/messages/{id}/resources/{key}?type=…。
@@ -1070,8 +1119,10 @@ class DingTalkAdapter(BotAdapter):
 
     channel_type = CHANNEL_DINGTALK
 
-    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret=''):
-        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret='',
+                 coalesce_window_provider=None):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret,
+                         coalesce_window_provider=coalesce_window_provider)
         self._app_key = (config or {}).get('app_id') or ''  # API 层 app_id 即钉钉 app_key
         self._app_secret = (config or {}).get('app_secret') or ''
         self._client = None
@@ -1143,7 +1194,7 @@ class DingTalkAdapter(BotAdapter):
                 print(f'[Poller] dingtalk media dl err ({self.bot_uuid}): {exc}', flush=True)
         if not text and not media_paths:
             return
-        self.post_webhook(self.webhook_body(
+        self.deliver_inbound([self.webhook_body(
             channel_account_id=str(
                 getattr(chatbot_msg, 'sender_staff_id', None)
                 or getattr(chatbot_msg, 'sender_id', None) or ''),
@@ -1156,7 +1207,7 @@ class DingTalkAdapter(BotAdapter):
             conversation_type=('group'
                                if str(getattr(chatbot_msg, 'conversation_type', '') or '') == '2'
                                else 'private'),
-        ))
+        )])
 
     def _extract_media(self, msgtype, content, conversation_id):
         """钉钉 downloadCode → 文件字节 → 落盘。返回 (media_paths, media_items, asr_text)。
@@ -1299,8 +1350,10 @@ class QQAdapter(BotAdapter):
     #: (input_state=10 全量替换)一次性送达, 内容不丢。
     _MAX_STREAM_APPENDS = 60
 
-    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret=''):
-        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret='',
+                 coalesce_window_provider=None):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret,
+                         coalesce_window_provider=coalesce_window_provider)
         self._app_id = (config or {}).get('app_id') or ''
         self._app_secret = (config or {}).get('app_secret') or ''
         self._client = None
@@ -1404,7 +1457,7 @@ class QQAdapter(BotAdapter):
                 # 无文本且媒体提取失败(下载/落盘异常): 丢弃并记日志, 不回
                 # 误导性的 "empty message ignored"(审查 B1 统一行为)。
                 return
-            self.post_webhook(self.webhook_body(
+            self.deliver_inbound([self.webhook_body(
                 channel_account_id=channel_account_id,
                 conversation_id=conversation_id,
                 message_id=message_id,
@@ -1412,7 +1465,7 @@ class QQAdapter(BotAdapter):
                 media_paths=media_paths,
                 media_items=media_items,
                 conversation_type='group' if is_group else 'private',
-            ))
+            )])
         except Exception as exc:
             print(f'[Poller] qq {self.bot_uuid} handle error: {exc}', flush=True)
 
@@ -1854,8 +1907,10 @@ class WeComAdapter(BotAdapter):
     #: 流式通过 SEND_MSG + stream 帧实现; 失败由平台判定矩阵收敛回终态。
     stream_supported = True
 
-    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret=''):
-        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret)
+    def __init__(self, bot_uuid, config, webhook_url, *, media_root=None, webhook_secret='',
+                 coalesce_window_provider=None):
+        super().__init__(bot_uuid, webhook_url, media_root=media_root, webhook_secret=webhook_secret,
+                         coalesce_window_provider=coalesce_window_provider)
         self._bot_id = (config or {}).get('app_id') or ''
         self._secret = (config or {}).get('app_secret') or ''
         self._client = None
@@ -1900,7 +1955,7 @@ class WeComAdapter(BotAdapter):
         conversation_type = 'private' if sender_id and chat_id == sender_id else 'group'
         if not text and not media_paths:
             return
-        self.post_webhook(self.webhook_body(
+        self.deliver_inbound([self.webhook_body(
             channel_account_id=sender_id,
             conversation_id=chat_id,
             message_id=message_id,
@@ -1908,7 +1963,7 @@ class WeComAdapter(BotAdapter):
             media_paths=media_paths,
             media_items=media_items,
             conversation_type=conversation_type,
-        ))
+        )])
 
     def _extract_media(self, msgtype, media):
         """企微入站媒体: 优先回调直链 URL(若有), 否则 media_id 走
@@ -2230,12 +2285,13 @@ class BotManager:
             self._adapters[bot_uuid] = adapter
 
     def _build_adapter(self, bot_uuid, channel_type, config, *, base_url, updates_buf, webhook_url):
-        common = dict(media_root=self._media_root, webhook_secret=self._webhook_secret)
+        # 审查 I-3: 全部渠道共用平台级入站合并窗口(微信此前独享)。
+        common = dict(media_root=self._media_root, webhook_secret=self._webhook_secret,
+                      coalesce_window_provider=self._coalesce_window_ms)
         if channel_type == CHANNEL_WECHAT:
             return WeChatAdapter(
                 bot_uuid, config, webhook_url,
                 base_url=base_url, updates_buf=updates_buf,
-                coalesce_window_provider=self._coalesce_window_ms,
                 **common,
             )
         if channel_type == CHANNEL_FEISHU:

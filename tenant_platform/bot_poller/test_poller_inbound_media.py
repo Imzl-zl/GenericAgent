@@ -59,6 +59,10 @@ def test_download_url_bounded_rejects_host_and_scheme(monkeypatch):
     with pytest.raises(ValueError, match="scheme"):
         media_dl.download_url_bounded(
             "http://multimedia.nt.qq.com.cn/x.jpg", "/tmp", allowed_hosts=media_dl.QQ_MEDIA_HOSTS)
+    # 审查 I-1: 空白名单 = 拒绝全部(fail-closed)——docstring 承诺与实现
+    # 曾相反(漏传白名单即放行任意 https 主机), 回归测试钉死契约。
+    with pytest.raises(ValueError, match="whitelist is empty"):
+        media_dl.download_url_bounded("https://evil.example.com/x.jpg", "/tmp")
     assert calls == []
 
 

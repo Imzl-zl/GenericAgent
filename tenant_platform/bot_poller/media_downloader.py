@@ -107,14 +107,18 @@ def sniff_image_ext(data):
 
 
 def _validate_url(url, allowed_hosts):
-    """仅 https + host 白名单(默认空 = 拒绝全部, fail-closed)。"""
+    """仅 https + host 白名单(默认空 = 拒绝全部, fail-closed)。
+    2026-08-14 审查 I-1: 原实现空白名单=放行任意 https 主机, 与文档
+    承诺相反——新调用方漏传白名单即暴露 SSRF 面。"""
     parsed = urlparse(url)
     if parsed.scheme != 'https':
         raise ValueError(f'insecure media url scheme: {parsed.scheme!r}')
     host = (parsed.hostname or '').lower()
     if not host:
         raise ValueError('media url has no host')
-    if allowed_hosts and host not in allowed_hosts:
+    if not allowed_hosts:
+        raise ValueError('media url host whitelist is empty (fail-closed)')
+    if host not in allowed_hosts:
         raise ValueError(f'media url host {host!r} not allowed')
     return parsed
 

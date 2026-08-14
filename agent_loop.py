@@ -125,7 +125,7 @@ def media_content_blocks(user_text, image_paths=None):
                 continue
             seen.add(rel)
             refs.append(rel)
-    picked = []
+    picked = []  # (rel, block, actual_bytes)——实际注入字节在降采样后确定
     skipped = []  # (rel, 原因)——预算/大小跳过时向用户显式占位(失败诚实, 2026-08-14 审查 S1)
     b64_budget = _ATTACH_IMG_B64_BUDGET
     for rel in refs:
@@ -136,22 +136,30 @@ def media_content_blocks(user_text, image_paths=None):
             continue
         try:
             size = os.path.getsize(full)
+            # 原始文件上限 = 解码防御(防整读+解码内存峰值); 预算判定见下。
             if size > _ATTACH_IMG_MAX_BYTES:
                 skipped.append((rel, f'{size} bytes > 3MB single-image cap'))
                 continue
         except OSError:
             continue
         if os.path.splitext(rel)[1].lstrip('.').lower() not in _IMG_MIME:
+            print(f'[Attach] skip {rel}: not a supported image type')
             continue
-        # 估算 base64 体积(4/3 膨胀 + 块开销), 总量预算内才入选(llm-proxy
-        # 4MiB 请求上限对齐, 审查 B3)。
-        est = size * 4 // 3 + 64
+        # 2026-08-14 审查 I-2(预算口径): 先降采样编码, 按**实际注入字节**
+        # 判定 base64 总量预算(llm-proxy 4MiB 请求上限对齐, 审查 B3)——
+        # 旧口径按原始文件大小估算, 大图降采样后本可注入却被误杀(est =
+        # 原大小*4/3 超预算即跳过)。PIL 失败原样透传时 actual=原始大小,
+        # 口径自动回落为旧语义, 安全。
+        block, actual = _image_block_from_file(full, rel)
+        if block is None:
+            continue
+        est = actual * 4 // 3 + 64
         if est > b64_budget:
             print(f'[Attach] skip {rel}: base64 est {est} exceeds remaining budget {b64_budget}')
             skipped.append((rel, f'base64 est {est} > remaining budget {b64_budget}'))
             continue
         b64_budget -= est
-        picked.append((rel, full))
+        picked.append((rel, block, actual))
     placeholder = ''
     if skipped:
         # 用户发了图但模型看不到: 显式占位而非静默忽略(设计原则 6 失败诚实)。
@@ -160,11 +168,9 @@ def media_content_blocks(user_text, image_paths=None):
         return user_text if not placeholder else user_text + placeholder
     blocks = [{"type": "text", "text": user_text + placeholder}]
     injected = 0
-    for rel, full in picked:
-        block, n = _image_block_from_file(full, rel)
-        if block is not None:
-            blocks.append(block)
-            injected += n
+    for rel, block, actual in picked:
+        blocks.append(block)
+        injected += actual
     if len(blocks) == 1:
         return user_text
     print(f"[Attach] injected {len(blocks) - 1} image block(s) ({injected} bytes) into first turn")

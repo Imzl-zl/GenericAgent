@@ -177,3 +177,59 @@ class TestAttachmentImageInjection:
             assert out.startswith("看图")
         finally:
             os.chdir(cwd)
+
+
+class TestBudgetMeasuredAfterDownsample:
+    """2026-08-14 审查 I-2: 预算按降采样后实际注入字节判定——旧口径按
+    原始文件大小估算, 大图降采样后本可注入却被误杀(est=原大小*4/3 超
+    预算即跳过, 与降采样 1568px 的成本控制意图互相抵消)。"""
+
+    def _setup_big_png(self):
+        from PIL import Image
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "attachments"))
+        # 3000x2000 真 PNG(~4MB 原始体量), 降采样后远小于预算。
+        big = Image.new("RGB", (3000, 2000), (20, 80, 200))
+        path = os.path.join(tmp, "attachments", "F001_big.png")
+        big.save(path, "PNG")
+        return tmp, path
+
+    def test_large_image_injected_after_downsample(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            return
+        cwd = os.getcwd()
+        try:
+            tmp, path = self._setup_big_png()
+            size = os.path.getsize(path)
+            # 原始文件在 3MB 单图上限内但按旧口径 est=size*4/3 会超 3.5MB
+            # 预算(约 4MB PNG 必超); 新口径按降采样后实际体积, 应放行。
+            assert size > 2_600_000, f"test fixture too small: {size}"
+            os.chdir(tmp)
+            out = media_content_blocks("看图", ["attachments/F001_big.png"])
+            assert isinstance(out, list), "大图降采样后应注入而非跳过"
+            images = [b for b in out if b["type"] == "image_url"]
+            assert len(images) == 1
+            url = images[0]["image_url"]["url"]
+            import io
+            img = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+            assert max(img.size) <= 1568
+        finally:
+            os.chdir(cwd)
+
+    def test_unresizable_passthrough_still_budget_limited(self):
+        """PIL 解码失败原样透传的图: 预算口径自动回落为原始大小(旧语义),
+        超预算仍跳过并占位——不因降采样路径而放宽安全边界。"""
+        cwd = os.getcwd()
+        try:
+            tmp = tempfile.mkdtemp()
+            os.makedirs(os.path.join(tmp, "attachments"))
+            with open(os.path.join(tmp, "attachments", "F001_fake.png"), "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n" + b"x" * (3 * 1024 * 1024))  # 假 PNG 头, PIL 解码失败
+            os.chdir(tmp)
+            out = media_content_blocks("看图", ["attachments/F001_fake.png"])
+            assert isinstance(out, str)
+            assert "[图片已跳过：超出模型输入预算" in out
+        finally:
+            os.chdir(cwd)

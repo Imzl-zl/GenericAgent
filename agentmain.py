@@ -73,7 +73,11 @@ class GenericAgent:
             try:
                 if 'mixin' in k: llm_sessions += [{'mixin_cfg': cfg}]
                 elif c := resolve_client(k): llm_sessions += [c]
-            except: pass
+                # 2026-08-14 审查 S-3: 配置名不含 native/claude/oai 标记时
+                # resolve_client 静默返回 None——用户配置名拼错时 /llms 缺项
+                # 且无提示, 必须显式警告。
+                else: print(f'[WARN] config {k!r} matches no session type (name must contain native/claude/oai), skipped')
+            except Exception as e: print(f'[WARN] failed to init config {k!r}: {e}')
         for i, s in enumerate(llm_sessions):
             if isinstance(s, dict) and 'mixin_cfg' in s:
                 try:

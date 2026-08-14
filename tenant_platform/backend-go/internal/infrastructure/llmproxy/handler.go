@@ -82,11 +82,15 @@ func (s *Server) handleProviderPath(
 	}
 	resetRequestBody(r, body)
 	// 2026-08-14 可观测性(多模态排障): 转发前记录请求体画像——确认
-	// image_url 块是否真实到达 llm-proxy(此前图片注入链路黑盒, 只能猜)。
+	// image 块是否真实到达 llm-proxy(此前图片注入链路黑盒, 只能猜)。
+	// 计数兼容两种块格式: OpenAI image_url 与 Claude image(审查 S-2,
+	// 原实现只数 image_url, native_claude 通道图片恒计 0 误导排障)。
+	imageBlocks := bytes.Count(body, []byte(`"image_url"`)) +
+		bytes.Count(body, []byte(`"type":"image"`))
 	slog.Info("llmproxy: forwarding request",
 		"provider_id", provider.ID, "provider_revision", provider.Revision,
 		"path", r.URL.Path, "body_bytes", len(body), "model", model,
-		"image_blocks", bytes.Count(body, []byte(`"image_url"`)),
+		"image_blocks", imageBlocks,
 	)
 	requestContext := &proxyRequestContext{
 		Claims: claims, Provider: provider, Target: target, RealKey: realKey,
