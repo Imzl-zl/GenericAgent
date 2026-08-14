@@ -101,7 +101,8 @@ func (s *Server) handleProviderPath(
 	// 原实现只数 image_url, native_claude 通道图片恒计 0 误导排障)。
 	imageBlocks := bytes.Count(body, []byte(`"image_url"`)) +
 		bytes.Count(body, []byte(`"type":"image"`))
-	slog.Info("llmproxy: forwarding request",
+	// 每请求高频日志, 降 Debug(生产流量下 Info 刷屏; 排障时开 debug 级别)。
+	slog.Debug("llmproxy: forwarding request",
 		"provider_id", provider.ID, "provider_revision", provider.Revision,
 		"path", r.URL.Path, "body_bytes", len(body), "model", model,
 		"image_blocks", imageBlocks,

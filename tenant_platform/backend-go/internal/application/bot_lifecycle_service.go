@@ -1,7 +1,9 @@
 package application
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -81,6 +83,22 @@ func NewBotLifecycleService(cfg BotLifecycleConfig) (BotLifecycleService, error)
 	}, nil
 }
 
+// normalizeChannelConfigJSON 兼容历史/漏网的非 JSON 凭据明文: 合法 JSON
+// 原样返回; 非 JSON(裸凭据字符串, 如 iLink "xxx@im.bot:yyy")按
+// {"token": <明文>} 包装(08-10 契约: 凭据 = JSON 密文)。2026-08-14 复盘:
+// 微信 QR 绑定写入路径曾直接加密裸 BotToken, restore 时 poller marshal
+// 失败——写入路径已根治, 本函数是存量/漏网数据的防御兜底。
+func normalizeChannelConfigJSON(plaintext []byte) []byte {
+	if len(bytes.TrimSpace(plaintext)) == 0 || json.Valid(plaintext) {
+		return plaintext
+	}
+	wrapped, err := json.Marshal(map[string]string{"token": string(plaintext)})
+	if err != nil {
+		return plaintext
+	}
+	return wrapped
+}
+
 // StartChannelConfig decrypts the channel config JSON and any persisted
 // cursor, then tells the Poller to begin polling for this channel. Safe to
 // call on a fresh config (no cursor yet) or after a platform restart
@@ -93,6 +111,10 @@ func (s *botLifecycleService) StartChannelConfig(ctx context.Context, cfg domain
 	if err != nil {
 		return fmt.Errorf("decrypt channel config: %w", err)
 	}
+	// 防御兜底(2026-08-14): 历史/漏网数据可能是裸凭据明文(非 JSON, 如
+	// wechat iLink "xxx@im.bot:yyy")——restore 时 poller marshal 失败。
+	// 非 JSON 明文按 {"token": <明文>} 包装(08-10 契约), 兼容旧数据。
+	configJSON = normalizeChannelConfigJSON(configJSON)
 	cursor, err := s.resolveCursor(ctx, cfg.ID)
 	if err != nil {
 		return err

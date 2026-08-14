@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -181,7 +182,15 @@ func (s *wechatQRBindingService) PollStatus(ctx context.Context, qrCode string) 
 		return domain.WechatQRSession{}, domain.ChannelConfig{}, fmt.Errorf("ilink confirmed but credentials incomplete")
 	}
 
-	cipher, version, err := s.cipher.Encrypt([]byte(creds.BotToken))
+	// 契约(IM_CHANNEL_BINDING 08-10 定案): 微信凭据 = JSON {"token": ...}。
+	// 历史坑(2026-08-14 复发): 此前直接加密 iLink 返回的裸 BotToken
+	// (xxx@im.bot:yyy 明文), restore 时 poller marshal 失败——08-12 只修了
+	// 存量数据未修代码, 用户重新扫码即复发。此处写入路径根治。
+	tokenJSON, err := json.Marshal(map[string]string{"token": creds.BotToken})
+	if err != nil {
+		return domain.WechatQRSession{}, domain.ChannelConfig{}, fmt.Errorf("marshal token: %w", err)
+	}
+	cipher, version, err := s.cipher.Encrypt(tokenJSON)
 	if err != nil {
 		return domain.WechatQRSession{}, domain.ChannelConfig{}, fmt.Errorf("encrypt token: %w", err)
 	}

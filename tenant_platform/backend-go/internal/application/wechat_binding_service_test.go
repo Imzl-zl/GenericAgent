@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 type fakeQRStore struct {
 	sess        domain.WechatQRSession
 	existingBot domain.ChannelConfig // 重新绑定前 owner 已有的旧 bot(GetChannelConfigByOwnerAndType)
+	lastToken   []byte               // UpdateWechatQRSessionStatus 收到的 token 密文(透传 cipher 下=明文)
 }
 
 func (f *fakeQRStore) CreateWechatQRSession(ctx context.Context, userID int64, ilinkQRCode, imgURL string, expiresAt time.Time) (domain.WechatQRSession, error) {
@@ -31,6 +33,7 @@ func (f *fakeQRStore) GetWechatQRSessionByQRCode(ctx context.Context, qrCode str
 func (f *fakeQRStore) UpdateWechatQRSessionStatus(ctx context.Context, id string, status domain.WechatQRStatus,
 	ilinkBotID, ilinkUserID, baseurl string, tokenCiphertext []byte) (domain.WechatQRSession, error) {
 	f.sess.Status = status
+	f.lastToken = tokenCiphertext
 	return f.sess, nil
 }
 
@@ -43,7 +46,7 @@ func (f *fakeQRStore) CreateChannelConfigFromQRSession(ctx context.Context, sess
 		IlinkBotID:  sess.ILINKBotID,
 		IlinkUserID: sess.ILINKUserID,
 		State:       domain.ChannelActive,
-		ChannelType: domain.ChannelWechat,}, nil
+		ChannelType: domain.ChannelWechat}, nil
 }
 
 func (f *fakeQRStore) GetBoundChannelConfigByIlinkUser(ctx context.Context, ilinkUserID string) (domain.ChannelConfig, error) {
@@ -72,6 +75,33 @@ type fakeCipher struct{}
 func (fakeCipher) Encrypt(plaintext []byte) ([]byte, int, error) { return plaintext, 0, nil }
 func (fakeCipher) Decrypt(ciphertext []byte, keyVersion int) ([]byte, error) {
 	return ciphertext, nil
+}
+
+// TestPollStatusPersistsTokenAsJSONContract: QR 绑定写入的凭据必须是
+// {"token": ...} JSON(08-10 契约)——历史坑: 曾直接加密 iLink 裸 BotToken
+// (xxx@im.bot:yyy), restore 时 poller marshal 失败; 2026-08-14 复发后根治。
+func TestPollStatusPersistsTokenAsJSONContract(t *testing.T) {
+	store := &fakeQRStore{sess: domain.WechatQRSession{
+		ID: "sess-json", UserID: 79, ILINKQRCode: "qr-token",
+		Status: domain.WechatQRWait, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}}
+	svc := newRebindTestService(t, store, &fakeStaleBotStopper{})
+	if _, _, err := svc.PollStatus(context.Background(), "qr-token"); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.lastToken) == 0 {
+		t.Fatal("token not persisted")
+	}
+	// fakeCipher 原样透传 → lastToken 即写入明文, 必须是合法 JSON {"token": ...}。
+	var parsed struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(store.lastToken, &parsed); err != nil {
+		t.Fatalf("persisted token is not JSON: %q (%v)", store.lastToken, err)
+	}
+	if parsed.Token != "token-1" {
+		t.Fatalf("token = %q, want token-1", parsed.Token)
+	}
 }
 
 // TestPollStatusLongPollTimeoutReportsLastKnownStatus is the regression guard

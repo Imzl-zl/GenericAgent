@@ -22,9 +22,9 @@ type workerCredentialSet struct {
 	// RPC(CancelTask/Shutdown/BeginCheckpoint)必须使用它,
 	// 不得复用 LLM/Sophub capability——LLM token 随调用发给 llm-proxy,
 	// 暴露面更大; 独立 control token 只在容器内传递。
-	ControlJTI      string
-	Snapshot         routingSnapshot
-	MCPSnapshot      RuntimeMCPSnapshot
+	ControlJTI  string
+	Snapshot    routingSnapshot
+	MCPSnapshot RuntimeMCPSnapshot
 }
 
 const credentialRevokeTimeout = 5 * time.Second
@@ -134,9 +134,9 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 		}
 	}
 	files, err := BuildRuntimeConfig(RuntimeConfigInput{
-		ProxyBaseURL: s.cfg.LLMProxyAddr,
+		ProxyBaseURL:      s.cfg.LLMProxyAddr,
 		RoutingSnapshotID: snapshot.ID, Providers: bindings, MCP: mcpSnapshot,
-		JTIs: set.JTIs,
+		JTIs:   set.JTIs,
 		Sophub: sophub,
 	})
 	if err != nil {
@@ -176,7 +176,7 @@ func (s *scheduler) issueProviderCapability(
 		SessionKey: sessionKey, ProviderID: routed.ID, ProviderRevision: routed.Revision,
 		ProviderType: routed.ProviderType, Model: routed.Model,
 		PolicyVersion: s.cfg.ModelPolicyVersion,
-		TaskID: taskID, RunnerGeneration: runnerGeneration,
+		TaskID:        taskID, RunnerGeneration: runnerGeneration,
 		Operation: operation, Budget: budget,
 	})
 	if err != nil {
@@ -232,7 +232,8 @@ func (s *scheduler) filterMCPServersByQuota(ctx context.Context, sessionKey stri
 			continue
 		}
 		if !available {
-			slog.InfoContext(ctx, "mcp server excluded: user quota exhausted",
+			// 配额耗尽期间的预期内事件, 每次签发都会出现——降 Debug 防刷屏。
+			slog.DebugContext(ctx, "mcp server excluded: user quota exhausted",
 				"server_id", server.ServerID, "owner_key", ownerKey)
 			continue
 		}
