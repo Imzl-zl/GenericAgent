@@ -3,8 +3,11 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentmain import GeneraticAgent
-from chatapp_common import AgentChatMixin, ensure_single_instance, public_access, redirect_log, require_runtime, split_text
+from chatapp_common import (AgentChatMixin, build_done_text, ensure_single_instance,
+                            public_access, redirect_log, require_runtime, split_text)
+from im_markers import resolve_file_markers
 from llmcore import mykeys
+from qq_media import QQMediaSender, QQ_MEDIA_FILE, QQ_MEDIA_IMAGE, QQ_MEDIA_VIDEO
 
 try:
     import botpy
@@ -14,11 +17,12 @@ except Exception:
     sys.exit(1)
 
 agent = GeneraticAgent(); agent.verbose = False
-# 媒体交付声明(2026-08-14 独立审查 C1): 本前端为**文本通道**——QQ 官方
-# 媒体上传需分片(prepare→PUT→finish)或公网 URL, 根路径无公网入口且无
-# 真实凭据实测条件, 有意不实现(避免半成品); 文件产出经 AgentChatMixin.
-# send_done 给出诚实提示(不输出服务器路径)。平台 bot_poller QQAdapter
-# 已实现完整分片上传+主动消息, 需文件交付请使用平台。
+# 媒体交付(2026-08-16 升级): 本前端由纯文本通道升级为媒体通道——QQ 官方
+# 无一步式发图接口, 整文件上传需公网 URL(根路径无公网入口)或官方
+# rich-media 分片 4 步流程; 实现见 qq_media.QQMediaSender(与平台 bot_poller
+# QQAdapter 同构, 该实现 2026-08-14 审查 B2/I4 已过审)。生图/文件产出经
+# send_done 解析 [FILE:] marker 后分片上传直发; 失败回退文本提示(内容不丢)。
+# 残余风险: 无真实凭据回归自动化, 参数细节以实际使用验证为准(平台同款)。
 APP_ID = str(mykeys.get("qq_app_id", "") or "").strip()
 APP_SECRET = str(mykeys.get("qq_app_secret", "") or "").strip()
 ALLOWED = {str(x).strip() for x in mykeys.get("qq_allowed_users", []) if str(x).strip()}
@@ -73,10 +77,53 @@ def _make_bot_class(app):
 
 class QQApp(AgentChatMixin):
     label, source, split_limit = "QQ", "qq", 1500
+    #: 媒体直发(2026-08-16 升级, 官方 rich-media 分片上传)。
+    can_send_media = True
+    #: [FILE:] marker 相对路径解析根(与 wechatapp/tgapp 同款)。
+    _TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'temp')
+    #: 扩展名 → 官方 media file_type(1=图片 2=视频 4=文件)。
+    _IMG_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+    _VIDEO_EXTS = {'.mp4', '.mov', '.m4v', '.webm'}
 
     def __init__(self):
         super().__init__(agent, USER_TASKS)
         self.client = None
+        #: 媒体发送器单例(2026-08-16 复审: 每次 send_done 新建会重置令牌
+        #: 桶, 15 QPM 频控形同虚设——必须按 app 生命周期持有)。
+        self._media_sender = None
+
+    def _media(self):
+        if self._media_sender is None and self.client is not None:
+            self._media_sender = QQMediaSender(self.client)
+        return self._media_sender
+
+    async def send_done(self, chat_id, raw_text, **ctx):
+        """终态交付: 文本照常 send_text; [FILE:] 产出走分片上传直发
+        (图片/视频/文件), 失败回退一句提示(内容不丢, 同微信语义)。"""
+        files = resolve_file_markers(raw_text, base_dir=self._TEMP_DIR)
+        text = build_done_text(raw_text)
+        if text != "..." or not files:
+            await self.send_text(chat_id, text, **ctx)
+        if not files:
+            return
+        sender = self._media()
+        if sender is None:
+            # 渠道未就绪(极端): 不静默丢文件, 明确告知。
+            await self.send_text(chat_id, "📎 文件已生成，但 QQ 通道尚未就绪，无法直发。", **ctx)
+            return
+        is_group = bool(ctx.get('is_group'))
+        for fpath in files:
+            ext = os.path.splitext(fpath)[1].lower()
+            ftype = (QQ_MEDIA_IMAGE if ext in self._IMG_EXTS else
+                     QQ_MEDIA_VIDEO if ext in self._VIDEO_EXTS else
+                     QQ_MEDIA_FILE)
+            try:
+                await sender.send_media(chat_id, fpath, file_type=ftype,
+                                        is_group=is_group)
+                print(f'[QQ] sent media: {fpath}', file=sys.__stdout__)
+            except Exception as e:
+                print(f'[QQ] media send err: {fpath}: {e}', file=sys.__stdout__)
+                await self.send_text(chat_id, f"📎 文件已生成但发送失败: {e}", **ctx)
 
     async def send_text(self, chat_id, content, *, msg_id=None, is_group=False):
         if not self.client:
