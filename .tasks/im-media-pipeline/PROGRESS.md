@@ -57,10 +57,23 @@ B4 8MiB+bytea / B5 QQ 主动消息路径）与重要项（I2 content_type、I4 �
 | T8.2 | llmcore：BaseImageGenClient + OpenAIImageGenClient + resolve_image_gen（配置子集解析/同步 b64 路径/gpt-image SSE 流式路径/仿 _stream_with_retry 重试/流式失败自动降级同步一次） | tests/test_image_gen.py |
 | T8.3 | ga.py do_image_gen（第 10 原子工具）+ tools_schema ×2 + mykey_template 配置块 | 工具形态仿 do_file_write/do_code_run |
 | T8.4 | mock 单测 + 本地 CLI 闭环（配置真实/中转 key → ga CLI 生图 → temp/outputs/ 出图；错误路径未配置时模型收到错误文本） | `python -m pytest tests -q` 全绿 |
+| T8.5 | **托管形态（Step 3，2026-08-14 实施）**：llm-proxy `images/generations` 路由 + `llm.image` capability + provider 能力维度（chat/image）+ runtime_config 下发 image_gen 块 + policy 放行 + openapi/web + worker marker 兜底 | Go 全量 + race 5 关键包 + worker 146 + 契约 41 全绿；**待部署冒烟** |
+
+**Step 3 实施明细（T8.5，2026-08-14 已落地）**：
+
+| 层 | 改动 |
+|---|---|
+| domain | `LLMProvider.Capabilities`（chat/image）+ `EffectiveCapabilities`/`HasCapability`；migration 0058 `capabilities JSONB DEFAULT '["chat"]'`（省略=[chat] 存量兼容）；store 读写 + 校验（非法值/重复/native_claude 禁 image） |
+| llmproxy | 路由 `/v1/images/generations`（+别名）；`handleProviderPath` operation 参数化（`OperationChat`/`OperationImage` 常量，错配 401）；`nativeEndpoint` 加 images/generations 映射（claude provider 拒绝）；**生图响应 32MiB 上限**（安全审查项：MaxWorkerRequestBytes 仅限请求体，现按 Content-Length 前置拒绝 fail-closed） |
+| 签发 | `worker_credential` 按 provider 能力签发（chat→`llm.chat`、image→`llm.image`，双能力双 token）；`issueProviderCapability` 抽公共签发/撤销/有效期逻辑 |
+| runtime_config | `RuntimeProviderBinding.Capability`；image binding → `image_gen` 块（apibase=proxy/v1 + 能力令牌，**不进 chat mixin**，多 image provider fail-closed）；GA 兼容探针实测（真实 llmcore.resolve_image_gen 消费 runtime 配置） |
+| policy | `foundation.session-files.v1` allowed_tools 补 `image_gen` |
+| worker | `install_image_gen_marker_registry`（I-2 兜底：包装 do_image_gen 登记产物到 generated_output_files，终态 append_missing_file_markers 自动补写漏回显 marker） |
+| openapi/web | LLMProviderCapability schema + capabilities 字段（读写）；web 表单能力复选框（image 仅 native_oai 可选） |
 
 **实施约束（定稿硬要求）**：①实现进 llmcore.py，严禁新增 imagegen.py（沙箱 overlay 固定清单 LEGACY_MODULES，新增模块 = 平台沙箱 ImportError）；②错误文本统一 `[Error: image_gen ...]`，绝不用 `!!!Error:`（触发 do_no_tool 致命判定链）；③response_format 仅 dall-e 系列发送（gpt-image 恒 b64_json，发该参数可能 400）；④落盘走 self.cwd/outputs/（不硬编码 script_dir），前置 ≤20MiB 检查；⑤agent_loop/Phase A 交付链/worker-python/backend-go/contracts 零改动。
 
-**验证**：根 pytest 全绿（78 项，含 test_image_gen.py 30 项）。**真实 key 闭环已实测（2026-08-14）**：new-api 中转（newapi.myovo.cc.cd）双渠道五模型——gpt-image-2 完整 CLI 闭环成功（模型自动调 image_gen → temp/outputs/ 出图 2.6MB PNG → 最终回复回显 [FILE:] marker）；agnes-image-2.1-flash 验证 url 直下兜底（1.8MB PNG）；探测确认 gemini-3-pro-image / gemini-3.1-flash-image-preview 返回 b64_json、sensenova-u1-fast 只回 url（size 集合特殊）。**实测驱动的客户端适配**：①size 缺省默认 1024x1024（中转计费必传）；②b64_json 为空时 url 直下兜底（≤20MiB 限流）。**残余风险（待实测）**：流式 SSE 稳定性（保持 stream=False）、n>1 兼容性（透传+错误诚实）、IM 端到端收图需真实渠道凭据冒烟；**Step 2 上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json）。
+**验证**：根 pytest 全绿（78 项，含 test_image_gen.py 30 项）。**真实 key 闭环已实测（2026-08-14）**：new-api 中转（newapi.myovo.cc.cd）双渠道五模型——gpt-image-2 完整 CLI 闭环成功（模型自动调 image_gen → temp/outputs/ 出图 2.6MB PNG → 最终回复回显 [FILE:] marker）；agnes-image-2.1-flash 验证 url 直下兜底（1.8MB PNG）；探测确认 gemini-3-pro-image / gemini-3.1-flash-image-preview 返回 b64_json、sensenova-u1-fast 只回 url（size 集合特殊）。**实测驱动的客户端适配**：①size 缺省默认 1024x1024（中转计费必传）；②b64_json 为空时 url 直下兜底（≤20MiB 限流）。**托管链路验证**：Go 全量 + race（application/worker/llmproxy）绿、worker 146、契约 41、web build 绿。**残余风险（待实测）**：流式 SSE 稳定性（保持 stream=False）、n>1 兼容性（透传+错误诚实）、IM 端到端收图需真实渠道凭据冒烟；**上生产需 make build 全量重建**（ga-runner 内嵌 ga.py/llmcore.py/tools_schema.json + platform/llm-proxy 带托管路由）。
 
 ## 2026-08-14 二次审查优化（IM_MEDIA_ARCHITECTURE 审查结论落地）
 

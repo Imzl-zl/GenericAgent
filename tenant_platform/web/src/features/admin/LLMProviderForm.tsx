@@ -32,6 +32,7 @@ function initialForm(provider?: LLMProvider): ProviderFormValue {
     base_url: provider?.base_url ?? '',
     model: provider?.model ?? '',
     api_key: '',
+    capabilities: provider?.capabilities ?? ['chat'],
     session_config: provider ? { ...provider.session_config } : { stream: true },
     transport_config: provider
       ? { ...provider.transport_config }
@@ -165,6 +166,27 @@ export function LLMProviderForm({ provider, onSave, onCancel }: LLMProviderFormP
         value={form.api_key}
         onChange={(event) => setForm({ ...form, api_key: event.target.value })}
       />
+
+      <div className="provider-form-full provider-inline-toggles">
+        <span className="input-label">能力（Capabilities）</span>
+        {(['chat', 'image'] as const).map((cap) => (
+          <label className="provider-toggle" key={cap}>
+            <input
+              type="checkbox"
+              checked={(form.capabilities ?? ['chat']).includes(cap)}
+              disabled={cap === 'image' && form.provider_type === 'native_claude'}
+              onChange={(event) => {
+                const current = form.capabilities ?? ['chat'];
+                const next = event.target.checked
+                  ? [...current, cap]
+                  : current.filter((item) => item !== cap);
+                setForm({ ...form, capabilities: next.length > 0 ? next : ['chat'] });
+              }}
+            />
+            <span>{cap === 'chat' ? 'Chat（对话）' : 'Image（生图）'}</span>
+          </label>
+        ))}
+      </div>
 
       <div className="provider-form-full provider-inline-toggles">
         <label className="provider-toggle">

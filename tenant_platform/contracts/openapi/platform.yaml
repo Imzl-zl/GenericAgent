@@ -2166,6 +2166,11 @@ components:
         response_header_timeout_seconds:
           type: [integer, "null"]
           minimum: 1
+    LLMProviderCapability:
+      type: string
+      enum: [chat, image]
+      description: "能力维度: chat=对话(llm.chat 路由), image=生图(llm.image 路由, 仅 native_oai)"
+
     LLMProvider:
       type: object
       additionalProperties: false
@@ -2198,6 +2203,11 @@ components:
         model:
           type: string
           minLength: 1
+        capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/LLMProviderCapability"
+          description: 能力维度列表; 省略 = [chat]
         session_config:
           $ref: "#/components/schemas/GASessionConfig"
         transport_config:
@@ -2313,6 +2323,11 @@ components:
           minLength: 1
           writeOnly: true
           description: Upstream API key; encrypted at rest and never returned
+        capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/LLMProviderCapability"
+          description: 能力维度列表; 省略 = [chat]
         session_config:
           $ref: "#/components/schemas/GASessionConfig"
         transport_config:

@@ -45,7 +45,7 @@
 - **旧实现漂移清理（2026-08-12）**：runner 创建/校验双面同步（protectedRunnerEnvKeys 补 GA_OVERLAY_ROOT + 4 缓存 env、inspect wantEnv 补 GA_OVERLAY_ROOT、pkg cache env 配套校验）；4 个渠道 SDK 调用面容器内逐项实证（全 PASS）；qqapp.py 旧属性名探测清理；Go 18 包 + poller 52 测试全绿，已部署
 - **IM 真实渠道连通（2026-08-12 修复部署）**：bot-poller 已补 4 渠道 SDK + 修复 botpy/lark_oapi API 兼容；**QQ 已 ready（用户已加 IP 白名单 23.94.23.150，WS 连接成功）、飞书 ws started ✓**；钉钉/企微 SDK API 已静态验证兼容，无凭据未实测
 - im-channel-binding epic 仅剩**真实渠道冒烟**（需用户提供飞书/钉钉/QQ/企微应用凭据；企微重点=SEND_MSG 主动流式帧是否被服务端接受）
-- **image_gen 生图（2026-08-14 已编码 + 真实 key 闭环已验）**：new-api 中转实测——gpt-image-2 完整 CLI 闭环成功（temp/outputs/ 出图 + marker 回显）、agnes-image-2.1-flash url 直下兜底验证、gemini-3-pro-image/gemini-3.1-flash-image-preview/sensenova-u1-fast 探测确认兼容（sensenova 只回 url + size 集合特殊）；**IM 端到端收图待渠道凭据冒烟**；流式 SSE 稳定性与 n>1 兼容性待真实上游实测（同步路径恒可用，stream 建议保持 False）
+- **image_gen 生图（2026-08-14 已编码 + 真实 key 闭环已验 + 托管形态已实施）**：直连形态 new-api 中转实测（gpt-image-2 完整 CLI 闭环 + agnes url 直下 + 五模型兼容性图谱）；**托管形态（T8.5）已落地**：llm-proxy images/generations 路由 + llm.image capability + provider 能力维度（migration 0058）+ runtime_config image_gen 块 + policy 放行 + worker marker 兜底登记 + openapi/web；Go 全量+race+worker 146+契约 41 全绿；**IM 端到端收图待部署冒烟**（需渠道凭据 + make build 全量重建 ga-runner/platform/llm-proxy/web）；流式 SSE 与 n>1 待真实上游实测（同步路径恒可用，stream 保持 False）
 - im-streaming-delivery epic 仅剩**真实渠道冒烟**（需用户提供凭据；重点=飞书编辑链路 + QQ 流式帧序列参数实测）
 - 有意遗留（不产生功能缺陷，已评估）：C5 delivery_service 834 行未拆（纯结构债）；bundle 多文件 SOP 平台侧不支持（sophub 平台已上线 bundle，平台 proxy 有意收窄为 single-file，若需用要加支持）
 - 残余验证（需真实 Linux 主机 + Docker/runsc）：runsc 运行时、mTLS 注入、六服务 compose 冒烟、共享卷跨 UID

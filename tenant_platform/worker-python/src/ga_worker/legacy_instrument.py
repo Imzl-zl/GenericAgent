@@ -785,3 +785,62 @@ def install_max_turns(
                 pass
 
     return unwrap_all
+
+
+def install_image_gen_marker_registry(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
+    """Phase B 托管形态(2026-08-14 定稿, 二轮审查 I-2): image_gen 的 marker
+    回显兜底——GA do_image_gen 工具返回 [FILE:outputs/...] 标记, 但工具返回
+    ≠ 交付发生, 模型必须在最终回复中回显 marker 才触发 Go 侧捕获。本包装
+    不替换工具逻辑(ga.py 原生实现), 只在工具成功落盘后把产物相对路径登记
+    到 session.generated_output_files——终态时 task_terminal 经
+    append_missing_file_markers 自动补写漏回显的 marker(与 export_docx 同款
+    机制, legacy_instrument.do_export_docx → task_terminal.py:151-164)。"""
+    if legacy_mods is None or session is None:
+        return lambda: None
+    ga_mod = legacy_mods.get("ga")
+    if ga_mod is None:
+        return lambda: None
+    handler_cls = getattr(ga_mod, "GenericAgentHandler", None)
+    if handler_cls is None:
+        return lambda: None
+    original = getattr(handler_cls, "do_image_gen", None)
+    if original is None:
+        # 旧版 ga.py 无 image_gen(不兼容): 不安装, 工具不可见属 policy 层职责。
+        return lambda: None
+    if getattr(original, "_tenant_image_gen_registry", False):
+        return lambda: None
+
+    import re
+
+    _MARKER_RE = re.compile(r"\[FILE:(outputs/[^\s\]]+)\]")
+
+    def do_image_gen(self: Any, args: dict[str, Any], response: Any) -> Any:
+        gen = original(self, args, response)
+        outcome = None
+        try:
+            while True:
+                yield next(gen)
+        except StopIteration as stop:
+            outcome = stop.value
+        if outcome is not None:
+            data = getattr(outcome, "data", None)
+            text = data if isinstance(data, str) else ""
+            if not text:
+                text = str(getattr(outcome, "next_prompt", "") or "")
+            generated = getattr(session, "generated_output_files", None)
+            if generated is not None:
+                for marker in _MARKER_RE.findall(text):
+                    rel = marker.replace("\\", "/")
+                    if rel not in generated:
+                        generated.append(rel)
+        return outcome
+
+    do_image_gen._tenant_image_gen_registry = True  # type: ignore[attr-defined]
+    setattr(handler_cls, "do_image_gen", do_image_gen)
+
+    def unwrap() -> None:
+        current = getattr(handler_cls, "do_image_gen", None)
+        if current is do_image_gen:
+            setattr(handler_cls, "do_image_gen", original)
+
+    return unwrap

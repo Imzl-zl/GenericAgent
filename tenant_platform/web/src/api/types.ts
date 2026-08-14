@@ -94,6 +94,8 @@ export interface Persona {
 }
 
 export type LLMProviderType = 'native_oai' | 'native_claude';
+
+export type LLMProviderCapability = 'chat' | 'image';
 export type ProviderAuthMode = 'auto' | 'bearer' | 'x_api_key';
 
 export interface GASessionConfig {
@@ -157,6 +159,7 @@ export interface LLMProvider {
   provider_type: LLMProviderType;
   base_url: string;
   model: string;
+  capabilities?: LLMProviderCapability[];
   session_config: GASessionConfig;
   transport_config: ProviderTransportConfig;
   revision: number;

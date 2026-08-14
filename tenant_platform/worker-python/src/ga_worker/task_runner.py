@@ -162,6 +162,7 @@ def _setup_runtime(
         apply_tool_policy, install_dispatch_guard, install_export_docx_tool,
         install_global_mcp_tools,
         install_handler_print_counter, install_max_turns, ensure_session_dirs,
+        install_image_gen_marker_registry,
         install_sophub_tools, prepare_handler_seed,
     )
     agent = adapter._session.agent
@@ -183,6 +184,7 @@ def _setup_runtime(
     try:
         state.sandbox_unwrap = ensure_session_dirs(adapter._session, adapter._legacy_mods)  # type: ignore[attr-defined]
         state.export_unwrap = install_export_docx_tool(adapter._session, adapter._legacy_mods)
+        state.image_gen_unwrap = install_image_gen_marker_registry(adapter._session, adapter._legacy_mods)
         state.sophub_unwrap = install_sophub_tools(adapter._session, adapter._legacy_mods)
         state.mcp_unwrap = install_global_mcp_tools(adapter._session, adapter._legacy_mods)
         state.previous_schema = apply_tool_policy(tool_policy, adapter._legacy_mods)
@@ -212,6 +214,7 @@ def _rollback_runtime_setup(adapter: Any, state: TaskRunState) -> None:
         state.loop_unwrap, print_counter_unwrap, state.dispatch_unwrap,
         state.seed_unwrap, state.mcp_unwrap, getattr(state, "sophub_unwrap", None),
         getattr(state, "export_unwrap", None),
+        getattr(state, "image_gen_unwrap", None),
         sandbox_unwrap,
     ):
         if unwrap is not None:

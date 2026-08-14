@@ -485,3 +485,69 @@ def test_global_mcp_tools_must_intersect_with_tenant_policy(tmp_path: Path, monk
         restore_tool_schema(previous, mods)
         mcp_unwrap()
         sandbox_unwrap()
+
+
+def test_image_gen_marker_registry_registers_outputs(tmp_path: Path, monkeypatch):
+    """Phase B 托管形态(I-2): image_gen 的 marker 回显兜底——包装 GA
+    do_image_gen(generator 转发), 工具成功返回 [FILE:outputs/...] 后登记到
+    session.generated_output_files, 供终态 append_missing_file_markers 兜底。
+    包装不替换工具逻辑(原方法仍被调用)。"""
+    from ga_worker.legacy_instrument import install_image_gen_marker_registry
+
+    called = []
+
+    def fake_do_image_gen(self, args, response):
+        called.append(args)
+
+        def gen():
+            yield "[Action] image_gen: ...\n"
+            return types.SimpleNamespace(
+                data="[FILE:outputs/image_20260814_1.png]\n[FILE:outputs/image_20260814_2.png]",
+                next_prompt="\n[FILE:outputs/image_20260814_1.png]",
+                should_exit=False,
+            )
+        return gen()
+
+    class FakeHandler:
+        do_image_gen = fake_do_image_gen
+
+    ga_mod = types.SimpleNamespace(GenericAgentHandler=FakeHandler)
+    session = types.SimpleNamespace(generated_output_files=[])
+
+    unwrap = install_image_gen_marker_registry(session, {"ga": ga_mod})
+    handler = ga_mod.GenericAgentHandler()
+    out = list(handler.do_image_gen({"prompt": "a cat", "n": 2}, None))
+    assert out == ["[Action] image_gen: ...\n"], out
+    # 登记: 工具返回的 marker 全部进 generated_output_files(去重)
+    assert session.generated_output_files == [
+        "outputs/image_20260814_1.png",
+        "outputs/image_20260814_2.png",
+    ]
+
+    unwrap()
+    assert ga_mod.GenericAgentHandler.do_image_gen is fake_do_image_gen
+
+
+def test_image_gen_marker_registry_error_returns_no_registration(tmp_path: Path, monkeypatch):
+    """失败语义: 工具返回错误文本(无 [FILE:])时零登记——模型不得谎报成功。"""
+    from ga_worker.legacy_instrument import install_image_gen_marker_registry
+
+    def fake_do_image_gen(self, args, response):
+        def gen():
+            yield "[Status] ❌ ...\n"
+            return types.SimpleNamespace(
+                data="[Error: image_gen HTTP 500]",
+                next_prompt="\n",
+                should_exit=False,
+            )
+        return gen()
+
+    class FakeHandler:
+        do_image_gen = fake_do_image_gen
+
+    ga_mod = types.SimpleNamespace(GenericAgentHandler=FakeHandler)
+    session = types.SimpleNamespace(generated_output_files=[])
+    unwrap = install_image_gen_marker_registry(session, {"ga": ga_mod})
+    list(ga_mod.GenericAgentHandler().do_image_gen({"prompt": "x"}, None))
+    assert session.generated_output_files == []
+    unwrap()

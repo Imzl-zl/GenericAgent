@@ -2,6 +2,7 @@ import { api } from './client';
 import type {
   GASessionConfig,
   LLMProvider,
+  LLMProviderCapability,
   LLMProviderType,
   ProviderTransportConfig,
 } from './types';
@@ -15,6 +16,7 @@ interface ProviderWriteFields {
   provider_type: LLMProviderType;
   base_url: string;
   model: string;
+  capabilities?: LLMProviderCapability[];
   session_config: GASessionConfig;
   transport_config: ProviderTransportConfig;
 }

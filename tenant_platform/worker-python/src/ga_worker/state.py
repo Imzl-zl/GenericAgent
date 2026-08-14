@@ -109,6 +109,7 @@ class TaskRunState:
     # 与 dataclass 声明不一致——补为显式字段, 类型检查可见。
     sandbox_unwrap: Callable[[], None] | None = None
     export_unwrap: Callable[[], None] | None = None
+    image_gen_unwrap: Callable[[], None] | None = None
     print_counter_unwrap: Callable[[], None] | None = None
     previous_persona: list[str] = field(default_factory=list)
     previous_schema: Any = None
