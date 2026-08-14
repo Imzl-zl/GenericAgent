@@ -57,7 +57,7 @@ for _p in (_POLLER_DIR, _FRONTENDS_DIR, _LEGACY_ROOT):
         sys.path.insert(0, _p)
 
 import media_downloader as media_dl  # noqa: E402
-from wxbot_client import WxBotClient, AuthExpired  # noqa: E402
+from wxbot_client import WxBotClient, AuthExpired, fit_image_for_upload  # noqa: E402
 from wxbot_media import download_media  # noqa: E402
 
 # 扩展名 → MIME 映射迁移至 media_downloader(多渠道共用, 2026-08-13 审查
@@ -1297,9 +1297,25 @@ class DingTalkAdapter(BotAdapter):
         return media_id
 
     # -- 出站媒体统一接口(IM_MEDIA_ARCHITECTURE §5.1 A1 / §3.2) -----------
+    #: 钉钉官方图片限制: jpg/gif/png/bmp, ≤20MB(open.dingtalk.com 上传媒体
+    # 文件)。webp 不在白名单 → 交付侧转 JPEG; 动图(gif)保留。
+    _DINGTALK_IMAGE_ALLOWED = {'JPEG', 'PNG', 'GIF', 'BMP'}
+    _DINGTALK_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+
     def _send_image(self, target, file_path, file_name='', client_id=''):
         # sampleImageMsg photo=media_id(机器人图片消息)。
-        self._send_via_api_key(target, 'sampleImageMsg', {'photo': self._upload_media(file_path, 'image')})
+        adapted = fit_image_for_upload(
+            file_path, max_bytes=self._DINGTALK_IMAGE_MAX_BYTES,
+            allowed_formats=self._DINGTALK_IMAGE_ALLOWED, animated_ok=True)
+        try:
+            path = str(adapted) if adapted else file_path
+            self._send_via_api_key(target, 'sampleImageMsg', {'photo': self._upload_media(path, 'image')})
+        finally:
+            if adapted:
+                try:
+                    os.remove(str(adapted))
+                except OSError:
+                    pass
 
     def _send_file(self, target, file_path, file_name='', client_id=''):
         # 钉钉机器人文件消息 = sampleFileMsg{fileName,fileType,fileSize,downloadCode},
@@ -2099,8 +2115,24 @@ class WeComAdapter(BotAdapter):
         self._run_coro(self._client.send_message(
             target, {'msgtype': 'media', 'media': {'media_id': media_id}}))
 
+    #: 企微官方图片限制: 仅 JPG/PNG, ≤10MB(developer.work.weixin.qq.com
+    # 上传临时素材)。白名单外格式(webp/gif/bmp)与动图交付侧转 JPEG。
+    _WECOM_IMAGE_ALLOWED = {'JPEG', 'PNG'}
+    _WECOM_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+
     def _send_image(self, target, file_path, file_name='', client_id=''):
-        self._send_media_message(target, self._upload_media(file_path, 'image'))
+        adapted = fit_image_for_upload(
+            file_path, max_bytes=self._WECOM_IMAGE_MAX_BYTES,
+            allowed_formats=self._WECOM_IMAGE_ALLOWED, animated_ok=False)
+        try:
+            path = str(adapted) if adapted else file_path
+            self._send_media_message(target, self._upload_media(path, 'image'))
+        finally:
+            if adapted:
+                try:
+                    os.remove(str(adapted))
+                except OSError:
+                    pass
 
     def _send_file(self, target, file_path, file_name='', client_id=''):
         self._send_media_message(target, self._upload_media(file_path, 'file'))

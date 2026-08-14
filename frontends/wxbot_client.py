@@ -36,6 +36,74 @@ for _k in ('HTTPS_PROXY', 'https_proxy'):
     os.environ.pop(_k, None)
 
 
+def fit_image_for_upload(file_path, *, max_bytes=None, allowed_formats=None, animated_ok=True):
+    """渠道媒体档案适配(2026-08-14 官方文档对齐, 微信/企微/钉钉共用):
+    - allowed_formats: PIL 格式白名单(官方文档: 企微图片仅 JPG/PNG; 钉钉
+      jpg/gif/png/bmp 无 webp)。白名单外的静态图转 JPEG; 白名单外的动图
+      GIF(animated_ok=False, 企微)取首帧转静态 JPEG。
+    - max_bytes: 超限迭代压缩(质量 q90→55, 再降采样 0.8^N)到 ≤max_bytes。
+    - animated_ok=True(微信/钉钉): 动图一律保留不转(丢动画不可接受)。
+    返回临时文件 Path(调用方负责清理)或 None(无需适配/非图片/失败回退原图)。
+    临时文件用 mkstemp 落可写系统临时目录——生产 poller 只读 rootfs, 源
+    (spool)卷只读, 写源旁目录会静默失败(2026-08-14 生产实证)。"""
+    fp = Path(file_path)
+    try:
+        from PIL import Image
+        im = Image.open(fp)
+        im.load()
+        fmt = (im.format or '').upper()
+        animated = bool(getattr(im, 'is_animated', False))
+    except Exception:
+        return None
+    try:
+        size = fp.stat().st_size
+    except OSError:
+        return None
+    if animated and animated_ok:
+        return None  # 动图保留(丢动画不可接受)
+    need_format = allowed_formats is not None and fmt not in allowed_formats
+    need_size = max_bytes is not None and size > max_bytes
+    if not need_format and not need_size:
+        return None
+    import tempfile
+    from io import BytesIO
+    out = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix='.fit_', suffix='.jpg')
+        os.close(fd)
+        out = Path(tmp_name)
+        bio = BytesIO()
+        target = max_bytes or (1 << 62)
+        buf = None
+        # 迭代压缩: q90→55 逐档降质, 仍超限再降采样 0.8^N。
+        for quality in (90, 80, 70, 60, 55):
+            bio.seek(0); bio.truncate()
+            im.convert('RGB').save(bio, format='JPEG', quality=quality)
+            if bio.tell() <= target:
+                buf = bio.getvalue(); break
+        if buf is None:
+            scale, cur = 0.9, im
+            while scale > 0.3:
+                w, h = max(1, int(im.width * scale)), max(1, int(im.height * scale))
+                cur = im.resize((w, h), Image.LANCZOS)
+                bio.seek(0); bio.truncate()
+                cur.convert('RGB').save(bio, format='JPEG', quality=70)
+                if bio.tell() <= target:
+                    buf = bio.getvalue(); break
+                scale -= 0.15
+        if buf is None:
+            return None
+        out.write_bytes(buf)
+        return out
+    except Exception:
+        try:
+            if out is not None:
+                out.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
 def _uin():
     return base64.b64encode(str(struct.unpack('>I', os.urandom(4))[0]).encode()).decode()
 
@@ -227,11 +295,16 @@ class WxBotClient:
         raise last_err
 
     def _build_upload_body(self, fp, raw, aes_key, item_key, ciphertext_size, thumb_raw, thumb_ciphertext_size):
+        # 2026-08-14 官方协议对齐: 腾讯 openclaw 实现默认 no_need_thumb=true
+        # (protocol-spec §8.6: "只上传主文件, 不上传缩略图; 公开实现里图片
+        # 消息往往只有 media, 没有 thumb_media")。旧实现 no_need_thumb=false
+        # 且服务端返回 thumb_upload_param 时上传空字节当缩略图——偏离官方
+        # 默认且是隐患。thumb_raw 参数保留兼容(调用方显式传了才要缩略图)。
         body = {
             'filekey': uuid.uuid4().hex, 'media_type': 0, 'to_user_id': '',
             'rawsize': len(raw), 'rawfilemd5': hashlib.md5(raw).hexdigest(),
             'filesize': ciphertext_size,
-            'no_need_thumb': item_key not in ('image_item', 'video_item'),
+            'no_need_thumb': not thumb_raw,
             'aeskey': aes_key.hex(), 'base_info': {'channel_version': VER}}
         if thumb_raw:
             body.update({'thumb_rawsize': len(thumb_raw),
@@ -249,35 +322,34 @@ class WxBotClient:
         bio = BytesIO(); im.save(bio, format='JPEG', quality=85)
         return bio.getvalue(), thumb_w, thumb_h
 
-    def _make_media_item(self, item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_size, fp, file_name=''):
+    def _make_media_item(self, item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_size, fp, file_name='', raw=b''):
         item = {'media': media}
         if item_key == 'file_item':
             # 审查 R5-I10: 优先使用显式显示名, 回退到本地文件名(兼容旧调用方)。
             item.update({'file_name': file_name or fp.name, 'len': str(len(fp.read_bytes()))})
         elif item_key == 'image_item':
-            thumb_media = self._upload_thumb(resp, media)
-            item.update({'mid_size': ciphertext_size, 'thumb_media': thumb_media,
-                         'thumb_size': thumb_size, 'thumb_width': thumb_w, 'thumb_height': thumb_h})
+            # 官方形态(openclaw no_need_thumb=true): media + mid_size。
+            item.update({'mid_size': ciphertext_size})
+            # 防御兼容: 若服务端仍返回 thumb_upload_param(显式传了真缩略图
+            # 的情形), 上传主图字节作为缩略图——绝不传空字节(旧实现隐患)。
+            if raw and (resp.get('thumb_upload_param') or resp.get('thumb_upload_full_url')):
+                thumb_media = self._upload('', resp.get('thumb_upload_param', ''),
+                                           raw, aes_key=b'\x00' * 16,
+                                           upload_url=resp.get('thumb_upload_full_url', ''))
+                item.update({'thumb_media': thumb_media, 'thumb_size': thumb_size,
+                             'thumb_width': thumb_w, 'thumb_height': thumb_h})
         elif item_key == 'video_item':
             item.update({'video_size': ciphertext_size})
         return item
-
-    def _upload_thumb(self, resp, fallback_media):
-        thumb_param = resp.get('thumb_upload_param', '')
-        thumb_url = resp.get('thumb_upload_full_url', '')
-        if thumb_param or thumb_url:
-            return self._upload('', thumb_param, b'', b'\x00' * 16, upload_url=thumb_url)
-        return fallback_media
 
     def _send_media(self, to_user_id, file_path, media_type, item_type, item_key, context_token='', file_name='', client_id=None):
         fp = Path(file_path)
         raw = fp.read_bytes()
         aes_key = os.urandom(16)
         ciphertext_size = ((len(raw) // 16) + 1) * 16
+        # 官方 openclaw 默认不上传缩略图(no_need_thumb=true); thumb 字段
+        # 保留默认空, 显式调用方传 _make_thumbnail 产物即可。
         thumb_raw = b''; thumb_w = thumb_h = 0; thumb_ciphertext_size = 0
-        if item_key == 'image_item':
-            thumb_raw, thumb_w, thumb_h = self._make_thumbnail(fp)
-            thumb_ciphertext_size = ((len(thumb_raw) // 16) + 1) * 16
         body = self._build_upload_body(fp, raw, aes_key, item_key, ciphertext_size, thumb_raw, thumb_ciphertext_size)
         body['media_type'] = media_type
         body['to_user_id'] = to_user_id
@@ -289,7 +361,7 @@ class WxBotClient:
         media = self._upload(body['filekey'], upload_param, raw, aes_key=aes_key, upload_url=upload_url)
         # 审查 R5-I10: 用户可见文件名由 Platform 显式传入(file_name), 不从
         # 本地临时路径 basename 推导(快照文件名含 marker hash 前缀)。
-        item = self._make_media_item(item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_ciphertext_size, fp, file_name=file_name)
+        item = self._make_media_item(item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_ciphertext_size, fp, file_name=file_name, raw=raw)
         msg = {'from_user_id': '', 'to_user_id': to_user_id,
                'client_id': client_id or f'pyclient-{uuid.uuid4().hex[:16]}',
                'message_type': MSG_BOT, 'message_state': STATE_FINISH,
@@ -326,60 +398,10 @@ class WxBotClient:
 
     def _fit_static_image_for_upload(self, file_path):
         """超限静态图 → 临时 JPEG(≤300KB), 返回 Path; 无需转换返回 None。
+        委托模块级 fit_image_for_upload(微信档案: 只按大小, 动图不转)。
         失败(非图片/编码异常)返回 None, 由调用方走原图(错误语义不变)。"""
-        fp = Path(file_path)
-        try:
-            if fp.suffix.lower() not in self._STATIC_IMAGE_EXTS:
-                return None
-            if fp.stat().st_size <= self._IMAGE_UPLOAD_MAX_BYTES:
-                return None
-            from io import BytesIO
-            from PIL import Image
-            im = Image.open(fp)
-            im.load()
-            if getattr(im, 'is_animated', False):
-                return None  # 动图不转
-        except Exception:
-            return None
-        out = None
-        try:
-            # 适配临时文件必须写在可写目录: 生产 poller 以只读 rootfs 运行,
-            # spool 卷对 poller 只读(只需读取), 写源文件旁目录会静默失败
-            # 回退原图(2026-08-14 生产实证: 超限图未压缩直接上传 → 节流写
-            # 超时 → 死信)。mkstemp 落系统临时目录(/tmp tmpfs, 可写)。
-            import tempfile
-            fd, tmp_name = tempfile.mkstemp(prefix='.fit_', suffix='.jpg')
-            os.close(fd)
-            out = Path(tmp_name)
-            bio = BytesIO()
-            # 迭代压缩: q90→55 逐档降质, 仍超限再降采样 0.8^N。
-            buf = None
-            for quality in (90, 80, 70, 60, 55):
-                bio.seek(0); bio.truncate()
-                rgb = im.convert('RGB')
-                rgb.save(bio, format='JPEG', quality=quality)
-                if bio.tell() <= self._IMAGE_UPLOAD_MAX_BYTES:
-                    buf = bio.getvalue(); break
-            if buf is None:
-                scale, cur = 0.9, im
-                while scale > 0.3:
-                    w, h = int(im.width * scale), int(im.height * scale)
-                    cur = im.resize((w, h), Image.LANCZOS)
-                    bio.seek(0); bio.truncate()
-                    cur.convert('RGB').save(bio, format='JPEG', quality=70)
-                    if bio.tell() <= self._IMAGE_UPLOAD_MAX_BYTES:
-                        buf = bio.getvalue(); break
-                    scale -= 0.15
-            if buf is None:
-                return None
-            out.write_bytes(buf)
-            return out
-        except Exception:
-            try:
-                out.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return None
+        return fit_image_for_upload(
+            file_path, max_bytes=self._IMAGE_UPLOAD_MAX_BYTES, animated_ok=True)
 
     def send_video(self, to_user_id, file_path, context_token='', client_id=None):
         return self._send_media(to_user_id, file_path, 2, ITEM_VIDEO, 'video_item', context_token, client_id=client_id)

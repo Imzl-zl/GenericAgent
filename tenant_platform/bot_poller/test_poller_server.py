@@ -225,6 +225,64 @@ def test_fit_static_image_for_upload_compresses_oversized_png(tmp_path):
         os.chmod(tmp_path, 0o755)
 
 
+def test_fit_image_for_upload_channel_format_whitelists(tmp_path):
+    """2026-08-14 官方文档对齐: 企微图片仅 JPG/PNG、钉钉 jpg/gif/png/bmp(无
+    webp)。白名单外格式转 JPEG; 企微动图取首帧; 钉钉动图保留。"""
+    from PIL import Image
+    from wxbot_client import fit_image_for_upload
+
+    webp = tmp_path / "a.webp"
+    Image.new("RGB", (64, 64), (10, 20, 30)).save(webp, format="WEBP")
+    gif = tmp_path / "a.gif"
+    Image.new("RGB", (32, 32), (1, 2, 3)).save(gif, format="GIF")
+    png = tmp_path / "a.png"
+    Image.new("RGB", (32, 32), (4, 5, 6)).save(png, format="PNG")
+
+    # 企微(仅 JPG/PNG): webp → JPEG, png 原样
+    w1 = fit_image_for_upload(str(webp), max_bytes=10 << 20,
+                              allowed_formats={"JPEG", "PNG"}, animated_ok=False)
+    assert w1 is not None
+    try:
+        assert Image.open(str(w1)).format == "JPEG"
+    finally:
+        w1.unlink(missing_ok=True)
+    assert fit_image_for_upload(str(png), max_bytes=10 << 20,
+                                allowed_formats={"JPEG", "PNG"}, animated_ok=False) is None
+    # 企微 GIF(动图) → 首帧 JPEG(animated_ok=False)
+    w2 = fit_image_for_upload(str(gif), max_bytes=10 << 20,
+                              allowed_formats={"JPEG", "PNG"}, animated_ok=False)
+    assert w2 is not None
+    try:
+        assert Image.open(str(w2)).format == "JPEG"
+    finally:
+        w2.unlink(missing_ok=True)
+
+    # 钉钉(jpg/gif/png/bmp): webp → JPEG, gif 保留
+    d1 = fit_image_for_upload(str(webp), max_bytes=20 << 20,
+                              allowed_formats={"JPEG", "PNG", "GIF", "BMP"}, animated_ok=True)
+    assert d1 is not None
+    try:
+        assert Image.open(str(d1)).format == "JPEG"
+    finally:
+        d1.unlink(missing_ok=True)
+    assert fit_image_for_upload(str(gif), max_bytes=20 << 20,
+                                allowed_formats={"JPEG", "PNG", "GIF", "BMP"}, animated_ok=True) is None
+
+
+def test_build_upload_body_defaults_no_need_thumb(tmp_path):
+    """2026-08-14 官方协议对齐: openclaw 默认 no_need_thumb=true(只传主图,
+    不上传缩略图)。无 thumb_raw 时请求体必须 no_need_thumb=True。"""
+    path = tmp_path / "img.png"
+    path.write_bytes(b"png")
+    client = WxBotClient(token="test", persist=False)
+    body = client._build_upload_body(path, b"png", b"\x00" * 16, "image_item",
+                                     ciphertext_size=32, thumb_raw=b"", thumb_ciphertext_size=0)
+    assert body["no_need_thumb"] is True
+    body2 = client._build_upload_body(path, b"png", b"\x00" * 16, "image_item",
+                                      ciphertext_size=32, thumb_raw=b"t", thumb_ciphertext_size=16)
+    assert body2["no_need_thumb"] is False
+
+
 def test_send_image_adapts_oversized_static_image(tmp_path):
     """send_image 对超限静态图走适配路径(JPEG ≤300KB), 协议调用面不变。"""
     from PIL import Image
