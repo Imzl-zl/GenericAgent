@@ -21,7 +21,10 @@
 - **wechat 频道恢复（2026-08-12）**：channel_configs 两条 wechat 绑定（08-08 写入，明文为 iLink 凭据字符串非 JSON）经格式迁移恢复——重加密为 `{"token": ...}`（备份 /tmp/wechat_plaintext_backup.txt）+ 重建 bot-poller 镜像（生产 poller 一直是旧 /start 契约 bot_token 顶层字段，89081f2 改 config_json 后 8-11 部署未重建 poller，两边失配才导致 marshal 失败）；恢复后两条 restored channel 无 ERROR
 - **web 镜像滞后修复（2026-08-12）**：8-11 部署时 web 镜像未重建（停在 08-08 构建），8-10/8-11 的界面改动（IM 渠道绑定页/企微卡片/MCP 治理面板）全缺失，用户看到旧“微信绑定”菜单——重建后含企业微信/渠道绑定/MCP 面板；同批排查：sandbox-manager 镜像旧但代码无改动（无影响）、ga-runner 旧但 0751a6d 仅影响宿主机场景（容器内无影响）。**教训：部署必须全量重建（make build），选择性重建会漏镜像（前有 bot-poller 契约失配，后有 web 界面滞后）**
 - **bot poller 对账机制（2026-08-14）**：`ReconcileBots` 周期收敛期望（DB channel_configs state='active'）与实际（poller /health active_bots）——缺失自动重注册、僵尸自动 stop（带 cursor 持久化）、health 失败安全不动；`BOT_RECONCILE_INTERVAL`（默认 60s，0 禁用）挂 main.go ticker。背景：poller 容器单独重建/替换后 RestoreActiveBots 只跑一次导致全部渠道静默失联（真实事故，微信 /new 无响应）。端到端验证：手动 stop 一个微信 bot → 60s 内自动拉回。教训：有状态下游重建后必须有对账，一次性启动注册不可靠
-- 最后更新：2026-08-14（微信生图交付死信全链路修复 5 提交 + 生产部署 433b7c7 + 10 张图端到端送达用户微信）
+- 最后更新：2026-08-14（pillow 依赖归位 + QQ 根前端媒体通道升级）
+
+  - **pillow 依赖归位（2026-08-14）**：`pillow>=9.0` 从 `ui` extra 移入 base dependencies——IM 媒体适配是硬依赖（wxbot_client 图片压缩/生图降采样），原先只挂 ui extra 导致 CI/新部署缺 PIL 且被 except Exception 静默吞掉（08-14 CDN 事故复发路径）；`fit_image_for_upload` 拆 ImportError 独立捕获+stderr 告警；bot_poller 测试 import 归位顶部
+- **QQ 根前端媒体直发（2026-08-14，根路径 6 IM 前端最后补齐）**：新模块 `frontends/qq_media.py`（QQMediaSender，与平台 poller QQAdapter 同构，审查 B2/I4 已过审）——官方 rich-media 分片 4 步上传（prepare→PUT→part_finish→files 合并 file_info）→ msg_type=7 主动消息；单聊/群聊端点组（上传发送必须同组，入站已知 is_group 直接选组）；file_info TTL=发送时刻上传；PUT 3 次退避；per-target 15 QPM 令牌桶；失败回退文本提示（内容不丢）。QQApp.send_done 覆写解析 [FILE:] marker 按扩展名分类直发（图/视频/文件）。测试 tests/test_qq_media.py 9 用例。原 08-14 "QQ 文本通道"声明已废止
 
 ## 已完成能力
 
@@ -37,7 +40,7 @@
 
 ## 进行中 / 未完成
 
-- **微信生图交付死信修复（2026-08-14，已部署 433b7c7，端到端验证通过）**：三层根因叠加——①spool checkpoint NULL content（0057 迁移只加列没改 INSERT，已修 COALESCE）；②buildPayload spool 分支漏设 relPath → mediaTypeForPath("") 回退 file → 生成图全部走 file_item 原图上传；③海外→微信 C2C CDN 大文件节流（~18KB/s + ~30s 断连，>450KB 必死）。修复：spool 分支补 relPath + send_image 交付侧转 JPEG ≤300KB + poller 上传 (30s 写,10s 读)×2 + Go 媒体预算 90s + 重试窗口 30min。10 张图重投全部 acked 送达；26/26 交付 acked 0 死信。**独立审查优化（2026-08-14 同日落地）**：预算链定稿——poller 最坏 ~85s < ctx 90s < poller client 兜底 120s（拆双 http.Client，修掉单一 15s Timeout 架空媒体预算的洞）；读超时 120s→10s 快速失败；删死代码（WeChatAdapter 旧双签名/快照二次发送分支+161 行 deliverable_snapshot/缩略图生成）；admin 死信查询+重投端点（GET /v1/admin/deliveries + POST .../{id}/requeue，E2）；根 QQ/钉钉文件交付改诚实提示（不再渲染服务器路径），钉钉补图片直发；FILE: 解析收敛到 frontends/im_markers.py。残余：>500KB 文件/GIF/视频交付仍受 CDN 节流限制（生成端 size 控制）；admin 死信重投端点已补（替代手动 SQL）
+- **微信生图交付死信修复（2026-08-14，已部署 433b7c7，端到端验证通过）**：三层根因叠加——①spool checkpoint NULL content（0057 迁移只加列没改 INSERT，已修 COALESCE）；②buildPayload spool 分支漏设 relPath → mediaTypeForPath("") 回退 file → 生成图全部走 file_item 原图上传；③海外→微信 C2C CDN 大文件节流（~18KB/s + ~30s 断连，>450KB 必死）。修复：spool 分支补 relPath + send_image 交付侧转 JPEG ≤300KB + poller 上传 (30s 写,10s 读)×2 + Go 媒体预算 90s + 重试窗口 30min。10 张图重投全部 acked 送达；26/26 交付 acked 0 死信。**独立审查优化（2026-08-14 同日落地）**：预算链定稿——poller 最坏 ~85s < ctx 90s < poller client 兜底 120s（拆双 http.Client，修掉单一 15s Timeout 架空媒体预算的洞）；读超时 120s→10s 快速失败；删死代码（WeChatAdapter 旧双签名/快照二次发送分支+161 行 deliverable_snapshot/缩略图生成）；admin 死信查询+重投端点（GET /v1/admin/deliveries + POST .../{id}/requeue，E2）；根 QQ/钉钉文件交付不再渲染服务器路径（QQ 2026-08-14 起图片/视频/文件直发，钉钉图片直发、文件/视频诚实提示）；FILE: 解析收敛到 frontends/im_markers.py。残余：>500KB 文件/GIF/视频交付仍受 CDN 节流限制（生成端 size 控制）；admin 死信重投端点已补（替代手动 SQL）
 
 - **思考外泄架构修复（2026-08-12）**：agent_loop 输出分层由 verbose 开关落实（verbose=False 只 yield 用户可见回复，不输出轮次标记/工具行/<summary>；verbose=True 完整转录不变）——不是 worker 正则补丁；实证：三渠道交付文本同源同脏（checkpoint result 铁证），飞书打字机最显眼；新增分层回归测试，已部署（platform + ga-runner digest）
 - **输出分层配套（2026-08-12 审查后补强）**：display 流新增事件信号——agentmain 每轮边界推送 `{'turn': N}`（先冲刷残留文本保证 'next' 不跨轮，outputs=turn_resps[-2:] 兼容 wechatapp 消费）+ 非 verbose 工具活动 `{'tool': name}`（worker 心跳推进信号，防长工具轮被 idle reaper 误收割）；tgapp 轮次协调从解析文本标记改为事件驱动（删 8 处死代码）；qqapp 删 dead on_direct_message_create（频道私信 intent 未订阅）；lark-oapi 约束收窄 >=1.7（LogLevel.WARNING 版本绑定）；Go 流式 open 文本 TrimSpace 防护（'…' 占位不可达）；uv.lock 孤儿文件 gitignore；新增 tests/test_agentmain_stream_events.py
@@ -71,6 +74,8 @@
 - 2026-08-06（D1 去分级）：工具能力统一静态 policy manifest；2026-08-06（D2-D5）：成功路径 draining 闭合、BlockUser 会话撤销、delivery fencing、DB 时钟 lease、LLM_FAILED 结构化终态
 
 ## 仍需注意的坑点
+
+- **依赖声明错位坑（2026-08-14 修复）**：硬依赖挂在错误 extra（pillow 在 `ui` 但 IM 图片适配运行时需要）+ 惰性导入 + 全量 except 吞错 = CI 红/生产静默降级/本地不显三态并存；依赖归属按运行面声明（base 或正确 extra），缺失必须显式告警不可静默回退；**CI 新增依赖后全量跑根测试**（会激活此前 `except ImportError: return` 跳过的测试，本次暴露 22KB 纯色 PNG fixture 存量缺陷）
 
 - **spool 交付文件 NULL content 坑（2026-08-14 修复）**：迁移 0057 spool 引用化后 capture 侧域对象 Content=nil（SpoolPath 非空），但 checkpoint_store INSERT 直插 content 列（NOT NULL）→ 微信生图成功终态事务整体回滚 CHECKPOINT_COMMIT_FAILED（23502）。已改 `COALESCE($5,''::bytea)` 落空 bytea；教训：**迁移注释里的列值语义变更（"content 为空"= 空 bytea 非 NULL）必须同步全部读写点**，域对象 nil 与 DB NOT NULL 失配时既有测试（loopback content 模式）覆盖不到 spool 路径
 - **Python 3.14 与 pywebview 不兼容，用 3.11/3.12**
@@ -107,6 +112,8 @@
 - `.tasks/*/SUBTASKS.csv` 字段内含逗号须引号包裹
 
 ## 最近活跃窗口
+
+- 2026-08-14：**pillow 依赖归位 + QQ 媒体通道升级（CI 红根因修复）**：CI 红=bot_poller 3 测试 `No module named 'PIL'`（pillow 只挂 ui extra，CI 装 base 无 PIL；本地 .venv 同样复现）。修复：pillow 移入 base dependencies + fit_image_for_upload 拆 ImportError 显式告警 + 测试 import 归位；用户实测 QQ 生图不直发（微信直发）→ 根因=08-14 C1 审查有意声明 QQ 文本通道（无凭据实测避免半成品），非协议限制（官方 rich-media 分片平台已实现）→ 移植平台实现到 frontends/qq_media.py + QQApp.send_done 媒体直发 + 9 测试。验证：bot_poller 95、根 90、contract/security/smoke 41 全绿
 
 - 2026-08-14：**32692e0 部署（交付链优化 + 复审修复）+ 镜像清理**：make build 全量重建（:local + :32692e0）→ 滚动重启 platform + bot-poller（备份 tag :local.bak-20260814-pre-reviewfix 先打）→ migration 0060 自动 apply（requeued_at 列验证存在）→ healthz 全绿、两容器 0 error、active_bots 正常、admin 端点带 token 200 / 无 token 401。镜像清理：删 50 个历史 commit tag + 9.2GB build cache → Images 8.0→2.9GB。**坑（本次实证）**：`docker image prune -a` 会删**所有未被容器引用的镜像，不论 tag**——把 :32692e0 追溯 tag 与 :local.bak-* 备份全删了（容器用 :local 无影响），需 make build 重建恢复 tag；备份 tag 无法恢复（旧镜像已删），回滚预案降级为"git 检出 + make build"（代码在 git，可接受）。教训：prune 只允许 `docker image prune -f`（仅 dangling）；清未使用镜像前先 `docker images --format` 核对，或逐个 rmi。
 - 2026-08-14：**子代理复审（3 路并行）P1 修复**：admin 重投端点"假成功"——窗口锚点仍为 tasks.terminal_at+30min 且死信清扫每 tick 先于 claim，事故后数小时重投的行 ~2s 被打回。修复：migration 0060 requeued_at（DO 块幂等）+ 窗口锚点统一 GREATEST(terminal_at, requeued_at)（claim/死信/retryDeadline 三处）+ 集成测试 TestDeliveryRequeueSurvivesExpiredRetryWindow；控制面 _post 显式 (10,10)（病理最坏 113s→103s 口径诚实化）；clientFor 防呆测试；删 poller 基类 send_file/Feishu send_stream_close_all 死方法；thumb 分支门控；`.pi/` 补 gitignore + rm --cached（47faa02 误提交 10 个审查转录，可能含密钥）。
