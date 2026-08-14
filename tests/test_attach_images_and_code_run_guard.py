@@ -186,13 +186,25 @@ class TestBudgetMeasuredAfterDownsample:
 
     def _setup_big_png(self):
         from PIL import Image
+        import random
         tmp = tempfile.mkdtemp()
         os.makedirs(os.path.join(tmp, "attachments"))
-        # 3000x2000 真 PNG(~4MB 原始体量), 降采样后远小于预算。
-        big = Image.new("RGB", (3000, 2000), (20, 80, 200))
+        # 噪声 PNG 校准到 (2.6MB, 2.95MB): 纯色 PNG 只有 ~22KB(原 fixture
+        # 缺陷, 2026-08-16 暴露——pillow 进 base deps 后 CI 不再跳过本类),
+        # 随机 RGB 噪声几乎不可压缩——固定种子 + 尺寸收缩迭代收敛到区间。
+        # 测试意图: 原始体积按旧口径 est=size*4/3 必超 3.5MB 预算(应跳过),
+        # 新口径按实际注入字节放行; PIL 版本间压缩差异由校准吸收。
         path = os.path.join(tmp, "attachments", "F001_big.png")
-        big.save(path, "PNG")
-        return tmp, path
+        rng = random.Random(42)
+        w, h = 1400, 1000
+        for _ in range(60):
+            Image.frombytes("RGB", (w, h), rng.randbytes(w * h * 3)).save(path, "PNG")
+            size = os.path.getsize(path)
+            if 2_600_000 < size < 2_950_000:
+                return tmp, path
+            w, h = max(64, int(w * (0.9 if size >= 2_950_000 else 1.04))), \
+                   max(64, int(h * (0.9 if size >= 2_950_000 else 1.04)))
+        raise RuntimeError("cannot calibrate big png fixture")
 
     def test_large_image_injected_after_downsample(self):
         try:

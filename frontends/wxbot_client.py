@@ -49,6 +49,15 @@ def fit_image_for_upload(file_path, *, max_bytes=None, allowed_formats=None, ani
     fp = Path(file_path)
     try:
         from PIL import Image
+    except ImportError:
+        # 硬依赖缺失必须显式告警(2026-08-16 复审): 此前惰性导入 + 全量
+        # except 吞掉 ModuleNotFoundError, 缺 pillow 时静默回退原图, 让
+        # 2026-08-14 CDN 超限事故无声复发。回退语义保留(调用方仍走原图),
+        # 但缺失原因必须可见。
+        print('[wxbot_client] PIL missing (pip install pillow): image fit disabled, '
+              'oversized uploads will be sent raw', file=sys.stderr)
+        return None
+    try:
         im = Image.open(fp)
         im.load()
         fmt = (im.format or '').upper()

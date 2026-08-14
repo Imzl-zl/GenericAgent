@@ -14,6 +14,11 @@ dependencies = [
     "bottle>=0.12",
     "simple-websocket-server>=0.4",
     "aiohttp>=3.9",
+    # IM 媒体适配硬依赖(2026-08-16 从 ui extra 移入): frontends/wxbot_client
+    # fit_image_for_upload 与 bot_poller 图片压缩均运行时依赖, 与 UI 无关;
+    # 原先只挂 ui extra 导致 CI/新部署缺 PIL 静默回退原图(2026-08-14 事故
+    # 复发风险)。全平台有 wheel。
+    "pillow>=9.0",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +32,6 @@ ui = [
     # now a direct dependency (was transitive via textual in tui_v2).
     "prompt_toolkit>=3.0,<4",
     "rich>=13.0",
-    "pillow>=9.0",
 ]
 all-frontends = [
     "python-telegram-bot>=20.0",

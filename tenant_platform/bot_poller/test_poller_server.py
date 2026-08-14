@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import random
 import re
 import threading
 import time
 
 import requests
+from PIL import Image
 
 import tenant_platform.bot_poller.poller_server as poller_server
 from tenant_platform.bot_poller.poller_server import WxBotClient, coalesce_webhook_bodies
@@ -183,12 +185,9 @@ def test_fit_static_image_for_upload_compresses_oversized_png(tmp_path):
     """2026-08-14 生产事故回归: 微信 CDN 大文件上传被限速/断连, 超限静态图
     必须在交付侧转 JPEG 压缩到 ≤300KB 再上传。超限 PNG → 合规 JPEG;
     小图/非图片/动图不转换返回 None。"""
-    from PIL import Image
-
     client = WxBotClient(token="test", persist=False)
     big = tmp_path / "big.png"
     # 1024x1024 噪声 PNG ≈ 1.4MB, 必然超限(稀疏噪声会被 PNG 压缩, 必须逐像素随机)
-    import random
     im = Image.frombytes("RGB", (1024, 1024), random.Random(42).randbytes(1024 * 1024 * 3))
     im.save(big, format="PNG")
     assert big.stat().st_size > client._IMAGE_UPLOAD_MAX_BYTES
@@ -228,7 +227,6 @@ def test_fit_static_image_for_upload_compresses_oversized_png(tmp_path):
 def test_fit_image_for_upload_channel_format_whitelists(tmp_path):
     """2026-08-14 官方文档对齐: 企微图片仅 JPG/PNG、钉钉 jpg/gif/png/bmp(无
     webp)。白名单外格式转 JPEG; 企微动图取首帧; 钉钉动图保留。"""
-    from PIL import Image
     from wxbot_client import fit_image_for_upload
 
     webp = tmp_path / "a.webp"
@@ -285,11 +283,8 @@ def test_build_upload_body_defaults_no_need_thumb(tmp_path):
 
 def test_send_image_adapts_oversized_static_image(tmp_path):
     """send_image 对超限静态图走适配路径(JPEG ≤300KB), 协议调用面不变。"""
-    from PIL import Image
-
     client = WxBotClient(token="test", persist=False)
     big = tmp_path / "big.png"
-    import random
     Image.frombytes("RGB", (1024, 1024), random.Random(7).randbytes(1024 * 1024 * 3)).save(big, format="PNG")
     assert big.stat().st_size > client._IMAGE_UPLOAD_MAX_BYTES
 
