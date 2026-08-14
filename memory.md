@@ -21,7 +21,7 @@
 - **wechat 频道恢复（2026-08-12）**：channel_configs 两条 wechat 绑定（08-08 写入，明文为 iLink 凭据字符串非 JSON）经格式迁移恢复——重加密为 `{"token": ...}`（备份 /tmp/wechat_plaintext_backup.txt）+ 重建 bot-poller 镜像（生产 poller 一直是旧 /start 契约 bot_token 顶层字段，89081f2 改 config_json 后 8-11 部署未重建 poller，两边失配才导致 marshal 失败）；恢复后两条 restored channel 无 ERROR
 - **web 镜像滞后修复（2026-08-12）**：8-11 部署时 web 镜像未重建（停在 08-08 构建），8-10/8-11 的界面改动（IM 渠道绑定页/企微卡片/MCP 治理面板）全缺失，用户看到旧“微信绑定”菜单——重建后含企业微信/渠道绑定/MCP 面板；同批排查：sandbox-manager 镜像旧但代码无改动（无影响）、ga-runner 旧但 0751a6d 仅影响宿主机场景（容器内无影响）。**教训：部署必须全量重建（make build），选择性重建会漏镜像（前有 bot-poller 契约失配，后有 web 界面滞后）**
 - **bot poller 对账机制（2026-08-14）**：`ReconcileBots` 周期收敛期望（DB channel_configs state='active'）与实际（poller /health active_bots）——缺失自动重注册、僵尸自动 stop（带 cursor 持久化）、health 失败安全不动；`BOT_RECONCILE_INTERVAL`（默认 60s，0 禁用）挂 main.go ticker。背景：poller 容器单独重建/替换后 RestoreActiveBots 只跑一次导致全部渠道静默失联（真实事故，微信 /new 无响应）。端到端验证：手动 stop 一个微信 bot → 60s 内自动拉回。教训：有状态下游重建后必须有对账，一次性启动注册不可靠
-- 最后更新：2026-08-14（Phase B 生图双形态实施完成 + 独立审查修复 3 提交 + 生产部署 faa63b6 + spool 交付 NULL content 事故修复待部署）
+- 最后更新：2026-08-14（微信生图交付死信全链路修复 5 提交 + 生产部署 433b7c7 + 10 张图端到端送达用户微信）
 
 ## 已完成能力
 
@@ -37,7 +37,7 @@
 
 ## 进行中 / 未完成
 
-- **spool 交付 NULL content 修复（2026-08-14，已编码待部署）**：微信生图 CHECKPOINT_COMMIT_FAILED 根因 = 迁移 0057 spool 引用化只加列没改 INSERT，capture spool 模式 Content=nil 直插 content NOT NULL → 成功终态事务回滚。已修 `COALESCE($5,''::bytea)` + 回归测试（先复现精确 23502 再修）；Go 全量+race 绿；待 platform 镜像重建部署（make build → 滚动重启）
+- **微信生图交付死信修复（2026-08-14，已部署 433b7c7，端到端验证通过）**：三层根因叠加——①spool checkpoint NULL content（0057 迁移只加列没改 INSERT，已修 COALESCE）；②buildPayload spool 分支漏设 relPath → mediaTypeForPath("") 回退 file → 生成图全部走 file_item 原图上传；③海外→微信 C2C CDN 大文件节流（~18KB/s + ~30s 断连，>450KB 必死）。修复：spool 分支补 relPath + send_image 交付侧转 JPEG ≤300KB + poller 上传 (30s,120s)×2 + Go 媒体预算 90s + 重试窗口 30min。10 张图重投全部 acked 送达；26/26 交付 acked 0 死信。残余：>500KB 文件/GIF/视频交付仍受 CDN 节流限制（生成端 size 控制）；admin 死信重投端点未做（手动 SQL 恢复）
 
 - **思考外泄架构修复（2026-08-12）**：agent_loop 输出分层由 verbose 开关落实（verbose=False 只 yield 用户可见回复，不输出轮次标记/工具行/<summary>；verbose=True 完整转录不变）——不是 worker 正则补丁；实证：三渠道交付文本同源同脏（checkpoint result 铁证），飞书打字机最显眼；新增分层回归测试，已部署（platform + ga-runner digest）
 - **输出分层配套（2026-08-12 审查后补强）**：display 流新增事件信号——agentmain 每轮边界推送 `{'turn': N}`（先冲刷残留文本保证 'next' 不跨轮，outputs=turn_resps[-2:] 兼容 wechatapp 消费）+ 非 verbose 工具活动 `{'tool': name}`（worker 心跳推进信号，防长工具轮被 idle reaper 误收割）；tgapp 轮次协调从解析文本标记改为事件驱动（删 8 处死代码）；qqapp 删 dead on_direct_message_create（频道私信 intent 未订阅）；lark-oapi 约束收窄 >=1.7（LogLevel.WARNING 版本绑定）；Go 流式 open 文本 TrimSpace 防护（'…' 占位不可达）；uv.lock 孤儿文件 gitignore；新增 tests/test_agentmain_stream_events.py
@@ -46,7 +46,7 @@
 - **旧实现漂移清理（2026-08-12）**：runner 创建/校验双面同步（protectedRunnerEnvKeys 补 GA_OVERLAY_ROOT + 4 缓存 env、inspect wantEnv 补 GA_OVERLAY_ROOT、pkg cache env 配套校验）；4 个渠道 SDK 调用面容器内逐项实证（全 PASS）；qqapp.py 旧属性名探测清理；Go 18 包 + poller 52 测试全绿，已部署
 - **IM 真实渠道连通（2026-08-12 修复部署）**：bot-poller 已补 4 渠道 SDK + 修复 botpy/lark_oapi API 兼容；**QQ 已 ready（用户已加 IP 白名单 23.94.23.150，WS 连接成功）、飞书 ws started ✓**；钉钉/企微 SDK API 已静态验证兼容，无凭据未实测
 - im-channel-binding epic 仅剩**真实渠道冒烟**（需用户提供飞书/钉钉/QQ/企微应用凭据；企微重点=SEND_MSG 主动流式帧是否被服务端接受）
-- **image_gen 生图（2026-08-14 已编码 + 真实 key 闭环已验 + 托管形态已实施）**：直连形态 new-api 中转实测（gpt-image-2 完整 CLI 闭环 + agnes url 直下 + 五模型兼容性图谱）；**托管形态（T8.5）已落地**：llm-proxy images/generations 路由 + llm.image capability + provider 能力维度（migration 0058）+ runtime_config image_gen 块 + policy 放行 + worker marker 兜底登记 + openapi/web；Go 全量+race+worker 146+契约 41 全绿；**IM 端到端收图待渠道冒烟**（需用户渠道发消息验证收图；2026-08-14 已部署：make build 全量重建 + 5 服务滚动重启 + migration 0058/0059 已应用 + llm-proxy 生图路由 401 验证）；流式 SSE 与 n>1 待真实上游实测（同步路径恒可用，stream 保持 False）
+- **image_gen 生图（2026-08-14 已编码 + 真实 key 闭环已验 + 托管形态已实施 + IM 端到端收图已验证）**：直连形态 new-api 中转实测；托管形态（T8.5）已落地（llm-proxy images/generations + capability + migration 0058/0059 + worker marker 兜底）；**2026-08-14 微信端到端收图闭环**：10 张生成图经交付链送达用户微信（此前 spool relPath 缺失 + CDN 节流导致死信，已修）；流式 SSE 与 n>1 待真实上游实测（同步路径恒可用，stream 保持 False）
 - im-streaming-delivery epic 仅剩**真实渠道冒烟**（需用户提供凭据；重点=飞书编辑链路 + QQ 流式帧序列参数实测）
 - 有意遗留（不产生功能缺陷，已评估）：C5 delivery_service 834 行未拆（纯结构债）；bundle 多文件 SOP 平台侧不支持（sophub 平台已上线 bundle，平台 proxy 有意收窄为 single-file，若需用要加支持）
 - 残余验证（需真实 Linux 主机 + Docker/runsc）：runsc 运行时、mTLS 注入、六服务 compose 冒烟、共享卷跨 UID
