@@ -75,7 +75,8 @@ def fit_image_for_upload(file_path, *, max_bytes=None, allowed_formats=None, ani
         bio = BytesIO()
         target = max_bytes or (1 << 62)
         buf = None
-        # 迭代压缩: q90→55 逐档降质, 仍超限再降采样 0.8^N。
+        # 迭代压缩: q90→55 逐档降质, 仍超限再降采样(0.9 起每档 -0.15,
+        # 共 5 档到 0.3 以下, 注释与实现一致, 2026-08-14 复审修正)。
         for quality in (90, 80, 70, 60, 55):
             bio.seek(0); bio.truncate()
             im.convert('RGB').save(bio, format='JPEG', quality=quality)
@@ -258,20 +259,27 @@ class WxBotClient:
         pad = 16 - (len(raw) % 16)
         return AES.new(aes_key, AES.MODE_ECB).encrypt(raw + bytes([pad] * pad))
 
-    def _upload(self, filekey, upload_param, raw, aes_key, timeout=120, upload_url=''):
+    def _upload(self, filekey, upload_param, raw, aes_key, upload_url=''):
         url = upload_url.strip() if upload_url else f'{CDN_BASE}/upload?encrypted_query_param={quote(upload_param)}&filekey={filekey}'
         data = self._enc(raw, aes_key)
         last_err = None
-        # 2026-08-14 生产事故修复(微信生图交付死信): CDN 瞬时故障(握手挂起/
-        # SSLEOFError)时, 单一 timeout 同时覆盖连接与传输, 连接层故障最长
-        # 阻塞 timeout×3 次, 远超 Go delivery /send 预算(15s→90s) → 8 次重试
-        # 全部超时 → 死信, 用户永远收不到图。拆分超时并对齐预算:
-        # urllib3 的 connect timeout 同时约束连接建立与请求体发送, 本服务器
-        # →微信 CDN 实测限速 ~18KB/s(300KB≈14s), 故 connect=30s;
-        # 单次 /send 最坏 30+3+30=63s < Go 媒体预算 90s, 重试窗口内有
-        # 机会成功; 失败快速上抛由 Go 侧整体重试(不无限阻塞 poller 线程)。
-        connect_timeout = min(30, max(5, timeout))
-        read_timeout = max(connect_timeout + 20, timeout)
+        # 2026-08-14 生产事故修复(微信生图交付死信)后的预算定稿(独立审查
+        # 优化, 2026-08-14): CDN 瞬时故障(握手挂起/SSLEOFError)时, 单一
+        # timeout 同时覆盖连接与传输, 连接层故障最长阻塞 timeout×3 次,
+        # 远超 Go delivery /send 预算 → 8 次重试全部超时 → 死信。现在
+        # 拆分为固定双段超时, 与 Go 侧预算链对齐:
+        #   - connect=30s: urllib3 的 connect timeout 同时约束连接建立与
+        #     请求体发送, 本服务器→微信 CDN 实测限速 ~18KB/s, 300KB≈14s,
+        #     30s 写预算内留余量(旧 10s 写预算过紧, 部署后仍死信)。
+        #   - read=10s: 响应读取(正常 <1s); 服务器收完 body 后挂起不回包
+        #     = 故障, 10s 快速失败(旧 read=120s 会让单次尝试最长挂 150s,
+        #     远超 Go 预算且占 poller 线程)。
+        #   正常/快速失败路径: getuploadurl(≤10s, 控制面) + 30+10+3+30+10
+        #   + sendmessage(≤10s) ≈ 85s < Go 媒体预算 90s(ctx); 病理(控制面
+        #   与 CDN 双侧挂起)最坏 ~103s 超 ctx——由 Go 侧重试 + 幂等
+        #   client_id 兜底, poller 线程占用有界(非死锁), 不引入新问题。
+        #   失败快速上抛由 Go 侧整体重试(不无限阻塞 poller 线程)。
+        connect_timeout, read_timeout = 30, 10
         for attempt in range(1, 3):
             try:
                 r = requests.post(url, data=data,
@@ -312,27 +320,20 @@ class WxBotClient:
                          'thumb_filesize': thumb_ciphertext_size})
         return body
 
-    def _make_thumbnail(self, fp):
-        from io import BytesIO
-        from PIL import Image
-        im = Image.open(fp); im.thumbnail((240, 240))
-        thumb_w, thumb_h = im.size
-        if im.mode not in ('RGB', 'L'):
-            im = im.convert('RGB')
-        bio = BytesIO(); im.save(bio, format='JPEG', quality=85)
-        return bio.getvalue(), thumb_w, thumb_h
-
     def _make_media_item(self, item_key, media, resp, ciphertext_size, thumb_w, thumb_h, thumb_size, fp, file_name='', raw=b''):
         item = {'media': media}
         if item_key == 'file_item':
             # 审查 R5-I10: 优先使用显式显示名, 回退到本地文件名(兼容旧调用方)。
-            item.update({'file_name': file_name or fp.name, 'len': str(len(fp.read_bytes()))})
+            # len 直接用已读入的 raw(2026-08-14 复审: 旧实现二次整读文件)。
+            item.update({'file_name': file_name or fp.name, 'len': str(len(raw))})
         elif item_key == 'image_item':
             # 官方形态(openclaw no_need_thumb=true): media + mid_size。
             item.update({'mid_size': ciphertext_size})
-            # 防御兼容: 若服务端仍返回 thumb_upload_param(显式传了真缩略图
-            # 的情形), 上传主图字节作为缩略图——绝不传空字节(旧实现隐患)。
-            if raw and (resp.get('thumb_upload_param') or resp.get('thumb_upload_full_url')):
+            # 防御兼容(2026-08-14 复审门控): 仅当调用方显式传了真缩略图
+            # (thumb_raw 非空)才可能触发——当前无调用方传, 生产不可达;
+            # 旧条件 `if raw and ...` 在服务端返回 thumb_upload_param 时会把
+            # 主图再上传一遍当缩略图(多一次 CDN 往返, 超预算)。
+            if thumb_size and raw and (resp.get('thumb_upload_param') or resp.get('thumb_upload_full_url')):
                 thumb_media = self._upload('', resp.get('thumb_upload_param', ''),
                                            raw, aes_key=b'\x00' * 16,
                                            upload_url=resp.get('thumb_upload_full_url', ''))
@@ -348,12 +349,16 @@ class WxBotClient:
         aes_key = os.urandom(16)
         ciphertext_size = ((len(raw) // 16) + 1) * 16
         # 官方 openclaw 默认不上传缩略图(no_need_thumb=true); thumb 字段
-        # 保留默认空, 显式调用方传 _make_thumbnail 产物即可。
+        # 保留默认空(_build_upload_body 的 thumb_raw 参数为兼容显式调用方)。
         thumb_raw = b''; thumb_w = thumb_h = 0; thumb_ciphertext_size = 0
         body = self._build_upload_body(fp, raw, aes_key, item_key, ciphertext_size, thumb_raw, thumb_ciphertext_size)
         body['media_type'] = media_type
         body['to_user_id'] = to_user_id
-        resp = self._post('ilink/bot/getuploadurl', body)
+        # 控制面调用显式小超时(2026-08-14 复审 P2): 正常 <1s, 与 CDN 段
+        # read=10s 同一快速失败语义——否则病理最坏(控制面+CDN 双侧挂起)
+        # = 15+83+15 ≈ 113s 超 Go ctx 90s(poller 线程占线由 Go 重试 + 
+        # client_id 幂等兜底, 有界非死锁)。
+        resp = self._post('ilink/bot/getuploadurl', body, timeout=(10, 10))
         upload_param = resp.get('upload_param', '')
         upload_url = resp.get('upload_full_url', '')
         if not (upload_param or upload_url):
@@ -368,7 +373,7 @@ class WxBotClient:
                'item_list': [{'type': item_type, item_key: item}]}
         if context_token:
             msg['context_token'] = context_token
-        return self._post('ilink/bot/sendmessage', {'msg': msg, 'base_info': {'channel_version': VER}})
+        return self._post('ilink/bot/sendmessage', {'msg': msg, 'base_info': {'channel_version': VER}}, timeout=(10, 10))
 
     def send_file(self, to_user_id, file_path, context_token='', file_name='', client_id=None):
         return self._send_media(to_user_id, file_path, 3, ITEM_FILE, 'file_item', context_token, file_name=file_name, client_id=client_id)
@@ -394,7 +399,6 @@ class WxBotClient:
     #: 微信 CDN 上传安全上限(实测节流 ~18KB/s: 300KB≈14s, 400KB≈22s, 450KB≈22s,
     # 1MB≈30s 被杀; 30s 写预算内留余量)。
     _IMAGE_UPLOAD_MAX_BYTES = 300 * 1024
-    _STATIC_IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
 
     def _fit_static_image_for_upload(self, file_path):
         """超限静态图 → 临时 JPEG(≤300KB), 返回 Path; 无需转换返回 None。

@@ -1,10 +1,12 @@
 package domain
 
+import "time"
+
 // DeliveryType is a platform-owned terminal delivery classification.
 type DeliveryType string
 
 const (
-	DeliveryTaskStarted     DeliveryType = "task_started"     // Initial "processing..." notification
+	DeliveryTaskStarted     DeliveryType = "task_started" // Initial "processing..." notification
 	DeliveryTaskComplete    DeliveryType = "task_complete"
 	DeliveryTaskFailed      DeliveryType = "task_failed"
 	DeliveryTaskCancelled   DeliveryType = "task_cancelled"
@@ -47,16 +49,35 @@ type DeliveryFile struct {
 
 // Delivery is a durable terminal delivery outbox row.
 type Delivery struct {
-	DeliveryID     string
-	TaskID         string
-	DeliveryType   DeliveryType
-	Status         DeliveryStatus
-	PayloadRef     string
-	PayloadDigest  string
-	ErrorCode      string
-	ErrorMessage   string
-	AttemptCount   int
+	DeliveryID    string
+	TaskID        string
+	DeliveryType  DeliveryType
+	Status        DeliveryStatus
+	PayloadRef    string
+	PayloadDigest string
+	ErrorCode     string
+	ErrorMessage  string
+	AttemptCount  int
 	// AttemptToken 是本次 claim 的 fencing token(审查 F2): claim 时生成,
 	// Ack/Retry/DeadLetter 必须携带, 防止旧 attempt 覆盖新 attempt。
 	AttemptToken string
+	// RequeuedAt 是 admin 死信重投时间(2026-08-14 复审 P1): 非空时重试
+	// 窗口锚点取 GREATEST(tasks.terminal_at, requeued_at)——管理重投开启
+	// 新窗口, 否则事故后数小时重投的行会在下一个 tick 被原样打回死信。
+	RequeuedAt *time.Time
+}
+
+// DeliveryAdminRow 是 admin 死信管理视图行(2026-08-14 审查 E2):
+// 08-14 事故恢复曾靠手动 SQL, 管理员需要可审计的查询视图。
+type DeliveryAdminRow struct {
+	DeliveryID   string
+	TaskID       string
+	DeliveryType DeliveryType
+	Status       DeliveryStatus
+	ErrorCode    string
+	ErrorMessage string
+	AttemptCount int
+	CreatedAt    time.Time
+	TerminalAt   *time.Time
+	RequeuedAt   *time.Time
 }

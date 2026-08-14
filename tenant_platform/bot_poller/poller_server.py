@@ -443,8 +443,6 @@ class BotAdapter(ABC):
     @abstractmethod
     def send_text(self, target, text, client_id=''):
         """Send a text reply to target (微信=ilink_user_id, 新渠道=对话单元)。"""
-    def send_file(self, target, file_path, file_name='', client_id=''):
-        raise NotImplementedError(f'send_file not supported by {self.channel_type} adapter')
 
     # -- 出站媒体统一接口(IM_MEDIA_ARCHITECTURE §5.1 A1) -------------------
     # media_type ∈ image|file|video。基类提供分发骨架 + 防御校验; 子类实现
@@ -739,25 +737,17 @@ class WeChatAdapter(BotAdapter):
     def send_text(self, target, text, client_id=''):
         self.client.send_text(target, text, context_token='', client_id=client_id)
 
-    def send_file(self, target, file_path, file_name='', client_id=''):
-        self.client.send_file(target, file_path, context_token='', file_name=file_name, client_id=client_id)
-
-    def send_image(self, target, file_path, client_id=''):
+    # 统一出站媒体接口(IM_MEDIA_ARCHITECTURE §5.1 A1): iLink 直传无上传步骤,
+    # 直接委托 WxBotClient(2026-08-14 独立审查清理: 旧 send_file/send_image/
+    # send_video 双签名兼容层无任何调用方, 已删除; send_media 统一分发)。
+    def _send_image(self, target, file_path, file_name='', client_id=''):
         self.client.send_image(target, file_path, context_token='', client_id=client_id)
 
-    def send_video(self, target, file_path, client_id=''):
-        self.client.send_video(target, file_path, context_token='', client_id=client_id)
-
-    # 统一出站媒体接口(IM_MEDIA_ARCHITECTURE §5.1 A1): iLink 直传无上传步骤,
-    # 复用既有 send_*。旧 send_file/send_image/send_video 签名保留兼容。
-    def _send_image(self, target, file_path, file_name='', client_id=''):
-        self.send_image(target, file_path, client_id=client_id)
-
     def _send_file(self, target, file_path, file_name='', client_id=''):
-        self.send_file(target, file_path, file_name=file_name, client_id=client_id)
+        self.client.send_file(target, file_path, context_token='', file_name=file_name, client_id=client_id)
 
     def _send_video(self, target, file_path, file_name='', client_id=''):
-        self.send_video(target, file_path, client_id=client_id)
+        self.client.send_video(target, file_path, context_token='', client_id=client_id)
 
 
 
@@ -992,7 +982,20 @@ class FeishuAdapter(BotAdapter):
         return file_key
 
     def _send_image(self, target, file_path, file_name='', client_id=''):
-        self._send_content_message(target, 'image', {'image_key': self._upload_image(file_path)})
+        # 飞书官方图片 ≤10MB(open.feishu.cn im-v1 image): 全局 media_size_limit
+        # (20MiB)按渠道偏宽, 超 10MB 的图会在飞书侧被拒 → 交付侧先适配
+        # (2026-08-14 独立审查 A2 补齐, 企微/钉钉/微信已有同款)。
+        # 格式不转换(飞书格式限制宽, allowed_formats=None); 动图保留。
+        adapted = fit_image_for_upload(file_path, max_bytes=10 * 1024 * 1024, animated_ok=True)
+        try:
+            path = str(adapted) if adapted else file_path
+            self._send_content_message(target, 'image', {'image_key': self._upload_image(path)})
+        finally:
+            if adapted:
+                try:
+                    os.remove(str(adapted))
+                except OSError:
+                    pass
 
     def _send_file(self, target, file_path, file_name='', client_id=''):
         self._send_content_message(target, 'file', {'file_key': self._upload_file(file_path, file_name)})
@@ -1102,12 +1105,6 @@ class FeishuAdapter(BotAdapter):
             self._update_message(message_id, '⚠️ 生成中断，请稍后查看最终结果')
         except Exception:
             pass  # 改写失败可接受: 占位消息残留, 终态 delivery 兜底
-
-    def send_stream_close_all(self):
-        """连接关闭时清理流状态(测试/停 bot 用)。"""
-        with self._stream_lock:
-            self._streams.clear()
-
 
 class DingTalkAdapter(BotAdapter):
     """钉钉开放平台应用(dingtalk-stream 长连接)。

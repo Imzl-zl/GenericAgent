@@ -14,6 +14,11 @@ except Exception:
     sys.exit(1)
 
 agent = GeneraticAgent(); agent.verbose = False
+# 媒体交付声明(2026-08-14 独立审查 C1): 本前端为**文本通道**——QQ 官方
+# 媒体上传需分片(prepare→PUT→finish)或公网 URL, 根路径无公网入口且无
+# 真实凭据实测条件, 有意不实现(避免半成品); 文件产出经 AgentChatMixin.
+# send_done 给出诚实提示(不输出服务器路径)。平台 bot_poller QQAdapter
+# 已实现完整分片上传+主动消息, 需文件交付请使用平台。
 APP_ID = str(mykeys.get("qq_app_id", "") or "").strip()
 APP_SECRET = str(mykeys.get("qq_app_secret", "") or "").strip()
 ALLOWED = {str(x).strip() for x in mykeys.get("qq_allowed_users", []) if str(x).strip()}

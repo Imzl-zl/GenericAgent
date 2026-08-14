@@ -18,10 +18,10 @@ from chatapp_common import (
     TELEGRAM_MENU_COMMANDS,
     clean_reply,
     ensure_single_instance,
-    extract_files,
     format_restore,
     redirect_log,
     require_runtime,
+    resolve_file_markers,
     split_text,
 )
 from continue_cmd import handle_frontend_command, reset_conversation
@@ -127,26 +127,17 @@ def _quote_tag(text):
     safe_text = (text or "").strip().replace(_QUOTE_OPEN_TAG, "").replace(_QUOTE_CLOSE_TAG, "")
     return f"{_QUOTE_OPEN_TAG}{safe_text}{_QUOTE_CLOSE_TAG}"
 
-def _resolve_files(paths):
-    files, seen = [], set()
-    for fpath in paths:
-        if not os.path.isabs(fpath):
-            fpath = os.path.join(_TEMP_DIR, fpath)
-        if fpath in seen or not os.path.exists(fpath):
-            continue
-        files.append(fpath)
-        seen.add(fpath)
-    return files
-
-
 def _render_file_markers(text):
     def repl(match):
         return os.path.basename(match.group(1))
     return re.sub(r"\[FILE:([^\]]+)\]", repl, text or "").strip()
 
+
 def _files_from_text(text):
     cleaned = clean_reply(text) if (text or "").strip() else ""
-    return _resolve_files(extract_files(cleaned))
+    # 统一解析(2026-08-14 独立审查 C2): 相对路径按 _TEMP_DIR, 去重+
+    # 存在性+坏占位符过滤(原 _resolve_files 本地实现已删除)。
+    return resolve_file_markers(cleaned, base_dir=_TEMP_DIR)
 
 async def _send_files(root_msg, files):
     for fpath in files:

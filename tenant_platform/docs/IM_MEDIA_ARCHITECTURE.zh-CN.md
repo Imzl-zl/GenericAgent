@@ -42,13 +42,13 @@
 
 ### 3.2 出站（字节 → 渠道消息）
 
-| 渠道 | 图片 | 视频 | 文件 | 上传机制（差异点） |
-|---|---|---|---|---|
-| 微信 iLink | ✅ `send_image`（已实现） | ✅ `send_video`（已实现） | ✅ `send_file`（已实现） | iLink 直传，无上传 API |
-| QQ | ✅ 富媒体 `msg_type=7` | ✅ 同上（video/mp4） | ✅ 同上 | **先上传拿 `file_info`**（整文件/分片上传，单聊/群聊不互通，有 TTL） |
-| 飞书 | ✅ | ✅（file 类型） | ✅ | `POST im/v1/images`（图片）/ `im/v1/files`（文件）拿 key → 消息 content |
-| 钉钉 | ✅ | ✅ | ✅ | `oapi/media/upload` 拿 mediaId → 消息 |
-| 企微 | ✅ | ✅ | ✅ | `qyapi/cgi-bin/media/upload` 拿 media_id → 消息 |
+| 渠道 | 图片 | 视频 | 文件 | 上传机制（差异点） | 官方限制（2026-08-14 实测/文档对齐） |
+|---|---|---|---|---|---|
+| 微信 iLink | ✅ `send_image`（已实现） | ✅ `send_video`（已实现） | ✅ `send_file`（已实现） | iLink 直传，无上传 API | 无文档化大小限制；**海外服务器实测 CDN 节流 ~18KB/s、连接 ~30s 被杀，>~450KB 必死** → 交付侧 ≤300KB JPEG 适配（决策 A7） |
+| QQ | ✅ 富媒体 `msg_type=7` | ✅ 同上（video/mp4） | ✅ 同上 | **先上传拿 `file_info`**（整文件/分片上传，单聊/群聊不互通，有 TTL） | 官方 upload_config.retry_timeout=300s；850031 超限；分片默认 5MB（已逐字段对齐） |
+| 飞书 | ✅ | ✅（file 类型） | ✅ | `POST im/v1/images`（图片）/ `im/v1/files`（文件）拿 key → 消息 content | 图片 ≤10MB、GIF ≤2000×2000、其他 ≤12000×12000；文件 ≤30MB（全局 8MiB 更紧，安全侧） |
+| 钉钉 | ✅ | ✅ | ✅ | `oapi/media/upload` 拿 mediaId → 消息 | 图片 ≤20MB 仅 jpg/gif/png/bmp（**无 webp** → 交付侧转 JPEG）；文件 ≤20MB 仅 doc/docx/xls/xlsx/ppt/pptx/zip/pdf/rar；**file/video 的 downloadCode 上传流未实现（fail-closed）** |
+| 企微 | ✅ | ✅ | ✅ | `qyapi/cgi-bin/media/upload` 拿 media_id → 消息 | 图片 ≤10MB 仅 JPG/PNG（白名单外+动图 → JPEG 首帧）；视频 ≤10MB（无渠道级适配，超限被拒=已知缺口）；文件 ≤20MB；media_id 3 天有效 |
 
 参考：QQ https://bot.qq.com/wiki/develop/api-v2/server-inter/message/type/media.html 、https://bot.qq.com/wiki/develop/api-v2/server-inter/message/overview.html
 
@@ -127,6 +127,15 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
 - [x] 决策 A3：**上传失败语义**：上传 API 失败 = 发送失败（fail-closed），走既有 delivery 错误路径；不静默降级文本（媒体是用户明确期望的产物）。
 - [x] 决策 A4：**大小上限**：~~沿用 `defaultMaxDeliverableBytes`~~（2026-08-13 审查 B4/T5 已落地）：出站文件存储 **spool 引用化**（migration 0057）——成功事务时文件流式复制到 delivery spool 共享卷（`GA_DELIVERY_SPOOL_DIR`，Platform rw / Poller ro），`task_delivery_files` 只存 spool 相对路径 + digest，不再存 BYTEA 字节；上限按媒体类型分化：**image ≤20MiB / video ≤100MiB（Phase C 视频）/ 其余 ≤8MiB**，任务聚合 ≤256MiB；超限媒体发送失败并诚实提示（与空结果文案同原则）。
 
+**2026-08-14 事故修复决策（A5-A10，微信生图交付死信全链路）**：
+
+- [x] 决策 A5：**媒体类型分类源 = auditPath（workspace 相对路径）**。spool 分支曾漏设 relPath → `mediaTypeForPath("")` 回退 file → 生成图全部走 file_item 原始上传（死信真正元凶之一）。现分类源收敛为两个分支按构造必然设置的 auditPath（`c0e0452`），`buildPayload` 对空 auditPath fail-closed（PAYLOAD_BUILD_FAILED），结构上杜绝"静默降级 file"再次发生。
+- [x] 决策 A6：**交付重试预算**：重试窗口 5min→**30min**（CDN 瞬时故障可持续 ≥8 分钟）+ `maxDeliveryAttempts=10`（退避 1s→5min 封顶，实际 ~8.5min 内耗尽，窗口是兜底非用户等待上限）；文本发送预算 15s / **媒体发送预算 90s**（`deliveryMediaSendTimeout`）。预算链（独立审查 + 子代理复审定稿）：正常/快速失败路径 poller 侧 ≈85s（CDN 30+10+3+30+10 + 控制面各 ≤10s）< ctx 90s < poller client 兜底 120s（`mediaTimeout`，拆双 client 修复单一 15s Timeout 架空）；**病理**（控制面+CDN 双侧挂起）最坏 ~103s 超 ctx——由 Go 重试 + 幂等 client_id 兜底，poller 线程占用有界。**admin 重投开启新窗口**：`requeued_at` 列（migration 0060），claim/死信/重试截止锚点 = `GREATEST(tasks.terminal_at, requeued_at)`（否则事故后数小时重投的行会在下一 tick 被原样打回死信）。
+- [x] 决策 A7：**微信 C2C CDN 节流适配**：海外服务器→微信 CDN 实测限速 ~18KB/s、连接 ~30s 被杀、>~450KB 必死——交付侧 `fit_image_for_upload` 把超限静态图转 JPEG 迭代压缩到 **≤300KB**（`send_image` 透明适配，动图不转）。
+- [x] 决策 A8：**官方协议对齐（ba60f26）**：`no_need_thumb=true`（openclaw 官方默认，image_item 仅 media+mid_size）；企微图片仅 JPG/PNG（白名单外+动图 → JPEG 首帧，≤10MB）；钉钉图片 jpg/gif/png/bmp（**无 webp**，≤20MB）。适配函数 `fit_image_for_upload` 模块级（微信实例方法委托，poller 企微/钉钉 adapter 直调）。
+- [x] 决策 A9：**适配临时文件落可写目录**：`tempfile.mkstemp` 落系统 /tmp（生产 poller 只读 rootfs + 只读 spool 卷，写源旁目录会静默失败回退原图——`260a59d`）。
+- [x] 决策 A10：**渠道官方限制与全局上限分层**：全局 `_MEDIA_SIZE_LIMITS`（image 20MiB / video 100MiB / file 8MiB，对齐 Go 捕获层）是纵深防御；渠道官方限制（企微 10MB、飞书 10MB、钉钉 20MB）在 adapter 内以 `fit_image_for_upload(max_bytes=渠道值)` 适配（飞书 2026-08-14 独立审查补齐）。**残余**：video 无渠道级适配（企微视频官方 ≤10MB < 全局 100MiB，超限会被渠道拒，属已知缺口）。
+
 ## 6. 生图能力（Phase B，2026-08-14 定稿并实施 GA 侧直连形态 v1）
 
 ### 6.1 定位
@@ -199,13 +208,15 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
 |---|---|---|
 | Phase A-0（前置，2026-08-13 审查阻断项） | ①四渠道入站媒体提取（QQ URL 直下 / 飞书 resources API / 钉钉 downloadCode / 企微 media_id+直链，公共下载器 `bot_poller/media_downloader.py`）——✅ 已实施；②GA 注入 base64 总量预算（对齐 llm-proxy 4MiB 上限）——✅ 已实施；③文档修订（本稿）——✅ | poller 单测 + 真实渠道冒烟（钉钉/企微下载 API 端点待凭据实测） |
 | Phase A | 出站媒体统一：基类 `send_media` + 5 渠道上传适配（QQ=分片定案）+ delivery MIME 分发 | 微信/QQ/飞书各发 docx/图片/视频成功；失败路径诚实提示。**2026-08-14 已实施完成**（钉钉 file/video downloadCode 上传流待实测） |
-| Phase B | 生图：**直连形态已实施（2026-08-14，v1）**——`image_gen` 工具（第 10 原子工具）+ ImageGenClient（同步 b64 默认路径 + gpt-image SSE 流式可选路径）+ outputs/ 落盘 + `[FILE:]` 出站；**托管形态已实施（2026-08-14）**——llm-proxy `images/generations` 代理 + capability `llm.image` + provider 能力类型维度（chat/image）+ runtime_config 下发 image_gen 块（不进 chat mixin）+ policy 放行 + openapi/web 同步 | 模型画图 → 用户 IM 收到图（各渠道）；直连本地闭环已验、托管链路 Go/worker 测试全绿；**IM 端到端收图待部署冒烟（需渠道凭据 + make build 重建 ga-runner/platform/llm-proxy）** |
+| Phase B | 生图：**直连形态已实施（2026-08-14，v1）**——`image_gen` 工具（第 10 原子工具）+ ImageGenClient（同步 b64 默认路径 + gpt-image SSE 流式可选路径）+ outputs/ 落盘 + `[FILE:]` 出站；**托管形态已实施（2026-08-14）**——llm-proxy `images/generations` 代理 + capability `llm.image` + provider 能力类型维度（chat/image）+ runtime_config 下发 image_gen 块（不进 chat mixin）+ policy 放行 + openapi/web 同步 | 模型画图 → 用户 IM 收到图（各渠道）；直连本地闭环已验、托管链路 Go/worker 测试全绿；**微信端到端收图已实测（2026-08-14 生产闭环：10 张生成图送达，26/26 交付 acked 0 死信）**；其他渠道待真实凭据冒烟 |
 | Phase C | 视频：镜像补 ffmpeg + 入站抽帧注入 + 出站 `send_media(video)` | 用户发视频可分析；GA 可发视频 |
 
 每期独立可交付、互不阻塞；渠道真实验证需用户凭据配合（QQ/飞书已配置）。
 
 ## 11. 残余风险
 
+- **微信 CDN 节流是路径约束（2026-08-14 生产实证）**：海外服务器→微信 C2C CDN 上传 ~18KB/s 且连接 ~30s 被杀。交付侧已适配（静态图 ≤300KB JPEG、预算链 85s<90s<120s），但 **>500KB 文件/GIF/视频交付仍受限**（GIF 动图不转、视频无适配）——根治是**中国侧部署/代理**（网络话题，仅记录不实施）；生成端建议控制 size（默认 1024x1024）。
+- **无 admin 死信重投端点 → 已补（2026-08-14 独立审查 E2 + 复审 P1）**：`GET /v1/admin/deliveries` + `POST /v1/admin/deliveries/{delivery_id}/requeue`（AdminToken 门禁，仅 dead_letter 行可重投，attempt 预算归零；08-14 事故曾靠手动 SQL 恢复）。**重投语义（复审 P1 修复）**：requeue 置 `requeued_at=now`（migration 0060），重试窗口锚点 = `GREATEST(tasks.terminal_at, requeued_at)`——事故后数小时重投不会在下一 tick 被 DeadLetterExpiredDeliveries 原样打回；error_code 置 'REQUEUED' 标记（满足 DB CHECK + 记录事件，下次终态覆盖）。
 - **gpt-image 参数兼容性（Phase B）**：**已实测（2026-08-14，new-api 中转）**——①`size` 必传（中转计费硬要求，缺省 500 "图片尺寸计费需要传 size"），客户端已默认 1024x1024；②gpt-image-2/gemini-*-image 返回 b64_json；③**sensenova/agnes 系只返回 `url` 直链**（b64_json 为空），客户端已加 url 直下兜底（≤20MiB 限流）；④sensenova-u1-fast size 合法集特殊（1664x2496/2048x2048 等，无 1024x1024）——错误文本含合法列表，模型可自愈；⑤流式路径（`stream:true` + `partial_images` SSE）仍未真实上游实测（社区有稳定性波动报告）——同步路径恒可用，建议保持 stream=False。
 - **marker 回显依赖（Phase B，托管已补兜底）**：工具返回 `[FILE:]` marker ≠ 交付发生，模型须在最终回复回显 marker 才触发交付——**托管形态已补 generated_output_files 登记**（worker 包装 do_image_gen，终态 append_missing_file_markers 自动补写漏回显 marker，仿 export_docx）；直连形态仍无兜底（模型忘回显则静默丢失，可接受）。
 - **直连形态无 JTI 计量（Phase B）**：成本靠 n≤4 限额 + 用户自觉（gpt-image token 计费，usage 日志留作后续计量基础）。托管形态下 image 调用走独立 llm.image token——**双能力 provider 的 chat 与 image 预算独立计量**（各持 max_turns 预算，互不占用），admin 配置时需知晓。

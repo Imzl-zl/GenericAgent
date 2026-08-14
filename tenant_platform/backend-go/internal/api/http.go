@@ -40,6 +40,7 @@ type Server struct {
 	mcpServers           application.MCPServerPort
 	botLifecycle         application.BotLifecycleService
 	taskStats            application.TaskStatsPort
+	deliveries           application.DeliveryAdminStore
 	maxBodyBytes         int64
 	runtimeProfileMu     sync.RWMutex
 	runtimeProfile       RuntimeProfile
@@ -101,6 +102,9 @@ type ServerConfig struct {
 	MCPServers           application.MCPServerPort
 	BotLifecycle         application.BotLifecycleService
 	TaskStats            application.TaskStatsPort
+	// Deliveries 提供 admin 死信查询/重投(2026-08-14 审查 E2); nil 时
+	// 不注册 /v1/admin/deliveries 路由(基础测试面保持最小)。
+	Deliveries           application.DeliveryAdminStore
 	RuntimeProfile       RuntimeProfile
 	IMAggregationRuntime IMAggregationRuntime
 	Sophub               application.SophubService
@@ -174,6 +178,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		mcpServers:           cfg.MCPServers,
 		botLifecycle:         cfg.BotLifecycle,
 		taskStats:            cfg.TaskStats,
+		deliveries:           cfg.Deliveries,
 		runtimeProfile:       cfg.RuntimeProfile,
 		imAggregationRuntime: cfg.IMAggregationRuntime,
 		sophub:               cfg.Sophub,
@@ -194,6 +199,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	s.mux.HandleFunc("POST /v1/tasks/{task_id}/cancel", s.userAuth(s.handleCancel))
 	s.registerUserTaskRoutes()
 	s.registerLifecycleRoutes()
+	if s.deliveries != nil {
+		// admin 死信管理(2026-08-14 审查 E2): 查询 + 重投, AdminToken 门禁。
+		s.mux.HandleFunc("GET /v1/admin/deliveries", s.auth(s.handleAdminListDeliveries))
+		s.mux.HandleFunc("POST /v1/admin/deliveries/{delivery_id}/requeue", s.auth(s.handleAdminRequeueDelivery))
+	}
 	return s, nil
 }
 

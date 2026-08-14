@@ -1583,7 +1583,6 @@ func TestBlockUserRevokesAllSessions(t *testing.T) {
 	}
 }
 
-
 // 审查 F2: delivery attempt fencing——旧 attempt 的 ack 携带过期 token 时
 // 不得影响新 attempt 的状态。
 func TestDeliveryAttemptTokenFencesStaleWrites(t *testing.T) {
@@ -1740,5 +1739,152 @@ func TestCreateUserEmptyPasswordHash(t *testing.T) {
 	}
 	if u.ID <= 0 || u.PasswordHash != "" || u.Status != domain.UserPending {
 		t.Fatalf("unexpected user: %+v", u)
+	}
+}
+
+// TestDeliveryAdminRequeueDeadLetter 验证 admin 死信查询/重投(2026-08-14
+// 审查 E2): 死信行可重投为 pending(attempt 预算归零), 非死信行拒绝。
+func TestDeliveryAdminRequeueDeadLetter(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-ord", MessageID: "ord-1",
+		Prompt: "ordering", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim task: %v ok=%v", err, ok)
+	}
+	if _, err := store.CompleteFailedTerminal(ctx, task.ID, "p1", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	dels, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute, 5*time.Minute, now)
+	if err != nil || len(dels) != 1 {
+		t.Fatalf("claim terminal delivery: %v n=%d", err, len(dels))
+	}
+	d := dels[0]
+	if err := store.MarkDeliveryDeadLetter(ctx, d.DeliveryID, d.AttemptToken, "SEND_FAILED", "boom", now); err != nil {
+		t.Fatal(err)
+	}
+
+	// 列表: 死信可见。
+	rows, err := store.ListDeliveries(ctx, "dead_letter", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.DeliveryID == d.DeliveryID {
+			found = true
+			if r.Status != "dead_letter" || r.ErrorCode != "SEND_FAILED" || r.AttemptCount < 1 {
+				t.Fatalf("dead letter row mismatch: %+v", r)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("dead letter delivery %s not listed", d.DeliveryID)
+	}
+
+	// 重投: 死信行 → pending, attempt_count 归零。
+	requeued, err := store.RequeueDeadLetterDelivery(ctx, d.DeliveryID, now.Add(time.Minute))
+	if err != nil || !requeued {
+		t.Fatalf("requeue: %v ok=%v", err, requeued)
+	}
+	var status string
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status, attempt_count FROM task_deliveries WHERE delivery_id = $1`, d.DeliveryID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || attempts != 0 {
+		t.Fatalf("requeued row: status=%s attempts=%d, want pending/0", status, attempts)
+	}
+
+	// 再次重投(pending 行): 拒绝(fail-closed)。
+	requeued, err = store.RequeueDeadLetterDelivery(ctx, d.DeliveryID, now.Add(2*time.Minute))
+	if err != nil || requeued {
+		t.Fatalf("requeue of pending row must be refused: %v ok=%v", err, requeued)
+	}
+
+	// 不存在 id: found=false。
+	requeued, err = store.RequeueDeadLetterDelivery(ctx, "no-such-delivery", now.Add(2*time.Minute))
+	if err != nil || requeued {
+		t.Fatalf("requeue of unknown row must be refused: %v ok=%v", err, requeued)
+	}
+}
+
+// TestDeliveryRequeueSurvivesExpiredRetryWindow 验证 P1 修复(2026-08-14
+// 子代理复审): 事故后数小时(窗口已过)重投死信, 行必须仍可被 claim, 而不是
+// 被 DeadLetterExpiredDeliveries 原样打回——requeued_at 开启新 30min 窗口,
+// 窗口锚点 = GREATEST(tasks.terminal_at, requeued_at)。
+func TestDeliveryRequeueSurvivesExpiredRetryWindow(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dev := seedDev(t, store)
+
+	task, err := store.SubmitTask(ctx, domain.SubmitTaskCommand{
+		SessionKey: dev.SessionKey, RequesterUserID: 1,
+		Source: "web", SourceInstanceID: "bot-ord", MessageID: "ord-1",
+		Prompt: "ordering", PersonaSnapshot: []string{"p"}, ToolPolicyVersion: "foundation.no-host-tools.v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNextTask(ctx, dev.SessionKey, "p1", time.Minute); err != nil || !ok {
+		t.Fatalf("claim task: %v ok=%v", err, ok)
+	}
+	if _, err := store.CompleteFailedTerminal(ctx, task.ID, "p1", domain.TaskFailed, domain.DeliveryTaskFailed, "E", "m", ""); err != nil {
+		t.Fatal(err)
+	}
+	// 任务完成于 2 小时前(模拟事故后数小时才发现死信, 30min 窗口早过)。
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET terminal_at = $1 WHERE id = $2`, old, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	dels, err := store.ClaimPendingDeliveries(ctx, 10, time.Minute, 30*time.Minute, old)
+	if err != nil || len(dels) != 1 {
+		t.Fatalf("claim terminal delivery: %v n=%d", err, len(dels))
+	}
+	d := dels[0]
+	if err := store.MarkDeliveryDeadLetter(ctx, d.DeliveryID, d.AttemptToken, "SEND_FAILED", "boom", old); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	requeued, err := store.RequeueDeadLetterDelivery(ctx, d.DeliveryID, now)
+	if err != nil || !requeued {
+		t.Fatalf("requeue: %v ok=%v", err, requeued)
+	}
+
+	// 重投后窗口已刷新: 死信清扫不得打回(旧实现会在这里原样打回)。
+	if n, err := store.DeadLetterExpiredDeliveries(ctx, 30*time.Minute, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Fatalf("requeued delivery must survive expired-window sweep, got %d dead-lettered", n)
+	}
+
+	// 且可被 claim(窗口内)。
+	dels, err = store.ClaimPendingDeliveries(ctx, 10, time.Minute, 30*time.Minute, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dels) != 1 || dels[0].DeliveryID != d.DeliveryID {
+		t.Fatalf("requeued delivery must be claimable after window refresh, got %+v", dels)
+	}
+	if dels[0].RequeuedAt == nil || dels[0].RequeuedAt.Sub(now) > time.Second || now.Sub(*dels[0].RequeuedAt) > time.Second {
+		t.Fatalf("requeued_at must be ~now on claim, got %v (want ~%v)", dels[0].RequeuedAt, now)
 	}
 }

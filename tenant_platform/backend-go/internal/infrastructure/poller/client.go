@@ -21,7 +21,17 @@ import (
 )
 
 const (
+	// defaultTimeout 是控制面/文本消息的请求硬上限(2026-08-14 事故修复后
+	// 定稿的预算层次, 见 mediaTimeout): 文本发送、/start /stop /health
+	// /config、流式帧都是短操作, 15s 足够且防调用方忘传 ctx 时无限阻塞。
 	defaultTimeout = 15 * time.Second
+	// mediaTimeout 是媒体(/send image|video|file)请求的兜底上限。媒体发送
+	// 预算的单一真值源是调用方 ctx(delivery 媒体 90s), 此处 120s 仅作
+	// 防御兜底(> 90s 使 ctx 恒先生效, 且未来新调用方忘传 ctx 时不会挂死
+	// poller 线程)。历史: 单一 15s Timeout 曾把媒体预算架空为 15s——
+	// 300KB 上传约 14-17s 贴着边界, 修复后生产靠概率成功; 本次拆分为
+	// 双 client 后预算链为: poller 侧最坏 ~85s < ctx 90s < 兜底 120s。
+	mediaTimeout = 120 * time.Second
 	// HTTP transport tunables for the Poller client. The Poller is a single
 	// downstream host, so MaxIdleConnsPerHost is the lever that matters: the
 	// Go default of 2 forces connection churn under any real concurrency.
@@ -35,8 +45,9 @@ const (
 // Client calls the Python Bot Poller HTTP API.
 type Client struct {
 	baseURL   string
-	http      *http.Client
-	apiSecret string // HMAC-SHA256 shared secret for X-API-Signature auth
+	quick     *http.Client // 控制面/文本/流式: Timeout 15s
+	media     *http.Client // 媒体发送: Timeout 120s 兜底, 预算以调用方 ctx 为准
+	apiSecret string       // HMAC-SHA256 shared secret for X-API-Signature auth
 }
 
 // NewClient validates the poller base URL and returns a client with a tuned
@@ -55,9 +66,14 @@ func NewClient(baseURL, apiSecret string) (*Client, error) {
 		MaxIdleConnsPerHost: defaultMaxIdleConnsPerHost,
 		IdleConnTimeout:     defaultIdleConnTimeout,
 	}
+	// 双 client 设计(2026-08-14 事故修复审查): http.Client.Timeout 是整个
+	// 交换的硬上限, 单一 15s 会把 delivery 媒体 90s 预算架空(poller 侧
+	// CDN 上传最坏 ~85s > 15s, 生产仅靠上传恰快于 15s 的概率成功)。
+	// 预算层次: 调用方 ctx(文本 15s / 媒体 90s) < client 兜底(15s / 120s)。
 	return &Client{
 		baseURL:   strings.TrimRight(baseURL, "/"),
-		http:      &http.Client{Timeout: defaultTimeout, Transport: transport},
+		quick:     &http.Client{Timeout: defaultTimeout, Transport: transport},
+		media:     &http.Client{Timeout: mediaTimeout, Transport: transport},
 		apiSecret: apiSecret,
 	}, nil
 }
@@ -166,6 +182,7 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 	if msgType == "" {
 		msgType = MsgTypeText
 	}
+	var media bool
 	switch msgType {
 	case MsgTypeText:
 		if req.Text == "" {
@@ -175,12 +192,24 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 		if req.FilePath == "" {
 			return fmt.Errorf("file_path is required for msg_type=%s", msgType)
 		}
+		media = true
 	default:
 		return fmt.Errorf("unsupported msg_type: %s", msgType)
 	}
 	req.MsgType = msgType
-	_, err := c.post(ctx, "/send", req)
+	// 媒体走 media client(Timeout 120s 兜底): 发送预算由 ctx 唯一决定
+	// (delivery 媒体 90s), 15s 的 quick client 会架空该预算。
+	_, err := c.postWith(c.clientFor(media), ctx, "/send", req)
 	return err
+}
+
+// clientFor 选择请求使用的 http.Client: 媒体发送走 media(长预算), 其余
+// 走 quick(15s 短预算)。
+func (c *Client) clientFor(media bool) *http.Client {
+	if media {
+		return c.media
+	}
+	return c.quick
 }
 
 // Stream action constants for StreamActionRequest.Action
@@ -249,7 +278,7 @@ func (c *Client) Health(ctx context.Context) (HealthResponse, error) {
 	if err != nil {
 		return HealthResponse{}, fmt.Errorf("build request: %w", err)
 	}
-	resp, err := c.http.Do(req)
+	resp, err := c.quick.Do(req)
 	if err != nil {
 		return HealthResponse{}, fmt.Errorf("poller health: %w", err)
 	}
@@ -266,6 +295,10 @@ func (c *Client) Health(ctx context.Context) (HealthResponse, error) {
 }
 
 func (c *Client) post(ctx context.Context, path string, body any) ([]byte, error) {
+	return c.postWith(c.quick, ctx, path, body)
+}
+
+func (c *Client) postWith(cl *http.Client, ctx context.Context, path string, body any) ([]byte, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
@@ -284,7 +317,7 @@ func (c *Client) post(ctx context.Context, path string, body any) ([]byte, error
 		req.Header.Set("X-API-Signature", sig)
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := cl.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("poller request %s: %w", path, err)
 	}

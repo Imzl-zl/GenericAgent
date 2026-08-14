@@ -287,3 +287,21 @@ image_gen = {
 **验证基线（实施 + 审查修复后）**：根 pytest 78（含 test_image_gen 30）、worker 146+1skip、Go 全量（llmproxy/application/postgres/api）+ race、契约 41、web lint/build 全绿。
 
 **残余风险（截至审查修复）**：IM 端到端收图冒烟需真实渠道凭据 + `make build` 全量重建；流式 SSE 待真实上游实测（保持 stream=False）；钉钉/企微上传端点待凭据实测。
+
+## 9.8 交付链闭环记录（2026-08-14 独立审查后回写）
+
+> §9.7 记录的是 image_gen 本身; 生图"能送到用户手上"还依赖 2026-08-14
+> 同日修复的交付链(微信生图交付死信事故)。设计真值在
+> `IM_MEDIA_ARCHITECTURE.zh-CN.md` §5 决策 A5-A10 与 §11, 此处只留索引。
+
+| 提交 | 内容 |
+|---|---|
+| `cd56e9d` | spool 交付 NULL content → CHECKPOINT_COMMIT_FAILED(0057 只加列没改 INSERT, COALESCE 修复) |
+| `1b93186` | CDN 快速失败 + 媒体发送预算 15s→90s + 重试窗口 5→30min + maxDeliveryAttempts=10 |
+| `cf081b0` / `3a31dd4` | CDN 节流适配: 超限静态图交付侧转 JPEG ≤300KB; 上传预算 connect=30s 对齐 |
+| `260a59d` | 适配临时文件 mkstemp 落可写目录(只读 spool 卷静默失败) |
+| `433b7c7` / `c0e0452` | 媒体类型分类源收敛到 auditPath(spool 分支漏设 relPath → 生成图走 file_item 的根因修复)+ 结构不变量 |
+| `ba60f26` | 官方协议对齐: no_need_thumb=true + 企微/钉钉图片格式白名单 |
+| 独立审查优化 | 预算链定稿(poller 最坏 ~85s < ctx 90s < client 兜底 120s, 拆双 http.Client); 死代码清理(双签名/快照分支/缩略图); admin 死信重投端点; 根 QQ/钉钉诚实降级+钉钉图片直发 |
+
+**验证**: 微信端到端收图已实测(2026-08-14 生产闭环: 10 张生成图送达, 26/26 交付 acked 0 死信)。

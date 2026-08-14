@@ -80,6 +80,7 @@ def _ensure_runtime_paths():
 _ensure_runtime_paths()
 from agentmain import GeneraticAgent
 from frontends.chatapp_common import AgentChatMixin, FILE_HINT, split_text
+from frontends.im_markers import extract_files, resolve_file_markers, strip_files
 
 _TAG_PATS = [r"<" + t + r">.*?</" + t + r">" for t in ("thinking", "summary", "tool_use", "file_content")]
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
@@ -134,16 +135,8 @@ def _clean(text):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def _extract_files(text):
-    return re.findall(r"\[FILE:([^\]]+)\]", text or "")
-
-
-def _strip_files(text):
-    return re.sub(r"\[FILE:[^\]]+\]", "", text or "").strip()
-
-
 def _display_text(text):
-    cleaned = _strip_files(_clean(text))
+    cleaned = strip_files(_clean(text))
     if cleaned:
         return cleaned
     tail = (text or "").strip()[-_TRUNC_TAIL:]
@@ -573,7 +566,9 @@ def _send_local_file(receive_id, file_path, receive_id_type="open_id"):
 
 
 def _send_generated_files(receive_id, raw_text, receive_id_type="open_id"):
-    for file_path in _extract_files(raw_text):
+    # 路径按 cwd 解析(fsapp 启动时 os.chdir(PROJECT_ROOT))——im_markers
+    # 统一解析(2026-08-14 独立审查 C2)。
+    for file_path in resolve_file_markers(raw_text):
         _send_local_file(receive_id, file_path, receive_id_type)
 
 

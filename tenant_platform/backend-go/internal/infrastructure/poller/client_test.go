@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -163,9 +164,9 @@ func TestSendMessage(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	err = c.SendMessage(context.Background(), SendMessageRequest{
-		BotUUID:     "bot-1",
+		BotUUID:          "bot-1",
 		ChannelAccountID: "user-1",
-		Text:        "hello",
+		Text:             "hello",
 	})
 	if err != nil {
 		t.Fatalf("send: %v", err)
@@ -208,11 +209,11 @@ func TestSendMessageMedia(t *testing.T) {
 				t.Fatalf("new client: %v", err)
 			}
 			err = c.SendMessage(context.Background(), SendMessageRequest{
-				BotUUID:     "bot-1",
+				BotUUID:          "bot-1",
 				ChannelAccountID: "user-1",
-				MsgType:     tt.msgType,
-				Text:        tt.text,
-				FilePath:    tt.filePath,
+				MsgType:          tt.msgType,
+				Text:             tt.text,
+				FilePath:         tt.filePath,
 			})
 			if tt.wantErr {
 				if err == nil {
@@ -328,3 +329,45 @@ func TestPostOmitsSignatureWithoutSecret(t *testing.T) {
 		t.Fatal("did not expect X-API-Signature header without secret")
 	}
 }
+
+// TestMediaSendUsesMediaClient 防呆(2026-08-14 子代理复审 P2-b): 媒体
+// /send 必须走 media client(120s 兜底)——若新调用方误用 post()(quick 15s)
+// 会把 delivery 媒体 90s 预算重新架空。用 RoundTripper 替换记录实际 client。
+func TestMediaSendUsesMediaClient(t *testing.T) {
+	c, err := NewClient("http://poller.test", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type record struct{ saw bool }
+	quickRec := &record{}
+	mediaRec := &record{}
+	c.quick.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		quickRec.saw = true
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"sent":true}`)), Header: make(http.Header)}, nil
+	})
+	c.media.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		mediaRec.saw = true
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"sent":true}`)), Header: make(http.Header)}, nil
+	})
+	ctx := context.Background()
+	if err := c.SendMessage(ctx, SendMessageRequest{
+		BotUUID: "b1", ChannelAccountID: "u1", MsgType: MsgTypeImage, FilePath: "/tmp/x.png",
+	}); err != nil {
+		t.Fatalf("media send: %v", err)
+	}
+	if !mediaRec.saw || quickRec.saw {
+		t.Fatalf("media send must use media client: media=%v quick=%v", mediaRec.saw, quickRec.saw)
+	}
+	if err := c.SendMessage(ctx, SendMessageRequest{
+		BotUUID: "b1", ChannelAccountID: "u1", Text: "hi",
+	}); err != nil {
+		t.Fatalf("text send: %v", err)
+	}
+	if !quickRec.saw {
+		t.Fatal("text send must use quick client")
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

@@ -1093,6 +1093,7 @@ func run() error {
 		MCPServers:   store, // global MCP server management (migration 0029)
 		BotLifecycle: botLifecycle,
 		TaskStats:    store,
+		Deliveries:   store, // admin 死信查询/重投(2026-08-14 审查 E2)
 		RuntimeProfile: api.RuntimeProfile{
 			ClaimLeaseSeconds:         int((*claimLease) / time.Second),
 			TokenTTLSeconds:           int(llmproxy.DefaultTokenTTL / time.Second),

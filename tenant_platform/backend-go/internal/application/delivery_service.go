@@ -49,9 +49,12 @@ const (
 	// deliveryMediaSendTimeout 是媒体(文件/图片/视频)单次发送预算(2026-08-14
 	// 生产事故修复: 微信生图交付死信)。iLink CDN 上传(US→微信 CDN, AES 加密
 	// 整文件)正常 1-5s, 但连接层瞬时故障时旧逻辑挂到 read timeout(120s×3
-	// 次)才失败——远超文本 15s 预算, 8 次重试全部撞同一窗口 → 死信。现在
-	// poller 侧连接超时 10s 快速失败(退避 1/3s, 最坏 ~33s), 此处给媒体
-	// 90s 预算: 快速失败路径完全落在预算内, 慢传输也有足够余量。
+	// 次)才失败——远超文本 15s 预算, 重试全部撞同一窗口 → 死信。预算链
+	// (2026-08-14 独立审查 + 子代理复审定稿): 正常/快速失败路径 poller 侧
+	// 最坏 ~85s(CDN 30+10+3+30+10 + 控制面各 ≤10s, wxbot_client) < 此处
+	// 90s(ctx) < poller client 120s 兜底(client.go mediaTimeout)——ctx 是
+	// 预算唯一真值源; 病理(控制面与 CDN 双侧挂起)最坏 ~103s 超 ctx, 由
+	// Go 重试 + 幂等 client_id 兜底, poller 线程占用有界。
 	deliveryMediaSendTimeout = 90 * time.Second
 	// maxDeliveryAttempts is a hard cap independent of the retry window. The
 	// 30-minute window already bounds attempts under exponential backoff, but a
@@ -124,12 +127,12 @@ type DeliveryService interface {
 
 // DeliveryServiceConfig wires the delivery loop dependencies.
 type DeliveryServiceConfig struct {
-	Store        DeliveryStore
-	Tasks        TaskReader
-	Bots         ChannelResolverByOwner
-	Transport    transport.BotTransportAdapter
-	Results      ResultReader
-	Messages     MessageStore
+	Store     DeliveryStore
+	Tasks     TaskReader
+	Bots      ChannelResolverByOwner
+	Transport transport.BotTransportAdapter
+	Results   ResultReader
+	Messages  MessageStore
 	// TeamMembership 非 nil 时, 团队任务的终端交付前校验发起人成员资格
 	// (审查 R5-I4: 已移除成员不得再收到团队任务结果)。
 	TeamMembership TeamMembershipChecker
@@ -449,24 +452,13 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 					return err
 				}
 				// 审查 R5-I3: DB 快照文件的内容来自成功事务的安全捕获
-				// (safefs 限长读取 + 普通文件校验), tmp 位于 Platform 私有
-				// 目录(0700), 直接发送, 无需二次快照。
-				if file.snapshotContent {
-					mediaCtx, mcancel := context.WithTimeout(ctx, deliveryMediaSendTimeout)
-					defer mcancel()
-					return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.auditPath))
-				}
-				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
-				// 后复制到 Platform 私有快照, transport 发送不可变快照,
-				// 消除校验与发送之间的 TOCTOU。
-				snap, snapErr := snapshotDeliverable(file.absPath, file.root, file.relPath, s.snapshotDir, defaultMaxDeliverableBytes)
-				if snapErr != nil {
-					return snapErr
-				}
-				defer os.Remove(snap)
+				// (safefs 限长读取 + 普通文件校验), spool/临时快照均位于
+				// Platform 侧可信目录, 直接发送, 无需二次快照——旧
+				// snapshotDeliverable(OpenBeneath 二次校验)路径在 spool
+				// 引用化后已不可达, 已删除(2026-08-14 独立审查清理)。
 				mediaCtx, mcancel := context.WithTimeout(ctx, deliveryMediaSendTimeout)
 				defer mcancel()
-				return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, snap, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.auditPath))
+				return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.auditPath))
 			},
 			sendErrorCode: "SEND_FILE_FAILED",
 		})
@@ -493,7 +485,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				"task_id", task.ID,
 				"user_id", bot.OwnerID,
 				"bot_id", bot.ID,
-				"file", file.relPath,
+				"file", file.auditPath,
 				"error", err)
 		}
 	}
@@ -589,16 +581,16 @@ func (s *deliveryService) clearUnjournaledPart(key string) {
 }
 
 type deliveryFile struct {
-	absPath         string // 可发送文件的完整路径(Platform 私有快照或捕获期 spool)
-	root            string // absPath 的受限根(OpenBeneath 用)
-	relPath         string // root 相对路径(OpenBeneath 用, 仅内容快照分支)
-	displayName     string
-	auditPath       string // workspace 内相对路径: 媒体类型分类 + 消息媒体审计
+	absPath     string // 可发送文件的完整路径(Platform 私有快照或捕获期 spool)
+	displayName string
+	auditPath   string // workspace 内相对路径: 媒体类型分类 + 消息媒体审计
 	// (2026-08-14 事故根因重构: 分类源从 relPath 移到 auditPath——前者
 	// spool 分支按构造为空, mediaTypeForPath("") 回退 file 导致生成图
-	// 全部走 file_item; 后者两个分支都必然设置, 结构上不可能再漏。)
-	snapshotContent bool   // true = 内容来自成功事务捕获, 直接发送
-	spoolPath       string // 非空 = 捕获期 spool 引用(保留, 不随 payload 清理)
+	// 全部走 file_item; 后者两个分支都必然设置, 结构上不可能再漏。
+	// 2026-08-14 独立审查清理: 旧 root/relPath(OpenBeneath 二次快照)字段
+	// 与其唯一消费者 snapshotDeliverable 一起删除——spool 引用化后所有
+	// 文件均来自成功事务捕获, 无运行时二次校验路径。)
+	spoolPath string // 非空 = 捕获期 spool 引用(保留, 不随 payload 清理)
 }
 
 type deliveryPayload struct {
@@ -677,11 +669,10 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 					return deliveryPayload{}, fmt.Errorf("spool file %q exceeds size limit", f.SpoolPath)
 				}
 				out.Files = append(out.Files, deliveryFile{
-					absPath:         spoolAbs,
-					displayName:     sanitizeDeliverableDisplayName(f.FileName, f.RelPath),
-					auditPath:       f.RelPath,
-					snapshotContent: true,
-					spoolPath:       f.SpoolPath,
+					absPath:     spoolAbs,
+					displayName: sanitizeDeliverableDisplayName(f.FileName, f.RelPath),
+					auditPath:   f.RelPath,
+					spoolPath:   f.SpoolPath,
 				})
 				continue
 			}
@@ -706,9 +697,9 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 				return deliveryPayload{}, fmt.Errorf("write delivery file snapshot %q: %w", f.Marker, err)
 			}
 			out.Files = append(out.Files, deliveryFile{
-				absPath: tmpPath, root: dir, relPath: filepath.Base(tmpPath),
+				absPath:     tmpPath,
 				displayName: sanitizeDeliverableDisplayName(f.FileName, f.RelPath),
-				auditPath:   f.RelPath, snapshotContent: true,
+				auditPath:   f.RelPath,
 			})
 		}
 		// 结构不变量(2026-08-14 事故重构): auditPath 是媒体类型分类的唯一
@@ -738,7 +729,7 @@ func (s *deliveryService) retryOrDeadLetter(ctx context.Context, d domain.Delive
 		return s.deadLetter(ctx, d, "MAX_ATTEMPTS_EXCEEDED",
 			fmt.Sprintf("%s (after %d attempts)", message, d.AttemptCount), now)
 	}
-	deadline := retryDeadline(task, s.cfg.RetryWindow)
+	deadline := retryDeadline(task, d.RequeuedAt, s.cfg.RetryWindow)
 	next := nextRetryAt(d, now)
 	if !deadline.IsZero() && next.After(deadline) {
 		return s.deadLetter(ctx, d, code, message, now)
@@ -750,11 +741,18 @@ func (s *deliveryService) deadLetter(ctx context.Context, d domain.Delivery, cod
 	return s.cfg.Store.MarkDeliveryDeadLetter(ctx, d.DeliveryID, d.AttemptToken, code, message, now)
 }
 
-func retryDeadline(task domain.Task, window time.Duration) time.Time {
-	if task.TerminalAt == nil {
+// retryDeadline 是重试截止时间: 窗口锚点 = GREATEST(tasks.terminal_at,
+// d.requeued_at)(2026-08-14 复审 P1: admin 重投开启新 30min 窗口, 与
+// ClaimPendingDeliveries/DeadLetterExpiredDeliveries 的 SQL 锚点一致)。
+func retryDeadline(task domain.Task, requeuedAt *time.Time, window time.Duration) time.Time {
+	base := task.TerminalAt
+	if base == nil {
 		return time.Time{}
 	}
-	return task.TerminalAt.Add(window)
+	if requeuedAt != nil && requeuedAt.After(*base) {
+		base = requeuedAt
+	}
+	return base.Add(window)
 }
 
 func nextRetryAt(d domain.Delivery, now time.Time) time.Time {
@@ -791,7 +789,6 @@ func teamSessionKey(sessionKey string) (string, bool) {
 	}
 	return id, true
 }
-
 
 // cleanupSpoolCaptureDir 删除 delivery spool capture/ 下早于 before 的
 // 文件与空目录(2026-08-13 审查 B4/T5): 捕获期 spool 文件是持久快照, 与
@@ -915,8 +912,8 @@ var (
 	internalReasoningEnglishRE = regexp.MustCompile(`(?i)(the user is asking|let me\b|i should\b|actually\b|since there(?:'s| is)\b|i'?m just waiting for instructions)`)
 
 	// IM 渠道 md 降级(微信等不渲染 Markdown): 见 cleanIMMarkdown。
-	imBoldCodeRE    = regexp.MustCompile(`\*\*(.+?)\*\*|` + "`([^`]+)`" + `|~~(.+?)~~`)
-	imLinkRE        = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`)
+	imBoldCodeRE      = regexp.MustCompile(`\*\*(.+?)\*\*|` + "`([^`]+)`" + `|~~(.+?)~~`)
+	imLinkRE          = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`)
 	imHeadingPrefixRE = regexp.MustCompile(`^\s*#{1,6}\s*`)
 )
 

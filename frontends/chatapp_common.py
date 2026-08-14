@@ -57,12 +57,17 @@ def clean_reply(text):
     return re.sub(r"\n{3,}", "\n\n", text).strip() or "..."
 
 
-def extract_files(text):
-    return re.findall(r"\[FILE:([^\]]+)\]", text or "")
+# marker 纯函数收敛到 im_markers(2026-08-14 独立审查 C2): 此处再导出保持
+# 既有导入面(wecomapp/tgapp/qqapp/dcapp import extract_files 等)。
+# 双路径兼容: 脚本直跑时 frontends/ 在 sys.path[0](顶层名), 被 fsapp 等
+# 以 frontends.chatapp_common 命名空间导入时走包路径。
+try:
+    from im_markers import (BAD_FILE_MARKERS, extract_files, resolve_file_markers,
+                            strip_files)  # noqa: E402
+except ImportError:
+    from frontends.im_markers import (BAD_FILE_MARKERS, extract_files,
+                                      resolve_file_markers, strip_files)  # noqa: E402
 
-
-def strip_files(text):
-    return re.sub(r"\[FILE:[^\]]+\]", "", text or "").strip()
 
 
 def split_text(text, limit):
@@ -202,11 +207,11 @@ def format_restore():
 
 
 def build_done_text(raw_text):
-    files = [p for p in extract_files(raw_text) if os.path.exists(p)]
-    body = strip_files(clean_reply(raw_text))
-    if files:
-        body = (body + "\n\n" if body else "") + "\n".join(f"生成文件: {p}" for p in files)
-    return body or "..."
+    """终态回复纯文本(2026-08-14 独立审查 C1: 移除"生成文件: <路径>"
+    文本交付——服务器本地路径对 IM 用户无意义且是信息泄漏; 文件交付由
+    各渠道 send_done 用 resolve_file_markers + 渠道媒体发送实现, 无媒体
+    能力的渠道给出诚实提示)。"""
+    return strip_files(clean_reply(raw_text)) or "..."
 
 
 def public_access(allowed):
@@ -259,6 +264,10 @@ class AgentChatMixin:
     source = "chat"
     split_limit = 1500
     ping_interval = 20
+    #: 渠道是否支持媒体直发(2026-08-14 独立审查 C1)。默认 False = 文本
+    #: 通道: 产出 [FILE:] 时给出诚实提示而非渲染服务器路径; 有媒体能力
+    #: 的渠道覆写 send_done 自行解析并发送(resolve_file_markers)。
+    can_send_media = False
 
     def __init__(self, agent, user_tasks):
         self.agent, self.user_tasks = agent, user_tasks
@@ -267,6 +276,12 @@ class AgentChatMixin:
         raise NotImplementedError
 
     async def send_done(self, chat_id, raw_text, **ctx):
+        if not self.can_send_media and extract_files(raw_text):
+            # 有文件产出但渠道无法直发: 诚实提示(不再输出服务器路径)。
+            body = strip_files(clean_reply(raw_text))
+            note = "📎 文件已生成，但当前渠道不支持直接发送文件。"
+            text = (body + "\n\n" + note) if body and body != "..." else note
+            return await self.send_text(chat_id, text, **ctx)
         await self.send_text(chat_id, build_done_text(raw_text), **ctx)
 
     async def handle_command(self, chat_id, cmd, **ctx):

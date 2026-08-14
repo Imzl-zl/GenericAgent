@@ -5,6 +5,7 @@ _TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 from agentmain import GeneraticAgent
 from wxbot_client import WxBotClient, AuthExpired
 from wxbot_media import download_media
+from im_markers import resolve_file_markers
 
 # ── Per-user abort flags (shared between on_message invocations) ──
 _task_aborted: dict = {}  # uid -> True  (set by /stop, read by _handle)
@@ -129,13 +130,9 @@ def on_message(bot, msg):
         rest = _clean('\n\n'.join(done[sent:] + ['\n\n' + tag]).strip())
         if rest: _wx_send(rest[-3000:])
 
-        files = re.findall(r'\[FILE:([^\]]+)\]', result)
-        bad = {'filepath', '<filepath>', 'path', '<path>', 'file_path', '<file_path>', '...'}
-        files = [f for f in files if f.strip().lower() not in bad and (f if os.path.isabs(f) else os.path.join(_TEMP_DIR, f)) not in media_paths]
-        for fpath in set(files):
-            if not os.path.isabs(fpath): fpath = os.path.join(_TEMP_DIR, fpath)
+        files = [f for f in resolve_file_markers(result, base_dir=_TEMP_DIR) if f not in media_paths]
+        for fpath in files:
             try:
-                if not os.path.exists(fpath): raise FileNotFoundError(f"文件不存在: {fpath}")
                 ext = os.path.splitext(fpath)[1].lower()
                 sender = bot.send_video if ext in {'.mp4', '.mov', '.m4v', '.webm'} else \
                          bot.send_image if ext in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'} else bot.send_file

@@ -266,6 +266,72 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/admin/deliveries:
+    get:
+      operationId: adminListDeliveries
+      summary: List terminal delivery outbox rows (dead-letter admin view; default status=dead_letter)
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            default: dead_letter
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            maximum: 200
+      responses:
+        "200":
+          description: Delivery admin rows (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - deliveries
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DeliveryAdminRecord"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/admin/deliveries/{delivery_id}/requeue:
+    post:
+      operationId: adminRequeueDelivery
+      summary: Requeue a dead-letter delivery as pending for the delivery loop to resend (attempt budget resets)
+      parameters:
+        - name: delivery_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Delivery requeued
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - requeued
+                properties:
+                  requeued:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/admin/llm-providers:
     get:
       operationId: adminListLLMProviders
@@ -1940,6 +2006,39 @@ components:
         password:
           type: string
           description: Optional password; empty means an admin-created test account
+    DeliveryAdminRecord:
+      type: object
+      required:
+        - delivery_id
+        - task_id
+        - delivery_type
+        - status
+        - attempt_count
+        - created_at
+      properties:
+        delivery_id:
+          type: string
+        task_id:
+          type: string
+        delivery_type:
+          type: string
+        status:
+          type: string
+        error_code:
+          type: string
+        error_message:
+          type: string
+        attempt_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        terminal_at:
+          type: string
+          format: date-time
+        requeued_at:
+          type: string
+          format: date-time
     UserRecord:
       type: object
       required:

@@ -27,9 +27,12 @@ WITH eligible AS (
     WHERE d.status IN ('pending','sending')
       AND (d.attempt_lease_until IS NULL OR d.attempt_lease_until <= $1)
       AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= $1)
+      -- 窗口锚点 = GREATEST(tasks.terminal_at, d.requeued_at)(0060):
+      -- admin 重投(requeued_at 非空)开启新 30min 窗口, 否则事故后数小时
+      -- 重投的行会立即被 DeadLetterExpiredDeliveries 打回(2026-08-14 复审 P1)。
       AND (
           t.terminal_at IS NULL
-          OR $1 < t.terminal_at + $4::interval
+          OR $1 < GREATEST(t.terminal_at, COALESCE(d.requeued_at, t.terminal_at)) + $4::interval
       )
       -- round10 审查(B8): 同一 task 的 task_started 未完成(pending/sending)
       -- 时不得 claim 其他 delivery——否则并发发送会让完成消息先于"正在处理"
@@ -62,7 +65,7 @@ WHERE d.delivery_id = e.delivery_id
 RETURNING d.delivery_id, d.task_id, d.delivery_type, d.status,
           COALESCE(d.payload_ref,''), COALESCE(d.payload_digest,''),
           COALESCE(d.error_code,''), COALESCE(d.error_message,''), d.attempt_count,
-          d.attempt_token
+          d.attempt_token, d.requeued_at
 `, now, limit, leaseUntil, retryWindow.String())
 	if err != nil {
 		return nil, fmt.Errorf("claim deliveries: %w", err)
@@ -86,7 +89,8 @@ WHERE status = 'sending' AND attempt_lease_until <= $1
 }
 
 // DeadLetterExpiredDeliveries moves pending/sending rows whose retry window
-// (terminal_at + retryWindow) has expired to dead_letter.
+// (terminal_at + retryWindow, 或 admin 重投后的 requeued_at + retryWindow)
+// has expired to dead_letter.
 func (s *Store) DeadLetterExpiredDeliveries(ctx context.Context, retryWindow time.Duration, now time.Time) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `
 UPDATE task_deliveries d SET
@@ -97,7 +101,7 @@ FROM tasks t
 WHERE d.task_id = t.id
   AND d.status IN ('pending','sending')
   AND t.terminal_at IS NOT NULL
-  AND $1 >= t.terminal_at + $2::interval
+  AND $1 >= GREATEST(t.terminal_at, COALESCE(d.requeued_at, t.terminal_at)) + $2::interval
 `, now, retryWindow.String())
 	if err != nil {
 		return 0, fmt.Errorf("dead letter expired deliveries: %w", err)
@@ -196,12 +200,12 @@ func (s *Store) GetDelivery(ctx context.Context, taskID string, dt domain.Delive
 SELECT delivery_id, task_id, delivery_type, status,
        COALESCE(payload_ref,''), COALESCE(payload_digest,''),
        COALESCE(error_code,''), COALESCE(error_message,''), attempt_count,
-       COALESCE(attempt_token,'')
+       COALESCE(attempt_token,''), requeued_at
 FROM task_deliveries WHERE task_id = $1 AND delivery_type = $2
 `, taskID, string(dt)).Scan(
 		&d.DeliveryID, &d.TaskID, &d.DeliveryType, &d.Status,
 		&d.PayloadRef, &d.PayloadDigest, &d.ErrorCode, &d.ErrorMessage, &d.AttemptCount,
-		&d.AttemptToken,
+		&d.AttemptToken, &d.RequeuedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Delivery{}, fmt.Errorf("delivery not found")
@@ -216,7 +220,7 @@ func scanDeliveries(rows pgx.Rows) ([]domain.Delivery, error) {
 		err := rows.Scan(
 			&d.DeliveryID, &d.TaskID, &d.DeliveryType, &d.Status,
 			&d.PayloadRef, &d.PayloadDigest, &d.ErrorCode, &d.ErrorMessage, &d.AttemptCount,
-			&d.AttemptToken,
+			&d.AttemptToken, &d.RequeuedAt,
 		)
 		if err != nil {
 			return nil, err
@@ -227,4 +231,71 @@ func scanDeliveries(rows pgx.Rows) ([]domain.Delivery, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// ListDeliveries 按状态列出 delivery 行(admin 管理视图, 2026-08-14 审查 E2)。
+// status 为 ” 时列出全部; 最新在前。
+func (s *Store) ListDeliveries(ctx context.Context, status string, limit int) ([]domain.DeliveryAdminRow, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT delivery_id, task_id, delivery_type, status,
+       COALESCE(error_code, ''), COALESCE(error_message, ''), attempt_count,
+       created_at, terminal_at, requeued_at
+FROM task_deliveries
+WHERE ($1 = '' OR status = $1)
+ORDER BY created_at DESC
+LIMIT $2
+`, status, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list deliveries: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.DeliveryAdminRow
+	for rows.Next() {
+		var r domain.DeliveryAdminRow
+		if err := rows.Scan(&r.DeliveryID, &r.TaskID, &r.DeliveryType, &r.Status,
+			&r.ErrorCode, &r.ErrorMessage, &r.AttemptCount, &r.CreatedAt, &r.TerminalAt, &r.RequeuedAt); err != nil {
+			return nil, fmt.Errorf("scan delivery admin row: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RequeueDeadLetterDelivery 把死信行重置为 pending 供 delivery 循环重投
+// (admin 动作, 2026-08-14 审查 E2)。attempt_count 归零——死信行的计数通常
+// 已到 maxDeliveryAttempts, 保留会让重投立即 MAX_ATTEMPTS_EXCEEDED 再死信;
+// 管理员显式重投 = 新的重试预算。仅 dead_letter 行可重投(fail-closed):
+// 其他状态不匹配(防误把 acked/进行中行打回)。返回 found。
+func (s *Store) RequeueDeadLetterDelivery(ctx context.Context, deliveryID string, now time.Time) (bool, error) {
+	// attempt_token 列 NOT NULL: 生成新 fencing token(claim 时还会再换),
+	// 旧 token 随死信行作废。error_code 置 'REQUEUED' 标记: CHECK 约束
+	// (task_deliveries_error_payload)要求非 task_complete 行 error_code
+	// 非空, 且该标记记录"管理员重投"事件——下次终态时被新错误码覆盖。
+	// requeued_at = now: 重投开启新 30min 重试窗口(claim/死信窗口锚点取
+	// GREATEST(terminal_at, requeued_at), 2026-08-14 复审 P1)。
+	tag, err := s.pool.Exec(ctx, `
+UPDATE task_deliveries
+SET status = 'pending',
+    attempt_count = 0,
+    attempt_token = md5(random()::text || clock_timestamp()::text),
+    attempt_lease_until = NULL,
+    next_attempt_at = $2,
+    sent_at = NULL,
+    terminal_at = NULL,
+    error_code = 'REQUEUED',
+    error_message = NULL,
+    requeued_at = $2,
+    updated_at = $2
+WHERE delivery_id = $1 AND status = 'dead_letter'
+`, deliveryID, now.UTC())
+	if err != nil {
+		return false, fmt.Errorf("requeue dead letter delivery: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
 }

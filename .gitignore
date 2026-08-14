@@ -187,3 +187,7 @@ tenant_platform/infra/compose/memory-template/*.tmp
 
 # uv lockfile(未接入 uv 安装链路, 防止误提交孤儿锁定文件)
 uv.lock
+
+# pi 子代理运行目录(审查转录/任务/mission 可能含仓库内容甚至密钥, 不入库——
+# 47faa02 曾误提交 10 个文件, 2026-08-14 复审后 rm --cached)
+.pi/
