@@ -234,6 +234,25 @@ and persist the result into its own memory.
 | 👁️ Vision | *"Set up your vision capability from the template in memory/."* — GA copies the template, wires it to your existing LLM keys, and self-tests. |
 | 🖱️ Computer use | *"Probe this system and set up your computer-use capability."* |
 
+### 🎨 Image Generation (`image_gen`)
+
+GA can generate images through a dedicated image model (OpenAI `images/generations`-compatible API). Configure it in `mykey.py` (copy the commented block from `mykey_template.py`):
+
+```python
+image_gen = {
+    'name': 'openai',                          # client dispatch key (v1: openai/oai)
+    'apibase': 'https://api.openai.com/v1',    # direct: real upstream/relay gateway
+    'apikey': 'sk-...',                        # direct: real key
+    'model': 'gpt-image-1',                    # image model, independent of chat model
+    # 'stream': False,                         # optional: gpt-image SSE refinement
+}
+```
+
+- The model decides to call the `image_gen` tool; the image is written to `outputs/` and delivered via the `[FILE:outputs/...]` marker.
+- Unconfigured → the tool returns an honest `[Error: image_gen ...]` message; it never crashes the loop.
+- **Hosted platform mode** (multi-tenant, `tenant_platform/`): admin checks the **Image** capability on a provider in the web console; the platform issues an `llm.image` capability token and injects the `image_gen` block into the sandbox automatically (no GA-side changes). An image-capable provider should be a dedicated provider whose `model` is the image model.
+- ⚠️ After upgrading GA code, rebuild images with `make build` (ga-runner embeds `ga.py`/`llmcore.py`/`tools_schema.json`).
+
 > 💡 **About language**: the pre-installed SOPs are written in Chinese — GA reads them
 > natively, so this never blocks you. If you prefer an English knowledge base, just say:
 > *"Read your pre-installed SOPs and rewrite them in English (keep code, paths and error
@@ -269,7 +288,7 @@ The entire core loop is just **~100 lines of code** ([`agent_loop.py`](agent_loo
 
 ### 3️⃣ Minimal Toolset
 
-> *GenericAgent provides only **9 atomic tools**, forming the foundational capabilities for interacting with the outside world.*
+> *GenericAgent provides only **10 atomic tools**, forming the foundational capabilities for interacting with the outside world.*
 
 | Tool | Function |
 | :--- | :--- |
@@ -282,6 +301,8 @@ The entire core loop is just **~100 lines of code** ([`agent_loop.py`](agent_loo
 | `ask_user` | Human-in-the-loop confirmation |
 | `update_working_checkpoint` | *(memory)* Short-term working notepad |
 | `start_long_term_update` | *(memory)* Distill long-term memory |
+| `web_search` | Web search |
+| `image_gen` | Generate images via a dedicated image model (`[FILE:]` → deliver) |
 
 ### 4️⃣ Capability Extension
 
@@ -433,7 +454,7 @@ Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for full text.
 
 ## 🌟 项目简介
 
-**GenericAgent** 是一个极简、可自我进化的自主 Agent 框架。核心仅 **~3K 行代码**，通过 **9 个原子工具 + ~100 行 Agent Loop**，赋予任意 LLM 对本地计算机的系统级控制能力，覆盖浏览器、终端、文件系统、键鼠输入、屏幕视觉及移动设备（ADB）。
+**GenericAgent** 是一个极简、可自我进化的自主 Agent 框架。核心仅 **~3K 行代码**，通过 **10 个原子工具 + ~100 行 Agent Loop**，赋予任意 LLM 对本地计算机的系统级控制能力，覆盖浏览器、终端、文件系统、键鼠输入、屏幕视觉及移动设备（ADB）。
 
 > 设计哲学 —— **不预设技能，靠进化获得能力。**
 
@@ -464,7 +485,7 @@ Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for full text.
 | :--- | :--- |
 | 🧬 **自我进化** | 每次任务自动沉淀 Skill，能力随使用持续增长，形成专属技能树 |
 | 🪶 **极简架构** | ~3K 行核心代码，Agent Loop 约百行，无复杂依赖，部署零负担 |
-| ⚡ **强执行力** | 注入真实浏览器（保留登录态），9 个原子工具直接接管系统 |
+| ⚡ **强执行力** | 注入真实浏览器（保留登录态），10 个原子工具直接接管系统 |
 | 🔌 **高兼容性** | 支持 Claude / Gemini / Kimi / MiniMax 等主流模型，跨平台运行 |
 | 💰 **极致省 Token** | 上下文窗口不到 30K，是其他 Agent（200K–1M）的零头；噪声更少、幻觉更低、成功率更高，成本低一个数量级 |
 
@@ -650,7 +671,7 @@ GenericAgent 通过 **分层记忆 × 最小工具集 × 自主执行循环** �
 
 ### 3️⃣ 最小工具集
 
-> *GenericAgent 仅提供 **9 个原子工具**，构成与外部世界交互的基础能力。*
+> *GenericAgent 仅提供 **10 个原子工具**（含 `image_gen` 生图），构成与外部世界交互的基础能力。*
 
 | 工具 | 功能 |
 | :--- | :--- |
@@ -663,12 +684,33 @@ GenericAgent 通过 **分层记忆 × 最小工具集 × 自主执行循环** �
 | `ask_user` | 人机协作确认 |
 | `update_working_checkpoint` | *（记忆）* 短期工作记事板 |
 | `start_long_term_update` | *（记忆）* 提炼长期记忆 |
+| `web_search` | 网络搜索 |
+| `image_gen` | 调用独立生图模型生成图片（`[FILE:]` marker 走交付链） |
 
 ### 4️⃣ 能力扩展机制
 
 > *具备动态创建新工具的能力。*
 
 通过 `code_run`，GenericAgent 可在运行时动态安装 Python 包、编写新脚本、调用外部 API 或控制硬件，将临时能力固化为永久工具。
+
+### 🎨 生图能力（`image_gen`）
+
+GA 通过独立生图模型（OpenAI `images/generations` 兼容协议）生图。在 `mykey.py` 中配置（模板见 `mykey_template.py` 生图配置块）：
+
+```python
+image_gen = {
+    'name': 'openai',                          # 客户端分派关键字（v1: openai/oai）
+    'apibase': 'https://api.openai.com/v1',    # 直连形态：真实上游/中转网关
+    'apikey': 'sk-...',                        # 直连形态：真实密钥
+    'model': 'gpt-image-1',                    # 独立生图模型，与对话模型无关
+    # 'stream': False,                         # 可选：gpt-image SSE 渐进细化
+}
+```
+
+- 模型决策调用 `image_gen` 工具 → 图片落盘 `outputs/` → 经 `[FILE:outputs/...]` marker 走交付链发给用户。
+- 未配置时工具返回诚实错误文本（`[Error: image_gen ...]`），不会崩溃。
+- **平台托管形态**（多租户，`tenant_platform/`）：admin 在 web 控制台给 provider 勾选 **Image 能力**，平台自动签发 `llm.image` 能力令牌并把 `image_gen` 块注入沙箱（GA 侧零改动）。生图 provider 建议独立配置（model 应为生图模型）。
+- ⚠️ 升级 GA 代码后需 `make build` 全量重建（ga-runner 内嵌 `ga.py`/`llmcore.py`/`tools_schema.json`）。
 
 <div align="center">
   <img src="assets/images/workflow.jpg" alt="GenericAgent 工作流程" width="420"/>

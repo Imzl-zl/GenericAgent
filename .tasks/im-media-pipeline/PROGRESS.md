@@ -41,7 +41,7 @@ B4 8MiB+bytea / B5 QQ 主动消息路径）与重要项（I2 content_type、I4 �
 ## 有意推迟（决策 D6，已被 D1 取代）
 
 - ~~T8 Phase B 生图：无真实用户需求证据，llm-proxy `llm.image` capability 扩展建议随 B 期一起做~~。
-- **2026-08-14 D1 用户拍板（取代 D6）**：T8 不再整体推迟——**v1 实施直连形态**（GA 侧 image_gen 工具 + ImageGenClient，平台侧零改动）；**托管形态**（llm-proxy `images/generations` 代理 + `llm.image` capability + provider 能力类型维度 + policy 放行 + openapi/web 同步）转为**终态设计，有真实需求时实施**。
+- **2026-08-14 D1 用户拍板（取代 D6）**：T8 不再整体推迟——**v1 实施直连形态**（GA 侧 image_gen 工具 + ImageGenClient，平台侧零改动）；**托管形态**（llm-proxy `images/generations` 代理 + `llm.image` capability + provider 能力类型维度 + policy 放行 + openapi/web 同步）转为**终态设计，有真实需求时实施**。**实施注记：D1 定稿当日托管形态即实施完成（T8.5 done，见下方 Step 3 明细），"终态设计延后"已被实际需求取代。**
 - 建议项 S1 后半（GA 注入前 PIL 解码失败丢弃而非原样透传）与 S3（媒体链路日志）未做，成本低可随时补。
 
 ## Phase B：生图（2026-08-14 定稿 + GA 侧直连形态 v1 实施）
@@ -49,7 +49,7 @@ B4 8MiB+bytea / B5 QQ 主动消息路径）与重要项（I2 content_type、I4 �
 > 方案真值：`PHASE_B_IMAGE_GEN_PLAN.zh-CN.md`（两轮 fresh-context 审查通过 + D1 拍板，§9.5/§9.6 审查结论）。
 > 设计真值：`tenant_platform/docs/IM_MEDIA_ARCHITECTURE.zh-CN.md` §6（B1-B5 + D1 已勾选，§6.3 失败语义摘要）。
 
-**D1 定位更新（替代原"有意推迟 D6"表述）**：直连形态先行（v1 实施），托管为终态设计（v1 不实施）——ImageGenClient 双形态设计（一份代码，配置决定形态）；平台侧（llm-proxy/policy/provider）一律不动，平台模式 v1 有意不可用生图（policy deny-by-default 无死工具暴露）。
+**D1 定位更新（替代原"有意推迟 D6"表述）**：直连形态先行（v1 实施），托管为终态设计（v1 不实施）——ImageGenClient 双形态设计（一份代码，配置决定形态）；平台侧（llm-proxy/policy/provider）一律不动，平台模式 v1 有意不可用生图（policy deny-by-default 无死工具暴露）。**2026-08-14 当日托管形态已实施（T8.5），本节为决策历史，当前状态以 T8.5 行为准。**
 
 | 子任务 | 内容 | 验证 |
 |---|---|---|

@@ -1,6 +1,6 @@
 # IM 媒体管道架构（Media Pipeline）
 
-> 状态：**设计定案（2026-08-13）**。入站理解段已落地；**出站发送已落地（Phase A，2026-08-14 审查后）**；**生图 GA 侧直连形态 v1 已落地（Phase B，2026-08-14，托管形态为终态设计按需实施）**；视频为设计稿（Phase C 分期实施，见 §10）。
+> 状态：**设计定案（2026-08-13）**。入站理解段已落地；**出站发送已落地（Phase A，2026-08-14 审查后）**；**生图直连 + 托管双形态均已实施（Phase B，2026-08-14）**；视频为设计稿（Phase C 分期实施，见 §10）。
 > 生图实施真值：`.tasks/im-media-pipeline/PHASE_B_IMAGE_GEN_PLAN.zh-CN.md`（两轮审查通过 + D1 拍板定稿，§3-§8）。
 > 关联：`IM_CHANNEL_ARCHITECTURE.zh-CN.md`（会话模型/分桶）、`IM_CHANNEL_BINDING.zh-CN.md`（渠道绑定/Adapter 注册表）、`IM_STREAMING_DELIVERY.zh-CN.md`（流式转发）、`LLM_PROVIDER_ARCHITECTURE.md`（llm-proxy）、`contracts/proto/genericagent/worker/v1/worker.proto`（TaskEnvelope.media 契约）。
 > 结论先行：**媒体 = 入站/出站对称的「文件 + 元数据」统一模型**；理解走消息块（content block，模型直接看），生成走工具+文件（模型产出 → 既有交付链路）；渠道协议差异收敛为 adapter 的两个薄接口（入站提取 / 出站上传发送），公共逻辑（URL 直下、落盘、MIME、大小限制、元数据）基类一套。
@@ -133,16 +133,16 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
 
 - **生图 ≠ 多模态理解**：理解是入站媒体 → chat 协议内 `image_url` content block；生图是模型决策 → **独立 API**（OpenAI `images/generations` 兼容协议）→ 文件 → 出站交付。
 - GA 原生无生图（llmcore 只有 chat 类 Session）；主流 agent（Claude Code/Codex/OpenAI Agents SDK）均为**工具化**：模型调用生图工具 → API 产图 → 文件交付，聊天流不返回图。
-- llm-proxy 目前**只代理 `/v1/chat/completions`**（handler 单路径）——托管形态需扩展（终态设计，v1 不实施）。
+- llm-proxy 已代理 `/v1/images/generations`（托管形态 2026-08-14 已实施，见 §6.2 B2）——operation 参数化（llm.chat/llm.image）按路由校验。
 
 ### 6.2 设计决策（2026-08-14 全部定稿；B1-B5 + D1）
 
 - [x] 决策 B1：**生图 = GA 工具**（`image_gen`，第 10 个原子工具）：模型调用（prompt/尺寸/数量）→ 工具内调生图 API → 图片落盘 `outputs/` → 返回 `[FILE:outputs/<name>]` 走既有出站链路。**GA 核心循环零侵入**（agent_loop.py 零改动，dispatch 泛化）。**v1 已实施（2026-08-14）**。
 - [x] 决策 B2：**llm-proxy 扩展 `POST /v1/images/generations` 代理**（**2026-08-14 已实施，托管形态落地**）：与 chat 同能力体系——capability 校验（operation 扩展 `llm.image`，路由层按 operation 拒绝错配 token）、JTI 预算计量（复用 max_turns 原子扣减）、白名单 egress（host/CIDR 级）、模型与 capability 匹配校验（loadBoundProvider 复用）；**provider 能力类型维度（chat/image）已实施**（migration 0058 capabilities 列，省略=[chat] 存量兼容）；生图 provider **排除 chat mixin**（image binding 写 image_gen 块，不进 llm_nos）；policy 放行（foundation.session-files.v1 allowed_tools 补 image_gen）；worker 侧 marker 回显兜底（image_gen 产物登记 generated_output_files，仿 export_docx）；安全审查项落地：生图响应体 32MiB 上限（MaxWorkerRequestBytes 仅限请求体，DisableCompression 大 JSON 原样传输——现按 Content-Length 前置拒绝 fail-closed）；openapi/web 同步（capabilities 字段 + 表单复选框）。
-- [x] 决策 B3：**生图上游模型 = 独立配置 + ImageGenClient 双形态设计**（v1 实施直连形态）：GA `ImageGenClient`（OpenAI images 兼容，`/images/generations`）只认 apibase/apikey/model 配置——**直连/托管是配置差异而非两套实现**（对齐 BaseSession 先例：chat 直连与平台托管共用一份代码）；v1 的 apibase = 真实上游/中转网关 + 真实密钥；托管形态（apibase = llm-proxy + `llm.image` 能力令牌）按需实施时 GA 侧协议代码零改动。实现进 `llmcore.py`（`BaseImageGenClient`/`OpenAIImageGenClient`/`resolve_image_gen`），**严禁新增 imagegen.py**——沙箱 overlay 只物化固定清单（LEGACY_MODULES），新增模块导致平台沙箱启动 ImportError。
-- [x] 决策 B4：**生成文件管理**：生图产物写入 session outputs/（`outputs/<name>`，`self.cwd` 相对路径 + `os.makedirs(exist_ok=True)`，落盘前 ≤20MiB 检查——Go 交付上限 image ≤20MiB 是 fail-closed 任务失败，不能等到提交时刻才爆）；`[FILE:]` marker 走 Phase A 出站交付链。**marker 回显依赖**：工具返回 marker ≠ 交付发生，模型须在最终回复回显 marker 才触发交付（根项目无兜底；托管形态实施时补 generated_output_files 登记，仿 do_export_docx）。
+- [x] 决策 B3：**生图上游模型 = 独立配置 + ImageGenClient 双形态设计**（v1 实施直连形态）：GA `ImageGenClient`（OpenAI images 兼容，`/images/generations`）只认 apibase/apikey/model 配置——**直连/托管是配置差异而非两套实现**（对齐 BaseSession 先例：chat 直连与平台托管共用一份代码）；v1 的 apibase = 真实上游/中转网关 + 真实密钥；托管形态（apibase = llm-proxy + `llm.image` 能力令牌）**2026-08-14 已实施**，GA 侧协议代码零改动（平台 runtime_config 下发 image_gen 块）。实现进 `llmcore.py`（`BaseImageGenClient`/`OpenAIImageGenClient`/`resolve_image_gen`），**严禁新增 imagegen.py**——沙箱 overlay 只物化固定清单（LEGACY_MODULES），新增模块导致平台沙箱启动 ImportError。
+- [x] 决策 B4：**生成文件管理**：生图产物写入 session outputs/（`outputs/<name>`，`self.cwd` 相对路径 + `os.makedirs(exist_ok=True)`，落盘前 ≤20MiB 检查——Go 交付上限 image ≤20MiB 是 fail-closed 任务失败，不能等到提交时刻才爆）；`[FILE:]` marker 走 Phase A 出站交付链。**marker 回显依赖**：工具返回 marker ≠ 交付发生，模型须在最终回复回显 marker 才触发交付（根项目无兜底；托管形态已补 generated_output_files 登记——worker `install_image_gen_marker_registry`，仿 do_export_docx，46e81b4）。
 - [x] 决策 B5：**流式 = 客户端内部可选路径**（`stream:true` + `partial_images` SSE 取最终帧，工具层透明）：同步路径恒可用；SSE 解析失败/超时/收到非流式 JSON → 自动重试一次同步路径。**v1 已实施（待真实上游实测，社区有 gpt-image-1 partial streaming 波动报告）**。
-- [x] 决策 D1（2026-08-14 用户拍板）：**直连形态先行（v1 实施），托管为终态设计（v1 不实施）**——ImageGenClient 双形态设计（一份代码，配置决定形态，见 B3）；平台侧（llm-proxy/policy/provider）一律不动；**平台模式 v1 有意不可用生图**（policy 保持 deny-by-default 现状，沙箱模型看不到该工具，无死工具暴露），托管形态实施时随 policy 放行。
+- [x] 决策 D1（2026-08-14 用户拍板）：**直连形态先行（v1 实施），托管为终态设计（v1 不实施）**——ImageGenClient 双形态设计（一份代码，配置决定形态，见 B3）；平台侧（llm-proxy/policy/provider）一律不动；**平台模式 v1 有意不可用生图**（policy 保持 deny-by-default 现状，沙箱模型看不到该工具，无死工具暴露）。**实施注记（2026-08-14 当日）**：D1 定稿后同日托管形态（Step 3）即实施完成（5870cc5/46e81b4），平台模式生图现可用（policy 已放行 image_gen、runtime_config 下发 image_gen 块）。
 
 ### 6.3 失败语义（2026-08-14 审查定稿，对齐 §8 原则 6 失败诚实；方案 §6.5 摘要）
 
@@ -208,11 +208,12 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
 
 - **gpt-image 参数兼容性（Phase B）**：**已实测（2026-08-14，new-api 中转）**——①`size` 必传（中转计费硬要求，缺省 500 "图片尺寸计费需要传 size"），客户端已默认 1024x1024；②gpt-image-2/gemini-*-image 返回 b64_json；③**sensenova/agnes 系只返回 `url` 直链**（b64_json 为空），客户端已加 url 直下兜底（≤20MiB 限流）；④sensenova-u1-fast size 合法集特殊（1664x2496/2048x2048 等，无 1024x1024）——错误文本含合法列表，模型可自愈；⑤流式路径（`stream:true` + `partial_images` SSE）仍未真实上游实测（社区有稳定性波动报告）——同步路径恒可用，建议保持 stream=False。
 - **marker 回显依赖（Phase B，托管已补兜底）**：工具返回 `[FILE:]` marker ≠ 交付发生，模型须在最终回复回显 marker 才触发交付——**托管形态已补 generated_output_files 登记**（worker 包装 do_image_gen，终态 append_missing_file_markers 自动补写漏回显 marker，仿 export_docx）；直连形态仍无兜底（模型忘回显则静默丢失，可接受）。
-- **直连形态无 JTI 计量（Phase B）**：成本靠 n≤4 限额 + 用户自觉（gpt-image token 计费，usage 日志留作后续计量基础）。
+- **直连形态无 JTI 计量（Phase B）**：成本靠 n≤4 限额 + 用户自觉（gpt-image token 计费，usage 日志留作后续计量基础）。托管形态下 image 调用走独立 llm.image token——**双能力 provider 的 chat 与 image 预算独立计量**（各持 max_turns 预算，互不占用），admin 配置时需知晓。
+- **托管形态语义边界（2026-08-14 审查定稿）**：①model override 在托管形态必 409（provider 绑定强制，schema 描述已注明）；②双能力 provider 单 model 字段——image 请求用同一 model 打上游，建议 image 用独立 provider（web 表单已提示）；③image-only 部署被拒绝（至少一个 chat provider，fail-fast）；④双能力 provider 按 (ID, 能力) 去重（原按 ID 去重会误拒，已修）。
 - **Phase B 上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json，runtime_overlay.py LEGACY_MODULES/ASSETS 清单物化）。
 - 各渠道上传 API（QQ file_info 分片、钉钉/企微 media 上传）需真实凭据实测（mock 只覆盖请求形状）。
 - QQ 附件下载 URL 有时效（`rkey`），下载失败需按事件级重试语义处理（poller 已有 InboundCoalescingBuffer，媒体下载失败策略沿用：丢弃该媒体并记录，不阻塞文本消息）。
-- 生图模型按 provider 配置独立，需 llm-proxy 能力扩展同步安全审查（JTI 预算、白名单、模型匹配，同 chat 路径）。
+- 生图模型按 provider 配置独立——llm-proxy 能力扩展安全审查项**已全部落地（2026-08-14）**：operation 错配 401 deny-by-default、JTI 预算（max_turns 原子计量，与 chat 同路径）、egress 白名单（host/CIDR 级复用）、model 匹配（loadBoundProvider 复用）、生图响应 32MiB 上限（Content-Length 前置 + chunked 流式计数双闸）。
 - **QQ 出站主动消息路径（审查 B5）**：异步 delivery 必超被动窗口（msg_id 5 分钟），媒体发送走主动消息——频控预算（单聊 20 QPM、日 1000/用户）与 C2C"用户近期交互"约束需 adapter 内实现并实测。
 - **钉钉/企微入站下载端点（审查 S4）**：钉钉 `POST /v1.0/robot/messageFiles/download`、企微 `media/get`（access_token 来源 = 智能机器人凭据，SDK token 端点未确认）——代码已按官方文档实现，真实凭据冒烟时验证。
 - **钉钉出站 file/video（审查 S4 同源）**：sampleFileMsg/sampleVideoMsg 需 downloadCode 上传流（端点未确认），暂 NotImplementedError fail-closed，真实凭据冒烟时验证。

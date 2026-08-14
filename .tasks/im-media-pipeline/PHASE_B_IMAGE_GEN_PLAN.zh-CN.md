@@ -1,6 +1,6 @@
 # Phase B 生图能力实施方案（image_gen）
 
-> 状态：**方案定稿（2026-08-14）→ 二轮 fresh-context 审查：需修改后批准（无阻断，4 重要已回写，见 §9.6）**。首轮审查已回写；用户拍板 **D1：直连形态先行，托管为终态设计延后实施**（双形态统一设计，一份客户端代码，见 §3.2/§9.5）。二轮审查提示词：`PHASE_B_IMAGE_GEN_PLAN.REVIEW2_PROMPT.zh-CN.md`。
+> 状态：**已实施完成（2026-08-14，commit 2175b15 / 5870cc5 / 46e81b4）——直连形态 + 托管形态（Step 3）双形态全部落地**。历史：方案定稿 → 二轮 fresh-context 审查通过（§9.6）→ 用户拍板 D1（直连先行，托管为终态设计）→ 2026-08-14 同日完成 v1 直连 + 托管全链路实施。实施记录见 §9.7。二轮审查提示词：`PHASE_B_IMAGE_GEN_PLAN.REVIEW2_PROMPT.zh-CN.md`。
 > 设计真值：`tenant_platform/docs/IM_MEDIA_ARCHITECTURE.zh-CN.md` §6（本方案定案后回写升级）。
 > 任务真值：`SUBTASKS.csv` T8（本方案二轮审查通过后拆分落地）。
 
@@ -31,8 +31,8 @@
 | `.../llmproxy/handler.go` | `handleImageGenerations`：复用 `handleProviderPath` 能力校验/预算/白名单流程，operation 校验 `llm.image` |
 | `.../llmproxy/target.go` | `nativeEndpoint` 路径映射加 `images/generations` case（target.go:31-70；egress 白名单是 host/CIDR 级，network_policy.go，无 path 级） |
 | `.../application/worker_credential.go` | `Operation: "llm.chat"` 硬编码 → 按 capability 类型扩展 `llm.image`（影响面扫描已确认：`llm.chat` 仅 3 处 Go 内，worker-python 零引用） |
-| `contracts/policy/foundation.v1.json` | **终态实施时**：`foundation.session-files.v1` 的 allowed_tools 补 `image_gen`。**v1 定稿有意不启用平台模式生图**（policy 保持 deny-by-default 现状 = 平台沙箱模型看不到该工具，无死工具暴露）；托管形态实施时随 policy 一起放行（过滤机制：legacy_instrument.py:93-120） |
-| `.../application/runtime_config.go` | **终态（托管实施时）**：向 `mykey.runtime.json` 写 `image_gen` 块（apibase=proxy/v1 + llm.image capability token），且**不进 chat mixin**（runtime_config.go:146-148 现有 >1 provider 自动写 mixin_config 逻辑）。v1 不实施 |
+| `contracts/policy/foundation.v1.json` | **已实施（5870cc5）**：`foundation.session-files.v1` 的 allowed_tools 已补 `image_gen`（foundation.v1.json:22），平台沙箱模型可见该工具（过滤机制：legacy_instrument.py:93-120） |
+| `.../application/runtime_config.go` | **已实施（5870cc5）**：image 能力 binding 向 `mykey.runtime.json` 写 `image_gen` 块（apibase=proxy/v1 + llm.image capability token），**不进 chat mixin**（runtime_config.go:145-163；mixin 写入 :173-174；至少一个 chat provider 校验 :176-180） |
 | 契约/文档 | capability 枚举说明 + 安全审查（JTI 预算、**响应体大小上限**——`MaxWorkerRequestBytes` 仅限请求体 handler.go:19-20，响应无上限；`DisableCompression: true` transport.go:117 大 JSON 原样传输） |
 | 部署 | ga-runner 镜像内嵌 `ga.py`/`llmcore.py`/`assets/tools_schema.json`（runtime_overlay.py:16-29）——**Step 2 上生产也必须 `make build` 重建 ga-runner**（非仅 Step 3） |
 
@@ -40,7 +40,7 @@
 
 - `agent_loop.py` 核心循环：零改动（工具化原则，dispatch 泛化 agent_loop.py:18-31）
 - Phase A 交付链路（delivery spool / send_media）：零改动（`[FILE:]` marker 已打通：Go `captureTaskDeliverableFiles` delivery_capture.go:55+ / `RecordOutbound` 强制 `outputs/` 前缀 session_files.go:368-370 / 根前端按 `<repo>/temp` 解析 wechatapp.py:132）
-- web / worker-python / proto：**无契约变更**（llm-proxy 是 HTTP 实现，无 proto；Operation 枚举仅 Go 内部）。托管形态（终态）实施时，openapi 的 llm-providers 模型与 web 表单必改——届时撤销本条
+- web / worker-python / proto：**无 proto 契约变更**（llm-proxy 是 HTTP 实现；Operation 枚举仅 Go 内部）。托管形态已实施：openapi `LLMProviderCapability` + capabilities 字段 + web 表单复选框已同步（46e81b4）
 
 ## 3. 改动前后架构设计
 
@@ -83,14 +83,14 @@ llm-proxy: /v1/chat/completions | /v1/responses | /v1/messages（仅 chat，单�
 
 **双形态设计（定稿）**：`ImageGenClient` 只认 `apibase/apikey/model` 配置——**直连/托管是配置差异而非两套实现**（对齐 `BaseSession` 先例：chat 直连与平台托管共用一份代码）：
 - **直连形态（v1 实施）**：apibase = 真实上游（api.openai.com 或中转网关），apikey = 真实密钥。适用本地/自用/loopback 开发。
-- **托管形态（终态，v1 不实施）**：apibase = llm-proxy，apikey = `llm.image` capability token。适用生产 IM 沙箱（密钥不进沙箱是安全硬原则）。GA 客户端协议代码零改动，仅配置下发方式不同；**但 worker 侧需补 marker 交付兜底**（见 §9.6 I-2：export_docx 有 generated_output_files 登记，image_gen 终态实施时需同款登记，否则模型最终回复忘回显 marker 则交付静默丢失）
+- **托管形态（已实施，2026-08-14，Step 3）**：apibase = llm-proxy，apikey = `llm.image` capability token。适用生产 IM 沙箱（密钥不进沙箱是安全硬原则）。GA 客户端协议代码零改动，仅配置下发方式不同（平台 runtime_config 下发 image_gen 块）；**worker 侧 marker 交付兜底已补**（§9.6 I-2 落地：`install_image_gen_marker_registry` 登记 generated_output_files，终态 append_missing_file_markers 自动补写漏回显 marker）
 
 ### 3.3 配置模型（mykey.py，与 chat 完全独立）
 
 ```python
 image_gen = {
     'name': 'openai',            # resolve_image_gen 分派关键字（v1: openai/oai）
-    'apibase': 'https://api.openai.com/v1',   # 直连形态：真实上游/中转网关；托管形态（终态）：llm-proxy 地址 + 能力令牌，GA 侧零改动
+    'apibase': 'https://api.openai.com/v1',   # 直连形态：真实上游/中转网关；托管形态（已实施）：llm-proxy 地址 + 能力令牌（平台下发），GA 侧零改动
     'apikey': 'sk-...',
     'model': 'gpt-image-1',      # 独立生图模型，与对话模型无关
     'stream': False,             # 可选：gpt-image 系列 SSE 渐进细化（见 §6.5 降级语义）
@@ -194,17 +194,17 @@ image_gen = {
 |---|---|---|---|---|
 | **1. 定案** | **D1 已拍板（2026-08-14：直连先行，托管为终态设计）**；二轮审查通过 → 回写 IM_MEDIA_ARCHITECTURE **§6 + §9/§10/§11**（B1–B5 勾选、§9 生图行、§10 Phase B 行、§11 残余风险行）→ SUBTASKS T8 拆分 | 文档更新 + SUBTASKS.csv | 二轮文档评审 | 0.5 天 |
 | **2. GA 侧 MVP** | `do_image_gen` + `BaseImageGenClient`/`OpenAIImageGenClient`（同步 + 流式路径）+ `resolve_image_gen` + schema ×2 + mykey 模板 + 单测（含未配置/空响应/超限/流式中断路径） | 代码 + `test_image_gen.py` | `python -m pytest tests -q` + **本地 CLI 闭环**（配置真实/中转 key → 让 GA 生图 → `outputs/` 出图） | 1 天 |
-| **3. 平台集成（终态设计，v1 不实施）** | llm-proxy `/v1/images/generations` 路由 + `llm.image` capability + **provider 能力类型维度（chat/image）** + 生图 provider 排除 chat mixin + runtime_config 下发 image_gen 块 + policy 放行 + openapi/web 同步 | 设计已定稿（§3.2/§8）；Go 代码实施时补 | 实施时：`go vet/build/test ./...` + 契约绑定测试 | 2–3 天（延后，有真实需求时实施） |
+| **3. 平台集成（已实施，2026-08-14，commit 5870cc5/46e81b4）** | llm-proxy `/v1/images/generations` 路由 + `llm.image` capability + **provider 能力类型维度（chat/image）** + 生图 provider 排除 chat mixin + runtime_config 下发 image_gen 块 + policy 放行 + openapi/web 同步 + worker marker 兜底登记 | 设计已定稿（§3.2/§8）→ 2026-08-14 实施 | `go vet/build/test ./...` + 契约绑定测试 + worker 146 + web build 全绿 | 已实施（含审查 W3-W6 修复） |
 
 残余风险：IM 端到端收图冒烟需真实渠道凭据（QQ/飞书已配置）；**Step 2 上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json，runtime_overlay.py:16-29），Step 3 需平台部署（make build 全量重建）；流式路径（`stream:true` + `partial_images` SSE）以 OpenAI/Azure 文档为据，社区有稳定性波动报告——同步路径恒可用，流式标"待真实上游实测"（2026-08-14 实测保持 stream=False 走同步）；**gpt-image 参数兼容性已实测（2026-08-14 new-api 中转）**：size 必传（客户端已默认 1024x1024）、gpt-image-2/gemini-*-image 返回 b64_json、**sensenova/agnes 只回 url 直链（客户端已加直下兜底）**、sensenova size 合法集特殊（错误文本引导自愈）、n>1 未实测（保持 n≤4 透传+错误诚实）；**marker 回显依赖**（工具返回 marker ≠ 交付发生，模型须在最终回复回显 marker 才触发交付；根项目无兜底，托管兜底终态补 generated_output_files 登记仿 do_export_docx legacy_instrument.py:233）；**直连形态无 JTI 计量**——成本靠 n≤4 + 用户自觉（gpt-image token 计费，usage 日志留作后续计量基础，二轮审查盲区 4）。
 
 ## 8. 决策记录（B1–B5）
 
-- [ ] B1：生图 = GA 工具 `image_gen`（schema §3.4），核心循环零侵入
-- [ ] B2：llm-proxy 扩展 `POST /v1/images/generations` 代理（Step 3，capability `llm.image`）
-- [ ] B3：`ImageGenClient` 多协议骨架，OpenAI 兼容协议第一实现；独立 apibase/apikey/model 配置
-- [ ] B4：产物落 `outputs/` + `[FILE:]` 走既有出站链路
-- [ ] B5：流式 = 客户端内部可选路径（`stream:true` + `partial_images` SSE，取最终帧），工具层透明；同步路径恒可用
+- [x] B1（2026-08-14 已实施，2175b15）：生图 = GA 工具 `image_gen`（schema §3.4），核心循环零侵入
+- [x] B2（2026-08-14 已实施，5870cc5）：llm-proxy 扩展 `POST /v1/images/generations` 代理（Step 3，capability `llm.image`）
+- [x] B3（2026-08-14 已实施，2175b15）：`ImageGenClient` 多协议骨架，OpenAI 兼容协议第一实现；独立 apibase/apikey/model 配置
+- [x] B4（2026-08-14 已实施，2175b15）：产物落 `outputs/` + `[FILE:]` 走既有出站链路
+- [x] B5（2026-08-14 已实施，2175b15）：流式 = 客户端内部可选路径（`stream:true` + `partial_images` SSE，取最终帧），工具层透明；同步路径恒可用（待真实上游实测）
 - [x] **D1（2026-08-14 用户拍板：直连先行，托管为终态设计）**：v1 实施直连形态（ImageGenClient 双形态设计——一份代码，配置决定形态，§3.2）；托管形态（llm-proxy 路由 + `llm.image` capability + **provider 能力类型维度（chat/image）** + 排除 chat mixin + runtime_config 下发 image_gen 块 + policy 放行 + openapi/web 同步）作为终态设计定稿，**有真实需求时实施**（与 T8 "可推迟"定位一致）。
 
 ---
@@ -251,7 +251,7 @@ image_gen = {
 
 ### 9.5 定稿记录（2026-08-14 用户拍板）
 
-- **D1 定稿：直连形态先行，托管为终态设计**（v1 实施 §7 Step 2；§7 Step 3 转为"终态设计，有真实需求时实施"）。
+- **D1 定稿：直连形态先行，托管为终态设计**（v1 实施 §7 Step 2；§7 Step 3 转为"终态设计，有真实需求时实施"）。**实施注记（2026-08-14 当日）**：直连形态与托管形态在 D1 定稿后同日先后实施完成（v1 直连 2175b15 → 托管 5870cc5/46e81b4），D1"托管按需实施"的延后判断被实际需求（多租户平台）取代——本记录保留决策历史。
 - 双形态设计原则写入 §3.2：`ImageGenClient` 只认 apibase/apikey/model 配置，直连/托管是配置差异（对齐 BaseSession 先例），GA 侧永远一份工具代码。
 - 平台模式 v1 **有意不可用生图**：policy 保持 deny-by-default（不补 image_gen），沙箱模型看不到该工具，无死工具暴露；托管形态实施时随 policy 放行。
 - 首轮阻断项 B-1/B-2 状态：已定稿处理（见 §9.1 处理列）。
@@ -269,3 +269,21 @@ image_gen = {
 | I-4 | 错误文本 `!!!Error:`/`[Error:` 混用：`!!!Error:` 在模型最终回复尾部触发 do_no_tool 致命判定/LLM_FAILED（ga.py:727-728），工具层先例是 `[Error]`（do_code_run ga.py:552） | ga.py:727-728 | 已回写 §6.5：统一 `[Error: image_gen ...]`；"复用 _stream_with_retry"改"仿写其重试语义" |
 
 建议项（已记录，实施时处理）：行号引用修正（transport.go:117、runtime_config.go:146-148——已改正文）；health-cleanup D-C 黑盒豁免说明（改 ga.py/tools_schema 属本项目设计明确需要，提交 PR 时说明）；PROGRESS.md 纳入 Step 1 交付物；输出文件名唯一性（`<base>_<ts>_<i>`）；tui_v3 `_XML_TOOL_RE` 白名单补 image_gen（tui_v3.py:1676-1687，历史回放折叠用）；tools_schema_cn.json 双文件漂移说明（model_cmd.py:66 会加载 cn 版）；mykey_template 头部速查表补 image_gen（非 Session、不进 mixin、不进 /llms）；直连形态成本失控取舍补入 §6.4。
+
+---
+
+## 9.7 实施记录（2026-08-14，实施完成后回写）
+
+> 本节记录实施完成态，避免后人将本方案误读为未实施。审查结论可采信但
+> 实施后须以本节 + 当前代码为准。
+
+| 提交 | 内容 |
+|---|---|
+| `2175b15` | **v1 直连形态**：llmcore `BaseImageGenClient`/`OpenAIImageGenClient`/`resolve_image_gen`（进 llmcore.py，严禁新模块）+ ga.py `do_image_gen`（第 10 原子工具）+ tools_schema ×2 + mykey 模板 + tui_v3 白名单 + 30 单测 + 真实 key 闭环（new-api 中转 5 模型实测：size 必传 / gpt-image 恒 b64_json / sensenova-agnes 只回 url 直链→客户端 url 直下兜底） |
+| `5870cc5` | **托管形态（Step 3）**：migration 0058 capabilities 列（省略=[chat]）+ store/api 校验 + llm-proxy images/generations 路由（OperationChat/OperationImage 参数化，错配 401）+ 生图响应 32MiB 上限 + worker_credential 按能力签发双 token + runtime_config image_gen 块（不进 chat mixin）+ policy 放行 |
+| `46e81b4` | **托管形态收尾**：worker `install_image_gen_marker_registry`（marker 兜底登记，I-2）+ openapi `LLMProviderCapability` + web 表单复选框 + api revision bump + 文档回写 |
+| 审查修复（本次独立审查后） | **W3**：32MiB 上限双闸（HasSuffix 路径判断 + chunked 流式计数 guard）；**W6**：至少一个 chat provider 校验 + 双能力 provider 按 (ID, 能力) 去重（真实 bug：原按 ID 去重使双能力 provider runtime config 必然失败）；**S1**：migration 0059 DB CHECK 约束；**S4**：双能力双 token 签发测试；**S9/S10**：重试对齐 + output_format 防御；**W4/W5**：schema model 参数托管语义注明 + web 表单提示；文档清理（§2/§3.2/§7/§8/§9.5 过时表述 + §9.7） |
+
+**验证基线（实施 + 审查修复后）**：根 pytest 78（含 test_image_gen 30）、worker 146+1skip、Go 全量（llmproxy/application/postgres/api）+ race、契约 41、web lint/build 全绿。
+
+**残余风险（截至审查修复）**：IM 端到端收图冒烟需真实渠道凭据 + `make build` 全量重建；流式 SSE 待真实上游实测（保持 stream=False）；钉钉/企微上传端点待凭据实测。
