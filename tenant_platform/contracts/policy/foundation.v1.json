@@ -19,6 +19,7 @@
       "export_docx",
       "sophub_search",
       "sophub_install",
+      "image_gen",
       "mcp:*"
      ]
     }

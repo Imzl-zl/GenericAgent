@@ -306,3 +306,155 @@ func TestWriteRuntimeConfigAtomicGroupReadableMode(t *testing.T) {
 		t.Fatalf("runtime config mode %o must be group-readable (0640)", got)
 	}
 }
+
+// ─────────────────── Phase B 托管形态: image_gen 块下发(2026-08-14) ───────────────────
+
+func imageProvider(id int64) domain.LLMProvider {
+	return domain.LLMProvider{
+		ID: id, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-image-2",
+		Capabilities: []domain.ProviderCapability{domain.ProviderCapabilityImage},
+	}
+}
+
+// TestBuildRuntimeConfigImageGenBlock: image 能力 binding 写 image_gen 块、
+// 不进 mixin; chat binding 保持 session 变量 + mixin。
+func TestBuildRuntimeConfigImageGenBlock(t *testing.T) {
+	chat := domain.LLMProvider{
+		ID: 1, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "gpt-test",
+	}
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL:      "http://127.0.0.1:8081",
+		RoutingSnapshotID: "snapshot-img",
+		Providers: []RuntimeProviderBinding{
+			{Provider: chat, Token: "chat-token", Capability: domain.ProviderCapabilityChat},
+			{Provider: imageProvider(9), Token: "image-token", Capability: domain.ProviderCapabilityImage},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(files.JSON, &document); err != nil {
+		t.Fatal(err)
+	}
+	img, ok := document["image_gen"].(map[string]any)
+	if !ok {
+		t.Fatalf("image_gen block missing: %s", files.JSON)
+	}
+	if img["apikey"] != "image-token" || img["model"] != "gpt-image-2" {
+		t.Fatalf("image_gen = %v", img)
+	}
+	if img["apibase"] != "http://127.0.0.1:8081/v1" {
+		t.Fatalf("image_gen apibase = %v", img)
+	}
+	if img["stream"] != false {
+		t.Fatalf("image_gen stream = %v, want false", img["stream"])
+	}
+	// image provider 不进 chat session 变量; 单 chat provider 时不写 mixin,
+	// 多 chat 时 mixin 也绝不含 image provider。
+	if _, exists := document["platform_native_oai_provider_9_config"]; exists {
+		t.Fatal("image provider must not produce a chat session variable")
+	}
+	if mixin, hasMixin := document["mixin_config"].(map[string]any); hasMixin {
+		for _, name := range mixin["llm_nos"].([]any) {
+			if name == "provider-9" {
+				t.Fatal("image provider must not join chat mixin")
+			}
+		}
+	}
+}
+
+// TestBuildRuntimeConfigImageBlockCompatibleWithGA: 下发的 image_gen 块能被
+// 真实 GA(llmcore.resolve_image_gen)直接消费——子进程加载 runtime 配置
+// 目录的 mykey loader, 与 chat 探针(runActualGAConfigProbe)同模式。
+func TestBuildRuntimeConfigImageBlockCompatibleWithGA(t *testing.T) {
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL:      "http://127.0.0.1:8081",
+		RoutingSnapshotID: "snapshot-img2",
+		Providers: []RuntimeProviderBinding{
+			{Provider: imageProvider(3), Token: "image-token", Capability: domain.ProviderCapabilityImage},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDir := t.TempDir()
+	if err := WriteRuntimeConfigAtomic(configDir, files); err != nil {
+		t.Fatal(err)
+	}
+	python, err := exec.LookPath("python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", ".."))
+	script := `
+import importlib
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(1, sys.argv[2])
+importlib.import_module("mykey")
+llmcore = importlib.import_module("llmcore")
+client = llmcore.resolve_image_gen("image_gen")
+print(json.dumps({"class_name": client.__class__.__name__, "model": client.model, "stream": client.stream, "api_base": client.api_base}))
+`
+	output, err := exec.Command(python, "-c", script, configDir, repoRoot).CombinedOutput()
+	if err != nil {
+		t.Fatalf("GA image_gen probe failed: %v\n%s", err, output)
+	}
+	lines := bytes.Split(bytes.TrimSpace(output), []byte{'\n'})
+	var probe struct {
+		ClassName string `json:"class_name"`
+		Model     string `json:"model"`
+		Stream    bool   `json:"stream"`
+		APIBase   string `json:"api_base"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(lines[len(lines)-1]), &probe); err != nil {
+		t.Fatalf("decode GA probe %q: %v", output, err)
+	}
+	if probe.ClassName != "OpenAIImageGenClient" || probe.Model != "gpt-image-2" || probe.Stream || probe.APIBase != "http://127.0.0.1:8081/v1" {
+		t.Fatalf("GA image_gen probe = %+v", probe)
+	}
+}
+
+// TestBuildRuntimeConfigRejectsMultipleImageProviders: 多 image provider
+// v1 不支持 → fail-closed。
+func TestBuildRuntimeConfigRejectsMultipleImageProviders(t *testing.T) {
+	_, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL:      "http://127.0.0.1:8081",
+		RoutingSnapshotID: "snapshot-multi-img",
+		Providers: []RuntimeProviderBinding{
+			{Provider: imageProvider(1), Token: "t1", Capability: domain.ProviderCapabilityImage},
+			{Provider: imageProvider(2), Token: "t2", Capability: domain.ProviderCapabilityImage},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for multiple image providers")
+	}
+}
+
+// TestBuildRuntimeConfigImageBlockAutoByProviderCapability: binding 未显式
+// 标 Capability 时按 provider.HasCapability(image) 自动归类(兼容存量构造)。
+func TestBuildRuntimeConfigImageBlockAutoByProviderCapability(t *testing.T) {
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL:      "http://127.0.0.1:8081",
+		RoutingSnapshotID: "snapshot-auto",
+		Providers: []RuntimeProviderBinding{
+			{Provider: imageProvider(5), Token: "image-token"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(files.JSON, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := document["image_gen"]; !ok {
+		t.Fatalf("image_gen block missing: %s", files.JSON)
+	}
+}

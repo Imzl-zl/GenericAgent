@@ -378,3 +378,95 @@ func TestParseBudgetMaxTurns(t *testing.T) {
 		}
 	}
 }
+
+// ─────────────────── Phase B 托管形态: 生图路由(2026-08-14) ───────────────────
+
+func imageCapabilitySpec(sessionKey string) CapabilitySpec {
+	spec := handlerCapabilitySpec(sessionKey)
+	spec.Operation = OperationImage
+	return spec
+}
+
+func doImageRequest(t *testing.T, srv *Server, token, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// TestHandlerImageGenerationsValidToken: llm.image 能力 token 打生图路由 →
+// 转发到上游 images/generations, 鉴权头注入正确。
+func TestHandlerImageGenerationsValidToken(t *testing.T) {
+	upstreamBody := `{"data":[{"b64_json":"aGVsbG8="}]}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/images/generations" {
+			t.Errorf("upstream path = %q, want /v1/images/generations", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+testUpstreamKey {
+			t.Errorf("upstream auth = %q", r.Header.Get("Authorization"))
+		}
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	srv := newTestServer(t, upstream)
+	token := issueHandlerToken(t, imageCapabilitySpec("personal:42"))
+	rec := doImageRequest(t, srv, token, `{"model":"gpt-test","prompt":"a cat","n":1,"size":"1024x1024"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestHandlerImageGenerationsRejectsChatToken: llm.chat 能力 token 打生图路由
+// → 401 CAPABILITY_INVALID(操作维度不匹配, deny-by-default)。
+func TestHandlerImageGenerationsRejectsChatToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("upstream must not be reached for chat token on image route")
+	}))
+	defer upstream.Close()
+
+	srv := newTestServer(t, upstream)
+	token := issueHandlerToken(t, handlerCapabilitySpec("personal:1"))
+	rec := doImageRequest(t, srv, token, `{"model":"gpt-test","prompt":"x"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+// TestHandlerChatRejectsImageToken: llm.image 能力 token 打 chat 路由 → 401。
+func TestHandlerChatRejectsImageToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("upstream must not be reached for image token on chat route")
+	}))
+	defer upstream.Close()
+
+	srv := newTestServer(t, upstream)
+	token := issueHandlerToken(t, imageCapabilitySpec("personal:1"))
+	rec := doChatRequest(t, srv, token)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+// TestHandlerImageGenerationsAliasPath: 无 /v1 前缀别名也路由到生图。
+func TestHandlerImageGenerationsAliasPath(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+
+	srv := newTestServer(t, upstream)
+	token := issueHandlerToken(t, imageCapabilitySpec("personal:1"))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/images/generations", strings.NewReader(`{"model":"gpt-test","prompt":"x"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}

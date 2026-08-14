@@ -13,19 +13,35 @@ import (
 )
 
 type routingProvider struct {
-	ID            int64                  `json:"id"`
-	Revision      int64                  `json:"revision"`
-	ProviderType  domain.LLMProviderType `json:"provider_type"`
-	Model         string                 `json:"model"`
-	RuntimeName   string                 `json:"runtime_name"`
-	SessionConfig domain.GASessionConfig `json:"session_config"`
+	ID            int64                    `json:"id"`
+	Revision      int64                    `json:"revision"`
+	ProviderType  domain.LLMProviderType   `json:"provider_type"`
+	Model         string                   `json:"model"`
+	RuntimeName   string                   `json:"runtime_name"`
+	SessionConfig domain.GASessionConfig    `json:"session_config"`
+	Capabilities  []domain.ProviderCapability `json:"capabilities"`
 }
 
 func (p routingProvider) runtimeProvider() domain.LLMProvider {
 	return domain.LLMProvider{
 		ID: p.ID, Revision: p.Revision, ProviderType: p.ProviderType,
 		Model: p.Model, SessionConfig: p.SessionConfig, State: "active",
+		Capabilities: p.Capabilities,
 	}
+}
+
+// HasCapability 判断该路由 provider 是否具备某能力维度(省略 = chat)。
+func (p routingProvider) HasCapability(c domain.ProviderCapability) bool {
+	caps := p.Capabilities
+	if len(caps) == 0 {
+		caps = []domain.ProviderCapability{domain.ProviderCapabilityChat}
+	}
+	for _, have := range caps {
+		if have == c {
+			return true
+		}
+	}
+	return false
 }
 
 type routingSnapshot struct {
@@ -82,6 +98,7 @@ func newRoutingProvider(provider domain.LLMProvider) routingProvider {
 		ID: provider.ID, Revision: provider.Revision, ProviderType: provider.ProviderType,
 		Model: provider.Model, RuntimeName: runtimeProviderName(provider.ID),
 		SessionConfig: provider.SessionConfig,
+		Capabilities:  provider.Capabilities,
 	}
 }
 

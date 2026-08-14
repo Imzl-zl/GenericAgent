@@ -27,9 +27,13 @@ globals().update(_config)
 del _config
 `
 
+// RuntimeProviderBinding 是单个 provider × 能力维度的运行时绑定: chat 能力
+// 写 session 变量(进 mixin), image 能力写 image_gen 块(不进 mixin)。
 type RuntimeProviderBinding struct {
 	Provider domain.LLMProvider
 	Token    string
+	// Capability 该 binding 对应的能力维度(chat|image)。
+	Capability domain.ProviderCapability
 }
 
 type RuntimeMCPServer struct {
@@ -125,6 +129,7 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 	}
 	seen := make(map[int64]struct{}, len(input.Providers))
 	mixinNames := make([]string, 0, len(input.Providers))
+	imageBound := false
 	for _, binding := range input.Providers {
 		provider := binding.Provider
 		if _, exists := seen[provider.ID]; exists {
@@ -133,6 +138,28 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 		seen[provider.ID] = struct{}{}
 		if err := validateRuntimeBinding(binding); err != nil {
 			return RuntimeConfigFiles{}, err
+		}
+		// Phase B 托管形态(2026-08-14 定稿): image 能力 binding 写 image_gen
+		// 块(GA resolve_image_gen 读取), **不进 chat mixin**——生图是角色
+		// 分离不是同能力故障转移。v1 只支持单 image provider(fail-closed)。
+		if binding.Capability == domain.ProviderCapabilityImage ||
+			(binding.Capability == "" && provider.HasCapability(domain.ProviderCapabilityImage)) {
+			if imageBound {
+				return RuntimeConfigFiles{}, fmt.Errorf("multiple image-capable providers are not supported yet")
+			}
+			if provider.ProviderType != domain.ProviderNativeOAI {
+				return RuntimeConfigFiles{}, fmt.Errorf("image capability requires native_oai provider")
+			}
+			document["image_gen"] = map[string]any{
+				"name":       "openai",
+				"apibase":    strings.TrimRight(proxyBase.String(), "/") + "/v1",
+				"apikey":     binding.Token,
+				"model":      provider.Model,
+				"stream":     false,
+				"max_retries": 2,
+			}
+			imageBound = true
+			continue
 		}
 		variableName := runtimeProviderVariable(provider)
 		runtimeName := runtimeProviderName(provider.ID)

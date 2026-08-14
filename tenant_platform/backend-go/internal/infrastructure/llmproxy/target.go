@@ -67,6 +67,8 @@ func nativeEndpoint(providerType domain.LLMProviderType, inboundPath string) (st
 			return "chat/completions", nil
 		case "/v1/responses", "/responses":
 			return "responses", nil
+		case "/v1/images/generations", "/images/generations":
+			return "images/generations", nil
 		}
 	case domain.ProviderNativeClaude:
 		if path == "/v1/messages" || path == "/messages" {

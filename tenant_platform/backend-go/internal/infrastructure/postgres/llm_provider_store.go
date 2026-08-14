@@ -14,14 +14,14 @@ import (
 
 const providerColumns = `id, name, provider_type, base_url, model,
 api_key_ciphertext, api_key_key_version, session_config, transport_config,
-revision, is_default, state, created_at, updated_at`
+capabilities, revision, is_default, state, created_at, updated_at`
 
 func (s *Store) CreateProvider(ctx context.Context, input domain.LLMProviderCreate) (domain.LLMProvider, error) {
 	input.TransportConfig = normalizeTransportConfig(input.TransportConfig)
 	if err := validateProviderCreate(input, true); err != nil {
 		return domain.LLMProvider{}, err
 	}
-	sessionJSON, transportJSON, err := marshalProviderConfigs(input)
+	sessionJSON, transportJSON, capabilitiesJSON, err := marshalProviderConfigs(input)
 	if err != nil {
 		return domain.LLMProvider{}, err
 	}
@@ -34,13 +34,13 @@ func (s *Store) CreateProvider(ctx context.Context, input domain.LLMProviderCrea
 		}
 		query := `INSERT INTO llm_providers (
 			name, provider_type, base_url, model, api_key_ciphertext,
-			api_key_key_version, session_config, transport_config, is_default
-		) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)
+			api_key_key_version, session_config, transport_config, capabilities, is_default
+		) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10)
 		RETURNING ` + providerColumns
 		return scanProvider(tx.QueryRow(ctx, query,
 			input.Name, string(input.ProviderType), input.BaseURL, input.Model,
 			input.APIKeyCiphertext, input.APIKeyKeyVersion,
-			string(sessionJSON), string(transportJSON), count == 0,
+			string(sessionJSON), string(transportJSON), string(capabilitiesJSON), count == 0,
 		), &provider)
 	})
 	return provider, err
@@ -90,7 +90,7 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, input domain.LLMPr
 	if err := validateProviderCreate(input.LLMProviderCreate, input.RotateAPIKey); err != nil {
 		return domain.LLMProvider{}, err
 	}
-	sessionJSON, transportJSON, err := marshalProviderConfigs(input.LLMProviderCreate)
+	sessionJSON, transportJSON, capabilitiesJSON, err := marshalProviderConfigs(input.LLMProviderCreate)
 	if err != nil {
 		return domain.LLMProvider{}, err
 	}
@@ -104,12 +104,14 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, input domain.LLMPr
 		api_key_key_version = CASE WHEN $6 THEN $8 ELSE api_key_key_version END,
 		session_config = $9::jsonb,
 		transport_config = $10::jsonb,
+		capabilities = $11::jsonb,
 		revision = revision + CASE WHEN
 			provider_type IS DISTINCT FROM $3 OR
 			base_url IS DISTINCT FROM $4 OR
 			model IS DISTINCT FROM $5 OR
 			session_config IS DISTINCT FROM $9::jsonb OR
-			transport_config IS DISTINCT FROM $10::jsonb
+			transport_config IS DISTINCT FROM $10::jsonb OR
+			capabilities IS DISTINCT FROM $11::jsonb
 		THEN 1 ELSE 0 END,
 		updated_at = NOW()
 	WHERE id = $1
@@ -119,7 +121,7 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, input domain.LLMPr
 	err = scanProvider(s.pool.QueryRow(ctx, query,
 		id, input.Name, string(input.ProviderType), input.BaseURL, input.Model,
 		input.RotateAPIKey, input.APIKeyCiphertext, input.APIKeyKeyVersion,
-		string(sessionJSON), string(transportJSON),
+		string(sessionJSON), string(transportJSON), string(capabilitiesJSON),
 	), &provider)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.LLMProvider{}, domain.ErrProviderNotFound
@@ -215,6 +217,25 @@ func validateProviderCreate(input domain.LLMProviderCreate, requireKey bool) err
 	if err := input.TransportConfig.Validate(); err != nil {
 		return fmt.Errorf("transport config: %w", err)
 	}
+	// 能力维度校验(0058): 空 = [chat](存量兼容); 元素合法、无重复、
+	// native_claude 仅 chat。
+	seen := map[domain.ProviderCapability]bool{}
+	for _, cap := range input.Capabilities {
+		if !domain.ValidProviderCapability(cap) {
+			return fmt.Errorf("invalid capability %q (valid: chat, image)", cap)
+		}
+		if seen[cap] {
+			return fmt.Errorf("duplicate capability %q", cap)
+		}
+		seen[cap] = true
+	}
+	if input.ProviderType == domain.ProviderNativeClaude {
+		for _, cap := range input.Capabilities {
+			if cap == domain.ProviderCapabilityImage {
+				return fmt.Errorf("image capability is only supported by native_oai providers")
+			}
+		}
+	}
 	return nil
 }
 
@@ -225,23 +246,33 @@ func normalizeTransportConfig(config domain.ProviderTransportConfig) domain.Prov
 	return config
 }
 
-func marshalProviderConfigs(input domain.LLMProviderCreate) ([]byte, []byte, error) {
+func marshalProviderConfigs(input domain.LLMProviderCreate) ([]byte, []byte, []byte, error) {
 	sessionJSON, err := json.Marshal(input.SessionConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("marshal session config: %w", err)
+		return nil, nil, nil, fmt.Errorf("marshal session config: %w", err)
 	}
 	transportJSON, err := json.Marshal(input.TransportConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("marshal transport config: %w", err)
+		return nil, nil, nil, fmt.Errorf("marshal transport config: %w", err)
 	}
-	return sessionJSON, transportJSON, nil
+	// 省略 = [chat] 由 DB 默认值兜底, 但显式序列化保持读写一致。
+	caps := input.Capabilities
+	if len(caps) == 0 {
+		caps = []domain.ProviderCapability{domain.ProviderCapabilityChat}
+	}
+	capabilitiesJSON, err := json.Marshal(caps)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("marshal capabilities: %w", err)
+	}
+	return sessionJSON, transportJSON, capabilitiesJSON, nil
 }
 
 func scanProvider(row pgx.Row, provider *domain.LLMProvider) error {
-	var sessionJSON, transportJSON []byte
+	var sessionJSON, transportJSON, capabilitiesJSON []byte
 	err := row.Scan(
 		&provider.ID, &provider.Name, &provider.ProviderType, &provider.BaseURL, &provider.Model,
 		&provider.APIKeyCiphertext, &provider.APIKeyKeyVersion, &sessionJSON, &transportJSON,
+		&capabilitiesJSON,
 		&provider.Revision, &provider.IsDefault, &provider.State,
 		&provider.CreatedAt, &provider.UpdatedAt,
 	)
@@ -253,6 +284,11 @@ func scanProvider(row pgx.Row, provider *domain.LLMProvider) error {
 	}
 	if err := json.Unmarshal(transportJSON, &provider.TransportConfig); err != nil {
 		return fmt.Errorf("unmarshal transport config: %w", err)
+	}
+	if len(capabilitiesJSON) > 0 {
+		if err := json.Unmarshal(capabilitiesJSON, &provider.Capabilities); err != nil {
+			return fmt.Errorf("unmarshal capabilities: %w", err)
+		}
 	}
 	return nil
 }

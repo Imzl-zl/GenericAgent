@@ -262,3 +262,93 @@ func providerCreate(name string) domain.LLMProviderCreate {
 		TransportConfig:  domain.ProviderTransportConfig{AuthMode: domain.ProviderAuthAuto},
 	}
 }
+
+// ─────────────────── Phase B 托管形态: 能力维度(0058, 2026-08-14) ───────────────────
+
+// TestLLMProviderCapabilitiesRoundTrip: capabilities 读写闭环 + 省略默认 chat。
+func TestLLMProviderCapabilitiesRoundTrip(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// 省略 = [chat](存量兼容)
+	created, err := store.CreateProvider(ctx, domain.LLMProviderCreate{
+		Name: "img", ProviderType: domain.ProviderNativeOAI,
+		BaseURL: "https://newapi.example.com/v1", Model: "gpt-image-2",
+		APIKeyCiphertext: []byte("cipher"), APIKeyKeyVersion: "1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetProvider(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 省略 = [chat]: marshalProviderConfigs 显式归一化落库, 读回无歧义。
+	if len(got.Capabilities) != 1 || got.Capabilities[0] != domain.ProviderCapabilityChat {
+		t.Fatalf("capabilities = %v, want [chat] for omitted", got.Capabilities)
+	}
+	if !got.HasCapability(domain.ProviderCapabilityChat) {
+		t.Fatal("HasCapability(chat) = false, want true for default")
+	}
+
+	// 显式 image 能力 → 读回一致
+	upd, err := store.UpdateProvider(ctx, created.ID, domain.LLMProviderUpdate{
+		LLMProviderCreate: domain.LLMProviderCreate{
+			Name: "img", ProviderType: domain.ProviderNativeOAI,
+			BaseURL: "https://newapi.example.com/v1", Model: "gpt-image-2",
+			APIKeyCiphertext: []byte("cipher"), APIKeyKeyVersion: "1",
+			Capabilities: []domain.ProviderCapability{domain.ProviderCapabilityImage},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upd.Revision != created.Revision+1 {
+		t.Fatalf("revision = %d, want %d (capability change must bump revision)", upd.Revision, created.Revision+1)
+	}
+	got, err = store.GetProvider(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Capabilities) != 1 || got.Capabilities[0] != domain.ProviderCapabilityImage {
+		t.Fatalf("capabilities = %v, want [image]", got.Capabilities)
+	}
+	if !got.HasCapability(domain.ProviderCapabilityImage) || got.HasCapability(domain.ProviderCapabilityChat) {
+		t.Fatalf("HasCapability mismatch: image=%v chat=%v", got.HasCapability(domain.ProviderCapabilityImage), got.HasCapability(domain.ProviderCapabilityChat))
+	}
+}
+
+// TestLLMProviderCapabilitiesValidation: image 能力仅 native_oai;
+// 非法能力值拒绝。
+func TestLLMProviderCapabilitiesValidation(t *testing.T) {
+	pool := requireDB(t)
+	store, err := NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	_, err = store.CreateProvider(ctx, domain.LLMProviderCreate{
+		Name: "claude-img", ProviderType: domain.ProviderNativeClaude,
+		BaseURL: "https://api.anthropic.com", Model: "claude-x",
+		APIKeyCiphertext: []byte("cipher"), APIKeyKeyVersion: "1",
+		Capabilities: []domain.ProviderCapability{domain.ProviderCapabilityImage},
+	})
+	if err == nil {
+		t.Fatal("expected error for image capability on native_claude provider")
+	}
+
+	_, err = store.CreateProvider(ctx, domain.LLMProviderCreate{
+		Name: "bad-cap", ProviderType: domain.ProviderNativeOAI,
+		BaseURL: "https://api.example.com/v1", Model: "x",
+		APIKeyCiphertext: []byte("cipher"), APIKeyKeyVersion: "1",
+		Capabilities: []domain.ProviderCapability{"video"},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid capability value")
+	}
+}

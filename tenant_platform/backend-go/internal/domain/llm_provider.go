@@ -25,6 +25,22 @@ const (
 	ProviderNativeClaude LLMProviderType = "native_claude"
 )
 
+// ProviderCapability is a capability dimension served by an LLMProvider
+// (Phase B 托管形态, 2026-08-14 定稿): chat = 对话(operation llm.chat),
+// image = 生图(operation llm.image)。一个 provider 可同时具备两种能力,
+// 但 model 单值意味着 image 能力 provider 的 model 是生图模型——实际部署
+// 中 image provider 通常是独立 provider。
+type ProviderCapability string
+
+const (
+	ProviderCapabilityChat  ProviderCapability = "chat"
+	ProviderCapabilityImage ProviderCapability = "image"
+)
+
+func ValidProviderCapability(c ProviderCapability) bool {
+	return c == ProviderCapabilityChat || c == ProviderCapabilityImage
+}
+
 type ProviderAuthMode string
 
 const (
@@ -175,6 +191,8 @@ type LLMProviderCreate struct {
 	APIKeyKeyVersion string
 	SessionConfig    GASessionConfig
 	TransportConfig  ProviderTransportConfig
+	// Capabilities 能力维度(chat/image); 省略 = [chat](兼容既有 provider)。
+	Capabilities []ProviderCapability
 }
 
 type LLMProviderUpdate struct {
@@ -195,11 +213,30 @@ type LLMProvider struct {
 	APIKey          string
 	SessionConfig   GASessionConfig
 	TransportConfig ProviderTransportConfig
+	Capabilities    []ProviderCapability
 	Revision        int64
 	IsDefault       bool
 	State           LLMProviderState
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+}
+
+// EffectiveCapabilities 返回归一化能力列表: 省略 = [chat](存量兼容)。
+func (p LLMProvider) EffectiveCapabilities() []ProviderCapability {
+	if len(p.Capabilities) == 0 {
+		return []ProviderCapability{ProviderCapabilityChat}
+	}
+	return p.Capabilities
+}
+
+// HasCapability 判断 provider 是否具备某能力维度。
+func (p LLMProvider) HasCapability(c ProviderCapability) bool {
+	for _, have := range p.EffectiveCapabilities() {
+		if have == c {
+			return true
+		}
+	}
+	return false
 }
 
 func (p LLMProvider) IsActive() bool { return p.State == ProviderActive }

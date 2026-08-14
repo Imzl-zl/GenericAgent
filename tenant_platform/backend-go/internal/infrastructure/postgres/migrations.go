@@ -86,6 +86,7 @@ func migrationFiles() []string {
 		"0055_mcp_governance.sql",
 		"0056_task_media.sql",
 		"0057_task_delivery_files_spool.sql",
+		"0058_provider_capabilities.sql",
 	}
 }
 
@@ -147,6 +148,7 @@ var pendingMigrations = []struct {
 	{"0055_mcp_governance.sql", "migration_0055_mcp_governance_marker"},
 	{"0056_task_media.sql", "migration_0056_task_media_marker"},
 	{"0057_task_delivery_files_spool.sql", "migration_0057_task_delivery_files_spool_marker"},
+	{"0058_provider_capabilities.sql", "migration_0058_provider_capabilities_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -218,6 +220,7 @@ var foundationTableNames = []string{
 	"migration_0055_mcp_governance_marker",
 	"migration_0056_task_media_marker",
 	"migration_0057_task_delivery_files_spool_marker",
+	"migration_0058_provider_capabilities_marker",
 	"migration_0012_bot_transport_cursor_key_version_marker",
 	"migration_0013_messages_marker",
 	"migration_0014_media_assets_marker",

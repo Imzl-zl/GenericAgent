@@ -78,6 +78,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/v1/responses", s.handleResponses)
 	mux.HandleFunc("/v1/messages", s.handleMessages)
+	mux.HandleFunc("/v1/images/generations", s.handleImageGenerations)
+	mux.HandleFunc("/images/generations", s.handleImageGenerations)
 	return mux
 }
 

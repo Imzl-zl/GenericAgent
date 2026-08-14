@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -589,5 +590,52 @@ func TestReverseProxyRejectsBodyAboveLimitBeforeUpstream(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("oversized request reached upstream %d times", hits.Load())
+	}
+}
+
+// TestSanitizeImageResponseOverLimit: 生图响应超 32MiB 上限 → 502
+// IMAGE_RESPONSE_TOO_LARGE(安全审查项: 响应体无既有上限)。
+func TestSanitizeImageResponseOverLimit(t *testing.T) {
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		ContentLength: maxImageResponseBytes + 1,
+		Body:          io.NopCloser(strings.NewReader("huge")),
+		Header:        make(http.Header),
+		Request:       &http.Request{},
+	}
+	ctx := context.WithValue(resp.Request.Context(), proxyRequestContextKey{}, &proxyRequestContext{
+		Target: &url.URL{Path: "/v1/images/generations"},
+	})
+	resp.Request = resp.Request.WithContext(ctx)
+	if err := sanitizeUpstreamResponse(resp); err != nil {
+		t.Fatalf("sanitizeUpstreamResponse: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "IMAGE_RESPONSE_TOO_LARGE") {
+		t.Fatalf("body = %q", string(body))
+	}
+}
+
+// TestSanitizeChatResponseIgnoresLimit: 非生图路由不受 32MiB 上限约束。
+func TestSanitizeChatResponseIgnoresLimit(t *testing.T) {
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		ContentLength: maxImageResponseBytes + 1,
+		Body:          io.NopCloser(strings.NewReader("ok")),
+		Header:        make(http.Header),
+		Request:       &http.Request{},
+	}
+	ctx := context.WithValue(resp.Request.Context(), proxyRequestContextKey{}, &proxyRequestContext{
+		Target: &url.URL{Path: "/v1/chat/completions"},
+	})
+	resp.Request = resp.Request.WithContext(ctx)
+	if err := sanitizeUpstreamResponse(resp); err != nil {
+		t.Fatalf("sanitizeUpstreamResponse: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 }

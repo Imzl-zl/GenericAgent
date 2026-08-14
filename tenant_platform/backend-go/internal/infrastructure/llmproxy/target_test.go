@@ -105,3 +105,55 @@ func TestResolveUpstreamTargetRejectsProtocolAndQueryConflicts(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveUpstreamTargetImageGenerations: 生图路由映射(Phase B 托管形态)。
+func TestResolveUpstreamTargetImageGenerations(t *testing.T) {
+	tests := []struct {
+		name    string
+		base    string
+		inbound string
+		want    string
+	}{
+		{
+			name: "image via base without version",
+			base: "https://api.example.com", inbound: "/v1/images/generations",
+			want: "https://api.example.com/v1/images/generations",
+		},
+		{
+			name: "image via base with v1",
+			base: "https://newapi.example.com/v1", inbound: "/v1/images/generations",
+			want: "https://newapi.example.com/v1/images/generations",
+		},
+		{
+			name: "image alias path no v1",
+			base: "https://api.example.com/v1", inbound: "/images/generations",
+			want: "https://api.example.com/v1/images/generations",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := domain.LLMProvider{ProviderType: domain.ProviderNativeOAI, BaseURL: tt.base, Model: "gpt-image-2"}
+			inbound, err := url.Parse(tt.inbound)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := ResolveUpstreamTarget(provider, inbound)
+			if err != nil {
+				t.Fatalf("ResolveUpstreamTarget: %v", err)
+			}
+			if got.String() != tt.want {
+				t.Fatalf("target = %q, want %q", got.String(), tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveUpstreamTargetImageRejectedOnClaudeProvider: native_claude
+// provider 不接受生图路径(生图走 OAI 协议)。
+func TestResolveUpstreamTargetImageRejectedOnClaudeProvider(t *testing.T) {
+	provider := domain.LLMProvider{ProviderType: domain.ProviderNativeClaude, BaseURL: "https://api.anthropic.com"}
+	inbound, _ := url.Parse("/v1/images/generations")
+	if _, err := ResolveUpstreamTarget(provider, inbound); err == nil {
+		t.Fatal("expected error for image path on claude provider")
+	}
+}

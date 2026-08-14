@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -463,4 +464,98 @@ func performProviderCommand(t *testing.T, srv *Server, path string) *httptest.Re
 	response := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(response, request)
 	return response
+}
+
+// ─────────────────── Phase B 托管形态: capabilities 能力维度(2026-08-14) ───────────────────
+
+func TestAdminCreateLLMProviderCapabilities(t *testing.T) {
+	srv, _, _ := llmProviderServerFixture(t)
+
+	// image 能力创建成功并回显
+	body := providerWritePayload("img-provider")
+	body["capabilities"] = []string{"image"}
+	response := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", body)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var reply map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	caps, ok := reply["capabilities"].([]any)
+	if !ok || len(caps) != 1 || caps[0] != "image" {
+		t.Fatalf("capabilities = %v", reply["capabilities"])
+	}
+
+	// 省略 = [chat]
+	body2 := providerWritePayload("chat-provider")
+	response2 := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", body2)
+	if response2.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response2.Code, response2.Body.String())
+	}
+	var reply2 map[string]any
+	if err := json.Unmarshal(response2.Body.Bytes(), &reply2); err != nil {
+		t.Fatal(err)
+	}
+	if caps2, _ := reply2["capabilities"].([]any); len(caps2) != 1 || caps2[0] != "chat" {
+		t.Fatalf("capabilities = %v, want [chat]", reply2["capabilities"])
+	}
+}
+
+func TestAdminCreateLLMProviderRejectsInvalidCapabilities(t *testing.T) {
+	srv, _, _ := llmProviderServerFixture(t)
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "unknown capability", mutate: func(body map[string]any) {
+			body["capabilities"] = []string{"video"}
+		}},
+		{name: "duplicate capability", mutate: func(body map[string]any) {
+			body["capabilities"] = []string{"chat", "chat"}
+		}},
+		{name: "claude rejects image", mutate: func(body map[string]any) {
+			body["provider_type"] = "native_claude"
+			body["capabilities"] = []string{"image"}
+		}},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := providerWritePayload("bad-cap-" + strconv.Itoa(index))
+			test.mutate(body)
+			response := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", body)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+// TestAdminUpdateLLMProviderCapabilitiesBumpsRevision: 改能力维度 → revision+1。
+func TestAdminUpdateLLMProviderCapabilitiesBumpsRevision(t *testing.T) {
+	srv, _, _ := llmProviderServerFixture(t)
+	body := providerWritePayload("rev-provider")
+	body["capabilities"] = []string{"chat"}
+	response := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", body)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var reply map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	id := reply["provider_id"].(float64)
+	body["capabilities"] = []string{"chat", "image"}
+	response = performProviderWrite(t, srv, http.MethodPut,
+		fmt.Sprintf("/v1/admin/llm-providers/%d", int64(id)), body)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var updated map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated["revision"].(float64) != reply["revision"].(float64)+1 {
+		t.Fatalf("revision = %v, want %v", updated["revision"], reply["revision"].(float64)+1)
+	}
 }

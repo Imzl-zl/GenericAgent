@@ -19,28 +19,42 @@ import (
 // MaxWorkerRequestBytes bounds the Worker request body read by the Proxy.
 const MaxWorkerRequestBytes = 4 * 1024 * 1024
 
+// Capability operations(Phase B 托管形态, 2026-08-14 定稿): chat = 对话路由,
+// image = 生图路由。签发与校验共用同一组常量(worker_credential.go)。
+const (
+	OperationChat  = "llm.chat"
+	OperationImage = "llm.image"
+)
+
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	s.handleProviderPath(w, r, domain.ProviderNativeOAI)
+	s.handleProviderPath(w, r, domain.ProviderNativeOAI, OperationChat)
 }
 
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
-	s.handleProviderPath(w, r, domain.ProviderNativeOAI)
+	s.handleProviderPath(w, r, domain.ProviderNativeOAI, OperationChat)
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	s.handleProviderPath(w, r, domain.ProviderNativeClaude)
+	s.handleProviderPath(w, r, domain.ProviderNativeClaude, OperationChat)
+}
+
+// handleImageGenerations 是生图路由(Phase B 托管形态): 复用 handleProviderPath
+// 全流程(能力校验/预算/白名单/model 匹配/在线联查), operation 校验 llm.image。
+func (s *Server) handleImageGenerations(w http.ResponseWriter, r *http.Request) {
+	s.handleProviderPath(w, r, domain.ProviderNativeOAI, OperationImage)
 }
 
 func (s *Server) handleProviderPath(
 	w http.ResponseWriter,
 	r *http.Request,
 	wantType domain.LLMProviderType,
+	wantOp string,
 ) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "ROUTE_NOT_ALLOWED", "use POST")
 		return
 	}
-	claims, ok := s.validateCapability(w, r)
+	claims, ok := s.validateCapability(w, r, wantOp)
 	if !ok {
 		return
 	}
@@ -110,7 +124,7 @@ func requestModelMatches(providerType domain.LLMProviderType, configured, outbou
 	return outbound == gaOutbound
 }
 
-func (s *Server) validateCapability(w http.ResponseWriter, r *http.Request) (CapabilityClaims, bool) {
+func (s *Server) validateCapability(w http.ResponseWriter, r *http.Request, wantOp string) (CapabilityClaims, bool) {
 	token := extractBearer(r)
 	if token == "" {
 		writeError(w, http.StatusUnauthorized, "CAPABILITY_INVALID", "Authorization Bearer required")
@@ -123,8 +137,8 @@ func (s *Server) validateCapability(w http.ResponseWriter, r *http.Request) (Cap
 		writeError(w, http.StatusUnauthorized, capabilityErrorCode(err), "capability token rejected")
 		return CapabilityClaims{}, false
 	}
-	// 方案 §7: LLM 路由只接受 llm.chat 操作。
-	if claims.Operation != "llm.chat" {
+	// 方案 §7: LLM 路由只接受与路由维度匹配的 operation(llm.chat / llm.image)。
+	if claims.Operation != wantOp {
 		writeError(w, http.StatusUnauthorized, "CAPABILITY_INVALID", "capability operation mismatch")
 		return CapabilityClaims{}, false
 	}

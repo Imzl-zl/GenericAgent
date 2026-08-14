@@ -51,34 +51,23 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 	}
 	budget := fmt.Sprintf(`{"max_turns":%d,"max_history_bytes":%d,"max_working_bytes":%d,"max_output_bytes":%d}`, maxTurns, defaultMaxHistoryBytes, defaultMaxWorkingBytes, defaultMaxOutputBytes)
 	for _, routed := range snapshot.Providers {
-		token, claims, err := s.cfg.TokenIssuer.Issue(llmproxy.CapabilitySpec{
-			SessionKey: sessionKey, ProviderID: routed.ID, ProviderRevision: routed.Revision,
-			ProviderType: routed.ProviderType, Model: routed.Model,
-			PolicyVersion: s.cfg.ModelPolicyVersion,
-			TaskID: taskID, RunnerGeneration: runnerGeneration,
-			Operation: "llm.chat", Budget: budget,
-		})
-		if err != nil {
-			s.revokeCredentialSetBestEffort(ctx, set)
-			return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("issue capability for provider %d: %w", routed.ID, err)
+		// Phase B 托管形态(2026-08-14 定稿): 按 provider 能力维度签发——
+		// chat 能力 → llm.chat token(对话路由), image 能力 → llm.image
+		// token(生图路由)。一个 provider 双能力则签两个 token。
+		if routed.HasCapability(domain.ProviderCapabilityChat) {
+			if err := s.issueProviderCapability(ctx, sessionKey, routed, taskID, runnerGeneration,
+				llmproxy.OperationChat, budget, &set, &bindings); err != nil {
+				s.revokeCredentialSetBestEffort(ctx, set)
+				return workerCredentialSet{}, RuntimeConfigFiles{}, err
+			}
 		}
-		if claims.ExpiresAt == nil || claims.IssuedAt == nil {
-			set.JTIs = append(set.JTIs, claims.ID)
-			s.revokeCredentialSetBestEffort(ctx, set)
-			return workerCredentialSet{}, RuntimeConfigFiles{}, fmt.Errorf("provider %d capability timestamps are incomplete", routed.ID)
+		if routed.HasCapability(domain.ProviderCapabilityImage) {
+			if err := s.issueProviderCapability(ctx, sessionKey, routed, taskID, runnerGeneration,
+				llmproxy.OperationImage, budget, &set, &bindings); err != nil {
+				s.revokeCredentialSetBestEffort(ctx, set)
+				return workerCredentialSet{}, RuntimeConfigFiles{}, err
+			}
 		}
-		expiresAt := claims.ExpiresAt.Time.UTC()
-		issuedAt := claims.IssuedAt.Time.UTC()
-		if expiresAt.Sub(issuedAt) < s.cfg.MaxTaskWallClock+s.cfg.TokenRefreshSkew {
-			set.JTIs = append(set.JTIs, claims.ID)
-			s.revokeCredentialSetBestEffort(ctx, set)
-			return workerCredentialSet{}, RuntimeConfigFiles{}, errors.New("issued capability lifetime cannot cover task wall clock")
-		}
-		if set.ExpiresAt.IsZero() || expiresAt.Before(set.ExpiresAt) {
-			set.ExpiresAt = expiresAt
-		}
-		set.JTIs = append(set.JTIs, claims.ID)
-		bindings = append(bindings, RuntimeProviderBinding{Provider: routed.runtimeProvider(), Token: token})
 	}
 	// Sophub proxy capability(方案 §5.2): 经同一签发体系, audience=ga-sophub-proxy。
 	// 绑定 task_id + runner_generation(方案 §7), 并将 JTI 纳入同一撤销集合:
@@ -168,6 +157,53 @@ func (s *scheduler) issueProviderCapabilitiesWithRuntime(
 		}
 	}
 	return set, files, nil
+}
+
+// issueProviderCapability 为单个 provider × 能力维度签发 capability token
+// 并登记入凭证集(共享签发/撤销/有效期检查逻辑)。
+func (s *scheduler) issueProviderCapability(
+	ctx context.Context,
+	sessionKey string,
+	routed routingProvider,
+	taskID string,
+	runnerGeneration uint64,
+	operation string,
+	budget string,
+	set *workerCredentialSet,
+	bindings *[]RuntimeProviderBinding,
+) error {
+	token, claims, err := s.cfg.TokenIssuer.Issue(llmproxy.CapabilitySpec{
+		SessionKey: sessionKey, ProviderID: routed.ID, ProviderRevision: routed.Revision,
+		ProviderType: routed.ProviderType, Model: routed.Model,
+		PolicyVersion: s.cfg.ModelPolicyVersion,
+		TaskID: taskID, RunnerGeneration: runnerGeneration,
+		Operation: operation, Budget: budget,
+	})
+	if err != nil {
+		return fmt.Errorf("issue capability for provider %d (op %s): %w", routed.ID, operation, err)
+	}
+	if claims.ExpiresAt == nil || claims.IssuedAt == nil {
+		set.JTIs = append(set.JTIs, claims.ID)
+		return fmt.Errorf("provider %d capability timestamps are incomplete", routed.ID)
+	}
+	expiresAt := claims.ExpiresAt.Time.UTC()
+	issuedAt := claims.IssuedAt.Time.UTC()
+	if expiresAt.Sub(issuedAt) < s.cfg.MaxTaskWallClock+s.cfg.TokenRefreshSkew {
+		set.JTIs = append(set.JTIs, claims.ID)
+		return errors.New("issued capability lifetime cannot cover task wall clock")
+	}
+	if set.ExpiresAt.IsZero() || expiresAt.Before(set.ExpiresAt) {
+		set.ExpiresAt = expiresAt
+	}
+	set.JTIs = append(set.JTIs, claims.ID)
+	capability := domain.ProviderCapabilityChat
+	if operation == llmproxy.OperationImage {
+		capability = domain.ProviderCapabilityImage
+	}
+	*bindings = append(*bindings, RuntimeProviderBinding{
+		Provider: routed.runtimeProvider(), Token: token, Capability: capability,
+	})
+	return nil
 }
 
 // filterMCPServersByQuota 按用户配额过滤快照 server: 无限额行/未耗尽保留,

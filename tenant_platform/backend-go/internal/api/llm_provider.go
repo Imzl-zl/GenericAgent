@@ -19,6 +19,8 @@ type providerWriteBody struct {
 	APIKey          *string                        `json:"api_key,omitempty"`
 	SessionConfig   domain.GASessionConfig         `json:"session_config"`
 	TransportConfig domain.ProviderTransportConfig `json:"transport_config"`
+	// Capabilities 能力维度(chat|image); 省略 = [chat](Phase B 托管形态)。
+	Capabilities []domain.ProviderCapability `json:"capabilities,omitempty"`
 }
 
 func (s *Server) handleAdminCreateLLMProvider(w http.ResponseWriter, r *http.Request) {
@@ -45,6 +47,7 @@ func (s *Server) handleAdminCreateLLMProvider(w http.ResponseWriter, r *http.Req
 		Name: body.Name, ProviderType: body.ProviderType, BaseURL: body.BaseURL, Model: body.Model,
 		APIKeyCiphertext: ciphertext, APIKeyKeyVersion: keyVersion,
 		SessionConfig: body.SessionConfig, TransportConfig: body.TransportConfig,
+		Capabilities: body.Capabilities,
 	})
 	if err != nil {
 		writeStoreError(w, err, "PROVIDER_CREATE_FAILED", tid)
@@ -124,6 +127,7 @@ func (s *Server) handleAdminUpdateLLMProvider(w http.ResponseWriter, r *http.Req
 			Name: body.Name, ProviderType: body.ProviderType, BaseURL: body.BaseURL, Model: body.Model,
 			APIKeyCiphertext: ciphertext, APIKeyKeyVersion: keyVersion,
 			SessionConfig: body.SessionConfig, TransportConfig: body.TransportConfig,
+			Capabilities: body.Capabilities,
 		},
 		RotateAPIKey: rotateKey,
 	})
@@ -226,6 +230,27 @@ func (b *providerWriteBody) validateAndNormalize(requireAPIKey bool) error {
 	if err := b.TransportConfig.Validate(); err != nil {
 		return fmt.Errorf("transport_config: %w", err)
 	}
+	// 能力维度: 空 = [chat]; 非法值/重复拒绝; native_claude 仅 chat。
+	seen := map[domain.ProviderCapability]bool{}
+	for _, cap := range b.Capabilities {
+		if !domain.ValidProviderCapability(cap) {
+			return fmt.Errorf("capabilities must be one of chat|image, got %q", cap)
+		}
+		if seen[cap] {
+			return fmt.Errorf("duplicate capability %q", cap)
+		}
+		seen[cap] = true
+	}
+	if b.ProviderType == domain.ProviderNativeClaude {
+		for _, cap := range b.Capabilities {
+			if cap == domain.ProviderCapabilityImage {
+				return fmt.Errorf("image capability is only supported by native_oai providers")
+			}
+		}
+	}
+	if len(b.Capabilities) == 0 {
+		b.Capabilities = []domain.ProviderCapability{domain.ProviderCapabilityChat}
+	}
 	return nil
 }
 
@@ -259,12 +284,14 @@ func parseProviderID(w http.ResponseWriter, r *http.Request, tid string) (int64,
 }
 
 func llmProviderReply(p domain.LLMProvider) map[string]any {
+	caps := p.EffectiveCapabilities()
 	return map[string]any{
 		"provider_id":      p.ID,
 		"name":             p.Name,
 		"provider_type":    string(p.ProviderType),
 		"base_url":         p.BaseURL,
 		"model":            p.Model,
+		"capabilities":     caps,
 		"session_config":   p.SessionConfig,
 		"transport_config": p.TransportConfig,
 		"revision":         p.Revision,

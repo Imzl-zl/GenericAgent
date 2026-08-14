@@ -137,6 +137,24 @@ func (r *routingRoundTripper) RoundTrip(request *http.Request) (*http.Response, 
 func sanitizeUpstreamResponse(response *http.Response) error {
 	rebuildAllowedResponseHeaders(response.Header)
 	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+		// Phase B 托管形态(安全审查项, 方案 §2): 生图响应无既有上限——
+		// MaxWorkerRequestBytes 仅限请求体, DisableCompression 大 JSON 原样
+		// 传输。20MiB 图片 b64 后 ≈27MB + JSON 开销, 按 Content-Length
+		// 前置拒绝(上限 32MiB 留余量); 超限 fail-closed, 不透传超限体。
+		if requestContext, ok := proxyContext(response.Request); ok && requestContext.Target != nil {
+			path := requestContext.Target.Path
+			if (path == "/v1/images/generations" || path == "/images/generations") &&
+				response.ContentLength > maxImageResponseBytes {
+				_ = response.Body.Close()
+				slog.Warn("llmproxy: image response exceeds size limit",
+					"content_length", response.ContentLength, "limit", maxImageResponseBytes)
+				response.Body = io.NopCloser(strings.NewReader(sanitizedImageTooLargeBody))
+				response.StatusCode = http.StatusBadGateway
+				response.ContentLength = int64(len(sanitizedImageTooLargeBody))
+				response.Header.Set("Content-Type", "application/json")
+				response.Header.Set("Content-Length", strconv.Itoa(len(sanitizedImageTooLargeBody)))
+			}
+		}
 		return nil
 	}
 	// 2026-08-14 架构改进(可观测性): 上游错误体只进服务端日志(清洗截断),
@@ -176,6 +194,13 @@ func rebuildAllowedResponseHeaders(headers http.Header) {
 		}
 	}
 }
+
+// maxImageResponseBytes 生图响应体上限(安全审查项): 20MiB 交付上限 b64
+// 膨胀 ~1.37 + JSON 结构开销, 32MiB 留余量。仅按 Content-Length 前置
+// 判定(同步 JSON 响应恒有); chunked 流式(-1)不在本层约束(生图走同步)。
+const maxImageResponseBytes = 32 * 1024 * 1024
+
+const sanitizedImageTooLargeBody = `{"code":"IMAGE_RESPONSE_TOO_LARGE","message":"image response exceeds size limit"}`
 
 func handleProxyTransportError(w http.ResponseWriter, request *http.Request, err error) {
 	if errors.Is(err, context.Canceled) || errors.Is(request.Context().Err(), context.Canceled) {
