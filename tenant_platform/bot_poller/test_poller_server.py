@@ -181,7 +181,7 @@ def test_file_upload_key_is_random_hex_not_filename(tmp_path):
 
 def test_fit_static_image_for_upload_compresses_oversized_png(tmp_path):
     """2026-08-14 生产事故回归: 微信 CDN 大文件上传被限速/断连, 超限静态图
-    必须在交付侧转 JPEG 压缩到 ≤400KB 再上传。超限 PNG → 合规 JPEG;
+    必须在交付侧转 JPEG 压缩到 ≤300KB 再上传。超限 PNG → 合规 JPEG;
     小图/非图片/动图不转换返回 None。"""
     from PIL import Image
 
@@ -213,7 +213,7 @@ def test_fit_static_image_for_upload_compresses_oversized_png(tmp_path):
 
 
 def test_send_image_adapts_oversized_static_image(tmp_path):
-    """send_image 对超限静态图走适配路径(JPEG ≤400KB), 协议调用面不变。"""
+    """send_image 对超限静态图走适配路径(JPEG ≤300KB), 协议调用面不变。"""
     from PIL import Image
 
     client = WxBotClient(token="test", persist=False)

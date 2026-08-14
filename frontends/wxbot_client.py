@@ -197,12 +197,14 @@ class WxBotClient:
         # 2026-08-14 生产事故修复(微信生图交付死信): CDN 瞬时故障(握手挂起/
         # SSLEOFError)时, 单一 timeout 同时覆盖连接与传输, 连接层故障最长
         # 阻塞 timeout×3 次, 远超 Go delivery /send 预算(15s→90s) → 8 次重试
-        # 全部超时 → 死信, 用户永远收不到图。拆分超时: 连接层(TCP+TLS 握手)
-        # 10s 快速失败, 传输层保留长读超时; 失败退避 1/3s, 单次 /send 最坏
-        # ~33s, 落在 Go 侧媒体预算(90s)内, 重试窗口内有机会成功。
-        connect_timeout = min(10, max(1, timeout))
-        read_timeout = max(30, timeout)
-        for attempt in range(1, 4):
+        # 全部超时 → 死信, 用户永远收不到图。拆分超时并对齐预算:
+        # urllib3 的 connect timeout 同时约束连接建立与请求体发送, 本服务器
+        # →微信 CDN 实测限速 ~18KB/s(300KB≈14s), 故 connect=30s;
+        # 单次 /send 最坏 30+3+30=63s < Go 媒体预算 90s, 重试窗口内有
+        # 机会成功; 失败快速上抛由 Go 侧整体重试(不无限阻塞 poller 线程)。
+        connect_timeout = min(30, max(5, timeout))
+        read_timeout = max(connect_timeout + 20, timeout)
+        for attempt in range(1, 3):
             try:
                 r = requests.post(url, data=data,
                                   headers={'Content-Type': 'application/octet-stream', 'User-Agent': UA},
@@ -218,9 +220,9 @@ class WxBotClient:
                         'aes_key': base64.b64encode(aes_key.hex().encode()).decode(), 'encrypt_type': 1}
             except Exception as e:
                 last_err = e
-                if 'client error' in str(e) or attempt >= 3:
+                if 'client error' in str(e) or attempt >= 2:
                     break
-                time.sleep(3 ** (attempt - 1))  # 1s, 3s 退避
+                time.sleep(3)
                 print(f'[WX] CDN upload retry {attempt}: {e}', file=sys.__stdout__)
         raise last_err
 
@@ -304,7 +306,7 @@ class WxBotClient:
         # (海外)→微信 C2C CDN 大文件上传被限速 ~20KB/s 且连接 ~30s 被杀,
         # >~500KB 的静态图上传必失败(1.3-1.6MB 的生成图全部 dead-letter)。
         # 交付侧透明适配: 超限静态图(png/jpeg/webp/bmp, 非动图)转 JPEG
-        # 并按质量/尺寸迭代缩到 ≤400KB 再上传——IM 场景视觉无损, 用户无感。
+        # 并按质量/尺寸迭代缩到 ≤300KB 再上传——IM 场景视觉无损, 用户无感。
         # GIF(动图)不转换(丢动画), 由生成端 size/质量控制。
         adapted = self._fit_static_image_for_upload(file_path)
         if adapted is None:
@@ -317,12 +319,13 @@ class WxBotClient:
             except OSError:
                 pass
 
-    #: 微信 CDN 上传安全上限(实测节流阈值 ~450KB, 留余量)。
-    _IMAGE_UPLOAD_MAX_BYTES = 400 * 1024
+    #: 微信 CDN 上传安全上限(实测节流 ~18KB/s: 300KB≈14s, 400KB≈22s, 450KB≈22s,
+    # 1MB≈30s 被杀; 30s 写预算内留余量)。
+    _IMAGE_UPLOAD_MAX_BYTES = 300 * 1024
     _STATIC_IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
 
     def _fit_static_image_for_upload(self, file_path):
-        """超限静态图 → 临时 JPEG(≤400KB), 返回 Path; 无需转换返回 None。
+        """超限静态图 → 临时 JPEG(≤300KB), 返回 Path; 无需转换返回 None。
         失败(非图片/编码异常)返回 None, 由调用方走原图(错误语义不变)。"""
         fp = Path(file_path)
         try:
