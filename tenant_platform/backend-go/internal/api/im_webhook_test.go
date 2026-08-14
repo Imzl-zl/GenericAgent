@@ -43,6 +43,7 @@ func (f *fakeBotLifecycle) StartChannelConfig(_ context.Context, bot domain.Chan
 }
 func (f *fakeBotLifecycle) StopBot(_ context.Context, _ string) error { return nil }
 func (f *fakeBotLifecycle) RestoreActiveBots(_ context.Context) error { return nil }
+func (f *fakeBotLifecycle) ReconcileBots(_ context.Context) error { return nil }
 func (f *fakeBotLifecycle) PersistUpdatesBuf(_ context.Context, botUUID, buf string) error {
 	f.persistBufBotUUID = botUUID
 	f.persistBuf = buf

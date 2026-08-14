@@ -34,6 +34,7 @@ type BotLifecycleService interface {
 	StartChannelConfig(ctx context.Context, cfg domain.ChannelConfig) error
 	StopBot(ctx context.Context, botUUID string) error
 	RestoreActiveBots(ctx context.Context) error
+	ReconcileBots(ctx context.Context) error
 	PersistUpdatesBuf(ctx context.Context, botUUID, plaintextBuf string) error
 	HandleAuthExpired(ctx context.Context, botUUID string) error
 }
@@ -211,6 +212,81 @@ func (s *botLifecycleService) RestoreActiveBots(ctx context.Context) error {
 		})
 	}
 	return g.Wait()
+}
+
+// ReconcileBots converges the desired state (DB channel_configs.state='active')
+// with the actual state (poller /health active_bots), in both directions:
+//   - desired-but-missing → StartChannelConfig (re-register the channel)
+//   - actual-but-not-desired → StopBot (kill the zombie session, persist cursor)
+//
+// 2026-08-14: RestoreActiveBots only runs once at platform startup, so a
+// poller container rebuild/restart (deploy replace, crash recovery) leaves
+// every channel silent until manual intervention. The reconciliation loop
+// restores them automatically within one tick, and also covers the case
+// where the poller was not ready when the platform booted (restore failures
+// no longer need human action). Idempotent: poller /start and /stop are
+// idempotent, so re-reconciling the same state has no side effects. Failures
+// are aggregated and retried on the next tick — convergence replaces retry
+// logic. Not intended for concurrent invocation (single ticker).
+func (s *botLifecycleService) ReconcileBots(ctx context.Context) error {
+	cfgs, err := s.store.ListActiveChannelConfigs(ctx)
+	if err != nil {
+		return fmt.Errorf("list active channel configs: %w", err)
+	}
+	health, err := s.poller.Health(ctx)
+	if err != nil {
+		return fmt.Errorf("poller health: %w", err)
+	}
+	actual := make(map[string]struct{}, len(health.ActiveBots))
+	for _, botUUID := range health.ActiveBots {
+		actual[botUUID] = struct{}{}
+	}
+	expected := make(map[string]domain.ChannelConfig, len(cfgs))
+	for _, cfg := range cfgs {
+		expected[cfg.BotUUID] = cfg
+	}
+	var errs []error
+	// Desired but missing → re-register. Re-check the DB state right before
+	// start so a stale list snapshot cannot resurrect a bot that was unbound/
+	// expired concurrently; a recheck failure skips this round and converges
+	// on the next tick.
+	for _, cfg := range cfgs {
+		if _, ok := actual[cfg.BotUUID]; ok {
+			continue
+		}
+		cur, err := s.store.GetChannelConfigByUUID(ctx, cfg.BotUUID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue // row deleted between list and re-check: no longer desired
+			}
+			errs = append(errs, fmt.Errorf("recheck channel config %s: %w", cfg.BotUUID, err))
+			continue
+		}
+		if cur.State != domain.ChannelActive {
+			continue // deactivated between list and now: the stop path owns convergence
+		}
+		if err := s.StartChannelConfig(ctx, cur); err != nil {
+			errs = append(errs, fmt.Errorf("restart channel config %s: %w", cfg.BotUUID, err))
+			continue
+		}
+		slog.InfoContext(ctx, "bot_lifecycle: reconciled missing bot",
+			"bot_uuid", cfg.BotUUID, "channel_type", cfg.ChannelType)
+	}
+	// Present but not desired → stop the zombie session (persists the final
+	// cursor via StopBot). StopBot also handles rows already deleted
+	// (pgx.ErrNoRows still forwards the stop to the poller).
+	for botUUID := range actual {
+		if _, ok := expected[botUUID]; ok {
+			continue
+		}
+		if err := s.StopBot(ctx, botUUID); err != nil {
+			errs = append(errs, fmt.Errorf("stop stale bot %s: %w", botUUID, err))
+			continue
+		}
+		slog.InfoContext(ctx, "bot_lifecycle: reconciled stale bot",
+			"bot_uuid", botUUID)
+	}
+	return errors.Join(errs...)
 }
 
 // PersistUpdatesBuf encrypts and stores the plaintext cursor pushed by the

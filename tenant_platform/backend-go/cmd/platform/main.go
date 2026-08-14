@@ -60,6 +60,18 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// defaultBotReconcileInterval returns the bot reconciliation period from
+// BOT_RECONCILE_INTERVAL (Go duration syntax), falling back to 60s for
+// unset/invalid values. Pass --bot-reconcile-interval=0s to disable.
+func defaultBotReconcileInterval() time.Duration {
+	if v := os.Getenv("BOT_RECONCILE_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 60 * time.Second
+}
+
 // envInt reads an integer from the named env var, returning fallback when
 // unset or unparsable. Used for quota tunables so operators can set them
 // without touching flags.
@@ -477,6 +489,7 @@ func run() error {
 		ilinkClientVersion       = flag.String("ilink-client-version", firstNonEmpty(os.Getenv("ILINK_CLIENT_VERSION"), "2.1.1"), "iLink App-ClientVersion header")
 		botPollerURL             = flag.String("bot-poller-url", os.Getenv("BOT_POLLER_URL"), "Bot Poller HTTP base URL (or BOT_POLLER_URL); empty = loopback transport")
 		botPollerAPISecret       = flag.String("bot-poller-api-secret", os.Getenv("BOT_POLLER_API_SECRET"), "HMAC-SHA256 secret for authenticating requests to Bot Poller /start /send /stop (or BOT_POLLER_API_SECRET); empty = unauthenticated (INSECURE - dev/test only)")
+		botReconcileInterval     = flag.Duration("bot-reconcile-interval", defaultBotReconcileInterval(), "periodic reconciliation of poller active bots against DB channel configs (or BOT_RECONCILE_INTERVAL); 0s = disabled")
 		botMediaRoot             = flag.String("bot-media-root", os.Getenv("GA_BOT_MEDIA_ROOT"), "Bot Poller media root directory (or GA_BOT_MEDIA_ROOT); inbound media_paths are rejected unless they resolve inside this root; empty = no check (loopback/dev)")
 		platformWebhookURL       = flag.String("platform-webhook-url", os.Getenv("PLATFORM_WEBHOOK_URL"), "platform /v1/im/webhook URL told to the Bot Poller (or PLATFORM_WEBHOOK_URL)")
 		webhookSecret            = flag.String("webhook-secret", os.Getenv("PLATFORM_WEBHOOK_SECRET"), "HMAC-SHA256 secret shared with the Bot Poller to authenticate /v1/im/webhook (or PLATFORM_WEBHOOK_SECRET); empty = unauthenticated (dev/test only)")
@@ -852,7 +865,7 @@ func run() error {
 			return nil
 		}(),
 		Bots:        store,
-		IdleTimeout:              time.Duration(*taskIdleTimeoutSec) * time.Second,
+		IdleTimeout: time.Duration(*taskIdleTimeoutSec) * time.Second,
 	})
 	if err != nil {
 		return err
@@ -1161,6 +1174,29 @@ func run() error {
 		if err := botLifecycle.RestoreActiveBots(ctx); err != nil {
 			slog.ErrorContext(ctx, "bot lifecycle restore error", "error", err)
 		}
+	}
+
+	// 2026-08-14: RestoreActiveBots only runs once at startup, so a poller
+	// rebuild/restart (deploy replace, crash recovery) leaves every channel
+	// silent. Periodic reconciliation converges desired (DB active configs)
+	// with actual (poller /health active_bots): missing bots are re-registered
+	// within one tick, stale ones are stopped. Also heals the window where the
+	// poller was not ready during startup restore.
+	if botLifecycle != nil && *botReconcileInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(*botReconcileInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := botLifecycle.ReconcileBots(ctx); err != nil {
+						slog.WarnContext(ctx, "bot lifecycle reconcile error", "error", err)
+					}
+				}
+			}
+		}()
 	}
 
 	fmt.Fprintf(os.Stderr, "platform: instance_id=%s listen=%s session=%s policy_digest=%s\n",
