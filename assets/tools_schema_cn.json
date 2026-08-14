@@ -79,5 +79,5 @@
       "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "质量等级；gpt-image 系列"},
       "n": {"type": "integer", "minimum": 1, "maximum": 4, "description": "生成数量（1-4）"},
       "output_format": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "输出格式；仅 gpt-image 系列（dall-e 无 output_format）"},
-      "model": {"type": "string", "description": "可选模型覆盖"}}}}}
+      "model": {"type": "string", "description": "可选模型覆盖（仅直连形态生效）。托管平台模式下 model 由 provider 绑定强制，传不同值将被拒绝（HTTP 409），请省略"}}}}}
 ]

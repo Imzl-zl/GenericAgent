@@ -187,6 +187,13 @@ export function LLMProviderForm({ provider, onSave, onCancel }: LLMProviderFormP
           </label>
         ))}
       </div>
+      {form.capabilities?.includes('image') && (
+        <p className="provider-form-full provider-form-hint">
+          Image（生图）能力下，"模型"字段将同时作为生图模型（images/generations 请求的 model）；
+          provider 只有单一 model 字段，无法同时服务对话与生图两种模型——建议为生图单独配置
+          仅勾选 Image 的 provider（该 provider 的 model 应为生图模型）。
+        </p>
+      )}
 
       <div className="provider-form-full provider-inline-toggles">
         <label className="provider-toggle">

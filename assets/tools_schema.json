@@ -79,5 +79,5 @@
       "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "Quality level; gpt-image series"},
       "n": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Number of images (1-4)"},
       "output_format": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "Output format; gpt-image series only (dall-e has no output_format)"},
-      "model": {"type": "string", "description": "Optional model override"}}}}}
+      "model": {"type": "string", "description": "Optional model override (direct mode). In hosted platform mode the model is bound to the provider — passing a different model here is rejected (HTTP 409), so omit it."}}}}}
 ]

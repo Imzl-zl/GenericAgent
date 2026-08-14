@@ -1316,9 +1316,9 @@ def fast_ask(prompt, cfg_name):
 #
 # 设计真值: .tasks/im-media-pipeline/PHASE_B_IMAGE_GEN_PLAN.zh-CN.md §3-§8
 # 双形态设计: 直连/托管 = 配置差异(apibase/apikey 指向不同端点), 一份代码
-# (对齐 BaseSession 先例: chat 直连与平台托管共用一份实现)。v1 实施直连
-# 形态: apibase = 真实上游/中转网关 + 真实密钥; 托管形态(llm-proxy +
-# llm.image 能力令牌)为终态设计, 按需实施时 GA 侧协议代码零改动。
+# (对齐 BaseSession 先例: chat 直连与平台托管共用一份实现)。两种形态均已
+# 实施(2026-08-14): 直连 = 真实上游/中转网关 + 真实密钥; 托管 = llm-proxy +
+# llm.image 能力令牌(平台 runtime_config 下发 image_gen 块, GA 侧零改动)。
 #
 # 实现进 llmcore.py, 严禁新增 imagegen.py —— 沙箱 overlay 只物化固定清单
 # (runtime_overlay.py LEGACY_MODULES), 新增模块导致平台沙箱启动
@@ -1394,7 +1394,8 @@ class BaseImageGenClient:
             ra = float((resp.headers or {}).get("retry-after"))
         except (TypeError, ValueError):
             ra = None
-        return None if ra is not None and ra > self.max_retry_after else max(0.5, ra if ra is not None else min(30.0, 1.5 * (2 ** attempt)))
+        # 与 _stream_with_retry(447-487) 完全一致: retry-after=0 时也走指数退避。
+        return None if ra is not None and ra > self.max_retry_after else max(0.5, ra or min(30.0, 1.5 * (2 ** attempt)))
 
     def _post(self, payload, stream=False):
         """带重试语义的 POST(仿 _stream_with_retry: 429/408/5xx 退避集合 +

@@ -699,8 +699,10 @@ class GenericAgentHandler(BaseHandler):
         size = args.get("size") or None
         quality = args.get("quality") or None
         n = max(1, min(_arg(args, "n", 1, int), 4))  # schema 已限 1-4, 防御夹取
-        output_format = str(args.get("output_format") or "png").strip().lstrip(".")
+        output_format = str(args.get("output_format") or "png").strip().lstrip(".").lower()
         if output_format == "jpg": output_format = "jpeg"
+        # 防御: schema 已限 png/jpeg/webp, 模型可能传任意值——枚举外回退 png(审查 S10)。
+        if output_format not in ("png", "jpeg", "webp"): output_format = "png"
         model = args.get("model") or None
         yield f"[Action] image_gen: 生成 {n} 张图 (prompt={smart_format(prompt, 60)!r}, size={size or '默认'}, quality={quality or '默认'}, format={output_format})\n"
         try:

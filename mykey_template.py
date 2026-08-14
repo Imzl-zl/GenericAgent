@@ -22,9 +22,9 @@
 #                                                                      NativeClaudeSession 与
 #                                                                      NativeOAISession 可混用
 #      image_gen(独立 dict, 见下方配置块)  → 非 Session              → 生图工具 image_gen
-#        说明: 不进 /llms 会话列表、不进 mixin 故障转移、不经 llm-proxy
-#        (v1 直连形态); 变量名刻意不含 api/config/cookie 子串以免被本
-#        扫描误判为 Session。
+#        说明: 不进 /llms 会话列表、不进 mixin 故障转移、变量名刻意不含
+#        api/config/cookie 子串以免被本扫描误判为 Session。直连形态不经
+#        llm-proxy; 托管形态由平台 runtime_config 下发本块(apibase=llm-proxy)。
 #
 #  工具调用一律走 API 原生 tool 字段（function calling），与 Claude Code /
 #  Codex 行为一致。Anthropic 协议渠道用 native_claude_*，OpenAI 兼容渠道用
@@ -328,11 +328,12 @@ mixin_config = {
 #  本配置不是 Session：不进 /llms 列表、不进 mixin 故障转移、不走 llm-proxy
 #  （v1 直连形态）。
 #
-#  双形态设计（一份代码，配置决定形态）：
-#  ① 直连形态（v1 实施）：apibase = 真实上游/中转网关，apikey = 真实密钥。
-#  ② 托管形态（终态设计，v1 不实施）：apibase = llm-proxy 地址，apikey =
-#     llm.image capability 能力令牌——GA 侧协议代码零改动，仅配置不同；
-#     平台侧（llm-proxy 路由/policy/provider）届时随托管实施一起放行。
+#  双形态设计（一份代码，配置决定形态，两种形态均已实施）：
+#  ① 直连形态：apibase = 真实上游/中转网关，apikey = 真实密钥。手配本块生效。
+#  ② 托管形态（2026-08-14 已实施）：apibase = llm-proxy 地址，apikey =
+#     llm.image capability 能力令牌——GA 侧协议代码零改动，平台 admin 在
+#     web 表单给 provider 勾选 Image 能力后由 runtime_config 自动下发本块
+#     （手配会被平台下发覆盖）。
 #
 #  不配置本块时 image_gen 工具返回错误文本（[Error: image_gen 未配置…]），
 #  不会崩溃。取消注释并填入真实密钥后生效。
