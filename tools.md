@@ -73,6 +73,17 @@
 - **生图托管形态（2026-08-14，Step 3 已实施）**：平台模式生图链路 = admin 配 image 能力 provider（web 表单 capabilities 勾 Image）→ 签发 `llm.image` capability token → runtime_config 下发 `image_gen` 块（不进 chat mixin）→ GA 沙箱 resolve_image_gen 读 mykeys['image_gen'] → llm-proxy `/v1/images/generations` 路由（operation 错配 401）→ 上游。**provider 能力维度**：`llm_providers.capabilities` JSONB（migration 0058，省略=[chat]）；image 仅 native_oai；**生图响应 32MiB 上限**（Content-Length 前置拒绝，MaxWorkerRequestBytes 只管请求体）；多 image provider v1 fail-closed；至少一个 chat provider（image-only 部署被拒）；双能力 provider 按 (ID,能力) 双 token（chat/image 预算独立计量）。生图响应 32MiB 上限双闸（Content-Length 前置 + chunked 流式计数）；migration 0059 补 DB CHECK。**托管语义边界**：model override 托管必 409（直连可用）；双能力 provider 单 model 字段（image 请求带同一 model 打上游，建议独立 image provider）；web 表单勾 Image 时有提示。policy `foundation.session-files.v1` 已补 image_gen（平台沙箱模型可见工具）。上生产必须 make build 全量重建（ga-runner + platform + llm-proxy + web）。
 - **IM 流式输出（2026-08-10，im-streaming-delivery 已落地）**：`StreamingSender`/`StreamReply` 可选接口（transport 包），非流渠道不实现；poller /send 扩展 stream_id+stream_action(open|append|commit|abort)（不新增端点，open 响应回 stream_id）；飞书=占位消息+PUT 全量替换打字机（_TokenBucket 5 QPS）；QQ 单聊=原生流式帧（stream{state 1/10, id, index, reset}，全量替换语义，append≤2 保护被动回复 4 次/条）；scheduler 500ms 节流合并（首条 chunk 为窗口起点，flush 由下一 chunk/心跳/Terminal 驱动）；stream_final_at 置位后 delivery 跳过文本 part（文件照发）；群聊统一只发最终结果（tasks.conversation_type）。设计真值：`tenant_platform/docs/IM_STREAMING_DELIVERY.zh-CN.md`。QQ 流式帧参数需真实凭据实测。
 
+- **出站媒体官方限制矩阵（2026-08-14 逐渠道核对官方文档，稳定事实）**：
+  | 渠道 | 上传机制 | 官方限制 | 交付侧适配 |
+  |---|---|---|---|
+  | 微信 iLink | getuploadurl → AES-128-ECB → CDN 上传 | 无文档化大小限制；海外服务器实测 CDN 节流 ~18KB/s、连接 ~30s 被杀，>~450KB 必死 | `fit_image_for_upload` ≤300KB 转 JPEG；`no_need_thumb=true`（openclaw 官方默认，image_item 仅 media+mid_size） |
+  | QQ | upload_prepare(md5/sha1/md5_10m) → 分片 PUT → upload_part_finish → 合并 | retry_timeout=300s；850031 超限；分片默认 5MB | 已逐字段对齐，无需适配 |
+  | 飞书 | im/v1/image/create(image_type=message) / file(stream) | 图片 ≤10MB、GIF ≤2000×2000、其他 ≤12000×12000；文件 ≤30MB | 已对齐 |
+  | 钉钉 | oapi/media/upload → media_id → sampleImageMsg | 图片 ≤20MB 仅 jpg/gif/png/bmp（**无 webp**）；文件 ≤20MB 仅 doc/docx/xls/xlsx/ppt/pptx/zip/pdf/rar | webp → JPEG；文件/视频发送未实现（fail-closed 待实测） |
+  | 企微 | cgi-bin/media/upload → media_id | 图片 ≤10MB 仅 JPG/PNG（旧文档 2MB）；视频 ≤10MB；文件 ≤20MB；media_id 3 天有效 | 白名单外（webp/gif/bmp）+ 动图 → JPEG 首帧 |
+  | Telegram（根 tgapp） | Bot API multipart 直传 | 图片 ≤10MB、文档 ≤50MB | 已对齐 |
+  适配函数：`frontends/wxbot_client.py` 模块级 `fit_image_for_upload(file_path, max_bytes, allowed_formats, animated_ok)`（微信实例方法委托它），poller WeCom/DingTalk adapter 直接调用；临时文件 mkstemp 落 /tmp（poller 只读 rootfs + 只读 spool 卷，写源旁目录会静默失败）。
+
 ## 镜像打包（compose）
 
 - 唯一部署入口：`tenant_platform/infra/compose/`（compose.yaml + 7 个 Dockerfile + Makefile + .env 模板）。文档：`compose/README.zh-CN.md`。
