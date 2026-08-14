@@ -255,7 +255,7 @@ func TestIssueProviderCapabilitiesBuildsDefaultFirstMixin(t *testing.T) {
 	}
 	s := &scheduler{cfg: SchedulerConfig{
 		LLMProvider: source, TokenIssuer: issuer, LLMProxyAddr: "http://127.0.0.1:9999",
-		ConfigRoot: t.TempDir(),
+		ConfigRoot:         t.TempDir(),
 		ModelPolicyVersion: "test.v1", MaxTaskWallClock: 45 * time.Minute,
 		TokenRefreshSkew: 5 * time.Minute,
 	}}
@@ -288,6 +288,60 @@ func TestIssueProviderCapabilitiesBuildsDefaultFirstMixin(t *testing.T) {
 	}
 }
 
+// TestIssueProviderCapabilitiesDualCapabilityProvider: 双能力 provider
+// (chat+image) 签两个 capability token(llm.chat + llm.image), 双 binding——
+// chat 进 session 变量/mixin, image 进 image_gen 块(Phase B 托管形态;
+// 审查 S4 补测: 此前仅 runtime_config 层间接覆盖)。
+func TestIssueProviderCapabilitiesDualCapabilityProvider(t *testing.T) {
+	provider := testProvider(3, 2, domain.ProviderNativeOAI, true)
+	provider.Model = "gpt-image-2"
+	provider.Capabilities = []domain.ProviderCapability{domain.ProviderCapabilityChat, domain.ProviderCapabilityImage}
+	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
+	issuer, err := llmproxy.NewIssuer([]byte("test-signing-key-at-least-32-bytes"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &scheduler{cfg: SchedulerConfig{
+		LLMProvider: source, TokenIssuer: issuer, LLMProxyAddr: "http://127.0.0.1:9999",
+		ConfigRoot:         t.TempDir(),
+		ModelPolicyVersion: "test.v1", MaxTaskWallClock: 45 * time.Minute,
+		TokenRefreshSkew: 5 * time.Minute,
+	}}
+	task := domain.Task{ID: "task-dual", SessionKey: "personal:1"}
+	set, files, err := s.issueInitialWorkerCredentials(context.Background(), task, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2 个 LLM capability(chat+image) + 1 个 control capability。
+	if len(set.JTIs) != 3 {
+		t.Fatalf("credential set JTIs = %d, want 3", len(set.JTIs))
+	}
+	var document map[string]any
+	if err := json.Unmarshal(files.JSON, &document); err != nil {
+		t.Fatal(err)
+	}
+	imageBlock, ok := document["image_gen"].(map[string]any)
+	if !ok {
+		t.Fatalf("image_gen block missing: %#v", document["image_gen"])
+	}
+	if imageBlock["model"] != "gpt-image-2" {
+		t.Fatalf("image_gen model = %#v", imageBlock["model"])
+	}
+	if _, ok := document["platform_native_oai_provider_3_config"]; !ok {
+		t.Fatalf("chat session config missing for dual-capability provider")
+	}
+	// image binding 不进 chat mixin; 单 provider 无 mixin。
+	if _, ok := document["mixin_config"]; ok {
+		t.Fatalf("single provider must not produce mixin_config")
+	}
+	// image_gen 块的 token 是 llm.image capability(与 chat session token 不同)。
+	chatToken := document["platform_native_oai_provider_3_config"].(map[string]any)["apikey"]
+	imageToken := imageBlock["apikey"]
+	if chatToken == imageToken {
+		t.Fatal("chat and image bindings must use distinct capability tokens")
+	}
+}
+
 func TestIssueProviderCapabilitiesAcceptsExactLifetimeCoverage(t *testing.T) {
 	provider := testProvider(1, 1, domain.ProviderNativeOAI, true)
 	source := &fakeLLMProviderSource{providers: []domain.LLMProvider{provider}}
@@ -302,7 +356,7 @@ func TestIssueProviderCapabilitiesAcceptsExactLifetimeCoverage(t *testing.T) {
 	}
 	s := &scheduler{cfg: SchedulerConfig{
 		LLMProvider: source, TokenIssuer: issuer, LLMProxyAddr: "http://127.0.0.1:9999",
-		ConfigRoot: t.TempDir(),
+		ConfigRoot:         t.TempDir(),
 		ModelPolicyVersion: "test.v1", MaxTaskWallClock: taskWallClock, TokenRefreshSkew: refreshSkew,
 	}}
 	task := domain.Task{ID: "task-lifetime", SessionKey: "personal:1"}

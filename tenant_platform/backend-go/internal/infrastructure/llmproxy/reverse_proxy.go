@@ -139,20 +139,26 @@ func sanitizeUpstreamResponse(response *http.Response) error {
 	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
 		// Phase B 托管形态(安全审查项, 方案 §2): 生图响应无既有上限——
 		// MaxWorkerRequestBytes 仅限请求体, DisableCompression 大 JSON 原样
-		// 传输。20MiB 图片 b64 后 ≈27MB + JSON 开销, 按 Content-Length
-		// 前置拒绝(上限 32MiB 留余量); 超限 fail-closed, 不透传超限体。
+		// 传输。20MiB 图片 b64 后 ≈27MB + JSON 开销, 上限 32MiB 留余量。
+		// 双闸: ①Content-Length 前置拒绝(同步 JSON 响应恒有); ②chunked
+		// (Content-Length=-1) 流式计数, 超限中断连接 fail-closed(审查 W3)。
+		// path 用 HasSuffix 判断——provider base URL 可带自定义前缀
+		// (/proxy/v1/images/generations), 固定前缀匹配会静默失效。
 		if requestContext, ok := proxyContext(response.Request); ok && requestContext.Target != nil {
 			path := requestContext.Target.Path
-			if (path == "/v1/images/generations" || path == "/images/generations") &&
-				response.ContentLength > maxImageResponseBytes {
-				_ = response.Body.Close()
-				slog.Warn("llmproxy: image response exceeds size limit",
-					"content_length", response.ContentLength, "limit", maxImageResponseBytes)
-				response.Body = io.NopCloser(strings.NewReader(sanitizedImageTooLargeBody))
-				response.StatusCode = http.StatusBadGateway
-				response.ContentLength = int64(len(sanitizedImageTooLargeBody))
-				response.Header.Set("Content-Type", "application/json")
-				response.Header.Set("Content-Length", strconv.Itoa(len(sanitizedImageTooLargeBody)))
+			if isImageGenerationsPath(path) {
+				if response.ContentLength > maxImageResponseBytes {
+					_ = response.Body.Close()
+					slog.Warn("llmproxy: image response exceeds size limit",
+						"content_length", response.ContentLength, "limit", maxImageResponseBytes)
+					response.Body = io.NopCloser(strings.NewReader(sanitizedImageTooLargeBody))
+					response.StatusCode = http.StatusBadGateway
+					response.ContentLength = int64(len(sanitizedImageTooLargeBody))
+					response.Header.Set("Content-Type", "application/json")
+					response.Header.Set("Content-Length", strconv.Itoa(len(sanitizedImageTooLargeBody)))
+				} else if response.ContentLength < 0 {
+					response.Body = &imageResponseGuard{src: response.Body, limit: maxImageResponseBytes}
+				}
 			}
 		}
 		return nil
@@ -196,9 +202,55 @@ func rebuildAllowedResponseHeaders(headers http.Header) {
 }
 
 // maxImageResponseBytes 生图响应体上限(安全审查项): 20MiB 交付上限 b64
-// 膨胀 ~1.37 + JSON 结构开销, 32MiB 留余量。仅按 Content-Length 前置
-// 判定(同步 JSON 响应恒有); chunked 流式(-1)不在本层约束(生图走同步)。
+// 膨胀 ~1.37 + JSON 结构开销, 32MiB 留余量。双闸: ①同步 JSON 响应按
+// Content-Length 前置判定; ②chunked(Content-Length=-1) 由
+// imageResponseGuard 流式计数, 超限中断连接 fail-closed(审查 W3)。
 const maxImageResponseBytes = 32 * 1024 * 1024
+
+// isImageGenerationsPath 判断上游目标路径是否为生图端点。用 HasSuffix
+// 而非固定前缀匹配——provider base URL 可带自定义前缀(如
+// https://host/proxy/v1), 此时 target.Path = /proxy/v1/images/generations。
+func isImageGenerationsPath(path string) bool {
+	return strings.HasSuffix(path, "/images/generations")
+}
+
+// errImageResponseTooLarge 是 chunked 生图响应超限时的连接中断信号。
+var errImageResponseTooLarge = errors.New("image response exceeds size limit")
+
+// imageResponseGuard 流式计数 body 读取; 累计超过上限即关闭上游 body 并
+// 返回 errImageResponseTooLarge——ReverseProxy 拷贝循环中止, 客户端收到
+// 截断的 chunked 响应(ConnectionError/JSON 解析失败), 上游超限体不透传。
+// GA 侧 20MiB 落盘前检查是交付安全的第二道闸; 本层拦带宽/内存峰值。
+type imageResponseGuard struct {
+	src    io.ReadCloser
+	limit  int64
+	read   int64
+	closed bool
+}
+
+func (g *imageResponseGuard) Read(p []byte) (int, error) {
+	if g.closed {
+		return 0, io.EOF
+	}
+	n, err := g.src.Read(p)
+	if n > 0 {
+		g.read += int64(n)
+		if g.read > g.limit {
+			_ = g.src.Close()
+			g.closed = true
+			return 0, errImageResponseTooLarge
+		}
+	}
+	return n, err
+}
+
+func (g *imageResponseGuard) Close() error {
+	if g.closed {
+		return nil
+	}
+	g.closed = true
+	return g.src.Close()
+}
 
 const sanitizedImageTooLargeBody = `{"code":"IMAGE_RESPONSE_TOO_LARGE","message":"image response exceeds size limit"}`
 

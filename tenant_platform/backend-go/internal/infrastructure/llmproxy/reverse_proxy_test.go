@@ -2,6 +2,7 @@ package llmproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -467,7 +468,7 @@ func TestCapabilityBindingRejectsStaleOrMismatchedProvider(t *testing.T) {
 				ProviderType: provider.ProviderType, Model: provider.Model, PolicyVersion: "p1",
 				TaskID: "task-1", RunnerGeneration: 1,
 				Operation: "llm.chat",
-				Budget:   `{"max_turns":8}`,
+				Budget:    `{"max_turns":8}`,
 			}
 			test.mutate(provider, &spec)
 			token := harness.issueToken(t, spec)
@@ -516,7 +517,7 @@ func TestCapabilityBindingAcceptsGAClaudeOneMillionContextModel(t *testing.T) {
 				ProviderType: provider.ProviderType, Model: provider.Model, PolicyVersion: "p1",
 				TaskID: "task-1", RunnerGeneration: 1,
 				Operation: "llm.chat",
-				Budget:   `{"max_turns":8}`,
+				Budget:    `{"max_turns":8}`,
 			})
 			response := proxyRequest(
 				t, context.Background(), harness.proxy.Client(), http.MethodPost,
@@ -605,6 +606,74 @@ func TestSanitizeImageResponseOverLimit(t *testing.T) {
 	}
 	ctx := context.WithValue(resp.Request.Context(), proxyRequestContextKey{}, &proxyRequestContext{
 		Target: &url.URL{Path: "/v1/images/generations"},
+	})
+	resp.Request = resp.Request.WithContext(ctx)
+	if err := sanitizeUpstreamResponse(resp); err != nil {
+		t.Fatalf("sanitizeUpstreamResponse: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "IMAGE_RESPONSE_TOO_LARGE") {
+		t.Fatalf("body = %q", string(body))
+	}
+}
+
+// TestSanitizeImageResponseChunkedCounting: chunked(Content-Length=-1)
+// 生图响应由 imageResponseGuard 流式计数——超限时 Read 返回中断错误,
+// 上游超限体不透传(审查 W3 双闸②)。
+func TestSanitizeImageResponseChunkedCounting(t *testing.T) {
+	oversized := make([]byte, maxImageResponseBytes+4096)
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		ContentLength: -1,
+		Body:          io.NopCloser(bytes.NewReader(oversized)),
+		Header:        make(http.Header),
+		Request:       &http.Request{},
+	}
+	ctx := context.WithValue(resp.Request.Context(), proxyRequestContextKey{}, &proxyRequestContext{
+		Target: &url.URL{Path: "/v1/images/generations"},
+	})
+	resp.Request = resp.Request.WithContext(ctx)
+	if err := sanitizeUpstreamResponse(resp); err != nil {
+		t.Fatalf("sanitizeUpstreamResponse: %v", err)
+	}
+	guard, ok := resp.Body.(*imageResponseGuard)
+	if !ok {
+		t.Fatalf("body = %T, want *imageResponseGuard", resp.Body)
+	}
+	buf := make([]byte, 64*1024)
+	total := 0
+	var readErr error
+	for {
+		n, err := guard.Read(buf)
+		total += n
+		if err != nil {
+			readErr = err
+			break
+		}
+	}
+	if readErr != errImageResponseTooLarge {
+		t.Fatalf("read err = %v, want errImageResponseTooLarge (total=%d)", readErr, total)
+	}
+	if total > int(maxImageResponseBytes)+64*1024 {
+		t.Fatalf("total read = %d, exceeded limit", total)
+	}
+}
+
+// TestSanitizeImageResponseCustomBasePrefix: provider base URL 带自定义
+// 前缀时(/proxy/v1/images/generations)上限仍生效——HasSuffix 判断(审查 W3)。
+func TestSanitizeImageResponseCustomBasePrefix(t *testing.T) {
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		ContentLength: maxImageResponseBytes + 1,
+		Body:          io.NopCloser(strings.NewReader("huge")),
+		Header:        make(http.Header),
+		Request:       &http.Request{},
+	}
+	ctx := context.WithValue(resp.Request.Context(), proxyRequestContextKey{}, &proxyRequestContext{
+		Target: &url.URL{Path: "/proxy/v1/images/generations"},
 	})
 	resp.Request = resp.Request.WithContext(ctx)
 	if err := sanitizeUpstreamResponse(resp); err != nil {

@@ -37,10 +37,10 @@ type RuntimeProviderBinding struct {
 }
 
 type RuntimeMCPServer struct {
-	ServerID       string   `json:"server_id"`
-	Name           string   `json:"name"`
-	URL            string   `json:"url"`
-	TimeoutSeconds int      `json:"timeout_seconds"`
+	ServerID       string `json:"server_id"`
+	Name           string `json:"name"`
+	URL            string `json:"url"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
 	// Transport 接入方式(http | stdio); 省略 = http。stdio 服务器由
 	// Worker 沙箱内进程宿主拉起, 不需要 url/proxy。
 	Transport string   `json:"transport,omitempty"`
@@ -127,18 +127,36 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 			"capability_token": strings.TrimSpace(input.Sophub.CapabilityToken),
 		}
 	}
-	seen := make(map[int64]struct{}, len(input.Providers))
+	// bindingKey 按 (provider ID, 能力维度) 去重——双能力 provider(chat+image)
+	// 签两个 token 产生两个 binding, 同 ID 不同能力是合法组合(审查 S4/W6
+	// 补测暴露: 原按 ID 去重会让双能力 provider 的 runtime config 必然失败)。
+	type bindingKey struct {
+		id  int64
+		cap domain.ProviderCapability
+	}
+	seen := make(map[bindingKey]struct{}, len(input.Providers))
 	mixinNames := make([]string, 0, len(input.Providers))
 	imageBound := false
+	chatBound := false
 	for _, binding := range input.Providers {
 		provider := binding.Provider
-		if _, exists := seen[provider.ID]; exists {
-			return RuntimeConfigFiles{}, fmt.Errorf("duplicate provider id %d", provider.ID)
-		}
-		seen[provider.ID] = struct{}{}
 		if err := validateRuntimeBinding(binding); err != nil {
 			return RuntimeConfigFiles{}, err
 		}
+		effectiveCap := binding.Capability
+		if effectiveCap == "" {
+			// 兼容存量构造(binding 未标能力): 按 provider 能力自动归类。
+			if provider.HasCapability(domain.ProviderCapabilityImage) {
+				effectiveCap = domain.ProviderCapabilityImage
+			} else {
+				effectiveCap = domain.ProviderCapabilityChat
+			}
+		}
+		key := bindingKey{provider.ID, effectiveCap}
+		if _, exists := seen[key]; exists {
+			return RuntimeConfigFiles{}, fmt.Errorf("duplicate provider id %d for capability %q", provider.ID, effectiveCap)
+		}
+		seen[key] = struct{}{}
 		// Phase B 托管形态(2026-08-14 定稿): image 能力 binding 写 image_gen
 		// 块(GA resolve_image_gen 读取), **不进 chat mixin**——生图是角色
 		// 分离不是同能力故障转移。v1 只支持单 image provider(fail-closed)。
@@ -151,11 +169,11 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 				return RuntimeConfigFiles{}, fmt.Errorf("image capability requires native_oai provider")
 			}
 			document["image_gen"] = map[string]any{
-				"name":       "openai",
-				"apibase":    strings.TrimRight(proxyBase.String(), "/") + "/v1",
-				"apikey":     binding.Token,
-				"model":      provider.Model,
-				"stream":     false,
+				"name":        "openai",
+				"apibase":     strings.TrimRight(proxyBase.String(), "/") + "/v1",
+				"apikey":      binding.Token,
+				"model":       provider.Model,
+				"stream":      false,
 				"max_retries": 2,
 			}
 			imageBound = true
@@ -169,6 +187,13 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 		}
 		document[variableName] = config
 		mixinNames = append(mixinNames, runtimeName)
+		chatBound = true
+	}
+	// 审查 W6: 至少一个 chat 能力 provider——image-only 部署(全部 provider
+	// 仅 image)会产出无对话 session 的 runtime config, GA 沙箱无对话模型、
+	// 任务必然失败且无清晰报错。fail-fast 于签发时刻。
+	if !chatBound {
+		return RuntimeConfigFiles{}, fmt.Errorf("at least one chat-capable provider is required")
 	}
 	if len(mixinNames) > 1 {
 		document["mixin_config"] = map[string]any{"llm_nos": mixinNames}

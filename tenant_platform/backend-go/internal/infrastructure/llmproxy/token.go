@@ -33,8 +33,8 @@ const (
 	// MCPAudience 是 Runner → Platform MCP proxy 的 capability audience。
 	// 与 Sophub 同模式: Runner 访问外部 HTTP MCP Server 经 Platform 受控
 	// 代理(key 平台侧持有 + 配额计量), server_id → URL 映射即白名单。
-	MCPAudience = "ga-mcp-proxy"
-	CapabilityType = "ga-llm-cap+jwt"
+	MCPAudience      = "ga-mcp-proxy"
+	CapabilityType   = "ga-llm-cap+jwt"
 	validationLeeway = 30 * time.Second
 )
 
@@ -59,7 +59,8 @@ type CapabilitySpec struct {
 	TaskID           string
 	RunnerGeneration uint64
 	// Operation 是允许的操作(方案 §7: capability 必须包含操作):
-	// "llm.chat" / "sophub.search" / "sophub.install"。
+	// "llm.chat" / "llm.image" / "sophub.search" / "sophub.install"
+	// (Phase B 托管形态: llm.image 由 OperationImage 常量签发, 见 handler.go)。
 	Operation string
 	// Budget 是预算描述(方案 §7: capability 必须包含预算), 采用与
 	// RuntimePolicy 一致的 JSON 片段(如 {"max_turns":N,"max_output_bytes":N});
