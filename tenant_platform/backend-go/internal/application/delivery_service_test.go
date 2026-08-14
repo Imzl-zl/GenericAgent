@@ -954,10 +954,11 @@ func TestDeleteExpiredMediaAssetsRetention(t *testing.T) {
 	}
 }
 
-// TestDeliveryServiceSpoolMediaTypeUsesRelPath 回归(2026-08-14 事故根因):
-// spool 引用行此前漏设 deliveryFile.relPath → mediaTypeForPath("") 回退
-// "file" → 生成图全部走 file_item 原始上传 → CDN 节流超时 → 死信, 用户
-// 永远收不到图。spool 行的媒体类型必须来自 DB rel_path(.png → image)。
+// TestDeliveryServiceSpoolMediaTypeUsesAuditPath 回归(2026-08-14 事故根因):
+// 媒体类型分类源 = auditPath(两个分支都按构造设置的 workspace 相对路径),
+// 而非 relPath(spool 分支为空 → mediaTypeForPath("") 回退 "file" → 生成图
+// 全部走 file_item 原始上传 → CDN 节流超时 → 死信)。spool 行的 .png 必须
+// 以 image 发送; auditPath 缺失必须 fail-closed(结构不变量)。
 func TestDeliveryServiceSpoolMediaTypeUsesRelPath(t *testing.T) {
 	ctx, svc, deps := setupDeliveryService(t)
 	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
@@ -985,6 +986,41 @@ func TestDeliveryServiceSpoolMediaTypeUsesRelPath(t *testing.T) {
 	}
 	if got := deps.transport.sentFiles[0].MediaType; got != "image" {
 		t.Fatalf("spool png media type = %q, want image (root cause 2026-08-14)", got)
+	}
+}
+
+// TestDeliveryServiceFilePartRequiresAuditPath 结构不变量: auditPath 缺失的
+// 文件 part 必须在 payload 构建期 fail-closed(PAYLOAD_BUILD_FAILED), 不
+// 能静默以 file 发送(2026-08-14 事故根因形态)。
+func TestDeliveryServiceFilePartRequiresAuditPath(t *testing.T) {
+	ctx, svc, deps := setupDeliveryService(t)
+	deps.tasks.task = domain.Task{ID: "t1", RequesterID: 1, TerminalAt: ptr(time.Now().UTC())}
+	deps.bots.bot = boundBot(1)
+	deps.results.payload = domain.ResultPayload{Ref: "ref:1", Digest: "sha256:a", Body: []byte("see [FILE:outputs/ok.png]")}
+	spoolAbs := filepath.Join(svc.snapshotDir, "capture", "t1", "hash_ok.png")
+	if err := os.MkdirAll(filepath.Dir(spoolAbs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(spoolAbs, []byte("png"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	deps.store.files = []domain.DeliveryFile{{
+		Marker: "outputs/ok.png", FileName: "ok.png",
+		RelPath: "outputs/ok.png", Digest: "sha256:b", SizeBytes: 3,
+		SpoolPath: "capture/t1/hash_ok.png",
+	}}
+	// 篡改 store: 返回的 rel_path 为空(模拟污染行/未来分支漏设)
+	deps.store.files[0].RelPath = ""
+	deps.store.pending = []domain.Delivery{{DeliveryID: "t1:task_complete", TaskID: "t1", DeliveryType: domain.DeliveryTaskComplete, PayloadRef: "ref:1", PayloadDigest: "sha256:a"}}
+
+	if err := svc.tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(deps.transport.sentFiles) != 0 {
+		t.Fatalf("expected no sends when auditPath missing, got %+v", deps.transport.sentFiles)
+	}
+	if len(deps.store.deadLetters) != 1 || deps.store.deadLetters[0].Code != "PAYLOAD_BUILD_FAILED" {
+		t.Fatalf("expected PAYLOAD_BUILD_FAILED dead-letter, got %+v", deps.store.deadLetters)
 	}
 }
 

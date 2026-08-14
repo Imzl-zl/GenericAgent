@@ -454,7 +454,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				if file.snapshotContent {
 					mediaCtx, mcancel := context.WithTimeout(ctx, deliveryMediaSendTimeout)
 					defer mcancel()
-					return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.relPath))
+					return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, file.absPath, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.auditPath))
 				}
 				// 安全发送(方案 §6): 打开校验(O_NOFOLLOW + fstat + 大小上限)
 				// 后复制到 Platform 私有快照, transport 发送不可变快照,
@@ -466,7 +466,7 @@ func (s *deliveryService) process(ctx context.Context, d domain.Delivery, now ti
 				defer os.Remove(snap)
 				mediaCtx, mcancel := context.WithTimeout(ctx, deliveryMediaSendTimeout)
 				defer mcancel()
-				return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, snap, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.relPath))
+				return s.cfg.Transport.SendFile(mediaCtx, bot.BotUUID, replyTarget, snap, file.displayName, deliveryClientID(partKey), mediaTypeForPath(file.auditPath))
 			},
 			sendErrorCode: "SEND_FILE_FAILED",
 		})
@@ -591,9 +591,12 @@ func (s *deliveryService) clearUnjournaledPart(key string) {
 type deliveryFile struct {
 	absPath         string // 可发送文件的完整路径(Platform 私有快照或捕获期 spool)
 	root            string // absPath 的受限根(OpenBeneath 用)
-	relPath         string // root 相对路径(OpenBeneath 用)
+	relPath         string // root 相对路径(OpenBeneath 用, 仅内容快照分支)
 	displayName     string
-	auditPath       string // workspace 内相对路径(消息媒体审计, 审查 R5-I3)
+	auditPath       string // workspace 内相对路径: 媒体类型分类 + 消息媒体审计
+	// (2026-08-14 事故根因重构: 分类源从 relPath 移到 auditPath——前者
+	// spool 分支按构造为空, mediaTypeForPath("") 回退 file 导致生成图
+	// 全部走 file_item; 后者两个分支都必然设置, 结构上不可能再漏。)
 	snapshotContent bool   // true = 内容来自成功事务捕获, 直接发送
 	spoolPath       string // 非空 = 捕获期 spool 引用(保留, 不随 payload 清理)
 }
@@ -675,11 +678,6 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 				}
 				out.Files = append(out.Files, deliveryFile{
 					absPath:         spoolAbs,
-					// 2026-08-14 事故根因(交付死信): 此处漏设 relPath → 发送时
-					// mediaTypeForPath(file.relPath) 对空串回退 "file" → 图片
-					// 全部走 file_item 原始 1.4MB 上传 → CDN 节流超时 → 死信。
-					// relPath 同时承载媒体类型分类源(OpenBeneath 仅快照分支用)。
-					relPath:         filepath.FromSlash(f.RelPath),
 					displayName:     sanitizeDeliverableDisplayName(f.FileName, f.RelPath),
 					auditPath:       f.RelPath,
 					snapshotContent: true,
@@ -712,6 +710,16 @@ func (s *deliveryService) buildPayload(ctx context.Context, d domain.Delivery, t
 				displayName: sanitizeDeliverableDisplayName(f.FileName, f.RelPath),
 				auditPath:   f.RelPath, snapshotContent: true,
 			})
+		}
+		// 结构不变量(2026-08-14 事故重构): auditPath 是媒体类型分类的唯一
+		// 来源且两个分支都按构造设置; 任何新分支漏设 auditPath 必须在此
+		// fail-closed(PAYLOAD_BUILD_FAILED), 而不是静默降级为 file 发送
+		// ——后者正是 2026-08-14 生成图全部走 file_item 死信的根因形态。
+		for _, f := range out.Files {
+			if f.auditPath == "" {
+				removePayloadFiles(out)
+				return deliveryPayload{}, errors.New("delivery file part missing auditPath (media classification source)")
+			}
 		}
 		return out, nil
 	case domain.DeliveryTaskFailed:
