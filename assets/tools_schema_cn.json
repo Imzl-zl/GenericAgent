@@ -69,5 +69,15 @@
     "name": "start_long_term_update",
     "description": "准备开始提炼记忆。发现值得长期记忆的信息（环境事实/用户偏好/避坑经验）时调用此工具。已记忆更新或在自主流程内时无需调用。超15轮完成的任务必须调用以沉淀经验",
     "parameters": {"type": "object", "properties": {}}}
-  }
+  },
+  {"type": "function", "function": {
+    "name": "image_gen",
+    "description": "通过独立生图模型生成图片（OpenAI images/generations 兼容协议）。需要创作/生成图片时使用。返回 [FILE:outputs/<name>] 标记；**你必须在最终回复中逐字包含 [FILE:outputs/<name>] 标记行** 才能触发图片交付给用户（工具返回标记本身不等于交付发生）。size/quality 合法取值依上游模型而定：dall-e 系列无 1536x1024、无 output_format；gpt-image 系列全支持。n<=4。",
+    "parameters": {"type": "object", "properties": {
+      "prompt": {"type": "string", "description": "画面描述（必填）"},
+      "size": {"type": "string", "enum": ["1024x1024", "1536x1024", "1024x1536", "auto"], "description": "画布尺寸；合法性依模型而定（dall-e-3 无 1536x1024）"},
+      "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "质量等级；gpt-image 系列"},
+      "n": {"type": "integer", "minimum": 1, "maximum": 4, "description": "生成数量（1-4）"},
+      "output_format": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "输出格式；仅 gpt-image 系列（dall-e 无 output_format）"},
+      "model": {"type": "string", "description": "可选模型覆盖"}}}}}
 ]

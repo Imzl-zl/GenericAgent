@@ -1680,7 +1680,7 @@ _XML_TOOL_RE = re.compile(
     r'<('
     r'code_run|file_read|file_write|file_patch|'
     r'web_scan|web_execute_js|web_search|'
-    r'update_working_checkpoint|start_long_term_update|ask_user|'
+    r'update_working_checkpoint|start_long_term_update|ask_user|image_gen|'
     r'tool_use|tool_result|tool_call|all_urls'
     r')>(.*?)</\1>',
     re.DOTALL)

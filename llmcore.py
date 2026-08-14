@@ -435,7 +435,13 @@ def _stamp_oai_cache_markers(messages, model):
         if isinstance(c, str):
             messages[idx] = {**messages[idx], 'content': [{'type': 'text', 'text': c, 'cache_control': {'type': 'ephemeral'}}]}
         elif isinstance(c, list) and c:
-            c = list(c); c[-1] = dict(c[-1], cache_control={'type': 'ephemeral'})
+            # cache_control 只落在 text 块(最后块可能是 image_url/image 块,
+            # 审查 I-4 连带: 图片任务首轮最后块是图, 标记须落在前面的文本)。
+            c = list(c)
+            for i in range(len(c) - 1, -1, -1):
+                if isinstance(c[i], dict) and c[i].get('type') == 'text':
+                    c[i] = dict(c[i], cache_control={'type': 'ephemeral'})
+                    break
             messages[idx] = {**messages[idx], 'content': c}
 
 def _stream_with_retry(sess, url, headers, payload, parse_fn):
@@ -709,12 +715,38 @@ class ClaudeSession(BaseSession):
         msgs = _drop_unsigned_thinking([{"role": m['role'], "content": list(m['content'])} for m in raw_list])
         user_idxs = [i for i, m in enumerate(msgs) if m['role'] == 'user']
         for idx in user_idxs[-2:]:
-            msgs[idx]["content"][-1] = dict(msgs[idx]["content"][-1], cache_control={"type": "ephemeral"})
+            content = msgs[idx]["content"]
+            # cache_control 只落在 text 块(最后块可能是 image 块, 审查 I-4)。
+            for i in range(len(content) - 1, -1, -1):
+                block = content[i]
+                if isinstance(block, dict) and block.get('type') == 'text':
+                    content[i] = dict(block, cache_control={"type": "ephemeral"})
+                    break
         return msgs
 
 class LLMSession(BaseSession):
     def raw_ask(self, messages): return (yield from _openai_stream(self, messages))
     def make_messages(self, raw_list): return _msgs_claude2oai(_fix_messages(raw_list))
+
+def _claude_image_block(b):
+    """OpenAI image_url 块 → Claude image 块(data URL 语义对等)。
+
+    2026-08-14 审查 I-4: 双轨制语义分裂——NativeClaudeSession/
+    ClaudeSession 走 Anthropic 协议, 注入层产出的 image_url 块原样发送
+    必然上游 400/丢图(仅 native_oai 通道经 _msgs_claude2oai 透传可用)。
+    外部 URL(非 data:)不转换, 透传由上游决定。"""
+    if not isinstance(b, dict) or b.get('type') != 'image_url':
+        return b
+    url = (b.get('image_url') or {}).get('url', '')
+    if not isinstance(url, str) or not url.startswith('data:'):
+        return b
+    try:
+        meta, b64 = url[5:].split(',', 1)
+        media_type = (meta.split(';')[0] or 'image/png').strip()
+    except (ValueError, TypeError):
+        return b
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
+
 
 def _fix_messages(messages):
     if not messages: return messages
@@ -750,7 +782,18 @@ def _fix_messages(messages):
                 else: rest.append(b)
             m['content'] = [got.get(u) or {"type": "tool_result", "tool_use_id": u, "content": "(error)"} for u in prev_uses] + rest
             prev_uses = []
-    for m in merged: m['content'] = [b for b in m['content'] if not (isinstance(b, dict) and b.get('type') == 'text' and not (b.get('text') or '').strip())] or [{"type": "text", "text": "."}]
+    for m in merged:
+        converted = []
+        for b in m['content']:
+            # I-4: user 消息的 image_url 块统一转 Claude image 块(Anthropic
+            # 协议通道必需); OAI 通道经 _msgs_claude2oai 转回 image_url,
+            # 往返一致, 无行为变化。
+            if m['role'] == 'user':
+                b = _claude_image_block(b)
+            if isinstance(b, dict) and b.get('type') == 'text' and not (b.get('text') or '').strip():
+                continue
+            converted.append(b)
+        m['content'] = converted or [{"type": "text", "text": "."}]
     return merged
 
 class NativeClaudeSession(BaseSession):
@@ -800,7 +843,13 @@ class NativeClaudeSession(BaseSession):
         user_idxs = [i for i, m in enumerate(messages) if m['role'] == 'user']
         for idx in user_idxs[-2:]:
             messages[idx] = {**messages[idx], "content": list(messages[idx]["content"])}
-            messages[idx]["content"][-1] = dict(messages[idx]["content"][-1], cache_control={"type": "ephemeral"})
+            # cache_control 只落在 text 块(最后块可能是 image 块, 审查 I-4)。
+            content = messages[idx]["content"]
+            for i in range(len(content) - 1, -1, -1):
+                block = content[i]
+                if isinstance(block, dict) and block.get('type') == 'text':
+                    content[i] = dict(block, cache_control={"type": "ephemeral"})
+                    break
         url = auto_make_url(self.api_base, "messages") + '?beta=true'
         parse_fn = (lambda r: _parse_claude_sse(r.iter_lines())) if self.stream else (lambda r: _parse_claude_json(r.json()))
         return (yield from _stream_with_retry(self, url, headers, payload, parse_fn))
@@ -868,6 +917,22 @@ class MockResponse:
         self.stop_reason = 'tool_use' if tool_calls else stop_reason
     def __repr__(self):    
         return f"<MockResponse thinking={bool(self.thinking)}, content='{self.content}', tools={bool(self.tool_calls)}>"
+
+def _flatten_prompt_content(content):
+    """协议通道(ToolClient)拍平 content 为文本: image/image_url 块降级为
+    占位字符串。2026-08-14 审查 S-1: 旧实现 str(list) 把整段 base64 文本
+    垃圾注入提示词/历史/日志(每轮重发最多 ~3.5MB, 模型却看不到图)。保持
+    list repr 形态, 仅图片块替换, 文本块格式零变化。"""
+    if not isinstance(content, list):
+        return str(content)
+    parts = []
+    for b in content:
+        if isinstance(b, dict) and b.get('type') in ('image', 'image_url'):
+            parts.append('{"type": "image", "note": "[image omitted: protocol channel has no vision]"}')
+        else:
+            parts.append(str(b))
+    return str(parts)
+
 
 class ToolClient:
     def __init__(self, backend, auto_save_tokens=True):
@@ -937,11 +1002,13 @@ Follow these steps to think and act:
             role = "USER" if m['role'] == 'user' else "ASSISTANT"
             user += f"=== {role} ===\n"
             for tr in m.get('tool_results', []): user += f'<tool_result>{tr["content"]}</tool_result>\n'
-            user += str(m['content']) + "\n"
+            # S-1: 协议通道无视觉, image 块降级为占位(不再 str() 输出 base64)。
+            flat = _flatten_prompt_content(m['content'])
+            user += flat + "\n"
             # Round16-G2: 只累计本条消息增量(原实现把累积拼接的整个 user
             # 字符串重复相加, O(n²) 虚高——10 条 1000 字符消息即越过 9000
             # 阈值, 导致 last_tools 频繁重置、工具描述每轮重新注入)。
-            self.total_cd_tokens += len(str(m['content'])) // 3
+            self.total_cd_tokens += len(flat) // 3
         if self.total_cd_tokens > 9000: self.last_tools = ''
         user += "=== ASSISTANT ===\n" 
         return system + user
@@ -1242,3 +1309,301 @@ def fast_ask(prompt, cfg_name):
     sess = resolve_session(cfg_name)
     if not sess: raise ValueError(f"fast_ask: '{cfg_name}' unsupported")
     return "".join(sess.raw_ask([{"role": "user", "content": prompt}]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 生图能力（Phase B image_gen，2026-08-14 定稿）
+#
+# 设计真值: .tasks/im-media-pipeline/PHASE_B_IMAGE_GEN_PLAN.zh-CN.md §3-§8
+# 双形态设计: 直连/托管 = 配置差异(apibase/apikey 指向不同端点), 一份代码
+# (对齐 BaseSession 先例: chat 直连与平台托管共用一份实现)。v1 实施直连
+# 形态: apibase = 真实上游/中转网关 + 真实密钥; 托管形态(llm-proxy +
+# llm.image 能力令牌)为终态设计, 按需实施时 GA 侧协议代码零改动。
+#
+# 实现进 llmcore.py, 严禁新增 imagegen.py —— 沙箱 overlay 只物化固定清单
+# (runtime_overlay.py LEGACY_MODULES), 新增模块导致平台沙箱启动
+# ImportError 全平台任务失败(二轮审查 I-1)。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 重试退避集合: 仿 _stream_with_retry(447-487)语义, 生图返回体是 JSON 非文本流
+# 不直接复用该函数。
+_IMAGE_GEN_RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 529}
+# Go 交付上限 image ≤20MiB (delivery_capture.go fail-closed): 客户端 url 直下
+# 兜底也在此限流; ga.py 落盘前同值检查(从本模块导入, 单一真值)。
+_IMAGE_GEN_MAX_BYTES = 20 * 1024 * 1024
+
+
+class BaseImageGenClient:
+    """生图客户端基类。只解析生图所需配置子集
+    {apibase/apikey/model/stream/timeout/read_timeout/max_retries/proxy/verify},
+    不照抄 BaseSession 的 chat 专属字段(context_win/thinking 等)。"""
+
+    def __init__(self, cfg):
+        self.name = cfg.get('name', 'image_gen')
+        self.api_key = cfg.get('apikey', '')
+        self.api_base = str(cfg.get('apibase', '')).rstrip('/')
+        self.model = cfg.get('model', '')
+        if not self.api_base or not self.api_key or not self.model:
+            raise ValueError('image_gen 配置不完整: 需要 apibase/apikey/model')
+        self.stream = bool(cfg.get('stream', False))
+        self.max_retries = max(0, int(cfg.get('max_retries', 2)))
+        self.max_retry_after = float(cfg.get('max_retry_after', 60.0))
+        self.connect_timeout = max(1, int(cfg.get('timeout', 10)))
+        self.read_timeout = max(5, int(cfg.get('read_timeout', 120)))
+        proxy = cfg.get('proxy')
+        self.proxies = {"http": proxy, "https": proxy} if proxy else None
+        self.verify = cfg.get('verify', True)
+        self.http = _build_http_session()
+
+    def _is_dalle(self):
+        ml = self.model.lower()
+        return 'dall-e' in ml or 'dalle' in ml
+
+    def _endpoint(self):
+        return auto_make_url(self.api_base, 'images/generations')
+
+    def _headers(self):
+        return {"Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"}
+
+    def _payload(self, prompt, size=None, quality=None, n=None, output_format=None, model=None, stream=None):
+        payload = {"model": model or self.model, "prompt": prompt, "n": int(n or 1)}
+        # new-api 类中转实测(2026-08-14): size 必传(图片尺寸计费), 缺省会
+        # 500 "图片尺寸计费需要传 size"。默认 1024x1024 = OpenAI 官方默认值,
+        # 对 dall-e/gpt-image/gemini-image 全部兼容。个别模型(sensenova 系)
+        # size 集合特殊(无 1024x1024), 由错误文本诚实引导模型改传。
+        payload["size"] = size or "1024x1024"
+        if quality:
+            payload["quality"] = quality
+        # 二轮审查 I-3: response_format/output_format 仅 dall-e 系列发送——
+        # gpt-image 恒返回 b64_json, 发 response_format 可能 400, 废掉默认
+        # 同步路径; dall-e-3 无 output_format 概念, 同样裁剪。
+        if self._is_dalle():
+            payload["response_format"] = "b64_json"
+        elif output_format:
+            payload["output_format"] = output_format
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    def _delay(self, resp, attempt):
+        """仿 _stream_with_retry 退避: retry-after 头优先, 超上限不重试;
+        否则指数退避 1.5*2^attempt, 夹在 [0.5, 30]s。"""
+        try:
+            ra = float((resp.headers or {}).get("retry-after"))
+        except (TypeError, ValueError):
+            ra = None
+        return None if ra is not None and ra > self.max_retry_after else max(0.5, ra if ra is not None else min(30.0, 1.5 * (2 ** attempt)))
+
+    def _post(self, payload, stream=False):
+        """带重试语义的 POST(仿 _stream_with_retry: 429/408/5xx 退避集合 +
+        retry-after 上限)。stream=True 返回打开的响应对象(调用方负责
+        close), 否则返回解析后的 dict。失败返回 (None, err_text), 错误
+        文本统一 [Error: image_gen ...] 前缀(§6.5, 绝不用 !!!Error:)。"""
+        url = self._endpoint()
+        headers = self._headers()
+        for attempt in range(self.max_retries + 1):
+            resp = None
+            try:
+                resp = self.http.post(url, headers=headers, json=payload, stream=stream,
+                                      timeout=(self.connect_timeout, self.read_timeout),
+                                      proxies=self.proxies, verify=self.verify)
+                if resp.status_code >= 400:
+                    body = ""
+                    try:
+                        body = resp.text.strip()[:500]
+                    except Exception:
+                        pass
+                    d = None
+                    if resp.status_code in _IMAGE_GEN_RETRYABLE and attempt < self.max_retries:
+                        d = self._delay(resp, attempt)
+                        if d is not None:
+                            print(f"[ImageGen Retry] HTTP {resp.status_code}, retry in {d:.1f}s ({attempt+1}/{self.max_retries+1})")
+                            time.sleep(d)
+                            resp.close()
+                            resp = None
+                            continue
+                    hint = " (retry-after > cap)" if resp.status_code in _IMAGE_GEN_RETRYABLE and d is None and attempt < self.max_retries else ""
+                    return None, f"[Error: image_gen HTTP {resp.status_code}{hint}" + (f": {body}" if body else "") + "]"
+                if stream:
+                    return resp, None
+                try:
+                    return resp.json(), None
+                except ValueError:
+                    return None, "[Error: image_gen 响应不是合法 JSON]"
+            except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+                if attempt < self.max_retries:
+                    d = self._delay(None, attempt)
+                    print(f"[ImageGen Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{self.max_retries+1})")
+                    time.sleep(d)
+                    continue
+                return None, (f"[Error: image_gen {type(e).__name__}: {e}]" if str(e) else f"[Error: image_gen {type(e).__name__}]")
+            except Exception as e:
+                return None, f"[Error: image_gen {type(e).__name__}: {e}]"
+            finally:
+                if resp is not None and not stream:
+                    resp.close()
+        return None, "[Error: image_gen 重试耗尽]"
+
+    def _extract_images(self, data):
+        """从同步响应 {data:[{b64_json|url}]} 提取 bytes 列表。
+        优先 b64_json(OpenAI/gemini 系); 实测(2026-08-14)部分中转模型
+        (sensenova/agnes)只返回 url 直链——b64_json 为空时 url 直下兜底,
+        下载超限/失败报错。空响应/双缺失 → 错误文本, 绝不返回空列表让
+        调用方误报成功(§6.5)。"""
+        items = (data or {}).get("data") or []
+        if not items:
+            return None, "[Error: image_gen 空响应 (data 为空数组/缺失)]"
+        images = []
+        for it in items:
+            it = it or {}
+            b64 = it.get("b64_json") or ""
+            if b64:
+                try:
+                    images.append(base64.b64decode(b64))
+                    continue
+                except Exception:
+                    return None, "[Error: image_gen b64 解码失败]"
+            url = it.get("url") or ""
+            if not url:
+                return None, "[Error: image_gen 响应缺少 b64_json 与 url 字段]"
+            raw, err = self._download(url)
+            if err:
+                return None, err
+            images.append(raw)
+        return images, None
+
+    def _download(self, url):
+        """url 直下兜底(部分中转只回直链): 流式读取, 超 20MiB 中止。
+        公网直链无需鉴权头。返回 (bytes|None, err_text)。"""
+        try:
+            resp = self.http.get(url, stream=True, timeout=(self.connect_timeout, self.read_timeout),
+                                 proxies=self.proxies, verify=self.verify)
+        except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+            return None, f"[Error: image_gen 图片直链下载失败 {type(e).__name__}: {e}]"
+        if resp.status_code >= 400:
+            resp.close()
+            return None, f"[Error: image_gen 图片直链下载失败 HTTP {resp.status_code}]"
+        chunks = []
+        total = 0
+        try:
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                total += len(chunk)
+                if total > _IMAGE_GEN_MAX_BYTES:
+                    return None, "[Error: image_gen 图片直链超过 20MiB 交付上限]"
+                chunks.append(chunk)
+        except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+            return None, f"[Error: image_gen 图片直链下载中断 {type(e).__name__}: {e}]"
+        finally:
+            resp.close()
+        if total == 0:
+            return None, "[Error: image_gen 图片直链下载为空]"
+        return b"".join(chunks), None
+
+    def generate(self, prompt, size=None, quality=None, n=1, output_format=None, model=None):
+        """统一入口: 同步路径恒可用; cfg stream=true 时先走 SSE 流式路径,
+        失败自动降级重试一次同步路径(§6.5)。返回 (images|None, err_text)。"""
+        if self.stream and int(n or 1) <= 1 and not self._is_dalle():
+            # 流式仅 gpt-image 系列: dall-e 不支持 stream/partial_images
+            frame, err = self.generate_stream(prompt, size=size, quality=quality, n=n,
+                                              output_format=output_format, model=model)
+            if frame is not None:
+                return [frame], None
+            print(f"[ImageGen] 流式路径失败({err}), 降级重试同步路径一次")
+            images, sync_err = self._generate_sync(prompt, size=size, quality=quality, n=n,
+                                                   output_format=output_format, model=model)
+            if sync_err:
+                return None, sync_err
+            return images, None
+        return self._generate_sync(prompt, size=size, quality=quality, n=n,
+                                   output_format=output_format, model=model)
+
+    def _generate_sync(self, prompt, size=None, quality=None, n=1, output_format=None, model=None):
+        """同步路径: POST {apibase}/images/generations → b64_json/url → bytes 列表。"""
+        payload = self._payload(prompt, size=size, quality=quality, n=n,
+                                output_format=output_format, model=model, stream=False)
+        data, err = self._post(payload, stream=False)
+        if err:
+            return None, err
+        return self._extract_images(data)
+
+    def generate_stream(self, prompt, size=None, quality=None, n=1, output_format=None, model=None):
+        """流式路径(仅 gpt-image 系列): stream:true + partial_images:0-3 SSE
+        → 取最终帧。失败(SSE 解析失败/超时/无最终帧/收到非流式 JSON)由
+        generate() 降级同步路径一次。返回 (final_frame_bytes|None, err_text)。"""
+        payload = self._payload(prompt, size=size, quality=quality, n=n,
+                                output_format=output_format, model=model, stream=True)
+        payload["partial_images"] = 0  # 0=只要最终帧; 1-3=含渐进帧(不落盘)
+        resp, err = self._post(payload, stream=True)
+        if err:
+            return None, err
+        ctype = (resp.headers or {}).get("content-type", "") or ""
+        if "event-stream" not in ctype and "json" in ctype:
+            # 中转网关把 SSE 折叠回普通 JSON(方案 §5): 直接按同步响应解析,
+            # 避免二次请求重复计费。
+            try:
+                data = resp.json()
+            except ValueError:
+                return None, "[Error: image_gen 流式响应非 SSE 亦非 JSON]"
+            finally:
+                resp.close()
+            images, err2 = self._extract_images(data)
+            if err2:
+                return None, err2
+            return images[0], None
+        final_frame = None
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(data_str)
+                except ValueError:
+                    continue  # 兼容注释/空 data 行
+                if not isinstance(evt, dict):
+                    continue
+                if evt.get("error"):
+                    em = evt["error"]
+                    msg = em.get("message") if isinstance(em, dict) else str(em)
+                    return None, f"[Error: image_gen 流式错误: {msg}]"
+                d0 = (evt.get("data") or [{}])[0] or {}
+                if isinstance(d0, dict) and d0.get("b64_json"):
+                    final_frame = d0["b64_json"]  # 最终帧: 非最终帧无 b64_json
+        except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError, ValueError) as e:
+            return None, f"[Error: image_gen 流式中断 {type(e).__name__}: {e}]"
+        finally:
+            resp.close()
+        if not final_frame:
+            return None, "[Error: image_gen 流式响应无最终帧]"
+        try:
+            return base64.b64decode(final_frame), None
+        except Exception:
+            return None, "[Error: image_gen b64 解码失败]"
+
+
+class OpenAIImageGenClient(BaseImageGenClient):
+    """OpenAI images/generations 兼容协议实现(直连/托管通用)。
+    v1 唯一实现; 未来协议(fal/sdwebui/comfyui)加子类, resolve_image_gen 分派。"""
+
+
+_IMAGE_GEN_SUPPORTED = ('openai', 'oai')
+
+
+def resolve_image_gen(name='image_gen'):
+    """命名分派工厂(仿 resolve_session)。读 mykeys[name](经
+    reload_mykeys()); 未配置抛 ValueError —— 由 do_image_gen 捕获并返回
+    错误文本, 绝不裸抛穿透 dispatch(agent_loop 只捕 StopIteration)。"""
+    cfg = reload_mykeys()[0].get(name)
+    if not cfg:
+        raise ValueError(f"Config '{name}' not in mykey")
+    kind = str(cfg.get('name', '') or '').strip().lower()
+    if not kind or kind in _IMAGE_GEN_SUPPORTED:
+        return OpenAIImageGenClient(cfg)
+    raise ValueError(f"image_gen: 不支持的客户端类型 {kind!r} (v1: openai/oai)")

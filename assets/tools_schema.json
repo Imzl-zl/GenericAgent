@@ -69,5 +69,15 @@
     "name": "start_long_term_update",
     "description": "Start distilling long-term memory. Call when discovering info worth remembering (env facts/user prefs/lessons learned). Skip if memory already updated or in autonomous flow. Must call when a task that took 15+ turns is completed",
     "parameters": {"type": "object", "properties": {}}}
-  }
+  },
+  {"type": "function", "function": {
+    "name": "image_gen",
+    "description": "Generate images via a dedicated image model (OpenAI images/generations compatible). Use for image creation requests. Returns [FILE:outputs/<name>] marker(s); **you MUST include the [FILE:outputs/<name>] marker line(s) verbatim in your final reply** to trigger file delivery to the user (the tool returning the marker alone does not deliver). size/quality legal values depend on upstream model: dall-e series has no 1536x1024 and no output_format; gpt-image series supports all. n<=4.",
+    "parameters": {"type": "object", "properties": {
+      "prompt": {"type": "string", "description": "Image description (required)"},
+      "size": {"type": "string", "enum": ["1024x1024", "1536x1024", "1024x1536", "auto"], "description": "Canvas size; legality depends on model (dall-e-3: no 1536x1024)"},
+      "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "Quality level; gpt-image series"},
+      "n": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Number of images (1-4)"},
+      "output_format": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "Output format; gpt-image series only (dall-e has no output_format)"},
+      "model": {"type": "string", "description": "Optional model override"}}}}}
 ]

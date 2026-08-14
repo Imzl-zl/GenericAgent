@@ -38,7 +38,45 @@ B4 8MiB+bytea / B5 QQ 主动消息路径）与重要项（I2 content_type、I4 �
 | S1 | GA 图片超预算跳过时向用户显式占位（失败诚实） | 根测试占位断言 |
 | S2 | `buildPayload` spool 路径 Clean + 逃逸前缀校验（纵深防御） | 逃逸死信单测 |
 
-## 有意推迟（决策 D6）
+## 有意推迟（决策 D6，已被 D1 取代）
 
-- **T8 Phase B 生图**：无真实用户需求证据。llm-proxy `llm.image` capability 扩展（Operation 枚举 + 路由 + 响应上限）建议在生图需求出现时随 B 期一起做（一次变更窗口）。
+- ~~T8 Phase B 生图：无真实用户需求证据，llm-proxy `llm.image` capability 扩展建议随 B 期一起做~~。
+- **2026-08-14 D1 用户拍板（取代 D6）**：T8 不再整体推迟——**v1 实施直连形态**（GA 侧 image_gen 工具 + ImageGenClient，平台侧零改动）；**托管形态**（llm-proxy `images/generations` 代理 + `llm.image` capability + provider 能力类型维度 + policy 放行 + openapi/web 同步）转为**终态设计，有真实需求时实施**。
 - 建议项 S1 后半（GA 注入前 PIL 解码失败丢弃而非原样透传）与 S3（媒体链路日志）未做，成本低可随时补。
+
+## Phase B：生图（2026-08-14 定稿 + GA 侧直连形态 v1 实施）
+
+> 方案真值：`PHASE_B_IMAGE_GEN_PLAN.zh-CN.md`（两轮 fresh-context 审查通过 + D1 拍板，§9.5/§9.6 审查结论）。
+> 设计真值：`tenant_platform/docs/IM_MEDIA_ARCHITECTURE.zh-CN.md` §6（B1-B5 + D1 已勾选，§6.3 失败语义摘要）。
+
+**D1 定位更新（替代原"有意推迟 D6"表述）**：直连形态先行（v1 实施），托管为终态设计（v1 不实施）——ImageGenClient 双形态设计（一份代码，配置决定形态）；平台侧（llm-proxy/policy/provider）一律不动，平台模式 v1 有意不可用生图（policy deny-by-default 无死工具暴露）。
+
+| 子任务 | 内容 | 验证 |
+|---|---|---|
+| T8.1 | 文档回写（§6/§9/§10/§11 + PROGRESS） | 二轮文档评审结论已回写 |
+| T8.2 | llmcore：BaseImageGenClient + OpenAIImageGenClient + resolve_image_gen（配置子集解析/同步 b64 路径/gpt-image SSE 流式路径/仿 _stream_with_retry 重试/流式失败自动降级同步一次） | tests/test_image_gen.py |
+| T8.3 | ga.py do_image_gen（第 10 原子工具）+ tools_schema ×2 + mykey_template 配置块 | 工具形态仿 do_file_write/do_code_run |
+| T8.4 | mock 单测 + 本地 CLI 闭环（配置真实/中转 key → ga CLI 生图 → temp/outputs/ 出图；错误路径未配置时模型收到错误文本） | `python -m pytest tests -q` 全绿 |
+
+**实施约束（定稿硬要求）**：①实现进 llmcore.py，严禁新增 imagegen.py（沙箱 overlay 固定清单 LEGACY_MODULES，新增模块 = 平台沙箱 ImportError）；②错误文本统一 `[Error: image_gen ...]`，绝不用 `!!!Error:`（触发 do_no_tool 致命判定链）；③response_format 仅 dall-e 系列发送（gpt-image 恒 b64_json，发该参数可能 400）；④落盘走 self.cwd/outputs/（不硬编码 script_dir），前置 ≤20MiB 检查；⑤agent_loop/Phase A 交付链/worker-python/backend-go/contracts 零改动。
+
+**验证**：根 pytest 全绿（78 项，含 test_image_gen.py 30 项）。**真实 key 闭环已实测（2026-08-14）**：new-api 中转（newapi.myovo.cc.cd）双渠道五模型——gpt-image-2 完整 CLI 闭环成功（模型自动调 image_gen → temp/outputs/ 出图 2.6MB PNG → 最终回复回显 [FILE:] marker）；agnes-image-2.1-flash 验证 url 直下兜底（1.8MB PNG）；探测确认 gemini-3-pro-image / gemini-3.1-flash-image-preview 返回 b64_json、sensenova-u1-fast 只回 url（size 集合特殊）。**实测驱动的客户端适配**：①size 缺省默认 1024x1024（中转计费必传）；②b64_json 为空时 url 直下兜底（≤20MiB 限流）。**残余风险（待实测）**：流式 SSE 稳定性（保持 stream=False）、n>1 兼容性（透传+错误诚实）、IM 端到端收图需真实渠道凭据冒烟；**Step 2 上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json）。
+
+## 2026-08-14 二次审查优化（IM_MEDIA_ARCHITECTURE 审查结论落地）
+
+只读全量审查发现 5 重要 + 7 建议, 按推荐全部落地(除需真实凭据的渠道冒烟):
+
+| 项 | 内容 | 落点 |
+|---|---|---|
+| I-1 | media_downloader `_validate_url` 空白名单 = 拒绝全部(fail-closed)——docstring 承诺与实现曾相反(漏传白名单即放行任意 https 主机) | media_downloader.py + fail-closed 回归测试 |
+| I-2 | 图片注入预算按**降采样后实际字节**判定(旧口径按原始文件大小估算, 大图降采样后本可注入却被误杀, 与 1568px 降采样意图互相抵消); 原始 3MB 上限保留为解码防御 | agent_loop.py media_content_blocks + 2 回归测试 |
+| I-3 | InboundCoalescingBuffer 从微信扩展到 QQ/飞书/钉钉/企微(基类统一 `deliver_inbound` + 事件渠道定时器 flush + 锁防双投)——修复"图消息与后续文本拆两任务、文本任务 media=null"追问语义断裂; 命令消息不延迟 | poller_server.py BotAdapter/五渠道 + 5 测试 |
+| I-4 | `_fix_messages` 把 image_url 块转 Claude image 块(Anthropic 协议通道此前原样发送必 400/丢图); cache_control 只落 text 块(3 处) | llmcore.py + 6 测试 |
+| I-5 | 设计文档勾选态/状态表/残余风险同步(A1-A3 勾选、§5 标题、§9 出站行、§11 已解决项移除) | IM_MEDIA_ARCHITECTURE.zh-CN.md |
+| S-1 | 协议通道(ToolClient)拍平时 image 块降级占位——不再把 base64 文本垃圾注入提示词/历史/日志(每轮重发最多 3.5MB) | llmcore.py `_flatten_prompt_content` + 2 测试 |
+| S-2 | llm-proxy `image_blocks` 计数兼容 Claude `{"type":"image"}` 块(原只数 image_url, native_claude 通道恒计 0 误导排障) | llmproxy/handler.go |
+| S-3 | `load_llm_sessions` 对未匹配 session 类型的配置名显式 WARN(原静默跳过, /llms 缺项无提示) | agentmain.py |
+| S-4 | 非图片扩展名媒体跳过时打日志(原静默 continue) | agent_loop.py |
+
+验证: 根 48 + bot_poller 91 + worker-python 144 + Go 全量(真实 TEST_DATABASE_URL) 全绿。
+残余风险(需真实凭据, 未变): 钉钉 file/video downloadCode 上传流、企微 token 端点、QQ 分片 4 步冒烟、飞书 media 视频。

@@ -16,4 +16,8 @@ T4.4,T4,Go delivery MIME 分发: transport.SendFile 加 mediaType + mediaTypeFor
 T5,,Phase C 前置: 出站存储改 spool 引用(DB 只存路径/摘要) + per-type 上限,done,migration 0057 spool_path + capture 流式复制 + per-type 上限(image 20M/video 100M/file 8M
 T6,,MediaItem.content_type 字段(proto 变更窗口,done,MediaItem.content_type=5 + generate_bindings + Go 链路透传 + inferMessageType 分 image/video; 契约测试自动比对通过
 T7,,媒体留存策略: poller media_root 清理 + media_assets 保留期(决策 D7),done,Go: media_assets 90d 保留期(delivery tick 24h 节流清理) + poller media_root 90d mtime 清扫(daemon 24h, BOT_POLLER_MEDIA_RETENTION_DAYS 可调); 与 spool 30d 清扫同模式
-T8,,Phase B: 生图 image_gen + llm-proxy llm.image(决策 D6),blocked,可推迟
+T8,,Phase B: 生图 image_gen(D1 定稿 2026-08-14: 直连先行, 托管为终态设计),done,"原 blocked(可推迟)由 D1 取代; 拆分 T8.1-T8.4; 托管部分(llm-proxy llm.image)按需实施"
+T8.1,T8,文档回写: IM_MEDIA_ARCHITECTURE §6/§9/§10/§11 + PROGRESS Phase B 段,done,§6 B1-B5+D1 勾选细化 + §6.3 失败语义摘要 + §9 生图行 ✅ + §10 Phase B 行 + §11 生图残余风险 3 条
+T8.2,T8,GA 客户端: llmcore BaseImageGenClient + OpenAIImageGenClient + resolve_image_gen,done,进 llmcore.py(严禁新模块, 沙箱 overlay 固定清单); 配置子集解析 + 同步/流式路径 + 仿 _stream_with_retry 重试 + 流式降级同步
+T8.3,T8,do_image_gen 工具 + tools_schema ×2 + mykey_template 配置块,done,第 10 原子工具; [Error: image_gen] 前缀/20MiB 前置检查/self.cwd 落盘/时间戳防覆盖; schema 描述含 marker 回显提示; mykey 模板双形态注释
+T8.4,T8,单测 test_image_gen.py + 本地 CLI 闭环,done,CI 安全约束 mock(无真实密钥): 请求形状/落盘/marker/4xx5xx/空响应/流式中断/超限/未配置/n=2

@@ -20,11 +20,12 @@
   - 已知数据问题（非本轮引入）：channel_configs 两条 wechat 绑定（08-08 写入）明文是 iLink 凭据字符串（`xxx@im.bot:yyy`）非 JSON，RestoreActiveBots 恢复时 poller client marshal 失败（日志 ERROR bot_lifecycle: restore channel failed）——良性不阻塞启动，待用户确认后清理/迁移
 - **wechat 频道恢复（2026-08-12）**：channel_configs 两条 wechat 绑定（08-08 写入，明文为 iLink 凭据字符串非 JSON）经格式迁移恢复——重加密为 `{"token": ...}`（备份 /tmp/wechat_plaintext_backup.txt）+ 重建 bot-poller 镜像（生产 poller 一直是旧 /start 契约 bot_token 顶层字段，89081f2 改 config_json 后 8-11 部署未重建 poller，两边失配才导致 marshal 失败）；恢复后两条 restored channel 无 ERROR
 - **web 镜像滞后修复（2026-08-12）**：8-11 部署时 web 镜像未重建（停在 08-08 构建），8-10/8-11 的界面改动（IM 渠道绑定页/企微卡片/MCP 治理面板）全缺失，用户看到旧“微信绑定”菜单——重建后含企业微信/渠道绑定/MCP 面板；同批排查：sandbox-manager 镜像旧但代码无改动（无影响）、ga-runner 旧但 0751a6d 仅影响宿主机场景（容器内无影响）。**教训：部署必须全量重建（make build），选择性重建会漏镜像（前有 bot-poller 契约失配，后有 web 界面滞后）**
-- 最后更新：2026-08-13（时区统一 + IM 多模态结构化链路 + 渠道切换答疑）
+- 最后更新：2026-08-14（Phase B 生图 image_gen v1 直连形态实施：10 原子工具 + ImageGenClient + 单测 26 全绿）
 
 ## 已完成能力
 
-- 根框架：自主执行循环 `agent_loop.py`（~100 行）+ 9 原子工具 + L0-L4 分层记忆系统 + 能力自扩展（code_run 动态装包/建工具）
+- **生图能力（2026-08-14，Phase B v1 直连形态）**：`image_gen` 第 10 原子工具 + llmcore `ImageGenClient`（BaseImageGenClient/OpenAIImageGenClient/resolve_image_gen，实现进 llmcore.py 严禁新增模块——沙箱 overlay 固定清单）+ OpenAI images/generations 兼容协议（同步 b64 默认路径 + gpt-image SSE 流式可选路径，流式失败自动降级同步一次）+ outputs/ 落盘（self.cwd 相对路径 + 前置 ≤20MiB 检查）+ `[FILE:]` marker 走 Phase A 出站链；**双形态设计**：直连（v1，真实上游+密钥）/托管（终态设计按需，llm-proxy `llm.image`）是配置差异一份代码；平台模式 v1 无生图（policy deny-by-default 无死工具暴露）；错误语义统一 `[Error: image_gen ...]`（绝不用 `!!!Error:`）；response_format 仅 dall-e 发送（gpt-image 恒 b64_json）。设计真值：`.tasks/im-media-pipeline/PHASE_B_IMAGE_GEN_PLAN.zh-CN.md` + `IM_MEDIA_ARCHITECTURE.zh-CN.md` §6
+- 根框架：自主执行循环 `agent_loop.py`（~100 行）+ 10 原子工具 + L0-L4 分层记忆系统 + 能力自扩展（code_run 动态装包/建工具）
 - 多前端：TUI（tui_v3）、Streamlit、桌面端、IM 机器人（TG/QQ/飞书/微信/企微/钉钉）、conductor
 - 租户平台：Go 后端（api/application/domain/infrastructure 分层）+ gRPC Python worker + React/Vite Web + bot poller + 契约（proto/openapi/policy）
 - IM 多渠道（2026-08-10）：对话单元分桶（workspace 共享 + 每群/私聊一桶 + /new 桶级化）+ 渠道绑定（微信扫码 + 飞书/钉钉/QQ 凭据表单，凭据 JSON 加密入库）
@@ -44,6 +45,7 @@
 - **旧实现漂移清理（2026-08-12）**：runner 创建/校验双面同步（protectedRunnerEnvKeys 补 GA_OVERLAY_ROOT + 4 缓存 env、inspect wantEnv 补 GA_OVERLAY_ROOT、pkg cache env 配套校验）；4 个渠道 SDK 调用面容器内逐项实证（全 PASS）；qqapp.py 旧属性名探测清理；Go 18 包 + poller 52 测试全绿，已部署
 - **IM 真实渠道连通（2026-08-12 修复部署）**：bot-poller 已补 4 渠道 SDK + 修复 botpy/lark_oapi API 兼容；**QQ 已 ready（用户已加 IP 白名单 23.94.23.150，WS 连接成功）、飞书 ws started ✓**；钉钉/企微 SDK API 已静态验证兼容，无凭据未实测
 - im-channel-binding epic 仅剩**真实渠道冒烟**（需用户提供飞书/钉钉/QQ/企微应用凭据；企微重点=SEND_MSG 主动流式帧是否被服务端接受）
+- **image_gen 生图（2026-08-14 已编码 + 真实 key 闭环已验）**：new-api 中转实测——gpt-image-2 完整 CLI 闭环成功（temp/outputs/ 出图 + marker 回显）、agnes-image-2.1-flash url 直下兜底验证、gemini-3-pro-image/gemini-3.1-flash-image-preview/sensenova-u1-fast 探测确认兼容（sensenova 只回 url + size 集合特殊）；**IM 端到端收图待渠道凭据冒烟**；流式 SSE 稳定性与 n>1 兼容性待真实上游实测（同步路径恒可用，stream 建议保持 False）
 - im-streaming-delivery epic 仅剩**真实渠道冒烟**（需用户提供凭据；重点=飞书编辑链路 + QQ 流式帧序列参数实测）
 - 有意遗留（不产生功能缺陷，已评估）：C5 delivery_service 834 行未拆（纯结构债）；bundle 多文件 SOP 平台侧不支持（sophub 平台已上线 bundle，平台 proxy 有意收窄为 single-file，若需用要加支持）
 - 残余验证（需真实 Linux 主机 + Docker/runsc）：runsc 运行时、mTLS 注入、六服务 compose 冒烟、共享卷跨 UID

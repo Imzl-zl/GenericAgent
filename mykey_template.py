@@ -21,6 +21,10 @@
 #      含 'mixin'                          → MixinSession           → 多 session 故障转移
 #                                                                      NativeClaudeSession 与
 #                                                                      NativeOAISession 可混用
+#      image_gen(独立 dict, 见下方配置块)  → 非 Session              → 生图工具 image_gen
+#        说明: 不进 /llms 会话列表、不进 mixin 故障转移、不经 llm-proxy
+#        (v1 直连形态); 变量名刻意不含 api/config/cookie 子串以免被本
+#        扫描误判为 Session。
 #
 #  工具调用一律走 API 原生 tool 字段（function calling），与 Claude Code /
 #  Codex 行为一致。Anthropic 协议渠道用 native_claude_*，OpenAI 兼容渠道用
@@ -310,4 +314,37 @@ mixin_config = {
 #     'public_key': 'pk-lf-...',
 #     'secret_key': 'sk-lf-...',
 #     'host': 'https://cloud.langfuse.com',   # 或自托管地址
+# }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  生图配置（Phase B image_gen，2026-08-14 定稿）
+# ══════════════════════════════════════════════════════════════════════════
+#  独立于 chat Session 的生图模型配置（模型决策 → image_gen 工具 →
+#  OpenAI images/generations 兼容 API → outputs/ 落盘 → [FILE:] 出站交付）。
+#
+#  ⚠️ 变量名必须叫 image_gen，不得含 config/api/cookie 子串——agentmain 的
+#  会话扫描按这些子串判断 Session，误判会 WARN（agentmain.py load_llm_sessions）。
+#  本配置不是 Session：不进 /llms 列表、不进 mixin 故障转移、不走 llm-proxy
+#  （v1 直连形态）。
+#
+#  双形态设计（一份代码，配置决定形态）：
+#  ① 直连形态（v1 实施）：apibase = 真实上游/中转网关，apikey = 真实密钥。
+#  ② 托管形态（终态设计，v1 不实施）：apibase = llm-proxy 地址，apikey =
+#     llm.image capability 能力令牌——GA 侧协议代码零改动，仅配置不同；
+#     平台侧（llm-proxy 路由/policy/provider）届时随托管实施一起放行。
+#
+#  不配置本块时 image_gen 工具返回错误文本（[Error: image_gen 未配置…]），
+#  不会崩溃。取消注释并填入真实密钥后生效。
+# image_gen = {
+#     'name': 'openai',                      # resolve_image_gen 分派关键字（v1: openai/oai）
+#     'apibase': 'https://api.openai.com/v1',  # 直连：真实上游/中转网关；托管（终态）：llm-proxy 地址 + 能力令牌
+#     'apikey': 'sk-<your-image-api-key>',   # 直连：真实密钥；托管（终态）：llm.image capability token
+#     'model': 'gpt-image-1',                # 独立生图模型，与对话模型无关
+#     'stream': False,                       # 可选：True 时走 gpt-image SSE 渐进细化（取最终帧），失败自动降级同步一次
+#     # 'timeout': 10,                       # 可选：连接超时秒数（默认 10）
+#     # 'read_timeout': 120,                 # 可选：读超时秒数（默认 120）
+#     # 'max_retries': 2,                    # 可选：429/408/5xx 退避重试次数（默认 2）
+#     # 'proxy': 'http://127.0.0.1:2082',    # 可选：单客户端代理
+#     # 'verify': True,                      # 可选：TLS 校验（默认 True）
 # }

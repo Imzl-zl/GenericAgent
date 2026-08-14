@@ -7,7 +7,14 @@ if sys.stderr is None: sys.stderr = open(os.devnull, "w")
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agent_loop import BaseHandler, StepOutcome, json_default
+from llmcore import resolve_image_gen, _IMAGE_GEN_MAX_BYTES
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Phase B 生图(2026-08-14 定稿): Go 交付上限 image ≤20MiB 是 fail-closed
+# 任务失败(delivery_capture.go)——工具侧落盘前前置检查, 不能等到提交时刻
+# 才爆。错误文本统一 [Error: image_gen ...] 前缀(绝不用 !!!Error:,
+# 会触发 do_no_tool 致命判定/LLM_FAILED 链)。上限常量从 llmcore 导入
+# (客户端 url 直下兜底同值限流, 单一真值)。
 
 # 审查 C2 (Round8): 多租户 Runner 按 workspace 复用, code_run 派生的后台进程若跨任务
 # 存活, 可窃取下一任务的 capability 凭据或继续写工作区。模块级注册表登记每个
@@ -680,6 +687,68 @@ class GenericAgentHandler(BaseHandler):
         try: return len(re.findall(r'\[ \]', open(p, encoding='utf-8', errors='replace').read()))
         except: return None
     
+    def do_image_gen(self, args, response):
+        '''调用独立生图模型生成图片(OpenAI images/generations 兼容协议)。
+        产物落盘 self.cwd/outputs/ 并返回 [FILE:outputs/<name>] marker 走
+        Phase A 出站交付链。失败语义见方案 §6.5: 错误统一
+        [Error: image_gen ...] 前缀给模型。'''
+        prompt = str(args.get("prompt") or "").strip()
+        if not prompt:
+            yield "[Action] image_gen: prompt 缺失\n"
+            return StepOutcome("[Error: image_gen prompt 参数缺失，请提供画面描述]", next_prompt="\n")
+        size = args.get("size") or None
+        quality = args.get("quality") or None
+        n = max(1, min(_arg(args, "n", 1, int), 4))  # schema 已限 1-4, 防御夹取
+        output_format = str(args.get("output_format") or "png").strip().lstrip(".")
+        if output_format == "jpg": output_format = "jpeg"
+        model = args.get("model") or None
+        yield f"[Action] image_gen: 生成 {n} 张图 (prompt={smart_format(prompt, 60)!r}, size={size or '默认'}, quality={quality or '默认'}, format={output_format})\n"
+        try:
+            client = resolve_image_gen('image_gen')
+        except ValueError as e:
+            # 未配置: 明确"不要重试", 避免模型空转 3 次才 LLM_FAILED(§6.5)。
+            yield f"[Status] ❌ {e}\n"
+            return StepOutcome(f"[Error: image_gen 未配置 ({e})——不要重试本工具，请直接告知用户生图能力未启用]", next_prompt="\n")
+        try:
+            images, err = client.generate(prompt, size=size, quality=quality, n=n,
+                                          output_format=output_format, model=model)
+        except Exception as e:
+            err = f"[Error: image_gen {type(e).__name__}: {e}]"
+        if err:
+            yield f"[Status] ❌ {err}\n"
+            return StepOutcome(err, next_prompt="\n")
+        out_dir = os.path.join(self.cwd, 'outputs')
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            yield f"[Status] ❌ 无法创建 outputs 目录: {e}\n"
+            return StepOutcome(f"[Error: image_gen 落盘失败: 无法创建 outputs 目录 {e}]", next_prompt="\n")
+        # 落盘前前置检查: 任一张超限 → 整体失败不写部分文件(避免半交付)。
+        for i, b in enumerate(images, 1):
+            if len(b) > _IMAGE_GEN_MAX_BYTES:
+                yield f"[Status] ❌ 第 {i} 张图 {len(b)} bytes 超过 20MiB 交付上限\n"
+                return StepOutcome(f"[Error: image_gen 产物 {len(b)} bytes 超过交付上限 20MiB，任务会失败，请缩小 size/quality 重试]", next_prompt="\n")
+        # 文件名带时间戳(含微秒): 防同任务重复调用同名覆盖(审查盲区 3)。
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        markers = []
+        for i, b in enumerate(images, 1):
+            fname = f"image_{ts}_{i}.{output_format}" if len(images) > 1 else f"image_{ts}.{output_format}"
+            path = os.path.join(out_dir, fname)
+            try:
+                with open(path, 'wb') as f:
+                    f.write(b)
+            except OSError as e:
+                yield f"[Status] ❌ 落盘失败: {e}\n"
+                return StepOutcome(f"[Error: image_gen 落盘失败: {e}]", next_prompt="\n")
+            markers.append(f"outputs/{fname}")
+        marker_text = "\n".join(f"[FILE:{m}]" for m in markers)
+        yield f"[Status] ✅ 已生成 {len(images)} 张图: {marker_text}\n"
+        next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
+        # marker 回显依赖(二轮审查 I-2): 工具返回 marker ≠ 交付发生, 模型
+        # 必须在最终回复中回显 [FILE:...] 才触发交付——next_prompt 再强调。
+        next_prompt += f"\n{marker_text}\n[SYSTEM TIPS] 图片已生成。请在最终回复中包含上述 [FILE:outputs/...] 标记行（原样保留），以触发图片交付给用户。\n"
+        return StepOutcome(marker_text, next_prompt=next_prompt)
+
     def do_update_working_checkpoint(self, args, response):
         '''为整个任务设定后续需要临时记忆的重点。'''
         key_info = args.get("key_info", "")
