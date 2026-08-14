@@ -211,6 +211,19 @@ def test_fit_static_image_for_upload_compresses_oversized_png(tmp_path):
     assert client._fit_static_image_for_upload(str(tmp_path / "nope.bin")) is None
     assert client._fit_static_image_for_upload(str(tmp_path / "missing.png")) is None
 
+    # 源目录只读时仍可适配(mkstemp 落可写临时目录, 2026-08-14 生产实证:
+    # poller 只读 rootfs + 只读 spool 卷, 写源文件旁目录会静默失败回退原图)
+    try:
+        os.chmod(tmp_path, 0o555)
+        ro = tmp_path / "big.png"
+        out_ro = client._fit_static_image_for_upload(str(ro))
+        assert out_ro is not None, "must adapt even when source dir is read-only"
+        assert out_ro.stat().st_size <= client._IMAGE_UPLOAD_MAX_BYTES
+        assert str(out_ro).startswith(str(out_ro.parent))  # 落在可写目录
+        out_ro.unlink(missing_ok=True)
+    finally:
+        os.chmod(tmp_path, 0o755)
+
 
 def test_send_image_adapts_oversized_static_image(tmp_path):
     """send_image 对超限静态图走适配路径(JPEG ≤300KB), 协议调用面不变。"""

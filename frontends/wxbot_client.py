@@ -341,8 +341,16 @@ class WxBotClient:
                 return None  # 动图不转
         except Exception:
             return None
-        out = fp.with_name(f'.fit_{fp.stem}_{os.getpid()}.jpg')
+        out = None
         try:
+            # 适配临时文件必须写在可写目录: 生产 poller 以只读 rootfs 运行,
+            # spool 卷对 poller 只读(只需读取), 写源文件旁目录会静默失败
+            # 回退原图(2026-08-14 生产实证: 超限图未压缩直接上传 → 节流写
+            # 超时 → 死信)。mkstemp 落系统临时目录(/tmp tmpfs, 可写)。
+            import tempfile
+            fd, tmp_name = tempfile.mkstemp(prefix='.fit_', suffix='.jpg')
+            os.close(fd)
+            out = Path(tmp_name)
             bio = BytesIO()
             # 迭代压缩: q90→55 逐档降质, 仍超限再降采样 0.8^N。
             buf = None
