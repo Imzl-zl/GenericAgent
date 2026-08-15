@@ -234,7 +234,7 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
     if code_type in ["python", "py"]:
         tmp_file = tempfile.NamedTemporaryFile(suffix=".ai.py", delete=False, mode='w', encoding='utf-8', dir=code_cwd)
         cr_header = os.path.join(script_dir, 'assets', 'code_run_header.py')
-        if os.path.exists(cr_header): tmp_file.write(open(cr_header, encoding='utf-8').read())
+        if os.path.exists(cr_header): tmp_file.write(Path(cr_header).read_text(encoding='utf-8'))
         tmp_file.write(code)
         tmp_path = tmp_file.name
         tmp_file.close()
@@ -641,8 +641,8 @@ class GenericAgentHandler(BaseHandler):
         try:
             new_content = expand_file_refs(content, base_dir=self.cwd)
             if mode == "prepend":
-                old = open(path, 'r', encoding="utf-8").read() if os.path.exists(path) else ""
-                open(path, 'w', encoding="utf-8", newline=_file_newline(path)).write(new_content + old)
+                old = Path(path).read_text(encoding="utf-8") if os.path.exists(path) else ""
+                Path(path).write_text(new_content + old, encoding="utf-8", newline=_file_newline(path))
             else:
                 with open(path, 'a' if mode == "append" else 'w', encoding="utf-8", newline=_file_newline(path)) as f: f.write(new_content)
             yield f"[Status] ✅ {mode.capitalize()} 成功 ({len(new_content)} bytes)\n"
@@ -684,7 +684,7 @@ class GenericAgentHandler(BaseHandler):
         return plan_path
     def _check_plan_completion(self):
         if not os.path.isfile(p:=self._in_plan_mode() or ''): return None
-        try: return len(re.findall(r'\[ \]', open(p, encoding='utf-8', errors='replace').read()))
+        try: return len(re.findall(r'\[ \]', Path(p).read_text(encoding='utf-8', errors='replace')))
         except: return None
     
     def do_image_gen(self, args, response):

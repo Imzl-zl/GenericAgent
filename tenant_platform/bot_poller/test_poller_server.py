@@ -242,7 +242,8 @@ def test_fit_image_for_upload_channel_format_whitelists(tmp_path):
                               allowed_formats={"JPEG", "PNG"}, animated_ok=False)
     assert w1 is not None
     try:
-        assert Image.open(str(w1)).format == "JPEG"
+        with Image.open(str(w1)) as _im:
+            assert _im.format == "JPEG"
     finally:
         w1.unlink(missing_ok=True)
     assert fit_image_for_upload(str(png), max_bytes=10 << 20,
@@ -252,7 +253,8 @@ def test_fit_image_for_upload_channel_format_whitelists(tmp_path):
                               allowed_formats={"JPEG", "PNG"}, animated_ok=False)
     assert w2 is not None
     try:
-        assert Image.open(str(w2)).format == "JPEG"
+        with Image.open(str(w2)) as _im:
+            assert _im.format == "JPEG"
     finally:
         w2.unlink(missing_ok=True)
 
@@ -261,7 +263,8 @@ def test_fit_image_for_upload_channel_format_whitelists(tmp_path):
                               allowed_formats={"JPEG", "PNG", "GIF", "BMP"}, animated_ok=True)
     assert d1 is not None
     try:
-        assert Image.open(str(d1)).format == "JPEG"
+        with Image.open(str(d1)) as _im:
+            assert _im.format == "JPEG"
     finally:
         d1.unlink(missing_ok=True)
     assert fit_image_for_upload(str(gif), max_bytes=20 << 20,

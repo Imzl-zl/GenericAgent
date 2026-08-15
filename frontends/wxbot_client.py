@@ -58,10 +58,10 @@ def fit_image_for_upload(file_path, *, max_bytes=None, allowed_formats=None, ani
               'oversized uploads will be sent raw', file=sys.stderr)
         return None
     try:
-        im = Image.open(fp)
-        im.load()
-        fmt = (im.format or '').upper()
-        animated = bool(getattr(im, 'is_animated', False))
+        with Image.open(fp) as im:
+            im.load()
+            fmt = (im.format or '').upper()
+            animated = bool(getattr(im, 'is_animated', False))
     except Exception:
         return None
     try:

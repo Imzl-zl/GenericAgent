@@ -17,7 +17,8 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 BANNED_TOOLS = (['ask_user', 'start_long_term_update'] if '--no-user-tools' in sys.argv else [])
 def load_tool_schema(suffix=''):
     global TOOLS_SCHEMA
-    TS = open(os.path.join(script_dir, f'assets/tools_schema{suffix}.json'), 'r', encoding='utf-8').read()
+    with open(os.path.join(script_dir, f'assets/tools_schema{suffix}.json'), 'r', encoding='utf-8') as f:
+        TS = f.read()
     TOOLS_SCHEMA = json.loads(TS if os.name == 'nt' else TS.replace('powershell', 'bash'))
     TOOLS_SCHEMA = [t for t in TOOLS_SCHEMA if t.get('function', {}).get('name') not in BANNED_TOOLS]
 load_tool_schema()
@@ -30,7 +31,10 @@ if not os.path.exists(mem_txt): open(mem_txt, 'w', encoding='utf-8').write('# [G
 mem_insight = os.path.join(mem_dir, 'global_mem_insight.txt')
 if not os.path.exists(mem_insight):
     t = os.path.join(script_dir, f'assets/global_mem_insight_template{lang_suffix}.txt')
-    open(mem_insight, 'w', encoding='utf-8').write(open(t, encoding='utf-8').read() if os.path.exists(t) else '')
+    if os.path.exists(t):
+        with open(t, encoding='utf-8') as f: tmpl = f.read()
+    else: tmpl = ''
+    with open(mem_insight, 'w', encoding='utf-8') as f: f.write(tmpl)
 
 def get_system_prompt():
     with open(os.path.join(script_dir, f'assets/sys_prompt{lang_suffix}.txt'), 'r', encoding='utf-8') as f: prompt = f.read()
@@ -146,7 +150,8 @@ class GenericAgent:
         if _sm := re.match(r'/session\.(\w+)=(.*)', raw_query.strip()):
             k, v = _sm.group(1), _sm.group(2)
             vfile = os.path.join(script_dir, 'temp', v)
-            if os.path.isfile(vfile): v = open(vfile, encoding='utf-8').read().strip()
+            if os.path.isfile(vfile):
+                with open(vfile, encoding='utf-8') as f: v = f.read().strip()
             try: v = json.loads(v)  # cover number parsing
             except (json.JSONDecodeError, ValueError): pass
             setattr(self.llmclient.backend, k, v)
@@ -338,7 +343,8 @@ if __name__ == '__main__':
     elif args.func:
         infile = args.func; outfile = os.path.splitext(args.func)[0] + '.out.txt'
 
-    if histfile and os.path.isfile(histfile): agent.llmclient.backend.history = json.loads(open(histfile, encoding='utf-8').read())
+    if histfile and os.path.isfile(histfile):
+        with open(histfile, encoding='utf-8') as f: agent.llmclient.backend.history = json.loads(f.read())
 
     if args.func or args.task:
         agent.peer_hint = False

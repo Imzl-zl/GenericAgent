@@ -47,6 +47,16 @@ all-frontends = [
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+# 第三方 lark-oapi 自带弃用调用(1.7.2 已最新, 2.0 未发布):
+# 1) well_known_types.py 的 datetime.utcfromtimestamp(3.12 弃用, 仅警告不失效)
+# 2) ws/client.py 的 asyncio.get_event_loop(无当前 loop 时创建全局单例)
+# 两者均为库内代码, 本项目无法修复, 精准忽略保持 CI 输出干净。
+filterwarnings = [
+    'ignore:datetime\.datetime\.utcfromtimestamp:DeprecationWarning:lark_oapi.ws.pb.google.protobuf.internal.well_known_types',
+    'ignore:There is no current event loop:DeprecationWarning:lark_oapi.ws.client',
+]
+
 [tool.setuptools]
 py-modules = []
 packages = ["ga_cli"]
