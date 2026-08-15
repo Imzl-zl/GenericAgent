@@ -83,6 +83,7 @@ def connect(agent, name=None, put_task=None, get_outputs=None, abort=None, fold=
     (text, queue) in agent._hub_inbox so a UI can pop it and echo the task as its own bubble.
     Never raises: a broken hub must not break its host."""
     def _put(text):
+        if not isinstance(text, str): return {'error': 'text must be a string', 'code': 'badop'}
         if getattr(agent, 'is_running', False): return {'error': f'peer {name} is busy', 'code': 'busy'}
         agent._hub_inbox.append({'text': text, 'q': agent.put_task(text, source='hub')})
     try:
@@ -152,7 +153,10 @@ if __name__ == '__main__':
     @app.get('/api/{name}/seg/{i}/{j}')
     async def api_seg(name: str, i: int, j: int, off: int = 0): return out(await ask(name, {'op': 'seg', 'i': i, 'j': j, 'off': off}))
     @app.post('/api/{name}/put')
-    async def api_put(name: str, body: dict): return out(await ask(name, {'op': 'put_task', 'text': body.get('text', '')}))
+    async def api_put(name: str, body: dict):
+        t = body.get('text', '')
+        if not isinstance(t, str): return JSONResponse({'error': 'text must be a string', 'code': 'badop'}, 400)
+        return out(await ask(name, {'op': 'put_task', 'text': t}))
     @app.post('/api/{name}/abort')
     async def api_abort(name: str): return out(await ask(name, {'op': 'abort'}))
     @app.get('/')
