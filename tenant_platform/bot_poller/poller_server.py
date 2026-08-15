@@ -616,6 +616,12 @@ class WeChatAdapter(BotAdapter):
         token = (config or {}).get('token') or ''
         self.client = WxBotClient(token=token, persist=False, base_url=base_url or None)
         self.committed_updates_buf = updates_buf or getattr(self.client, 'updates_buf', '') or ''
+        # 2026-08-15 事故根因修复: iLink 出站 sendmessage 必须携带该用户最新
+        # context_token(会话凭证, 仅入站时刷新)——此前出站恒空串, 会话活跃
+        # 期 tokenless 可发, 会话过期(长时无入站)后 iLink 拒绝 ret=-2 且被
+        # 静默吞掉(假 ack)。这里按 target(ilink_user_id) 缓存最新 token,
+        # 出站自动注入; 内存缓存即可(poller 重启后等用户下一条入站刷新)。
+        self._ctx_tokens: dict[str, str] = {}
         # 合并缓冲由基类统一(_coalescer, 审查 I-3): 微信由长轮询循环驱动
         # flush + 定时器双保险(锁保证不双投)。
 
@@ -662,6 +668,9 @@ class WeChatAdapter(BotAdapter):
         text = self.client.extract_text(msg)
         uid = msg.get('from_user_id', '')
         ctx = msg.get('context_token', '')
+        # 入站 token 即该用户最新会话凭证, 缓存供出站注入(事故根因修复)。
+        if uid and ctx:
+            self._ctx_tokens[uid] = ctx
         media_paths = []
         media_items = []
         if self._media_dir:
@@ -735,19 +744,27 @@ class WeChatAdapter(BotAdapter):
         return self.committed_updates_buf
 
     def send_text(self, target, text, client_id=''):
-        self.client.send_text(target, text, context_token='', client_id=client_id)
+        self.client.send_text(target, text,
+                              context_token=self._ctx_tokens.get(target, ''),
+                              client_id=client_id)
 
     # 统一出站媒体接口(IM_MEDIA_ARCHITECTURE §5.1 A1): iLink 直传无上传步骤,
     # 直接委托 WxBotClient(2026-08-14 独立审查清理: 旧 send_file/send_image/
     # send_video 双签名兼容层无任何调用方, 已删除; send_media 统一分发)。
     def _send_image(self, target, file_path, file_name='', client_id=''):
-        self.client.send_image(target, file_path, context_token='', client_id=client_id)
+        self.client.send_image(target, file_path,
+                               context_token=self._ctx_tokens.get(target, ''),
+                               client_id=client_id)
 
     def _send_file(self, target, file_path, file_name='', client_id=''):
-        self.client.send_file(target, file_path, context_token='', file_name=file_name, client_id=client_id)
+        self.client.send_file(target, file_path,
+                              context_token=self._ctx_tokens.get(target, ''),
+                              file_name=file_name, client_id=client_id)
 
     def _send_video(self, target, file_path, file_name='', client_id=''):
-        self.client.send_video(target, file_path, context_token='', client_id=client_id)
+        self.client.send_video(target, file_path,
+                               context_token=self._ctx_tokens.get(target, ''),
+                               client_id=client_id)
 
 
 

@@ -170,6 +170,22 @@ class WxBotClient:
         r.raise_for_status()
         return r.json()
 
+    def _check_send_resp(self, ep, resp):
+        """出站消息业务级校验(2026-08-15 生产事故根因修复): iLink 对
+        sendmessage/getuploadurl 的业务失败返回 HTTP 200 + 非零错误码,
+        `raise_for_status` 拦不住——此前 send_text/_send_media 直接返回
+        resp, poller 视为成功 → Go delivery acked → 用户没收到却无任何
+        错误痕迹(静默丢消息, 与钉钉 adapter 的 errcode fail-closed 形成
+        对比, 违反"失败路径可见"原则)。与 getupdates 同构: errcode 非
+        0/非 None 抛错; 部分接口(ret 语义, 如 QR 轮询)同时检查 ret。"""
+        errcode = resp.get('errcode')
+        if errcode not in (None, 0):
+            raise RuntimeError(f'{ep} errcode={errcode} {resp.get("errmsg", "")}')
+        ret = resp.get('ret')
+        if ret not in (None, 0):
+            raise RuntimeError(f'{ep} ret={ret}')
+        return resp
+
     # ── QR login (used by GA Core; platform Poller does binding in Go) ──
     def login_qr(self, poll_interval=2):
         d = {}
@@ -240,6 +256,21 @@ class WxBotClient:
         return resp.get('msgs') or []
 
     # ── send text ──
+    def _send_sendmessage(self, body, msg, timeout=15):
+        """sendmessage 统一发送 + 业务级校验 + 过期 token 降级重试。
+
+        2026-08-15 生产事故根因修复(社区实证: iLink 对带过期 context_token
+        的 sendmessage 返回 ret=-2 拒绝, tokenless 在会话活跃期可成功):
+        带 token 失败 ret=-2 时去掉 token 重试一次; 仍失败抛错(fail-closed,
+        由调用方/Poller 上层显形——不再静默假 ack)。"""
+        try:
+            return self._check_send_resp('sendmessage', self._post('ilink/bot/sendmessage', body, timeout=timeout))
+        except RuntimeError as exc:
+            if 'ret=-2' in str(exc) and 'context_token' in msg:
+                del msg['context_token']
+                return self._check_send_resp('sendmessage', self._post('ilink/bot/sendmessage', body, timeout=timeout))
+            raise
+
     def send_text(self, to_user_id, text, context_token='', client_id=None):
         # 审查 round9: client_id 由 Platform 传入稳定幂等键(delivery_id:part),
         # 重试投递同一内容时保持同 id, 供服务端去重; 空值回退随机(兼容旧调用方)。
@@ -249,7 +280,7 @@ class WxBotClient:
                'item_list': [{'type': ITEM_TEXT, 'text_item': {'text': text}}]}
         if context_token:
             msg['context_token'] = context_token
-        return self._post('ilink/bot/sendmessage', {'msg': msg, 'base_info': {'channel_version': VER}})
+        return self._send_sendmessage({'msg': msg, 'base_info': {'channel_version': VER}}, msg)
 
     def send_typing(self, to_user_id, typing_ticket='', cancel=False):
         return self._post('ilink/bot/sendtyping', {
@@ -367,7 +398,7 @@ class WxBotClient:
         # read=10s 同一快速失败语义——否则病理最坏(控制面+CDN 双侧挂起)
         # = 15+83+15 ≈ 113s 超 Go ctx 90s(poller 线程占线由 Go 重试 + 
         # client_id 幂等兜底, 有界非死锁)。
-        resp = self._post('ilink/bot/getuploadurl', body, timeout=(10, 10))
+        resp = self._check_send_resp('getuploadurl', self._post('ilink/bot/getuploadurl', body, timeout=(10, 10)))
         upload_param = resp.get('upload_param', '')
         upload_url = resp.get('upload_full_url', '')
         if not (upload_param or upload_url):
@@ -382,7 +413,7 @@ class WxBotClient:
                'item_list': [{'type': item_type, item_key: item}]}
         if context_token:
             msg['context_token'] = context_token
-        return self._post('ilink/bot/sendmessage', {'msg': msg, 'base_info': {'channel_version': VER}}, timeout=(10, 10))
+        return self._send_sendmessage({'msg': msg, 'base_info': {'channel_version': VER}}, msg, timeout=(10, 10))
 
     def send_file(self, to_user_id, file_path, context_token='', file_name='', client_id=None):
         return self._send_media(to_user_id, file_path, 3, ITEM_FILE, 'file_item', context_token, file_name=file_name, client_id=client_id)
