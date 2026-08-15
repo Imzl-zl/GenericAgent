@@ -369,7 +369,7 @@ class BotAdapter(ABC):
         # 入站窗口合并(2026-08-14 审查 I-3): 全部渠道共用同一缓冲语义——
         # 窗口内同一会话相邻消息(图 + 后续文本)合并为一个任务, 修复
         # “图消息与后续文本拆成两个任务、文本任务 media=null”的追问语义
-        # 断裂。窗口 = 平台 im_inbound_coalesce_window_ms(默认 2500ms,
+        # 断裂。窗口 = 平台 im_inbound_coalesce_window_ms(默认 4000ms,
         # 微信已在用)。事件渠道(QQ/飞书/钉钉/企微)由定时器驱动窗口到期
         # flush, 微信由长轮询循环驱动(无定时器竞态)。所有 flush 路径共用
         # _flush_lock, 防并发双投。命令消息 push 即 flush 不延迟。

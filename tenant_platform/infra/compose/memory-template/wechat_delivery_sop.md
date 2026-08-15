@@ -27,10 +27,14 @@
 工具链（runner 镜像内置，**本地直接执行**）：
 
 - **export_docx（平台工具，2026-08-15 起首选）**：md/html/txt 自动走镜像内
-  pandoc 转换 + 统一中文字体微软雅黑（内部实现见 document_conversion_sop §1/§3），
-  直接调用即可得到排好版的 Word，**无需自己拼 pandoc 命令**。
+  pandoc + 内置中文模板（宋体正文小四/首行缩进/黑体标题/西文 Times New
+  Roman/表格浅蓝表头全框线，2026-08-15 模板化升级，见 document_conversion_sop
+  §1/§3），title 参数自动生成封面标题，转换后自动验证。直接调用即可得到
+  排好版的 Word，**无需自己拼 pandoc 命令**。
 - **pandoc**：md → docx/pdf/html 等格式转换。用法：
   `pandoc 输入.md -o outputs/输出.docx`
+  ⚠️ **裸调=默认模板（丑且无中文排版）**，与 export_docx 内置模板效果
+  不同——除非明确要默认样式，否则用 export_docx 或加模板参数；
   追求更精细样式时生成 reference-doc 模板再转换：
   `pandoc -o /tmp/ref.docx --print-default-data-file reference.docx`
   `pandoc 输入.md -o outputs/输出.docx --reference-doc=/tmp/ref.docx`
@@ -44,7 +48,8 @@
 1. 文档有明确标题层级（封面/大标题 → 章节 → 小节），不是一坨正文
 2. 长文有目录或章节编号，读者能快速定位
 3. 表格有表头样式（底纹/加粗），不是光秃秃的网格
-4. 中文字体明确设置（微软雅黑/等线/楷体），不是默认宋体
+4. 中文字体已按内置模板设置（正文宋体/标题黑体，西文 Times New Roman），
+   不要求也不推荐改字体（模板已达标）
 5. 生成后**实际打开验证**（如用 python-docx 重新读取统计段落/表格数，或转 PDF 检查页数），不能只看脚本"跑成功了"
 
 ## 3. 交付清单（消息 + 文件）

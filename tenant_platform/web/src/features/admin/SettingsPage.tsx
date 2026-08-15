@@ -21,7 +21,7 @@ function errorMessage(error: unknown, fallback: string): string {
 }
 
 export function SettingsPage() {
-  const [windowMs, setWindowMs] = useState('2500');
+  const [windowMs, setWindowMs] = useState('4000');
   const [maxTurns, setMaxTurns] = useState('80');
   const [streamMode, setStreamMode] = useState<IMStreamingMode>('streaming');
   const [isLoading, setIsLoading] = useState(true);
@@ -123,7 +123,7 @@ export function SettingsPage() {
           <h3>微信入站聚合</h3>
           <form className="provider-form" onSubmit={handleAggregationSave}>
             <Input label="入站聚合窗口（毫秒）" type="number" min={0} max={5000} step={100} value={windowMs} disabled={disabled} onChange={(event) => setWindowMs(event.target.value)} />
-            <div className="settings-group" style={{ marginTop: '8px' }}><div className="settings-row"><div className="settings-row-info"><span className="settings-row-title">说明</span><span className="settings-row-desc">仅对微信 IM 普通消息生效。0 表示关闭，建议范围 1500~2500ms。</span></div></div></div>
+            <div className="settings-group" style={{ marginTop: '8px' }}><div className="settings-row"><div className="settings-row-info"><span className="settings-row-title">说明</span><span className="settings-row-desc">仅对微信 IM 普通消息生效。0 表示关闭，建议范围 1500~4000ms（文件上传耗时约 3-4s，窗口需覆盖“文字+文件”发送间隔）。</span></div></div></div>
             <div className="provider-form-full provider-actions"><Button isLoading={savingKey === 'aggregation'} disabled={disabled}>保存配置</Button></div>
           </form>
         </Card>

@@ -102,6 +102,11 @@ PRESET_CN = {
     "Heading6": {"font": "黑体", "latin": "Times New Roman", "size": 12, "bold": True},
     "BlockText": {"font": "宋体", "latin": "Times New Roman", "size": 12, "line": 1.5},
     "SourceCode": {"font": "Consolas", "latin": "Consolas", "size": 10},
+    # 2026-08-15 模板化升级: 表格样式(社区模板标配, 官方 reference-doc 机制
+    # 的一部分)——全框线 + 首行表头浅蓝底纹加粗, 由 _apply_table_style 特判
+    # 应用(非段落样式: tblPr/tblStylePr)。header_fill 可被 --spec 覆盖。
+    "Table": {"font": "宋体", "latin": "Times New Roman", "size": 10,
+               "header_fill": "DEEAF6"},
 }
 
 
@@ -123,7 +128,9 @@ def _resolve_pt(size: Any) -> float | None:
 
 def _normalize_spec(spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """规格归一化: 语义键/直写 styleId 都映射为 {styleId: {font, latin, size,
-    bold, before, after, line, indent_chars, center}}; 非法项忽略(宽松)。"""
+    bold, before, after, line, indent_chars, center, header_fill}};
+    非法项忽略(宽松)。header_fill 仅 Table 样式使用(表头底纹色, 审查 M1:
+    此前不在白名单导致 --spec 静默丢弃, 与 PRESET_CN 注释/SOP 宣传矛盾)。"""
     out: dict[str, dict[str, Any]] = {}
     for key, raw in spec.items():
         if not isinstance(raw, dict):
@@ -152,6 +159,8 @@ def _normalize_spec(spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 clean["indent_chars"] = int(v)
             if raw.get("center"):
                 clean["center"] = True
+            if raw.get("header_fill"):
+                clean["header_fill"] = str(raw["header_fill"]).strip()
             if clean:
                 out[style_id] = clean
     return out
@@ -183,25 +192,165 @@ def _ensure_style(doc: Any, style_id: str, base_id: str = "Normal") -> bool:
         el = st.makeelement(qn(tag), {})
         el.set(qn("w:val"), val)
         st.append(el)
-    qf = st.makeelement(qn("w:qFormat"), {})
-    st.append(qf)
+    # CT_Style 顺序: ... unhideWhenUsed, qFormat(审查: 旧代码 qFormat 在前,
+    # 违反 schema 序——strict 校验器会拒, 现按序 append)。
     unhide = st.makeelement(qn("w:unhideWhenUsed"), {})
     st.append(unhide)
+    qf = st.makeelement(qn("w:qFormat"), {})
+    st.append(qf)
     doc.styles.element.append(st)
     return True
+
+
+def _apply_table_style(doc: Any, style_id: str, spec: dict[str, Any]) -> bool:
+    """Table 样式(表格样式, 非段落): 全框线 0.5pt 灰 + 首行表头底纹加粗。
+
+    社区模板标配(参考 Achuan-2/pandoc_docx_template 等): pandoc 默认模板的
+    Table 样式只有单元格内边距, 表格观感=朴素网格; 本函数补 tblBorders(全
+    框线)与 tblStylePr firstRow(表头底纹/加粗)。样式缺失时补建 type=table
+    (pandoc 默认模板已含 Table, 补建仅为防御)。子元素一律按 OOXML schema
+    顺序插入(CT_TblPr: tblBorders 必须在 tblCellMar 之前; CT_TblStylePr:
+    tcPr 在 rPr 之前)。"""
+    from docx.oxml.ns import qn
+
+    target = _find_style(doc.styles.element, style_id)
+    if target is None:
+        target = doc.styles.element.makeelement(qn("w:style"), {})
+        target.set(qn("w:type"), "table")
+        target.set(qn("w:styleId"), style_id)
+        name = target.makeelement(qn("w:name"), {})
+        name.set(qn("w:val"), style_id)
+        target.append(name)
+        qf = target.makeelement(qn("w:qFormat"), {})
+        target.append(qf)
+        doc.styles.element.append(target)
+    # 字体(与段落样式同构: 中文=宋体, 西文=Times New Roman)
+    latin = spec.get("latin", spec.get("font", "Times New Roman"))
+    rPr = target.find(qn("w:rPr"))
+    if rPr is None:
+        rPr = target.makeelement(qn("w:rPr"), {})
+        _insert_style_child_in_order(target, rPr, "rPr")
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = rPr.makeelement(qn("w:rFonts"), {})
+        rPr.insert(0, rFonts)
+    rFonts.set(qn("w:ascii"), latin)
+    rFonts.set(qn("w:hAnsi"), latin)
+    rFonts.set(qn("w:eastAsia"), spec.get("font", latin))
+    rFonts.set(qn("w:cs"), latin)
+    for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+        if rFonts.get(qn(attr)) is not None:
+            del rFonts.attrib[qn(attr)]
+    if "size" in spec:
+        half = str(int(round(spec["size"] * 2)))
+        for tag in ("w:sz", "w:szCs"):
+            sz = rPr.find(qn(tag))
+            if sz is None:
+                sz = rPr.makeelement(qn(tag), {})
+                rPr.append(sz)
+            sz.set(qn("w:val"), half)
+    # 全框线: tblPr/tblBorders(单线 0.5pt 灰)。CT_TblPr 顺序: tblBorders
+    # 在 shd/tblLayout/tblCellMar 之前——pandoc 默认 Table 样式已有
+    # tblCellMar, 直接 append 会违反 schema 序, 必须插到它前面。
+    tblPr = target.find(qn("w:tblPr"))
+    if tblPr is None:
+        tblPr = target.makeelement(qn("w:tblPr"), {})
+        _insert_style_child_in_order(target, tblPr, "tblPr")
+    tblBorders = tblPr.find(qn("w:tblBorders"))
+    if tblBorders is None:
+        tblBorders = tblPr.makeelement(qn("w:tblBorders"), {})
+        before = tblPr.find(qn("w:tblCellMar"))
+        if before is not None:
+            before.addprevious(tblBorders)
+        else:
+            tblPr.append(tblBorders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = tblBorders.find(qn(f"w:{edge}"))
+        if el is None:
+            el = tblBorders.makeelement(qn(f"w:{edge}"), {})
+            tblBorders.append(el)
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), "4")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "7F7F7F")
+    # 表头行: 底纹 + 加粗。CT_TblStylePr 顺序: tcPr 在 rPr 之前。
+    tblStylePr = target.find(qn("w:tblStylePr"))
+    if tblStylePr is None:
+        tblStylePr = target.makeelement(qn("w:tblStylePr"), {})
+        _insert_style_child_in_order(target, tblStylePr, "tblStylePr")
+    tblStylePr.set(qn("w:type"), "firstRow")
+    tcPr = tblStylePr.find(qn("w:tcPr"))
+    if tcPr is None:
+        tcPr = tblStylePr.makeelement(qn("w:tcPr"), {})
+        tblStylePr.insert(0, tcPr)
+    shd = tcPr.find(qn("w:shd"))
+    if shd is None:
+        shd = tcPr.makeelement(qn("w:shd"), {})
+        tcPr.append(shd)
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), spec.get("header_fill", "DEEAF6"))
+    hrPr = tblStylePr.find(qn("w:rPr"))
+    if hrPr is None:
+        hrPr = tblStylePr.makeelement(qn("w:rPr"), {})
+        tcPr.addnext(hrPr)  # tcPr 之后, CT_TblStylePr 顺序
+    b = hrPr.find(qn("w:b"))
+    if b is None:
+        b = hrPr.makeelement(qn("w:b"), {})
+        hrPr.append(b)
+    b.set(qn("w:val"), "1")
+    return True
+
+
+# OOXML CT_Style 子元素顺序表(insert 定位用)。
+# 顺序: name, aliases, basedOn, next, link, autoRedefine, hidden, uiPriority,
+# semiHidden, unhideWhenUsed, qFormat, locked, personal, personalCompose,
+# personalReply, rsid, pPr, rPr, tblPr, trPr, tcPr, tblStylePr。
+_STYLE_CHILD_RANK = {
+    "name": 0, "aliases": 1, "basedOn": 2, "next": 3, "link": 4,
+    "autoRedefine": 5, "hidden": 6, "uiPriority": 7, "semiHidden": 8,
+    "unhideWhenUsed": 9, "qFormat": 10, "locked": 11, "personal": 12,
+    "personalCompose": 13, "personalReply": 14, "rsid": 15,
+    "pPr": 16, "rPr": 17, "tblPr": 18, "trPr": 19, "tcPr": 20,
+    "tblStylePr": 21,
+}
+
+
+def _insert_style_child_in_order(target: Any, el: Any, tag: str) -> None:
+    """按 CT_Style 子元素顺序把 el 插入 target(样式元素)。
+
+    旧代码 insert(0) 会把 pPr/rPr 插到 w:name 之前, 违反 schema 序(strict
+    校验器/LibreOffice 可能拒); 直接 append 又会把 tblBorders 放到
+    tblCellMar 之后。本函数按秩表找第一个秩更大的已有子元素, 插到它前面;
+    没有则 append。"""
+    from docx.oxml.ns import qn
+
+    rank = _STYLE_CHILD_RANK.get(tag)
+    if rank is None:
+        target.append(el)
+        return
+    for child in target:
+        local = child.tag.rsplit("}", 1)[-1]
+        child_rank = _STYLE_CHILD_RANK.get(local)
+        if child_rank is not None and child_rank > rank:
+            child.addprevious(el)
+            return
+    target.append(el)
 
 
 def _apply_style(doc: Any, style_id: str, spec: dict[str, Any]) -> bool:
     """对 styles.xml 中指定 styleId 应用字体/字号/加粗/段落属性。"""
     from docx.oxml.ns import qn
 
+    if style_id.lower() == "table":
+        return _apply_table_style(doc, style_id, spec)
     target = _find_style(doc.styles.element, style_id)
     if target is None:
         return False
     rPr = target.find(qn("w:rPr"))
     if rPr is None:
         rPr = target.makeelement(qn("w:rPr"), {})
-        target.insert(0, rPr)
+        _insert_style_child_in_order(target, rPr, "rPr")
     latin = spec.get("latin", spec.get("font", "Times New Roman"))
     if "font" in spec or "latin" in spec:
         rFonts = rPr.find(qn("w:rFonts"))
@@ -239,7 +388,7 @@ def _apply_style(doc: Any, style_id: str, spec: dict[str, Any]) -> bool:
     if need_pPr:
         if pPr is None:
             pPr = target.makeelement(qn("w:pPr"), {})
-            target.insert(0, pPr)
+            _insert_style_child_in_order(target, pPr, "pPr")
         if "indent_chars" in spec:
             ind = pPr.find(qn("w:ind"))
             if ind is None:
@@ -278,6 +427,7 @@ def make_template(dst: Path, spec: dict[str, Any], pandoc: str | None = None,
     pandoc 的开发/测试场景); 生产镜像内 pandoc 存在, 自动提取。"""
     if not dst.parent.is_dir():
         dst.parent.mkdir(parents=True, exist_ok=True)
+    tmpdir: Path | None = None
     if base_docx is not None and base_docx.is_file():
         base = base_docx
     else:
@@ -286,26 +436,40 @@ def make_template(dst: Path, spec: dict[str, Any], pandoc: str | None = None,
             print("[docx_utils] pandoc not found; cannot generate reference.docx "
                   "(镜像已预装; loopback 开发需自行安装)", file=sys.stderr)
             return 1
-        base = Path(tempfile.mkdtemp(prefix="docx_utils_")) / "reference.docx"
+        # 审查: mkdtemp 目录必须清理(此前只在成功路径 unlink 文件, 目录与
+        # 失败路径文件都泄漏在 /tmp)。
+        tmpdir = Path(tempfile.mkdtemp(prefix="docx_utils_"))
+        base = tmpdir / "reference.docx"
         try:
             # pandoc 输出为二进制 docx, 必须 -o 落文件(不能经 stdout 文本编码)。
             proc = subprocess.run([pandoc, "-o", str(base), "--print-default-data-file", "reference.docx"],
                                   capture_output=True, text=True, timeout=60)
             if proc.returncode != 0 or not base.is_file():
                 print(f"[docx_utils] pandoc default reference extraction failed: {proc.stderr[:300]}", file=sys.stderr)
+                shutil.rmtree(tmpdir, ignore_errors=True)
                 return 1
         except subprocess.TimeoutExpired:
             print("[docx_utils] pandoc timed out", file=sys.stderr)
+            shutil.rmtree(tmpdir, ignore_errors=True)
             return 1
         except OSError as exc:
             print(f"[docx_utils] pandoc execution failed: {exc}", file=sys.stderr)
+            shutil.rmtree(tmpdir, ignore_errors=True)
             return 1
     try:
         from docx import Document
     except ImportError:
         print("[docx_utils] python-docx not installed", file=sys.stderr)
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         return 1
-    doc = Document(str(base))
+    try:
+        doc = Document(str(base))
+    except Exception as exc:
+        print(f"[docx_utils] 无法打开基础模板: {exc}", file=sys.stderr)
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return 1
     applied = 0
     missing: list[str] = []
     for style_id, s in spec.items():
@@ -322,8 +486,8 @@ def make_template(dst: Path, spec: dict[str, Any], pandoc: str | None = None,
             # 直写 styleId 缺失: 显式告警(拼写错误不静默造样式)。
             missing.append(style_id)
     doc.save(str(dst))
-    if base_docx is None:
-        base.unlink(missing_ok=True)
+    if base_docx is None and tmpdir is not None:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     detail = f" ({len(missing)} 个未应用: {', '.join(missing)})" if missing else ""
     print(f"[docx_utils] ✅ 模板已生成: {dst} ({applied}/{len(spec)} 个样式应用{detail})")
     return 0 if applied > 0 else 1
@@ -352,8 +516,12 @@ def _default_reference_docx() -> Path:
 
 def md_to_docx(src: Path, dst: Path, template: Path | None = None, *,
                toc: bool = False, number_sections: bool = False,
-               gfm: bool = False, highlight: bool = False, pandoc: str | None = None) -> int:
-    """md/html/txt → docx。template 默认取本脚本同目录 reference.docx。"""
+               gfm: bool = False, highlight: bool = False, title: str | None = None,
+               pandoc: str | None = None) -> int:
+    """md/html/txt → docx。template 默认取本脚本同目录 reference.docx。
+
+    title 非空时追加 --metadata=title:...(pandoc 官方 docx 机制: Title 样式
+    段落 + docProps 元数据, 即"封面标题")。"""
     pandoc = pandoc or shutil.which("pandoc")
     if not pandoc:
         print("[docx_utils] pandoc not found (镜像已预装; loopback 需自行安装)", file=sys.stderr)
@@ -382,6 +550,8 @@ def md_to_docx(src: Path, dst: Path, template: Path | None = None, *,
         print(f"[docx_utils] read source failed: {exc}", file=sys.stderr)
         return 1
     cmd = [pandoc, str(tmp_src), "-o", str(dst), f"--reference-doc={template}"]
+    if title:
+        cmd.append(f"--metadata=title:{title}")
     if gfm:
         cmd.append("-f")
         cmd.append("gfm")
@@ -416,8 +586,23 @@ def md_to_docx(src: Path, dst: Path, template: Path | None = None, *,
 # verify：转换后重读验证（闭环，不靠模型自觉）
 # ---------------------------------------------------------------------------
 
+def _normalize_title_text(text: str) -> str:
+    """标题对比归一(pandoc --metadata=title 按 markdown+smart 解析, 产物 Title
+    段落文本与参数有可预期差异): 去 markdown 标记字符, 统一弯引号/省略号。"""
+    out = re.sub(r"[#*_`~]", "", text)
+    out = out.replace("\u201c", "\"").replace("\u201d", "\"")
+    out = out.replace("\u2018", "'").replace("\u2019", "'")
+    out = out.replace("\u2026", "...").replace("\u2014", "-")
+    return out.strip()
+
+
 def verify_docx(path: Path, expect_paragraphs: int | None = None,
-                expect_tables: int | None = None) -> int:
+                expect_tables: int | None = None,
+                expect_title: str | None = None) -> int:
+    """重读验证: 段落数下限/表格数精确/Title 样式段落(含标题文本)。
+
+    expect_title 非空时要求存在 Title 样式段落且文本包含该字符串——对应
+    pandoc --metadata=title 的产物契约(封面标题)。"""
     try:
         from docx import Document
     except ImportError:
@@ -432,15 +617,32 @@ def verify_docx(path: Path, expect_paragraphs: int | None = None,
     tables = len(doc.tables)
     headings = [p.text for p in doc.paragraphs if p.style.name.lower().startswith("heading")]
     ok = True
+    # 空文档无条件失败(审查 N6: 与工具内置 _verify_docx 的段落+表格判空对齐——
+    # 无任何 expect 参数时空文档也必须暴露, 不能"验证通过")。
+    if paras + tables < 1:
+        print(f"[docx_utils] ❌ 空文档: 段落={paras} 表格={tables}", file=sys.stderr)
+        ok = False
     if expect_paragraphs is not None and paras < expect_paragraphs:
         print(f"[docx_utils] ❌ 段落数 {paras} < 期望 {expect_paragraphs}", file=sys.stderr)
         ok = False
     if expect_tables is not None and tables != expect_tables:
         print(f"[docx_utils] ❌ 表格数 {tables} != 期望 {expect_tables}", file=sys.stderr)
         ok = False
-    print(f"[docx_utils] ✅ 验证通过: {path} 段落={paras} 表格={tables} 标题={len(headings)}")
-    if headings:
-        print(f"[docx_utils]   标题层级: {', '.join(headings[:10])}")
+    if expect_title:
+        want = _normalize_title_text(expect_title)
+        titles = [_normalize_title_text(p.text)
+                  for p in doc.paragraphs if p.style.name.lower() == "title"]
+        if not want or not titles or not any(want in t for t in titles):
+            print(f"[docx_utils] ❌ Title 样式段落缺失或未包含 {expect_title!r}", file=sys.stderr)
+            ok = False
+    # 审查 N1: 失败时绝不打印 ✅(此前无条件打印"验证通过"再返回 1,
+    # 模型消费 stdout 会被误导)——成功/失败各打印明确状态。
+    if ok:
+        print(f"[docx_utils] ✅ 验证通过: {path} 段落={paras} 表格={tables} 标题={len(headings)}")
+        if headings:
+            print(f"[docx_utils]   标题层级: {', '.join(headings[:10])}")
+    else:
+        print(f"[docx_utils] ❌ 验证未通过: {path} 段落={paras} 表格={tables} 标题={len(headings)}", file=sys.stderr)
     return 0 if ok else 1
 
 
@@ -471,12 +673,14 @@ def main(argv: list[str] | None = None) -> int:
     p_cv.add_argument("--number-sections", action="store_true", help="章节编号")
     p_cv.add_argument("--gfm", action="store_true", help="GitHub Flavored Markdown(表格/任务列表)")
     p_cv.add_argument("--highlight", action="store_true", help="代码高亮(tango)")
+    p_cv.add_argument("--title", help="封面标题(传 --metadata=title, 生成 Title 样式段落 + docProps)")
     p_cv.set_defaults(func=cmd_md_to_docx)
 
     p_vf = sub.add_parser("verify", help="重读验证 docx(段落/表格/标题)")
     p_vf.add_argument("path", help=".docx 文件")
     p_vf.add_argument("--expect-paragraphs", type=int, default=None)
     p_vf.add_argument("--expect-tables", type=int, default=None)
+    p_vf.add_argument("--expect-title", default=None, help="要求存在 Title 样式段落且含该文本")
     p_vf.set_defaults(func=cmd_verify)
 
     args = parser.parse_args(argv)
@@ -516,11 +720,12 @@ def cmd_make_template(args) -> int:
 def cmd_md_to_docx(args) -> int:
     return md_to_docx(Path(args.src), Path(args.dst), Path(args.template) if args.template else None,
                       toc=args.toc, number_sections=args.number_sections,
-                      gfm=args.gfm, highlight=args.highlight)
+                      gfm=args.gfm, highlight=args.highlight, title=args.title)
 
 
 def cmd_verify(args) -> int:
-    return verify_docx(Path(args.path), args.expect_paragraphs, args.expect_tables)
+    return verify_docx(Path(args.path), args.expect_paragraphs, args.expect_tables,
+                       args.expect_title)
 
 
 if __name__ == "__main__":

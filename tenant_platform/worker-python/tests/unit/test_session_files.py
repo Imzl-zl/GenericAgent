@@ -125,7 +125,6 @@ def test_export_docx_tool_injected_and_generates_real_docx(tmp_path: Path, monke
             "",
         ))
         assert len(out) >= 1
-        target = tmp_path / "runtime" / "session_files" / "personal:1" / "outputs" / "resume.docx"
         # session_sandbox_root 使用 session_key digest 布局(无 GA_WORKSPACE_TEMP)。
         from ga_worker.session_files import session_key_digest
         target = tmp_path / "runtime" / "session_files" / session_key_digest("personal:1") / "outputs" / "resume.docx"
@@ -554,7 +553,10 @@ def test_image_gen_marker_registry_error_returns_no_registration(tmp_path: Path,
 
 
 def _export_docx_harness(tmp_path: Path, monkeypatch):
-    """export_docx 测试脚手架: 返回 (handler, root, session, unwrap, legacy_instrument_mod)。"""
+    """export_docx 测试脚手架: 返回 (handler, root, session, unwrap, legacy_instrument_mod)。
+
+    overlay 内预置 assets/reference.docx 占位模板(python-docx 生成, 内容无关——
+    测试中 pandoc 为 fake; 模板存在性检查走真实文件系统)。"""
     import sys
     import types
 
@@ -578,6 +580,12 @@ def _export_docx_harness(tmp_path: Path, monkeypatch):
         generated_output_files=[],
     )
     session.overlay_dir.mkdir(parents=True, exist_ok=True)
+    # 占位 reference.docx(构建期产物模拟; 缺模板=显式报错有独立测试)。
+    from docx import Document
+
+    tpl_dir = session.overlay_dir / "assets"
+    tpl_dir.mkdir(parents=True, exist_ok=True)
+    Document().save(str(tpl_dir / "reference.docx"))
 
     from ga_worker import legacy_instrument
     from ga_worker.session_files import session_sandbox_root
@@ -590,82 +598,98 @@ def _export_docx_harness(tmp_path: Path, monkeypatch):
 
 def _make_fake_pandoc(target: Path):
     """fake pandoc: 用 python-docx 生成一个含标题样式的 docx(模拟 pandoc 产物),
-    返回可注入 _run_pandoc 的替身。"""
+    返回可注入 _run_pandoc 的替身。metadata_title 非空时按 pandoc 契约生成
+    Title 样式段落(verify 断言依赖)。调用参数记录到 fake.calls。"""
     from docx import Document
 
-    def _fake(src, tgt, timeout_s=60):
+    def _fake(src, tgt, timeout_s=60, reference_doc=None, metadata_title=None):
         assert Path(src).is_file(), f"pandoc source missing: {src}"
+        _fake.calls.append({
+            "src": str(src), "tgt": str(tgt), "timeout_s": timeout_s,
+            "reference_doc": str(reference_doc) if reference_doc else None,
+            "metadata_title": metadata_title,
+        })
         doc = Document()
+        if metadata_title:
+            doc.add_paragraph(metadata_title, style="Title")
         doc.add_heading("转换标题", level=1)
         doc.add_paragraph("正文段落")
         doc.save(str(tgt))
         return True, ""
 
+    _fake.calls = []
     return _fake
 
 
 def test_export_docx_markdown_source_routes_to_pandoc(tmp_path: Path, monkeypatch):
-    """2026-08-15: md 源必须走 pandoc(不逐行裸 dump), 产物统一中文字体。"""
+    """2026-08-15: md 源必须走 pandoc(不逐行裸 dump), 且套用内置中文模板
+    (官方 --reference-doc 机制)——不再事后全量强改字体。"""
     handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
     try:
         src = root / "notes.md"
         src.parent.mkdir(parents=True, exist_ok=True)
         src.write_text("# 标题\n\n- 列表项\n\n| a | b |\n|---|---|\n| 1 | 2 |\n", encoding="utf-8")
-        calls = []
         fake = _make_fake_pandoc(root / "outputs" / "x.docx")
         monkeypatch.setattr(mod, "_run_pandoc", fake)
 
         out = list(handler.do_export_docx(
-            {"path": "outputs/from_md.docx", "source_path": "notes.md"},
+            {"path": "outputs/from_md.docx", "source_path": "notes.md", "title": "我的文档"},
             "",
         ))
         target = root / "outputs" / "from_md.docx"
         assert target.exists()
         # 工具如实报告引擎。
         assert any("pandoc" in str(o) for o in out), f"engine not reported: {out}"
-        # 中文字体统一(pandoc 默认模板混排修复)。
-        import zipfile
-        with zipfile.ZipFile(target) as zf:
-            styles = zf.read("word/styles.xml").decode("utf-8")
-        assert "微软雅黑" in styles
+        # 模板与封面标题透传给 pandoc(官方机制)。
+        assert len(fake.calls) == 1, f"pandoc must be invoked once, calls={fake.calls}"
+        call = fake.calls[0]
+        assert call["reference_doc"].endswith("assets/reference.docx"), f"template not passed: {call}"
+        assert call["metadata_title"] == "我的文档", f"title not passed: {call}"
+        assert "模板=assets/reference.docx" in "\n".join(str(o) for o in out)
+        assert "封面标题=我的文档" in "\n".join(str(o) for o in out)
     finally:
         unwrap()
 
 
 def test_export_docx_markdown_content_routes_to_pandoc(tmp_path: Path, monkeypatch):
-    """2026-08-15: content 为 markdown 结构时走 pandoc; 纯文本不依赖 pandoc。"""
+    """2026-08-15: content 为 markdown 结构时走 pandoc(带模板); 纯文本不依赖
+    pandoc, 中文 eastAsia 字体=宋体(不再全量强改雅黑)。"""
     handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
     try:
-        calls = []
         fake = _make_fake_pandoc(root / "outputs" / "y.docx")
-        monkeypatch.setattr(mod, "_run_pandoc", lambda src, tgt, timeout_s=60: calls.append((str(src), str(tgt))) or fake(src, tgt))
+        monkeypatch.setattr(mod, "_run_pandoc", fake)
 
         out = list(handler.do_export_docx(
-            {"path": "outputs/md_content.docx", "content": "# 大标题\n\n**加粗** 正文\n\n- 项一\n- 项二\n"},
+            {"path": "outputs/md_content.docx", "title": "大标题文档", "content": "# 大标题\n\n**加粗** 正文\n\n- 项一\n- 项二\n"},
             "",
         ))
         target = root / "outputs" / "md_content.docx"
         assert target.exists(), f"docx missing: {target}"
-        assert len(calls) == 1, f"pandoc must be invoked for markdown content, calls={calls}"
-        assert calls[0][0].endswith(".src.md"), f"temp md source expected, got {calls[0][0]}"
+        assert len(fake.calls) == 1, f"pandoc must be invoked for markdown content, calls={fake.calls}"
+        assert fake.calls[0]["src"].endswith(".src.md"), f"temp md source expected, got {fake.calls[0]}"
+        assert fake.calls[0]["reference_doc"].endswith("assets/reference.docx")
+        assert fake.calls[0]["metadata_title"] == "大标题文档"
         # 临时源已清理。
-        assert not Path(calls[0][0]).exists()
+        assert not Path(fake.calls[0]["src"]).exists()
         assert any("pandoc" in str(o) for o in out)
+        # 验证闭环: fake pandoc 产物含 Title 段落 + 段落断言通过, 工具报告验证结果。
+        assert any("验证=" in str(o) for o in out), f"verify result not reported: {out}"
 
-        # 纯文本: 不调 pandoc, 直接 python-docx。
-        calls.clear()
+        # 纯文本: 不调 pandoc, 直接 python-docx; 中文 eastAsia=宋体, 西文不动。
+        fake.calls.clear()
         out2 = list(handler.do_export_docx(
             {"path": "outputs/plain.docx", "title": "普通文档", "content": "第一行\n第二行"},
             "",
         ))
         target2 = root / "outputs" / "plain.docx"
         assert target2.exists()
-        assert len(calls) == 0, f"pandoc must NOT be invoked for plain text, calls={calls}"
+        assert len(fake.calls) == 0, f"pandoc must NOT be invoked for plain text, calls={fake.calls}"
         assert any("python-docx" in str(o) for o in out2)
         import zipfile
         with zipfile.ZipFile(target2) as zf:
             styles = zf.read("word/styles.xml").decode("utf-8")
-        assert "微软雅黑" in styles
+        assert "微软雅黑" not in styles, "plain text must not force YaHei for latin fonts"
+        assert "宋体" in styles
     finally:
         unwrap()
 
@@ -678,7 +702,8 @@ def test_export_docx_pandoc_missing_fails_explicitly(tmp_path: Path, monkeypatch
         src = root / "notes.md"
         src.parent.mkdir(parents=True, exist_ok=True)
         src.write_text("# 标题\n", encoding="utf-8")
-        monkeypatch.setattr(mod, "_run_pandoc", lambda s, t, timeout_s=60: (False, "pandoc not found in this environment"))
+        monkeypatch.setattr(mod, "_run_pandoc",
+                            lambda s, t, timeout_s=60, reference_doc=None, metadata_title=None: (False, "pandoc not found in this environment"))
 
         out = list(handler.do_export_docx(
             {"path": "outputs/fail.docx", "source_path": "notes.md"},
@@ -702,8 +727,13 @@ def test_export_docx_txt_with_markdown_content_routes_as_markdown(tmp_path: Path
         src.write_text("# 标题\n\n- 项一\n- 项二\n", encoding="utf-8")
         calls = []
         fake = _make_fake_pandoc(root / "outputs" / "x.docx")
-        monkeypatch.setattr(mod, "_run_pandoc",
-                            lambda s, t, timeout_s=60: calls.append((str(s), str(t))) or fake(s, t))
+        monkeypatch.setattr(
+            mod, "_run_pandoc",
+            lambda s, t, timeout_s=60, reference_doc=None, metadata_title=None:
+                calls.append((str(s), str(t))) or fake(s, t, timeout_s=timeout_s,
+                                                     reference_doc=reference_doc,
+                                                     metadata_title=metadata_title),
+        )
 
         out = list(handler.do_export_docx(
             {"path": "outputs/txt_md.docx", "source_path": "notes.txt"},
@@ -756,7 +786,8 @@ def test_export_docx_gbk_markdown_source_routed_via_pandoc(tmp_path: Path, monke
 
         calls = []
         fake = _make_fake_pandoc(root / "outputs" / "x.docx")
-        monkeypatch.setattr(mod, "_run_pandoc", lambda s, t, timeout_s=60: calls.append((str(s), str(t))) or fake(s, t))
+        monkeypatch.setattr(mod, "_run_pandoc",
+                            lambda s, t, timeout_s=60, reference_doc=None, metadata_title=None: calls.append((str(s), str(t))) or fake(s, t))
 
         list(handler.do_export_docx(
             {"path": "outputs/gbk_md.docx", "source_path": "gbk_doc.md"},
@@ -769,5 +800,205 @@ def test_export_docx_gbk_markdown_source_routed_via_pandoc(tmp_path: Path, monke
         tmp_src = Path(calls[0][0])
         assert tmp_src.suffix == ".md", f"temp source must keep .md ext, got {tmp_src}"
         assert not tmp_src.exists(), "temp source must be cleaned up"
+    finally:
+        unwrap()
+
+
+def test_export_docx_template_missing_fails_explicitly(tmp_path: Path, monkeypatch):
+    """2026-08-15 模板化: assets/reference.docx 缺失(构建期产物缺失=环境异常)
+    必须显式报错, 不静默降级 pandoc 默认模板——与 pandoc 缺失同策略。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        # 删除占位模板, 模拟构建期产物缺失。
+        (session.overlay_dir / "assets" / "reference.docx").unlink()
+        fake = _make_fake_pandoc(root / "outputs" / "x.docx")
+        monkeypatch.setattr(mod, "_run_pandoc", fake)
+
+        out = list(handler.do_export_docx(
+            {"path": "outputs/tpl_missing.docx", "content": "# 标题\n\n正文\n"},
+            "",
+        ))
+        target = root / "outputs" / "tpl_missing.docx"
+        assert not target.exists(), "template missing must not produce a docx"
+        assert len(fake.calls) == 0, "pandoc must not be invoked without template"
+        assert any("reference template missing" in str(o) for o in out), f"explicit error expected: {out}"
+    finally:
+        unwrap()
+
+
+def test_export_docx_verification_failure_removes_output(tmp_path: Path, monkeypatch):
+    """2026-08-15 验证闭环: title 给定时产物必须含 Title 样式段落(pandoc
+    --metadata=title 契约); 验证失败=删除产物+显式报错, 不交付坏文件。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        def _bad_fake(src, tgt, timeout_s=60, reference_doc=None, metadata_title=None):
+            # 模拟 pandoc 丢标题(如旧版或异常): 无 Title 段落。
+            from docx import Document
+            doc = Document()
+            doc.add_heading("转换标题", level=1)
+            doc.add_paragraph("正文段落")
+            doc.save(str(tgt))
+            return True, ""
+
+        monkeypatch.setattr(mod, "_run_pandoc", _bad_fake)
+        out = list(handler.do_export_docx(
+            {"path": "outputs/verify_fail.docx", "title": "封面标题", "content": "# 标题\n\n正文\n"},
+            "",
+        ))
+        target = root / "outputs" / "verify_fail.docx"
+        assert not target.exists(), "verification failure must remove the output"
+        assert any("docx verification failed" in str(o) for o in out), f"explicit error expected: {out}"
+        assert any("Title" in str(o) for o in out), f"reason must be reported: {out}"
+    finally:
+        unwrap()
+
+
+def test_export_docx_html_source_routes_to_pandoc(tmp_path: Path, monkeypatch):
+    """审查: .html/.htm 源必须走 pandoc 且临时文件保留 .html 扩展(格式识别)。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        src = root / "page.html"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("<html><body><h1>标题</h1><p>正文</p></body></html>", encoding="utf-8")
+        fake = _make_fake_pandoc(root / "outputs" / "x.docx")
+        monkeypatch.setattr(mod, "_run_pandoc", fake)
+
+        list(handler.do_export_docx(
+            {"path": "outputs/from_html.docx", "source_path": "page.html"},
+            "",
+        ))
+        target = root / "outputs" / "from_html.docx"
+        assert target.exists()
+        assert len(fake.calls) == 1
+        assert fake.calls[0]["src"].endswith(".src.html"), f"html ext must be kept: {fake.calls[0]}"
+        assert not Path(fake.calls[0]["src"]).exists(), "temp source must be cleaned up"
+    finally:
+        unwrap()
+
+
+def test_export_docx_verification_corrupt_output_removes_file(tmp_path: Path, monkeypatch):
+    """审查: pandoc 退出 0 但产物损坏(Document() 打开即抛)时, 必须删除产物并
+    显式报错——不把坏文件留在沙箱/交付。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        def _corrupt_fake(src, tgt, timeout_s=60, reference_doc=None, metadata_title=None):
+            tgt.write_bytes(b"PK\x03\x04 not a real docx")
+            return True, ""
+
+        monkeypatch.setattr(mod, "_run_pandoc", _corrupt_fake)
+        out = list(handler.do_export_docx(
+            {"path": "outputs/corrupt.docx", "content": "# 标题\n\n正文\n"},
+            "",
+        ))
+        target = root / "outputs" / "corrupt.docx"
+        assert not target.exists(), "corrupt output must be removed"
+        assert any("docx verification failed" in str(o) for o in out), f"explicit error expected: {out}"
+    finally:
+        unwrap()
+
+
+def test_export_docx_table_only_document_passes_verify(tmp_path: Path, monkeypatch):
+    """审查: 纯表格文档(python-docx 的 doc.paragraphs 不含表格内段落)不得被
+    paras<1 误杀——验证按 段落+表格 总数判空。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        def _table_only_fake(src, tgt, timeout_s=60, reference_doc=None, metadata_title=None):
+            from docx import Document
+            doc = Document()
+            t = doc.add_table(rows=2, cols=2)
+            t.cell(0, 0).text = "a"
+            t.cell(0, 1).text = "b"
+            doc.save(str(tgt))
+            return True, ""
+
+        monkeypatch.setattr(mod, "_run_pandoc", _table_only_fake)
+        out = list(handler.do_export_docx(
+            {"path": "outputs/table_only.docx", "content": "| a | b |\n|---|---|\n| 1 | 2 |\n"},
+            "",
+        ))
+        target = root / "outputs" / "table_only.docx"
+        assert target.exists(), "table-only docx must not be deleted by verify"
+        assert any("验证=" in str(o) for o in out)
+    finally:
+        unwrap()
+
+
+def test_export_docx_title_with_smart_quotes_passes_verify(tmp_path: Path, monkeypatch):
+    """审查 MAJOR: 标题含弯引号(pandoc smart 变换产物)时, 验证必须归一后通过,\
+    不得删除合法产物。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        def _smart_title_fake(src, tgt, timeout_s=60, reference_doc=None, metadata_title=None):
+            from docx import Document
+            doc = Document()
+            # 模拟 pandoc smart 输出: 弯引号版本
+            doc.add_paragraph("计划：“Q3”报告", style="Title")
+            doc.add_paragraph("正文")
+            doc.save(str(tgt))
+            return True, ""
+
+        monkeypatch.setattr(mod, "_run_pandoc", _smart_title_fake)
+        out = list(handler.do_export_docx(
+            {"path": "outputs/smart_title.docx", "title": '计划："Q3"报告', "content": "# 标题\n\n正文\n"},
+            "",
+        ))
+        target = root / "outputs" / "smart_title.docx"
+        assert target.exists(), f"valid docx with smart-quoted title must survive verify: {out}"
+        assert any("验证=" in str(o) for o in out)
+    finally:
+        unwrap()
+
+
+def test_export_docx_returns_step_outcome_with_feedback(tmp_path: Path, monkeypatch):
+    """审查 M3: 非 verbose 模式下 yield 的状态文本会被 agent_loop.exhaust 丢弃,
+    模型唯一反馈 = StepOutcome.data(进入 tool_results)。必须断言返回值的
+    data/next_prompt, 防止回归到 data=None 的"盲调用"(此前的生产缺陷)。"""
+    import sys
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        fake = _make_fake_pandoc(root / "outputs" / "x.docx")
+        monkeypatch.setattr(mod, "_run_pandoc", fake)
+
+        gen = handler.do_export_docx(
+            {"path": "outputs/feedback.docx", "title": "反馈文档", "content": "# 标题\n\n正文\n"},
+            "",
+        )
+        yielded = []
+        outcome = None
+        try:
+            while True:
+                yielded.append(next(gen))
+        except StopIteration as exc:
+            outcome = exc.value
+
+        StepOutcome = sys.modules["agent_loop"].StepOutcome
+        assert isinstance(outcome, StepOutcome), f"must return StepOutcome, got {outcome!r}"        # data = 状态文本(与 do_image_gen 同构), 模型经 tool_results 可见。
+        assert isinstance(outcome.data, str), f"data must carry status text, got {type(outcome.data)}"
+        assert "已生成 Word 文档" in outcome.data
+        assert "engine=pandoc" in outcome.data
+        assert "封面标题=反馈文档" in outcome.data
+        assert "验证=" in outcome.data
+        # next_prompt 强调 FILE 标记回显(交付触发契约)。
+        assert "[FILE:outputs/feedback.docx]" in outcome.next_prompt
+        assert outcome.should_exit is False
+        # 失败路径同样返回可消费的 StepOutcome(不是裸 raise)。
+        def _bad_fake(src, tgt, timeout_s=60, reference_doc=None, metadata_title=None):
+            return False, "boom"
+
+        monkeypatch.setattr(mod, "_run_pandoc", _bad_fake)
+        gen2 = handler.do_export_docx(
+            {"path": "outputs/fail_feedback.docx", "content": "# 标题\n\n正文\n"},
+            "",
+        )
+        outcome2 = None
+        try:
+            while True:
+                next(gen2)
+        except StopIteration as exc:
+            outcome2 = exc.value
+        assert isinstance(outcome2, StepOutcome)
+        assert isinstance(outcome2.data, dict) and outcome2.data.get("status") == "error"
+        assert "pandoc conversion failed" in outcome2.data.get("message", "")
+        assert "report the explicit error" in outcome2.next_prompt
     finally:
         unwrap()

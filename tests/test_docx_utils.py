@@ -223,3 +223,152 @@ def test_cn_font_size_table():
     assert docx_utils._resolve_pt("三号") == 16
     assert docx_utils._resolve_pt(15) == 15
     assert docx_utils._resolve_pt("超大") is None
+
+
+def test_make_template_preset_cn_applies_table_style(base_reference, tmp_path):
+    """2026-08-15 模板化: 预设 cn 必须含 Table 样式(全框线 + 首行表头浅蓝底纹
+    加粗)——社区模板标配; 基模板缺 Table 时补建 type=table 并应用。"""
+    dst = tmp_path / "ref.docx"
+    rc = docx_utils.make_template(dst, docx_utils.PRESET_CN, base_docx=base_reference)
+    assert rc == 0
+    with zipfile.ZipFile(dst) as zf:
+        styles = zf.read("word/styles.xml").decode("utf-8")
+    # 表格样式骨架: type=table + 全框线 + 表头底纹 + 表格内字体(宋体/TNR)。
+    assert 'w:styleId="Table"' in styles
+    assert 'w:type="table"' in styles
+    assert "<w:tblBorders>" in styles
+    assert '<w:insideH w:val="single"' in styles and '<w:insideV w:val="single"' in styles
+    assert '<w:tblStylePr w:type="firstRow">' in styles
+    assert 'w:fill="DEEAF6"' in styles, "表头浅蓝底纹"
+    assert '<w:b w:val="1"/>' in styles, "表头加粗"
+    assert 'w:eastAsia="宋体"' in styles
+    assert 'w:ascii="Times New Roman"' in styles
+
+
+def test_md_to_docx_passes_title_metadata(tmp_path, monkeypatch):
+    """2026-08-15: --title 必须透传为 pandoc --metadata=title(官方 docx 封面
+    标题机制: Title 样式段落 + docProps)。"""
+    src = tmp_path / "in.md"
+    src.write_text("# 标题\n\n正文\n", encoding="utf-8")
+    dst = tmp_path / "out.docx"
+    template = tmp_path / "ref.docx"
+    template.write_bytes(b"PK-fake")
+    calls = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=120):
+        calls.append(cmd)
+        dst.write_bytes(b"PK\x03\x04fake-docx")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docx_utils.subprocess, "run", fake_run)
+    rc = docx_utils.md_to_docx(src, dst, template, title="封面标题", pandoc="/usr/bin/pandoc")
+    assert rc == 0
+    assert any("--metadata=title:封面标题" in c for c in calls), f"title metadata missing: {calls}"
+
+
+def test_verify_docx_expect_title(tmp_path):
+    """2026-08-15: verify --expect-title 断言 Title 样式段落存在且含文本。"""
+    from docx import Document
+
+    doc = Document()
+    doc.add_paragraph("封面标题", style="Title")
+    doc.add_paragraph("正文")
+    path = tmp_path / "v.docx"
+    doc.save(str(path))
+    assert docx_utils.verify_docx(path, expect_title="封面标题") == 0
+    assert docx_utils.verify_docx(path, expect_title="不存在的标题") == 1
+
+    doc2 = Document()
+    doc2.add_heading("标题", level=1)
+    p2 = tmp_path / "v2.docx"
+    doc2.save(str(p2))
+    assert docx_utils.verify_docx(p2, expect_title="封面标题") == 1, "无 Title 样式段落必须失败"
+
+
+def test_make_template_table_style_child_order(base_reference, tmp_path):
+    """审查: OOXML CT_TblPr/CT_TblStylePr/CT_Style 子元素顺序——tblBorders 在
+    tblCellMar 之前, tblStylePr 内 tcPr 在 rPr 之前, pPr/rPr 在 name 之后。
+    (注意: python-docx 默认模板自带 Table Grid 样式含 tblStylePr, 断言必须
+    限定在本次生成的 Table 样式元素内, 否则搜到别的样式。) """
+    dst = tmp_path / "ref.docx"
+    rc = docx_utils.make_template(dst, docx_utils.PRESET_CN, base_docx=base_reference)
+    assert rc == 0
+    with zipfile.ZipFile(dst) as zf:
+        styles = zf.read("word/styles.xml").decode("utf-8")
+    # 限定在 Table 样式元素内
+    start = styles.index('<w:style w:type="table" w:styleId="Table">')
+    end = styles.index("</w:style>", start)
+    tbl_el = styles[start:end]
+    # tblBorders 必须先于 tblCellMar
+    if "w:tblCellMar" in tbl_el:
+        assert tbl_el.index("<w:tblBorders>") < tbl_el.index("<w:tblCellMar>"), \
+            "tblBorders must precede tblCellMar (CT_TblPr)"
+    # tblStylePr 内: tcPr 先于 rPr
+    tsp = tbl_el[tbl_el.index('<w:tblStylePr w:type="firstRow">'):]
+    assert tsp.index("<w:tcPr>") < tsp.index("<w:rPr>"), \
+        "tblStylePr: tcPr must precede rPr (CT_TblStylePr)"
+    # 段落样式: rPr/pPr 在 name 之后且 pPr 在 rPr 之前
+    firstp = styles[styles.index('w:styleId="FirstParagraph"'):]
+    firstp = firstp[:firstp.index("</w:style>")]
+    name_pos = firstp.index("<w:name")
+    assert "<w:rPr>" not in firstp[:name_pos], "rPr must not precede w:name"
+    assert "<w:pPr>" not in firstp[:name_pos], "pPr must not precede w:name"
+    assert firstp.index("<w:pPr>") < firstp.index("<w:rPr>")
+
+
+def test_verify_docx_expect_title_normalizes_markdown_smart(tmp_path):
+    """审查 MAJOR: --metadata=title 的值经 pandoc markdown+smart 解析, Title 段落
+    文本与原始参数有差异(弯引号/强调符)——verify 双侧归一后必须通过, 不误删产物。"""
+    from docx import Document
+
+    doc = Document()
+    doc.add_paragraph("计划：“Q3”报告", style="Title")  # 模拟 pandoc smart 输出
+    doc.add_paragraph("正文")
+    path = tmp_path / "v.docx"
+    doc.save(str(path))
+    assert docx_utils.verify_docx(path, expect_title='计划："Q3"报告') == 0
+    # 强调符归一: "*重要*标题" 归一为 "重要标题", 与产物 Title 文本匹配
+    doc2 = Document()
+    doc2.add_paragraph("重要标题", style="Title")
+    p2 = tmp_path / "v2.docx"
+    doc2.save(str(p2))
+    assert docx_utils.verify_docx(p2, expect_title="*重要*标题") == 0
+    # 真正不匹配仍必须失败
+    doc3 = Document()
+    doc3.add_paragraph("其他标题内容", style="Title")
+    p3 = tmp_path / "v3.docx"
+    doc3.save(str(p3))
+    assert docx_utils.verify_docx(p3, expect_title="重要标题") == 1
+
+
+def test_make_template_spec_overrides_header_fill(base_reference, tmp_path):
+    """审查 M1: --spec 的 header_fill 必须真正覆盖表头底纹色(此前 _normalize_spec
+    白名单缺失, header_fill 被静默丢弃——注释/SOP 宣称可覆盖但实现不生效)。"""
+    dst = tmp_path / "ref_red.docx"
+    rc = docx_utils.make_template(
+        dst, {"Table": {"font": "宋体", "header_fill": "FF0000"}}, base_docx=base_reference)
+    assert rc == 0
+    with zipfile.ZipFile(dst) as zf:
+        styles = zf.read("word/styles.xml").decode("utf-8")
+    assert 'w:fill="FF0000"' in styles, "spec header_fill must reach the template"
+
+
+def test_verify_docx_empty_fails_and_no_false_success(tmp_path, capsys):
+    """审查 N1/N6: 空文档必须失败(与工具 _verify_docx 对齐); 失败时 stdout
+    不得出现 ✅ 验证通过(此前无条件打印, 误导脚本消费方)。"""
+    from docx import Document
+
+    empty = tmp_path / "empty.docx"
+    Document().save(str(empty))
+    assert docx_utils.verify_docx(empty) == 1, "empty docx must fail verification"
+    out, err = capsys.readouterr()
+    assert "✅" not in out, f"no false success on failure: {out}"
+
+    # 非空无期望参数: 通过。
+    doc = Document()
+    doc.add_paragraph("正文")
+    p = tmp_path / "ok.docx"
+    doc.save(str(p))
+    assert docx_utils.verify_docx(p) == 0
+    out, _ = capsys.readouterr()
+    assert "✅ 验证通过" in out

@@ -11,15 +11,16 @@ dependencies = [
   "grpcio",
   "protobuf",
   "requests>=2.28",
+  # 2026-08-15 审查: python-docx 是 export_docx 运行时硬依赖(非仅测试)——
+  # 此前只挂 [test] extra, 非镜像部署会静默降级到显式报错路径。Dockerfile
+  # 显式安装与这里重复, 属防御性一致声明。
+  "python-docx",
 ]
 
 [project.optional-dependencies]
 test = [
   "pytest",
   "grpcio-tools",
-  # round13 审查(CI): test_session_files 断言 export_docx 生成真实 docx;
-  # 运行时缺失 python-docx 时工具走显式降级路径, 但测试必须验证完整行为。
-  "python-docx",
 ]
 
 [tool.setuptools.packages.find]

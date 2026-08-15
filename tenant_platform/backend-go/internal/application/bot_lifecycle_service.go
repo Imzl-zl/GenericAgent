@@ -254,7 +254,7 @@ func (s *botLifecycleService) ReconcileBots(ctx context.Context) error {
 	// 对账同生命周期)。曾因 poller 重启(部署/崩溃恢复)后窗口回 0 且无对账,
 	// 静默失效 18 小时——文字+文件消息被拆成两个任务, 无附件任务误转旧会话
 	// 文件。失败仅记录, 下一 tick 收敛。旧版 poller 不报该字段(=0), 与 DB
-	// 默认 2500 必然不一致 → 触发推送, 兼容。
+	// 默认 4000 必然不一致 → 触发推送, 兼容。
 	windowMS, err := s.store.GetIMInboundCoalesceWindowMS(ctx)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("get inbound coalesce window: %w", err))

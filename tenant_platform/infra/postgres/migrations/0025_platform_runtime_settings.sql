@@ -14,7 +14,7 @@ CREATE TABLE platform_runtime_settings (
 );
 
 INSERT INTO platform_runtime_settings (setting_key, int_value, updated_by)
-VALUES ('im_inbound_coalesce_window_ms', 2500, 0)
+VALUES ('im_inbound_coalesce_window_ms', 4000, 0)
 ON CONFLICT (setting_key) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS migration_0025_platform_runtime_settings_marker (
