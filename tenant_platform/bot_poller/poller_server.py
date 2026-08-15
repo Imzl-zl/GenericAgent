@@ -2388,7 +2388,10 @@ class BotManager:
 
     def health(self):
         with self._lock:
-            return {'healthy': True, 'active_bots': list(self._adapters.keys())}
+            return {'healthy': True, 'active_bots': list(self._adapters.keys()),
+                    # 2026-08-15 可观测性: 平台对账/诊断读它(窗口曾因重启
+                    # 回 0 且不可见, 静默失效 18 小时)。
+                    'inbound_coalesce_window_ms': self._inbound_coalesce_window_ms}
 
 
 class PollerHandler(BaseHTTPRequestHandler):

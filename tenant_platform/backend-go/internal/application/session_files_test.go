@@ -268,3 +268,113 @@ func TestLoadManifestRejectsMidPathDotDot(t *testing.T) {
 		t.Fatal("Recent must reject manifest with mid-path .. traversal")
 	}
 }
+
+// TestRecentSinceFiltersOldRefs 验证会话引用隔离: since 之后的文件注入,
+// 之前的过滤(2026-08-15: 旧会话附件曾注入新会话 prompt 导致误转旧文件)。
+func TestRecentSinceFiltersOldRefs(t *testing.T) {
+	root := t.TempDir()
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp",
+			sessionFilesDirName, mustSessionDirHash(t, sessionKey)), 0o770)
+	})
+	if err != nil {
+		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
+	}
+	srcA := filepath.Join(t.TempDir(), "old.txt")
+	if err := os.WriteFile(srcA, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refsA, err := files.ImportInbound("personal:1", []string{srcA})
+	if err != nil || len(refsA) != 1 {
+		t.Fatalf("import old: refs=%v err=%v", refsA, err)
+	}
+	// 模拟 /new: cutoff 取两次导入之间, 之后导入的附件属于新会话。
+	cutoff := time.Now().UTC()
+	time.Sleep(20 * time.Millisecond)
+	srcB := filepath.Join(t.TempDir(), "new.md")
+	if err := os.WriteFile(srcB, []byte("# new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refsB, err := files.ImportInbound("personal:1", []string{srcB})
+	if err != nil || len(refsB) != 1 {
+		t.Fatalf("import new: refs=%v err=%v", refsB, err)
+	}
+
+	all, err := files.Recent("personal:1", 8)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("Recent(no filter) = %d refs, want 2", len(all))
+	}
+	filtered, err := files.RecentSince("personal:1", 8, cutoff)
+	if err != nil {
+		t.Fatalf("RecentSince: %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].RelativePath != refsB[0].RelativePath {
+		t.Fatalf("RecentSince(cutoff) = %+v, want only %s", filtered, refsB[0].RelativePath)
+	}
+	// 零值 since = 不过滤(兼容未 /new 场景)。
+	filteredAll, err := files.RecentSince("personal:1", 8, time.Time{})
+	if err != nil || len(filteredAll) != 2 {
+		t.Fatalf("RecentSince(zero) = %d refs err=%v, want 2", len(filteredAll), err)
+	}
+}
+
+// TestPruneInboundBeforeRemovesOldAttachments 验证 /new 物理清理旧会话附件
+// (inbound 文件删除 + manifest 移除; outbound 产物保留磁盘)。
+func TestPruneInboundBeforeRemovesOldAttachments(t *testing.T) {
+	root := t.TempDir()
+	files, err := NewWorkspaceSessionFiles(root, "", func(sessionKey string) error {
+		return os.MkdirAll(filepath.Join(root, mustSessionDirHash(t, sessionKey), "temp",
+			sessionFilesDirName, mustSessionDirHash(t, sessionKey)), 0o770)
+	})
+	if err != nil {
+		t.Fatalf("NewWorkspaceSessionFiles: %v", err)
+	}
+	sandbox := mustSandboxRoot(t, files, "personal:1")
+	srcA := filepath.Join(t.TempDir(), "old.txt")
+	if err := os.WriteFile(srcA, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refsA, err := files.ImportInbound("personal:1", []string{srcA})
+	if err != nil || len(refsA) != 1 {
+		t.Fatalf("import old: %v err=%v", refsA, err)
+	}
+	oldAbs := filepath.Join(sandbox, filepath.FromSlash(refsA[0].RelativePath))
+	// outbound 产物(模拟): 手动登记一个 outputs 文件, 不应被 prune。
+	outAbs := filepath.Join(sandbox, "outputs", "keep.docx")
+	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outAbs, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outRef, err := files.RecordOutbound("personal:1", "outputs/keep.docx")
+	if err != nil {
+		t.Fatalf("RecordOutbound: %v", err)
+	}
+
+	cutoff := time.Now().UTC()
+	time.Sleep(20 * time.Millisecond)
+	if err := files.PruneInboundBefore("personal:1", cutoff); err != nil {
+		t.Fatalf("PruneInboundBefore: %v", err)
+	}
+	if _, err := os.Stat(oldAbs); !os.IsNotExist(err) {
+		t.Fatalf("old attachment must be deleted, stat err=%v", err)
+	}
+	if _, err := os.Stat(outAbs); err != nil {
+		t.Fatalf("outbound product must survive prune: %v", err)
+	}
+	refs, err := files.Recent("personal:1", 8)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(refs) != 1 || refs[0].RelativePath != outRef.RelativePath {
+		t.Fatalf("manifest after prune = %+v, want only %s", refs, outRef.RelativePath)
+	}
+	// 零值 before = no-op。
+	if err := files.PruneInboundBefore("personal:1", time.Time{}); err != nil {
+		t.Fatalf("PruneInboundBefore(zero): %v", err)
+	}
+}

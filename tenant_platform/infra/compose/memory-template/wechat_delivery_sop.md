@@ -22,10 +22,13 @@
 - Emoji 强调：`✅` `📄` `⚠️`（不要用符号堆砌，克制使用）
 - 关键信息放**最前面**（微信会折叠长消息）
 
-## 2. 文档生成：先本地 pandoc，再 python-docx
+## 2. 文档生成：export_docx 首选，pandoc/python-docx 按需
 
 工具链（runner 镜像内置，**本地直接执行**）：
 
+- **export_docx（平台工具，2026-08-15 起首选）**：md/html/txt 自动走镜像内
+  pandoc 转换 + 统一中文字体微软雅黑（内部实现见 document_conversion_sop §1/§3），
+  直接调用即可得到排好版的 Word，**无需自己拼 pandoc 命令**。
 - **pandoc**：md → docx/pdf/html 等格式转换。用法：
   `pandoc 输入.md -o outputs/输出.docx`
   追求更精细样式时生成 reference-doc 模板再转换：

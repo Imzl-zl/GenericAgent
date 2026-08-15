@@ -925,5 +925,55 @@ def get_global_memory():
         prompt += f"\n[Memory] (../memory)\n"
         prompt += structure + '\n../memory/global_mem_insight.txt:\n'
         prompt += insight + "\n"
+        # 2026-08-15 L1 动态补全: 静态索引可能漏录新 SOP(生产实证: 平台新增
+        # document_conversion_sop/wechat_delivery_sop 未更新 L1 模板, 模型从
+        # 未读到它们)。扫描 memory/ 顶层自动披露全部 SOP/工具文件名——渐进
+        # 披露不再依赖索引人工维护(静态索引保留注释语义, 动态清单兜底发现)。
+        auto = _auto_discovered_sops(insight)
+        if auto:
+            prompt += "\n[L3 auto-discovered SOPs/utils]\n" + " | ".join(auto) + "\n"
     except FileNotFoundError: pass
     return prompt
+
+
+def _indexed_memory_names(insight):
+    """从静态 L1 索引文本提取已索引文件名 base 名集合(去扩展名/注释括号/
+    符号)。审查 B-6: 不能用子串匹配——"cleanup_sop" 是 "memory_cleanup_sop"
+    的子串, 新 SOP 会被误判已索引而漏披露(恰是本轮要防的事故类别)。"""
+    names = set()
+    for tok in re.split(r"[\s|,()+/]+", insight or ""):
+        tok = tok.strip().rstrip(".")
+        if not tok:
+            continue
+        for suffix in (".py", ".md"):
+            if tok.endswith(suffix):
+                tok = tok[: -len(suffix)]
+        # "ljqCtrl_sop+" 类带后缀符号的 token 取首个字母数字段。
+        head = re.split(r"[^A-Za-z0-9_]", tok)[0]
+        if head:
+            names.add(head)
+    return names
+
+
+def _auto_discovered_sops(insight):
+    """列出 memory/ 顶层未在静态 L1 索引中出现的 *.md/*.py(自动披露)。"""
+    try:
+        mem = os.path.join(script_dir, 'memory')
+        if not os.path.isdir(mem):
+            return []
+        indexed = _indexed_memory_names(insight)
+        out = []
+        for name in sorted(os.listdir(mem)):
+            if name.startswith('.'):
+                continue
+            if not (name.endswith('.md') or name.endswith('.py')):
+                continue
+            if not os.path.isfile(os.path.join(mem, name)):
+                continue
+            base = name.rsplit('.', 1)[0]
+            if base in indexed:
+                continue  # 已在静态索引(含注释语义), 不重复
+            out.append(name)
+        return out
+    except OSError:
+        return []

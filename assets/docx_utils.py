@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""docx_utils.py — 文档转换工具脚本（GA L3 原生 .py 形态，2026-08-15）。
+
+架构定位（对齐社区 pandoc skill 案例 + GA SOP 规范）：
+    - 指令层 document_conversion_sop.md 教"怎么选/怎么组合"，本脚本封装
+      "高复用、逻辑复杂、不想每次重新推理"的处理流程（GA L3 .py 定义）。
+    - pandoc 优先：md/html→docx、docx→md、pptx/epub 全走 pandoc；
+      pandoc 不支持的（PDF 生成、.doc/.xls 老格式）由 SOP 指引 LibreOffice，
+      本脚本不重复实现。
+    - --help 即配方：每个子命令自解释参数，模型跑 help 即得用法。
+
+子命令：
+    make-template   按规格/预设生成 pandoc --reference-doc 模板(样式定制核心)
+    md-to-docx      md/html/txt → docx（模板 + toc/编号/高亮/GFM 全参数）
+    verify          转换后重读验证（段落/表格/字体，闭环不靠模型自觉）
+
+用法示例：
+    python docx_utils.py make-template -o /tmp/ref.docx --preset cn
+    python docx_utils.py make-template -o /tmp/ref.docx --spec '{"heading1": {"font": "黑体", "size": "四号"}}'
+    python docx_utils.py md-to-docx 输入.md outputs/输出.docx --toc
+    python docx_utils.py verify outputs/输出.docx --expect-tables 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# 常量与样式规格解析
+# ---------------------------------------------------------------------------
+
+# 中文常用字号 → pt（确定性映射，支持"四号"这类叫法）。
+CN_FONT_SIZE_PT = {
+    "初号": 42, "小初": 36, "一号": 26, "小一": 24, "二号": 22, "小二": 18,
+    "三号": 16, "小三": 15, "四号": 14, "小四": 12, "五号": 10.5, "小五": 9,
+    "六号": 7.5, "小六": 6.5, "七号": 5.5, "八号": 5,
+}
+
+# 用户语义键 → pandoc reference.docx styleId 集合(2026-08-15 审查 A-2):
+# pandoc 正文段落实际使用 FirstParagraph(首段)/BodyText(后续段), Normal
+# 几乎不被段落引用(实测: 三段正文 = FirstParagraph/BodyText/BodyText)。
+# 语义键必须展开为实际使用集合, 否则用户"正文宋体小四"只改到 Normal,
+# 产物正文纹丝不动。直写 styleId 则保持单点精确控制。
+SEMANTIC_STYLE_MAP = {
+    "title": ("Title",),
+    "heading1": ("Heading1",), "heading2": ("Heading2",), "heading3": ("Heading3",),
+    "heading4": ("Heading4",), "heading5": ("Heading5",), "heading6": ("Heading6",),
+    "body": ("Normal", "BodyText", "FirstParagraph"),
+    "bodytext": ("BodyText", "FirstParagraph"),
+    "firstparagraph": ("FirstParagraph",),
+    "table": ("Table",), "compact": ("Compact",), "blocktext": ("BlockText",),
+    "sourcecode": ("SourceCode",),
+}
+
+# 语义键覆盖的 styleId 全集: 缺失时 make-template 自动补建(pandoc 默认
+# 模板无 SourceCode; 语义键=意图, 意图必须落地)。直写 styleId 不在本集合
+# 时缺失仅告警——拼写错误显式暴露, 不静默造样式。
+AUTO_ENSURE_STYLES = {sid for group in SEMANTIC_STYLE_MAP.values() for sid in group}
+
+
+# markdown 结构启发式(与 worker legacy_instrument._looks_like_markdown 保持
+# 一致, 2026-08-15 审查 A-1: txt 内容判定用, 决定 pandoc 临时源扩展名)。
+_MARKDOWN_HINTS = (
+    re.compile(r"^#{1,6}\s", re.M),
+    re.compile(r"^\s*\|.*\|\s*$", re.M),
+    re.compile(r"^\s*[-*]\s+\S", re.M),
+    re.compile(r"\*\*[^*]+\*\*"),
+    re.compile(r"^```", re.M),
+)
+
+
+def _looks_like_markdown(content: str) -> bool:
+    """启发式判定文本是否 markdown 结构(标题/表格/列表/粗体/代码块)。"""
+    if not content or not content.strip():
+        return False
+    head = content[:4000]
+    return any(p.search(head) for p in _MARKDOWN_HINTS)
+
+# 中文排版预设（社区 pandoc_docx_template 标准，实测验证）：
+# 正文宋体小四+首行缩进2字符+1.5倍行距；H1 黑体小二加粗段前段后24磅；
+# H2 黑体三号；H3 黑体小三；H4-6 黑体小四；标题黑体二号居中；
+# 表格单元格宋体 10pt；西文一律 Times New Roman。
+PRESET_CN = {
+    "Normal": {"font": "宋体", "latin": "Times New Roman", "size": 12, "line": 1.5},
+    "BodyText": {"font": "宋体", "latin": "Times New Roman", "size": 12, "indent_chars": 2, "line": 1.5},
+    "FirstParagraph": {"font": "宋体", "latin": "Times New Roman", "size": 12, "indent_chars": 2, "line": 1.5},
+    "Compact": {"font": "宋体", "latin": "Times New Roman", "size": 10},
+    "Title": {"font": "黑体", "latin": "Times New Roman", "size": 22, "center": True},
+    "Heading1": {"font": "黑体", "latin": "Times New Roman", "size": 18, "bold": True, "before": 24, "after": 24},
+    "Heading2": {"font": "黑体", "latin": "Times New Roman", "size": 16, "bold": True, "before": 12, "after": 6},
+    "Heading3": {"font": "黑体", "latin": "Times New Roman", "size": 15, "bold": True, "before": 12, "after": 6},
+    "Heading4": {"font": "黑体", "latin": "Times New Roman", "size": 12, "bold": True},
+    "Heading5": {"font": "黑体", "latin": "Times New Roman", "size": 12, "bold": True},
+    "Heading6": {"font": "黑体", "latin": "Times New Roman", "size": 12, "bold": True},
+    "BlockText": {"font": "宋体", "latin": "Times New Roman", "size": 12, "line": 1.5},
+    "SourceCode": {"font": "Consolas", "latin": "Consolas", "size": 10},
+}
+
+
+def _resolve_pt(size: Any) -> float | None:
+    """字号解析: 数字 = pt; 字符串数字 = pt; 中文叫法查表。非法返回 None。"""
+    if isinstance(size, (int, float)):
+        return float(size) if size > 0 else None
+    if isinstance(size, str):
+        v = size.strip()
+        if v in CN_FONT_SIZE_PT:
+            return CN_FONT_SIZE_PT[v]
+        try:
+            f = float(v)
+            return f if f > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_spec(spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """规格归一化: 语义键/直写 styleId 都映射为 {styleId: {font, latin, size,
+    bold, before, after, line, indent_chars, center}}; 非法项忽略(宽松)。"""
+    out: dict[str, dict[str, Any]] = {}
+    for key, raw in spec.items():
+        if not isinstance(raw, dict):
+            continue
+        # 语义键展开为实际样式集合; 直写 styleId 单点。
+        for style_id in SEMANTIC_STYLE_MAP.get(key.lower(), (key,)):
+            clean: dict[str, Any] = {}
+            if raw.get("font"):
+                clean["font"] = str(raw["font"]).strip()
+            if raw.get("latin"):
+                clean["latin"] = str(raw["latin"]).strip()
+            pt = _resolve_pt(raw.get("size"))
+            if pt is not None:
+                clean["size"] = pt
+            if raw.get("bold") is not None:
+                clean["bold"] = bool(raw["bold"])
+            for k in ("before", "after"):
+                v = raw.get(k)
+                if isinstance(v, (int, float)) and v >= 0:
+                    clean[k] = float(v)
+            v = raw.get("line")
+            if isinstance(v, (int, float)) and v > 0:
+                clean["line"] = float(v)
+            v = raw.get("indent_chars")
+            if isinstance(v, (int, float)) and v > 0:
+                clean["indent_chars"] = int(v)
+            if raw.get("center"):
+                clean["center"] = True
+            if clean:
+                out[style_id] = clean
+    return out
+
+
+# ---------------------------------------------------------------------------
+# make-template：按规格生成 pandoc reference.docx 模板
+# ---------------------------------------------------------------------------
+
+def _find_style(styles_el: Any, style_id: str):
+    from docx.oxml.ns import qn
+    for st in styles_el.iter(qn("w:style")):
+        if (st.get(qn("w:styleId")) or "").lower() == style_id.lower():
+            return st
+    return None
+
+
+def _ensure_style(doc: Any, style_id: str, base_id: str = "Normal") -> bool:
+    """为缺失的样式补建最小骨架(基于 Normal)。pandoc 默认 reference.docx 无
+    SourceCode(实测 12/13), 语义键必须落地——补建后 _apply_style 再应用。"""
+    from docx.oxml.ns import qn
+
+    if _find_style(doc.styles.element, style_id) is not None:
+        return True
+    st = doc.styles.element.makeelement(qn("w:style"), {})
+    st.set(qn("w:type"), "paragraph")
+    st.set(qn("w:styleId"), style_id)
+    for tag, val in (("w:name", style_id), ("w:basedOn", base_id)):
+        el = st.makeelement(qn(tag), {})
+        el.set(qn("w:val"), val)
+        st.append(el)
+    qf = st.makeelement(qn("w:qFormat"), {})
+    st.append(qf)
+    unhide = st.makeelement(qn("w:unhideWhenUsed"), {})
+    st.append(unhide)
+    doc.styles.element.append(st)
+    return True
+
+
+def _apply_style(doc: Any, style_id: str, spec: dict[str, Any]) -> bool:
+    """对 styles.xml 中指定 styleId 应用字体/字号/加粗/段落属性。"""
+    from docx.oxml.ns import qn
+
+    target = _find_style(doc.styles.element, style_id)
+    if target is None:
+        return False
+    rPr = target.find(qn("w:rPr"))
+    if rPr is None:
+        rPr = target.makeelement(qn("w:rPr"), {})
+        target.insert(0, rPr)
+    latin = spec.get("latin", spec.get("font", "Times New Roman"))
+    if "font" in spec or "latin" in spec:
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = rPr.makeelement(qn("w:rFonts"), {})
+            rPr.insert(0, rFonts)
+        rFonts.set(qn("w:ascii"), latin)
+        rFonts.set(qn("w:hAnsi"), latin)
+        rFonts.set(qn("w:eastAsia"), spec.get("font", latin))
+        rFonts.set(qn("w:cs"), latin)
+        for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+            if rFonts.get(qn(attr)) is not None:
+                del rFonts.attrib[qn(attr)]
+    if "size" in spec:
+        half = str(int(round(spec["size"] * 2)))
+        for tag in ("w:sz", "w:szCs"):
+            sz = rPr.find(qn(tag))
+            if sz is None:
+                sz = rPr.makeelement(qn(tag), {})
+                rPr.append(sz)
+            sz.set(qn("w:val"), half)
+    if "bold" in spec:
+        b = rPr.find(qn("w:b"))
+        if spec["bold"]:
+            if b is None:
+                b = rPr.makeelement(qn("w:b"), {})
+                rPr.append(b)
+            b.set(qn("w:val"), "1")
+        elif b is not None:
+            b.set(qn("w:val"), "0")
+
+    # 段落属性: 首行缩进(字符)/段前段后(pt)/行距(倍数)/居中。
+    pPr = target.find(qn("w:pPr"))
+    need_pPr = any(k in spec for k in ("indent_chars", "before", "after", "line", "center"))
+    if need_pPr:
+        if pPr is None:
+            pPr = target.makeelement(qn("w:pPr"), {})
+            target.insert(0, pPr)
+        if "indent_chars" in spec:
+            ind = pPr.find(qn("w:ind"))
+            if ind is None:
+                ind = pPr.makeelement(qn("w:ind"), {})
+                pPr.append(ind)
+            ind.set(qn("w:firstLineChars"), str(spec["indent_chars"] * 100))
+            ind.set(qn("w:firstLine"), str(int(spec["indent_chars"] * 240)))
+        if "before" in spec or "after" in spec or "line" in spec:
+            spacing = pPr.find(qn("w:spacing"))
+            if spacing is None:
+                spacing = pPr.makeelement(qn("w:spacing"), {})
+                pPr.append(spacing)
+            if "before" in spec:
+                spacing.set(qn("w:before"), str(int(spec["before"] * 20)))
+                spacing.set(qn("w:beforeLines"), "0")
+            if "after" in spec:
+                spacing.set(qn("w:after"), str(int(spec["after"] * 20)))
+                spacing.set(qn("w:afterLines"), "0")
+            if "line" in spec:
+                spacing.set(qn("w:line"), str(int(spec["line"] * 240)))
+                spacing.set(qn("w:lineRule"), "auto")
+        if spec.get("center"):
+            jc = pPr.find(qn("w:jc"))
+            if jc is None:
+                jc = pPr.makeelement(qn("w:jc"), {})
+                pPr.append(jc)
+            jc.set(qn("w:val"), "center")
+    return True
+
+
+def make_template(dst: Path, spec: dict[str, Any], pandoc: str | None = None,
+                 base_docx: Path | None = None) -> int:
+    """生成 reference.docx：pandoc 默认模板 → 按 spec 改样式。返回应用样式数。
+
+    base_docx 提供已提取的 pandoc 默认 reference.docx 时跳过提取(本机无
+    pandoc 的开发/测试场景); 生产镜像内 pandoc 存在, 自动提取。"""
+    if not dst.parent.is_dir():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+    if base_docx is not None and base_docx.is_file():
+        base = base_docx
+    else:
+        pandoc = pandoc or shutil.which("pandoc")
+        if not pandoc:
+            print("[docx_utils] pandoc not found; cannot generate reference.docx "
+                  "(镜像已预装; loopback 开发需自行安装)", file=sys.stderr)
+            return 1
+        base = Path(tempfile.mkdtemp(prefix="docx_utils_")) / "reference.docx"
+        try:
+            # pandoc 输出为二进制 docx, 必须 -o 落文件(不能经 stdout 文本编码)。
+            proc = subprocess.run([pandoc, "-o", str(base), "--print-default-data-file", "reference.docx"],
+                                  capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0 or not base.is_file():
+                print(f"[docx_utils] pandoc default reference extraction failed: {proc.stderr[:300]}", file=sys.stderr)
+                return 1
+        except subprocess.TimeoutExpired:
+            print("[docx_utils] pandoc timed out", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"[docx_utils] pandoc execution failed: {exc}", file=sys.stderr)
+            return 1
+    try:
+        from docx import Document
+    except ImportError:
+        print("[docx_utils] python-docx not installed", file=sys.stderr)
+        return 1
+    doc = Document(str(base))
+    applied = 0
+    missing: list[str] = []
+    for style_id, s in spec.items():
+        if _apply_style(doc, style_id, s):
+            applied += 1
+        elif style_id in AUTO_ENSURE_STYLES:
+            # 语义键覆盖的样式(如 SourceCode)默认模板缺失时自动补建再应用。
+            _ensure_style(doc, style_id)
+            if _apply_style(doc, style_id, s):
+                applied += 1
+            else:
+                missing.append(style_id)
+        else:
+            # 直写 styleId 缺失: 显式告警(拼写错误不静默造样式)。
+            missing.append(style_id)
+    doc.save(str(dst))
+    if base_docx is None:
+        base.unlink(missing_ok=True)
+    detail = f" ({len(missing)} 个未应用: {', '.join(missing)})" if missing else ""
+    print(f"[docx_utils] ✅ 模板已生成: {dst} ({applied}/{len(spec)} 个样式应用{detail})")
+    return 0 if applied > 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# md-to-docx：pandoc 全参数转换（模板/目录/编号/GFM/高亮/编码容错）
+# ---------------------------------------------------------------------------
+
+def _read_text_robust(path: Path) -> str:
+    """编码容错: UTF-8 优先, GB18030 回退(Windows 记事本来源), 兜底 replace。"""
+    data = path.read_bytes()
+    for enc in ("utf-8", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _default_reference_docx() -> Path:
+    """默认参考模板: 本脚本同目录 reference.docx(ga-runner 构建期生成)。
+    独立函数便于测试注入(审查 C-4: 测试不得依赖真实仓库文件系统状态)。"""
+    return Path(__file__).resolve().parent / "reference.docx"
+
+
+def md_to_docx(src: Path, dst: Path, template: Path | None = None, *,
+               toc: bool = False, number_sections: bool = False,
+               gfm: bool = False, highlight: bool = False, pandoc: str | None = None) -> int:
+    """md/html/txt → docx。template 默认取本脚本同目录 reference.docx。"""
+    pandoc = pandoc or shutil.which("pandoc")
+    if not pandoc:
+        print("[docx_utils] pandoc not found (镜像已预装; loopback 需自行安装)", file=sys.stderr)
+        return 1
+    if template is None:
+        template = _default_reference_docx()
+    if not template.is_file():
+        print(f"[docx_utils] reference template missing: {template} (先 make-template 生成)", file=sys.stderr)
+        return 1
+    if not dst.parent.is_dir():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+    # 编码容错: GBK 源先归一 UTF-8 临时文件。
+    tmp_src = src
+    try:
+        text = _read_text_robust(src)
+        if src.suffix.lower() in (".md", ".markdown", ".html", ".htm", ".txt"):
+            # 2026-08-15 审查 A-1: txt 内容命中 markdown 启发式时临时文件
+            # 必须用 .md 扩展——pandoc 按扩展名推断格式, 保留 .txt 会把
+            # md 当纯文本解析(标记被剥除且无排版)。
+            tmp_ext = src.suffix.lower()
+            if tmp_ext == ".txt" and _looks_like_markdown(text):
+                tmp_ext = ".md"
+            tmp_src = dst.parent / f".{dst.name}.src{tmp_ext}"
+            tmp_src.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        print(f"[docx_utils] read source failed: {exc}", file=sys.stderr)
+        return 1
+    cmd = [pandoc, str(tmp_src), "-o", str(dst), f"--reference-doc={template}"]
+    if gfm:
+        cmd.append("-f")
+        cmd.append("gfm")
+    if toc:
+        cmd.append("--toc")
+    if number_sections:
+        cmd.append("--number-sections")
+    if highlight:
+        cmd.append("--highlight-style=tango")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("[docx_utils] pandoc timed out", file=sys.stderr)
+        return 1
+    finally:
+        if tmp_src is not src:
+            try:
+                tmp_src.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if proc.returncode != 0:
+        print(f"[docx_utils] pandoc failed: {(proc.stderr or proc.stdout or '')[:500]}", file=sys.stderr)
+        return 1
+    if not dst.is_file() or dst.stat().st_size == 0:
+        print("[docx_utils] pandoc produced no output", file=sys.stderr)
+        return 1
+    print(f"[docx_utils] ✅ 已生成: {dst}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# verify：转换后重读验证（闭环，不靠模型自觉）
+# ---------------------------------------------------------------------------
+
+def verify_docx(path: Path, expect_paragraphs: int | None = None,
+                expect_tables: int | None = None) -> int:
+    try:
+        from docx import Document
+    except ImportError:
+        print("[docx_utils] python-docx not installed", file=sys.stderr)
+        return 1
+    try:
+        doc = Document(str(path))
+    except Exception as exc:
+        print(f"[docx_utils] ❌ 无法打开 docx: {exc}", file=sys.stderr)
+        return 1
+    paras = len(doc.paragraphs)
+    tables = len(doc.tables)
+    headings = [p.text for p in doc.paragraphs if p.style.name.lower().startswith("heading")]
+    ok = True
+    if expect_paragraphs is not None and paras < expect_paragraphs:
+        print(f"[docx_utils] ❌ 段落数 {paras} < 期望 {expect_paragraphs}", file=sys.stderr)
+        ok = False
+    if expect_tables is not None and tables != expect_tables:
+        print(f"[docx_utils] ❌ 表格数 {tables} != 期望 {expect_tables}", file=sys.stderr)
+        ok = False
+    print(f"[docx_utils] ✅ 验证通过: {path} 段落={paras} 表格={tables} 标题={len(headings)}")
+    if headings:
+        print(f"[docx_utils]   标题层级: {', '.join(headings[:10])}")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="docx_utils.py",
+        description="文档转换工具脚本（pandoc 优先；模板/转换/验证一体）。",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_mk = sub.add_parser("make-template", help="按规格/预设生成 pandoc --reference-doc 模板")
+    p_mk.add_argument("-o", "--output", required=True, help="输出模板路径(如 /tmp/ref.docx)")
+    p_mk.add_argument("--preset", choices=("cn",), help="内置中文排版预设(社区标准)")
+    p_mk.add_argument("--base", help="pandoc 默认 reference.docx(已提取, 跳过提取; 本机无 pandoc 时用)")
+    p_mk.add_argument("--spec", help="样式规格 JSON，如 {\"heading1\": {\"font\": \"黑体\", \"size\": \"四号\"}}; 键支持 heading1..6/title/body/firstparagraph/bodytext/table/compact/blocktext/sourcecode 或 styleId(body/bodytext 会展开到 pandoc 正文实际使用的 FirstParagraph/BodyText)")
+    p_mk.add_argument("--print-default", action="store_true", help="仅导出 pandoc 默认模板不改样式")
+    p_mk.set_defaults(func=cmd_make_template)
+
+    p_cv = sub.add_parser("md-to-docx", help="md/html/txt → docx(pandoc + 模板)")
+    p_cv.add_argument("src", help="输入文件")
+    p_cv.add_argument("dst", help="输出 .docx")
+    p_cv.add_argument("--template", help="reference.docx 模板(默认同目录 reference.docx)")
+    p_cv.add_argument("--toc", action="store_true", help="自动目录")
+    p_cv.add_argument("--number-sections", action="store_true", help="章节编号")
+    p_cv.add_argument("--gfm", action="store_true", help="GitHub Flavored Markdown(表格/任务列表)")
+    p_cv.add_argument("--highlight", action="store_true", help="代码高亮(tango)")
+    p_cv.set_defaults(func=cmd_md_to_docx)
+
+    p_vf = sub.add_parser("verify", help="重读验证 docx(段落/表格/标题)")
+    p_vf.add_argument("path", help=".docx 文件")
+    p_vf.add_argument("--expect-paragraphs", type=int, default=None)
+    p_vf.add_argument("--expect-tables", type=int, default=None)
+    p_vf.set_defaults(func=cmd_verify)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+def cmd_make_template(args) -> int:
+    if args.print_default:
+        pandoc = shutil.which("pandoc")
+        if not pandoc:
+            print("pandoc not found", file=sys.stderr)
+            return 1
+        proc = subprocess.run([pandoc, "-o", args.output, "--print-default-data-file", "reference.docx"],
+                              capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            print(proc.stderr[:300], file=sys.stderr)
+            return 1
+        print(f"✅ 默认模板: {args.output}")
+        return 0
+    spec: dict[str, Any] = {}
+    if args.preset == "cn":
+        spec.update(PRESET_CN)
+    if args.spec:
+        try:
+            user_spec = json.loads(args.spec)
+        except ValueError as exc:
+            print(f"spec JSON 解析失败: {exc}", file=sys.stderr)
+            return 1
+        spec.update(_normalize_spec(user_spec))
+    if not spec:
+        print("请提供 --preset cn 或 --spec", file=sys.stderr)
+        return 1
+    return make_template(Path(args.output), spec,
+                         base_docx=Path(args.base) if args.base else None)
+
+
+def cmd_md_to_docx(args) -> int:
+    return md_to_docx(Path(args.src), Path(args.dst), Path(args.template) if args.template else None,
+                      toc=args.toc, number_sections=args.number_sections,
+                      gfm=args.gfm, highlight=args.highlight)
+
+
+def cmd_verify(args) -> int:
+    return verify_docx(Path(args.path), args.expect_paragraphs, args.expect_tables)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

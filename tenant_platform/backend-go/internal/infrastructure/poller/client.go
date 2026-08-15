@@ -270,6 +270,10 @@ func (c *Client) StreamAction(ctx context.Context, req StreamActionRequest) (Str
 type HealthResponse struct {
 	Healthy    bool     `json:"healthy"`
 	ActiveBots []string `json:"active_bots"`
+	// InboundCoalesceWindowMS 是 Poller 当前入站合并窗口(ms), 供平台对账/
+	// 诊断(2026-08-15: 窗口曾因 poller 重启回 0 且 /health 不可见, 静默
+	// 失效 18 小时)。
+	InboundCoalesceWindowMS int `json:"inbound_coalesce_window_ms,omitempty"`
 }
 
 // Health checks poller liveness.

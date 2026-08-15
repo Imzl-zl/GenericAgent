@@ -551,3 +551,23 @@ ORDER BY claimed_at ASC NULLS LAST
 	}
 	return out, rows.Err()
 }
+
+// GetConversationResetAt 返回本对话单元桶最近一次 /new 的 reset_at
+// (2026-08-15 会话文件引用隔离真值源)。无记录返回零值 time + nil
+// (从未 /new = 不过滤)。DB 错误上抛, 调用方决定降级策略。
+func (s *Store) GetConversationResetAt(ctx context.Context, sessionKey, conversationKey string) (time.Time, error) {
+	var resetAt time.Time
+	err := s.pool.QueryRow(ctx, `
+SELECT cr.reset_at
+FROM conversation_resets cr
+JOIN workspaces w ON w.id = cr.workspace_id
+WHERE w.session_key = $1 AND cr.conversation_key = $2
+`, sessionKey, conversationKey).Scan(&resetAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("get conversation reset at: %w", err)
+	}
+	return resetAt, nil
+}

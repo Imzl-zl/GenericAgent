@@ -551,3 +551,223 @@ def test_image_gen_marker_registry_error_returns_no_registration(tmp_path: Path,
     list(ga_mod.GenericAgentHandler().do_image_gen({"prompt": "x"}, None))
     assert session.generated_output_files == []
     unwrap()
+
+
+def _export_docx_harness(tmp_path: Path, monkeypatch):
+    """export_docx 测试脚手架: 返回 (handler, root, session, unwrap, legacy_instrument_mod)。"""
+    import sys
+    import types
+
+    class StepOutcome:
+        def __init__(self, data, next_prompt=None, should_exit=False):
+            self.data = data
+            self.next_prompt = next_prompt
+            self.should_exit = should_exit
+
+    monkeypatch.setitem(sys.modules, "agent_loop", types.SimpleNamespace(StepOutcome=StepOutcome))
+
+    class FakeHandler:
+        def __init__(self, *args, **kwargs):
+            self.cwd = "./temp"
+
+    ga_mod = types.SimpleNamespace(GenericAgentHandler=FakeHandler)
+    agentmain_mod = types.SimpleNamespace(TOOLS_SCHEMA=[])
+    session = types.SimpleNamespace(
+        overlay_dir=tmp_path / "runtime" / "s-1" / "legacy-overlay",
+        session_key="personal:1",
+        generated_output_files=[],
+    )
+    session.overlay_dir.mkdir(parents=True, exist_ok=True)
+
+    from ga_worker import legacy_instrument
+    from ga_worker.session_files import session_sandbox_root
+
+    root = session_sandbox_root(tmp_path / "runtime", "personal:1")
+    unwrap = legacy_instrument.install_export_docx_tool(session, {"ga": ga_mod, "agentmain": agentmain_mod})
+    handler = ga_mod.GenericAgentHandler(None)
+    return handler, root, session, unwrap, legacy_instrument
+
+
+def _make_fake_pandoc(target: Path):
+    """fake pandoc: 用 python-docx 生成一个含标题样式的 docx(模拟 pandoc 产物),
+    返回可注入 _run_pandoc 的替身。"""
+    from docx import Document
+
+    def _fake(src, tgt, timeout_s=60):
+        assert Path(src).is_file(), f"pandoc source missing: {src}"
+        doc = Document()
+        doc.add_heading("转换标题", level=1)
+        doc.add_paragraph("正文段落")
+        doc.save(str(tgt))
+        return True, ""
+
+    return _fake
+
+
+def test_export_docx_markdown_source_routes_to_pandoc(tmp_path: Path, monkeypatch):
+    """2026-08-15: md 源必须走 pandoc(不逐行裸 dump), 产物统一中文字体。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        src = root / "notes.md"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("# 标题\n\n- 列表项\n\n| a | b |\n|---|---|\n| 1 | 2 |\n", encoding="utf-8")
+        calls = []
+        fake = _make_fake_pandoc(root / "outputs" / "x.docx")
+        monkeypatch.setattr(mod, "_run_pandoc", fake)
+
+        out = list(handler.do_export_docx(
+            {"path": "outputs/from_md.docx", "source_path": "notes.md"},
+            "",
+        ))
+        target = root / "outputs" / "from_md.docx"
+        assert target.exists()
+        # 工具如实报告引擎。
+        assert any("pandoc" in str(o) for o in out), f"engine not reported: {out}"
+        # 中文字体统一(pandoc 默认模板混排修复)。
+        import zipfile
+        with zipfile.ZipFile(target) as zf:
+            styles = zf.read("word/styles.xml").decode("utf-8")
+        assert "微软雅黑" in styles
+    finally:
+        unwrap()
+
+
+def test_export_docx_markdown_content_routes_to_pandoc(tmp_path: Path, monkeypatch):
+    """2026-08-15: content 为 markdown 结构时走 pandoc; 纯文本不依赖 pandoc。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        calls = []
+        fake = _make_fake_pandoc(root / "outputs" / "y.docx")
+        monkeypatch.setattr(mod, "_run_pandoc", lambda src, tgt, timeout_s=60: calls.append((str(src), str(tgt))) or fake(src, tgt))
+
+        out = list(handler.do_export_docx(
+            {"path": "outputs/md_content.docx", "content": "# 大标题\n\n**加粗** 正文\n\n- 项一\n- 项二\n"},
+            "",
+        ))
+        target = root / "outputs" / "md_content.docx"
+        assert target.exists(), f"docx missing: {target}"
+        assert len(calls) == 1, f"pandoc must be invoked for markdown content, calls={calls}"
+        assert calls[0][0].endswith(".src.md"), f"temp md source expected, got {calls[0][0]}"
+        # 临时源已清理。
+        assert not Path(calls[0][0]).exists()
+        assert any("pandoc" in str(o) for o in out)
+
+        # 纯文本: 不调 pandoc, 直接 python-docx。
+        calls.clear()
+        out2 = list(handler.do_export_docx(
+            {"path": "outputs/plain.docx", "title": "普通文档", "content": "第一行\n第二行"},
+            "",
+        ))
+        target2 = root / "outputs" / "plain.docx"
+        assert target2.exists()
+        assert len(calls) == 0, f"pandoc must NOT be invoked for plain text, calls={calls}"
+        assert any("python-docx" in str(o) for o in out2)
+        import zipfile
+        with zipfile.ZipFile(target2) as zf:
+            styles = zf.read("word/styles.xml").decode("utf-8")
+        assert "微软雅黑" in styles
+    finally:
+        unwrap()
+
+
+def test_export_docx_pandoc_missing_fails_explicitly(tmp_path: Path, monkeypatch):
+    """2026-08-15: md 输入而 pandoc 不可用(异常环境)时必须显式失败, 不静默
+    降级裸 dump——镜像预装 pandoc, 生产不应触发。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        src = root / "notes.md"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("# 标题\n", encoding="utf-8")
+        monkeypatch.setattr(mod, "_run_pandoc", lambda s, t, timeout_s=60: (False, "pandoc not found in this environment"))
+
+        out = list(handler.do_export_docx(
+            {"path": "outputs/fail.docx", "source_path": "notes.md"},
+            "",
+        ))
+        target = root / "outputs" / "fail.docx"
+        assert not target.exists(), "md without pandoc must not produce a dump docx"
+        assert any("pandoc conversion failed" in str(o) for o in out), f"explicit error expected: {out}"
+    finally:
+        unwrap()
+
+
+def test_export_docx_txt_with_markdown_content_routes_as_markdown(tmp_path: Path, monkeypatch):
+    """审查 A-1: .txt 内容命中 markdown 启发式时必须按 markdown 走 pandoc
+    (临时文件 .md 扩展)——保留 .txt 扩展会让 pandoc 按纯文本解析, 标记被
+    剥除且无排版(实测: # 标题行 → 无标题样式的纯文本)。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        src = root / "notes.txt"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("# 标题\n\n- 项一\n- 项二\n", encoding="utf-8")
+        calls = []
+        fake = _make_fake_pandoc(root / "outputs" / "x.docx")
+        monkeypatch.setattr(mod, "_run_pandoc",
+                            lambda s, t, timeout_s=60: calls.append((str(s), str(t))) or fake(s, t))
+
+        out = list(handler.do_export_docx(
+            {"path": "outputs/txt_md.docx", "source_path": "notes.txt"},
+            "",
+        ))
+        target = root / "outputs" / "txt_md.docx"
+        assert target.exists()
+        assert len(calls) == 1, f"markdown-looking txt must route to pandoc, calls={calls}"
+        tmp_src = Path(calls[0][0])
+        assert tmp_src.suffix == ".md", f"markdown-looking txt must use .md ext, got {tmp_src}"
+        assert not tmp_src.exists(), "temp source must be cleaned up"
+        assert any("pandoc" in str(o) for o in out)
+    finally:
+        unwrap()
+
+
+def test_export_docx_gbk_source_decoded(tmp_path: Path, monkeypatch):
+    """2026-08-15: GBK/GB2312 编码 txt(Windows 记事本来源)必须正确解码,
+    不再依赖模型先 iconv(SOP §4.7 收进工具契约)。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        src = root / "gbk_note.txt"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_bytes("工作计划：今天完成报告评审，明天安排代码走查。\n".encode("gb18030"))
+
+        out = list(handler.do_export_docx(
+            {"path": "outputs/gbk.docx", "source_path": "gbk_note.txt"},
+            "",
+        ))
+        target = root / "outputs" / "gbk.docx"
+        assert target.exists()
+        import zipfile
+        with zipfile.ZipFile(target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        assert "工作计划" in xml, "GBK 中文必须正确解码, 不得乱码"
+        assert "完成报告评审" in xml
+        assert "�" not in xml, "不得出现替换符"
+    finally:
+        unwrap()
+
+
+def test_export_docx_gbk_markdown_source_routed_via_pandoc(tmp_path: Path, monkeypatch):
+    """2026-08-15: GBK 编码的 md 走 pandoc 前必须归一为 UTF-8(临时文件),
+    且保留 .md 扩展名让 pandoc 正确解析。"""
+    handler, root, session, unwrap, mod = _export_docx_harness(tmp_path, monkeypatch)
+    try:
+        src = root / "gbk_doc.md"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_bytes("# 中文标题\n\n正文内容\n".encode("gb18030"))
+
+        calls = []
+        fake = _make_fake_pandoc(root / "outputs" / "x.docx")
+        monkeypatch.setattr(mod, "_run_pandoc", lambda s, t, timeout_s=60: calls.append((str(s), str(t))) or fake(s, t))
+
+        list(handler.do_export_docx(
+            {"path": "outputs/gbk_md.docx", "source_path": "gbk_doc.md"},
+            "",
+        ))
+        target = root / "outputs" / "gbk_md.docx"
+        assert target.exists()
+        assert len(calls) == 1
+        # 临时文件保留 .md 扩展名(否则 pandoc 无法识别格式)且已清理。
+        tmp_src = Path(calls[0][0])
+        assert tmp_src.suffix == ".md", f"temp source must keep .md ext, got {tmp_src}"
+        assert not tmp_src.exists(), "temp source must be cleaned up"
+    finally:
+        unwrap()

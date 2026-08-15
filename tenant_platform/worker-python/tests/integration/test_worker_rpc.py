@@ -53,6 +53,8 @@ LEGACY_ROOT_WATCHED_FILES = (
     "assets/insight_fixed_structure.txt",
     "assets/insight_fixed_structure_en.txt",
     "assets/code_run_header.py",
+    "assets/docx_utils.py",
+    "assets/reference.docx",
 )
 
 
@@ -68,6 +70,25 @@ def _snapshot_legacy_root() -> dict[str, str]:
             continue
         snap[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
     return snap
+
+
+@pytest.fixture(scope="module", autouse=True)
+def reference_docx_placeholder():
+    """assets/reference.docx 是 ga-runner 构建期产物(不入库, docx_utils.py
+    make-template 生成)。integration 以仓库根为 legacy root, overlay 物化
+    要求该文件存在——缺失时生成最小占位 docx(物化只复制不校验内容, 转换
+    功能不在此测试范围), 测试后清理。"""
+    p = REPO_ROOT / "assets" / "reference.docx"
+    generated = False
+    if not p.is_file():
+        from docx import Document
+
+        Document().save(str(p))
+        generated = True
+        print("[itest] generated placeholder assets/reference.docx")
+    yield p
+    if generated:
+        p.unlink(missing_ok=True)
 
 
 def _assert_legacy_root_unchanged(before: dict[str, str]) -> None:

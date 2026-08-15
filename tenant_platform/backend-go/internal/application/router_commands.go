@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -155,6 +156,20 @@ func (r *router) handleNew(ctx context.Context, msg IncomingMessage, bot domain.
 	if _, err := r.store.ResetWorkspaceForNewSession(ctx, sessionKey, msg.ConversationID); err != nil {
 		return RouterResult{}, fmt.Errorf("reset workspace: %w", err)
 	}
+	// 2026-08-15 会话隔离: /new 同时物理清理旧会话 inbound 附件(manifest
+	// 移除 + 文件删除), 与新任务的 RecentSince 引用过滤一致——旧输入文件
+	// 不落盘残留、不注入新会话上下文。outbound 产物保留磁盘(引用隔离由
+	// RecentSince 保证)。清理失败仅告警: /new 主语义(历史/reset)已成功。
+	if r.sessionFiles != nil {
+		resetAt, err := r.store.GetConversationResetAt(ctx, sessionKey, msg.ConversationID)
+		if err != nil {
+			slog.WarnContext(ctx, "router: /new get conversation reset at failed", "error", err)
+		} else if !resetAt.IsZero() {
+			if err := r.sessionFiles.PruneInboundBefore(sessionKey, resetAt); err != nil {
+				slog.WarnContext(ctx, "router: /new prune session files failed", "error", err)
+			}
+		}
+	}
 	reply := "已开启新会话，history 和 working 已清空"
 	_ = r.transport.SendMessage(ctx, msg.BotUUID, msg.replyTarget(), reply, "")
 	return RouterResult{Action: ActionNewSession, Reply: reply, UserID: bot.OwnerID}, nil
@@ -253,7 +268,15 @@ func (r *router) handleNormalMessage(ctx context.Context, msg IncomingMessage, b
 		// 按序补入 refs(与 MediaPaths 同序构造, poller 保证), 随任务媒体
 		// 清单持久化/下发——飞书 image 等无扩展名场景不靠文件名重猜。
 		applyInboundContentTypes(currentRefs, msg.MediaItems)
-		recentRefs, err := r.sessionFiles.Recent(sessionKey, 8)
+		// 2026-08-15 会话隔离: 引用注入只含本桶最近一次 /new 之后的文件——
+		// 旧会话附件/输出不再出现在新会话 prompt(生产实证: 旧表格文件注入
+		// 导致新任务误转旧文件)。DB 查询失败时降级为不过滤(宁可多注入也
+		// 不阻断任务; 引用隔离是体验问题非安全问题)。
+		var resetAt time.Time
+		if resetAt, err = r.store.GetConversationResetAt(ctx, sessionKey, msg.ConversationID); err != nil {
+			slog.WarnContext(ctx, "router: get conversation reset at failed; session file filter disabled", "error", err)
+		}
+		recentRefs, err := r.sessionFiles.RecentSince(sessionKey, 8, resetAt)
 		if err != nil {
 			// round13 审查(X3): 附件已导入成功而 Recent 失败时, 必须回滚本次
 			// 导入——否则附件残留且无 manifest 归属(消息整体失败, Poller 重试

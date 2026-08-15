@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -129,18 +130,101 @@ _EXPORT_DOCX_TOOL = {
     "type": "function",
     "function": {
         "name": "export_docx",
-        "description": "Generate a .docx file inside the session outputs/ sandbox. Use content or <file_content> in the reply body; optionally set source_path to convert an existing text file.",
+        "description": "Generate a .docx file inside the session outputs/ sandbox. Markdown/HTML sources (source_path or content) are converted with the built-in pandoc and unified to Chinese font 微软雅黑; plain text uses python-docx. Use content or <file_content> in the reply body; optionally set source_path to convert an existing text file. For custom typography (user-specified heading fonts/sizes), run ../assets/docx_utils.py (make-template with --spec, then md-to-docx) per memory/document_conversion_sop.md.",
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "relative output path, usually outputs/<name>.docx"},
-                "source_path": {"type": "string", "description": "optional relative text source file to convert"},
-                "title": {"type": "string", "description": "optional document title"},
-                "content": {"type": "string", "description": "optional plain text content; if omitted, the tool reads <file_content> from the assistant reply body"},
+                "source_path": {"type": "string", "description": "optional relative md/html/txt source file to convert (pandoc)"},
+                "title": {"type": "string", "description": "optional document title (plain-text path only; markdown headings come from the source)"},
+                "content": {"type": "string", "description": "optional text content; markdown content is converted via pandoc; if omitted, the tool reads <file_content> from the assistant reply body"},
             },
         },
     },
 }
+
+
+# 2026-08-15 docx 生成质量修复(生产实证): export_docx 曾逐行裸 dump(无排版),
+# 模型亦不知道镜像预装 pandoc。现在工具契约内置正确性: md/html/txt 走 pandoc
+# 保真转换(标题/表格/列表), 转换后统一中文字体(消除 pandoc 默认模板
+# major/minor 混排 + 中文回退导致的“粗细不一”); 纯文本走 python-docx 但同样
+# 统一字体。pandoc 缺失时显式报错, 不静默降级 dump。
+_DOCX_CJK_FONT = "微软雅黑"
+_MARKDOWN_SOURCE_EXTS = (".md", ".markdown", ".html", ".htm")
+_PANDOC_TIMEOUT_S = 60
+
+_MARKDOWN_HINTS = (
+    re.compile(r"^#{1,6}\s", re.M),
+    re.compile(r"^\s*\|.*\|\s*$", re.M),
+    re.compile(r"^\s*[-*]\s+\S", re.M),
+    re.compile(r"\*\*[^*]+\*\*"),
+    re.compile(r"^```", re.M),
+)
+
+
+def _looks_like_markdown(content: str) -> bool:
+    """启发式判定 content 是否为 markdown 结构(标题/表格/列表/粗体/代码块)。"""
+    if not content or not content.strip():
+        return False
+    head = content[:4000]
+    return any(p.search(head) for p in _MARKDOWN_HINTS)
+
+
+def _unify_cjk_fonts(doc: Any, font_name: str) -> None:
+    """把 docx 样式层(含 docDefaults)与正文的字体统一为 font_name 并清除主题
+    字体引用。python-docx 的 lxml 直接操作: 遍历 styles.xml 与 document.xml 的
+    全部 w:rPr。get_or_add_* 按 OOXML schema 序插入(审查 C-3: 手写 insert(0)
+    会把 rFonts 插到 rStyle 之前, 违反 CT_RPr 元素顺序)。"""
+    from docx.oxml.ns import qn
+
+    for container in (doc.styles.element, doc.element):
+        for rPr in container.iter(qn("w:rPr")):
+            rFonts = rPr.get_or_add_rFonts()
+            for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+                rFonts.set(qn(attr), font_name)
+            for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+                if rFonts.get(qn(attr)) is not None:
+                    del rFonts.attrib[qn(attr)]
+
+
+def _read_text_robust(path: Path) -> str:
+    """编码容错读取(SOP §4.7 收进工具契约): UTF-8 优先, 失败回退 GB18030
+    (GBK/GB2312 超集, Windows 记事本来源), 再兜底 errors=replace——不再
+    依赖模型记得先 iconv。"""
+    data = path.read_bytes()
+    for enc in ("utf-8", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _run_pandoc(src: Path, target: Path, timeout_s: int = _PANDOC_TIMEOUT_S) -> tuple[bool, str]:
+    """镜像内置 pandoc(ga-runner 预装官方二进制)文本类转换。
+    返回 (ok, errmsg)。pandoc 缺失/超时/非零退出均返回错误——调用方决定
+    显式报错(不做静默降级裸 dump)。"""
+    import shutil
+    import subprocess
+
+    pandoc = shutil.which("pandoc")
+    if pandoc is None:
+        return False, "pandoc not found in this environment"
+    try:
+        proc = subprocess.run(
+            [pandoc, str(src), "-o", str(target)],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"pandoc timed out after {timeout_s}s"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        return False, f"pandoc failed (exit {proc.returncode}): {detail}"
+    return True, ""
 
 def install_export_docx_tool(session: Any, legacy_mods: dict[str, Any] | None) -> Callable[[], None]:
     """Expose export_docx(round11 审查 I5): GA 原生没有 docx 生成工具, 而
@@ -203,9 +287,11 @@ def install_export_docx_tool(session: Any, legacy_mods: dict[str, Any] | None) -
 
             content = str(args.get("content") or "")
             source_path = str(args.get("source_path") or "")
+            src_abs: Path | None = None
             if not content and source_path:
-                src = resolve_under_root(sandbox_root, source_path)
-                content = src.read_text(encoding="utf-8", errors="replace")
+                src_abs = resolve_under_root(sandbox_root, source_path)
+                if not src_abs.is_file():
+                    raise ValueError(f"source_path not found: {source_path}")
             if not content:
                 body = ""
                 try:
@@ -215,27 +301,89 @@ def install_export_docx_tool(session: Any, legacy_mods: dict[str, Any] | None) -
                 m = re.search(r"<file_content>(.*?)</file_content>", body, re.S)
                 if m:
                     content = m.group(1).strip()
-            if not content.strip():
+            if not content.strip() and src_abs is None:
                 raise ValueError(
                     "no content to export: pass content, source_path, or <file_content>"
                 )
 
-            doc = Document()
             title = str(args.get("title") or "").strip()
-            if title:
-                doc.add_heading(title, level=0)
-            for line in content.splitlines():
-                if not line.strip():
-                    continue
-                doc.add_paragraph(line.rstrip())
-            doc.save(str(target))
+            engine = "python-docx"
+            if src_abs is not None:
+                ext = src_abs.suffix.lower()
+                if ext not in _MARKDOWN_SOURCE_EXTS and ext != ".txt":
+                    raise ValueError(
+                        f"source_path type not supported for docx: {ext} (use md/html/txt)"
+                    )
+                # 2026-08-15: 编码容错读入(SOP §4.7 收进工具契约: GBK 不再依赖
+                # 模型先 iconv), 统一 UTF-8 落临时文件走 pandoc。审查 A-1:
+                # txt 内容命中 markdown 启发式时临时文件必须用 .md 扩展——
+                # pandoc 按扩展名推断格式, 保留 .txt 会把 md 当纯文本解析
+                # (标记被剥除且无排版, 实测); md/html 保留原扩展名让 pandoc
+                # 正确识别格式, 纯文本 txt 走 python-docx。
+                content = _read_text_robust(src_abs)
+                if ext == ".txt" and not _looks_like_markdown(content):
+                    doc = Document()
+                    if title:
+                        doc.add_heading(title, level=0)
+                    for line in content.splitlines():
+                        if not line.strip():
+                            continue
+                        doc.add_paragraph(line.rstrip())
+                    _unify_cjk_fonts(doc, _DOCX_CJK_FONT)
+                    doc.save(str(target))
+                else:
+                    tmp_ext = ".md" if ext == ".txt" else ext
+                    tmp = target.parent / (f".{target.name}.src{tmp_ext}")
+                    tmp.write_text(content, encoding="utf-8")
+                    try:
+                        ok, errmsg = _run_pandoc(tmp, target)
+                    finally:
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    if not ok:
+                        raise ValueError(f"pandoc conversion failed: {errmsg}")
+                    engine = "pandoc"
+                    _doc = Document(str(target))
+                    _unify_cjk_fonts(_doc, _DOCX_CJK_FONT)
+                    _doc.save(str(target))
+            elif _looks_like_markdown(content):
+                # content 是 markdown: 落临时 .md 走 pandoc(保真), 完毕删除。
+                tmp = target.parent / (f".{target.name}.src.md")
+                tmp.write_text(content, encoding="utf-8")
+                try:
+                    ok, errmsg = _run_pandoc(tmp, target)
+                finally:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if not ok:
+                    raise ValueError(f"pandoc conversion failed: {errmsg}")
+                engine = "pandoc"
+                _doc = Document(str(target))
+                _unify_cjk_fonts(_doc, _DOCX_CJK_FONT)
+                _doc.save(str(target))
+            else:
+                # 纯文本: python-docx 逐行 + 中文字体统一(不裸 dump)。
+                doc = Document()
+                if title:
+                    doc.add_heading(title, level=0)
+                for line in content.splitlines():
+                    if not line.strip():
+                        continue
+                    doc.add_paragraph(line.rstrip())
+                _unify_cjk_fonts(doc, _DOCX_CJK_FONT)
+                doc.save(str(target))
+                engine = "python-docx"
 
             generated = getattr(session, "generated_output_files", None)
             if generated is not None:
                 rel = str(target.relative_to(sandbox_root)).replace("\\", "/")
                 if rel not in generated:
                     generated.append(rel)
-            yield f"[Status] ✅ 已生成 Word 文档: {normalized}\n"
+            yield f"[Status] ✅ 已生成 Word 文档({engine} + 中文字体 {_DOCX_CJK_FONT}): {normalized}\n"
         except Exception as exc:
             yield f"[Status] ❌ export_docx 失败: {exc}\n"
             step_outcome_cls = getattr(sys.modules.get("agent_loop"), "StepOutcome", None)

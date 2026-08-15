@@ -5,6 +5,7 @@ import hmac
 import os
 import random
 import re
+import json
 import threading
 import time
 
@@ -748,3 +749,27 @@ def test_deliver_inbound_stop_cancels_flush_timer():
     assert adapter._flush_timer is None
     # 定时器已取消: pending 不再投递(无 post_webhook 路径可触发)。
     assert adapter._coalescer.flush_all() != []  # 数据仍在缓冲中, 由下次启动承接
+
+
+def test_health_exposes_inbound_coalesce_window():
+    """2026-08-15 可观测性: /health 必须暴露当前合并窗口, 平台对账/诊断依赖
+    它(曾因 poller 重启窗口回 0 且不可见, 静默失效 18 小时)。"""
+    import urllib.request
+
+    server, base = _start_handler_server()
+    try:
+        # 默认窗口 0(未配置); /config 设置后 health 应反映新值。
+        with urllib.request.urlopen(base + "/health", timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["inbound_coalesce_window_ms"] == 0, body
+
+        resp = requests.post(base + "/config",
+                             json={"inbound_coalesce_window_ms": 2500}, timeout=5)
+        assert resp.status_code == 200, resp.text
+
+        with urllib.request.urlopen(base + "/health", timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["inbound_coalesce_window_ms"] == 2500, body
+        assert body["healthy"] is True
+    finally:
+        server.shutdown()

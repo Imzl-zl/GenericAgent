@@ -25,6 +25,9 @@ type BotLifecycleStore interface {
 	UpsertBotTransportState(ctx context.Context, botID int64, cursorCiphertext []byte, cursorKeyVersion int, reconnectState, lastErrorCode string) error
 	ListActiveChannelConfigs(ctx context.Context) ([]domain.ChannelConfig, error)
 	UpdateChannelConfigState(ctx context.Context, botUUID string, state domain.ChannelConfigState) error
+	// GetIMInboundCoalesceWindowMS 读取入站合并窗口(ms), 对账时幂等重推给
+	// Poller(2026-08-15: 窗口曾因 poller 重启丢失且无对账, 静默失效)。
+	GetIMInboundCoalesceWindowMS(ctx context.Context) (int, error)
 }
 
 // BotLifecycleService orchestrates bot start/stop/restore against the Bot
@@ -246,6 +249,20 @@ func (s *botLifecycleService) ReconcileBots(ctx context.Context) error {
 		expected[cfg.BotUUID] = cfg
 	}
 	var errs []error
+	// 2026-08-15 入站合并窗口对账: 窗口配置真值源 = DB platform_runtime_settings,
+	// 每 tick 与 /health 上报的 poller 当前值比对, 不一致才重推 /config(与 bot
+	// 对账同生命周期)。曾因 poller 重启(部署/崩溃恢复)后窗口回 0 且无对账,
+	// 静默失效 18 小时——文字+文件消息被拆成两个任务, 无附件任务误转旧会话
+	// 文件。失败仅记录, 下一 tick 收敛。旧版 poller 不报该字段(=0), 与 DB
+	// 默认 2500 必然不一致 → 触发推送, 兼容。
+	windowMS, err := s.store.GetIMInboundCoalesceWindowMS(ctx)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("get inbound coalesce window: %w", err))
+	} else if health.InboundCoalesceWindowMS != windowMS {
+		if err := s.poller.ConfigureInboundCoalescing(ctx, windowMS); err != nil {
+			errs = append(errs, fmt.Errorf("configure poller inbound coalescing: %w", err))
+		}
+	}
 	// Desired but missing → re-register. Re-check the DB state right before
 	// start so a stale list snapshot cannot resurrect a bot that was unbound/
 	// expired concurrently; a recheck failure skips this round and converges
