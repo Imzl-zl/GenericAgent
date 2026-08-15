@@ -113,7 +113,7 @@
 
 ## 最近活跃窗口
 
-- 2026-08-15：**审查后优化落地 + 微信 E2E 复验（docx 模板化链路）**：修复 6 处——header_fill --spec 覆盖生效（_normalize_spec 白名单）、窗口默认值单真值源（store 无行回退 domain 常量 + migration 种子契约测试）、StepOutcome 反馈契约补测试、双轨 helper 漂移守卫测试（test_docx_helpers_drift.py）、verify_docx 失败不再打印 ✅ + 空文档必失败、SOP 补 custom-style fenced div + 裸 pandoc 警示。已部署（ga-runner digest 78c4d7b7）→ 真实微信 E2E 任务 0029b8b2 交付 acked：E2E模板化验证.docx 封面/宋体/表格/零雅黑全 ✓，模型回复与产物一致。- 2026-08-15：**微信出站假 ack 事故根因修复（用户实证 20:52 未收到）**：acked≠送达——wxbot_client 出站从不检查 iLink 业务错误码（钉钉有、微信没有），sendmessage ret=-2（过期 context_token，仅入站刷新）被静默吞掉；修复=错误码 fail-closed + poller 入站缓存 token 出站注入 + 过期降级重试（commit 67c80f9）；用户发"在吗"刷新会话后复验任务 bf4e1ace 真实送达（会话恢复复验.docx 契约全 ✓）。
+- 2026-08-15：**审查后优化落地 + 微信 E2E 复验（docx 模板化链路）**：修复 6 处——header_fill --spec 覆盖生效（_normalize_spec 白名单）、窗口默认值单真值源（store 无行回退 domain 常量 + migration 种子契约测试）、StepOutcome 反馈契约补测试、双轨 helper 漂移守卫测试（test_docx_helpers_drift.py）、verify_docx 失败不再打印 ✅ + 空文档必失败、SOP 补 custom-style fenced div + 裸 pandoc 警示。已部署（ga-runner digest 78c4d7b7）→ 真实微信 E2E 任务 0029b8b2 交付 acked：E2E模板化验证.docx 封面/宋体/表格/零雅黑全 ✓，模型回复与产物一致。- 2026-08-15：**微信出站假 ack 事故根因修复（用户实证 20:52 未收到）**：acked≠送达——wxbot_client 出站从不检查 iLink 业务错误码（钉钉有、微信没有），sendmessage ret=-2（过期 context_token，仅入站刷新）被静默吞掉；修复=错误码 fail-closed + poller 入站缓存 token 出站注入 + 过期降级重试（commit 67c80f9）；用户发"在吗"刷新会话后复验任务 bf4e1ace 真实送达，**用户确认微信收到**（会话恢复复验.docx 契约全 ✓）。
 
 - 2026-08-15：**docx 转换模板化定案（官方/社区实证落地）**：export_docx 裸 pandoc + 全雅黑强改 → 默认套内置 reference.docx（宋体/TNR/首行缩进/表格浅蓝表头）+ `--metadata=title` 封面 + 内置验证（失败删产物报错）；title 不再静默丢弃；纯文本仅 eastAsia=宋体；docx_utils PRESET_CN 补 Table 样式（全框线+表头底纹）；SOP 明确默认路径/禁自写 python-docx；生产工作区 SOP 已同步。部署：重建 ga-runner 镜像（worker-python src+assets+memory-template 单镜像承载）。
 
