@@ -464,6 +464,8 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
         return None if ra and ra > cap else max(0.5, ra or min(30.0, 1.5 * (2 ** attempt)))
     for attempt in range(sess.max_retries + 1):
         streamed = False
+        STATS.update(t_start=time.time(), t_ttft=None)
+        if not sess.stream: STATS['t_ttft'] = STATS['t_start']
         try:
             with sess.http.post(url, headers=headers, json=payload, stream=sess.stream,
                                timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
@@ -480,9 +482,15 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                     yield err; return [{"type": "text", "text": err}]
                 gen = parse_fn(r)
                 try:
-                    while True: chunk = next(gen); streamed = True; yield chunk
+                    while True:
+                        if getattr(sess, 'should_stop', None) and sess.should_stop():
+                            STATS['t_end'] = time.time(); return []
+                        chunk = next(gen)
+                        if chunk and STATS.get('t_ttft') is None: STATS['t_ttft'] = time.time()
+                        streamed = True; yield chunk
                 except StopIteration as e:
                     if not e.value and not streamed: raise requests.ConnectionError("empty response")
+                    STATS['t_end'] = time.time()
                     return e.value or []
         except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
             err = f"!!!Error: {type(e).__name__}: {e}" if str(e) else f"!!!Error: {type(e).__name__}"
