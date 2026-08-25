@@ -461,8 +461,16 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
     def _delay(resp, attempt):
         try: ra = float((resp.headers or {}).get("retry-after"))
         except: ra = None
-        return None if ra and ra > cap else max(0.5, ra or min(30.0, 1.5 * (2 ** attempt)))
+        return None if ra and ra > cap else max(0.5, ra or min(30.0, 3.0 * (2 ** attempt)))
+    def _stopped(): return getattr(sess, 'should_stop', None) and sess.should_stop()
+    def _sleep(d):  # interruptible sleep; True if aborted
+        end = time.time() + d
+        while time.time() < end:
+            if _stopped(): return True
+            time.sleep(0.2)
+        return _stopped()
     for attempt in range(sess.max_retries + 1):
+        if _stopped(): return []
         streamed = False
         STATS.update(t_start=time.time(), t_ttft=None)
         if not sess.stream: STATS['t_ttft'] = STATS['t_start']
@@ -475,7 +483,8 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                     d = _delay(r, attempt) if r.status_code in _RETRYABLE and attempt < sess.max_retries else None
                     if d is not None:
                         print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
-                        time.sleep(d); continue
+                        if _sleep(d): return []
+                        continue
                     try: body = r.text.strip()[:500]
                     except: body = ""
                     err = f"!!!Error: HTTP {r.status_code}" + (f" (retry-after > {cap:.0f}s)" if d is None and r.status_code in _RETRYABLE and attempt < sess.max_retries else "") + (f": {body}" if body else "")
@@ -499,7 +508,8 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
             if attempt < sess.max_retries:
                 d = _delay(None, attempt)
                 print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
-                time.sleep(d); continue
+                if _sleep(d): return []
+                continue
             yield err; return [{"type": "text", "text": err}]
         except Exception as e:
             err = f"\n\n[!!! 流异常中断 {type(e).__name__}: {e} !!!]" if streamed else f"!!!Error: {type(e).__name__}: {e}"
