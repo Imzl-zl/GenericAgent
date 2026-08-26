@@ -170,6 +170,10 @@ class GenericAgent:
 
     def run(self):
         self._runner_thread = threading.current_thread()
+        # self-heal for minimal/__new__ constructions (tests, overlays): missing
+        # attrs default safely instead of AttributeError mid-task.
+        if not hasattr(self, 'all_outputs'): self.all_outputs = []
+        if not hasattr(self, '_current_queue'): self._current_queue = None
         while True:
             task = self.task_queue.get()
             if isinstance(task, str): break
