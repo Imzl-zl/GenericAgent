@@ -35,6 +35,8 @@ def roots(tmp_path):
         "insight_fixed_structure.txt",
         "insight_fixed_structure_en.txt",
         "code_run_header.py",
+        "docx_utils.py",
+        "reference.docx",
     ):
         (assets / name).write_text(f"# {name}\n", encoding="utf-8")
     return legacy_root, runtime_root

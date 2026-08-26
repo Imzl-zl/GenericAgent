@@ -2,9 +2,11 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/Imzl-zl/GenericAgent/tenant_platform/backend-go/internal/domain"
+	"github.com/jackc/pgx/v5"
 )
 
 func (s *Store) GetIMInboundCoalesceWindowMS(ctx context.Context) (int, error) {
@@ -15,6 +17,14 @@ FROM platform_runtime_settings
 WHERE setting_key = $1
 `, domain.IMInboundCoalesceWindowSettingKey).Scan(&windowMS)
 	if err != nil {
+		// 审查 M2(单真值源): 无行 = 从未配置/种子被删 = 回退域默认值。
+		// domain.DefaultIMInboundCoalesceWindowMS 是"默认"的唯一定义,
+		// migration 0025 种子与其一致由契约测试守护; 此前直接返回错误
+		// 会让 GET /admin/settings 500、ReconcileBots 持续报错——DB 行
+		// 是运行期覆盖, 缺省应回落默认而非故障。
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.DefaultIMInboundCoalesceWindowMS, nil
+		}
 		return 0, fmt.Errorf("get im inbound coalesce window: %w", err)
 	}
 	return windowMS, nil

@@ -234,7 +234,7 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
     if code_type in ["python", "py"]:
         tmp_file = tempfile.NamedTemporaryFile(suffix=".ai.py", delete=False, mode='w', encoding='utf-8', dir=code_cwd)
         cr_header = os.path.join(script_dir, 'assets', 'code_run_header.py')
-        if os.path.exists(cr_header): tmp_file.write(open(cr_header, encoding='utf-8').read())
+        if os.path.exists(cr_header): tmp_file.write(Path(cr_header).read_text(encoding='utf-8'))
         tmp_file.write(code)
         tmp_path = tmp_file.name
         tmp_file.close()
@@ -641,8 +641,8 @@ class GenericAgentHandler(BaseHandler):
         try:
             new_content = expand_file_refs(content, base_dir=self.cwd)
             if mode == "prepend":
-                old = open(path, 'r', encoding="utf-8").read() if os.path.exists(path) else ""
-                open(path, 'w', encoding="utf-8", newline=_file_newline(path)).write(new_content + old)
+                old = Path(path).read_text(encoding="utf-8") if os.path.exists(path) else ""
+                Path(path).write_text(new_content + old, encoding="utf-8", newline=_file_newline(path))
             else:
                 with open(path, 'a' if mode == "append" else 'w', encoding="utf-8", newline=_file_newline(path)) as f: f.write(new_content)
             yield f"[Status] ✅ {mode.capitalize()} 成功 ({len(new_content)} bytes)\n"
@@ -684,7 +684,7 @@ class GenericAgentHandler(BaseHandler):
         return plan_path
     def _check_plan_completion(self):
         if not os.path.isfile(p:=self._in_plan_mode() or ''): return None
-        try: return len(re.findall(r'\[ \]', open(p, encoding='utf-8', errors='replace').read()))
+        try: return len(re.findall(r'\[ \]', Path(p).read_text(encoding='utf-8', errors='replace')))
         except: return None
     
     def do_image_gen(self, args, response):
@@ -925,5 +925,55 @@ def get_global_memory():
         prompt += f"\n[Memory] (../memory)\n"
         prompt += structure + '\n../memory/global_mem_insight.txt:\n'
         prompt += insight + "\n"
+        # 2026-08-15 L1 动态补全: 静态索引可能漏录新 SOP(生产实证: 平台新增
+        # document_conversion_sop/wechat_delivery_sop 未更新 L1 模板, 模型从
+        # 未读到它们)。扫描 memory/ 顶层自动披露全部 SOP/工具文件名——渐进
+        # 披露不再依赖索引人工维护(静态索引保留注释语义, 动态清单兜底发现)。
+        auto = _auto_discovered_sops(insight)
+        if auto:
+            prompt += "\n[L3 auto-discovered SOPs/utils]\n" + " | ".join(auto) + "\n"
     except FileNotFoundError: pass
     return prompt
+
+
+def _indexed_memory_names(insight):
+    """从静态 L1 索引文本提取已索引文件名 base 名集合(去扩展名/注释括号/
+    符号)。审查 B-6: 不能用子串匹配——"cleanup_sop" 是 "memory_cleanup_sop"
+    的子串, 新 SOP 会被误判已索引而漏披露(恰是本轮要防的事故类别)。"""
+    names = set()
+    for tok in re.split(r"[\s|,()+/]+", insight or ""):
+        tok = tok.strip().rstrip(".")
+        if not tok:
+            continue
+        for suffix in (".py", ".md"):
+            if tok.endswith(suffix):
+                tok = tok[: -len(suffix)]
+        # "ljqCtrl_sop+" 类带后缀符号的 token 取首个字母数字段。
+        head = re.split(r"[^A-Za-z0-9_]", tok)[0]
+        if head:
+            names.add(head)
+    return names
+
+
+def _auto_discovered_sops(insight):
+    """列出 memory/ 顶层未在静态 L1 索引中出现的 *.md/*.py(自动披露)。"""
+    try:
+        mem = os.path.join(script_dir, 'memory')
+        if not os.path.isdir(mem):
+            return []
+        indexed = _indexed_memory_names(insight)
+        out = []
+        for name in sorted(os.listdir(mem)):
+            if name.startswith('.'):
+                continue
+            if not (name.endswith('.md') or name.endswith('.py')):
+                continue
+            if not os.path.isfile(os.path.join(mem, name)):
+                continue
+            base = name.rsplit('.', 1)[0]
+            if base in indexed:
+                continue  # 已在静态索引(含注释语义), 不重复
+            out.append(name)
+        return out
+    except OSError:
+        return []

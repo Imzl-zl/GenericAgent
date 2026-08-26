@@ -93,6 +93,10 @@ type RouterStore interface {
 	FindRunningTaskBySession(ctx context.Context, sessionKey, conversationKey string) (domain.Task, error)
 	// ResetWorkspaceForNewSession 设置 reset_at 并取消 queued 任务(/new)。
 	ResetWorkspaceForNewSession(ctx context.Context, sessionKey, conversationKey string) (int, error)
+	// GetConversationResetAt 返回本对话单元桶最近一次 /new 的 reset_at
+	// (无记录 = 零值)。会话文件引用隔离的真值源(2026-08-15):
+	// RecentSince 按它过滤跨会话文件。
+	GetConversationResetAt(ctx context.Context, sessionKey, conversationKey string) (time.Time, error)
 }
 
 // MessageStore persists inbound and outbound WeChat messages for history,

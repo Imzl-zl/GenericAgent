@@ -59,6 +59,14 @@ type SessionFiles interface {
 	// 附件残留。幂等: 文件/条目不存在视为成功。
 	RemoveInbound(sessionKey string, refs []SessionFileRef) error
 	Recent(sessionKey string, limit int) ([]SessionFileRef, error)
+	// RecentSince 返回会话最近文件(created_at 降序), 只保留 since 之后创建的
+	// (零值 = 不过滤)。会话隔离基础: /new 后旧会话文件不再注入 prompt
+	// (2026-08-15 生产实证: 旧附件注入导致新会话任务误转旧文件)。
+	RecentSince(sessionKey string, limit int, since time.Time) ([]SessionFileRef, error)
+	// PruneInboundBefore 物理删除 before 之前导入的 inbound 附件并从
+	// manifest 移除(/new 清理旧会话输入; outbound 产物保留磁盘, 仅引用
+	// 隔离)。删除失败不阻塞: 残留文件靠 RecentSince 过滤不可见。
+	PruneInboundBefore(sessionKey string, before time.Time) error
 	ResolveMarker(sessionKey, marker string) (absPath string, relPath string, err error)
 	RecordOutbound(sessionKey, marker string) (SessionFileRef, error)
 	// SandboxRoot 返回会话沙箱根路径(workspace 布局: workspaces/<hash>/temp)。
@@ -302,6 +310,10 @@ func (m *sessionFilesManager) RemoveInbound(sessionKey string, refs []SessionFil
 }
 
 func (m *sessionFilesManager) Recent(sessionKey string, limit int) ([]SessionFileRef, error) {
+	return m.RecentSince(sessionKey, limit, time.Time{})
+}
+
+func (m *sessionFilesManager) RecentSince(sessionKey string, limit int, since time.Time) ([]SessionFileRef, error) {
 	if limit <= 0 {
 		limit = 8
 	}
@@ -316,7 +328,13 @@ func (m *sessionFilesManager) Recent(sessionKey string, limit int) ([]SessionFil
 	if err != nil {
 		return nil, err
 	}
-	files := append([]SessionFileRef(nil), manifest.Files...)
+	files := make([]SessionFileRef, 0, len(manifest.Files))
+	for _, ref := range manifest.Files {
+		if !since.IsZero() && ref.CreatedAt.Before(since) {
+			continue
+		}
+		files = append(files, ref)
+	}
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].CreatedAt.After(files[j].CreatedAt)
 	})
@@ -324,6 +342,45 @@ func (m *sessionFilesManager) Recent(sessionKey string, limit int) ([]SessionFil
 		files = files[:limit]
 	}
 	return files, nil
+}
+
+// PruneInboundBefore 删除 before 之前导入的 inbound 附件(2026-08-15 会话
+// 隔离: /new 后旧会话输入物理清理, 与新会话文件引用隔离一致)。outbound
+// 产物保留磁盘(工作区产物), 引用层由 RecentSince 过滤。文件删除失败仅
+// 告警不失败——残留文件不会被注入(引用隔离已保证)。
+func (m *sessionFilesManager) PruneInboundBefore(sessionKey string, before time.Time) error {
+	if before.IsZero() {
+		return nil
+	}
+	lock := m.lockFor(sessionKey)
+	lock.Lock()
+	defer lock.Unlock()
+	root, err := m.SandboxRoot(sessionKey)
+	if err != nil {
+		return err
+	}
+	manifest, err := m.loadManifest(root)
+	if err != nil {
+		return err
+	}
+	kept := make([]SessionFileRef, 0, len(manifest.Files))
+	pruned := 0
+	for _, ref := range manifest.Files {
+		if ref.Direction == "inbound" && ref.CreatedAt.Before(before) && ref.RelativePath != "" {
+			if err := safefs.RemoveBeneath(root, filepath.FromSlash(ref.RelativePath)); err != nil && !os.IsNotExist(err) {
+				slog.WarnContext(context.Background(), "session files: prune inbound attachment failed",
+					"session_key", sessionKey, "rel", ref.RelativePath, "error", err)
+			}
+			pruned++
+			continue
+		}
+		kept = append(kept, ref)
+	}
+	if pruned == 0 {
+		return nil
+	}
+	manifest.Files = kept
+	return m.saveManifest(root, manifest)
 }
 
 func (m *sessionFilesManager) ResolveMarker(sessionKey, marker string) (string, string, error) {
@@ -439,7 +496,7 @@ func sessionFilesPrompt(current []SessionFileRef, recent []SessionFileRef) strin
 	}
 	var b strings.Builder
 	b.WriteString("[Session file workspace]\n")
-	b.WriteString("Use file_read/file_write/file_patch only with these relative paths. To create a Word document, use export_docx and save it under outputs/. To send a generated file back to the user, include [FILE:outputs/<filename>] in your final reply.\n")
+	b.WriteString("Use file_read/file_write/file_patch only with these relative paths. To create a Word document, call export_docx (it converts markdown/html via the built-in pandoc with Chinese font styling) and save it under outputs/. To send a generated file back to the user, include [FILE:outputs/<filename>] in your final reply.\n")
 	if len(current) > 0 {
 		b.WriteString("Current attachments:\n")
 		for _, ref := range current {

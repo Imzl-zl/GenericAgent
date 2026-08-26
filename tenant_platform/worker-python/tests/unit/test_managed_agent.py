@@ -47,6 +47,8 @@ LEGACY_ASSETS = (
     "assets/insight_fixed_structure.txt",
     "assets/insight_fixed_structure_en.txt",
     "assets/code_run_header.py",
+    "assets/docx_utils.py",
+    "assets/reference.docx",
 )
 
 
@@ -1338,7 +1340,8 @@ def test_overlay_memory_temp_link_to_workspace(monkeypatch, tmp_path):
         "tools_schema.json", "sys_prompt.txt",
         "sys_prompt_en.txt", "global_mem_insight_template.txt",
         "global_mem_insight_template_en.txt", "insight_fixed_structure.txt",
-        "insight_fixed_structure_en.txt", "code_run_header.py",
+        "insight_fixed_structure_en.txt", "code_run_header.py", "reference.docx",
+        "docx_utils.py",
     ):
         (legacy / "assets" / name).write_text("x")
 

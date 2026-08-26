@@ -58,6 +58,7 @@ workspace（personal:<uid> / team:<uuid>）── 共享：memory/、SOP、项�
 - **memory L0-L4 / SOP 保持 workspace 级共享**，写穿语义不变（与 `GA_SANDBOX_RUNNER_REFACTOR` §2 一致）。
 - **群桶成员**：群内多人共享该群桶（团队=租户，不按人再分）；私聊各自一桶。
 - **`/new` 桶级实现（0052 已落地）**：reset 标记在 `conversation_resets(workspace_id, conversation_key)` 表，按桶 upsert；/new 只取消该桶 queued 任务并标记该桶；消费语义不变（该桶 fresh 任务成功终态才清除，失败/取消不消费，R4-I8）；旧 `workspaces.reset_at` 列已随 0052 退役。微信 /new 只清 `''` 默认桶。
+- **`/new` 会话文件隔离（2026-08-15 落地）**：`/new` 语义 = 对话历史 + 会话文件引用双清——①新任务注入的 `Recent session files` 只含本桶最近一次 reset_at 之后创建的文件（`RecentSince` 过滤，真值源 = `conversation_resets.reset_at`）；②`/new` 同时物理清理旧会话 inbound 附件（`PruneInboundBefore`：manifest 移除 + 文件删除），outbound 产物保留磁盘（工作区产物）但同样不再注入。生产实证背景：旧附件曾注入新会话 prompt 导致“转 word”任务误转旧表格；poller 合并窗口失效时文字/文件拆成两个任务、无附件任务只能看到旧文件。落盘隔离与上下文隔离一致做，避免“能 ls 就能看到旧文件”的困惑源。**边界（2026-08-15 审查确认）**：文件池为工作区级共享，隔离是**时间级过滤**而非按桶归属——多桶渠道（QQ 群+私聊）下，其他桶在 reset 之后导入的文件仍可能注入本桶任务、本桶 /new 也会连带过滤其他桶的旧文件（微信单桶无影响）。
 
 ## 4. 落地路径（平台侧）
 

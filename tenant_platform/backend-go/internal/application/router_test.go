@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -22,7 +23,9 @@ type fakeRouterStore struct {
 	runningTask *domain.Task
 	findTaskErr error
 	getBotErr   error
-	resetKeys   []string // /new 桶级 reset 记录(conversation_key)
+	resetKeys   []string  // /new 桶级 reset 记录(conversation_key)
+	resetAt     time.Time // GetConversationResetAt 返回值(零值 = 不过滤)
+	resetAtErr  error
 }
 
 func newFakeRouterStore() *fakeRouterStore {
@@ -64,6 +67,10 @@ func (f *fakeRouterStore) FindRunningTaskBySession(_ context.Context, _ string, 
 func (f *fakeRouterStore) ResetWorkspaceForNewSession(_ context.Context, _ string, conversationKey string) (int, error) {
 	f.resetKeys = append(f.resetKeys, conversationKey)
 	return 0, nil
+}
+
+func (f *fakeRouterStore) GetConversationResetAt(_ context.Context, _ string, _ string) (time.Time, error) {
+	return f.resetAt, nil
 }
 
 // fakeTaskService is a minimal TaskService for router tests.
@@ -219,7 +226,7 @@ func TestRouterUnknownBotRejected(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "unknown", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected, got %s", res.Action)
 	}
@@ -262,7 +269,7 @@ func TestRouterUnboundBotRejected(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected for unbound bot, got %s", res.Action)
 	}
@@ -279,7 +286,7 @@ func TestRouterIdentityMismatchRejected(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "wrong-user", MessageID: "m1", Text: "hello",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected for identity mismatch, got %s", res.Action)
 	}
@@ -293,7 +300,7 @@ func TestRouterBlockedUserRejected(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected for blocked user, got %s", res.Action)
 	}
@@ -307,7 +314,7 @@ func TestRouterPendingUserRejected(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected rejected for pending user, got %s", res.Action)
 	}
@@ -321,7 +328,7 @@ func TestRouterNormalMessageCreatesTask(t *testing.T) {
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "do something",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionTaskCreated {
 		t.Fatalf("expected task_created, got %s", res.Action)
 	}
@@ -416,7 +423,7 @@ func TestRouterStopCancelsRunningTask(t *testing.T) {
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/stop",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionStopped {
 		t.Fatalf("expected stopped, got %s", res.Action)
 	}
@@ -433,7 +440,7 @@ func TestRouterStopWithNoRunningTask(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/stop",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionNoRunning {
 		t.Fatalf("expected no_running, got %s", res.Action)
 	}
@@ -447,7 +454,7 @@ func TestRouterNewCommandAcknowledged(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/new",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionNewSession {
 		t.Fatalf("expected new_session, got %s", res.Action)
 	}
@@ -461,7 +468,7 @@ func TestRouterHelpCommand(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/help",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionHelp {
 		t.Fatalf("expected help, got %s", res.Action)
 	}
@@ -487,7 +494,7 @@ func TestRouterStatusIdle(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/status",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionStatus {
 		t.Fatalf("expected status, got %s", res.Action)
 	}
@@ -506,7 +513,7 @@ func TestRouterStatusRunning(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/status",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionStatus {
 		t.Fatalf("expected status, got %s", res.Action)
 	}
@@ -524,7 +531,7 @@ func TestRouterLLMCommandIsRestricted(t *testing.T) {
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/llm 1",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected restricted /llm to be rejected, got %s", res.Action)
 	}
@@ -542,7 +549,7 @@ func TestRouterAbortAliasStopsRunningTask(t *testing.T) {
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/abort",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionStopped || tasks.cancelledID != "task-running" {
 		t.Fatalf("expected /abort to stop task, result=%+v cancelled=%q", res, tasks.cancelledID)
 	}
@@ -556,7 +563,7 @@ func TestRouterUnknownSlashCommandIsRejected(t *testing.T) {
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/restore",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionRejected {
 		t.Fatalf("expected unknown /xxx to be rejected, got %s", res.Action)
 	}
@@ -577,7 +584,7 @@ func TestRouterSessionMutationCommandIsRejected(t *testing.T) {
 	r, tasks := newTestRouter(store, tr)
 	res, _ := r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "/session.temperature=2",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if res.Action != ActionRejected || tasks.submittedTask.ID != "" {
 		t.Fatalf("session mutation must be rejected before worker dispatch: result=%+v task=%+v", res, tasks.submittedTask)
 	}
@@ -591,7 +598,7 @@ func TestRouterNormalMessageDoesNotSendImmediateReply(t *testing.T) {
 	r, _ := newTestRouter(store, tr)
 	_, _ = r.HandleMessage(context.Background(), IncomingMessage{
 		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "hello",
-		ChannelType: "wechat",})
+		ChannelType: "wechat"})
 	if sent := tr.SentMessages(); len(sent) != 0 {
 		t.Fatalf("expected no immediate transport reply for normal message, got %+v", sent)
 	}
@@ -614,4 +621,88 @@ func containsStr(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestRouterNewPrunesOldInboundAttachments 验证 /new 双清接线: handleNew 读回
+// conversation_resets.reset_at → PruneInboundBefore 物理清理旧会话 inbound 附件
+// (2026-08-15 会话隔离; 曾因只清历史导致新会话任务误转旧文件)。
+func TestRouterNewPrunesOldInboundAttachments(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, _, sf := newTestRouterWithSessionFiles(t, store, tr)
+
+	src := filepath.Join(t.TempDir(), "old.txt")
+	if err := os.WriteFile(src, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := sf.ImportInbound("personal:42", []string{src})
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("import old: refs=%v err=%v", refs, err)
+	}
+	// 模拟 /new 落库的 reset_at(在附件导入之后; fakeRouterStore 直接返回)。
+	store.resetAt = time.Now().UTC()
+	time.Sleep(20 * time.Millisecond)
+
+	res, err := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m-new", Text: "/new",
+		ChannelType: "wechat"})
+	if err != nil || res.Action != ActionNewSession {
+		t.Fatalf("new: res=%+v err=%v", res, err)
+	}
+	// manifest 移除 + 文件物理删除。
+	recent, err := sf.Recent("personal:42", 8)
+	if err != nil || len(recent) != 0 {
+		t.Fatalf("recent after /new = %d refs err=%v, want 0", len(recent), err)
+	}
+	abs := filepath.Join(mustSandboxRoot(t, sf, "personal:42"), filepath.FromSlash(refs[0].RelativePath))
+	if _, err := os.Stat(abs); !os.IsNotExist(err) {
+		t.Fatalf("old attachment still on disk after /new: %v", err)
+	}
+}
+
+// TestRouterRecentSinceFiltersSessionFiles 验证新任务注入的 Recent session
+// files 只含本桶 reset_at 之后创建的文件(旧会话附件不注入新会话 prompt)。
+func TestRouterRecentSinceFiltersSessionFiles(t *testing.T) {
+	store := newFakeRouterStore()
+	store.bots["b1"] = domain.ChannelConfig{ID: 1, BotUUID: "b1", OwnerID: 42, IlinkUserID: "u1", State: domain.ChannelActive, ChannelType: domain.ChannelWechat}
+	store.statuses[42] = domain.UserApproved
+	tr := transport.NewLoopbackTransport()
+	r, tasks, sf := newTestRouterWithSessionFiles(t, store, tr)
+
+	oldSrc := filepath.Join(t.TempDir(), "old.txt")
+	if err := os.WriteFile(oldSrc, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldRefs, err := sf.ImportInbound("personal:42", []string{oldSrc})
+	if err != nil || len(oldRefs) != 1 {
+		t.Fatalf("import old: refs=%v err=%v", oldRefs, err)
+	}
+	// 模拟 /new: reset_at 落在两次导入之间。
+	store.resetAt = time.Now().UTC()
+	time.Sleep(20 * time.Millisecond)
+	newSrc := filepath.Join(t.TempDir(), "new.md")
+	if err := os.WriteFile(newSrc, []byte("# new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newRefs, err := sf.ImportInbound("personal:42", []string{newSrc})
+	if err != nil || len(newRefs) != 1 {
+		t.Fatalf("import new: refs=%v err=%v", newRefs, err)
+	}
+
+	// 纯文本消息(无附件): Recent session files 只含新文件。
+	res, err := r.HandleMessage(context.Background(), IncomingMessage{
+		BotUUID: "b1", ChannelAccountID: "u1", MessageID: "m1", Text: "转换一下",
+		ChannelType: "wechat"})
+	if err != nil || res.Action != ActionTaskCreated {
+		t.Fatalf("message: res=%+v err=%v", res, err)
+	}
+	prompt := tasks.submittedTask.Prompt
+	if !strings.Contains(prompt, newRefs[0].OriginalName) {
+		t.Fatalf("new file must be injected into prompt: %q", prompt)
+	}
+	if strings.Contains(prompt, oldRefs[0].OriginalName) {
+		t.Fatalf("old file must be filtered from prompt: %q", prompt)
+	}
 }

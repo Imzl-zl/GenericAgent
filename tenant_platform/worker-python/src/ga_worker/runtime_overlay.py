@@ -34,6 +34,10 @@ LEGACY_ASSETS = (
     "assets/insight_fixed_structure.txt",
     "assets/insight_fixed_structure_en.txt",
     "assets/code_run_header.py",
+    # 2026-08-15: 文档转换工具脚本 + 中文排版 reference.docx 模板
+    # (docx_utils make-template 构建期生成; SOP document_conversion_sop 指引)。
+    "assets/docx_utils.py",
+    "assets/reference.docx",
 )
 
 OVERLAY_MANIFEST_ENTRIES: tuple[str, ...] = LEGACY_MODULES + LEGACY_PLUGINS + LEGACY_ASSETS

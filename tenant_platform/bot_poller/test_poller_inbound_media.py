@@ -91,7 +91,8 @@ def test_download_url_bounded_size_cap_and_atomic_write(monkeypatch, tmp_path):
         str(tmp_path), file_name="photo.jpg",
         allowed_hosts=media_dl.QQ_MEDIA_HOSTS, max_bytes=1024)
     assert path.startswith(str(tmp_path))
-    assert open(path, "rb").read() == payload
+    with open(path, "rb") as f:
+        assert f.read() == payload
     assert path.endswith("photo.jpg")  # hash 前缀 + 原文件名
     # 同内容重试: 复用已有落盘(不产生重复残留)。
     path2 = media_dl.download_url_bounded(

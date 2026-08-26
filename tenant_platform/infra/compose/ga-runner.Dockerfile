@@ -88,6 +88,13 @@ COPY agentmain.py ga.py llmcore.py agent_loop.py simphtml.py /ga/legacy/
 COPY plugins/ /ga/legacy/plugins/
 COPY assets/ /ga/legacy/assets/
 
+# 2026-08-15: 构建期生成中文排版模板(reference.docx)——docx_utils.py 的
+# make-template --preset cn(社区标准: 黑体标题/宋体正文小四/首行缩进 2 字符/
+# 1.5 倍行距/段前段后)。模板不入库, 逻辑以 docx_utils.py 源码为真值;
+# pandoc 与 python-docx 均已在此前步骤装好。
+RUN python /ga/legacy/assets/docx_utils.py make-template \
+        -o /ga/legacy/assets/reference.docx --preset cn
+
 # 上游固定 commit 的已跟踪 memory 基线(只读模板;首次工作区初始化来源)。
 COPY tenant_platform/infra/compose/memory-template/ /ga/memory-template/
 

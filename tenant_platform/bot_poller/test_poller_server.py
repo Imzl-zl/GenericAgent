@@ -5,6 +5,7 @@ import hmac
 import os
 import random
 import re
+import json
 import threading
 import time
 
@@ -241,7 +242,8 @@ def test_fit_image_for_upload_channel_format_whitelists(tmp_path):
                               allowed_formats={"JPEG", "PNG"}, animated_ok=False)
     assert w1 is not None
     try:
-        assert Image.open(str(w1)).format == "JPEG"
+        with Image.open(str(w1)) as _im:
+            assert _im.format == "JPEG"
     finally:
         w1.unlink(missing_ok=True)
     assert fit_image_for_upload(str(png), max_bytes=10 << 20,
@@ -251,7 +253,8 @@ def test_fit_image_for_upload_channel_format_whitelists(tmp_path):
                               allowed_formats={"JPEG", "PNG"}, animated_ok=False)
     assert w2 is not None
     try:
-        assert Image.open(str(w2)).format == "JPEG"
+        with Image.open(str(w2)) as _im:
+            assert _im.format == "JPEG"
     finally:
         w2.unlink(missing_ok=True)
 
@@ -260,7 +263,8 @@ def test_fit_image_for_upload_channel_format_whitelists(tmp_path):
                               allowed_formats={"JPEG", "PNG", "GIF", "BMP"}, animated_ok=True)
     assert d1 is not None
     try:
-        assert Image.open(str(d1)).format == "JPEG"
+        with Image.open(str(d1)) as _im:
+            assert _im.format == "JPEG"
     finally:
         d1.unlink(missing_ok=True)
     assert fit_image_for_upload(str(gif), max_bytes=20 << 20,
@@ -748,3 +752,76 @@ def test_deliver_inbound_stop_cancels_flush_timer():
     assert adapter._flush_timer is None
     # 定时器已取消: pending 不再投递(无 post_webhook 路径可触发)。
     assert adapter._coalescer.flush_all() != []  # 数据仍在缓冲中, 由下次启动承接
+
+
+def test_health_exposes_inbound_coalesce_window():
+    """2026-08-15 可观测性: /health 必须暴露当前合并窗口, 平台对账/诊断依赖
+    它(曾因 poller 重启窗口回 0 且不可见, 静默失效 18 小时)。"""
+    import urllib.request
+
+    server, base = _start_handler_server()
+    try:
+        # 默认窗口 0(未配置); /config 设置后 health 应反映新值。
+        with urllib.request.urlopen(base + "/health", timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["inbound_coalesce_window_ms"] == 0, body
+
+        resp = requests.post(base + "/config",
+                             json={"inbound_coalesce_window_ms": 2500}, timeout=5)
+        assert resp.status_code == 200, resp.text
+
+        with urllib.request.urlopen(base + "/health", timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["inbound_coalesce_window_ms"] == 2500, body
+        assert body["healthy"] is True
+    finally:
+        server.shutdown()
+
+
+def test_wechat_adapter_caches_inbound_token_and_injects_on_outbound(monkeypatch):
+    """2026-08-15 事故根因修复: 出站 sendmessage 必须携带该用户最新
+    context_token(iLink 会话凭证, 仅入站刷新)——此前出站恒空串, 会话过期后
+    iLink 拒收 ret=-2 且被静默吞掉(假 ack)。入站缓存 + 出站注入闭环。"""
+    class Client:
+        def __init__(self):
+            self.sent = []
+            self.updates_buf = "cursor"
+        def extract_text(self, msg):
+            return msg.get("text", "")
+        def is_user_msg(self, msg):
+            return True
+        def send_text(self, target, text, context_token="", client_id=""):
+            self.sent.append((target, text, context_token, client_id))
+        def send_file(self, target, file_path, context_token="", file_name="", client_id=""):
+            self.sent.append((target, file_path, context_token, file_name, client_id))
+
+    client = Client()
+    adapter = poller_server.WeChatAdapter(
+        "b1", {"token": "test"}, "http://platform/webhook")
+    adapter.client = client
+    adapter._media_dir = None
+
+    seen = poller_server._DedupWindow(maxlen=100)
+    body = adapter._prepare_webhook_body(
+        {"message_id": "m1", "from_user_id": "u1", "context_token": "ctx-fresh",
+         "text": "hi", "item_list": []}, seen, 0)
+    assert body is not None
+    assert adapter._ctx_tokens.get("u1") == "ctx-fresh", "inbound token must be cached"
+
+    # 出站文本注入缓存 token。
+    adapter.send_text("u1", "回复")
+    assert client.sent[-1] == ("u1", "回复", "ctx-fresh", ""), f"got {client.sent[-1]}"
+    # 出站文件同样注入。
+    adapter._send_file("u1", "/tmp/x.bin", file_name="x.bin")
+    assert client.sent[-1][2] == "ctx-fresh", f"media send must inject token: {client.sent[-1]}"
+    # 未知 target(无缓存) → 空 token(不注入脏值, 由 wxbot_client 降级处理)。
+    adapter.send_text("unknown-user", "hi")
+    assert client.sent[-1] == ("unknown-user", "hi", "", "")
+
+    # 新入站刷新缓存。
+    body2 = adapter._prepare_webhook_body(
+        {"message_id": "m2", "from_user_id": "u1", "context_token": "ctx-newer",
+         "text": "again", "item_list": []}, seen, 0)
+    assert body2 is not None
+    adapter.send_text("u1", "回复2")
+    assert client.sent[-1] == ("u1", "回复2", "ctx-newer", "")

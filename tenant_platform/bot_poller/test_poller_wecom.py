@@ -118,10 +118,19 @@ class _FakeWeComClient:
         self.sent.append({"chatid": chatid, **body})
 
 
+def _run_coro(coro):
+    """同步桥: 新建事件循环执行协程并立即关闭(防 unclosed event loop 泄漏)。"""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 def _wire_sync(adapter, client):
     """把适配器的异步执行桥替换为同步直跑(胶水层不测, 业务帧被真实执行)。"""
     adapter._client = client
-    adapter._run_coro = lambda coro: asyncio.new_event_loop().run_until_complete(coro)
+    adapter._run_coro = _run_coro
 
 
 def test_wecom_send_text_builds_markdown_frame():

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -91,6 +92,12 @@ func (s *reconcileFakeStore) UpdateChannelConfigState(_ context.Context, botUUID
 	return nil
 }
 
+func (s *reconcileFakeStore) GetIMInboundCoalesceWindowMS(_ context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return 2500, nil
+}
+
 // fakePoller is an httptest poller recording /start and /stop calls.
 type fakePoller struct {
 	server     *httptest.Server
@@ -98,11 +105,17 @@ type fakePoller struct {
 	activeBots []string
 	starts     []string
 	stops      []string
+	configured []int // 2026-08-15: /config 收到的窗口值记录
+	healthWindow int // /health 上报的窗口值(-1 = 不报该字段, 模拟旧版 poller)
 	healthErr  bool
 }
 
 func newFakePoller(activeBots []string) *fakePoller {
-	fp := &fakePoller{activeBots: activeBots}
+	return newFakePollerWithWindow(activeBots, -1)
+}
+
+func newFakePollerWithWindow(activeBots []string, healthWindow int) *fakePoller {
+	fp := &fakePoller{activeBots: activeBots, healthWindow: healthWindow}
 	fp.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fp.mu.Lock()
 		defer fp.mu.Unlock()
@@ -112,10 +125,21 @@ func newFakePoller(activeBots []string) *fakePoller {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			health := map[string]any{
 				"healthy":     true,
 				"active_bots": fp.activeBots,
-			})
+			}
+			if fp.healthWindow >= 0 {
+				health["inbound_coalesce_window_ms"] = fp.healthWindow
+			}
+			_ = json.NewEncoder(w).Encode(health)
+		case "/config":
+			var body struct {
+				InboundCoalesceWindowMS int `json:"inbound_coalesce_window_ms"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			fp.configured = append(fp.configured, body.InboundCoalesceWindowMS)
+			_, _ = w.Write([]byte(`{"inbound_coalesce_window_ms":` + strconv.Itoa(body.InboundCoalesceWindowMS) + `}`))
 		case "/start":
 			var body struct {
 				BotUUID string `json:"bot_uuid"`
@@ -149,11 +173,17 @@ func (fp *fakePoller) recorded() (starts, stops []string) {
 // StartChannelConfig decrypts it like production.
 func newReconcileHarness(t *testing.T, store *reconcileFakeStore, activeBots []string) (*botLifecycleService, *fakePoller) {
 	t.Helper()
+	fp := newFakePoller(activeBots)
+	svc := newReconcileHarnessWithPoller(t, store, fp)
+	return svc, fp
+}
+
+func newReconcileHarnessWithPoller(t *testing.T, store *reconcileFakeStore, fp *fakePoller) *botLifecycleService {
+	t.Helper()
 	cipher, err := secret.NewStaticKeyCipher(make([]byte, 32))
 	if err != nil {
 		t.Fatalf("cipher: %v", err)
 	}
-	fp := newFakePoller(activeBots)
 	client, err := poller.NewClient(fp.server.URL, "")
 	if err != nil {
 		t.Fatalf("poller client: %v", err)
@@ -168,7 +198,7 @@ func newReconcileHarness(t *testing.T, store *reconcileFakeStore, activeBots []s
 	if err != nil {
 		t.Fatalf("lifecycle service: %v", err)
 	}
-	return svc.(*botLifecycleService), fp
+	return svc.(*botLifecycleService)
 }
 
 func reconcileTestConfig(t *testing.T, cipher *secret.StaticKeyCipher, botUUID string, id int64) domain.ChannelConfig {
@@ -354,5 +384,70 @@ func TestReconcileBotsMultipleDiscrepancies(t *testing.T) {
 	// Only the bot whose row still exists persists a cursor.
 	if len(store.upserted) != 1 {
 		t.Fatalf("expected exactly one cursor persist (row exists), upserted=%v", store.upserted)
+	}
+}
+
+// TestReconcileBotsPushesCoalesceWindow 验证对账 tick 幂等重推入站合并窗口
+// (2026-08-15: poller 重启后窗口曾回 0 且无对账, 静默失效 18 小时)。
+func TestReconcileBotsPushesCoalesceWindow(t *testing.T) {
+	store := newReconcileFakeStore(nil)
+	svc, fp := newReconcileHarness(t, store, nil)
+	defer fp.close()
+
+	if err := svc.ReconcileBots(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	fp.mu.Lock()
+	configured := append([]int(nil), fp.configured...)
+	fp.mu.Unlock()
+	if len(configured) != 1 || configured[0] != 2500 {
+		t.Fatalf("expected one /config with window 2500, got %v", configured)
+	}
+	// 幂等: 再次对账仍推送(下一 tick 收敛, 不改状态)。
+	if err := svc.ReconcileBots(context.Background()); err != nil {
+		t.Fatalf("reconcile#2: %v", err)
+	}
+	fp.mu.Lock()
+	configured = append([]int(nil), fp.configured...)
+	fp.mu.Unlock()
+	if len(configured) != 2 {
+		t.Fatalf("expected two /config calls, got %v", configured)
+	}
+}
+
+// TestReconcileBotsSkipsPushWhenWindowMatches 验证 poller 当前窗口与 DB 一致时
+// 跳过推送(审查 B-8: /health 新字段被对账消费, 一致时不再盲推)。
+func TestReconcileBotsSkipsPushWhenWindowMatches(t *testing.T) {
+	store := newReconcileFakeStore(nil)
+	fp := newFakePollerWithWindow(nil, 2500)
+	svc := newReconcileHarnessWithPoller(t, store, fp)
+	defer fp.close()
+
+	if err := svc.ReconcileBots(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	fp.mu.Lock()
+	configured := append([]int(nil), fp.configured...)
+	fp.mu.Unlock()
+	if len(configured) != 0 {
+		t.Fatalf("expected no /config when health window matches, got %v", configured)
+	}
+}
+
+// TestReconcileBotsOldPollerWithoutHealthWindowStillPushes 验证旧版 poller(/health
+// 不报窗口字段=0)与 DB 值不一致时仍推送(兼容路径)。
+func TestReconcileBotsOldPollerWithoutHealthWindowStillPushes(t *testing.T) {
+	store := newReconcileFakeStore(nil)
+	svc, fp := newReconcileHarness(t, store, nil)
+	defer fp.close()
+
+	if err := svc.ReconcileBots(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	fp.mu.Lock()
+	configured := append([]int(nil), fp.configured...)
+	fp.mu.Unlock()
+	if len(configured) != 1 || configured[0] != 2500 {
+		t.Fatalf("expected one /config push for old poller, got %v", configured)
 	}
 }

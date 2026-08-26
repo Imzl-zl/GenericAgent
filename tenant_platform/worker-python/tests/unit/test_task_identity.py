@@ -41,6 +41,8 @@ LEGACY_ASSETS = (
     "assets/insight_fixed_structure.txt",
     "assets/insight_fixed_structure_en.txt",
     "assets/code_run_header.py",
+    "assets/docx_utils.py",
+    "assets/reference.docx",
 )
 
 

@@ -195,7 +195,7 @@ GA 产出（生图工具/文件写入）→ outputs/ + [FILE:outputs/<name>] mar
 | 能力 | 状态 | 落点 |
 |---|---|---|
 | 入站理解（图片） | ✅ 已落地（微信 2026-08-13；QQ/飞书/钉钉/企微提取 2026-08-13 审查补齐，钉钉/企微下载 API 待实测） | §4 |
-| 入站合并（图+后续文本） | ✅ 已落地（2026-08-14 审查 I-3：InboundCoalescingBuffer 从微信扩展到四渠道，平台级窗口默认 2500ms） | §4 |
+| 入站合并（图+后续文本） | ✅ 已落地（2026-08-14 审查 I-3：InboundCoalescingBuffer 从微信扩展到四渠道，平台级窗口默认 4000ms，2026-08-15 实测文字+文件间隔 3752ms 后由 2500ms 调升） | §4 |
 | code_run 防护 + OCR 依赖 | ✅ 已落地 | §4.3 |
 | 出站发送（文件/图/视频） | ✅ 已落地（Phase A：send_media 统一接口 + QQ 分片 + 飞书/钉钉/企微上传适配 + delivery MIME 分发；**钉钉 file/video 的 downloadCode 上传流待实测**，暂 NotImplementedError fail-closed） | §5 Phase A |
 | 生图 | ✅ GA 侧直连形态 v1 已落地（2026-08-14：`image_gen` 工具 + ImageGenClient 同步/流式路径 + outputs/ 落盘 + `[FILE:]` 出站）；**托管形态已实施（2026-08-14：llm-proxy `images/generations` 路由 + `llm.image` capability + provider 能力维度 chat/image + runtime_config 下发 image_gen 块 + policy 放行 + marker 兜底登记）**——平台模式生图可用 | §6 Phase B |
