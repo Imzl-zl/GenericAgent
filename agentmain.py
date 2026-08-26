@@ -1,4 +1,4 @@
-import os, sys, threading, queue, time, json, re, random, locale, glob
+import os, sys, threading, queue, time, json, re, random, locale, glob, socket
 os.environ.setdefault('GA_LANG', 'zh' if any(k in (locale.getlocale()[0] or '').lower() for k in ('zh', 'chinese')) else 'en')
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 elif hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='replace')
@@ -113,20 +113,25 @@ class GenericAgent:
         return f"{type(b.backend).__name__.replace('Session', '')}/{b.backend.name}"
     def get_ctx_multiplier(self): return getattr(self.llmclient.backend, 'maxlen_multiplier', 1.0)
 
+    def _backend_sessions(self):
+        """llmclient.backend 及 mixin 子 session 列表(abort 注入 / run finally 清理共用)。"""
+        backend = getattr(getattr(self, 'llmclient', None), 'backend', None)
+        return getattr(backend, '_sessions', [backend]) if backend is not None else []
+
     def abort(self):
         if not self.is_running: return
         print('Abort current task...')
         self.stop_sig = True
         if self.handler is not None: self.handler.code_stop_signal.append(1)
-        for sess in getattr(self.llmclient.backend, '_sessions', [self.llmclient.backend]):
-            sess.should_stop = lambda: self.stop_sig  # live read; cleared by run()'s finally
+        for sess in self._backend_sessions():
+            # live read of agent.stop_sig; cleared (set to None) in run()'s finally
+            sess.should_stop = lambda: self.stop_sig
             try:  # wake a recv() blocked in another thread. Verified on Windows: shutdown()/close() do NOT
                   # wake it (makefile refcount defers real closesocket); _real_close() does -> ChunkedEncodingError
-                import socket as _socket
                 raw = sess.active_response.raw
                 fp = getattr(getattr(raw, '_fp', None), 'fp', None)  # http.client response -> buffered socket file
                 sock = fp.raw._sock if fp else raw.connection.sock   # SocketIO._sock (SSL-wrapped OK); fallback urllib3 conn
-                try: sock.shutdown(_socket.SHUT_RDWR)  # for non-Windows semantics
+                try: sock.shutdown(socket.SHUT_RDWR)  # for non-Windows semantics
                 except OSError: pass
                 try: sock._real_close()  # CPython internal; bypasses refcount -> actual closesocket
                 except AttributeError: sock.close()
@@ -147,6 +152,9 @@ class GenericAgent:
         if runner is not None and runner.is_alive() and runner is not threading.current_thread():
             runner.join(timeout=join_timeout)
     def put_task(self, query, source="user", images=None):
+        # 契约(O6): shutdown 后拒收新任务(RuntimeError)。审计结论: shutdown
+        # 仅 dcapp.py:167 停服路径调用, 停服后所有前端已停止接收输入, 此
+        # 分支实际不可达——前端无需 try, 勿在 shutdown 后继续 put_task。
         if self._shutdown: raise RuntimeError('GenericAgent is shut down')
         display_queue = queue.Queue()
         self.task_queue.put({"query": query, "source": source, "images": images or [], "output": display_queue})
@@ -237,6 +245,9 @@ class GenericAgent:
                     if consume_file(self.task_dir, '_stop'): self.abort() 
                     if self.stop_sig: break
                     if isinstance(chunk, dict) and 'turn' in chunk:
+                        # 契约(agent_loop.agent_runner_loop yield_info): runner 先发
+                        # {'turn': N} 事件开槽(turn_resps.append('')), 后续文本 chunk
+                        # 才有槽位可写; 见下方文本分支的自动开槽兜底。
                         # 轮次边界事件(输出分层架构的配套信号, 2026-08-12):
                         # ①先冲刷上一轮残留文本——保证 'next' 不跨轮次边界,
                         # 前端按 turn 事件切分消息时文本归属精确;
@@ -259,6 +270,12 @@ class GenericAgent:
                         display_queue.put({'tool': chunk['tool'], 'source': source,
                                            'turn': curr_turn})
                         continue
+                    # 契约兜底: runner 未先发 turn 事件直接 yield 文本时自动开槽
+                    # (原实现 turn_resps[-1] 抛 IndexError → 外层 except 显示
+                    # Backend Error, 任务失败)。agent_loop 的 yield_info 保证先
+                    # 发 turn 事件, 此为防御未来新 runner 的硬契约。
+                    if not turn_resps:
+                        curr_turn += 1; turn_resps.append('')
                     full_resp += chunk;  turn_resps[-1] += chunk
                     # 'LLM Running' 条件服务 verbose 路径: 轮次标记文本需立即
                     # 推给前端(TUI 思考提示); 非 verbose 无标记, 仅靠 >30 字符
@@ -303,6 +320,10 @@ class GenericAgent:
             finally:
                 if self.stop_sig: print('User aborted the task.')
                 self.is_running = self.stop_sig = False
+                # O2: 清理 abort() 注入的 should_stop lambda(注释曾声称 finally
+                # 清理但未实现)。single-session 架构下无害; worker 未来扩共享
+                # session 时, 残留 lambda 捕获旧 agent 会误停新会话的任务。
+                for sess in self._backend_sessions(): sess.should_stop = None
                 self.task_queue.task_done()
                 if self.handler is not None: self.handler.code_stop_signal.append(1)
 

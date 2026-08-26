@@ -151,6 +151,54 @@ def test_llm_failed_nested_in_data_is_reported_to_worker(monkeypatch):
     assert not runner.is_alive()
 
 
+def test_run_finally_clears_abort_should_stop(monkeypatch):
+    """O2: run() finally 显式清 abort() 注入的 should_stop lambda(注释曾声称
+    finally 清理但未实现)。worker 未来扩共享 session 时, 残留 lambda 捕获旧
+    agent 会误停新会话任务, 此处验证任务结束后 backend/should_stop 无残留。"""
+    class FakeHandler:
+        def __init__(self, _parent, history, _temp_dir):
+            self.history_info = history
+            self.working = {}
+            self.code_stop_signal = []
+
+    backend = SimpleNamespace(extra_sys_prompt="")
+
+    def runner(*_args, **_kwargs):
+        yield {"turn": 1}
+        # 模拟 abort() 注入 should_stop(lambda 捕获 agent.stop_sig)
+        backend.should_stop = lambda: True
+        yield "text"
+        return {"result": "EXITED"}
+
+    monkeypatch.setattr(agentmain, "GenericAgentHandler", FakeHandler)
+    monkeypatch.setattr(agentmain, "agent_runner_loop", runner)
+    monkeypatch.setattr(agentmain, "get_system_prompt", lambda: "system")
+
+    agent = _minimal_agent()
+    agent.history = []
+    agent.extra_sys_prompts = []
+    agent.peer_hint = False
+    agent.llmclient = SimpleNamespace(log_path=None, backend=backend)
+    agent.log_path = ""
+    agent.task_dir = None
+    agent.force_non_stream = False
+    agent.verbose = False
+    agent.inc_out = True
+
+    output = queue.Queue()
+    agent.task_queue.put({"query": "t", "source": "test", "images": [], "output": output})
+    runner_thread = threading.Thread(target=agentmain.GenericAgent.run, args=(agent,), daemon=True)
+    runner_thread.start()
+
+    while "done" not in output.get(timeout=1.0):
+        pass
+    agent.task_queue.put("STOP")
+    runner_thread.join(timeout=1.0)
+
+    # run() finally 已执行: abort 注入的 should_stop lambda 被清理
+    assert backend.should_stop is None
+
+
 def test_non_dict_data_without_llm_failed_is_success(monkeypatch):
     """正常完成时 exit_reason.data 是任意对象(如 do_no_tool 的 response),
     不得因 isinstance 非 dict 而抛错(Round14 C2 回归: data 为 MockResponse

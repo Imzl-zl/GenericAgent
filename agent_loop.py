@@ -194,7 +194,12 @@ def agent_runner_loop(client, system_prompt, user_input, handler, tools_schema,
         turn += 1; turnstr = f'LLM Running (Turn {turn}) ...'
         if handler.parent.task_dir: turnstr = f'Turn {turn} ...'
         if verbose: turnstr = f'**{turnstr}**'
-        if yield_info: yield {'turn': turn}
+        if yield_info:
+            # 契约(agentmain.run 消费侧): {'turn': N} 事件必须先于本轮文本
+            # chunk 发出——run() 按它开槽(turn_resps.append(''), 文本归属当前
+            # 轮, outputs 切分精确)。省略会触发 run() 的自动开槽兜底(不抛
+            # IndexError), 但轮次归属退化, 新 runner 勿依赖兜底。
+            yield {'turn': turn}
         # 输出分层(架构): verbose=True 输出完整过程转录(TUI/CLI/桌面等
         # 展示思考过程的前端); verbose=False 只输出用户可见回复文本
         # (租户 worker 交付 + 根项目 IM 前端, 用户不应看到轮次标记/工具
