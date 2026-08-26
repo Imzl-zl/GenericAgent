@@ -154,8 +154,8 @@ def test_im_sources_skip_all_outputs(monkeypatch, minimal_agent):
     assert len(agent.all_outputs) == 3
     assert all(entry["outputs"] == ["文本"] for entry in agent.all_outputs)
 
-    # IM source(黑名单): 不新增条目
-    for source in ("wechat", "telegram", "chat"):
+    # IM source(黑名单, 含平台 worker 渠道类型): 不新增条目
+    for source in ("wechat", "telegram", "chat", "feishu", "dingtalk", "qq", "wecom"):
         run_one(source)
     assert len(agent.all_outputs) == 3
 

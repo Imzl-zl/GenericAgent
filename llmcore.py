@@ -1445,7 +1445,8 @@ class BaseImageGenClient:
 
     def _delay(self, resp, attempt):
         """仿 _stream_with_retry 退避: retry-after 头优先, 超上限不重试;
-        否则指数退避 1.5*2^attempt, 夹在 [0.5, 30]s。"""
+        否则指数退避 1.5*2^attempt, 夹在 [0.5, 30]s。
+        注意底数 _IMG_BACKOFF_BASE=1.5 与主链路 _BACKOFF_BASE=3.0 不同。"""
         try:
             ra = float((resp.headers or {}).get("retry-after"))
         except (TypeError, ValueError):

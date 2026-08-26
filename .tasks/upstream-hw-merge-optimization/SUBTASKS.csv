@@ -1,9 +1,9 @@
-id,parent,title,status,notes
+﻿id,parent,title,status,notes
 O1,,agentmain.run() turn_resps 槽位防御 + 契约注释(agent_loop yield_info 双向标注),done,run() 自动开槽兜底 + 双向契约注释; 新单测 test_text_without_turn_event_auto_slots (2b09ce0c)
 O2,,abort() should_stop 幽灵 lambda 清理符实化(run finally 置 None + 修正注释),done,_backend_sessions() 提取共用; run finally 显式置 None; 新单测 test_run_finally_clears_abort_should_stop (2b09ce0c)
 O3,,agentmain 函数内 import socket 提模块顶部,done,顶部 import socket (2b09ce0c)
 O4,,trim_messages_history 单行复合语句重构(保持 O(n)),done,成本数组+索引推进多行化; 新增 test_llmcore_trim.py 单行版参考 5 场景 diff 全等 (e1562603)
-O5,,all_outputs 按来源过滤(IM 渠道跳过),done,IM_CHAT_SOURCES 黑名单跳过; IM 任务任务局部槽位不触碰 all_outputs; 新单测 source 矩阵 (e1562603)
+O5,,all_outputs 按来源过滤(IM 渠道跳过),done,"IM_CHAT_SOURCES 黑名单跳过; IM 任务任务局部槽位不触碰 all_outputs; 新单测 source 矩阵 (e1562603) | review补全: 平台 worker 链路 source=ChannelType(feishu/dingtalk/qq/wecom), 黑名单补 4 渠道"
 O6,,agentmain.put_task shutdown 检查加契约注释,done,注释已补落地(原标记 done 但代码缺失, 2b09ce0c 一并补上)
 O7,,测试 _minimal_agent 工厂化(tests 共享 fixture),done,tests/conftest.py make_minimal_agent 覆盖 __init__ 全字段 + minimal_agent fixture; 两测试文件已复用 (e1562603)
 O8,,llmcore STATS 全局 dict -> session 实例属性,backlog,评估后保持: STATS 仅 stapp 显示用无正确性影响; 改 4 parse 函数签名+7 写入+stapp 读取, 收益低; 如需求作为独立 feature 实施
