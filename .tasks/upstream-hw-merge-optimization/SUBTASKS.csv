@@ -1,0 +1,12 @@
+id,parent,title,status,notes
+O1,,agentmain.run() turn_resps 槽位防御 + 契约注释(agent_loop yield_info 双向标注),todo,run() 收文本 chunk 且 turn_resps 空时自动开槽; 单测: 不先发 turn 直接 yield 文本不抛 IndexError
+O2,,abort() should_stop 幽灵 lambda 清理符实化(run finally 置 None + 修正注释),todo,worker 扩共享 session 前的防误停; 验证 lifecycle 测试 + smoke 无残留
+O3,,agentmain 函数内 import socket 提模块顶部,todo,abort() 内 import socket -> 顶部 import
+O4,,trim_messages_history 单行复合语句重构(保持 O(n)),todo,成本数组+索引推进多行化; 等价性验证
+O5,,all_outputs 按来源过滤(IM 渠道跳过)或调低上限,todo,先确认各渠道 source 取值; stapp 渲染回归
+O6,,IM 前端 put_task shutdown 语义契约(捕获 RuntimeError 或声明),todo,chatapp_common/conductor/dcapp/fsapp/desktop_bridge/hub 调用点
+O7,,测试 _minimal_agent 工厂化(tests 共享 fixture),todo,本次 all_outputs 踩 5 测试回归的教训; conftest.py 提取
+O8,,llmcore STATS 全局 dict -> session 实例属性,backlog,影响 stapp 读取; 改动面评估后定
+O9,,退避/重试魔法数字命名常量(llmcore),backlog,0.5/3.0/30.0/0.2/0.3/0.75
+O10,,runtime_data 历史 overlay 清理(保留最近 N),backlog,worker 启动或周期清理; 勿删活动会话
+O11,,memory.md 更新(合入闭环),done,2026-08-26 已更新

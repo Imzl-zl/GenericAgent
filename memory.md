@@ -7,6 +7,7 @@
 
 - CI 门禁（分支/PR 级）：Go（vet/build/test -p 1/race 5 关键包）、Python（根 + 平台 contract/security/smoke/integration + bot_poller + worker）、Web（lint/build）全绿
 - 集成测试依赖真实 PostgreSQL（`TEST_DATABASE_URL`），缺失显式失败
+- **上游高价值优化合入（2026-08-26，merge/upstream-high-value → main，+504/-188）**：llmcore trimming 线性化、abort 强制唤醒阻塞 recv + 可中断退避、OpenAI overload 重试、api_key_header、conductor XSS、stapp 现代化（Streamlit>=1.62）、context_win 默认提升（30k→35k / deepseek 70k→80k）；保留本地 ga.py 空响应防护（D5 审查版）+ tools_schema code_run 定制；跳过上游 React Desktop 2.0 / hub-p2p / turn-summary 统一。后续清理计划：`.tasks/upstream-hw-merge-optimization/`（O1-O10）。**环境注意：pyproject streamlit>=1.62，本地 1.57，用 stapp 前需升级**
 - **IM 多渠道完成（2026-08-10，im-channel-binding epic 6/6 DONE）**：渠道配置统一模型（channel_configs）+ 飞书/钉钉/QQ 接入（poller BotAdapter 注册表）+ im-bindings API + Web 渠道绑定页
 - **IM 流式输出完成（2026-08-10，im-streaming-delivery epic 7/7 DONE）**：StreamingSender 可选接口 + scheduler 500ms 节流转发管道 + 飞书消息编辑打字机 + QQ 单聊原生流式 + 群聊收敛（只发最终结果）+ im_streaming_mode 管理开关；真实渠道冒烟待用户凭据
 - **企微渠道完成（2026-08-11，commit 3023e3d2）**：WeComAdapter（wecom_aibot_sdk WS）+ 渠道绑定页企业微信卡片 + 流式判定矩阵 + delivery 回复路由（审查 C1 修复）；真实渠道冒烟待用户凭据，流式模式建议保持 off/final_only
@@ -40,6 +41,7 @@
 
 ## 进行中 / 未完成
 
+- **上游合入后清理计划（2026-08-26 排期，epic `upstream-hw-merge-optimization`）**：O1 run() turn_resps 隐式契约硬化 / O2 should_stop 清理符实化 / O3 import socket 归位；O4 trim 单行重构 / O5 all_outputs 来源过滤 / O6 IM put_task shutdown 契约 / O7 测试 fixture 工厂化；O8 STATS 实例化(backlog) / O9 魔法数字常量 / O10 overlay 清理。计划真值：`.tasks/upstream-hw-merge-optimization/EPIC.md`，新会话提示词 `HANDOFF_PROMPT.md`
 - **微信生图交付死信修复（2026-08-14，已部署 433b7c7，端到端验证通过）**：三层根因叠加——①spool checkpoint NULL content（0057 迁移只加列没改 INSERT，已修 COALESCE）；②buildPayload spool 分支漏设 relPath → mediaTypeForPath("") 回退 file → 生成图全部走 file_item 原图上传；③海外→微信 C2C CDN 大文件节流（~18KB/s + ~30s 断连，>450KB 必死）。修复：spool 分支补 relPath + send_image 交付侧转 JPEG ≤300KB + poller 上传 (30s 写,10s 读)×2 + Go 媒体预算 90s + 重试窗口 30min。10 张图重投全部 acked 送达；26/26 交付 acked 0 死信。**独立审查优化（2026-08-14 同日落地）**：预算链定稿——poller 最坏 ~85s < ctx 90s < poller client 兜底 120s（拆双 http.Client，修掉单一 15s Timeout 架空媒体预算的洞）；读超时 120s→10s 快速失败；删死代码（WeChatAdapter 旧双签名/快照二次发送分支+161 行 deliverable_snapshot/缩略图生成）；admin 死信查询+重投端点（GET /v1/admin/deliveries + POST .../{id}/requeue，E2）；根 QQ/钉钉文件交付不再渲染服务器路径（QQ 2026-08-14 起图片/视频/文件直发，钉钉图片直发、文件/视频诚实提示）；FILE: 解析收敛到 frontends/im_markers.py。残余：>500KB 文件/GIF/视频交付仍受 CDN 节流限制（生成端 size 控制）；admin 死信重投端点已补（替代手动 SQL）
 
 - **思考外泄架构修复（2026-08-12）**：agent_loop 输出分层由 verbose 开关落实（verbose=False 只 yield 用户可见回复，不输出轮次标记/工具行/<summary>；verbose=True 完整转录不变）——不是 worker 正则补丁；实证：三渠道交付文本同源同脏（checkpoint result 铁证），飞书打字机最显眼；新增分层回归测试，已部署（platform + ga-runner digest）
@@ -113,7 +115,7 @@
 
 ## 最近活跃窗口
 
-- 2026-08-14：**pillow 依赖归位 + QQ 媒体通道升级（CI 红根因修复）**：CI 红=bot_poller 3 测试 `No module named 'PIL'`（pillow 只挂 ui extra，CI 装 base 无 PIL；本地 .venv 同样复现）。修复：pillow 移入 base dependencies + fit_image_for_upload 拆 ImportError 显式告警 + 测试 import 归位；用户实测 QQ 生图不直发（微信直发）→ 根因=08-14 C1 审查有意声明 QQ 文本通道（无凭据实测避免半成品），非协议限制（官方 rich-media 分片平台已实现）→ 移植平台实现到 frontends/qq_media.py + QQApp.send_done 媒体直发 + 9 测试。验证：bot_poller 95、根 90、contract/security/smoke 41 全绿
+- 2026-08-26：**上游高价值优化合入（module: 根项目 agentmain/llmcore/ga/stapp/frontends）**：cherry-pick 15 上游提交 + 2 合成提交（stapp 整搬 + agentmain all_outputs/_current_queue 最小补丁 + run() self-heal）；冲突决策——ga.py 空响应防护/tools_schema 保留本地；验证 92 passed + 运行时 smoke 5 项 + 符号/依赖核对；已 fast-forward 并入 main（18 文件 +504/-188）；关键决策与坑点已归档 memory/archive/2026-08.md；plan 排期 `.tasks/upstream-hw-merge-optimization/`（pillow 只挂 ui extra，CI 装 base 无 PIL；本地 .venv 同样复现）。修复：pillow 移入 base dependencies + fit_image_for_upload 拆 ImportError 显式告警 + 测试 import 归位；用户实测 QQ 生图不直发（微信直发）→ 根因=08-14 C1 审查有意声明 QQ 文本通道（无凭据实测避免半成品），非协议限制（官方 rich-media 分片平台已实现）→ 移植平台实现到 frontends/qq_media.py + QQApp.send_done 媒体直发 + 9 测试。验证：bot_poller 95、根 90、contract/security/smoke 41 全绿
 
 - 2026-08-14：**32692e0 部署（交付链优化 + 复审修复）+ 镜像清理**：make build 全量重建（:local + :32692e0）→ 滚动重启 platform + bot-poller（备份 tag :local.bak-20260814-pre-reviewfix 先打）→ migration 0060 自动 apply（requeued_at 列验证存在）→ healthz 全绿、两容器 0 error、active_bots 正常、admin 端点带 token 200 / 无 token 401。镜像清理：删 50 个历史 commit tag + 9.2GB build cache → Images 8.0→2.9GB。**坑（本次实证）**：`docker image prune -a` 会删**所有未被容器引用的镜像，不论 tag**——把 :32692e0 追溯 tag 与 :local.bak-* 备份全删了（容器用 :local 无影响），需 make build 重建恢复 tag；备份 tag 无法恢复（旧镜像已删），回滚预案降级为"git 检出 + make build"（代码在 git，可接受）。教训：prune 只允许 `docker image prune -f`（仅 dangling）；清未使用镜像前先 `docker images --format` 核对，或逐个 rmi。
 - 2026-08-14：**子代理复审（3 路并行）P1 修复**：admin 重投端点"假成功"——窗口锚点仍为 tasks.terminal_at+30min 且死信清扫每 tick 先于 claim，事故后数小时重投的行 ~2s 被打回。修复：migration 0060 requeued_at（DO 块幂等）+ 窗口锚点统一 GREATEST(terminal_at, requeued_at)（claim/死信/retryDeadline 三处）+ 集成测试 TestDeliveryRequeueSurvivesExpiredRetryWindow；控制面 _post 显式 (10,10)（病理最坏 113s→103s 口径诚实化）；clientFor 防呆测试；删 poller 基类 send_file/Feishu send_stream_close_all 死方法；thumb 分支门控；`.pi/` 补 gitignore + rm --cached（47faa02 误提交 10 个审查转录，可能含密钥）。
