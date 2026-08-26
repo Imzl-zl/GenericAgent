@@ -119,8 +119,8 @@ def test_text_without_turn_event_auto_slots(monkeypatch, minimal_agent):
 
 
 def test_im_sources_skip_all_outputs(monkeypatch, minimal_agent):
-    """O5: IM source(wechat/telegram/chat)任务不记录 all_outputs; 交互
-    source(user/hub/controller)记录且 outputs 归属正确。"""
+    """O5: IM source(全部渠道)任务不记录 all_outputs; 交互 source 记录且
+    outputs 归属正确; IM 任务的 display 事件 outputs 仍正常(任务局部列表)。"""
 
     class FakeHandler:
         def __init__(self, _parent, history, _temp_dir):
@@ -145,8 +145,9 @@ def test_im_sources_skip_all_outputs(monkeypatch, minimal_agent):
     def run_one(source):
         output = queue.Queue()
         agent.task_queue.put({"query": "t", "source": source, "images": [], "output": output})
-        while "done" not in output.get(timeout=2.0):
+        while "done" not in (item := output.get(timeout=2.0)):
             pass
+        return item
 
     # 交互 source: 全部记录
     for source in ("user", "hub", "controller"):
@@ -154,9 +155,10 @@ def test_im_sources_skip_all_outputs(monkeypatch, minimal_agent):
     assert len(agent.all_outputs) == 3
     assert all(entry["outputs"] == ["文本"] for entry in agent.all_outputs)
 
-    # IM source(黑名单, 含平台 worker 渠道类型): 不新增条目
-    for source in ("wechat", "telegram", "chat", "feishu", "dingtalk", "qq", "wecom"):
-        run_one(source)
+    # IM source(黑名单全集): 不新增条目, 但 display 事件 outputs 仍正确
+    for source in ("wechat", "telegram", "chat", "qq", "dingtalk", "wecom", "discord", "feishu"):
+        done = run_one(source)
+        assert done["outputs"] == ["文本"]
     assert len(agent.all_outputs) == 3
 
     agent.task_queue.put("STOP")

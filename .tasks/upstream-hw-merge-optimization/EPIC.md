@@ -21,10 +21,15 @@
 
 - **streamlit 已升级 1.57 → 1.62**（`pip install -U "streamlit>=1.62"`；系统 Python 3.13.12，无 .venv）——stapp bare 导入验证 OK，92 测试全绿。**新会话无需处理环境**。
 - **O5 source 取值全集已查清**（grep 全量）：
-  - IM 聊天渠道（应跳过 all_outputs）：`wechat`（wechatapp 显式）、`telegram`（tgapp 显式）、`chat`（AgentChatMixin 默认，chatapp_common.py:264——QQ/飞书/钉钉/Discord 均继承未覆写）
+  - ❌ 勘误（2026-08-26 独立审查）：原“QQ/飞书/钉钉/Discord 均继承未覆写（source=chat）”错误——
+    五个 AgentChatMixin 子类全部覆写：`qqapp.py:79 source="qq"`、`dingtalkapp.py:27 source="dingtalk"`、
+    `wecomapp.py:59 source="wecom"`、`dcapp.py:70 source="discord"`、`fsapp.py:720 source="feishu"`；
+    `chat` 仅为 chatapp_common.py:264 默认（无实际渠道使用，保留兜底）。正确全集见下方。
+  - 根前端 IM：`wechat`（wechatapp）、`telegram`（tgapp）、`qq`（qqapp）、`dingtalk`（dingtalkapp）、
+    `wecom`（wecomapp）、`discord`（dcapp）、`feishu`（fsapp）、`chat`（AgentChatMixin 默认，无实际渠道）
   - 交互/管理（保留）：`user`（默认/CLI/qtapp/stapp/stapp2）、`hub`、`controller`、`conductor`、`subagent:*`（conductor.py:331）、`acp`、`func`、`reflect`
-  - 租户 worker：`task.source or "user"`（task_drain.py:69，source 来自 TaskEnvelope）——租户交付不走 stapp，同样可跳过
-  - 过滤规则建议：黑名单 `IM_CHAT_SOURCES = {'wechat','telegram','chat'}`，其余记录（新增交互 source 自动保留）
+  - 平台 worker：`task.source or "user"`（task_drain.py:69，source 来自 TaskEnvelope=ChannelType）——平台 IM 任务 source 即渠道名，同样跳过；平台 web 控制台 `web` 保留
+  - 过滤规则已落地：黑名单 `IM_CHAT_SOURCES = {'wechat','telegram','chat','qq','dingtalk','wecom','discord','feishu'}`，其余记录（新增交互 source 自动保留）
 - **O6 审计结论**：`agent.shutdown()` 仅 dcapp.py:167 停服路径调用；put_task 调用的 18 个前端点（chatapp_common/conductor/dcapp/desktop_bridge/fsapp/acp_bridge/hub/qtapp/stapp/stapp2/tgapp/wechatapp/task_drain）在 shutdown 后均已停止接收输入——**RuntimeError 实际不可达**。O6 降级为：契约注释声明 + 不非法改前端代码。
 - **O8 影响面评估**：`_parse_claude_sse/_parse_openai_sse/_parse_openai_json/_record_usage` 签名均无 `sess` 参数（llmcore.py 167/255/394/375 行）；STATS 写入 7 处（116/124/142/218/392/458-503 区），读取仅 stapp.py:290。实例化需参数化 4 个函数 + stapp 改读 `agent.llmclient.backend.stats`——改动中等，backlog 保持。
 

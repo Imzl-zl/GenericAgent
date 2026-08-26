@@ -17,11 +17,14 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 # 2026-08-26 O5: all_outputs 为 stapp 渲染设计; 高频 IM 渠道前端不读
 # all_outputs, 全量记录完整分轮文本导致长跑内存累计(上限 5000 任务)。
 # 黑名单跳过这些 source, 其余(交互/管理)记录——新增交互 source 自动保留。
-# source 全集: 根前端 IM={wechat(wechatapp)/telegram(tgapp)/chat(AgentChatMixin
-# 默认, QQ/飞书/钉钉/Discord 继承未覆写)}; 平台 worker IM=渠道类型
-# (feishu/dingtalk/qq/wecom, backend-go router_commands.go Source=ChannelType);
-# 交互={user/hub/controller/conductor/subagent:*/acp/func/reflect}。
-IM_CHAT_SOURCES = {'wechat', 'telegram', 'chat', 'feishu', 'dingtalk', 'qq', 'wecom'}
+# IM source 全集(2026-08-26 复审逐渠道核实, 全部覆写 non-chat):
+#   根前端: wechat(wechatapp.py) / telegram(tgapp.py) / qq(qqapp.py:79) /
+#           dingtalk(dingtalkapp.py:27) / wecom(wecomapp.py:59) /
+#           discord(dcapp.py:70) / feishu(fsapp.py:720)
+#   chat = AgentChatMixin 默认(chatapp_common.py:264), 上述全部覆写, 保留兜底
+#   平台 worker: source=ChannelType(backend-go router_commands.go Source:
+#           msg.ChannelType), 渠道集同上(无 discord); web 控制台 source=web 保留
+IM_CHAT_SOURCES = {'wechat', 'telegram', 'chat', 'qq', 'dingtalk', 'wecom', 'discord', 'feishu'}
 BANNED_TOOLS = (['ask_user', 'start_long_term_update'] if '--no-user-tools' in sys.argv else [])
 def load_tool_schema(suffix=''):
     global TOOLS_SCHEMA

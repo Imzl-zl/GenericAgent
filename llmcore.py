@@ -20,6 +20,8 @@ _MAXLEN_RATIO = 0.75        # context_win 折算 maxlen_multiplier 系数
 _MAXLEN_MULT_FLOOR = 1.0    # maxlen_multiplier 下限
 _MAXLEN_MULT_CAP = 3.0      # maxlen_multiplier 上限
 _DEFAULT_BASE_DELAY = 3.0   # MixinSession 切换后重试基线延迟(秒)
+_MIXIN_RETRY_BASE = 1.5      # MixinSession 退避底数(轮耗尽指数)
+_MIXIN_RETRY_CAP = 30.0      # MixinSession 退避上限(秒)
 
 def _build_http_session():
     sess = requests.Session()
@@ -1275,7 +1277,7 @@ class MixinSession:
             nxt = (base + attempt + 1) % n
             if nxt == base:
                 rnd = (attempt + 1) // n
-                delay = min(30, self._base_delay * (1.5 ** rnd))
+                delay = min(_MIXIN_RETRY_CAP, self._base_delay * (_MIXIN_RETRY_BASE ** rnd))
                 print(f'[MixinSession] {last_chunk[:80]}, round {rnd} exhausted, retry in {delay:.1f}s')
                 time.sleep(delay)
             else:
