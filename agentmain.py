@@ -47,7 +47,7 @@ class GenericAgent:
         os.makedirs(os.path.join(script_dir, 'temp'), exist_ok=True)
         self.lock = threading.Lock()
         self.task_dir = None
-        self.history = []; self.handler = None; 
+        self.history = []; self.handler = None; self.all_outputs = []
         self.task_queue = queue.Queue() 
         self.is_running = False; self.stop_sig = False; self.llm_no = 0;  
         self.inc_out = False; self.verbose = True
@@ -55,6 +55,7 @@ class GenericAgent:
         self.force_non_stream = False
         self._shutdown = False
         self._runner_thread = None
+        self._current_queue = None
         logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
         self.log_path = os.path.join(script_dir, f'temp/model_responses/model_responses_{logid}.txt')
         self.llmclient = None
@@ -174,7 +175,7 @@ class GenericAgent:
             raw_query = self._handle_slash_cmd(raw_query, display_queue)
             if raw_query is None:
                 self.task_queue.task_done(); continue
-            self.is_running = True
+            self.is_running = True; self._current_queue = display_queue
             if len(raw_query) > 2000:
                 task_file = os.path.join(script_dir, 'temp', f'user_prompt_{os.getpid()}_{time.time_ns()}.md')
                 with open(task_file, 'w', encoding='utf-8') as f: f.write(raw_query)
@@ -189,6 +190,8 @@ class GenericAgent:
                 self.task_queue.task_done()
                 self.is_running = False
                 continue
+            self.all_outputs.append({"input": raw_query, "outputs": []})
+            if len(self.all_outputs) > 10000: self.all_outputs = self.all_outputs[-5000:]
             sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
             if self.peer_hint: sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
             handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
@@ -208,7 +211,7 @@ class GenericAgent:
                                     initial_user_content=(
                                         media_content_blocks(raw_query, task_images) if task_images else None))
             try:
-                full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = []
+                full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = self.all_outputs[-1]["outputs"]
                 runner_result = {}
                 while True:
                     try:
