@@ -644,7 +644,7 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
-        default_context_win = 35000; default_cut_msg_interval = 5
+        default_context_win = 35000; default_cut_msg_interval = 7
         if 'deepseek' in self.model.lower():
             default_context_win = 80000; default_cut_msg_interval = 25; self.trim_keep_rate = 0.3
         self.context_win = cfg.get('context_win', default_context_win)
@@ -1165,7 +1165,7 @@ class MixinSession:
 
     def __init__(self, all_sessions, cfg):
         self._retries = cfg.get('max_retries', 3)
-        self._base_delay = cfg.get('base_delay', 1.5)
+        self._base_delay = cfg.get('base_delay', 3.0)
         self._spring_sec = cfg.get('spring_back', 300)
         selected = [all_sessions[i].backend if isinstance(i, int) else
                     next(s.backend for s in all_sessions if type(s) is not dict and s.backend.name == i)
