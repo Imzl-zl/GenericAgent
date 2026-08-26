@@ -14,6 +14,13 @@ except Exception: pass
 from ga import GenericAgentHandler, smart_format, get_global_memory, format_error, consume_file
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
+# 2026-08-26 O5: all_outputs 为 stapp 渲染设计; 高频 IM 渠道(wechat/telegram/chat)
+# 前端不读 all_outputs, 全量记录完整分轮文本导致长跑内存累计(上限 5000 任务)。
+# 黑名单跳过这些 source, 其余(交互/管理)记录——新增交互 source 自动保留。
+# source 全集: IM={wechat(wechatapp)/telegram(tgapp)/chat(AgentChatMixin 默认,
+# QQ/飞书/钉钉/Discord 继承未覆写)}; 交互={user/hub/controller/conductor/
+# subagent:*/acp/func/reflect}; 租户 worker = task.source or 'user'(不走 stapp)。
+IM_CHAT_SOURCES = {'wechat', 'telegram', 'chat'}
 BANNED_TOOLS = (['ask_user', 'start_long_term_update'] if '--no-user-tools' in sys.argv else [])
 def load_tool_schema(suffix=''):
     global TOOLS_SCHEMA
@@ -213,8 +220,15 @@ class GenericAgent:
                 self.task_queue.task_done()
                 self.is_running = False
                 continue
-            self.all_outputs.append({"input": raw_query, "outputs": []})
-            if len(self.all_outputs) > 10000: self.all_outputs = self.all_outputs[-5000:]
+            # O5: IM 渠道不渲染 all_outputs(见 IM_CHAT_SOURCES), 跳过记录;
+            # 其余 source 记录。记录时 turn_resps 引用该槽位, IM 任务用任务
+            # 局部列表, 不触碰 all_outputs, 也不产生跨任务错位。
+            if source in IM_CHAT_SOURCES:
+                outputs_slot = None
+            else:
+                self.all_outputs.append({"input": raw_query, "outputs": []})
+                if len(self.all_outputs) > 10000: self.all_outputs = self.all_outputs[-5000:]
+                outputs_slot = self.all_outputs[-1]["outputs"]
             sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
             if self.peer_hint: sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
             handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
@@ -234,7 +248,8 @@ class GenericAgent:
                                     initial_user_content=(
                                         media_content_blocks(raw_query, task_images) if task_images else None))
             try:
-                full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = self.all_outputs[-1]["outputs"]
+                full_resp = ""; last_pos = 0; curr_turn = 0
+                turn_resps = outputs_slot if outputs_slot is not None else []
                 runner_result = {}
                 while True:
                     try:
