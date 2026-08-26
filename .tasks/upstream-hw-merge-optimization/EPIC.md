@@ -16,7 +16,17 @@
 - worker overlay 是每次会话动态物化的（digest 漂移自动重建）——llmcore 优化对新会话 worker 自动生效。
 - should_stop lambda 当前 single-session 架构下安全（worker 每会话独立 agent）。
 - stapp 整搬后依赖 continue_cmd/btw_cmd/export_cmd（符号全存在），import 在 try 块内可选降级。
-- 环境注意：pyproject 已声明 `streamlit>=1.62`，本地环境仍是 1.57——**用 stapp 前必须 `pip install -U streamlit`**。
+
+## 前置工作（已完成，2026-08-26，新会话直接开工）
+
+- **streamlit 已升级 1.57 → 1.62**（`pip install -U "streamlit>=1.62"`；系统 Python 3.13.12，无 .venv）——stapp bare 导入验证 OK，92 测试全绿。**新会话无需处理环境**。
+- **O5 source 取值全集已查清**（grep 全量）：
+  - IM 聊天渠道（应跳过 all_outputs）：`wechat`（wechatapp 显式）、`telegram`（tgapp 显式）、`chat`（AgentChatMixin 默认，chatapp_common.py:264——QQ/飞书/钉钉/Discord 均继承未覆写）
+  - 交互/管理（保留）：`user`（默认/CLI/qtapp/stapp/stapp2）、`hub`、`controller`、`conductor`、`subagent:*`（conductor.py:331）、`acp`、`func`、`reflect`
+  - 租户 worker：`task.source or "user"`（task_drain.py:69，source 来自 TaskEnvelope）——租户交付不走 stapp，同样可跳过
+  - 过滤规则建议：黑名单 `IM_CHAT_SOURCES = {'wechat','telegram','chat'}`，其余记录（新增交互 source 自动保留）
+- **O6 审计结论**：`agent.shutdown()` 仅 dcapp.py:167 停服路径调用；put_task 调用的 18 个前端点（chatapp_common/conductor/dcapp/desktop_bridge/fsapp/acp_bridge/hub/qtapp/stapp/stapp2/tgapp/wechatapp/task_drain）在 shutdown 后均已停止接收输入——**RuntimeError 实际不可达**。O6 降级为：契约注释声明 + 不非法改前端代码。
+- **O8 影响面评估**：`_parse_claude_sse/_parse_openai_sse/_parse_openai_json/_record_usage` 签名均无 `sess` 参数（llmcore.py 167/255/394/375 行）；STATS 写入 7 处（116/124/142/218/392/458-503 区），读取仅 stapp.py:290。实例化需参数化 4 个函数 + stapp 改读 `agent.llmclient.backend.stats`——改动中等，backlog 保持。
 
 ---
 
@@ -48,14 +58,14 @@
 
 ### O5. all_outputs 按来源过滤（内存治理）
 - **问题**：all_outputs 为 stapp 渲染设计，但所有 source（含高频 IM 渠道）都全量记录完整分轮文本，上限 5000 任务，长跑内存累计（普通任务 50-100MB，大输出任务可能数百 MB）。IM 前端不读 all_outputs。
-- **修法（选一）**：① run() 里对非交互 source（IM 渠道 source 前缀）跳过 append；② 调低截断（>10000 → >2000，截到 1000）。
-- **注意**：方案①需确认 stapp/CLI 的 source 取值（`source="user"`/`"hub"`/`"conductor"`/`"subagent:*"` 等），IM 渠道 source 取值（看 frontends/*app.py 传的 source）。stapp 显示只读 all_outputs[-1]，过滤后交互来源仍正常。
-- **验证**：stapp 渲染路径回归（source="user" 任务后 all_outputs[-1] 有 outputs；IM source 任务后不新增条目）。
+- **修法（推荐黑名单）**：run() 里 `source` ∈ `{'wechat','telegram','chat'}` 时跳过 append（source 全集见「前置工作」）；其余记录。常量定义在 agentmain 模块级。
+- **验证**：交互 source（user/hub/controller）任务后 all_outputs[-1] 有 outputs；IM source（wechat/chat/telegram）任务后不新增条目。用现有 smoke 模式跑 source 参数矩阵。
 
 ### O6. IM 前端 put_task shutdown 语义契约
-- **问题**：d8d90eef 合入后 put_task 在 shutdown 后抛 RuntimeError；chatapp_common/conductor/dcapp/fsapp/desktop_bridge/hub 调用处均无 try。停服瞬间用户消息 → 前端线程异常。
-- **修法**：统一契约——各前端调用点捕获 RuntimeError（shutdown 场景）并交互式提示"服务已停止"；或确认各前端在 shutdown 时已停止接收输入（若如此则只加注释声明契约）。
-- **验证**：无行为变化的静态审查 + 现有测试全绿。
+- **问题**：d8d90eef 合入后 put_task 在 shutdown 后抛 RuntimeError；前端调用点均无 try。
+- **已审计（前置）**：shutdown 仅 dcapp.py:167 停服路径调用，shutdown 后所有前端已停止接收输入 → RuntimeError 实际不可达。
+- **修法（降级）**：不改前端代码；在 agentmain.put_task 的 shutdown 检查处加注释声明契约（"shutdown 后拒收，前端保证不调用"），避免未来误用。
+- **验证**：静态审查 + 现有测试全绿。
 
 ### O7. 测试 _minimal_agent 工厂化
 - **问题**：`_minimal_agent` 在 tests/test_agentmain_lifecycle.py、test_agentmain_stream_events.py（等）重复手写，新增 agent 字段要同步多处改（本次 all_outputs 踩了 5 个测试回归）。
@@ -68,8 +78,9 @@
 
 ### O8. llmcore STATS 全局 dict → session 实例属性
 - **问题**：模块级 `STATS` 多 session 并发互相覆盖（tps/ttft 显示最后活跃 session）。影响面：仅 stapp 读（worker 不读），但 stapp 用 `llmcore.STATS` 全局引用。
-- **方案**：STATS 挪到 BaseSession 实例（self.stats），stapp 改为读 `agent.llmclient.backend.stats`；兼容层保留全局别名。评估 _parse_* 函数签名改动面。
-- **验证**：stapp 渲染 + llmcore http 测试。
+- **前置评估（已完成）**：`_parse_claude_sse`(167)/`_parse_openai_sse`(255)/`_parse_openai_json`(394)/`_record_usage`(375) 签名均无 `sess`；STATS 写入 7 处（116/124/142/218/392 + 流区 458-503）；读取仅 stapp.py:290。
+- **方案**：BaseSession 加 `self.stats = {}`；`_stream_with_retry(sess,...)` 把 stats 透传给 parse 闭包（或 parse_fn 加参数）；stapp 改读 `agent.llmclient.backend.stats`（MixinSession 需转发到当前子 session）。改动中等，backlog 保持，实施前先写 digests 对照测试。
+- **验证**：llmcore http 测试 + stapp 渲染 + 双 session 并发下统计不互相污染（新测试）。
 
 ### O9. 退避/重试魔法数字命名常量
 - **问题**：llmcore.py 中退避常量（0.5 min / 3.0 base / 30.0 cap / 0.2 sleep 粒度 / 0.3 trim_keep_rate / 0.75 maxlen 系数）多处硬编码。
