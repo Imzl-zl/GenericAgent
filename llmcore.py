@@ -8,6 +8,19 @@ if _ROOT not in sys.path: sys.path.append(_ROOT)
 _HTTP_POOL_CONNECTIONS = 8
 _HTTP_POOL_MAXSIZE = 32
 
+# 2026-08-26 O9: 退避/重试魔法数字命名常量(多版退避逻辑共用口径)。
+_BACKOFF_MIN = 0.5          # 指数退避单次最小等待(秒)
+_BACKOFF_BASE = 3.0         # _stream_with_retry 指数退避底数
+_BACKOFF_CAP = 30.0         # 退避单次上限(秒), 超过则视为不可重试
+_BACKOFF_SLEEP_STEP = 0.2   # 可中断退避 sleep 粒度(秒)
+_IMG_BACKOFF_BASE = 1.5     # ImageGenClient._delay 指数退避底数(与主链路不同)
+_DEFAULT_TRIM_KEEP_RATE = 0.6     # trim 未配置时的默认保留率
+_TRIM_KEEP_RATE_DEEPSEEK = 0.3    # deepseek 会话 trim 保留率
+_MAXLEN_RATIO = 0.75        # context_win 折算 maxlen_multiplier 系数
+_MAXLEN_MULT_FLOOR = 1.0    # maxlen_multiplier 下限
+_MAXLEN_MULT_CAP = 3.0      # maxlen_multiplier 上限
+_DEFAULT_BASE_DELAY = 3.0   # MixinSession 切换后重试基线延迟(秒)
+
 def _build_http_session():
     sess = requests.Session()
     adapter = requests.adapters.HTTPAdapter(
@@ -117,7 +130,7 @@ STATS = {}
 
 def trim_messages_history(history, sess):
     cap = sess.context_win * 3
-    target = int(cap * getattr(sess, 'trim_keep_rate', 0.6))
+    target = int(cap * getattr(sess, 'trim_keep_rate', _DEFAULT_TRIM_KEEP_RATE))
     kp = sess.trim_keep_prefix
     def cost(ms): return sum(len(json.dumps(m, ensure_ascii=False)) for m in ms)
     compress_history_tags(history, interval=getattr(sess, 'cut_msg_interval', 5))
@@ -471,13 +484,13 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
     def _delay(resp, attempt):
         try: ra = float((resp.headers or {}).get("retry-after"))
         except: ra = None
-        return None if ra and ra > cap else max(0.5, ra or min(30.0, 3.0 * (2 ** attempt)))
+        return None if ra and ra > cap else max(_BACKOFF_MIN, ra or min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt)))
     def _stopped(): return getattr(sess, 'should_stop', None) and sess.should_stop()
     def _sleep(d):  # interruptible sleep; True if aborted
         end = time.time() + d
         while time.time() < end:
             if _stopped(): return True
-            time.sleep(0.2)
+            time.sleep(_BACKOFF_SLEEP_STEP)
         return _stopped()
     for attempt in range(sess.max_retries + 1):
         if _stopped(): return []
@@ -656,9 +669,9 @@ class BaseSession:
         self.model = cfg.get('model', '')
         default_context_win = 35000; default_cut_msg_interval = 7
         if 'deepseek' in self.model.lower():
-            default_context_win = 80000; default_cut_msg_interval = 25; self.trim_keep_rate = 0.3
+            default_context_win = 80000; default_cut_msg_interval = 25; self.trim_keep_rate = _TRIM_KEEP_RATE_DEEPSEEK
         self.context_win = cfg.get('context_win', default_context_win)
-        self.maxlen_multiplier = min(max(self.context_win / default_context_win * 0.75, 1.0), 3.0)
+        self.maxlen_multiplier = min(max(self.context_win / default_context_win * _MAXLEN_RATIO, _MAXLEN_MULT_FLOOR), _MAXLEN_MULT_CAP)
         self.cut_msg_interval = int(default_cut_msg_interval * self.maxlen_multiplier)
         self.trim_keep_prefix = max(0, int(cfg.get('trim_keep_prefix', 0) or 0))
         self.history = []; self.lock = threading.Lock(); self.system = ""
@@ -1175,7 +1188,7 @@ class MixinSession:
 
     def __init__(self, all_sessions, cfg):
         self._retries = cfg.get('max_retries', 3)
-        self._base_delay = cfg.get('base_delay', 3.0)
+        self._base_delay = cfg.get('base_delay', _DEFAULT_BASE_DELAY)
         self._spring_sec = cfg.get('spring_back', 300)
         selected = [all_sessions[i].backend if isinstance(i, int) else
                     next(s.backend for s in all_sessions if type(s) is not dict and s.backend.name == i)
@@ -1438,7 +1451,7 @@ class BaseImageGenClient:
         except (TypeError, ValueError):
             ra = None
         # 与 _stream_with_retry(447-487) 完全一致: retry-after=0 时也走指数退避。
-        return None if ra is not None and ra > self.max_retry_after else max(0.5, ra or min(30.0, 1.5 * (2 ** attempt)))
+        return None if ra is not None and ra > self.max_retry_after else max(_BACKOFF_MIN, ra or min(_BACKOFF_CAP, _IMG_BACKOFF_BASE * (2 ** attempt)))
 
     def _post(self, payload, stream=False):
         """带重试语义的 POST(仿 _stream_with_retry: 429/408/5xx 退避集合 +
