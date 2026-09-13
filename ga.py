@@ -7,7 +7,7 @@ if sys.stderr is None: sys.stderr = open(os.devnull, "w")
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agent_loop import BaseHandler, StepOutcome, json_default
-from llmcore import resolve_image_gen, _IMAGE_GEN_MAX_BYTES
+from llmcore import resolve_image_gen, _IMAGE_GEN_MAX_BYTES, sniff_image_format
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Phase B 生图(2026-08-14 定稿): Go 交付上限 image ≤20MiB 是 fail-closed
@@ -731,10 +731,18 @@ class GenericAgentHandler(BaseHandler):
                 yield f"[Status] ❌ 第 {i} 张图 {len(b)} bytes 超过 20MiB 交付上限\n"
                 return StepOutcome(f"[Error: image_gen 产物 {len(b)} bytes 超过交付上限 20MiB，任务会失败，请缩小 size/quality 重试]", next_prompt="\n")
         # 文件名带时间戳(含微秒): 防同任务重复调用同名覆盖(审查盲区 3)。
+        # 扩展名以魔数为准: 上游可能裁剪/忽略 output_format(实测 agnes 的
+        # text image queue 直接 400 拒绝该参数, 客户端已按协商裁剪), 交付文件
+        # 必须与真实字节一致, 否则 IM 侧 MIME 失配。嗅探失败才用请求值。
         ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         markers = []
+        sniffed = []
         for i, b in enumerate(images, 1):
-            fname = f"image_{ts}_{i}.{output_format}" if len(images) > 1 else f"image_{ts}.{output_format}"
+            real = sniff_image_format(b) or output_format
+            if real != output_format:
+                sniffed.append(f"{output_format}→{real}")
+            ext = real
+            fname = f"image_{ts}_{i}.{ext}" if len(images) > 1 else f"image_{ts}.{ext}"
             path = os.path.join(out_dir, fname)
             try:
                 with open(path, 'wb') as f:
@@ -744,6 +752,9 @@ class GenericAgentHandler(BaseHandler):
                 return StepOutcome(f"[Error: image_gen 落盘失败: {e}]", next_prompt="\n")
             markers.append(f"outputs/{fname}")
         marker_text = "\n".join(f"[FILE:{m}]" for m in markers)
+        if sniffed:
+            # 失败诚实: 请求的格式被上游忽略/不支持时明说, 不让模型误以为拿到了 jpeg。
+            yield f"[Status] ℹ️ 上游返回格式与请求不符(按真实格式命名): {', '.join(sorted(set(sniffed)))}\n"
         yield f"[Status] ✅ 已生成 {len(images)} 张图: {marker_text}\n"
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         # marker 回显依赖(二轮审查 I-2): 工具返回 marker ≠ 交付发生, 模型

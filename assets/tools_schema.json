@@ -72,12 +72,12 @@
   },
   {"type": "function", "function": {
     "name": "image_gen",
-    "description": "Generate images via a dedicated image model (OpenAI images/generations compatible). Use for image creation requests. Returns [FILE:outputs/<name>] marker(s); **you MUST include the [FILE:outputs/<name>] marker line(s) verbatim in your final reply** to trigger file delivery to the user (the tool returning the marker alone does not deliver). size/quality legal values depend on upstream model: dall-e series has no 1536x1024 and no output_format; gpt-image series supports all. n<=4.",
+    "description": "Generate images via a dedicated image model (OpenAI images/generations compatible). Use for image creation requests. Returns [FILE:outputs/<name>] marker(s); **you MUST include the [FILE:outputs/<name>] marker line(s) verbatim in your final reply** to trigger file delivery to the user (the tool returning the marker alone does not deliver). size/quality legal values depend on upstream model: dall-e series has no 1536x1024 and no output_format; gpt-image series supports all; Agnes image models (e.g. agnes-image-2.5-flash) accept size tiers 1K/2K/3K/4K but reject quality/output_format. Unsupported params are auto-trimmed once with a retry, and the error text names what the model rejects — read it and adjust instead of retrying blindly. n<=4.",
     "parameters": {"type": "object", "properties": {
       "prompt": {"type": "string", "description": "Image description (required)"},
-      "size": {"type": "string", "enum": ["1024x1024", "1536x1024", "1024x1536", "auto"], "description": "Canvas size; legality depends on model (dall-e-3: no 1536x1024)"},
-      "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "Quality level; gpt-image series"},
+      "size": {"type": "string", "description": "Canvas size. Recommended: exact pixels for OpenAI series (1024x1024 / 1536x1024 / 1024x1536 / auto) and tiers for Agnes series (1K / 2K / 3K / 4K). Legality depends on model; unsupported exact sizes may be normalized upstream."},
+      "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "Quality level; gpt-image series only (Agnes queues reject it and it gets auto-trimmed). Slow models sit behind a 120s proxy window — prefer low or omit quality for big/slow models, or the request may time out (HTTP 524)."},
       "n": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Number of images (1-4)"},
-      "output_format": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "Output format; gpt-image series only (dall-e has no output_format)"},
-      "model": {"type": "string", "description": "Optional model override (direct mode). In hosted platform mode the model is bound to the provider — passing a different model here is rejected (HTTP 409), so omit it."}}}}}
+      "output_format": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "Output format; gpt-image series only (dall-e and Agnes have no output_format). The delivered file extension follows the real returned bytes."},
+      "model": {"type": "string", "description": "Optional model override (direct mode). In hosted platform mode the model is bound to the provider — passing a different model here is rejected (HTTP 409), so omit it. Direct mode: the override must be available to the configured apikey, otherwise the gateway returns 503 model_not_found."}}}}}
 ]

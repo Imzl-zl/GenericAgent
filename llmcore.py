@@ -1391,6 +1391,43 @@ _IMAGE_GEN_RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 5
 # 兜底也在此限流; ga.py 落盘前同值检查(从本模块导入, 单一真值)。
 _IMAGE_GEN_MAX_BYTES = 20 * 1024 * 1024
 
+# ── 参数协商自愈(2026-09-13 真实上游实测新增) ──────────────────────────
+# "OpenAI 兼容" ≠ "参数全集通用": 上游按"队列"裁剪参数。实测 new-api 中转 →
+# agnes-image-2.5-flash 的 text image queue 只收 model/prompt/size/ratio/extra_body,
+# 收到 output_format / quality 一律 400 invalid_request("... is not supported by
+# text image queue"); 而 gpt-image-2 恰好接受 output_format。因此客户端不能把
+# OpenAI 参数全集无条件下发, 也不能按模型名黑名单(方案 §4 原则不在客户端点名模型)
+# ——改为"错误文本驱动的参数协商": 400/422 且错误文本点名了本次请求里的可裁剪
+# 参数时, 裁剪该参数后重试(独立预算, 不消耗 max_retries)。
+_IMAGE_GEN_PARAM_TRIM_STATUS = {400, 422}
+_IMAGE_GEN_MAX_PARAM_TRIMS = 3
+# 可裁剪参数 = 缺席时上游会给出合理默认、且不改变用户可见契约的可选参数。
+# 刻意不含 size(计费必传/模型必需)、n(张数属用户契约, 静默缩水=不诚实)、
+# model/prompt(必需)——这几类失败应如实回给模型, 由错误文本引导其改参重试。
+_IMAGE_GEN_TRIMMABLE = ("output_format", "quality", "response_format", "stream", "partial_images")
+# 错误文本里"参数不被支持"的话术族(命中才进入裁剪判定, 避免误裁无关 400)。
+_IMAGE_GEN_PARAM_UNSUPPORTED_HINTS = (
+    "not supported", "unsupported", "unknown parameter", "unrecognized",
+    "invalid parameter", "unknown field", "extra field", "not allowed",
+)
+
+
+# 图片容器魔数: 上游可能裁剪/忽略 output_format(实测 agnes 不接受该参数),
+# 交付文件扩展名必须跟随真实字节, 否则 IM 侧 MIME 失配(§6.5 失败诚实)。
+def sniff_image_format(data):
+    """按魔数识别图片容器格式, 返回 'png'/'jpeg'/'gif'/'webp', 未知返回 None。"""
+    if not data or len(data) < 12:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
 
 class BaseImageGenClient:
     """生图客户端基类。只解析生图所需配置子集
@@ -1440,7 +1477,10 @@ class BaseImageGenClient:
         # 同步路径; dall-e-3 无 output_format 概念, 同样裁剪。
         if self._is_dalle():
             payload["response_format"] = "b64_json"
-        elif output_format:
+        elif output_format and output_format != "png":
+            # png 是协议默认输出格式: 显式发它只是给上游多一个 400 借口
+            # (实测 agnes text image queue 直接拒收 output_format), 故不发;
+            # 仅非默认格式(webp/jpeg)才显式声明。真实容器以魔数嗅探为准。
             payload["output_format"] = output_format
         if stream:
             payload["stream"] = True
@@ -1458,16 +1498,42 @@ class BaseImageGenClient:
         return None if ra is not None and ra > self.max_retry_after else max(_BACKOFF_MIN, ra or min(_BACKOFF_CAP, _IMG_BACKOFF_BASE * (2 ** attempt)))
 
     def _post(self, payload, stream=False):
-        """带重试语义的 POST(仿 _stream_with_retry: 429/408/5xx 退避集合 +
-        retry-after 上限)。stream=True 返回打开的响应对象(调用方负责
-        close), 否则返回解析后的 dict。失败返回 (None, err_text), 错误
-        文本统一 [Error: image_gen ...] 前缀(§6.5, 绝不用 !!!Error:)。"""
+        """带重试语义的 POST + 参数协商自愈。
+
+        单轮语义见 _post_once(429/408/5xx 退避集合 + retry-after 上限)。
+        外层负责"上游不支持某参数"的自愈: 400/422 且错误文本点名了本次请求
+        里的可裁剪参数 → 裁剪后重试(独立预算, 不消耗 max_retries)。
+
+        返回 (resp|dict|None, err_text), 错误文本统一 [Error: image_gen ...]
+        前缀(§6.5, 绝不用 !!!Error:)。stream=True 成功时返回打开的响应对象
+        (调用方负责 close)。"""
+        payload = dict(payload)
+        trims = 0
+        while True:
+            out, err, err_body, err_status = self._post_once(payload, stream=stream)
+            if err is None:
+                return out, None
+            if err_status in _IMAGE_GEN_PARAM_TRIM_STATUS and trims < _IMAGE_GEN_MAX_PARAM_TRIMS:
+                name = self._unsupported_param(err_body, payload)
+                if name:
+                    payload.pop(name, None)
+                    trims += 1
+                    print(f"[ImageGen Adapt] 上游不支持参数 {name!r}, 已裁剪后重试: {err_body[:160]}")
+                    continue
+            # 预算用尽/无可裁剪参数 → 如实返回上游错误(不返回合成"耗尽"文本,
+            # 保留上游 message 供模型自愈改参)。
+            return None, err
+
+    def _post_once(self, payload, stream=False):
+        """单轮 POST(仿 _stream_with_retry: 429/408/5xx 退避集合 + retry-after
+        上限)。返回 (resp|dict|None, err_text, err_body, err_status); err_body
+        仅供参数协商解析(非 4xx 时为 "")。"""
         url = self._endpoint()
         headers = self._headers()
         for attempt in range(self.max_retries + 1):
             resp = None
             try:
-                resp = self.http.post(url, headers=headers, json=payload, stream=stream,
+                resp = self.http.post(url, headers=headers, json=dict(payload), stream=stream,
                                       timeout=(self.connect_timeout, self.read_timeout),
                                       proxies=self.proxies, verify=self.verify)
                 if resp.status_code >= 400:
@@ -1476,36 +1542,60 @@ class BaseImageGenClient:
                         body = resp.text.strip()[:500]
                     except Exception:
                         pass
+                    status = resp.status_code
                     d = None
-                    if resp.status_code in _IMAGE_GEN_RETRYABLE and attempt < self.max_retries:
+                    if status in _IMAGE_GEN_RETRYABLE and attempt < self.max_retries:
                         d = self._delay(resp, attempt)
                         if d is not None:
-                            print(f"[ImageGen Retry] HTTP {resp.status_code}, retry in {d:.1f}s ({attempt+1}/{self.max_retries+1})")
+                            print(f"[ImageGen Retry] HTTP {status}, retry in {d:.1f}s ({attempt+1}/{self.max_retries+1})")
                             time.sleep(d)
                             resp.close()
                             resp = None
                             continue
-                    hint = " (retry-after > cap)" if resp.status_code in _IMAGE_GEN_RETRYABLE and d is None and attempt < self.max_retries else ""
-                    return None, f"[Error: image_gen HTTP {resp.status_code}{hint}" + (f": {body}" if body else "") + "]"
+                    hint = " (retry-after > cap)" if status in _IMAGE_GEN_RETRYABLE and d is None and attempt < self.max_retries else ""
+                    resp.close()  # stream=True 的 4xx 响应也要关(此前只关非流式)
+                    resp = None
+                    return None, f"[Error: image_gen HTTP {status}{hint}" + (f": {body}" if body else "") + "]", body, status
                 if stream:
-                    return resp, None
+                    return resp, None, "", None
                 try:
-                    return resp.json(), None
+                    return resp.json(), None, "", None
                 except ValueError:
-                    return None, "[Error: image_gen 响应不是合法 JSON]"
+                    return None, "[Error: image_gen 响应不是合法 JSON]", "", None
             except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
                 if attempt < self.max_retries:
                     d = self._delay(None, attempt)
                     print(f"[ImageGen Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{self.max_retries+1})")
                     time.sleep(d)
                     continue
-                return None, (f"[Error: image_gen {type(e).__name__}: {e}]" if str(e) else f"[Error: image_gen {type(e).__name__}]")
+                return None, (f"[Error: image_gen {type(e).__name__}: {e}]" if str(e) else f"[Error: image_gen {type(e).__name__}]"), "", None
             except Exception as e:
-                return None, f"[Error: image_gen {type(e).__name__}: {e}]"
+                return None, f"[Error: image_gen {type(e).__name__}: {e}]", "", None
             finally:
                 if resp is not None and not stream:
                     resp.close()
-        return None, "[Error: image_gen 重试耗尽]"
+        return None, "[Error: image_gen 重试耗尽]", "", None
+
+    def _unsupported_param(self, body, payload):
+        """从 4xx 错误文本里解析"上游不支持的参数名", 仅在同时满足三条时返回:
+        ① 文本命中"参数不被支持/未知参数"话术族; ② 文本里字面出现该参数名;
+        ③ 该参数确在本次 payload 中且属于 _IMAGE_GEN_TRIMMABLE。
+
+        三条同时成立才裁剪, 是为了不误裁无关 4xx(如 prompt 缺失、鉴权失败)。
+        实测上游话术(2026-09-13, new-api 中转 → agnes-image-2.5-flash):
+          "output_format is not supported by text image queue"
+          "quality is not supported by text image queue"
+        兼容 OpenAI 系话术: "Unknown parameter: 'x'" / "Unrecognized request
+        argument supplied: x" / "Unsupported parameter: x"。"""
+        low = (body or "").lower()
+        if not low:
+            return None
+        if not any(h in low for h in _IMAGE_GEN_PARAM_UNSUPPORTED_HINTS):
+            return None
+        for name in _IMAGE_GEN_TRIMMABLE:
+            if name in payload and name in low:
+                return name
+        return None
 
     def _extract_images(self, data):
         """从同步响应 {data:[{b64_json|url}]} 提取 bytes 列表。

@@ -32,6 +32,7 @@ class _FakeResponse:
         self._json = _json
         self._lines = _lines
         self._chunks = _chunks
+        self.closed = 0
 
     def __enter__(self):
         return self
@@ -54,7 +55,7 @@ class _FakeResponse:
             yield ch
 
     def close(self):
-        pass
+        self.closed += 1
 
 
 class _FakeHTTP:
@@ -115,7 +116,7 @@ class TestClientRequestShape:
     CFG = {"name": "openai", "apibase": "https://api.openai.com/v1",
            "apikey": "sk-test", "model": "gpt-image-1", "max_retries": 0}
 
-    def test_sync_payload_gpt_image_no_response_format(self, monkeypatch):
+    def test_sync_payload_gpt_image_omits_default_output_format(self, monkeypatch):
         fake = _install_fake_http(monkeypatch, [_sync_response([base64.b64encode(_1PX_PNG).decode()])])
         client = _client(self.CFG, fake)
         images, err = client.generate("a cat", size="1024x1024", quality="high",
@@ -128,9 +129,16 @@ class TestClientRequestShape:
         assert body["prompt"] == "a cat"
         assert body["size"] == "1024x1024" and body["quality"] == "high"
         assert body["n"] == 1
-        assert body["output_format"] == "png"
+        # png 是协议默认值 → 不发(显式发 png 只是多一个上游 400 借口)
+        assert "output_format" not in body
         # 二轮审查 I-3: gpt-image 恒返回 b64_json, 不发 response_format(会 400)
         assert "response_format" not in body
+
+    def test_sync_payload_sends_non_default_output_format(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [_sync_response([base64.b64encode(_1PX_PNG).decode()])])
+        client = _client(self.CFG, fake)
+        client.generate("a cat", output_format="webp")
+        assert fake.calls[0][1]["json"]["output_format"] == "webp"
 
     def test_sync_payload_dalle_sends_response_format_and_trims_output_format(self, monkeypatch):
         fake = _install_fake_http(monkeypatch, [_sync_response([base64.b64encode(_1PX_PNG).decode()])])
@@ -439,10 +447,151 @@ class TestDoImageGen:
         assert "[FILE:" not in outcome.data
         assert not list((tmp_path / "outputs").glob("image_*"))
 
-    def test_output_format_jpeg_extension(self, monkeypatch, tmp_path):
+    def test_output_format_follows_returned_bytes(self, monkeypatch, tmp_path):
+        # 2026-09-13: agnes 系队列拒绝 output_format(客户端已裁剪), 返回字节可能是
+        # 请求之外的容器格式 → 交付扩展名必须以真实魔数为准, 否则 IM 侧 MIME 失配。
         h = _handler(tmp_path)
         monkeypatch.setattr(ga, "resolve_image_gen",
                             lambda name: self._client_with(monkeypatch, [_sync_response([self.B64])]))
         outcome = _drain(h.do_image_gen({"prompt": "a cat", "output_format": "jpeg"}, None))
+        assert re.match(r"^\[FILE:outputs/image_\d{8}_\d{6}_\d{6}\.png\]$", outcome.data)
+        assert list((tmp_path / "outputs").glob("image_*.png"))
+        assert not list((tmp_path / "outputs").glob("image_*.jpeg"))
+
+    def test_output_format_kept_when_magic_unknown(self, monkeypatch, tmp_path):
+        # 魔数嗅探失败(非标准容器)才回退到请求的扩展名
+        h = _handler(tmp_path)
+        blob = b"\x00" * 64
+        monkeypatch.setattr(ga, "resolve_image_gen",
+                            lambda name: self._client_with(
+                                monkeypatch, [_sync_response([base64.b64encode(blob).decode()])]))
+        outcome = _drain(h.do_image_gen({"prompt": "a cat", "output_format": "jpeg"}, None))
         assert re.match(r"^\[FILE:outputs/image_\d{8}_\d{6}_\d{6}\.jpeg\]$", outcome.data)
         assert list((tmp_path / "outputs").glob("image_*.jpeg"))
+
+
+# ───────────── 客户端：参数协商自愈（2026-09-13 真实上游实测） ─────────────
+
+class TestClientParamNegotiation:
+    """上游按"队列"裁剪参数(实测 new-api 中转 → agnes-image-2.5-flash 的 text
+    image queue): 收到 output_format/quality 直接 400 invalid_request，而
+    gpt-image-2 恰好接受 output_format。客户端按错误文本协商裁剪后重试，
+    而不是按模型名黑名单（方案 §4 原则）。"""
+
+    CFG = {"name": "openai", "apibase": "https://api.openai.com/v1",
+           "apikey": "sk-test", "model": "agnes-image-2.5-flash"}
+    B64 = base64.b64encode(_1PX_PNG).decode()
+
+    @staticmethod
+    def _err400(param):
+        return _FakeResponse(status_code=400, text=json.dumps(
+            {"error": {"message": f"{param} is not supported by text image queue",
+                       "type": "invalid_request", "code": "invalid_request"}}))
+
+    def test_unsupported_output_format_trimmed_and_retried(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [self._err400("output_format"), _sync_response([self.B64])])
+        client = _client({**self.CFG, "max_retries": 0}, fake)
+        images, err = client.generate("a cat", size="1024x1024", quality="high",
+                                      output_format="webp")
+        assert err is None and images == [_1PX_PNG]
+        assert len(fake.calls) == 2
+        first, second = fake.calls[0][1]["json"], fake.calls[1][1]["json"]
+        assert first["output_format"] == "webp" and first["quality"] == "high"
+        # 只裁被点名的参数，其余原样（不能连带把 quality 也丢掉）
+        assert "output_format" not in second
+        assert second["quality"] == "high" and second["size"] == "1024x1024"
+        assert second["model"] == "agnes-image-2.5-flash" and second["prompt"] == "a cat"
+
+    def test_quality_trimmed_then_success(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [self._err400("quality"), _sync_response([self.B64])])
+        client = _client({**self.CFG, "max_retries": 0}, fake)
+        images, err = client.generate("a cat", quality="high", output_format="webp")
+        assert err is None and images == [_1PX_PNG]
+        second = fake.calls[1][1]["json"]
+        assert "quality" not in second and second["output_format"] == "webp"
+
+    def test_two_params_trimmed_in_sequence(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [self._err400("output_format"),
+                                                self._err400("quality"),
+                                                _sync_response([self.B64])])
+        client = _client({**self.CFG, "max_retries": 0}, fake)
+        images, err = client.generate("a cat", quality="high", output_format="webp")
+        assert err is None and images == [_1PX_PNG]
+        assert len(fake.calls) == 3
+        last = fake.calls[2][1]["json"]
+        assert "output_format" not in last and "quality" not in last
+
+    def test_trim_never_drops_size_or_n(self, monkeypatch):
+        # size(计费必传/模型必需) 与 n(张数属用户契约) 在可裁剪清单之外：
+        # 不静默缩水，如实报错让模型改参重试。
+        resp = _FakeResponse(status_code=400, text=json.dumps({"error": {
+            "message": "size is not supported by text image queue; n is not supported",
+            "type": "invalid_request"}}))
+        fake = _install_fake_http(monkeypatch, [resp])
+        client = _client({**self.CFG, "max_retries": 0}, fake)
+        images, err = client.generate("a cat", size="1024x1024", n=2)
+        assert images is None and err.startswith("[Error: image_gen HTTP 400")
+        assert len(fake.calls) == 1
+
+    def test_unrelated_400_not_trimmed(self, monkeypatch):
+        # 非"参数不被支持"话术族的 400 一律不裁剪（防误裁）
+        resp = _FakeResponse(status_code=400, text="bad request: prompt too long")
+        fake = _install_fake_http(monkeypatch, [resp])
+        client = _client({**self.CFG, "max_retries": 0}, fake)
+        images, err = client.generate("a cat", output_format="png")
+        assert images is None and err.startswith("[Error: image_gen HTTP 400")
+        assert len(fake.calls) == 1
+
+    def test_trim_budget_bounded_and_error_is_upstream_text(self, monkeypatch):
+        monkeypatch.setattr(llmcore, "_IMAGE_GEN_MAX_PARAM_TRIMS", 1)
+        fake = _install_fake_http(monkeypatch, [self._err400("output_format"),
+                                                self._err400("quality")])
+        client = _client({**self.CFG, "max_retries": 0}, fake)
+        images, err = client.generate("a cat", quality="high", output_format="webp")
+        assert images is None
+        assert len(fake.calls) == 2  # 预算 1 → 不无限协商
+        # 如实返回上游 message（供模型自愈改参），不返回合成文本
+        assert err.startswith("[Error: image_gen HTTP 400") and "quality is not supported" in err
+
+    def test_stream_path_also_negotiates(self, monkeypatch):
+        sse = _FakeResponse(headers={"content-type": "text/event-stream"}, _lines=[
+            f'data: {{"data": [{{"b64_json": "{self.B64}"}}]}}',
+            "data: [DONE]",
+        ])
+        fake = _install_fake_http(monkeypatch, [self._err400("output_format"), sse])
+        client = _client({**self.CFG, "stream": True, "max_retries": 0}, fake)
+        images, err = client.generate("a cat", output_format="webp")
+        assert err is None and images == [_1PX_PNG]
+        assert len(fake.calls) == 2
+        assert "output_format" not in fake.calls[1][1]["json"]
+
+    def test_4xx_stream_response_closed(self, monkeypatch):
+        # stream=True 的 4xx 响应也要关闭（此前只关非流式，句柄泄漏）
+        resp = _FakeResponse(status_code=500, text="boom")
+        fake = _install_fake_http(monkeypatch, [resp])
+        client = _client({**self.CFG, "stream": True, "max_retries": 0}, fake)
+        out, err = client._post({"model": "m", "prompt": "p"}, stream=True)
+        assert out is None and err.startswith("[Error: image_gen HTTP 500")
+        assert resp.closed == 1
+
+
+# ───────────────────────── 魔数嗅探（落盘扩展名） ─────────────────────────
+
+class TestSniffImageFormat:
+
+    def test_png(self):
+        assert llmcore.sniff_image_format(_1PX_PNG) == "png"
+
+    def test_jpeg(self):
+        assert llmcore.sniff_image_format(b"\xff\xd8\xff\xe0" + b"\x00" * 16) == "jpeg"
+
+    def test_webp(self):
+        assert llmcore.sniff_image_format(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "webp"
+
+    def test_gif(self):
+        assert llmcore.sniff_image_format(b"GIF89a" + b"\x00" * 8) == "gif"
+
+    def test_unknown_and_short(self):
+        assert llmcore.sniff_image_format(b"\x00" * 64) is None
+        assert llmcore.sniff_image_format(b"") is None
+        assert llmcore.sniff_image_format(b"\x89PNG") is None  # 短于魔数窗口
