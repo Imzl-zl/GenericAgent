@@ -93,3 +93,19 @@ B4 8MiB+bytea / B5 QQ 主动消息路径）与重要项（I2 content_type、I4 �
 
 验证: 根 48 + bot_poller 91 + worker-python 144 + Go 全量(真实 TEST_DATABASE_URL) 全绿。
 残余风险(需真实凭据, 未变): 钉钉 file/video downloadCode 上传流、企微 token 端点、QQ 分片 4 步冒烟、飞书 media 视频。
+
+## 2026-09-13 生图参数协商自愈（用户报 400 闭环）
+
+> 归因与实测矩阵（含官方文档对照、10 次真实探测）见 `PHASE_B_IMAGE_GEN_PLAN.zh-CN.md` §9.9。
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| P1 | 400 根因：客户端对非 dall-e 恒发 `output_format`（ga.py 默认 png），Agnes text image queue 只收 `model/prompt/size/ratio/extra_body` → `output_format is not supported by text image queue`；`quality` 同因 | 真实 key 复现（400 原文） |
+| P2 | 参数协商自愈：`_post` 拆 `_post_once` + 协商循环，4xx 且错误文本点名本次 payload 里的可裁剪参数才裁剪重试（三重门槛防误裁；**不裁 size/n**；预算 3 次；尽则如实回上游 message） | test_image_gen 新增 7 项 |
+| P3 | 最小请求面：`png` 是协议默认值 → 不再显式发送，仅 webp/jpeg 声明 | 请求形状断言 |
+| P4 | 交付格式诚实：新增 `sniff_image_format`，ga.py 落盘扩展名以真实魔数为准（协商裁掉 output_format 后请求 jpeg 可能拿回 png） | 嗅探 5 项 + 落盘 2 项 |
+| P5 | schema ×2：size 去 OpenAI-only 枚举（Agnes 推荐 1K/2K/3K/4K）；quality/output_format 补队列差异；quality 补 120s 窗口提示；model 补 503 语义 | JSON 合法 + 无测试依赖枚举 |
+| P6 | 附带修复：`stream=True` 的 4xx 响应补 close；每次 HTTP 尝试发 payload 快照 | 句柄 close 断言 |
+| P7 | 配置决策：CF proxy read timeout=120s（慢模型撞 524）→ 生图默认改 `agnes-image-2.5-flash`（渠道2 key，8-11s）+ `read_timeout=100`；gpt-image-2 保留换回路径 | 真实 key 端到端：默认参数单请求 **9.6s** 出图 1.74MB；原 400 参数集自动裁剪后 200 出图 1.84MB |
+
+**残余风险/后续**：协商遇到新队列先付 1-2 次 400 往返（~1.3s，未做跨请求记忆；高频生图可加按 (apibase, model) 的进程内裁剪记忆）；agnes 非方形比例需 `ratio` 参数（工具 schema 未暴露，需 `size:"2K"` + `ratio:"16:9"`）；Agnes `return_base64` 经该中转被忽略（仍回 url，走既有 url 直下兜底）。**上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json）。

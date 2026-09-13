@@ -196,7 +196,7 @@ image_gen = {
 | **2. GA 侧 MVP** | `do_image_gen` + `BaseImageGenClient`/`OpenAIImageGenClient`（同步 + 流式路径）+ `resolve_image_gen` + schema ×2 + mykey 模板 + 单测（含未配置/空响应/超限/流式中断路径） | 代码 + `test_image_gen.py` | `python -m pytest tests -q` + **本地 CLI 闭环**（配置真实/中转 key → 让 GA 生图 → `outputs/` 出图） | 1 天 |
 | **3. 平台集成（已实施，2026-08-14，commit 5870cc5/46e81b4）** | llm-proxy `/v1/images/generations` 路由 + `llm.image` capability + **provider 能力类型维度（chat/image）** + 生图 provider 排除 chat mixin + runtime_config 下发 image_gen 块 + policy 放行 + openapi/web 同步 + worker marker 兜底登记 | 设计已定稿（§3.2/§8）→ 2026-08-14 实施 | `go vet/build/test ./...` + 契约绑定测试 + worker 146 + web build 全绿 | 已实施（含审查 W3-W6 修复） |
 
-残余风险：IM 端到端收图冒烟需真实渠道凭据（QQ/飞书已配置）；**Step 2 上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json，runtime_overlay.py:16-29），Step 3 需平台部署（make build 全量重建）；流式路径（`stream:true` + `partial_images` SSE）以 OpenAI/Azure 文档为据，社区有稳定性波动报告——同步路径恒可用，流式标"待真实上游实测"（2026-08-14 实测保持 stream=False 走同步）；**gpt-image 参数兼容性已实测（2026-08-14 new-api 中转）**：size 必传（客户端已默认 1024x1024）、gpt-image-2/gemini-*-image 返回 b64_json、**sensenova/agnes 只回 url 直链（客户端已加直下兜底）**、sensenova size 合法集特殊（错误文本引导自愈）、n>1 未实测（保持 n≤4 透传+错误诚实）；**marker 回显依赖**（工具返回 marker ≠ 交付发生，模型须在最终回复回显 marker 才触发交付；根项目无兜底，托管兜底终态补 generated_output_files 登记仿 do_export_docx legacy_instrument.py:233）；**直连形态无 JTI 计量**——成本靠 n≤4 + 用户自觉（gpt-image token 计费，usage 日志留作后续计量基础，二轮审查盲区 4）。
+残余风险：IM 端到端收图冒烟需真实渠道凭据（QQ/飞书已配置）；**Step 2 上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json，runtime_overlay.py:16-29），Step 3 需平台部署（make build 全量重建）；流式路径（`stream:true` + `partial_images` SSE）以 OpenAI/Azure 文档为据，社区有稳定性波动报告——同步路径恒可用，流式标"待真实上游实测"（2026-08-14 实测保持 stream=False 走同步）；**gpt-image 参数兼容性已实测（2026-08-14 new-api 中转）**：size 必传（客户端已默认 1024x1024）、gpt-image-2/gemini-*-image 返回 b64_json、**sensenova/agnes 只回 url 直链（客户端已加直下兜底）**、sensenova size 合法集特殊（错误文本引导自愈）、n>1 未实测（保持 n≤4 透传+错误诚实）；**marker 回显依赖**（工具返回 marker ≠ 交付发生，模型须在最终回复回显 marker 才触发交付；根项目无兜底，托管兜底终态补 generated_output_files 登记仿 do_export_docx legacy_instrument.py:233）；**直连形态无 JTI 计量**——成本靠 n≤4 + 用户自觉（gpt-image token 计费，usage 日志留作后续计量基础，二轮审查盲区 4）。**2026-09-13 更新（详见 §9.9）**："OpenAI 兼容"不等于参数全集通用——上游按队列裁剪参数（agnes 拒 output_format/quality，gpt-image 接受），已在客户端加参数协商自愈（含 size/n 不裁的诚实边界）；另确认网关走 Cloudflare、proxy read timeout=120s，慢模型会撞 524，默认生图模型已改 agnes-image-2.5-flash（8-11s）。
 
 ## 8. 决策记录（B1–B5）
 
@@ -305,3 +305,44 @@ image_gen = {
 | 独立审查优化 | 预算链定稿(poller 最坏 ~85s < ctx 90s < client 兜底 120s, 拆双 http.Client); 死代码清理(双签名/快照分支/缩略图); admin 死信重投端点; 根 QQ/钉钉诚实降级+钉钉图片直发 |
 
 **验证**: 微信端到端收图已实测(2026-08-14 生产闭环: 10 张生成图送达, 26/26 交付 acked 0 死信)。
+
+## 9.9 参数协商自愈 + 失败模型归因（2026-09-13，真实上游 400 复现闭环）
+
+> 触发：用户报"生图 400"并指向 Agnes Image 2.5 Flash 文档。方案 §4 原则"不搞模型名
+> 黑名单、靠错误文本自愈"在本节被升级为**协议层机制**，而不是加一条 if。
+
+**复现与归因（真实 key，new-api 中转 → apihub.agnes-ai.com）**：
+
+| 观测 | 结论 |
+|---|---|
+| `POST /images/generations` + `agnes-image-2.5-flash` + 客户端原 payload（含 `output_format`）→ **400** `output_format is not supported by text image queue` | 400 的**直接**成因：客户端对非 dall-e 模型恒发 `output_format`（ga.py 默认 `png`），而 Agnes 的 text image queue 只收 `model/prompt/size/ratio/extra_body` |
+| 同上 + `quality=high` → **400** `quality is not supported by text image queue` | 第二个同类成因：`quality` 同样不被该队列接受 |
+| 渠道1 key + agnes 模型 → **503** `model_not_found ... under group image` | 渠道/key 与模型的配对是**独立**陷阱（渠道1 key 只有 6 个模型，无 agnes）：/models 先自查比猜参数更快 |
+| agnes + `{model,prompt,size:"1K"}` / `+n=1` / `+extra_body.response_format` / `+return_base64` → **200 (8-11s, url)** | 正确 payload 形态；`n` 可发，`extra_body` 才是 response_format 的合法位置（官方文档明示**顶层放 response_format 是错误写法**） |
+| gpt-image-2 + `output_format=png` → **200 (23-25s, b64_json)**；去掉 `output_format` 同样 200 | 同一参数在不同队列命运相反 → **不能**全局删参数，必须按队列协商 |
+| gpt-image-2 在 Cloudflare 后置网关下多次 **524**（125s = CF proxy read timeout） | 该网关有 120s 读超时窗口：慢模型（gpt-image-2 实测 24-125s）会撞线；agnes 8-11s 安全 |
+
+**实现（本文件 §3.3/§6.5 的落地修订）**：
+
+| 层 | 改动 |
+|---|---|
+| `_post` 参数协商 | 拆 `_post_once`（单轮 + 429/5xx 退避）与 `_post`（协商循环）：4xx 命中 `_IMAGE_GEN_PARAM_TRIM_STATUS={400,422}` 且错误文本点名了本次 payload 里的**可裁剪参数**（`output_format/quality/response_format/stream/partial_images`）→ 裁剪该参数重试，预算 `_IMAGE_GEN_MAX_PARAM_TRIMS=3`，**不消耗 max_retries**；预算用尽/无可裁剪项时**如实返回上游 message**（不返回合成"耗尽"文本，保留自愈信息） |
+| 裁剪边界（诚实性） | **刻意不裁** `size`（计费必传/模型必需）与 `n`（张数属用户契约，静默缩水=不诚实）——这类失败必须回给模型让它改参 |
+| 防误裁 | `_unsupported_param` 三重门槛：①文本命中"not supported/unsupported/unknown parameter/unrecognized/invalid parameter..."话术族；②参数名**字面出现**在错误文本里；③该参数确在本次 payload 中。避免把"prompt too long"之类的 400 误判成参数问题 |
+| 最小请求面 | `png` 是协议默认输出格式 → **不再显式发送**（显式发只是给上游多一个 400 借口）；仅 webp/jpeg 才声明 |
+| 交付格式诚实 | 新增 `sniff_image_format`（PNG/JPEG/GIF/WEBP 魔数）；ga.py 落盘扩展名**以真实字节为准**，嗅探失败才回退请求值；请求与实返不符时输出 `[Status] ℹ️` 明示。原因：协商裁剪掉 `output_format` 后，请求 jpeg 可能拿回 png——旧实现会写出"名叫 .jpeg 的 png"，IM 侧 MIME 失配 |
+| 附带修复 | `stream=True` 的 4xx 响应此前不 close（句柄泄漏）；每次 HTTP 尝试改发 payload 快照（`dict(payload)`），消除跨尝试共享可变状态 |
+| schema ×2 | `size` 去掉 OpenAI-only 枚举（Agnes 推荐 `1K/2K/3K/4K` 档位，枚举会把模型锁死在 `1024x1024`）；`quality/output_format` 描述补"Agnes 队列拒绝、会自动裁剪"；`quality` 补 120s 代理窗口提示（慢模型/大尺寸请 low 或省略）；`model` 补直连模式下"密钥必须覆盖该模型，否则 503" |
+
+**验证**：根 pytest 135→136 全绿（`test_image_gen.py` 30→44，新增协商×7 + 嗅探×5 + 落盘扩展名×2）；
+真实 key 端到端（走 `mykey.image_gen` 正式配置、无桩）：`do_image_gen` 单请求 **9.6s** 出图 1.74MB PNG；
+原 400 参数集（`quality=high` + `output_format=png`）**自适应通过**（自动裁 `quality` 后 200，1.84MB PNG）。
+
+**配置结论（2026-09-13 用户拍板）**：CF 代理 120s 超时下，生图默认模型改用
+`agnes-image-2.5-flash`（渠道2 key，8-11s，当前免费），`read_timeout=100`（< CF 窗口，
+宁可自己超时也不吃 CF 的 HTML 524）；gpt-image-2 保留换回路径（渠道1 key + read_timeout=300）。
+
+**残余风险**：参数协商每次遇到新队列会先付 1-2 次 400 往返（~1.3s/次，未做跨请求记忆；
+若后续高频生图可加按 (apibase, model) 的进程内裁剪记忆）；agnes 的非方形比例需
+`ratio` 参数（当前工具 schema 未暴露，需 `size:"2K"` + `ratio:"16:9"` 才能表达，
+列为后续增强）；Agnes `return_base64` 经该中转时被忽略（实测仍回 url，走既有 url 直下兜底）。
