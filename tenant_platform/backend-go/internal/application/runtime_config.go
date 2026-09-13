@@ -20,6 +20,34 @@ const (
 	myKeyLoaderFilename   = "mykey.py"
 )
 
+// 托管 image_gen 块的超时/重试默认值(2026-09-13 稳定性边界)。
+//
+// 两个数字都是从**任务预算倒推**出来的, 不是随手填的:
+//   - 入口是 Cloudflare(proxy read timeout 默认 120s): 客户端读超时必须短于
+//     它, 否则拿到的是 CF 的 HTML 524 而非常规超时错误(不可判读, 重试白烧)。
+//   - 生产 TASK_TIMEOUT_SECONDS=300(compose 默认): 单次生图的最坏墙钟 =
+//     (max_retries+1) × read_timeout + 退避 ≈ 2×100+1.5 ≈ 202s < 300s,
+//     留给 Agent 把失败**如实回复**给用户的预算; 旧值 120s×3≈365s 会吃光
+//     任务预算 → TASK_INTERRUPTED 零回复(与 08-13 图片任务超时同源)。
+//
+// 注: 慢模型确实需要 >100s 时, 应同时上调 TASK_TIMEOUT_SECONDS, 否则只是把
+// 失败从「超时错误」换成「任务被杀」。GA_IMAGE_GEN_READ_TIMEOUT 可覆盖读超时。
+const (
+	imageGenDefaultReadTimeout = 100
+	imageGenMaxRetries         = 1
+)
+
+// imageGenReadTimeout 返回托管 image_gen 块的 read_timeout(秒): 默认
+// imageGenDefaultReadTimeout, 可用 GA_IMAGE_GEN_READ_TIMEOUT 覆盖(非法/<=0 回落默认)。
+func imageGenReadTimeout() int {
+	if v := strings.TrimSpace(os.Getenv("GA_IMAGE_GEN_READ_TIMEOUT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return imageGenDefaultReadTimeout
+}
+
 const MyKeyLoader = `import json as _json
 from pathlib import Path as _Path
 _config = _json.loads(_Path(__file__).with_name("mykey.runtime.json").read_text(encoding="utf-8"))
@@ -174,7 +202,9 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 				"apikey":      binding.Token,
 				"model":       provider.Model,
 				"stream":      false,
-				"max_retries": 2,
+				"max_retries": imageGenMaxRetries,
+				// 读超时必须短于入口代理窗口(见文件上方常量注释的任务预算算术)。
+				"read_timeout": imageGenReadTimeout(),
 			}
 			imageBound = true
 			continue

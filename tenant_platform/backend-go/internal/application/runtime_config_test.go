@@ -375,6 +375,14 @@ func TestBuildRuntimeConfigImageGenBlock(t *testing.T) {
 	if img["stream"] != false {
 		t.Fatalf("image_gen stream = %v, want false", img["stream"])
 	}
+	// 稳定性边界(2026-09-13): 读超时须短于入口代理窗口(CF 120s), 重试数须让
+	// 最坏墙钟留在任务预算内——见 runtime_config.go 常量注释。
+	if got, ok := img["read_timeout"].(float64); !ok || got != float64(imageGenDefaultReadTimeout) {
+		t.Fatalf("image_gen read_timeout = %v, want %d", img["read_timeout"], imageGenDefaultReadTimeout)
+	}
+	if got, ok := img["max_retries"].(float64); !ok || got != float64(imageGenMaxRetries) {
+		t.Fatalf("image_gen max_retries = %v, want %d", img["max_retries"], imageGenMaxRetries)
+	}
 	// image provider 不进 chat session 变量; 单 chat provider 时不写 mixin,
 	// 多 chat 时 mixin 也绝不含 image provider。
 	if _, exists := document["platform_native_oai_provider_9_config"]; exists {
@@ -386,6 +394,65 @@ func TestBuildRuntimeConfigImageGenBlock(t *testing.T) {
 				t.Fatal("image provider must not join chat mixin")
 			}
 		}
+	}
+}
+
+// TestBuildRuntimeConfigImageGenTimeoutBoundary: 托管生图的两个数字必须同时满足
+// 两个外部约束——① 读超时 < 入口代理窗口(CF 默认 120s, 否则拿到 HTML 524 而非
+// 可判读超时); ② 最坏墙钟 (max_retries+1)×read_timeout < 生产任务预算
+// (compose TASK_TIMEOUT_SECONDS=300, 否则 TASK_INTERRUPTED 零回复)。
+// 本测试把这两条不变式钉住, 防止以后随手调大其中一个。
+func TestBuildRuntimeConfigImageGenTimeoutBoundary(t *testing.T) {
+	t.Setenv("GA_IMAGE_GEN_READ_TIMEOUT", "") // 显式回到默认值
+	const (
+		ingressProxyWindow = 120 // Cloudflare proxy read timeout
+		taskBudgetSeconds  = 300 // compose GA_RUNNER_TASK_TIMEOUT
+	)
+	if imageGenDefaultReadTimeout >= ingressProxyWindow {
+		t.Fatalf("read_timeout=%d 必须短于入口代理窗口 %ds", imageGenDefaultReadTimeout, ingressProxyWindow)
+	}
+	worstCase := (imageGenMaxRetries + 1) * imageGenDefaultReadTimeout
+	if worstCase >= taskBudgetSeconds {
+		t.Fatalf("最坏墙钟 %ds 必须小于任务预算 %ds", worstCase, taskBudgetSeconds)
+	}
+}
+
+// TestBuildRuntimeConfigImageGenReadTimeoutOverride: GA_IMAGE_GEN_READ_TIMEOUT 可覆盖
+// (运维可不重建镜像调整); 非法/非正值回落默认, 不静默成 0(0 会让客户端取默认)。
+func TestBuildRuntimeConfigImageGenReadTimeoutOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want int
+	}{
+		{"override", "45", 45},
+		{"invalid falls back", "abc", imageGenDefaultReadTimeout},
+		{"non-positive falls back", "0", imageGenDefaultReadTimeout},
+		{"blank falls back", "  ", imageGenDefaultReadTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GA_IMAGE_GEN_READ_TIMEOUT", tc.env)
+			files, err := BuildRuntimeConfig(RuntimeConfigInput{
+				ProxyBaseURL:      "http://127.0.0.1:8081",
+				RoutingSnapshotID: "snapshot-img-timeout",
+				Providers: []RuntimeProviderBinding{
+					// 至少一个 chat provider: image-only 部署被 fail-closed 拒绝。
+					{Provider: chatProvider(1), Token: "chat-token", Capability: domain.ProviderCapabilityChat},
+					{Provider: imageProvider(9), Token: "image-token", Capability: domain.ProviderCapabilityImage},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var document map[string]any
+			if err := json.Unmarshal(files.JSON, &document); err != nil {
+				t.Fatal(err)
+			}
+			img := document["image_gen"].(map[string]any)
+			if got, ok := img["read_timeout"].(float64); !ok || got != float64(tc.want) {
+				t.Fatalf("read_timeout = %v, want %d", img["read_timeout"], tc.want)
+			}
+		})
 	}
 }
 
@@ -426,7 +493,7 @@ sys.path.insert(1, sys.argv[2])
 importlib.import_module("mykey")
 llmcore = importlib.import_module("llmcore")
 client = llmcore.resolve_image_gen("image_gen")
-print(json.dumps({"class_name": client.__class__.__name__, "model": client.model, "stream": client.stream, "api_base": client.api_base}))
+print(json.dumps({"class_name": client.__class__.__name__, "model": client.model, "stream": client.stream, "api_base": client.api_base, "read_timeout": client.read_timeout, "max_retries": client.max_retries}))
 `
 	output, err := exec.Command(python, "-c", script, configDir, repoRoot).CombinedOutput()
 	if err != nil {
@@ -434,16 +501,26 @@ print(json.dumps({"class_name": client.__class__.__name__, "model": client.model
 	}
 	lines := bytes.Split(bytes.TrimSpace(output), []byte{'\n'})
 	var probe struct {
-		ClassName string `json:"class_name"`
-		Model     string `json:"model"`
-		Stream    bool   `json:"stream"`
-		APIBase   string `json:"api_base"`
+		ClassName   string `json:"class_name"`
+		Model       string `json:"model"`
+		Stream      bool   `json:"stream"`
+		APIBase     string `json:"api_base"`
+		ReadTimeout int    `json:"read_timeout"`
+		MaxRetries  int    `json:"max_retries"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(lines[len(lines)-1]), &probe); err != nil {
 		t.Fatalf("decode GA probe %q: %v", output, err)
 	}
 	if probe.ClassName != "OpenAIImageGenClient" || probe.Model != "gpt-image-2" || probe.Stream || probe.APIBase != "http://127.0.0.1:8081/v1" {
 		t.Fatalf("GA image_gen probe = %+v", probe)
+	}
+	// 客户端真实消费超时/重试字段(不是只写进 JSON 就完事): read_timeout 与
+	// max_retries 必须原值落到 llmcore 客户端上。
+	if probe.ReadTimeout != imageGenDefaultReadTimeout {
+		t.Fatalf("GA client read_timeout = %d, want %d", probe.ReadTimeout, imageGenDefaultReadTimeout)
+	}
+	if probe.MaxRetries != imageGenMaxRetries {
+		t.Fatalf("GA client max_retries = %d, want %d", probe.MaxRetries, imageGenMaxRetries)
 	}
 }
 
