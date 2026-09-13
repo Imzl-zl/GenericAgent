@@ -354,6 +354,19 @@ image_gen = {
 `TestBuildRuntimeConfigImageBlockCompatibleWithGA` 探针扩展到断言 `read_timeout`/`max_retries`
 **真的落到真实 GA 客户端上**。验证：Go vet/build/全量 `-p 1`/race 5 关键包全绿。
 
+**托管形态协商失效（2026-09-13 第三轮，用户实测暴露，最重要的一次）**：用户在微信实测后，服务端转录（`backend_history`）显示模型收到的是
+`[Error: image_gen HTTP 400: {"code":"UPSTREAM_ERROR","message":"upstream request failed"}]`，并出现「Image generation failed with upstream 400 error, retrying
+with simpler prompt」→「Image service still down after 4 retry attempts」——**模型在盲重试并最终放弃**。根因不在客户端：llm-proxy 为安全边界
+（2026-08-14 设计：上游错误体可能含账号/配额，**默认清洗不透传**，排障看 llm-proxy 日志）把上游 400 体改写成了通用 `UPSTREAM_ERROR`，
+于是「错误文本驱动协商」在托管形态下**永远拿不到参数名** → 裁剪永不触发 → 400 原样回给模型。**这是设计假设与安全边界的冲突，不是实现 bug。**
+
+两处修复（互为纵深）：
+
+| 层 | 修复 | 代价/风险 |
+|---|---|---|
+| llm-proxy（补信息） | 新增 `clientActionableErrorBody`：**仅**生图端点 + **仅** 4xx + **仅**命中「参数类」白名单话术（`is not supported`/`unknown parameter`/`invalid parameter`/`must be one of`…）时，**只提取 message 字段重建成 `{code,message}`** 透传；5xx/chat/账号配额类维持清洗体。**不原样转发**——上游体里与 message 并列的账号/配额/凭据字段根本不会出去 | 安全边界不变；3 组测试双向钉住（透传 / 兄弟字段不泄露 / message 含敏感词也不放行 / 5xx 与 chat 仍清洗） |
+| llmcore（不依赖网关话术） | 新增**保守集兜底**：4xx 且错误文本不可判读、且请求仍带装饰性参数时，丢弃全部 `_IMAGE_GEN_TRIMMABLE` 重试**一次**（不占裁剪预算，不做第二次）。请求语义/交付契约不变（装饰参数缺席不影响结果；落盘扩展名已按魔数嗅探） | 硬失败（内容策略等）最多多 1 次请求，随后如实报错；5xx 语义不变 |
+
 **残余风险**：参数协商每次遇到新队列会先付 1-2 次 400 往返（~1.3s/次，未做跨请求记忆；
 若后续高频生图可加按 (apibase, model) 的进程内裁剪记忆）；agnes 的非方形比例需
 `ratio` 参数（当前工具 schema 未暴露，需 `size:"2K"` + `ratio:"16:9"` 才能表达，
