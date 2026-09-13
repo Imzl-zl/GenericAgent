@@ -1509,6 +1509,7 @@ class BaseImageGenClient:
         (调用方负责 close)。"""
         payload = dict(payload)
         trims = 0
+        conservative_done = False
         while True:
             out, err, err_body, err_status = self._post_once(payload, stream=stream)
             if err is None:
@@ -1520,6 +1521,19 @@ class BaseImageGenClient:
                     trims += 1
                     print(f"[ImageGen Adapt] 上游不支持参数 {name!r}, 已裁剪后重试: {err_body[:160]}")
                     continue
+                # 错误文本不可判读(网关清洗/非标准话术): 只要还带着装饰性参数,
+                # 就退回"保守参数集"重试**一次**——不依赖上游话术, 使托管形态
+                # (llm-proxy 为安全边界默认清洗上游错误体, 见 reverse_proxy.go)
+                # 也能自愈。只做一次, 且只丢 _IMAGE_GEN_TRIMMABLE(纯装饰性,
+                # 不影响请求语义与交付契约), 故不会把内容/鉴权类失败变成无限重试。
+                if not conservative_done:
+                    dropped = [k for k in _IMAGE_GEN_TRIMMABLE if k in payload]
+                    if dropped:
+                        for k in dropped:
+                            payload.pop(k, None)
+                        conservative_done = True
+                        print(f"[ImageGen Adapt] 4xx 不可判读(疑被网关清洗), 退回保守参数集(丢弃 {', '.join(dropped)})重试一次: {err_body[:160]}")
+                        continue
             # 预算用尽/无可裁剪参数 → 如实返回上游错误(不返回合成"耗尽"文本,
             # 保留上游 message 供模型自愈改参)。
             return None, err

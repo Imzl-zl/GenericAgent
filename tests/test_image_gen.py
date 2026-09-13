@@ -595,3 +595,61 @@ class TestSniffImageFormat:
         assert llmcore.sniff_image_format(b"\x00" * 64) is None
         assert llmcore.sniff_image_format(b"") is None
         assert llmcore.sniff_image_format(b"\x89PNG") is None  # 短于魔数窗口
+
+
+class TestConservativeFallbackOnOpaque4xx:
+    """llm-proxy 为安全边界默认清洗上游错误体(只回 {"code":"UPSTREAM_ERROR"}),
+    实测后果: 协商拿不到参数名 → 模型只看到裸 400 → 盲重试 4 次后放弃。
+    客户端因此补一层不依赖上游话术的兜底: 4xx 不可判读且仍带装饰性参数时,
+    退回保守参数集重试**一次**(纯装饰参数, 不影响请求语义/交付契约)。"""
+
+    CFG = {"name": "openai", "apibase": "https://api.openai.com/v1",
+           "apikey": "sk-test", "model": "agnes-image-2.5-flash", "max_retries": 0}
+    B64 = base64.b64encode(_1PX_PNG).decode()
+    _OPAQUE = json.dumps({"code": "UPSTREAM_ERROR", "message": "upstream request failed"})
+
+    def test_opaque_4xx_falls_back_to_conservative_payload(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [
+            _FakeResponse(status_code=400, text=self._OPAQUE),
+            _sync_response([self.B64]),
+        ])
+        client = _client(self.CFG, fake)
+        images, err = client.generate("a cat", size="1024x1024", quality="high",
+                                      output_format="webp", n=1)
+        assert err is None and images == [_1PX_PNG]
+        assert len(fake.calls) == 2
+        first, second = fake.calls[0][1]["json"], fake.calls[1][1]["json"]
+        assert first["quality"] == "high" and first["output_format"] == "webp"
+        # 保守集: 装饰性参数全丢, 但请求语义(必需参数)保持
+        for k in llmcore._IMAGE_GEN_TRIMMABLE:
+            assert k not in second
+        assert second["model"] == "agnes-image-2.5-flash" and second["prompt"] == "a cat"
+        assert second["size"] == "1024x1024" and second["n"] == 1
+
+    def test_conservative_fallback_happens_only_once(self, monkeypatch):
+        # 硬失败(如内容策略)不能被变成无限重试: 两次请求后如实报错
+        fake = _install_fake_http(monkeypatch, [
+            _FakeResponse(status_code=400, text=self._OPAQUE),
+            _FakeResponse(status_code=400, text=self._OPAQUE),
+        ])
+        client = _client(self.CFG, fake)
+        images, err = client.generate("a cat", quality="high", output_format="webp")
+        assert images is None
+        assert len(fake.calls) == 2
+        assert err.startswith("[Error: image_gen HTTP 400")
+
+    def test_no_conservative_retry_without_trimmable_params(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [_FakeResponse(status_code=400, text=self._OPAQUE)])
+        client = _client(self.CFG, fake)
+        images, err = client.generate("a cat")
+        assert images is None and len(fake.calls) == 1
+
+    def test_5xx_unaffected_by_conservative_fallback(self, monkeypatch):
+        # 5xx 走既有重试语义(非参数协商状态码), 不触发保守重试
+        resp = _FakeResponse(status_code=503, headers={"retry-after": "0.5"})
+        fake = _install_fake_http(monkeypatch, [resp, resp])
+        client = _client({**self.CFG, "max_retries": 1}, fake)
+        images, err = client.generate("a cat", quality="high")
+        assert images is None and err.startswith("[Error: image_gen HTTP 503")
+        assert len(fake.calls) == 2  # max_retries=1, 未额外保守重试
+        assert fake.calls[1][1]["json"]["quality"] == "high"

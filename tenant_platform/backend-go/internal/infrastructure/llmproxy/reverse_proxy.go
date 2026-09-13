@@ -2,12 +2,14 @@ package llmproxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -29,6 +31,68 @@ var nativeResponseHeaderAllowlist = map[string]struct{}{
 }
 
 const sanitizedUpstreamErrorBody = "{\"code\":\"UPSTREAM_ERROR\",\"message\":\"upstream request failed\"}\n"
+
+// clientActionableUpstreamError 判定上游错误体是否属于"客户端可自行修正的参数/
+// 校验类"错误——只有这类文本才被透传给 GA(见 clientActionableErrorBody)。
+//
+// 背景(2026-09-13 实测): image_gen 的参数协商靠错误文本点名参数("quality is
+// not supported by text image queue")才能裁剪重试。本代理默认清洗上游错误体
+// (安全边界: 上游体可能含账号/配额等敏感信息, 见 2026-08-14 注释与
+// TestReverseProxySanitizesUpstreamErrorsWithoutReplay), 结果 GA 只看到
+// UPSTREAM_ERROR → 协商永远不生效 → 模型只能盲重试, 实测 4 次后对用户说
+// "图片服务不可用"。折中: **白名单**(而非黑名单)只放行"某参数不被支持/取值
+// 非法"这类客户端能自行修正的文本, 其余(账号/配额/鉴权/内部错误)一律维持
+// 清洗后的通用错误体。
+var clientActionableUpstreamError = regexp.MustCompile(
+	`(?i)is not supported|not supported by|unsupported|unknown parameter|` +
+		`unrecognized (request )?(argument|parameter|field)|invalid parameter|` +
+		`invalid_request|invalid value|must be one of|not allowed`)
+
+// sensitiveUpstreamField 是上游体里出现就一律不透传的敏感字段名(纵深防御:
+// 即便命中白名单话术, 也不把整段上游体发出去)。
+var sensitiveUpstreamField = regexp.MustCompile(
+	`(?i)(account|quota|balance|credit|api[-_]?key|secret|bearer|authorization)`)
+
+// clientActionableErrorBody 从上游 4xx 错误体里**提取参数类错误消息并重建**
+// 成干净的 {code,message} 体透传。返回 "" 表示不透传(维持通用清洗体)。
+//
+// 关键设计: **不原样转发**上游体, 而是只取 message 字段重建——这样上游体里
+// 与 message 并列的账号/配额/凭据字段(安全审查担心的泄露面)根本不会出去,
+// 同时 image_gen 凭文本点名参数自愈所需的信息完整保留。
+func clientActionableErrorBody(errBody string) string {
+	if errBody == "" {
+		return ""
+	}
+	msg := ""
+	var parsed map[string]any
+	if json.Unmarshal([]byte(errBody), &parsed) == nil {
+		if e, ok := parsed["error"].(map[string]any); ok {
+			msg, _ = e["message"].(string)
+		}
+		if msg == "" {
+			msg, _ = parsed["message"].(string)
+		}
+	} else {
+		// 非 JSON(纯文本错误): 整段就是消息
+		msg = errBody
+	}
+	msg = strings.TrimSpace(msg)
+	if msg == "" || !clientActionableUpstreamError.MatchString(msg) {
+		return "" // 非参数类 → 不透传
+	}
+	if sensitiveUpstreamField.MatchString(msg) {
+		return "" // 消息里都带敏感词 → 宁可不透传
+	}
+	msg = cleanUpstreamErrorBody([]byte(msg))
+	if msg == "" {
+		return ""
+	}
+	out, err := json.Marshal(map[string]string{"code": "UPSTREAM_ERROR", "message": msg})
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
 
 // maxUpstreamErrorBodyBytes 是保留的上游错误体读上限(安全截断)。
 const maxUpstreamErrorBodyBytes = 1024
@@ -166,6 +230,12 @@ func sanitizeUpstreamResponse(response *http.Response) error {
 	// 2026-08-14 架构改进(可观测性): 上游错误体只进服务端日志(清洗截断),
 	// 不透传给 GA——上游错误体可能含账号/配额等敏感信息(测试 mock 即含
 	// account/quota), 原"不透传"设计是安全边界, 保留; 排障看 llm-proxy 日志。
+	//
+	// 2026-09-13 窄口径例外(见 clientActionableUpstreamError 注释): **生图端点
+	// 的 4xx 参数/校验类错误**必须透传, 否则 image_gen 的错误文本驱动协商在
+	// 托管形态下永远拿不到参数名(实测导致模型盲重试 4 次后放弃)。安全边界
+	// 不破: 仅生图端点 + 仅 4xx + 仅命中白名单话术; 5xx/chat/账号配额类
+	// 仍然清洗, 且有测试钉住两面。
 	var errBody string
 	if response.Body != nil {
 		if raw, err := io.ReadAll(io.LimitReader(response.Body, maxUpstreamErrorBodyBytes)); err == nil {
@@ -173,10 +243,17 @@ func sanitizeUpstreamResponse(response *http.Response) error {
 		}
 		_ = response.Body.Close()
 	}
-	response.Body = io.NopCloser(strings.NewReader(sanitizedUpstreamErrorBody))
-	response.ContentLength = int64(len(sanitizedUpstreamErrorBody))
+	forwardedBody := sanitizedUpstreamErrorBody
+	if isImageGenerationsPath(response.Request.URL.Path) &&
+		response.StatusCode >= 400 && response.StatusCode < 500 {
+		if actionable := clientActionableErrorBody(errBody); actionable != "" {
+			forwardedBody = actionable
+		}
+	}
+	response.Body = io.NopCloser(strings.NewReader(forwardedBody))
+	response.ContentLength = int64(len(forwardedBody))
 	response.Header.Set("Content-Type", "application/json")
-	response.Header.Set("Content-Length", strconv.Itoa(len(sanitizedUpstreamErrorBody)))
+	response.Header.Set("Content-Length", strconv.Itoa(len(forwardedBody)))
 	response.Header.Del("Content-Encoding")
 
 	if requestContext, ok := proxyContext(response.Request); ok {

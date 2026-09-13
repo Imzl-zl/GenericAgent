@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -87,6 +88,25 @@ func (h *reverseProxyHarness) defaultToken(t *testing.T) string {
 		TaskID:           "task-1",
 		RunnerGeneration: 1,
 		Operation:        "llm.chat",
+		Budget:           `{"max_turns":8}`,
+	})
+}
+
+// imageToken 签发 llm.image 能力 token: 生图路由按能力维度校验, 用 defaultToken
+// (llm.chat) 打生图路由会得到 CAPABILITY_INVALID operation mismatch(2026-09-13 实证)。
+func (h *reverseProxyHarness) imageToken(t *testing.T) string {
+	t.Helper()
+	provider := h.providerSource.provider
+	return h.issueToken(t, CapabilitySpec{
+		SessionKey:       "personal:42",
+		ProviderID:       provider.ID,
+		ProviderRevision: provider.Revision,
+		ProviderType:     provider.ProviderType,
+		Model:            provider.Model,
+		PolicyVersion:    "p1",
+		TaskID:           "task-1",
+		RunnerGeneration: 1,
+		Operation:        OperationImage,
 		Budget:           `{"max_turns":8}`,
 	})
 }
@@ -706,5 +726,118 @@ func TestSanitizeChatResponseIgnoresLimit(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestReverseProxyForwardsClientActionableImageErrors: 生图端点的 4xx"参数类"
+// 错误体必须透传——image_gen 的错误文本驱动参数协商依赖它(2026-09-13 实测:
+// 清洗后 GA 只看到 UPSTREAM_ERROR, 协商失效, 模型盲重试 4 次后放弃)。
+func TestReverseProxyForwardsClientActionableImageErrors(t *testing.T) {
+	harness := newReverseProxyHarness(t, domain.ProviderNativeOAI, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"quality is not supported by text image queue","type":"invalid_request"}}`))
+	}))
+	response := proxyRequest(
+		t, context.Background(), harness.proxy.Client(), http.MethodPost,
+		harness.proxy.URL+"/v1/images/generations", harness.imageToken(t),
+		fmt.Sprintf(`{"model":%q,"prompt":"a cat","size":"1024x1024","quality":"high"}`, harness.providerSource.provider.Model),
+	)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d want=400 body=%s", response.StatusCode, body)
+	}
+	// GA 侧靠这两点裁剪重试: 状态码 400 + 错误文本点名参数
+	if !strings.Contains(string(body), "quality is not supported by text image queue") {
+		t.Fatalf("client-actionable upstream body not forwarded: %s", body)
+	}
+	// 只提取 message 重建, 不透传上游体的其余字段(此处上游带 type=invalid_request)
+	if strings.Contains(string(body), "invalid_request") {
+		t.Fatalf("sibling upstream fields must not be forwarded: %s", body)
+	}
+}
+
+// TestReverseProxyForwardedImageErrorLeaksNoSiblingFields: 透传实行"只取 message
+// 重建"——上游体里与 message 并列的账号/配额字段绝不能跟着出去(安全边界).
+func TestReverseProxyForwardedImageErrorLeaksNoSiblingFields(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantLeak bool
+		wantMsg  string
+	}{
+		{
+			name:    "参数类 message + 敏感兄弟字段",
+			body:    `{"account":"secret@example.com","quota":"private","error":{"message":"quality is not supported by text image queue"}}`,
+			wantMsg: "quality is not supported by text image queue",
+		},
+		{
+			name:     "敏感词出现在 message 内 → 不透传",
+			body:     `{"error":{"message":"invalid parameter: quota exceeded for account"}}`,
+			wantLeak: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := newReverseProxyHarness(t, domain.ProviderNativeOAI, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			response := proxyRequest(
+				t, context.Background(), harness.proxy.Client(), http.MethodPost,
+				harness.proxy.URL+"/v1/images/generations", harness.imageToken(t),
+				fmt.Sprintf(`{"model":%q,"prompt":"a cat","size":"1024x1024"}`, harness.providerSource.provider.Model),
+			)
+			defer response.Body.Close()
+			body, _ := io.ReadAll(response.Body)
+			if strings.Contains(string(body), "secret@example.com") || strings.Contains(string(body), "private") {
+				t.Fatalf("sensitive sibling field leaked: %s", body)
+			}
+			if tc.wantMsg != "" && !strings.Contains(string(body), tc.wantMsg) {
+				t.Fatalf("actionable message missing: %s", body)
+			}
+			if tc.wantMsg == "" && !strings.Contains(string(body), "UPSTREAM_ERROR") {
+				t.Fatalf("want sanitized fallback: %s", body)
+			}
+			if tc.wantMsg == "" && strings.Contains(string(body), "quota") {
+				t.Fatalf("sensitive message leaked: %s", body)
+			}
+		})
+	}
+}
+
+// TestReverseProxyStillSanitizesNonActionableImageErrors: 同一端点上的非参数类
+// 错误(账号/配额/内部)必须继续被清洗——白名单不能变成漏勺。
+func TestReverseProxyStillSanitizesNonActionableImageErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"account-quota 4xx", http.StatusBadRequest, `{"account":"secret@example.com","quota":"private"}`},
+		{"5xx 参数类文本也不透传", http.StatusInternalServerError, `{"error":{"message":"quality is not supported"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := newReverseProxyHarness(t, domain.ProviderNativeOAI, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			response := proxyRequest(
+				t, context.Background(), harness.proxy.Client(), http.MethodPost,
+				harness.proxy.URL+"/v1/images/generations", harness.imageToken(t),
+				fmt.Sprintf(`{"model":%q,"prompt":"a cat","size":"1024x1024"}`, harness.providerSource.provider.Model),
+			)
+			defer response.Body.Close()
+			body, _ := io.ReadAll(response.Body)
+			if !strings.Contains(string(body), "UPSTREAM_ERROR") {
+				t.Fatalf("non-actionable image error must stay sanitized: %s", body)
+			}
+			if strings.Contains(string(body), "secret@example.com") || strings.Contains(string(body), "quality is not supported") {
+				t.Fatalf("leaked upstream body: %s", body)
+			}
+		})
 	}
 }
