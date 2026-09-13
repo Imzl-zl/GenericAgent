@@ -342,7 +342,21 @@ image_gen = {
 `agnes-image-2.5-flash`（渠道2 key，8-11s，当前免费），`read_timeout=100`（< CF 窗口，
 宁可自己超时也不吃 CF 的 HTML 524）；gpt-image-2 保留换回路径（渠道1 key + read_timeout=300）。
 
+**托管链路超时预算收紧（2026-09-13 同日第二轮，稳定性）**：发现两处硬边界不一致并修掉——
+①入口是 Cloudflare（proxy read timeout 默认 120s），而托管 `image_gen` 块原先**不带 `read_timeout`**
+→ 客户端取协议默认 120s，正好顶到 CF 窗口，慢模型拿到的是 CF 的 HTML 524（不可判读）；
+②生产 `TASK_TIMEOUT_SECONDS=300`，而原 `max_retries=2` × 120s ≈ 365s **超过任务预算** →
+变成 TASK_INTERRUPTED 零回复（与 08-13 图片任务超时同源）。
+修复：`runtime_config.go` 的 image_gen 块改为 `read_timeout`（`GA_IMAGE_GEN_READ_TIMEOUT` 可覆盖，默认 **100**）
++ `max_retries: 1`，最坏墙钟 ≈ 2×100+退避 ≈ 202s < 300s。两条不变式已用
+`TestBuildRuntimeConfigImageGenTimeoutBoundary` 钉住（read_timeout < 120s 入口窗口；最坏墙钟 < 300s 任务预算），
+`TestBuildRuntimeConfigImageGenReadTimeoutOverride` 覆盖非法/非正/空白回落，
+`TestBuildRuntimeConfigImageBlockCompatibleWithGA` 探针扩展到断言 `read_timeout`/`max_retries`
+**真的落到真实 GA 客户端上**。验证：Go vet/build/全量 `-p 1`/race 5 关键包全绿。
+
 **残余风险**：参数协商每次遇到新队列会先付 1-2 次 400 往返（~1.3s/次，未做跨请求记忆；
 若后续高频生图可加按 (apibase, model) 的进程内裁剪记忆）；agnes 的非方形比例需
 `ratio` 参数（当前工具 schema 未暴露，需 `size:"2K"` + `ratio:"16:9"` 才能表达，
-列为后续增强）；Agnes `return_base64` 经该中转时被忽略（实测仍回 url，走既有 url 直下兜底）。
+列为后续增强）；Agnes `return_base64` 经该中转时被忽略（实测仍回 url，走既有 url 直下兜底）；
+生图读超时仍会走既有重试语义（超时=上游可能仍在生成，重试会重复上游工作量——agnes 当前免费所以只损失延迟，
+换计费模型前应重新评估是否对 read timeout 单独禁用重试）。

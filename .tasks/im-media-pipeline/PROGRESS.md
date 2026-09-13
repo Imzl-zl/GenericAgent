@@ -108,4 +108,6 @@ B4 8MiB+bytea / B5 QQ 主动消息路径）与重要项（I2 content_type、I4 �
 | P6 | 附带修复：`stream=True` 的 4xx 响应补 close；每次 HTTP 尝试发 payload 快照 | 句柄 close 断言 |
 | P7 | 配置决策：CF proxy read timeout=120s（慢模型撞 524）→ 生图默认改 `agnes-image-2.5-flash`（渠道2 key，8-11s）+ `read_timeout=100`；gpt-image-2 保留换回路径 | 真实 key 端到端：默认参数单请求 **9.6s** 出图 1.74MB；原 400 参数集自动裁剪后 200 出图 1.84MB |
 
+| P8 | 稳定性：托管块补 `read_timeout=100`（`GA_IMAGE_GEN_READ_TIMEOUT` 可覆盖）+ `max_retries` 2→1，使最坏墙钟 ≈202s < `TASK_TIMEOUT_SECONDS=300`（原 120×3≈365s 会 TASK_INTERRUPTED 零回复），且 < CF 入口窗口 120s | 新增 `TestBuildRuntimeConfigImageGenTimeoutBoundary`（钉死两条不变式）+ `...ReadTimeoutOverride` + GA 探针断言字段真落地；Go vet/build/-p 1/race 全绿 |
+
 **残余风险/后续**：协商遇到新队列先付 1-2 次 400 往返（~1.3s，未做跨请求记忆；高频生图可加按 (apibase, model) 的进程内裁剪记忆）；agnes 非方形比例需 `ratio` 参数（工具 schema 未暴露，需 `size:"2K"` + `ratio:"16:9"`）；Agnes `return_base64` 经该中转被忽略（仍回 url，走既有 url 直下兜底）。**上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json）。
