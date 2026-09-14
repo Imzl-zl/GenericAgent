@@ -30,6 +30,11 @@
 - **免费模型 P3' 生产路径端到端已验（2026-09-14）**：`sensenova-u1.5-lite` 文生图 200/42.9s、
   改图 200/70.8s 且**像素客观验证**（蓝→红 changed=True）；工具层落盘/marker/省略明示/魔数改名全通。
   验证入口已固化进建档工具：`assets/probe_image_channel.py --e2e`（走 llmcore 客户端 + 像素判据）。
+- **P2-2a 已完成（2026-09-14）**：参考图归一化落地在工具层（`ga._normalize_reference`）——
+  源文件读取上限 64MiB（解码防御）+ **解码前**像素上限 24MP + ≤1MiB 且尺寸合规则原字节透传
+  + 否则长边 ≤1568/JPEG q85（alpha 留 PNG）+ 归一化明示。真机最坏情况（33MB 噪声 PNG）→
+  423KB、请求体 564KB vs 4MiB（余量 3.45MiB）、像素验证参考图仍生效；根 224 passed。
+  见 DESIGN §8.12（含途中拓出的两个真缺陷）。
 - P1-3 部分：`mykey.py` 已按档案形态配置（`image_gen`=agnes-image-2.5-flash；
   `image_edit`=sensenova-u1.5-lite 免费改图，**不再需要手写 protocol/operations**）。
 
@@ -50,8 +55,10 @@
 3. 工具 schema 里写死的能力断言（"当前路由无参考图/改图能力"）被删除，改为运行期渲染。
 4. sensenova 参考图上限由 1 改 5（实测）。
 
-## 待办
+## 待办（按序）
 
+- P2-1 平台形态契约（`capabilities` 加 `image.generate`/`image.edit` + runtime_config `operations`）
+- P2-2b 真大图走受控上传→短时 URL（替代内联字节）
 - P1-2 收尾：剩下模型的 P3 真图验证（免费模型优先；付费需用户确认预算）。
 - P1-3 收尾：`mykey_template.py` 同步为档案形态（去掉 protocol/operations 手写示例）。
 - P2：平台形态（契约 `capabilities` 维度 + runtime_config `operations` + 参考图进出沙箱）。

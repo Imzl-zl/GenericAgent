@@ -1,4 +1,4 @@
-import sys, os, re, json, time, threading, importlib, webbrowser
+import sys, os, re, io, json, time, threading, importlib, webbrowser
 from datetime import datetime
 from pathlib import Path
 import tempfile, traceback, subprocess, itertools, collections, difflib, shutil
@@ -9,6 +9,37 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from agent_loop import BaseHandler, StepOutcome, json_default
 from llmcore import resolve_image_gen, _IMAGE_GEN_MAX_BYTES, sniff_image_format
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def _reference_image_module():
+    """取 PIL.Image（参考图校验/归一化用）。
+
+    pillow 是 base 依赖（2026-08-14 归位）：缺了就既不能校像素上限也不能归一化，
+    此时**必须显式失败**——静默发原图会把问题推到远处的托管链路 413（debug-first）。"""
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise RuntimeError(f"缺少 pillow 依赖（{e}）") from e
+    return Image
+
+
+# ── 参考图归一化预算（2026-09-14，DESIGN §8.11 定案）───────────────────────
+# 为何在工具层: 与路径安全/魔数/字节上限同层（llmcore 只管发送, 不依赖 cwd 与图像库）。
+# 为何必须压: 出图只有 1K/2K（原生尺寸表见档案）, 4K 原图对生成无收益; 而托管形态的参考图是
+# base64 内联进请求体, llm-proxy 硬上限 4MiB（≈3MiB 原始字节）→ 8MiB 原图必 413。
+# 行业做法一致: 客户端先缩 + 去元数据（fal 官方明说 data URI 只适合小于几 KB 的文件）;
+# 解码前先校像素上限防解压炸弹（fal max_image_pixels / PIL MAX_IMAGE_PIXELS 同量级）。
+_REF_MAX_EDGE = 1568                   # 与入站视觉注入同策略（agent_loop 1568px）
+_REF_JPEG_QUALITY = 85
+_REF_PASS_THROUGH_BYTES = 1024 * 1024  # 尺寸合规且 ≤1MiB → 原样透传（不必要不重编码）
+# 头部像素上限（解码前校）：覆盖 6000x4000（手机/相机常见的实际上限）。
+# 比 fal 的 89M 严得多是有意的——fal 服务多租户、又只读头部，我们这里的目的是参考图
+# （出图 ≤2K, 24MP 已是输出像素的 60 倍），收紧到实际需求才能控住解码内存。
+_REF_MAX_PIXELS = 24_000_000
+# 读源文件的防御上限：2026-09-14 实测噪声图 4000x3000 的 PNG 有 33MB（纯色才 41KB），
+# 用旧的 20MiB 上限会把完全正常的图拒掉。真正的闸门是**像素上限 + 归一化后体积**，
+# 读上限只防“读到爆内存”。
+_REF_MAX_SOURCE_BYTES = 64 * 1024 * 1024
 
 # Phase B 生图(2026-08-14 定稿): Go 交付上限 image ≤20MiB 是 fail-closed
 # 任务失败(delivery_capture.go)——工具侧落盘前前置检查, 不能等到提交时刻
@@ -689,39 +720,105 @@ class GenericAgentHandler(BaseHandler):
     
     _IMAGE_MIME_BY_FORMAT = {'png': 'image/png', 'jpeg': 'image/jpeg', 'webp': 'image/webp', 'gif': 'image/gif'}
 
+    def _normalize_reference(self, full_path, name, fmt):
+        '''参考图归一化（按**文件路径**处理，不只读字节）。返回 (new_name, raw, mime, summary|None, err|None)。
+
+        顺序不可换（DESIGN §8.11）：
+          ① 源文件读取防御上限（防“读到爆内存”，不是能力上限）
+          ② 解码前校头部像素数（防解压炸弹；先拒再解，不浪费内存）
+          ③ 尺寸合规且体积小 → 原字节透传（不必要不重编码，不做无损转有损）
+          ④ 否则缩到长边 ≤1568（保比例，LANCZOS；JPEG 先 draft 解码期降采样省内存）
+          ⑤ 有 alpha 留 PNG（转 JPEG 会压成黑底），无 alpha 转 JPEG q85（重编码天然剥 EXIF）
+        summary 非空 = 本次改动了参考图，必须明示给模型与用户。
+
+        为何按路径而非先读全部字节：4000x3000 的噪声 PNG 实测 33MB，先读字节再归一化会把
+        正常的大图拒在读取上限上（2026-09-14 实测踩到）；按路径让 PIL 直接解码才能大图照样压。'''
+        Image = _reference_image_module()
+        base = os.path.splitext(name)[0]
+        size = os.path.getsize(full_path)
+        if size > _REF_MAX_SOURCE_BYTES:
+            return None, None, None, None, (
+                f"[Error: image_gen 参考图 {name} 源文件 {size // 1024 // 1024}MiB 超过读取上限 "
+                f"{_REF_MAX_SOURCE_BYTES // 1024 // 1024}MiB（解码防御, 不是能力上限）, 请先缩小该文件]")
+        try:
+            with Image.open(full_path) as im:
+                w, h = im.size                    # 头部即可得, 不触发全图解码
+                if w * h > _REF_MAX_PIXELS:
+                    return None, None, None, None, (
+                        f"[Error: image_gen 参考图 {name} 像素数 {w}x{h}={w * h} 超过上限 {_REF_MAX_PIXELS}"
+                        f"（解码前即拒绝, 防解压炸弹）, 请先缩小后重试]")
+                has_alpha = im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info)
+                if max(w, h) <= _REF_MAX_EDGE and size <= _REF_PASS_THROUGH_BYTES:
+                    with open(full_path, 'rb') as f:
+                        data = f.read()
+                    return name, data, self._IMAGE_MIME_BY_FORMAT.get(fmt, 'image/png'), None, None
+                if fmt == 'jpeg':
+                    im.draft('RGB', (_REF_MAX_EDGE, _REF_MAX_EDGE))   # 解码期降采样(仅 JPEG)
+                cw, ch = im.size
+                scale = _REF_MAX_EDGE / max(cw, ch)
+                if scale < 1:
+                    # round 而非 int: 浮点误差会把长边算成 1567（实测），"长边≤1568"的意图
+                    # 应当是缩到正好 1568；短边不能因取整变 0，故 max(1, ...)
+                    im = im.resize((max(1, round(cw * scale)), max(1, round(ch * scale))), Image.LANCZOS)
+                nw, nh = im.size
+                out = io.BytesIO()
+                if has_alpha:
+                    im.convert('RGBA').save(out, 'PNG', optimize=True)
+                    mime, ext, enc = 'image/png', 'png', 'PNG'
+                else:
+                    im.convert('RGB').save(out, 'JPEG', quality=_REF_JPEG_QUALITY)
+                    mime, ext, enc = 'image/jpeg', 'jpg', f'JPEG q{_REF_JPEG_QUALITY}'
+                raw = out.getvalue()
+        except Exception as e:
+            return None, None, None, None, (
+                f"[Error: image_gen 参考图 {name} 归一化失败: {type(e).__name__}: {e}]")
+        new_name = f"{base}.{ext}"
+        summary = (f"参考图已归一化（长边 ≤{_REF_MAX_EDGE}, 去元数据）: "
+                   f"{name} {w}x{h}/{size // 1024}KB → {new_name} {nw}x{nh}/{len(raw) // 1024}KB（{enc}）")
+        return new_name, raw, mime, summary, None
+
     def _load_reference_images(self, raw):
-        '''改图参考图(argv 为路径列表/逗号分隔): 工具层负责读盘 + 路径安全 + 大小/格式校验，
-        客户端只管发送(见 llmcore.BaseImageGenClient)。
+        '''改图参考图(argv 为路径列表/逗号分隔): 工具层负责读盘 + 路径安全 + 大小/格式校验
+        + **归一化**（缩放/转码/剥元数据/像素上限, 见 _normalize_reference），客户端只管发送。
 
         为何放在工具层: ①llmcore 不依赖 cwd/文件系统语义(沙箱/单测友好);
         ②路径逃逸、体积、格式这些是“工具输入安全”类问题，与交付链同层防线。
-        返回 ([(name, bytes, mime), ...], err_text)。'''
+        返回 ([(name, bytes, mime), ...], notices[(标签, 说明), ...], err_text)。'''
         if raw is None or raw == '':
-            return [], None
+            return [], [], None
         items = raw if isinstance(raw, (list, tuple)) else [p for p in str(raw).replace('\n', ',').split(',')]
         paths = [str(p).strip() for p in items if str(p).strip()]
         if not paths:
-            return [], None
+            return [], [], None
+        try:
+            _reference_image_module()      # 依赖缺失必须显式失败: 校验与归一化都靠它
+        except (ImportError, RuntimeError) as e:
+            return [], [], (f"[Error: image_gen 参考图校验需要 pillow: {e}——不可静默发送未校验的参考图, "
+                            f"请修复镜像依赖后重试]")
         base = os.path.realpath(self.cwd)
-        out = []
+        out, notices = [], []
         for p in paths:
             full = os.path.realpath(p if os.path.isabs(p) else os.path.join(base, p))
             if full != base and not full.startswith(base + os.sep):
-                return [], f"[Error: image_gen 参考图必须位于工作区内(拒绝路径逃逸): {p}]"
+                return [], [], f"[Error: image_gen 参考图必须位于工作区内(拒绝路径逃逸): {p}]"
             if not os.path.isfile(full):
-                return [], f"[Error: image_gen 参考图不存在: {p}]"
+                return [], [], f"[Error: image_gen 参考图不存在: {p}]"
             try:
                 with open(full, 'rb') as f:
-                    data = f.read(_IMAGE_GEN_MAX_BYTES + 1)
+                    data = f.read(32)   # 魔数嗅探只需头部；完整字节由归一化按需读（大图不整读）
             except OSError as e:
-                return [], f"[Error: image_gen 参考图读取失败 {p}: {e}]"
-            if len(data) > _IMAGE_GEN_MAX_BYTES:
-                return [], f"[Error: image_gen 参考图超过 20MiB 上限: {p}]"
+                return [], [], f"[Error: image_gen 参考图读取失败 {p}: {e}]"
             fmt = sniff_image_format(data)
             if not fmt or fmt not in self._IMAGE_MIME_BY_FORMAT:
-                return [], f"[Error: image_gen 参考图不是可识别的图片(png/jpeg/webp/gif): {p}]"
-            out.append((os.path.basename(full), data, self._IMAGE_MIME_BY_FORMAT[fmt]))
-        return out, None
+                return [], [], f"[Error: image_gen 参考图不是可识别的图片(png/jpeg/webp/gif): {p}]"
+            new_name, raw, mime, summary, nerr = self._normalize_reference(
+                full, os.path.basename(full), fmt)
+            if nerr:
+                return [], [], nerr
+            if summary:
+                notices.append(('image', summary))
+            out.append((new_name, raw, mime))
+        return out, notices, None
 
     def do_image_gen(self, args, response):
         '''调用生图模型生成/修改图片(OpenAI images/generations 兼容协议)。
@@ -743,7 +840,7 @@ class GenericAgentHandler(BaseHandler):
         if output_format not in ("png", "jpeg", "webp"): output_format = "png"
         model = args.get("model") or None
         # 参考图(2026-09-13): 工具层负责读盘 + 路径安全 + 大小校验(客户端只管发送)。
-        images, ierr = self._load_reference_images(args.get("image"))
+        images, ref_notices, ierr = self._load_reference_images(args.get("image"))
         if ierr:
             yield f"[Status] ❌ {ierr}\n"
             return StepOutcome(ierr, next_prompt="\n")
@@ -767,7 +864,9 @@ class GenericAgentHandler(BaseHandler):
             return StepOutcome(err, next_prompt="\n")
         # 档案按"构造期裁剪"省下的参数必须明示（规则：装饰参数可省，但不能静默）——
         # 同时进显示流与工具结果，模型据此知道本次实际生效的参数集。
-        notices = [f"[Status] ℹ️ {reason}" for _name, reason in (getattr(client, 'last_notices', None) or [])]
+        # 参考图归一化在前（发生在发送前）, 通道省略在后
+        all_notices = list(ref_notices) + list(getattr(client, 'last_notices', None) or [])
+        notices = [f"[Status] ℹ️ {reason}" for _name, reason in all_notices]
         for line in notices:
             yield line + "\n"
         images = produced

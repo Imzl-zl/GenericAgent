@@ -19,9 +19,12 @@ import pytest
 import ga
 import llmcore
 
+# 真·合法的 1x1 PNG（PIL 可解码）。2026-09-14 修正: 旧 fixture 只有魔数正确、CRC/IDAT
+# 不合法（PIL 报 UnidentifiedImageError）——原先只做魔数嗅探所以一直未暴露, 参考图归一化
+# 用 PIL 头部解析后立刻显形（fixture 缺陷与产品缺陷必须分开修: 这里改 fixture）。
 _1PX_PNG = bytes.fromhex(
-    "89504e470d0a1a0a0000000d4948445200000000010000000108060000001f15c489"
-    "0000000d4944415478da63fcffff3f0300050001ff1aa1e66e0000000049454e44ae426082"
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
 )
 
 # 未建档模型（catalog 无此名）: 档案为"宽松集 + 未验证"，是**兜底自愈**类用例的被测通道。
@@ -973,6 +976,94 @@ class TestJsonEditProtocol:
 
     def test_data_url_mime_propagates(self):
         assert llmcore._image_gen_data_url(b"abc", "image/webp").startswith("data:image/webp;base64,")
+
+
+class TestReferenceImageNormalization:
+    """DESIGN §8.11 定案：参考图在**工具层**归一化——长边 ≤1568 等比缩放、去元数据、
+    必要时转 JPEG（保 alpha 则留 PNG）；解码前做像素上限（防解压炸弹，对齐 PIL/fal 量级）；
+    不必要不重编码；归一化必须明示给模型。理由：输出只有 1K/2K，4K 原图无收益，
+    而 base64 内联在托管形态会撞 4MiB 请求体上限（平台 413）。"""
+
+    CFG = {"name": "openai", "apibase": "https://relay.example/v1", "apikey": "sk-test",
+           "model": "sensenova-u1.5-lite", "max_retries": 0}
+    B64 = base64.b64encode(_1PX_PNG).decode()
+
+    @staticmethod
+    def _png(w, h, color=(200, 30, 30), alpha=False):
+        from PIL import Image
+        im = Image.new("RGBA" if alpha else "RGB", (w, h), (*color, 255) if alpha else color)
+        buf = __import__("io").BytesIO()
+        im.save(buf, "PNG")
+        return buf.getvalue()
+
+    def _run(self, monkeypatch, tmp_path, ref_bytes, name="ref.png"):
+        (tmp_path / name).write_bytes(ref_bytes)
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = llmcore.OpenAIImageGenClient(self.CFG)
+        h = _handler(tmp_path)
+        monkeypatch.setattr(ga, "resolve_image_gen", lambda name, operation='generate': client)
+        outcome = _drain(h.do_image_gen({"prompt": "改成绿色", "image": name}, None))
+        return fake, outcome
+
+    @staticmethod
+    def _sent_reference(fake):
+        url = fake.calls[0][1]["json"]["images"][0]["image_url"]
+        head, b64 = url.split(",", 1)
+        return head, base64.b64decode(b64)
+
+    def test_oversized_reference_downscaled_and_reencoded(self, monkeypatch, tmp_path):
+        fake, outcome = self._run(monkeypatch, tmp_path, self._png(3000, 2000))
+        head, raw = self._sent_reference(fake)
+        assert head.startswith("data:image/jpeg")          # 无 alpha → JPEG q85
+        from PIL import Image
+        img = Image.open(__import__("io").BytesIO(raw))
+        assert max(img.size) <= 1568                        # 长边归一化
+        assert img.size == (1568, 1045)                     # 保比例（3000x2000 → 1568x1045）
+        assert "归一化" in outcome.data and "3000x2000" in outcome.data
+
+    def test_small_reference_passed_through_untouched(self, monkeypatch, tmp_path):
+        # 不必要不重编码：尺寸合规且体积小 → 原字节透传，不损失画质
+        original = self._png(100, 80)
+        fake, _ = self._run(monkeypatch, tmp_path, original)
+        head, raw = self._sent_reference(fake)
+        assert head.startswith("data:image/png") and raw == original
+
+    def test_alpha_png_keeps_png(self, monkeypatch, tmp_path):
+        # alpha 图转 JPEG 会被压成黑底 → 保留 PNG（只缩尺寸）
+        fake, _ = self._run(monkeypatch, tmp_path, self._png(2000, 2000, alpha=True))
+        head, raw = self._sent_reference(fake)
+        assert head.startswith("data:image/png")
+        from PIL import Image
+        assert max(Image.open(__import__("io").BytesIO(raw)).size) <= 1568
+
+    def test_pixel_limit_checked_before_decode(self, monkeypatch, tmp_path):
+        # 解码炸弹防护：头部像素数超上限直接拒绝，不进解码/不发请求
+        monkeypatch.setattr(ga, "_REF_MAX_PIXELS", 10_000)
+        fake, outcome = self._run(monkeypatch, tmp_path, self._png(300, 300))
+        assert fake.calls == []
+        assert "像素" in outcome.data and outcome.data.startswith("[Error: image_gen")
+
+    def test_large_source_file_is_normalized_not_rejected(self, monkeypatch, tmp_path):
+        # 2026-09-14 实测踩到: 4000x3000 噪声 PNG 有 33MB, 旧的"先读字节再校 20MiB"会把正常
+        # 大图拒掉。现在按路径交给 PIL 解码, 读取上限只做解码防御(_REF_MAX_SOURCE_BYTES)。
+        monkeypatch.setattr(ga, "_REF_MAX_SOURCE_BYTES", 4 * 1024 * 1024)
+        fake, outcome = self._run(monkeypatch, tmp_path, self._png(2000, 1500))
+        assert not outcome.data.startswith("[Error")          # 4MiB 读取上限不该误杀
+        head, raw = self._sent_reference(fake)
+        assert head.startswith("data:image/jpeg") and len(raw) < 4 * 1024 * 1024
+        # 超过读取上限就必须显式拒绝(而不是读爆内存)
+        monkeypatch.setattr(ga, "_REF_MAX_SOURCE_BYTES", 100)
+        fake2, outcome2 = self._run(monkeypatch, tmp_path, self._png(2000, 1500))
+        assert fake2.calls == [] and "读取上限" in outcome2.data
+
+    def test_missing_pillow_fails_loud(self, monkeypatch, tmp_path):
+        # pillow 是 base 依赖；缺了就不能保证像素上限 → 拒绝而不是静默发原图
+        def _boom():
+            raise ImportError("no PIL")
+        monkeypatch.setattr(ga, "_reference_image_module", _boom)
+        fake, outcome = self._run(monkeypatch, tmp_path, self._png(100, 80))
+        assert fake.calls == []
+        assert "pillow" in outcome.data and outcome.data.startswith("[Error: image_gen")
 
 
 class TestToolSurfacesOmittedParams:
