@@ -55,8 +55,49 @@ globals().update(_config)
 del _config
 `
 
+// imageBlockName 图像 operation → runtime_config 顶层块名。
+// GA 侧命名约定(llmcore._edit_config_name: <name>_edit)决定这两个名字必须如此:
+// generate → image_gen; edit → image_edit(GA resolve_image_gen(operation="edit")
+// 优先读 image_edit, 否则回退 image_gen 并由 GA 侧 fail-closed)。
+func imageBlockName(operation string) string {
+	if operation == "edit" {
+		return "image_edit"
+	}
+	return "image_gen"
+}
+
+// imageGenBlock 构造 GA 消费的生图/改图块。operations 是**能力声明**
+// (GA 对未声明的 operation fail-closed 并如实告知), 不是路由参数——
+// 代理路由仍共享 llm.image, 见 domain.ProviderCapability 的注释。
+func imageGenBlock(proxyBase, token, model, operation string) map[string]any {
+	return map[string]any{
+		"name":        "openai",
+		"apibase":     proxyBase + "/v1",
+		"apikey":      token,
+		"model":       model,
+		"stream":      false,
+		"max_retries": imageGenMaxRetries,
+		"operations":  []string{operation},
+		// 读超时必须短于入口代理窗口(见文件上方常量注释的任务预算算术)。
+		"read_timeout": imageGenReadTimeout(),
+	}
+}
+
+// imageBindingOperations 返回该 binding 在图像域覆盖的 operation 集合; 非图像 binding 返回 nil。
+// capability 是显式值时即该能力对应的 operation; 为空(存量构造)时取 provider 声明能力的并集。
+func imageBindingOperations(binding RuntimeProviderBinding, provider domain.LLMProvider) []string {
+	if binding.Capability != "" {
+		return domain.ImageCapabilityOperations(binding.Capability)
+	}
+	ops := make([]string, 0, 2)
+	for _, capability := range provider.EffectiveCapabilities() {
+		ops = append(ops, domain.ImageCapabilityOperations(capability)...)
+	}
+	return ops
+}
+
 // RuntimeProviderBinding 是单个 provider × 能力维度的运行时绑定: chat 能力
-// 写 session 变量(进 mixin), image 能力写 image_gen 块(不进 mixin)。
+// 写 session 变量(进 mixin), 图像能力写 image_gen / image_edit 块(不进 mixin)。
 type RuntimeProviderBinding struct {
 	Provider domain.LLMProvider
 	Token    string
@@ -164,7 +205,10 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 	}
 	seen := make(map[bindingKey]struct{}, len(input.Providers))
 	mixinNames := make([]string, 0, len(input.Providers))
-	imageBound := false
+	// 图像能力按 **operation** 去重(2026-09-14): generate 与 edit 各一条通道是真实部署形态
+	// (实测: 文生图走 agnes、改图走 sensenova 免费通道); 但同一 operation 被两条 binding
+	// 认领仍 fail-closed——没有路由策略前无法定序, 假成功比拒签更危险。
+	imageOpBound := make(map[string]struct{}, 2)
 	chatBound := false
 	for _, binding := range input.Providers {
 		provider := binding.Provider
@@ -185,28 +229,22 @@ func BuildRuntimeConfig(input RuntimeConfigInput) (RuntimeConfigFiles, error) {
 			return RuntimeConfigFiles{}, fmt.Errorf("duplicate provider id %d for capability %q", provider.ID, effectiveCap)
 		}
 		seen[key] = struct{}{}
-		// Phase B 托管形态(2026-08-14 定稿): image 能力 binding 写 image_gen
-		// 块(GA resolve_image_gen 读取), **不进 chat mixin**——生图是角色
-		// 分离不是同能力故障转移。v1 只支持单 image provider(fail-closed)。
-		if binding.Capability == domain.ProviderCapabilityImage ||
-			(binding.Capability == "" && provider.HasCapability(domain.ProviderCapabilityImage)) {
-			if imageBound {
-				return RuntimeConfigFiles{}, fmt.Errorf("multiple image-capable providers are not supported yet")
-			}
+		// Phase B 托管形态: 图像能力 binding 写 image_gen / image_edit 块
+		// (GA resolve_image_gen 读取), **不进 chat mixin**——生图是角色分离,
+		// 不是同能力故障转移。
+		if ops := imageBindingOperations(binding, provider); len(ops) > 0 {
 			if provider.ProviderType != domain.ProviderNativeOAI {
 				return RuntimeConfigFiles{}, fmt.Errorf("image capability requires native_oai provider")
 			}
-			document["image_gen"] = map[string]any{
-				"name":        "openai",
-				"apibase":     strings.TrimRight(proxyBase.String(), "/") + "/v1",
-				"apikey":      binding.Token,
-				"model":       provider.Model,
-				"stream":      false,
-				"max_retries": imageGenMaxRetries,
-				// 读超时必须短于入口代理窗口(见文件上方常量注释的任务预算算术)。
-				"read_timeout": imageGenReadTimeout(),
+			proxyBaseURL := strings.TrimRight(proxyBase.String(), "/")
+			for _, operation := range ops {
+				if _, dup := imageOpBound[operation]; dup {
+					return RuntimeConfigFiles{}, fmt.Errorf(
+						"multiple image-capable providers for operation %q are not supported yet", operation)
+				}
+				imageOpBound[operation] = struct{}{}
+				document[imageBlockName(operation)] = imageGenBlock(proxyBaseURL, binding.Token, provider.Model, operation)
 			}
-			imageBound = true
 			continue
 		}
 		variableName := runtimeProviderVariable(provider)

@@ -169,12 +169,18 @@ export function LLMProviderForm({ provider, onSave, onCancel }: LLMProviderFormP
 
       <div className="provider-form-full provider-inline-toggles">
         <span className="input-label">能力（Capabilities）</span>
-        {(['chat', 'image'] as const).map((cap) => (
+        {(
+          [
+            ['chat', 'Chat（对话）'],
+            ['image.generate', 'Image（文生图）'],
+            ['image.edit', 'Image Edit（参考图/改图）'],
+          ] as const
+        ).map(([cap, label]) => (
           <label className="provider-toggle" key={cap}>
             <input
               type="checkbox"
               checked={(form.capabilities ?? ['chat']).includes(cap)}
-              disabled={cap === 'image' && form.provider_type === 'native_claude'}
+              disabled={cap !== 'chat' && form.provider_type === 'native_claude'}
               onChange={(event) => {
                 const current = form.capabilities ?? ['chat'];
                 const next = event.target.checked
@@ -183,15 +189,17 @@ export function LLMProviderForm({ provider, onSave, onCancel }: LLMProviderFormP
                 setForm({ ...form, capabilities: next.length > 0 ? next : ['chat'] });
               }}
             />
-            <span>{cap === 'chat' ? 'Chat（对话）' : 'Image（生图）'}</span>
+            <span>{label}</span>
           </label>
         ))}
       </div>
-      {form.capabilities?.includes('image') && (
+      {form.capabilities?.some((cap) => cap.startsWith('image')) && (
         <p className="provider-form-full provider-form-hint">
-          Image（生图）能力下，"模型"字段将同时作为生图模型（images/generations 请求的 model）；
-          provider 只有单一 model 字段，无法同时服务对话与生图两种模型——建议为生图单独配置
-          仅勾选 Image 的 provider（该 provider 的 model 应为生图模型）。
+          Image 能力下，"模型"字段将作为图像模型（images/generations 或 images/edits 请求的 model）；
+          provider 只有单一 model 字段，无法同时服务对话与图像两种模型——建议为图像能力单独配置 provider。
+          另："改图"是通道属性（上游端点 + 网关适配器）而不是模型属性——实测同一条通道可能只能文生图、
+          也可能只能改图，所以两者分开勾选；未勾选的维度 GA 侧 fail-closed 并如实告知用户。
+          旧数据里的 image 等价于 image.generate（读取时自动归一化）。
         </p>
       )}
 

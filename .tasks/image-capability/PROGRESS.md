@@ -55,9 +55,18 @@
 3. 工具 schema 里写死的能力断言（"当前路由无参考图/改图能力"）被删除，改为运行期渲染。
 4. sensenova 参考图上限由 1 改 5（实测）。
 
+- **P2-1 已完成（2026-09-14）**：平台能力维度按 operation 细分——`capabilities` = chat / image.generate /
+  image.edit（`image` 为别名, 写入与读取都归一化, 无数据迁移）；runtime_config 按 operation 下发
+  `image_gen` / `image_edit` 两个块（各带 `operations` 声明与自己的 token）；多图像 provider 按 operation 去重；
+  migration 0061 放宽 CHECK；openapi + web 同步。验证：domain + application 单测（含**跨语言 GA 探针**——
+  真 GA 子进程能分别解析两个块）、web lint/build、contract/security/smoke 41 passed。
+  见 DESIGN §8.13（含代理层不做 operation 细分的取舍与残余风险 P2-1b）。
+
 ## 待办（按序）
 
-- P2-1 平台形态契约（`capabilities` 加 `image.generate`/`image.edit` + runtime_config `operations`）
+- **P2-1 验证补课**：`internal/api` 能力用例 + `internal/infrastructure/postgres` + migration 0061
+  真实应用——需 `TEST_DATABASE_URL`（本机 Docker 未启动）
+- P2-1b（可选）：代理 operation 细分（token 签发 + 路由校验）
 - P2-2b 真大图走受控上传→短时 URL（替代内联字节）
 - P1-2 收尾：剩下模型的 P3 真图验证（免费模型优先；付费需用户确认预算）。
 - P1-3 收尾：`mykey_template.py` 同步为档案形态（去掉 protocol/operations 手写示例）。

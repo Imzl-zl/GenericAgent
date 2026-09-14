@@ -230,20 +230,26 @@ func (b *providerWriteBody) validateAndNormalize(requireAPIKey bool) error {
 	if err := b.TransportConfig.Validate(); err != nil {
 		return fmt.Errorf("transport_config: %w", err)
 	}
-	// 能力维度: 空 = [chat]; 非法值/重复拒绝; native_claude 仅 chat。
+	// 能力维度(2026-09-14 operation 细分): 空 = [chat]; 非法值拒绝;
+	// 重复按**归一化后**判(image 与 image.generate 同时写是配置错误, 不是两种能力);
+	// 落库一律用显式形态(image.generate/image.edit), 读取侧仍兼容 image 别名。
 	seen := map[domain.ProviderCapability]bool{}
+	normalized := make([]domain.ProviderCapability, 0, len(b.Capabilities))
 	for _, cap := range b.Capabilities {
 		if !domain.ValidProviderCapability(cap) {
-			return fmt.Errorf("capabilities must be one of chat|image, got %q", cap)
+			return fmt.Errorf("capabilities must be one of chat|image.generate|image.edit (image is an alias of image.generate), got %q", cap)
 		}
-		if seen[cap] {
+		canonical := domain.NormalizeProviderCapability(cap)
+		if seen[canonical] {
 			return fmt.Errorf("duplicate capability %q", cap)
 		}
-		seen[cap] = true
+		seen[canonical] = true
+		normalized = append(normalized, canonical)
 	}
+	b.Capabilities = normalized
 	if b.ProviderType == domain.ProviderNativeClaude {
 		for _, cap := range b.Capabilities {
-			if cap == domain.ProviderCapabilityImage {
+			if domain.IsImageProviderCapability(cap) {
 				return fmt.Errorf("image capability is only supported by native_oai providers")
 			}
 		}

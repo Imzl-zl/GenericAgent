@@ -25,20 +25,64 @@ const (
 	ProviderNativeClaude LLMProviderType = "native_claude"
 )
 
-// ProviderCapability is a capability dimension served by an LLMProvider
-// (Phase B 托管形态, 2026-08-14 定稿): chat = 对话(operation llm.chat),
-// image = 生图(operation llm.image)。一个 provider 可同时具备两种能力,
-// 但 model 单值意味着 image 能力 provider 的 model 是生图模型——实际部署
-// 中 image provider 通常是独立 provider。
+// ProviderCapability is a capability dimension served by an LLMProvider.
+//
+//	chat           = 对话(operation llm.chat)
+//	image.generate = 文生图(operation llm.image)
+//	image.edit     = 参考图/改图(operation llm.image, 同一代理路由)
+//	image          = **image.generate 的别名**(存量数据/API 兼容), 新写入一律用显式形态
+//
+// 为何细分 generate/edit(2026-09-14 定稿):"改图"是**通道属性**(上游端点 + 网关适配器),
+// 不是模型属性——实测同一条通道可能只能文生图(agnes: 网关丢弃参考图参数),
+// 也可能只能改图(sensenova 免费改图通道)。平台必须能表达"这条通道能做什么",
+// 否则只能靠 GA 端试探; GA 对未声明的 operation **fail-closed**(不静默丢弃参考图)。
 type ProviderCapability string
 
 const (
-	ProviderCapabilityChat  ProviderCapability = "chat"
+	ProviderCapabilityChat          ProviderCapability = "chat"
+	ProviderCapabilityImageGenerate ProviderCapability = "image.generate"
+	ProviderCapabilityImageEdit     ProviderCapability = "image.edit"
+	// ProviderCapabilityImage 保留为 image.generate 的别名: 0058 以来的存量行与
+	// 既有 API 客户端都写 "image", 不能因为细分而失效(读取时归一化)。
 	ProviderCapabilityImage ProviderCapability = "image"
 )
 
+// NormalizeProviderCapability 把能力归一到显式形态(别名展开); 非法值原样返回,
+// 由 ValidProviderCapability 拒绝。
+func NormalizeProviderCapability(c ProviderCapability) ProviderCapability {
+	if c == ProviderCapabilityImage {
+		return ProviderCapabilityImageGenerate
+	}
+	return c
+}
+
 func ValidProviderCapability(c ProviderCapability) bool {
-	return c == ProviderCapabilityChat || c == ProviderCapabilityImage
+	switch NormalizeProviderCapability(c) {
+	case ProviderCapabilityChat, ProviderCapabilityImageGenerate, ProviderCapabilityImageEdit:
+		return true
+	}
+	return false
+}
+
+// IsImageProviderCapability 判断能力是否属于图像域(generate/edit 都算, 含别名)。
+func IsImageProviderCapability(c ProviderCapability) bool {
+	switch NormalizeProviderCapability(c) {
+	case ProviderCapabilityImageGenerate, ProviderCapabilityImageEdit:
+		return true
+	}
+	return false
+}
+
+// ImageCapabilityOperations 返回该图像能力覆盖的 operation 集合(generate/edit);
+// 非图像能力返回 nil。runtime_config 把它下发给 GA(GA 据此 fail-closed)。
+func ImageCapabilityOperations(c ProviderCapability) []string {
+	switch NormalizeProviderCapability(c) {
+	case ProviderCapabilityImageGenerate:
+		return []string{"generate"}
+	case ProviderCapabilityImageEdit:
+		return []string{"edit"}
+	}
+	return nil
 }
 
 type ProviderAuthMode string
@@ -221,18 +265,31 @@ type LLMProvider struct {
 	UpdatedAt       time.Time
 }
 
-// EffectiveCapabilities 返回归一化能力列表: 省略 = [chat](存量兼容)。
+// EffectiveCapabilities 返回归一化能力列表: 省略 = [chat](存量兼容);
+// 别名展开并去重(image 与 image.generate 同时写按一个算)。
 func (p LLMProvider) EffectiveCapabilities() []ProviderCapability {
 	if len(p.Capabilities) == 0 {
 		return []ProviderCapability{ProviderCapabilityChat}
 	}
-	return p.Capabilities
+	out := make([]ProviderCapability, 0, len(p.Capabilities))
+	seen := make(map[ProviderCapability]struct{}, len(p.Capabilities))
+	for _, c := range p.Capabilities {
+		n := NormalizeProviderCapability(c)
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
 }
 
-// HasCapability 判断 provider 是否具备某能力维度。
+// HasCapability 判断 provider 是否具备某能力维度(查询值同样归一化,
+// 所以 HasCapability(image) 与 HasCapability(image.generate) 等价)。
 func (p LLMProvider) HasCapability(c ProviderCapability) bool {
+	want := NormalizeProviderCapability(c)
 	for _, have := range p.EffectiveCapabilities() {
-		if have == c {
+		if have == want {
 			return true
 		}
 	}

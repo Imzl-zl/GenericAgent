@@ -95,7 +95,9 @@ export interface Persona {
 
 export type LLMProviderType = 'native_oai' | 'native_claude';
 
-export type LLMProviderCapability = 'chat' | 'image';
+// 能力维度: chat / image.generate(文生图) / image.edit(参考图改动)。
+// 后端把旧别名 'image' 归一化为 'image.generate' 后再返回, 前端只会看到显式形态。
+export type LLMProviderCapability = 'chat' | 'image.generate' | 'image.edit';
 export type ProviderAuthMode = 'auto' | 'bearer' | 'x_api_key';
 
 export interface GASessionConfig {

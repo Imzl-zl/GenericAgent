@@ -8,6 +8,7 @@ P0-6,"测试：新增档案行为用例 + 旧协商用例重指到未建档通�
 P1-1,"建档脚本（P0 列表 → P1 端点探活 → P2 参数探活 → P3 真图）",done,"assets/probe_image_channel.py（默认 0 计费；--paid 显式开启）"
 P1-2,"12 个图像模型逐个建档（免费模型补真图验证，付费仅零成本三步）",partial,"P0+P1 全量跑完并回填 evidence（DESIGN §8.10）；免费模型 sensenova-u1.5-lite 已 --e2e 真图通过（像素验证）；付费模型的真图待预算确认"
 P1-3,"配置：mykey_template 更新为档案形态 + 免费优先",done,"mykey_template 重写说明；本地 mykey.py 已按档案形态配置（agen 生成/sensenova 免费改图）"
-P2-1,"平台形态：契约 capabilities(image.generate/image.edit) + runtime_config operations",todo,
+P2-1,"平台形态：契约 capabilities(image.generate/image.edit) + runtime_config operations",done,"DESIGN §8.13：domain/api/migration 0061/runtime_config(image_gen+image_edit)/openapi/web 已落地；domain+application 单测与跨语言 GA 探针通过；web lint/build 通过；**api+postgres 集成测试与迁移未本地跑（需 TEST_DATABASE_URL）**"
+P2-1b,"代理 operation 按 generate/edit 细分（token 签发 + 路由校验）—— 非必需, 但若出现非自有 worker 就必须",todo,"DESIGN §8.13 残余风险：现状由 GA 侧 operations 声明 fail-closed 兜住"
 P2-2a,"参考图工具层归一化（长边>1568 缩放 + JPEG q85 + 剥 EXIF + 像素上限）+ 归一化明示",done,"DESIGN §8.12：真机 33MB 噪声图 → 423KB/请求体 564KB(4MiB 余量 3.45MiB)/像素验证蓝→红；根 224 passed"
 P2-2b,"真大图走受控上传→短时 URL（替代内联字节）；禁止抬 MaxWorkerRequestBytes",todo,"DESIGN §8.11：fal CDN / Gemini File API / SenseNova 公网 URL 均以 URL 为一等输入"

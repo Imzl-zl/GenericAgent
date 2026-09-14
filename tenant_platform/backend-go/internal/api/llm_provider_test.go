@@ -471,7 +471,8 @@ func performProviderCommand(t *testing.T, srv *Server, path string) *httptest.Re
 func TestAdminCreateLLMProviderCapabilities(t *testing.T) {
 	srv, _, _ := llmProviderServerFixture(t)
 
-	// image 能力创建成功并回显
+	// 别名归一化(2026-09-14 operation 细分): 入参写 image 视作 image.generate,
+	// 落库与回显都是显式形态——0058 以来写 image 的客户端不能失效, 但新行不留旧别名。
 	body := providerWritePayload("img-provider")
 	body["capabilities"] = []string{"image"}
 	response := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", body)
@@ -483,8 +484,23 @@ func TestAdminCreateLLMProviderCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	caps, ok := reply["capabilities"].([]any)
-	if !ok || len(caps) != 1 || caps[0] != "image" {
-		t.Fatalf("capabilities = %v", reply["capabilities"])
+	if !ok || len(caps) != 1 || caps[0] != "image.generate" {
+		t.Fatalf("capabilities = %v, want [image.generate] (alias normalized)", reply["capabilities"])
+	}
+
+	// 显式 image.edit: 改图是独立能力维度(与 generate 分属两条通道)
+	editBody := providerWritePayload("edit-provider")
+	editBody["capabilities"] = []string{"image.edit"}
+	editResponse := performProviderWrite(t, srv, http.MethodPost, "/v1/admin/llm-providers", editBody)
+	if editResponse.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", editResponse.Code, editResponse.Body.String())
+	}
+	var editReply map[string]any
+	if err := json.Unmarshal(editResponse.Body.Bytes(), &editReply); err != nil {
+		t.Fatal(err)
+	}
+	if editCaps, _ := editReply["capabilities"].([]any); len(editCaps) != 1 || editCaps[0] != "image.edit" {
+		t.Fatalf("capabilities = %v, want [image.edit]", editReply["capabilities"])
 	}
 
 	// 省略 = [chat]
@@ -514,9 +530,20 @@ func TestAdminCreateLLMProviderRejectsInvalidCapabilities(t *testing.T) {
 		{name: "duplicate capability", mutate: func(body map[string]any) {
 			body["capabilities"] = []string{"chat", "chat"}
 		}},
+		{name: "duplicate after alias normalization", mutate: func(body map[string]any) {
+			// image 与 image.generate 指向同一能力: 同时写是配置错误, 不是两种能力
+			body["capabilities"] = []string{"image", "image.generate"}
+		}},
+		{name: "unknown image sub-capability", mutate: func(body map[string]any) {
+			body["capabilities"] = []string{"image.upscale"}
+		}},
 		{name: "claude rejects image", mutate: func(body map[string]any) {
 			body["provider_type"] = "native_claude"
 			body["capabilities"] = []string{"image"}
+		}},
+		{name: "claude rejects image edit", mutate: func(body map[string]any) {
+			body["provider_type"] = "native_claude"
+			body["capabilities"] = []string{"image.edit"}
 		}},
 	}
 	for index, test := range tests {

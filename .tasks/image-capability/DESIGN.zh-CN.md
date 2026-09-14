@@ -422,6 +422,55 @@ _CHANNEL_PROFILES = {
 而非 fal 的 89M——fal 服务多租户且只读头部，我们这里参考图进的是**出图 ≤2K** 的生成链路（24MP 已是输出像素的 60 倍），
 收紧才能控住解码内存。`pillow` 缺失时**显式失败**（不能校像素就不能保证输入安全，不静默发原图）。
 
+### 8.13 P2-1 实施记录：平台能力维度按 operation 细分（2026-09-14 已落地）
+
+**为何必须细分**："改图"是**通道属性**（上游端点 + 网关适配器），不是模型属性——实测同一网关下 agnes 只能文生图、
+sensenova 只能改图。平台如果只有一个 `image` 维度，就无法表达"这条通道能做什么"，托管形态下改图只能靠试探或静默错配。
+
+**能力词表**（`domain.ProviderCapability`）：`chat` / `image.generate` / `image.edit`；
+**`image` 保留为 `image.generate` 的别名**——0058/0059 以来的存量行与既有 API 客户端都写 `image`，
+不能因为细分而失效。归一化在**写入时进行**（api 层，落库一律显式形态），**读取时也归一化**
+（`EffectiveCapabilities`，所以存量行回显为 `image.generate`，前端零兼容分支）。**无数据迁移**。
+
+**runtime_config**（GA 消费面）：
+
+| 平台声明 | 下发块 | 块内 `operations` |
+|---|---|---|
+| `image.generate`（或别名 `image`） | `image_gen` | `["generate"]` |
+| `image.edit` | `image_edit` | `["edit"]` |
+
+- 块名不是自由命名：GA 的 `llmcore._edit_config_name` 约定是 `<name>_edit`，所以必须是这两个名字；
+  `image_edit` 能被 GA 的 `resolve_image_gen("image_gen", operation="edit")` 直接命中。
+- `operations` 是**能力声明**（GA 对未声明 operation fail-closed），不是路由参数。
+- 多图像 provider 的 fail-closed **按 operation 去重**：不同 operation 各一条通道（真实部署：文生图 agnes + 改图 sensenova），
+  同一 operation 两条通道仍拒签（没有路由策略前无法定序，假成功比拒签更危险）。
+- `MyKeyLoader` 是 `globals().update(_config)`（无键白名单），所以新增顶层块 `image_edit` 天然能被 GA 读到。
+
+**代理层 operation 保持不变的取舍（必须知道）**：`llmproxy` 仍只有 `llm.chat` / `llm.image` 两个 operation，
+**不按 generate/edit 细分**。后果：**平台侧无法拦住"用 generate-only 的 capability token 打 `/images/edits`"**；
+这一层由 GA 侧兜住（`operations` 声明 + 未声明即 fail-closed，已有单测）。
+这是 **有意取舍**（要细分就得双 token/双路由映射 + 策略同步，而 GA 侧已是诚实门），
+但也是**残余风险**：若将来出现非我们自己的 worker，就需要 P2-1b（token 按 operation 签发 + 路由校验）。
+
+**契约与前端同步**：`contracts/openapi/platform.yaml` 的 `LLMProviderCapability` 枚举改为
+`[chat, image.generate, image.edit]`（描述里写明 `image` 别名与为何细分）；Web 能力复选框改为三选
+（`api/types.ts` 联合类型 + `LLMProviderForm.tsx`），native_claude 仍禁图像能力，旧别名在读取时已归一化。
+
+**DB 约束**：migration `0061_provider_capabilities_operations.sql` 把 CHECK 放宽到
+`<@ ["chat","image","image.generate","image.edit"]`——**保留 `image`** 是因为存量行就是它，
+不做数据迁移；新写入不再产生该字面值。
+
+**验证（2026-09-14）**：
+
+| 检查 | 结果 |
+|---|---|
+| `go vet ./...` / `go build ./...` | 通过 |
+| `go test ./internal/domain/...` | 通过（新增别名归一化/去重/operation 映射/非法值 4 例） |
+| `go test ./internal/application/ -run "RuntimeConfig\|Capabilit\|OperationSplit\|Image"` | 通过（新增：双块拆分、按 operation 去重、别名不泄露 edit、**跨语言探针**——真 GA 子进程分别解析出 `image_gen`/`image_edit` 的 model/token/operations） |
+| `npm run lint` / `npm run build`（web） | 通过 |
+| `pytest tenant_platform/tests/{contract,security,smoke}` | 41 passed（1 例既存 grpcio 版本问题，与本次无关） |
+| **未跑（必须补）** | `internal/api` 能力用例、`internal/infrastructure/postgres`、以及 **migration 0061 的真实应用**——需要 `TEST_DATABASE_URL`；本机 Docker 未启动。交付前必须在 CI 或带 Postgres 的环境跑一次（迁移写错是生产事故） |
+
 **仍未证实的（不得当作已支持）**：gemini-3-pro-image / 各 preview / gpt-image-2(.5-flare) 的**真图改图**（仅端点探活）；gpt-image 系的 `stream`/`partial_images` 在本网关的实际行为；sensenova 的 `quality`/`output_format`（本轮探针在 size 校验前即返回，得不到结论 → 保守声明为不支持）。
 
 

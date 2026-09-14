@@ -562,3 +562,176 @@ func TestBuildRuntimeConfigImageBlockAutoByProviderCapability(t *testing.T) {
 		t.Fatalf("image_gen block missing: %s", files.JSON)
 	}
 }
+
+// imageEditProvider 与 imageProvider 用**不同 model**: 真实部署里文生图与改图常是不同上游
+// (实测 agnes 文生图 / sensenova 免费改图), 只有 model 不同才能证明两个块没串。
+func imageEditProvider(id int64) domain.LLMProvider {
+	return domain.LLMProvider{
+		ID: id, Revision: 1, ProviderType: domain.ProviderNativeOAI, Model: "sensenova-u1.5-lite",
+		Capabilities: []domain.ProviderCapability{domain.ProviderCapabilityImageEdit},
+	}
+}
+
+// TestBuildRuntimeConfigSplitsImageOperationsIntoTwoBlocks: 2026-09-14 operation 细分——
+// generate 与 edit 是**两条通道**(各自 provider + token), 分别下发 image_gen / image_edit;
+// 块内 operations 是能力声明(GA 据此 fail-closed)。
+func TestBuildRuntimeConfigSplitsImageOperationsIntoTwoBlocks(t *testing.T) {
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL:      "http://127.0.0.1:8081",
+		RoutingSnapshotID: "snapshot-img-split",
+		Providers: []RuntimeProviderBinding{
+			{Provider: chatProvider(1), Token: "chat-token", Capability: domain.ProviderCapabilityChat},
+			{Provider: imageProvider(3), Token: "gen-token", Capability: domain.ProviderCapabilityImageGenerate},
+			{Provider: imageEditProvider(4), Token: "edit-token", Capability: domain.ProviderCapabilityImageEdit},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(files.JSON, &document); err != nil {
+		t.Fatal(err)
+	}
+	gen, ok := document["image_gen"].(map[string]any)
+	if !ok {
+		t.Fatalf("image_gen block missing: %s", files.JSON)
+	}
+	edit, ok := document["image_edit"].(map[string]any)
+	if !ok {
+		t.Fatalf("image_edit block missing: %s", files.JSON)
+	}
+	if gen["model"] != "gpt-image-2" || gen["apikey"] != "gen-token" {
+		t.Fatalf("image_gen block bound to wrong provider: %v", gen)
+	}
+	if edit["model"] != "sensenova-u1.5-lite" || edit["apikey"] != "edit-token" {
+		t.Fatalf("image_edit block bound to wrong provider: %v", edit)
+	}
+	for name, block := range map[string]map[string]any{"image_gen": gen, "image_edit": edit} {
+		ops, ok := block["operations"].([]any)
+		if !ok || len(ops) != 1 {
+			t.Fatalf("%s operations missing: %v", name, block)
+		}
+	}
+	if gen["operations"].([]any)[0] != "generate" || edit["operations"].([]any)[0] != "edit" {
+		t.Fatalf("operations mismatch: gen=%v edit=%v", gen["operations"], edit["operations"])
+	}
+}
+
+// TestBuildRuntimeConfigOperationSplitReachesGA: 跨语言契约——平台下发的
+// image_gen / image_edit 必须能被真实 GA(llmcore)分别解析出来, 且各自 operations
+// 与 token 正确(GA 对未声明的 operation fail-closed, 声明错了就是静默能力错配)。
+func TestBuildRuntimeConfigOperationSplitReachesGA(t *testing.T) {
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL:      "http://127.0.0.1:8081",
+		RoutingSnapshotID: "snapshot-img-split-ga",
+		Providers: []RuntimeProviderBinding{
+			{Provider: chatProvider(1), Token: "chat-token", Capability: domain.ProviderCapabilityChat},
+			{Provider: imageProvider(3), Token: "gen-token", Capability: domain.ProviderCapabilityImageGenerate},
+			{Provider: imageEditProvider(4), Token: "edit-token", Capability: domain.ProviderCapabilityImageEdit},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDir := t.TempDir()
+	if err := WriteRuntimeConfigAtomic(configDir, files); err != nil {
+		t.Fatal(err)
+	}
+	python, err := exec.LookPath("python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", ".."))
+	script := `
+import importlib
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(1, sys.argv[2])
+importlib.import_module("mykey")
+llmcore = importlib.import_module("llmcore")
+def snap(client):
+    return {"model": client.model, "apikey": client.api_key, "ops": sorted(client.operations)}
+print(json.dumps({
+    "gen": snap(llmcore.resolve_image_gen("image_gen")),
+    "edit": snap(llmcore.resolve_image_gen("image_gen", operation="edit")),
+}))
+`
+	output, err := exec.Command(python, "-c", script, configDir, repoRoot).CombinedOutput()
+	if err != nil {
+		t.Fatalf("GA image split probe failed: %v\n%s", err, output)
+	}
+	lines := bytes.Split(bytes.TrimSpace(output), []byte{'\n'})
+	var probe struct {
+		Gen  struct {
+			Model  string   `json:"model"`
+			APIKey string   `json:"apikey"`
+			Ops    []string `json:"ops"`
+		} `json:"gen"`
+		Edit struct {
+			Model  string   `json:"model"`
+			APIKey string   `json:"apikey"`
+			Ops    []string `json:"ops"`
+		} `json:"edit"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(lines[len(lines)-1]), &probe); err != nil {
+		t.Fatalf("decode GA split probe %q: %v", output, err)
+	}
+	if probe.Gen.Model != "gpt-image-2" || probe.Gen.APIKey != "gen-token" ||
+		len(probe.Gen.Ops) != 1 || probe.Gen.Ops[0] != "generate" {
+		t.Fatalf("GA generate channel = %+v", probe.Gen)
+	}
+	if probe.Edit.Model != "sensenova-u1.5-lite" || probe.Edit.APIKey != "edit-token" ||
+		len(probe.Edit.Ops) != 1 || probe.Edit.Ops[0] != "edit" {
+		t.Fatalf("GA edit channel = %+v", probe.Edit)
+	}
+}
+
+// TestBuildRuntimeConfigRejectsDuplicateImageOperation: 同一 operation 两条通道仍 fail-closed
+// (没有路由策略前无法定序; 细分只放宽了"不同 operation 各一条")。
+func TestBuildRuntimeConfigRejectsDuplicateImageOperation(t *testing.T) {
+	second := imageEditProvider(5)
+	_, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL:      "http://127.0.0.1:8081",
+		RoutingSnapshotID: "snapshot-dup-op",
+		Providers: []RuntimeProviderBinding{
+			{Provider: chatProvider(1), Token: "chat-token", Capability: domain.ProviderCapabilityChat},
+			{Provider: imageEditProvider(4), Token: "e1", Capability: domain.ProviderCapabilityImageEdit},
+			{Provider: second, Token: "e2", Capability: domain.ProviderCapabilityImageEdit},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "edit") {
+		t.Fatalf("want operation-scoped rejection, got %v", err)
+	}
+}
+
+// TestBuildRuntimeConfigLegacyImageAliasStillGenerates: 存量 "image" 能力(别名)仍只声明
+// generate, 不会因为细分而变成"能改图"——否则 GA 会向不支持的通道发参考图(实测 agnes 就是这样)。
+func TestBuildRuntimeConfigLegacyImageAliasStillGenerates(t *testing.T) {
+	files, err := BuildRuntimeConfig(RuntimeConfigInput{
+		ProxyBaseURL:      "http://127.0.0.1:8081",
+		RoutingSnapshotID: "snapshot-alias",
+		Providers: []RuntimeProviderBinding{
+			{Provider: chatProvider(1), Token: "chat-token", Capability: domain.ProviderCapabilityChat},
+			{Provider: imageProvider(3), Token: "gen-token", Capability: domain.ProviderCapabilityImage},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(files.JSON, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := document["image_edit"]; leaked {
+		t.Fatalf("legacy image alias must not advertise edit: %s", files.JSON)
+	}
+	gen := document["image_gen"].(map[string]any)
+	if gen["operations"].([]any)[0] != "generate" {
+		t.Fatalf("legacy alias operations = %v", gen["operations"])
+	}
+}

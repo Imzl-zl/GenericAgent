@@ -2267,8 +2267,8 @@ components:
           minimum: 1
     LLMProviderCapability:
       type: string
-      enum: [chat, image]
-      description: "能力维度: chat=对话(llm.chat 路由), image=生图(llm.image 路由, 仅 native_oai)"
+      enum: [chat, image.generate, image.edit]
+      description: "能力维度: chat=对话(llm.chat 路由)；image.generate=文生图、image.edit=参考图/改图(两者共用 llm.image 路由, 仅 native_oai)。为什么细分: 改图是**通道属性**(上游端点+网关适配器)而不是模型属性, 同一条通道可能只能文生图(如 agnes)或只能改图(如 sensenova 免费通道); 平台按能力下发 runtime_config 的 image_gen/image_edit 块的 operations 声明, GA 对未声明的 operation fail-closed。兼容: 入参写 image 视作 image.generate 的别名, 落库归一化为 image.generate；读取时 image 同样展开为 image.generate。"
 
     LLMProvider:
       type: object
