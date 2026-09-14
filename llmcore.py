@@ -1412,6 +1412,30 @@ _IMAGE_GEN_PARAM_UNSUPPORTED_HINTS = (
 )
 
 
+# 参数协商结果记忆(进程内, 键=(apibase, model))——2026-09-13 实测新增。
+# 上游队列的参数能力在进程生命周期内不会变, 但每个请求都重新"撞一次 400 再裁剪"
+# 毫无意义: 实测一次任务可调 20+ 次生图, 每次都白付 ~1.3s + 一条上游 400
+# (llm-proxy WARN 噪音 + 上游侧失败计数)。只记装饰性参数(_IMAGE_GEN_TRIMMABLE),
+# 故记忆失效的代价仅是"少发一个可选参数", 不影响请求语义与交付契约。
+_IMAGE_GEN_TRIM_MEMO = {}
+_IMAGE_GEN_TRIM_MEMO_MAX = 64  # 防御长命进程(CLI/桌面端)无界增长
+
+
+def _image_gen_memo_key(api_base, model):
+    return (str(api_base or ''), str(model or ''))
+
+
+def _image_gen_remember_trim(api_base, model, names):
+    """记住"该 (网关, 模型) 不支持这些装饰性参数", 后续请求直接不发。"""
+    if not names:
+        return
+    key = _image_gen_memo_key(api_base, model)
+    known = _IMAGE_GEN_TRIM_MEMO.setdefault(key, set())
+    known.update(names)
+    while len(_IMAGE_GEN_TRIM_MEMO) > _IMAGE_GEN_TRIM_MEMO_MAX:
+        _IMAGE_GEN_TRIM_MEMO.pop(next(iter(_IMAGE_GEN_TRIM_MEMO)))
+
+
 # 图片容器魔数: 上游可能裁剪/忽略 output_format(实测 agnes 不接受该参数),
 # 交付文件扩展名必须跟随真实字节, 否则 IM 侧 MIME 失配(§6.5 失败诚实)。
 def sniff_image_format(data):
@@ -1482,6 +1506,9 @@ class BaseImageGenClient:
             # (实测 agnes text image queue 直接拒收 output_format), 故不发;
             # 仅非默认格式(webp/jpeg)才显式声明。真实容器以魔数嗅探为准。
             payload["output_format"] = output_format
+        # 已协商过的"该网关+模型不支持"装饰性参数不再重复发送(去掉每次一次白 400)。
+        for name in _IMAGE_GEN_TRIM_MEMO.get(_image_gen_memo_key(self.api_base, payload["model"]), ()):
+            payload.pop(name, None)
         if stream:
             payload["stream"] = True
         return payload
@@ -1519,6 +1546,7 @@ class BaseImageGenClient:
                 if name:
                     payload.pop(name, None)
                     trims += 1
+                    _image_gen_remember_trim(self.api_base, payload.get("model"), [name])
                     print(f"[ImageGen Adapt] 上游不支持参数 {name!r}, 已裁剪后重试: {err_body[:160]}")
                     continue
                 # 错误文本不可判读(网关清洗/非标准话术): 只要还带着装饰性参数,
@@ -1532,6 +1560,7 @@ class BaseImageGenClient:
                         for k in dropped:
                             payload.pop(k, None)
                         conservative_done = True
+                        _image_gen_remember_trim(self.api_base, payload.get("model"), dropped)
                         print(f"[ImageGen Adapt] 4xx 不可判读(疑被网关清洗), 退回保守参数集(丢弃 {', '.join(dropped)})重试一次: {err_body[:160]}")
                         continue
             # 预算用尽/无可裁剪参数 → 如实返回上游错误(不返回合成"耗尽"文本,

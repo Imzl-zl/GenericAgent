@@ -653,3 +653,88 @@ class TestConservativeFallbackOnOpaque4xx:
         assert images is None and err.startswith("[Error: image_gen HTTP 503")
         assert len(fake.calls) == 2  # max_retries=1, 未额外保守重试
         assert fake.calls[1][1]["json"]["quality"] == "high"
+
+
+@pytest.fixture(autouse=True)
+def _clear_image_gen_trim_memo():
+    """参数协商记忆是模块级状态: 每个用例前后清空, 避免跨用例串味。"""
+    llmcore._IMAGE_GEN_TRIM_MEMO.clear()
+    yield
+    llmcore._IMAGE_GEN_TRIM_MEMO.clear()
+
+
+class TestTrimMemoRemovesRepeatedWastedCalls:
+    """实测一次任务可调 20+ 次生图: 每次都"撞一次 400 再裁剪"= 白付 ~1.3s +
+    一条上游 400(WARN 噪音/上游失败计数)。协商结果按 (apibase, model) 记在进程内,
+    后续请求直接不发那些装饰性参数。"""
+
+    CFG = {"name": "openai", "apibase": "https://relay.example/v1",
+           "apikey": "sk-test", "model": "agnes-image-2.5-flash", "max_retries": 0}
+    B64 = base64.b64encode(_1PX_PNG).decode()
+
+    @staticmethod
+    def _err400(param):
+        return _FakeResponse(status_code=400, text=json.dumps(
+            {"error": {"message": f"{param} is not supported by text image queue"}}))
+
+    def test_second_call_skips_rejected_param(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [
+            self._err400("quality"), _sync_response([self.B64]),   # 第 1 次: 400 → 裁剪 → 成功
+            _sync_response([self.B64]),                            # 第 2 次: 直接成功
+        ])
+        client = _client(self.CFG, fake)
+        assert client.generate("a cat", quality="high")[0] == [_1PX_PNG]
+        assert len(fake.calls) == 2
+        assert "quality" in fake.calls[0][1]["json"]
+
+        assert client.generate("a cat", quality="high")[0] == [_1PX_PNG]
+        assert len(fake.calls) == 3                      # 只多一次请求, 不再有 400
+        assert "quality" not in fake.calls[2][1]["json"]
+        # 请求语义不受影响
+        assert fake.calls[2][1]["json"]["prompt"] == "a cat"
+
+    def test_memo_is_per_model(self, monkeypatch):
+        # 同一网关下 gpt-image 系接受 quality: 记忆必须按 model 隔离
+        fake = _install_fake_http(monkeypatch, [
+            self._err400("quality"), _sync_response([self.B64]),
+            _sync_response([self.B64]),
+        ])
+        client = _client(self.CFG, fake)
+        client.generate("a cat", quality="high")
+        client.generate("a cat", quality="high", model="gpt-image-2")
+        assert fake.calls[2][1]["json"]["quality"] == "high"
+        assert fake.calls[2][1]["json"]["model"] == "gpt-image-2"
+
+    def test_memo_is_per_gateway(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [
+            self._err400("quality"), _sync_response([self.B64]),
+            _sync_response([self.B64]),
+        ])
+        _client(self.CFG, fake).generate("a cat", quality="high")
+        other = _client({**self.CFG, "apibase": "https://other.example/v1"}, fake)
+        other.generate("a cat", quality="high")
+        assert fake.calls[2][1]["json"]["quality"] == "high"
+
+    def test_conservative_fallback_is_also_memoized(self, monkeypatch):
+        opaque = json.dumps({"code": "UPSTREAM_ERROR", "message": "upstream request failed"})
+        fake = _install_fake_http(monkeypatch, [
+            _FakeResponse(status_code=400, text=opaque), _sync_response([self.B64]),
+            _sync_response([self.B64]),
+        ])
+        client = _client(self.CFG, fake)
+        assert client.generate("a cat", quality="high", output_format="webp")[0] == [_1PX_PNG]
+        assert len(fake.calls) == 2
+        client.generate("a cat", quality="high", output_format="webp")
+        assert len(fake.calls) == 3
+        body = fake.calls[2][1]["json"]
+        assert "quality" not in body and "output_format" not in body
+
+    def test_memo_never_drops_required_params(self, monkeypatch):
+        # 记忆只可能记住装饰性参数: 必需参数即便上游点名也不裁(no size/n)
+        fake = _install_fake_http(monkeypatch, [
+            _FakeResponse(status_code=400, text=json.dumps({"error": {"message": "size is not supported"}})),
+        ])
+        client = _client(self.CFG, fake)
+        images, err = client.generate("a cat", size="1024x1024")
+        assert images is None and len(fake.calls) == 1
+        assert llmcore._IMAGE_GEN_TRIM_MEMO == {}        # 无记忆写入
