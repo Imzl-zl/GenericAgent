@@ -471,6 +471,40 @@ sensenova 只能改图。平台如果只有一个 `image` 维度，就无法表�
 | `pytest tenant_platform/tests/{contract,security,smoke}` | 41 passed（1 例既存 grpcio 版本问题，与本次无关） |
 | **未跑（必须补）** | `internal/api` 能力用例、`internal/infrastructure/postgres`、以及 **migration 0061 的真实应用**——需要 `TEST_DATABASE_URL`；本机 Docker 未启动。交付前必须在 CI 或带 Postgres 的环境跑一次（迁移写错是生产事故） |
 
+### 8.14 事故与结构修复：迁移清单两处真值（2026-09-14）
+
+**现象**：P2-1 推送后 CI 红——`new row for relation "llm_providers" violates check constraint
+"llm_providers_capabilities_check" (SQLSTATE 23514)`；而**本地全绿**，因为本机没有 Postgres，
+DB 类测试（`internal/api` / `postgres` 包）根本没跑。就是“**没跑过的改动不能算验证过**”的教科书案例。
+
+**根因**：`internal/infrastructure/postgres/migrations.go` 有**两份硬编码清单**：
+
+1. `migrationFiles()`——应用顺序（fresh schema 直跑）；
+2. `pendingMigrations`——**已有 schema** 的补跑清单，靠 marker 表判断（标记表不存在就重跑该文件，
+   所以近期“纯约束替换”类迁移用幂等 DO 块 + 永不存在的标记表，每次 EnsureSchema 都重跑一次）。
+
+我的 `0061` 只落了文件，**两份清单都没加** ⇒ 新库直接用旧约束、存量库也不会补跑。
+
+**结构修复（不是补丁）**：
+
+- `migrationFiles()` 改为**读目录排序**（目录=单一真值；文件名即顺序，`^\d{4}_[A-Za-z0-9_]+\.sql$` 约束命名）；
+- `readMigrationBatch` / `ApplyMigrations` 对**空清单显式报错**（防“静默应用零个迁移”）；
+- 新增两条测试把两处清单的覆盖关系变成**硬失败**：`TestMigrationFilesCoverPendingMigrations`
+  （目录里有、`pendingMigrations` 没列 → 报错）与 `TestMigrationFilesOnDiskSortedAndConventional`；
+- `pendingMigrations` 补 `0061` 条目，并写清“幂等 DO 块不建标记表、每次重跑”这个模式。
+
+**验证（真 Postgres 16 容器，两条路径都跑）**：
+
+| 路径 | 做法 | 结果 |
+|---|---|---|
+| 全新库 | `CREATE DATABASE ga_verify` → `go test -p 1 ./...` | **17 个包 ok**；先前 CI 失败的 `TestAdminCreateLLMProviderCapabilities` / `...UpdateLLMProviderCapabilitiesBumpsRevision` 全部通过 |
+| **存量库** | 从用户 `ga_test` 复制出 `ga_existing`（连 0059 的约束都没有）→ 跑 api 能力用例 | 通过；且事后查 `pg_get_constraintdef` 确认约束**已补成** `<@ '["chat","image","image.generate","image.edit"]'` |
+
+（临时库已删除；仅剩一个 Windows 本机路径问题：`personal:1-g1` 带冒号在 Windows 建不了目录，CI/Linux 本就是过的。）
+
+**两条教训（已归档）**：① 硬编码清单 = 两处真值 = 必然漏一处；② **CI 已按用户要求关闭**
+（额度问题）⇒ 以后没有“推送后 CI 替我验收”这一层，交付前**必须本地真库验证**（含迁移）。
+
 **仍未证实的（不得当作已支持）**：gemini-3-pro-image / 各 preview / gpt-image-2(.5-flare) 的**真图改图**（仅端点探活）；gpt-image 系的 `stream`/`partial_images` 在本网关的实际行为；sensenova 的 `quality`/`output_format`（本轮探针在 size 校验前即返回，得不到结论 → 保守声明为不支持）。
 
 

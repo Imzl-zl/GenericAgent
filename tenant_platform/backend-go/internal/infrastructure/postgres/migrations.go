@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// migrationFilePattern 迁移文件名格式: 四位数序号 + 名称 + .sql（文件名即应用顺序）。
+var migrationFilePattern = regexp.MustCompile(`^\d{4}_[A-Za-z0-9_]+\.sql$`)
 
 // migrationsDir returns the checked-in migrations directory relative to this module.
 func migrationsDir() string {
@@ -32,64 +37,27 @@ func DefaultMigrationPath() string {
 }
 
 // migrationFiles lists all migration SQL files in apply order.
+//
+// 结构性修正（2026-09-14）: 以前是**硬编码文件名清单**——新增迁移要同时改两处
+// (这里 + pendingMigrations), 漏一处就是"迁移从未执行但仍全绿"的静默故障。
+// 实际踩到: 0061 忘了加进来 → CI 里 0059 的旧 CHECK 约束还在, 新能力值写入直接
+// 23514(SQLSTATE), 而且是**先提交推送、再被 CI 抓到**。
+// 现在以**目录为单一真值**（文件名即顺序）; 与 pendingMigrations 的覆盖关系由
+// TestMigrationFilesCoverPendingMigrations 强制。
 func migrationFiles() []string {
-	return []string{
-		"0001_foundation.sql",
-		"0002_team_tables.sql",
-		"0003_user_lifecycle.sql",
-		"0004_configurable_policies.sql",
-		"0005_per_user_tool_policy.sql",
-		"0006_delivery_outbox_indexes.sql",
-		"0007_llm_providers.sql",
-		"0008_user_id_serial.sql",
-		"0009_invite_persona_self_binding.sql",
-		"0010_user_password_hash.sql",
-		"0011_wechat_qr_session.sql",
-		"0012_bot_transport_cursor_key_version.sql",
-		"0013_messages.sql",
-		"0014_media_assets.sql",
-		"0015_task_last_activity_at.sql",
-		"0016_team_lifecycle.sql",
-		"0017_relay_opt_in.sql",
-		"0018_session_reset.sql",
-		"0019_drop_binding_attempts.sql",
-		"0020_task_event_sequence_counter.sql",
-		"0021_tasks_requester_status_index.sql",
-		"0022_task_started_delivery.sql",
-		"0023_llm_provider_ga_config.sql",
-		"0024_transparent_llm_proxy.sql",
-		"0025_platform_runtime_settings.sql",
-		"0026_safe_user_commands.sql",
-		"0027_outbound_delivery_progress.sql",
-		"0028_agent_max_turns_setting.sql",
-		"0029_mcp_servers.sql",
-		"0030_remove_mcp_headers.sql",
-		"0035_sophub_sop_registry.sql",
-		"0036_channel_bindings.sql",
-		"0037_runner_leases.sql",
-		"0039_drop_sophub_registry.sql",
-		"0040_checkpoint_runner_generation.sql",
-		"0041_runner_lease_stale_container.sql",
-		"0042_task_capability_jtis.sql",
-		"0043_capability_usage.sql",
-		"0044_task_delivery_files.sql",
-		"0045_delivery_cancelled.sql",
-		"0046_drop_tool_policy.sql",
-		"0047_delivery_attempt_token.sql",
-		"0048_platform_admin_bootstrap.sql",
-		"0049_mcp_gateway.sql",
-		"0050_user_personal_workspace.sql",
-		"0051_conversation_key.sql",
-		"0052_conversation_resets.sql",
-		"0053_channel_configs.sql",
-		"0054_im_streaming.sql",
-		"0055_mcp_governance.sql",
-		"0056_task_media.sql",
-		"0057_task_delivery_files_spool.sql",
-		"0058_provider_capabilities.sql",
-		"0059_provider_capabilities_check.sql",
-		"0060_delivery_requeued_at.sql",
+	entries, err := os.ReadDir(migrationsDir())
+	if err != nil {
+		return nil
 	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !migrationFilePattern.MatchString(entry.Name()) {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	return names
 }
 
 // pendingMigrations maps each post-foundation migration file to a marker table
@@ -153,6 +121,10 @@ var pendingMigrations = []struct {
 	{"0058_provider_capabilities.sql", "migration_0058_provider_capabilities_marker"},
 	{"0059_provider_capabilities_check.sql", "migration_0059_provider_capabilities_check_marker"},
 	{"0060_delivery_requeued_at.sql", "migration_0060_delivery_requeued_at_marker"},
+	// 0061 是纯约束替换的幂等 DO 块(不建标记表): 标记永不存在 ⇒ 每次 EnsureSchema
+	// 都重跑一次, 幂等由 DROP CONSTRAINT IF EXISTS + 异常处理保证(0059/0060 同模式)。
+	// 因此它**必须**出现在这里, 否则已有 schema 的部署永远拿不到新约束。
+	{"0061_provider_capabilities_operations.sql", "migration_0061_provider_capabilities_operations_marker"},
 }
 
 // foundationTableNames are dropped before re-applying migrations (dependents first).
@@ -240,6 +212,11 @@ var foundationTableNames = []string{
 }
 
 func readMigrationBatch(files []string) (string, error) {
+	if len(files) == 0 {
+		// 显式失败而不是"应用零个迁移": 迁移目录读不到/文件命名不合规时,
+		// 静默通过会让部署在空 schema 上跑起来(问题是延迟暴露的)。
+		return "", fmt.Errorf("no migration files found in %s", migrationsDir())
+	}
 	dir := migrationsDir()
 	var batch strings.Builder
 	for _, name := range files {
@@ -289,6 +266,9 @@ func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool, migrationPath stri
 		return fmt.Errorf("pool is nil")
 	}
 	files := migrationFiles()
+	if len(files) == 0 {
+		return fmt.Errorf("no migration files found in %s", migrationsDir())
+	}
 	// Backward-compatible single-file override (tests/dev tooling).
 	if strings.TrimSpace(migrationPath) != "" {
 		if info, err := os.Stat(migrationPath); err == nil && !info.IsDir() {

@@ -62,10 +62,16 @@
   真 GA 子进程能分别解析两个块）、web lint/build、contract/security/smoke 41 passed。
   见 DESIGN §8.13（含代理层不做 operation 细分的取舍与残余风险 P2-1b）。
 
-## 待办（按序）
+## ⚠️ 环境事实（影响交付流程）
 
-- **P2-1 验证补课**：`internal/api` 能力用例 + `internal/infrastructure/postgres` + migration 0061
-  真实应用——需 `TEST_DATABASE_URL`（本机 Docker 未启动）
+- **GitHub Actions 已关闭**（用户要求，额度问题）：`Imzl-zl/GenericAgent` 与
+  `Imzl-zl/Vibe-Research-alpha` 的 `actions/permissions` = `enabled:false`。
+  恢复：`gh api -X PUT repos/<owner>/<repo>/actions/permissions -F enabled=true`。
+  **推论：以后没有 CI 代为验收，交付前必须本地真库跑（含迁移）。**
+- 本地测试库：容器 `ga-test-pg`（postgres:16-alpine，`127.0.0.1:54329`，db=`ga_test`，
+  密码 `test`）→ `TEST_DATABASE_URL=postgres://postgres:test@127.0.0.1:54329/ga_test?sslmode=disable`。
+
+## 待办（按序）
 - P2-1b（可选）：代理 operation 细分（token 签发 + 路由校验）
 - P2-2b 真大图走受控上传→短时 URL（替代内联字节）
 - P1-2 收尾：剩下模型的 P3 真图验证（免费模型优先；付费需用户确认预算）。
