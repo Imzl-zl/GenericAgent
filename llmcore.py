@@ -1438,6 +1438,13 @@ def _image_gen_remember_trim(api_base, model, names):
 
 # 图片容器魔数: 上游可能裁剪/忽略 output_format(实测 agnes 不接受该参数),
 # 交付文件扩展名必须跟随真实字节, 否则 IM 侧 MIME 失配(§6.5 失败诚实)。
+def _image_gen_data_url(raw, mime):
+    """把参考图编码成 Data-URL。部分上游(如 SenseNova)只接受公网 URL 或带
+    `data:image/*;base64,` 前缀的 Data-URL,**不接受纯 base64 字符串**; 我们没有公网图床,
+    因此统一用 Data-URL(官方文档明示支持)。"""
+    return f"data:{mime or 'image/png'};base64," + base64.b64encode(raw).decode('ascii')
+
+
 def sniff_image_format(data):
     """按魔数识别图片容器格式, 返回 'png'/'jpeg'/'gif'/'webp', 未知返回 None。"""
     if not data or len(data) < 12:
@@ -1468,14 +1475,21 @@ class BaseImageGenClient:
 
     PROTOCOL_GENERATIONS = 'images_generations'
     PROTOCOL_EDITS = 'images_edits'
-    _PROTOCOLS = (PROTOCOL_GENERATIONS, PROTOCOL_EDITS)
+    # 2026-09-13 实测新增: 部分上游(如 SenseNova U1.5 Lite)的改图接口是 **JSON**,
+    # 图片用 `images:[{image_url: <公网URL|data:image/*;base64,...>}]` 传入——
+    # 与 OpenAI 的 multipart 文件上传完全不同(发 multipart 会被上游回 `invalid arguments`)。
+    # 官方依据: platform.sensenova.cn/docs → SenseNova U1.5 Lite → 图片编辑接口。
+    PROTOCOL_EDITS_JSON = 'images_edits_json'
+    _PROTOCOLS = (PROTOCOL_GENERATIONS, PROTOCOL_EDITS, PROTOCOL_EDITS_JSON)
+    _EDIT_PROTOCOLS = (PROTOCOL_EDITS, PROTOCOL_EDITS_JSON)
     # 参考图预算(防内存/上游爆): 单张 ≤8MiB。
     # **为何只支持 1 张**(2026-09-13 源码依据, 不猜): new-api `relay/helper/valid_request.go`
-    # 的 edits 分支只读 `formData.Get("image")`(单值), 多图形态(`image[]`/`images`)未实测;
-    # Agnes 官方虽支持多图合成, 但那条通道的改图已被网关丢弃(见 DESIGN §2)。
-    # 待实测后再放开——宁可知情拒绝, 不可静默只取第一张。
+    # 的 edits 分支只读 `formData.Get("image")`(单值); SenseNova 的 `images` 数组虽是多图形态,
+    # 但多图在**本网关 + 路由**上未经实测 → 宁可知情拒绝, 不可静默只取第一张。
     MAX_EDIT_IMAGES = 1
     MAX_EDIT_IMAGE_BYTES = 8 * 1024 * 1024
+    # extra_params 不得覆盖的语义字段(防“配置静默改写用户意图”)
+    _PROTECTED_PAYLOAD_KEYS = ('model', 'prompt', 'n', 'images', 'image')
 
     def __init__(self, cfg):
         self.name = cfg.get('name', 'image_gen')
@@ -1491,7 +1505,17 @@ class BaseImageGenClient:
         if declared:
             self.operations = {str(op).strip().lower() for op in declared if str(op).strip()}
         else:
-            self.operations = {'edit'} if self.protocol == self.PROTOCOL_EDITS else {'generate'}
+            self.operations = {'edit'} if self.protocol in self._EDIT_PROTOCOLS else {'generate'}
+        # 透传参数(如 SenseNova 的 watermark=false): 运营侧显式配置, 原样并入请求体。
+        # **注意**: 网关的 DTO 白名单可能丢弃未知字段(见 DESIGN §2 的 new-api 源码结论),
+        # 所以只配"确认会被转发"的参数(watermark/response_format 均在 DTO 白名单内)。
+        extra = cfg.get('extra_params') or {}
+        if not isinstance(extra, dict):
+            raise ValueError('image_gen: extra_params 必须是 dict')
+        bad = [k for k in extra if k in self._PROTECTED_PAYLOAD_KEYS]
+        if bad:
+            raise ValueError(f"image_gen: extra_params 不得覆盖语义参数 {', '.join(sorted(bad))}")
+        self.extra_params = dict(extra)
         self.stream = bool(cfg.get('stream', False))
         self.max_retries = max(0, int(cfg.get('max_retries', 2)))
         self.max_retry_after = float(cfg.get('max_retry_after', 60.0))
@@ -1509,10 +1533,11 @@ class BaseImageGenClient:
     def _endpoint(self, operation='generate'):
         # 端点由 **operation** 决定(OpenAI 语义两端点), protocol 只描述"改图走什么传输":
         #   generate → JSON POST /images/generations(所有通道通用)
-        #   edit     → protocol=images_edits 时 multipart POST /images/edits(已验证)
+        #   edit     → protocol=images_edits(multipart, OpenAI 官方形态) 与
+        #              images_edits_json(JSON + images[{image_url}], 如 SenseNova)都打 /images/edits
         # 其它 edits 传输形态(如豆包 seedream 把改图走 generations JSON, 见 new-api PR
         # #2090)属**未验证扩展点**, 需要时再加 protocol 取值 + 实测, 不提前实现。
-        if operation == 'edit' and self.protocol == self.PROTOCOL_EDITS:
+        if operation == 'edit' and self.protocol in self._EDIT_PROTOCOLS:
             return auto_make_url(self.api_base, 'images/edits')
         return auto_make_url(self.api_base, 'images/generations')
 
@@ -1547,6 +1572,8 @@ class BaseImageGenClient:
             payload.pop(name, None)
         if stream:
             payload["stream"] = True
+        for key, value in self.extra_params.items():
+            payload[key] = value
         return payload
 
     def _delay(self, resp, attempt):
@@ -1737,30 +1764,30 @@ class BaseImageGenClient:
     def _operation_supported(self, operation):
         return operation in getattr(self, 'operations', ())
 
-    def _edit_images(self, images):
+    def _validate_edit_images(self, images):
         """把调用方给的参考图规整成 requests 的 multipart files 列表。
 
         images 元素: (filename, bytes, mime) —— **由工具层读盘并做路径安全/大小校验**，
         客户端只管发送(保持 llmcore 不依赖 cwd/文件系统语义, 也便于单测)。
-        返回 (files|None, err_text)。"""
+        返回 (list[(name, raw, mime)], err_text)。"""
         if not images:
-            return None, "[Error: image_gen 改图需要参考图(image 参数)]"
+            return [], "[Error: image_gen 改图需要参考图(image 参数)]"
         if len(images) > self.MAX_EDIT_IMAGES:
-            return None, (f"[Error: image_gen 改图当前仅支持 {self.MAX_EDIT_IMAGES} 张参考图(多图形态未经实测, "
-                          f"见 .tasks/image-capability/DESIGN.zh-CN.md §2), 收到 {len(images)} 张]")
-        files = []
+            return [], (f"[Error: image_gen 改图当前仅支持 {self.MAX_EDIT_IMAGES} 张参考图(多图形态未经上游实测, "
+                        f"见 .tasks/image-capability/DESIGN.zh-CN.md §2), 收到 {len(images)} 张]")
+        out = []
         for idx, item in enumerate(images, 1):
             try:
                 name, raw, mime = item[0], item[1], item[2]
             except (TypeError, IndexError):
-                return None, f"[Error: image_gen 第 {idx} 张参考图格式非法]",
+                return [], f"[Error: image_gen 第 {idx} 张参考图格式非法]"
             if not raw:
-                return None, f"[Error: image_gen 第 {idx} 张参考图为空: {name}]"
+                return [], f"[Error: image_gen 第 {idx} 张参考图为空: {name}]"
             if len(raw) > self.MAX_EDIT_IMAGE_BYTES:
-                return None, (f"[Error: image_gen 第 {idx} 张参考图 {len(raw)} bytes 超过 "
-                              f"{self.MAX_EDIT_IMAGE_BYTES // (1024 * 1024)}MiB 上限, 请先缩小]")
-            files.append(("image", (name or f"ref{idx}.png", raw, mime or 'image/png')))
-        return files, None
+                return [], (f"[Error: image_gen 第 {idx} 张参考图 {len(raw)} bytes 超过 "
+                            f"{self.MAX_EDIT_IMAGE_BYTES // (1024 * 1024)}MiB 上限, 请先缩小]")
+            out.append((name or f"ref{idx}.png", raw, mime or 'image/png'))
+        return out, None
 
     def generate(self, prompt, size=None, quality=None, n=1, output_format=None, model=None, images=None):
         """统一入口。operation 由是否带参考图决定: 带图=改图(edit)、不带=文生图(generate)。
@@ -1777,12 +1804,21 @@ class BaseImageGenClient:
                           f"(已声明: {have}, protocol={self.protocol})——不要重试本工具, 请如实告知用户"
                           f"该通道做不到, 或换用已声明该能力的配置]")
         if operation == 'edit':
-            files, ferr = self._edit_images(images)
+            valid, ferr = self._validate_edit_images(images)
             if ferr:
                 return None, ferr
+            if self.protocol == self.PROTOCOL_EDITS:
+                files = [("image", (name, raw, mime)) for name, raw, mime in valid]
+                return self._generate_sync(prompt, size=size, quality=quality, n=n,
+                                           output_format=output_format, model=model, files=files,
+                                           operation='edit')
+            # images_edits_json: 图片以 images[{image_url: Data-URL}] 放进 JSON 体
+            override = self._payload(prompt, size=size, quality=quality, n=n,
+                                     output_format=output_format, model=model, stream=False)
+            override['images'] = [{"image_url": _image_gen_data_url(raw, mime)} for _, raw, mime in valid]
             return self._generate_sync(prompt, size=size, quality=quality, n=n,
-                                       output_format=output_format, model=model, files=files,
-                                       operation='edit')
+                                       output_format=output_format, model=model,
+                                       payload_override=override, operation='edit')
         if self.stream and int(n or 1) <= 1 and not self._is_dalle():
             # 流式仅 gpt-image 系列: dall-e 不支持 stream/partial_images
             frame, err = self.generate_stream(prompt, size=size, quality=quality, n=n,
@@ -1799,10 +1835,11 @@ class BaseImageGenClient:
                                    output_format=output_format, model=model)
 
     def _generate_sync(self, prompt, size=None, quality=None, n=1, output_format=None, model=None,
-                       files=None, operation='generate'):
+                       files=None, operation='generate', payload_override=None):
         """同步路径: POST {apibase}/images/generations(或 /images/edits) → b64_json/url → bytes 列表。"""
-        payload = self._payload(prompt, size=size, quality=quality, n=n,
-                                output_format=output_format, model=model, stream=False)
+        payload = payload_override if payload_override is not None else self._payload(
+            prompt, size=size, quality=quality, n=n,
+            output_format=output_format, model=model, stream=False)
         data, err = self._post(payload, stream=False, files=files, operation=operation)
         if err:
             return None, err

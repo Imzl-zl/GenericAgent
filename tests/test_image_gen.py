@@ -908,3 +908,57 @@ class TestDoImageGenEditTool:
         monkeypatch.setattr(ga, "resolve_image_gen", lambda name, operation='generate': client)
         outcome = _drain(h.do_image_gen({"prompt": "x", "image": "a.png,b.png"}, None))
         assert "仅支持 1 张" in outcome.data and fake.calls == []
+
+
+class TestJsonEditProtocol:
+    """sensenova 等上游的改图是 **JSON**: `images:[{image_url: <url|Data-URL>}]`，
+    与 OpenAI 的 multipart 文件上传不同（发 multipart 会被上游回 invalid arguments）。
+    官方依据：platform.sensenova.cn/docs → SenseNova U1.5 Lite → 图片编辑接口。"""
+
+    CFG = {"name": "openai", "apibase": "https://relay.example/v1", "apikey": "sk-test",
+           "model": "sensenova-u1.5-lite", "protocol": "images_edits_json",
+           "operations": ["edit"], "extra_params": {"watermark": False}, "max_retries": 0}
+    B64 = base64.b64encode(_1PX_PNG).decode()
+
+    def test_json_edit_sends_images_data_url(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = _client(self.CFG, fake)
+        images, err = client.generate("把方块改成绿色", size="2048x2048",
+                                      images=[("ref.png", _1PX_PNG, "image/png")])
+        assert err is None and images == [_1PX_PNG]
+        url, kwargs = fake.calls[0]
+        assert url.endswith("/images/edits")
+        assert "files" not in kwargs                      # JSON 形态: 不走 multipart
+        body = kwargs["json"]
+        assert isinstance(body["images"], list) and len(body["images"]) == 1
+        data_url = body["images"][0]["image_url"]
+        assert data_url.startswith("data:image/png;base64,")
+        assert base64.b64decode(data_url.split(",", 1)[1]) == _1PX_PNG
+        assert body["model"] == "sensenova-u1.5-lite"
+        assert body["prompt"] == "把方块改成绿色"
+        assert body["size"] == "2048x2048"
+        assert body["watermark"] is False                 # extra_params 透传
+
+    def test_extra_params_cannot_override_semantics(self):
+        for key in ("model", "prompt", "n", "images", "image"):
+            with pytest.raises(ValueError):
+                llmcore.OpenAIImageGenClient({**self.CFG, "extra_params": {key: "x"}})
+
+    def test_extra_params_must_be_dict(self):
+        with pytest.raises(ValueError):
+            llmcore.OpenAIImageGenClient({**self.CFG, "extra_params": ["watermark"]})
+
+    def test_json_edit_still_gated_by_operations(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [])
+        client = _client({**self.CFG, "operations": ["generate"]}, fake)
+        images, err = client.generate("x", images=[("r.png", _1PX_PNG, "image/png")])
+        assert images is None and "未声明" in err and fake.calls == []
+
+    def test_multipart_protocol_unchanged_by_json_support(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = _client({**self.CFG, "protocol": "images_edits"}, fake)
+        client.generate("x", images=[("r.png", _1PX_PNG, "image/png")])
+        assert "files" in fake.calls[0][1] and "json" not in fake.calls[0][1]
+
+    def test_data_url_mime_propagates(self):
+        assert llmcore._image_gen_data_url(b"abc", "image/webp").startswith("data:image/webp;base64,")

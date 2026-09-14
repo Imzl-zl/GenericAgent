@@ -36,6 +36,9 @@
 | `n` | ✅ | n=1 通过 |
 | `quality`（agnes 文本图队列） | ❌ 400 | `quality is not supported by text image queue` → 客户端已自动协商裁剪 |
 | 图内文字 | ⚠️ 模型不可靠 | 现有做法：`code_run`+PIL 合成（agent 已自发采用，效果可用） |
+| `sensenova-u1.5-lite` 改图（**免费**，2026-09-13） | ✅ 可用但形态不同 | 官方文档：`POST /v1/images/edits` **JSON**（非 multipart）+ `images:[{image_url: <公网URL 或 data:image/*;base64,>}]`；`n` 只能 1；`size` 2K/4K 常量（32 倍数、≤4096、比例 ≤3:1）；`watermark` 默认 true、`prompt_extend` 默认 true。实测 200 / **49.6s** / 1024×1024，**像素验证参考图生效** |
+| `sensenova-u1.5-lite` 文生图 | ⚠️ 可用但慢 | 1024 档可用；**2K（`2048x2048`）实测撞 CF 524（>120s）** → CF 后面别指望 2K |
+| 参考图输入来源（SenseNova） | 仅公网 URL 或 Data-URL | 官方明示**不支持纯无前缀 base64**；我们无公网图床 → 统一 Data-URL |
 | 自检（模型看自己的产出） | ❌ 缺能力 | `agent_loop` 工具结果只支持文本（`tool_results.append({'content': datastr})`） |
 
 > **修正注（2026-09-13）**：本文件上一版曾记录"gemini/gpt-image 打 edits → `No available channel ... under group free`"并据此判定"改图不可用"。
@@ -85,7 +88,13 @@
 
 ### 4.2 客户端协议分层（llmcore 内，单一扩展点）
 
-`BaseImageGenClient` → `OpenAIImageGenClient`（现有）；改图接入时新增 **`OpenAIImageEditClient`**（multipart `/v1/images/edits`），配置用 `protocol: "images_generations" | "images_edits"` 分派（`resolve_image_gen` 已按 `kind` 分派）。**已验证的 edits 契约**（可直接据此实现）：`multipart/form-data`，文件字段名 `image`，普通字段 `model`/`prompt`/`size`/`n`；返回体与 generations 同构（`data[0].b64_json` 或 `url`），可复用既有 `_extract_images`/魔数嗅探/20MiB 前置检查。**成本提示**：改图按张计费（flash 档 ~9s），而 agnes 文生图当前免费 → 默认模型与是否启用由运营侧决定（§6）。
+`BaseImageGenClient` → `OpenAIImageGenClient`（现有）；改图接入时新增 **`OpenAIImageEditClient`**（multipart `/v1/images/edits`），配置用 `protocol: "images_generations" | "images_edits"` 分派（`resolve_image_gen` 已按 `kind` 分派）。**两种 edits 传输（protocol 选择，都已实测）**：
+- `images_edits`（OpenAI 官方形态）：`multipart/form-data` + 文件字段 `image`（gemini/gpt-image 走这条）；
+- `images_edits_json`（SenseNova 等）：`application/json` + `images:[{image_url: <URL|Data-URL>}]`
+  ——**形态选错就是最常见的"参数差异"类故障**（multipart 发给 SenseNova 会被回 `invalid arguments`，反之亦然）。
+返回体与 generations 同构（`data[0].b64_json` 或 `url`），复用 `_extract_images`/魔数嗅探/20MiB 前置检查。
+`extra_params`（如 `{'watermark': False}`）配置透传：**不得覆盖语义参数**（model/prompt/n/images，构造即拒绝），
+且只应放"确认能过网关 DTO 白名单"的键（见 §2 new-api 源码结论）。
 **必须遵守的两条新规则（本次实测换来的）**：
 1. **参数有效性可验证**：任何"上游可能静默忽略"的参数（参考图、模板、mask）都不得默认发送；发送前必须有 operation 声明，发送后必须有**可判定的成功信号**（否则视为失败，不得当成功交付）。
 2. **能力协商要留证据**：协商（裁剪/切换协议）必须打日志（`[ImageGen Adapt]` 已有），便于从 runner 日志/代理日志回溯"到底哪条通道做了什么"。
@@ -133,11 +142,29 @@
 （参考图中心蓝方块 → 输出中心变绿）。附带收获：该上游**返回 JPEG 而非请求的 png**，魔数嗅探自动改名 `.jpeg` 并打 `ℹ️`——
 先前"交付扩展名跟真实字节"的设计在真实场景救了一次（否则交付"名叫 .png 的 jpeg"，IM 侧 MIME 失配）。
 
-**未实测（不得当作已支持）**：多图合成（网关表单只读单值 `image`）；`gemini-3.1-flash-image` 的纯文生图（generations 路径）；
+**默认通道（2026-09-13 定稿）**：`image_edit` = **sensenova-u1.5-lite（免费，~46-50s，JSON 形态）**；
+注释保留 `gemini-3.1-flash-image`（付费，9.0s，multipart 形态）→ **慢但免费 vs 快但付费**，按需切换。
+超时预算：`read_timeout=110`（< CF 120s 窗口）+ `max_retries=1` → 最坏 ≈220s < 300s 任务预算。
+
+**未实测（不得当作已支持）**：多图合成（网关表单只读单值 `image`，SenseNova 的 `images` 数组虽是多图形态但未实测）；`gemini-3.1-flash-image` 的纯文生图（generations 路径）；
 `gpt-image-2` / `gemini-3-pro-image-preview` 的 edits；`mask`/`input_fidelity` 等其它 DTO 参数在 edits 路径上的行为。
 
 **平台形态（待定，属契约变更）**：新增 `image.edit` 能力 provider（`capabilities` 维度 + runtime_config 增 `operations` + openapi/web/policy 同步）→ 走既有"契约先行"流程。
 本轮**未做**：生产 provider 仍是 agnes（generate-only），因此**生产环境用改图会 fail-closed 并如实告知**，不会静默出错图。
+
+### 4.7 托管形态（平台）待办与已知硬约束
+
+平台模式要让 GA 用到改图，需把"能力维度"落进契约（本轮**未做**）：
+- `capabilities` 扩为 `chat` / `image.generate` / `image.edit`（省略语义保持 `["chat"]`，存量零迁移）；
+- `runtime_config` 的 image_gen 块增 `operations`（或新增独立 `image_edit` 块），GA 侧按声明 fail-closed；
+- openapi/web/policy 同步（走既有"契约先行 + 生成绑定 + 契约绑定测试"流程）。
+
+**已知硬约束（必须一起解）**：托管链路里参考图是 **Data-URL 内联进请求体**，而 `llm-proxy` 现有
+**4MiB 请求体上限**（`MaxWorkerRequestBytes`）→ 参考图会被直接拒绝。可选路径（按主流做法排序）：
+① 参考图**降采样到预算内**（runner 已有 pillow，可复用媒体链路的 1568px 策略）；
+② 平台侧做**受控上传/对象存储**换取短时 URL（SenseNova 也接受公网 URL，这条更通用）；
+③ 抬升该路由请求体上限（最差：破坏传输层不变量）。
+**结论**：托管形态单独一期，且必须先定"参考图怎么进/出沙箱"。
 
 ## 6. 待用户决策
 
