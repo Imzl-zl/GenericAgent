@@ -22,7 +22,9 @@
 
 定向验证：
 - 集成测试前先设 `TEST_DATABASE_URL`（真实 PostgreSQL）；缺失时集成测试显式失败
-- **本机测试库（2026-08-14 实证）：`ga-test-pg` 容器（独立容器，非 compose），`127.0.0.1:55433`，用户/密码/库均 `test`：`export TEST_DATABASE_URL='postgresql://test:test@127.0.0.1:55433/test?sslmode=disable'`——不设此变量跑 Go 集成测试会大面积假失败（勿当成回归）
+- **本机测试库（2026-09-14 校正）：`ga-test-pg` 容器（独立容器，非 compose）**，端口用 `docker port ga-test-pg` 现查（会变；2026-09-14 实测为 `54329`），库 `ga_test`、用户 `postgres`、密码 `test`：`docker start ga-test-pg` → `export TEST_DATABASE_URL='postgres://postgres:test@127.0.0.1:54329/ga_test?sslmode=disable'`（旧文档里的 `55433/test/test` 已失效，踩过）——不设此变量跑 Go 集成测试会大面积假失败（勿当成回归）
+- **GitHub Actions 已关闭（2026-09-14，用户额度原因）**：`Imzl-zl/GenericAgent`、`Imzl-zl/Vibe-Research-alpha` 的 `actions/permissions` = `enabled:false`。恢复：`gh api -X PUT repos/<owner>/<repo>/actions/permissions -F enabled=true`。**推论：推送不再触发 CI，交付前必须本地真库跑（含迁移）——没有第二道网了**
+- **图像能力建档探测（2026-09-14）**：`python assets/probe_image_channel.py`（P0 `GET /v1/models` / P1 端点探活 / P2 参数探活，**默认 0 计费**）；`--e2e` 走真实生产代码路径（llmcore 客户端）+ **像素客观判据**，是新增模型从 `documented` 升到 `measured` 的唯一入口；`--paid` 会真出图，只对免费模型用
 - **集成测试 E2E 依赖（CI 单独装，不在 pyproject）：`uv pip install 'psycopg[binary]' psutil`**（psycopg 播种旧实例数据、psutil 验 worker 进程隔离）；缺失时对应场景 ModuleNotFoundError 失败
 - 集成测试直插 workspace 必须幂等（`ON CONFLICT (session_key) DO NOTHING`）——注册路径已自动建行（0050 不变量）；`_register_user` 先例
 - 契约绑定测试：`tenant_platform/tests/contract`（import worker-python 生成代码，需 protobuf/grpcio）
@@ -47,10 +49,15 @@
 - 共享 PostgreSQL 测试实例：Go 包间 `-p 1` 串行，避免 truncate 互踩。
 - CI 门禁：分支/PR 级矩阵（Go/Python/Web）先于合并；集成测试需真实 Postgres service。
 - 沙箱实证：真实 Docker 行为（如 volume-subpath inspect 格式）以集成测试实证为准，不凭文档假设。
+- **图像通道能力 = 数据不是代码（2026-09-14）**：能力（端点/operations/参数支持/size 形态/参考图上限）内联在 `llmcore._IMAGE_CATALOG` 的**档案**里，新增模型 = **加一条数据 + 跑一次建档探测**，不改控制流；语义参数不支持时 fail-loud，装饰参数省略但必须明示。平台侧同构：`capabilities = chat|image.generate|image.edit`（`image` 是别名）→ runtime_config 下发 `image_gen`/`image_edit` 两块的 `operations` 声明。设计真值 `.tasks/image-capability/DESIGN.zh-CN.md` §8。
 
 ## Pitfalls
 
 - Python 3.14 与 pywebview 等依赖不兼容；推荐 3.11/3.12（CI 用 3.11）。
+- **迁移清单曾经是两处真值（2026-09-14 已结构修复）**：`migrations.go` 的 `migrationFiles()`（应用顺序）与 `pendingMigrations`（**已有 schema** 的补跑清单 + marker 表）都曾是硬编码列表，新增迁移漏一处就是"迁移从未执行但仍绿"的静默故障（当时表现为 CI 里旧 CHECK 约束还在、新值写入 23514）。现在 `migrationFiles()` **读目录排序**（文件名即顺序）、空清单显式报错，且 `TestMigrationFilesCoverPendingMigrations` 把两份清单的覆盖关系钉成硬失败。**新增迁移后必跑 `go test ./internal/infrastructure/postgres/ -run MigrationFiles`**
+- **DB 类改动没跑过 = 没验证过（2026-09-14 实际踩到）**：本机无 Postgres 时 `internal/api` / `infrastructure/postgres` / 迁移都是静默跳过（看起来全绿），于是"先推送、再被 CI 抓到"。**改到 store/api/迁移/契约时，必须先起 `ga-test-pg` 设 `TEST_DATABASE_URL` 再下结论**；另可两路验证：全新库（走目录迁移）+ 从存量库复制一份（走 `pendingMigrations` 补跑）
+- **测试 fixture 也会有毒（2026-09-14）**：`tests/test_image_gen.py` 的 `_1PX_PNG` 只是"魔数正确、CRC/IDAT 不合法"的假 PNG，长期未被发现（因为只做魔数嗅探）；一旦改用 PIL 头部解析就立刻 `UnidentifiedImageError`。**fixture 缺陷与产品缺陷要分开修**（换真合法 PNG，而不是放松产品的校验）
+- **内联图片（base64/Data-URI）只适合小文件（2026-09-14）**：fal 官方原话“not recommended for files larger than a few KB”，其通用形态是 URL/上传。参考图进沙箱必须在**工具层归一化**（长边 ≤1568 + JPEG q85 + 剥 EXIF + 解码前像素上限），否则 8MiB 原图 base64 后 ≈10.7MB 直接撞 llm-proxy 的 `MaxWorkerRequestBytes`(4MiB)；归一化后实测 33MB 原图 → 请求体 564KB。**不要抬 `MaxWorkerRequestBytes`（那是内存防御）**
 - **表改名迁移（2026-08-10 实证）**：早期迁移的 marker 可能就是表本身（0003 的 marker = bots 表）——RENAME 后必须重建仅作 marker 的 stub 表，否则该迁移被重放重建空表；RENAME/列改名/约束改名无 IF NOT EXISTS，用 DO 块条件执行（0052/0053 先例）。
 - `TEST_DATABASE_URL` 缺失时集成测试显式失败；本地先起 Postgres 并设环境变量。
 - 两包并行跑共享测试库有既有 flaky（死锁/唯一键冲突），用 `go test -p 1` 规避，不要当代码 bug 修。

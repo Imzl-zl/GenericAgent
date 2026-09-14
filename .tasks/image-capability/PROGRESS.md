@@ -71,6 +71,20 @@
 - 本地测试库：容器 `ga-test-pg`（postgres:16-alpine，`127.0.0.1:54329`，db=`ga_test`，
   密码 `test`）→ `TEST_DATABASE_URL=postgres://postgres:test@127.0.0.1:54329/ga_test?sslmode=disable`。
 
+## 生产部署清单（本轮改动的落地步骤）
+
+1. **迁移**：migration `0061_provider_capabilities_operations.sql` 必须在生产库生效。平台启动时
+   `EnsureSchema` 会因 `pendingMigrations` 自动补跑（幂等 DO 块，不建标记表 ⇒ 每次启动重跑一次，无害）。
+   验证：`select pg_get_constraintdef(oid) from pg_constraint where conname='llm_providers_capabilities_check';`
+   应包含 `image.generate` / `image.edit`。**部署前先在真库演练一次**（本次已在本地 `ga-test-pg` 双路验过）。
+2. **镜像**：`make build` **全量重建**（本轮改了 `llmcore.py`/`ga.py`/两个 schema→ ga-runner；platform 代码 + web → platform/web 镜像）；
+   重建后 `make runner-digest` 更新 `.env` 里的 runner 镜像（containerd 下镜像 ID 非内容稳定标识）。
+3. **配置**：生产 `mykey.py`/平台 provider 按需声明 `image.generate` / `image.edit`
+   （`image` 旧值仍兼容，读取时归一化为 `image.generate`）；勾了 `image.edit` 才会下发 `image_edit` 块。
+4. **验证**：`healthz` 全绿 + platform 日志 0 error；真实渠道跑一次生图（微信出图）与一次改图
+   （若已配 edit provider）；`GET /v1/config/...` 类检查不适用（无此端点）。
+5. **回滚**：镜像打 `:local.bak-<YYYYMMDD>`；迁移 0061 是**放宽**约束（向后兼容），无需回滚 SQL。
+
 ## 待办（按序）
 - P2-1b（可选）：代理 operation 细分（token 签发 + 路由校验）
 - P2-2b 真大图走受控上传→短时 URL（替代内联字节）
