@@ -1460,6 +1460,346 @@ def sniff_image_format(data):
     return None
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 通道能力档案（2026-09-14；设计真值 .tasks/image-capability/DESIGN.zh-CN.md §8）
+#
+# 为什么是数据、不是代码分支：本渠道实测有 11 个图像模型（GET /v1/models），端点与参数
+# 支持各不相同。把"可裁剪参数名 + 错误话术 + 模型名匹配"写进代码 = 每接一个模型改一次
+# 代码，且第一次请求必然白付一次 400。成熟做法一致（pi 的 ImagesModel.api +
+# images-api-registry、OpenRouter 的 supported_parameters、LiteLLM 的
+# get_supported_openai_params）：**逐通道声明能力**，不支持的参数默认报错，静默丢弃是
+# 显式 opt-in。
+#
+# 不变量（红线，测试钉住）：
+#   语义参数（prompt/n/size/image/aspect_ratio/resolution）—— 改了等于改用户意图，
+#     通道不支持 → fail-loud，绝不静默缩水；
+#   装饰参数（output_format/quality/seed/stream/partial_images）—— 缺席时上游给合理
+#     默认，通道不支持 → 省略，但必须在工具结果里明示省略了什么。
+# ═══════════════════════════════════════════════════════════════════════════
+# 注：`aspect_ratio`/`resolution` 是**保留的语义参数**（主流形态，如 OpenRouter 的
+# aspect_ratio/resolution、Gemini 的 responseFormat.image）——本网关把 ratio 静默丢弃
+# （§2），工具暂未暴露它们，故档案里不声明；将来暴露时只需填档案 `maps`，不改控制流。
+_IMAGE_SEMANTIC_PARAMS = ('prompt', 'n', 'size', 'image', 'aspect_ratio', 'resolution')
+_IMAGE_DECORATIVE_PARAMS = ('output_format', 'quality', 'seed', 'stream', 'partial_images')
+
+# size 的**形态**是逐通道事实（2026-09-14 实测）：agnes 接受档位 1K/2K 与原生像素；
+# gemini/gpt-image/sensenova 只接受 WxH——传档位会被网关回「图片尺寸格式错误，应为 宽x高，
+# 例如 1024x1024」，而且该错误被标成 **500** 而不是 400。size 是语义参数 → 形态不符必须
+# fail-loud（不静默替换用户要求的尺寸）。
+_IMAGE_SIZE_TIER_RE = re.compile(r'^\s*\d+\s*[kK]\s*$')
+_IMAGE_SIZE_PIXELS_RE = re.compile(r'^\s*\d+\s*[xX*×]\s*\d+\s*$')
+
+_IMAGE_API_GENERATIONS = 'images_generations'
+_IMAGE_API_EDITS = 'images_edits'
+_IMAGE_API_EDITS_JSON = 'images_edits_json'
+_IMAGE_APIS = (_IMAGE_API_GENERATIONS, _IMAGE_API_EDITS, _IMAGE_API_EDITS_JSON)
+_IMAGE_EDIT_APIS = (_IMAGE_API_EDITS, _IMAGE_API_EDITS_JSON)
+
+
+def _deco(**supported):
+    """装饰参数声明表：**未列出的装饰参数一律声明为不支持(None)** → 省略 + 明示。
+    档案是权威的：新增装饰参数必须同时更新档案（宁可不发，也不发出去撞 400）。"""
+    table = {p: None for p in _IMAGE_DECORATIVE_PARAMS}
+    table.update(supported)
+    return table
+
+
+# maps: 统一参数 → 线参数名（None = 该通道不支持，
+#       不管是“实测被拒”还是“未验证”——两者对请求构造的含义相同：不发；差异写在 evidence 里）
+_IMAGE_CATALOG = {
+    # ── 本渠道实测（newapi.myovo.cc.cd，2026-09-13/14；能力矩阵见 DESIGN §2） ──
+    'agnes-image-2.5-flash': dict(
+        api=_IMAGE_API_GENERATIONS, ops={'generate'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 0},
+        size_style='both',                   # 实测档位 1K/2K 与原生像素均通过
+        latency='fast', cost='metered', source='measured',
+        evidence='文生图 200/8-11s；text image queue 实测拒收 output_format/quality(400)；'
+                 'ratio/extra_body 静默丢弃。**改图不声明（证据矛盾，宁可不做）**：'
+                 '2026-09-14 探针显示 multipart edits 路由回 image is required（仅说明网关适配器在），'
+                 '但 2026-08-14 真实改图实测 503/106s 且 Agnes 官方无 /images/edits 端点；'
+                 'JSON edits 路径 30s 无响应。未证实不声明 → 带参考图走本通道会 fail-closed',
+    ),
+    'agnes-image-2.1-flash': dict(
+        api=_IMAGE_API_GENERATIONS, ops={'generate'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 0},
+        size_style='both',
+        latency='fast', cost='metered', source='measured',
+        evidence='与 2.5 同队列（2026-08-14 实测：只回 url 直链；2026-09-14 探测：档位通过 size 校验）',
+    ),
+    'agnes-image-2.0-flash': dict(
+        api=_IMAGE_API_GENERATIONS, ops={'generate'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 0},
+        size_style='both',
+        latency='fast', cost='metered', source='measured',
+        evidence='2026-09-14 探测：档位 1K 通过 size 校验、只报 prompt is required（endpoint+模型可用）',
+    ),
+    'sensenova-u1.5-lite': dict(
+        api=_IMAGE_API_EDITS_JSON, ops={'generate', 'edit'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 1, 'max_refs': 5},   # 2026-09-14 探测：网关校验 images 为 1..5 项
+        extra_params={'watermark': False},
+        latency='slow', cost='free', source='measured',
+        evidence='改图 JSON 200/49.6s 像素验证（免费；2026-09-14 生产路径复验 200/70.8s/888KB，'
+                 '中心像素蓝→红）；文生图 1024x1024 复验 200/42.9s；n 只能 1；2K 文生图撞 CF 524；'
+                 'read_timeout 必须 ≥110s（慢）；'
+                 '2026-09-14 探测：size 只接受 WxH（auto 或 32 倍数/512-4096/比例≤3:1），'
+                 '参考图 1..5 张（网关原文 invalid images, should contain between 1 and 5 items）',
+    ),
+    'sensenova-u1-fast': dict(
+        api=_IMAGE_API_GENERATIONS, ops={'generate'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 1, 'max_refs': 5},
+        latency='slow', cost='free', source='measured',
+        evidence='2026-08-14 实测只回 url 直链（b64 空）；2026-09-14 探测：文生图端点 400 '
+                 'field Prompt invalid；JSON edits 端点 400 invalid images, should contain between 1 and 5 items',
+    ),
+    'gemini-3.1-flash-image': dict(
+        api=_IMAGE_API_EDITS, ops={'generate', 'edit'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 1},
+        latency='fast', cost='paid', source='measured',
+        evidence='/images/edits multipart 200/9.0s 像素验证；返回 JPEG（魔数嗅探改名）；'
+                 '2026-09-14 探测：size 只接受 WxH（传 1K 被网关回「图片尺寸格式错误」且标成 500）；'
+                 '/images/edits 路由+适配器已探活（image is required），未做真图验证',
+    ),
+    # ── 端点/操作按网关源码与官方文档声明，逐模型参数未实测（故装饰参数保守） ──
+    'gemini-3.1-flash-image-preview': dict(
+        api=_IMAGE_API_EDITS, ops={'generate', 'edit'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 1},
+        latency='fast', cost='paid', source='documented',
+        evidence='Gemini 官方：生成/编辑同一入口；预览版未在本网关实测',
+    ),
+    'gemini-3-pro-image': dict(
+        api=_IMAGE_API_EDITS, ops={'generate', 'edit'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 1},
+        latency='slow', cost='paid', source='documented',
+        evidence='Gemini 官方：Pro 版支持 4K/多参考图（本网关未实测）',
+    ),
+    'gemini-3-pro-image-preview': dict(
+        api=_IMAGE_API_EDITS, ops={'generate', 'edit'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 1},
+        latency='slow', cost='paid', source='documented',
+        evidence='同 gemini-3-pro-image（预览通道）',
+    ),
+    'gemini-3.0-pro-image-preview': dict(
+        api=_IMAGE_API_EDITS, ops={'generate', 'edit'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 1},
+        latency='slow', cost='paid', source='documented',
+        evidence='同 gemini-3-pro-image（3.0 预览通道）；2026-09-14 探测：文生图端点可达'
+                 '（500 prompt is required）、edits JSON 路径回 image is required，size 只接受 WxH',
+    ),
+    'gpt-image-2': dict(
+        api=_IMAGE_API_EDITS, ops={'generate', 'edit'},
+        maps={**_deco(output_format='output_format', quality='quality',
+                      stream='stream', partial_images='partial_images'),
+              'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 1},
+        latency='slow', cost='paid', source='documented',
+        evidence='2026-08-14 实测接受 output_format；2026-09-13 实测 24-125s 在 CF 120s 窗口下会撞 524；'
+                 '2026-09-14 探测：size 只接受 WxH、/images/edits 路由+适配器已探活（image is required），未做真图验证',
+    ),
+    'gpt-image-2.5-flare': dict(
+        api=_IMAGE_API_EDITS, ops={'generate', 'edit'},
+        maps={**_deco(output_format='output_format', quality='quality',
+                      stream='stream', partial_images='partial_images'),
+              'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 1},
+        latency='slow', cost='paid', source='documented',
+        evidence='与 gpt-image-2 同族（本网关未单独实测）',
+    ),
+    # ── OpenAI 官方模型（直连形态用；本渠道没有这些型号） ──
+    'gpt-image-1': dict(
+        api=_IMAGE_API_GENERATIONS, ops={'generate'},
+        maps={**_deco(output_format='output_format', quality='quality',
+                      stream='stream', partial_images='partial_images'),
+              'size': 'size', 'n': 'n'},
+        limits={'max_n': 4, 'max_refs': 1},
+        latency='slow', cost='metered', source='documented',
+        evidence='OpenAI 官方：恒返回 b64_json（发 response_format 会 400，见二轮审查 I-3）',
+    ),
+    'dall-e-3': dict(
+        api=_IMAGE_API_GENERATIONS, ops={'generate'},
+        maps={**_deco(quality='quality'), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 1, 'max_refs': 0},
+        fixed={'response_format': 'b64_json'},
+        latency='slow', cost='metered', source='documented',
+        evidence='OpenAI 官方：无 output_format 概念/无 stream；n 只能 1',
+    ),
+    'dall-e-2': dict(
+        api=_IMAGE_API_GENERATIONS, ops={'generate'},
+        maps={**_deco(), 'size': 'size', 'n': 'n'},
+        limits={'max_n': 10, 'max_refs': 0},
+        fixed={'response_format': 'b64_json'},
+        latency='slow', cost='metered', source='documented',
+        evidence='OpenAI 官方：无 output_format/quality 概念',
+    ),
+}
+
+# 未建档通道（catalog 无此模型且配置未声明）: 宽松集 + 有界自愈 + 显式标注未验证。
+_IMAGE_PERMISSIVE_MAPS = {p: p for p in _IMAGE_DECORATIVE_PARAMS}
+_IMAGE_PERMISSIVE_MAPS.update({'size': 'size', 'n': 'n'})
+
+
+class ImageChannelProfile:
+    """一条通道（网关 × 模型）的能力档案：**数据**，不是代码分支。
+
+    字段：
+      api      —— 线协议（端点与传输形态）
+      ops      —— 本通道实际能做的操作（generate/edit）
+      maps     —— 统一参数 → 线参数名；None = 声明为不支持（**唯一表示**，不再另设"被拒集合"）
+      limits   —— max_n / max_refs（**语义上限**，超限 fail-loud，不静默缩水）
+      fixed    —— 每次请求必带的固定参数（如 dall-e 的 response_format）
+      extra_params —— 运营声明的透传参数（不得覆盖语义字段）
+      source   —— measured | documented | config | unverified（决定宽松/严格与提示文案）
+      evidence —— 结论依据（哪次实测/哪份文档），排障与复查用
+    """
+
+    def __init__(self, api, ops, maps=None, limits=None, fixed=None, extra_params=None,
+                 latency='unknown', cost='unknown', source='unverified', evidence='',
+                 size_style='pixels'):
+        # size_style: 'pixels'(WxH) | 'tier'(1K/2K) | 'both'。catalog 条目默认按主流
+        # （WxH）严格声明；未建档通道在 resolve_image_profile 里放宽为 'both'。
+        self.size_style = size_style
+        self.api = api
+        self.ops = set(ops or ())
+        self.maps = dict(maps or {})
+        self.limits = dict(limits or {})
+        self.fixed = dict(fixed or {})
+        self.extra_params = dict(extra_params or {})
+        self.latency = latency
+        self.cost = cost
+        self.source = source
+        self.evidence = evidence
+
+    @classmethod
+    def from_catalog(cls, model, host=''):
+        """从内置 catalog 取该模型（可选用 `<host>|<model>` 网关限定键覆盖）的档案。
+        返回 None = 未建档（调用方按宽松集 + 未验证处理）。"""
+        host_key = f"{host}|{model}" if host else ''
+        entry = (_IMAGE_CATALOG.get(host_key) if host_key else None) or _IMAGE_CATALOG.get(str(model or ''))
+        return cls(**entry) if entry else None
+
+    @property
+    def max_n(self):
+        return max(1, int(self.limits.get('max_n', 1) or 1))
+
+    @property
+    def max_refs(self):
+        return max(0, int(self.limits.get('max_refs', 0) or 0))
+
+    @property
+    def verified(self):
+        return self.source in ('measured', 'documented', 'config')
+
+    def supports(self, operation):
+        return operation in self.ops
+
+    def wire_key(self, param):
+        """统一参数 → 线参数名；None = 档案声明不支持（调用方按语义/装饰二分处理）。"""
+        if param in self.maps:
+            return self.maps[param]
+        # 档案未提及的参数：严格档案按“不支持”处理（宁可不发），未建档通道宽松发送
+        return None if self.verified else param
+
+    def op_label(self, zh=True):
+        names = [('文生图' if zh else 'generate'), ('改图' if zh else 'edit')]
+        return '+'.join(n for n, op in zip(names, ('generate', 'edit')) if op in self.ops) or ('无' if zh else 'none')
+
+    def cost_label(self, zh=True):
+        return {'free': ('免费' if zh else 'free'),
+                'paid': ('按张付费' if zh else 'paid per image'),
+                'metered': ('计量收费' if zh else 'metered')}.get(self.cost, self.cost)
+
+    def describe(self, model, host='', zh=True):
+        """档案 → 能力文本（工具 schema 渲染用；同一份数据，不是第二处手写文案）。"""
+        where = f"{model}@{host}" if host else str(model)
+        refs = ('参考图: 不支持' if zh else 'reference images: unsupported') if not self.max_refs else (
+            f"参考图: 最多 {self.max_refs} 张" if zh else f"reference images: up to {self.max_refs}")
+        size_form = {'both': ('档位(1K/2K)与 WxH 像素均可' if zh else 'tiers (1K/2K) or WxH pixels'),
+                     'tier': ('只接受档位(1K/2K)' if zh else 'tiers (1K/2K) only'),
+                     'pixels': ('只接受 WxH 像素(如 1024x1024)' if zh else 'WxH pixels only')}.get(
+                         self.size_style, self.size_style)
+        line = (f"model={where} ｜ 能力: {self.op_label(zh)} ｜ {refs} ｜ "
+                f"size 形态: {size_form} ｜ "
+                f"{'单次张数上限' if zh else 'max n'}: {self.max_n} ｜ "
+                f"{'计费' if zh else 'cost'}: {self.cost_label(zh)} ｜ "
+                f"{'典型耗时' if zh else 'latency'}: {self.latency}")
+        dropped = sorted(p for p, wire in self.maps.items()
+                         if wire is None and p in _IMAGE_DECORATIVE_PARAMS)
+        if dropped:
+            line += (f" ｜ {'已知不支持(自动省略)' if zh else 'known-unsupported (auto-omitted)'}: {', '.join(dropped)}")
+        if not self.verified:
+            line += (' ｜ 该模型未建档(能力未验证): 参数按宽松集发送, 上游拒绝时自动裁剪'
+                     if zh else ' ｜ unlisted model (unverified): permissive params + bounded self-heal')
+        return line
+
+    def proposal(self, names, api_base='', model=''):
+        """协商学到的结论 → 可直接粘进 catalog 的补丁（把运行时发现固化成数据）。"""
+        patch = {str(n): None for n in names}
+        return {'key': f"{model}", 'where': str(api_base or ''), 'maps_patch': patch}
+
+
+def resolve_image_profile(model, cfg):
+    """档案解析（优先级：配置显式声明 > 内置 catalog > 未建档宽松集）。
+
+    - catalog 里且 `verified` 的条目是**权威**：未提及的参数 = 不支持（宁可不发）。
+    - catalog 无此模型（或条目未验证/配置声明 unverified）→ 宽松集 + 有界自愈，
+      但档案被显式标为 `unverified`，工具能把这一点如实告诉模型。
+    - 显式声明（protocol/operations/profile/unverified）优先于内置档案：运营最懂自己的网关。"""
+    cfg = cfg or {}
+    host = str(cfg.get('apibase', '')).split('//')[-1].split('/')[0].lower()
+    cat = ImageChannelProfile.from_catalog(model, host)
+    explicit = cfg.get('profile') or {}
+    if not isinstance(explicit, dict):
+        raise ValueError('image_gen: profile 必须是 dict')
+    api = str(cfg.get('protocol') or explicit.get('api')
+              or (cat.api if cat else _IMAGE_API_GENERATIONS)).strip().lower()
+    if api not in _IMAGE_APIS:
+        raise ValueError(f"image_gen: 不支持的 protocol {api!r} (支持 {', '.join(_IMAGE_APIS)})")
+    declared_ops = explicit.get('ops') or cfg.get('operations')
+    if declared_ops:
+        ops = {str(op).strip().lower() for op in declared_ops if str(op).strip()}
+    elif cat:
+        ops = set(cat.ops)
+    else:
+        ops = {'edit'} if api in _IMAGE_EDIT_APIS else {'generate'}
+    unknown_ops = ops - {'generate', 'edit'}
+    if unknown_ops:
+        raise ValueError(f"image_gen: operations 只支持 generate/edit, 收到 {sorted(unknown_ops)}")
+    unverified = bool(cfg.get('unverified') or explicit.get('unverified'))
+    if cat and cat.verified and not unverified:
+        source = 'config' if (cfg.get('protocol') or cfg.get('operations') or explicit) else cat.source
+        maps = dict(cat.maps)
+    else:
+        source = 'unverified'
+        maps = dict(_IMAGE_PERMISSIVE_MAPS)
+    maps.update(explicit.get('maps') or {})
+    size_style = str(explicit.get('size_style') or (cat.size_style if cat else 'both')).strip().lower()
+    if size_style not in ('pixels', 'tier', 'both'):
+        raise ValueError(f"image_gen: size_style 只支持 pixels/tier/both, 收到 {size_style!r}")
+    limits = {'max_n': 4, 'max_refs': int(BaseImageGenClient.MAX_EDIT_IMAGES)}
+    if cat:
+        limits.update(cat.limits)
+    limits.update(explicit.get('limits') or {})
+    fixed = dict(cat.fixed) if cat else {}
+    fixed.update(explicit.get('fixed') or {})
+    extra = dict(cat.extra_params) if cat else {}
+    extra.update(cfg.get('extra_params') or {})
+    return ImageChannelProfile(
+        api=api, ops=ops, maps=maps, limits=limits, fixed=fixed, extra_params=extra,
+        latency=cat.latency if cat else 'unknown', cost=cat.cost if cat else 'unknown',
+        source=source, evidence=str(explicit.get('evidence') or (cat.evidence if cat else '')),
+        size_style=size_style,
+    )
+
+
 class BaseImageGenClient:
     """生图客户端基类。只解析生图所需配置子集
     {apibase/apikey/model/protocol/operations/stream/timeout/read_timeout/max_retries/proxy/verify},
@@ -1473,19 +1813,21 @@ class BaseImageGenClient:
     **调用未声明的 operation 一律 fail-closed 报错**——因为存在"网关照文档收下参数但静默丢弃"的通道
     （实测 agnes 的 `extra_body.image` 就是静默无效），宁可知情失败，不可假装成功。"""
 
-    PROTOCOL_GENERATIONS = 'images_generations'
-    PROTOCOL_EDITS = 'images_edits'
+    # 线协议常量与模块级 _IMAGE_APIS 同源（档案与客户端共用一份真值）
+    PROTOCOL_GENERATIONS = _IMAGE_API_GENERATIONS
+    PROTOCOL_EDITS = _IMAGE_API_EDITS
     # 2026-09-13 实测新增: 部分上游(如 SenseNova U1.5 Lite)的改图接口是 **JSON**,
     # 图片用 `images:[{image_url: <公网URL|data:image/*;base64,...>}]` 传入——
     # 与 OpenAI 的 multipart 文件上传完全不同(发 multipart 会被上游回 `invalid arguments`)。
     # 官方依据: platform.sensenova.cn/docs → SenseNova U1.5 Lite → 图片编辑接口。
-    PROTOCOL_EDITS_JSON = 'images_edits_json'
-    _PROTOCOLS = (PROTOCOL_GENERATIONS, PROTOCOL_EDITS, PROTOCOL_EDITS_JSON)
-    _EDIT_PROTOCOLS = (PROTOCOL_EDITS, PROTOCOL_EDITS_JSON)
-    # 参考图预算(防内存/上游爆): 单张 ≤8MiB。
-    # **为何只支持 1 张**(2026-09-13 源码依据, 不猜): new-api `relay/helper/valid_request.go`
+    PROTOCOL_EDITS_JSON = _IMAGE_API_EDITS_JSON
+    _PROTOCOLS = _IMAGE_APIS
+    _EDIT_PROTOCOLS = _IMAGE_EDIT_APIS
+    # 参考图单张预算(防内存/上游爆): ≤8MiB。
+    # **为何默认只支持 1 张**(2026-09-13 源码依据, 不猜): new-api `relay/helper/valid_request.go`
     # 的 edits 分支只读 `formData.Get("image")`(单值); SenseNova 的 `images` 数组虽是多图形态,
     # 但多图在**本网关 + 路由**上未经实测 → 宁可知情拒绝, 不可静默只取第一张。
+    # 上限的**真值在档案** (`limits.max_refs`), 此常量仅为未声明上限时的默认值。
     MAX_EDIT_IMAGES = 1
     MAX_EDIT_IMAGE_BYTES = 8 * 1024 * 1024
     # extra_params 不得覆盖的语义字段(防“配置静默改写用户意图”)
@@ -1498,24 +1840,20 @@ class BaseImageGenClient:
         self.model = cfg.get('model', '')
         if not self.api_base or not self.api_key or not self.model:
             raise ValueError('image_gen 配置不完整: 需要 apibase/apikey/model')
-        self.protocol = str(cfg.get('protocol') or self.PROTOCOL_GENERATIONS).strip().lower()
-        if self.protocol not in self._PROTOCOLS:
-            raise ValueError(f"image_gen: 不支持的 protocol {self.protocol!r} (支持 {', '.join(self._PROTOCOLS)})")
-        declared = cfg.get('operations')
-        if declared:
-            self.operations = {str(op).strip().lower() for op in declared if str(op).strip()}
-        else:
-            self.operations = {'edit'} if self.protocol in self._EDIT_PROTOCOLS else {'generate'}
-        # 透传参数(如 SenseNova 的 watermark=false): 运营侧显式配置, 原样并入请求体。
-        # **注意**: 网关的 DTO 白名单可能丢弃未知字段(见 DESIGN §2 的 new-api 源码结论),
-        # 所以只配"确认会被转发"的参数(watermark/response_format 均在 DTO 白名单内)。
+        self._cfg = dict(cfg)
+        # extra_params 不得覆盖语义字段(防"配置静默改写用户意图")
         extra = cfg.get('extra_params') or {}
         if not isinstance(extra, dict):
             raise ValueError('image_gen: extra_params 必须是 dict')
         bad = [k for k in extra if k in self._PROTECTED_PAYLOAD_KEYS]
         if bad:
             raise ValueError(f"image_gen: extra_params 不得覆盖语义参数 {', '.join(sorted(bad))}")
-        self.extra_params = dict(extra)
+        self._profiles = {}                     # model → ImageChannelProfile(含 per-request 覆写)
+        prof = self.profile_for(self.model)          # 校验 protocol/operations 取值(非法立即抛 ValueError)
+        self.protocol = prof.api                # 兼容属性: 基模型的线协议
+        self.operations = set(prof.ops)         # 兼容属性: 基模型声明的操作
+        self.extra_params = dict(prof.extra_params)
+        self.last_notices = []                  # 本次请求被省略/裁剪的参数 [(名, 原因)], ga 层明示给模型
         self.stream = bool(cfg.get('stream', False))
         self.max_retries = max(0, int(cfg.get('max_retries', 2)))
         self.max_retry_after = float(cfg.get('max_retry_after', 60.0))
@@ -1526,18 +1864,36 @@ class BaseImageGenClient:
         self.verify = cfg.get('verify', True)
         self.http = _build_http_session()
 
-    def _is_dalle(self):
-        ml = self.model.lower()
-        return 'dall-e' in ml or 'dalle' in ml
+    def profile_for(self, model=None):
+        """取该模型的能力档案(带缓存)。模型决定能力: 请求里覆写 model 会切到对应档案。"""
+        name = str(model or self.model)
+        if name not in self._profiles:
+            self._profiles[name] = resolve_image_profile(name, self._cfg)
+        return self._profiles[name]
 
-    def _endpoint(self, operation='generate'):
-        # 端点由 **operation** 决定(OpenAI 语义两端点), protocol 只描述"改图走什么传输":
+    @property
+    def profile(self):
+        """基模型的能力档案(请求级覆写请用 profile_for(model))。"""
+        return self.profile_for(self.model)
+
+    def _supported_hint(self, profile):
+        return ', '.join(p for p in ('prompt', 'size', 'n', 'image') if profile.wire_key(p)) or '无'
+
+    def _unsupported_semantic(self, profile, model, param, detail=''):
+        """语义参数不支持 → fail-loud(附该通道实际支持集, 让模型能改参自愈)。"""
+        return (f"[Error: image_gen 通道({model}) 未声明支持 {param}{detail}——"
+                f"{param} 是语义参数(改了等于改用户意图), 不做静默缩水; "
+                f"该通道支持: {self._supported_hint(profile)}, 可用操作: {profile.op_label(zh=False)}")
+
+    def _endpoint(self, operation='generate', api=None):
+        # 端点由 **operation + 档案的 api** 决定(OpenAI 语义两端点), api 只描述"改图走什么传输":
         #   generate → JSON POST /images/generations(所有通道通用)
-        #   edit     → protocol=images_edits(multipart, OpenAI 官方形态) 与
-        #              images_edits_json(JSON + images[{image_url}], 如 SenseNova)都打 /images/edits
+        #   edit     → images_edits(multipart, OpenAI 官方形态) 与 images_edits_json
+        #              (JSON + images[{image_url}], 如 SenseNova)都打 /images/edits
         # 其它 edits 传输形态(如豆包 seedream 把改图走 generations JSON, 见 new-api PR
-        # #2090)属**未验证扩展点**, 需要时再加 protocol 取值 + 实测, 不提前实现。
-        if operation == 'edit' and self.protocol in self._EDIT_PROTOCOLS:
+        # #2090)属**未验证扩展点**, 需要时再加 api 取值 + 实测, 不提前实现。
+        api = api or self.protocol
+        if operation == 'edit' and api in self._EDIT_PROTOCOLS:
             return auto_make_url(self.api_base, 'images/edits')
         return auto_make_url(self.api_base, 'images/generations')
 
@@ -1548,33 +1904,55 @@ class BaseImageGenClient:
         # multipart 时不能自己设 Content-Type: requests 要写入含 boundary 的头
         return headers
 
-    def _payload(self, prompt, size=None, quality=None, n=None, output_format=None, model=None, stream=None):
-        payload = {"model": model or self.model, "prompt": prompt, "n": int(n or 1)}
+    def _build_payload(self, profile, prompt, size=None, quality=None, n=None,
+                       output_format=None, model=None, stream=None):
+        """按**档案**构造请求体: 只发档案声明支持的参数(构造期裁剪, 不是发出去再裁)。
+
+        返回 (payload|None, notices, err):
+          notices —— 本次被省略的装饰参数(可省, 但必须明示给模型/用户);
+          err     —— 语义参数不被支持(fail-loud, 不静默缩水)。"""
+        model_eff = str(model or self.model)
+        notices = []
+        payload = {'model': model_eff, 'prompt': prompt, 'n': int(n or 1)}
+        # size: 协议必传(new-api 图片计费按 size 校验) + 语义参数 → 不支持则如实报错
+        wire_size = profile.wire_key('size')
+        if wire_size is None:
+            return None, notices, self._unsupported_semantic(profile, model_eff, 'size')
         # new-api 类中转实测(2026-08-14): size 必传(图片尺寸计费), 缺省会
-        # 500 "图片尺寸计费需要传 size"。默认 1024x1024 = OpenAI 官方默认值,
-        # 对 dall-e/gpt-image/gemini-image 全部兼容。个别模型(sensenova 系)
-        # size 集合特殊(无 1024x1024), 由错误文本诚实引导模型改传。
-        payload["size"] = size or "1024x1024"
-        if quality:
-            payload["quality"] = quality
-        # 二轮审查 I-3: response_format/output_format 仅 dall-e 系列发送——
-        # gpt-image 恒返回 b64_json, 发 response_format 可能 400, 废掉默认
-        # 同步路径; dall-e-3 无 output_format 概念, 同样裁剪。
-        if self._is_dalle():
-            payload["response_format"] = "b64_json"
-        elif output_format and output_format != "png":
-            # png 是协议默认输出格式: 显式发它只是给上游多一个 400 借口
-            # (实测 agnes text image queue 直接拒收 output_format), 故不发;
-            # 仅非默认格式(webp/jpeg)才显式声明。真实容器以魔数嗅探为准。
-            payload["output_format"] = output_format
-        # 已协商过的"该网关+模型不支持"装饰性参数不再重复发送(去掉每次一次白 400)。
-        for name in _IMAGE_GEN_TRIM_MEMO.get(_image_gen_memo_key(self.api_base, payload["model"]), ()):
+        # 500 "图片尺寸计费需要传 size"。默认 1024x1024 = OpenAI 官方默认值。
+        size_req = str(size or "1024x1024")
+        # size 的形态逐通道不同(2026-09-14 实测): 形态不符如实报错, 不静默替换用户要求的尺寸
+        if profile.size_style == 'pixels' and not _IMAGE_SIZE_PIXELS_RE.match(size_req):
+            return None, notices, (f"[Error: image_gen 通道({model_eff}) 的 size 只接受 WxH 像素"
+                                   f"(实测该网关对档位回「图片尺寸格式错误，应为 宽x高，例如 1024x1024」); "
+                                   f"收到 {size_req!r}——size 是语义参数, 不静默替换; 请传如 1024x1024 / 1536x1024")
+        if profile.size_style == 'tier' and not _IMAGE_SIZE_TIER_RE.match(size_req):
+            return None, notices, (f"[Error: image_gen 通道({model_eff}) 的 size 只接受档位(1K/2K); "
+                                   f"收到 {size_req!r}——size 是语义参数, 不静默替换")
+        payload[wire_size] = size_req
+        # 装饰参数: 档案声明支持才发; 不支持的省略并明示(不静默)
+        #   output_format: png 是协议默认值 → 不发(显式发 png 只是多一个上游 400 借口)
+        for name, value in (('quality', quality),
+                            ('output_format', output_format if output_format and output_format != 'png' else None),
+                            ('stream', True if stream else None)):
+            if value is None:
+                continue
+            wire = profile.wire_key(name)
+            if wire is None:
+                notices.append((name, f"该通道未声明支持 {name}，已省略（不影响请求语义）"))
+                continue
+            payload[wire] = value
+        payload.update(profile.fixed)          # 如 dall-e 的 response_format=b64_json
+        # 已协商过的"该网关+模型不支持"装饰参数不再重复发送(去掉每次一次白 400)。
+        for name in _IMAGE_GEN_TRIM_MEMO.get(_image_gen_memo_key(self.api_base, model_eff), ()):
             payload.pop(name, None)
-        if stream:
-            payload["stream"] = True
-        for key, value in self.extra_params.items():
+        # 档案声明的透传参数(如 SenseNova watermark=false): 内置档案里的是可信代码常量,
+        # 不得覆盖语义字段(否则等于档案静默改写用户意图)
+        for key, value in profile.extra_params.items():
+            if key in self._PROTECTED_PAYLOAD_KEYS:
+                raise ValueError(f"image_gen: 档案 extra_params 不得覆盖语义参数 {key}")
             payload[key] = value
-        return payload
+        return payload, notices, None
 
     def _delay(self, resp, attempt):
         """仿 _stream_with_retry 退避: retry-after 头优先, 超上限不重试;
@@ -1587,7 +1965,7 @@ class BaseImageGenClient:
         # 与 _stream_with_retry(447-487) 完全一致: retry-after=0 时也走指数退避。
         return None if ra is not None and ra > self.max_retry_after else max(_BACKOFF_MIN, ra or min(_BACKOFF_CAP, _IMG_BACKOFF_BASE * (2 ** attempt)))
 
-    def _post(self, payload, stream=False, files=None, operation='generate'):
+    def _post(self, payload, stream=False, files=None, operation='generate', api=None):
         """带重试语义的 POST + 参数协商自愈。
 
         单轮语义见 _post_once(429/408/5xx 退避集合 + retry-after 上限)。
@@ -1602,7 +1980,8 @@ class BaseImageGenClient:
         trims = 0
         conservative_done = False
         while True:
-            out, err, err_body, err_status = self._post_once(payload, stream=stream, files=files, operation=operation)
+            out, err, err_body, err_status = self._post_once(payload, stream=stream, files=files,
+                                                              operation=operation, api=api)
             if err is None:
                 return out, None
             if err_status in _IMAGE_GEN_PARAM_TRIM_STATUS and trims < _IMAGE_GEN_MAX_PARAM_TRIMS:
@@ -1611,7 +1990,10 @@ class BaseImageGenClient:
                     payload.pop(name, None)
                     trims += 1
                     _image_gen_remember_trim(self.api_base, payload.get("model"), [name])
+                    self.last_notices.append(
+                        (name, "上游拒绝该参数，已自动裁剪（建议把 profile-proposal 固化进档案）"))
                     print(f"[ImageGen Adapt] 上游不支持参数 {name!r}, 已裁剪后重试: {err_body[:160]}")
+                    self._print_profile_proposal([name], payload.get("model"))
                     continue
                 # 错误文本不可判读(网关清洗/非标准话术): 只要还带着装饰性参数,
                 # 就退回"保守参数集"重试**一次**——不依赖上游话术, 使托管形态
@@ -1625,17 +2007,26 @@ class BaseImageGenClient:
                             payload.pop(k, None)
                         conservative_done = True
                         _image_gen_remember_trim(self.api_base, payload.get("model"), dropped)
+                        self.last_notices.append(
+                            (', '.join(dropped), "4xx 错误体不可判读（疑被网关清洗）→ 退回保守参数集"))
                         print(f"[ImageGen Adapt] 4xx 不可判读(疑被网关清洗), 退回保守参数集(丢弃 {', '.join(dropped)})重试一次: {err_body[:160]}")
+                        self._print_profile_proposal(dropped, payload.get("model"))
                         continue
             # 预算用尽/无可裁剪参数 → 如实返回上游错误(不返回合成"耗尽"文本,
             # 保留上游 message 供模型自愈改参)。
             return None, err
 
-    def _post_once(self, payload, stream=False, files=None, operation='generate'):
+    def _print_profile_proposal(self, names, model):
+        """把协商学到的结论打一行**可直接固化进 catalog** 的补丁（运行时发现 → 数据）。"""
+        prop = self.profile_for(model).proposal(names, self.api_base, model)
+        print(f"[ImageGen Adapt] profile-proposal: {json.dumps(prop['maps_patch'], ensure_ascii=False)}"
+              f"  # key={prop['key']} where={prop['where']}")
+
+    def _post_once(self, payload, stream=False, files=None, operation='generate', api=None):
         """单轮 POST(仿 _stream_with_retry: 429/408/5xx 退避集合 + retry-after
         上限)。返回 (resp|dict|None, err_text, err_body, err_status); err_body
         仅供参数协商解析(非 4xx 时为 "")。files 非空 → multipart。"""
-        url = self._endpoint(operation)
+        url = self._endpoint(operation, api)
         headers = self._headers(multipart=bool(files))
         # multipart 的"参数"在表单字段里, 协商裁剪同样作用于 payload(表单字段)
         send = {"data": dict(payload), "files": files} if files else {"json": dict(payload)}
@@ -1761,20 +2152,22 @@ class BaseImageGenClient:
             return None, "[Error: image_gen 图片直链下载为空]"
         return b"".join(chunks), None
 
-    def _operation_supported(self, operation):
-        return operation in getattr(self, 'operations', ())
-
-    def _validate_edit_images(self, images):
+    def _validate_edit_images(self, images, profile=None):
         """把调用方给的参考图规整成 requests 的 multipart files 列表。
 
         images 元素: (filename, bytes, mime) —— **由工具层读盘并做路径安全/大小校验**，
         客户端只管发送(保持 llmcore 不依赖 cwd/文件系统语义, 也便于单测)。
+        参考图上限真值在**档案**(limits.max_refs)；未声明上限时回退类常量。
         返回 (list[(name, raw, mime)], err_text)。"""
         if not images:
             return [], "[Error: image_gen 改图需要参考图(image 参数)]"
-        if len(images) > self.MAX_EDIT_IMAGES:
-            return [], (f"[Error: image_gen 改图当前仅支持 {self.MAX_EDIT_IMAGES} 张参考图(多图形态未经上游实测, "
-                        f"见 .tasks/image-capability/DESIGN.zh-CN.md §2), 收到 {len(images)} 张]")
+        max_refs = profile.max_refs if (profile and profile.max_refs) else self.MAX_EDIT_IMAGES
+        if len(images) > max_refs:
+            # 上限真值在档案（逐通道不同：JSON 形态实测 1..5，multipart 只读单值字段）
+            src = (profile.source if profile else 'default')
+            return [], (f"[Error: image_gen 改图当前仅支持 {max_refs} 张参考图"
+                        f"(通道档案 limits.max_refs, 来源={src}；超过不静默只取第一张), 收到 {len(images)} 张——"
+                        f"请改传 ≤{max_refs} 张，或分多次调用")
         out = []
         for idx, item in enumerate(images, 1):
             try:
@@ -1792,67 +2185,92 @@ class BaseImageGenClient:
     def generate(self, prompt, size=None, quality=None, n=1, output_format=None, model=None, images=None):
         """统一入口。operation 由是否带参考图决定: 带图=改图(edit)、不带=文生图(generate)。
 
-        **能力 gate(2026-09-13)**: 调用本通道未声明的 operation 一律 fail-closed——
-        因为存在"网关照文档收下参数但静默丢弃"的通道(实测 agnes 的 extra_body.image),
-        宁可知情失败, 不可假装成功。返回 (images|None, err_text)。"""
+        **能力 gate**: 调用档案未声明的 operation 一律 fail-closed——因为存在"网关照文档
+        收下参数但静默丢弃"的通道(实测 agnes 的 extra_body.image), 宁可知情失败, 不可假装成功。
+        **语义上限 gate**: n 超档张数上限也不静默缩水(张数属用户可见契约)。
+        返回 (images|None, err_text); 本次省略的装饰参数在 self.last_notices。"""
         images = list(images or [])
+        model_eff = str(model or self.model)
+        profile = self.profile_for(model_eff)
         operation = 'edit' if images else 'generate'
-        if not self._operation_supported(operation):
+        self.last_notices = []
+        if not profile.supports(operation):
             want = '改图(image.edit)' if operation == 'edit' else '文生图(image.generate)'
-            have = ','.join(sorted(getattr(self, 'operations', ()))) or '无'
-            return None, (f"[Error: image_gen 当前配置({self.model} @ {self.api_base}) 未声明{want}能力"
-                          f"(已声明: {have}, protocol={self.protocol})——不要重试本工具, 请如实告知用户"
-                          f"该通道做不到, 或换用已声明该能力的配置]")
+            have = ','.join(sorted(profile.ops)) or '无'
+            return None, (f"[Error: image_gen 当前配置({model_eff} @ {self.api_base}) 未声明{want}能力"
+                          f"(已声明: {have}, protocol={profile.api}, 档案来源={profile.source})——不要重试本工具, "
+                          f"请如实告知用户该通道做不到, 或换用已声明该能力的配置]")
+        n_int = max(1, int(n or 1))
+        if n_int > profile.max_n:
+            return None, (f"[Error: image_gen 通道({model_eff}) 单次最多 {profile.max_n} 张, 本次请求 {n_int} 张——"
+                          f"张数是语义参数(用户可见契约), 不静默缩水; 请改为 ≤{profile.max_n} 张或换用支持更多的通道")
         if operation == 'edit':
-            valid, ferr = self._validate_edit_images(images)
+            valid, ferr = self._validate_edit_images(images, profile)
             if ferr:
                 return None, ferr
-            if self.protocol == self.PROTOCOL_EDITS:
+            if profile.api == self.PROTOCOL_EDITS:
                 files = [("image", (name, raw, mime)) for name, raw, mime in valid]
-                return self._generate_sync(prompt, size=size, quality=quality, n=n,
-                                           output_format=output_format, model=model, files=files,
-                                           operation='edit')
+                return self._generate_sync(prompt, size=size, quality=quality, n=n_int,
+                                           output_format=output_format, model=model_eff, files=files,
+                                           operation='edit', profile=profile)
             # images_edits_json: 图片以 images[{image_url: Data-URL}] 放进 JSON 体
-            override = self._payload(prompt, size=size, quality=quality, n=n,
-                                     output_format=output_format, model=model, stream=False)
+            override, notices, perr = self._build_payload(
+                profile, prompt, size=size, quality=quality, n=n_int,
+                output_format=output_format, model=model_eff, stream=False)
+            if perr:
+                return None, perr
+            self.last_notices = notices
             override['images'] = [{"image_url": _image_gen_data_url(raw, mime)} for _, raw, mime in valid]
-            return self._generate_sync(prompt, size=size, quality=quality, n=n,
-                                       output_format=output_format, model=model,
-                                       payload_override=override, operation='edit')
-        if self.stream and int(n or 1) <= 1 and not self._is_dalle():
-            # 流式仅 gpt-image 系列: dall-e 不支持 stream/partial_images
-            frame, err = self.generate_stream(prompt, size=size, quality=quality, n=n,
-                                              output_format=output_format, model=model)
+            return self._generate_sync(prompt, size=size, quality=quality, n=n_int,
+                                       output_format=output_format, model=model_eff,
+                                       payload_override=override, operation='edit', profile=profile)
+        if self.stream and n_int <= 1 and profile.wire_key('stream') is not None:
+            # 流式仅档案声明支持 stream 的模型(gpt-image 系): dall-e/agnes 均未声明
+            frame, err = self.generate_stream(prompt, size=size, quality=quality, n=n_int,
+                                              output_format=output_format, model=model_eff, profile=profile)
             if frame is not None:
                 return [frame], None
             print(f"[ImageGen] 流式路径失败({err}), 降级重试同步路径一次")
-            images_out, sync_err = self._generate_sync(prompt, size=size, quality=quality, n=n,
-                                                       output_format=output_format, model=model)
+            images_out, sync_err = self._generate_sync(prompt, size=size, quality=quality, n=n_int,
+                                                       output_format=output_format, model=model_eff,
+                                                       profile=profile)
             if sync_err:
                 return None, sync_err
             return images_out, None
-        return self._generate_sync(prompt, size=size, quality=quality, n=n,
-                                   output_format=output_format, model=model)
+        return self._generate_sync(prompt, size=size, quality=quality, n=n_int,
+                                   output_format=output_format, model=model_eff, profile=profile)
 
     def _generate_sync(self, prompt, size=None, quality=None, n=1, output_format=None, model=None,
-                       files=None, operation='generate', payload_override=None):
+                       files=None, operation='generate', payload_override=None, profile=None):
         """同步路径: POST {apibase}/images/generations(或 /images/edits) → b64_json/url → bytes 列表。"""
-        payload = payload_override if payload_override is not None else self._payload(
-            prompt, size=size, quality=quality, n=n,
-            output_format=output_format, model=model, stream=False)
-        data, err = self._post(payload, stream=False, files=files, operation=operation)
+        profile = profile or self.profile_for(model)
+        if payload_override is not None:
+            payload = payload_override
+        else:
+            payload, notices, perr = self._build_payload(profile, prompt, size=size, quality=quality, n=n,
+                                                         output_format=output_format, model=model, stream=False)
+            if perr:
+                return None, perr
+            self.last_notices = notices
+        data, err = self._post(payload, stream=False, files=files, operation=operation, api=profile.api)
         if err:
             return None, err
         return self._extract_images(data)
 
-    def generate_stream(self, prompt, size=None, quality=None, n=1, output_format=None, model=None):
-        """流式路径(仅 gpt-image 系列): stream:true + partial_images:0-3 SSE
+    def generate_stream(self, prompt, size=None, quality=None, n=1, output_format=None, model=None, profile=None):
+        """流式路径(仅档案声明支持 stream 的模型): stream:true + partial_images:0-3 SSE
         → 取最终帧。失败(SSE 解析失败/超时/无最终帧/收到非流式 JSON)由
         generate() 降级同步路径一次。返回 (final_frame_bytes|None, err_text)。"""
-        payload = self._payload(prompt, size=size, quality=quality, n=n,
-                                output_format=output_format, model=model, stream=True)
-        payload["partial_images"] = 0  # 0=只要最终帧; 1-3=含渐进帧(不落盘)
-        resp, err = self._post(payload, stream=True)
+        profile = profile or self.profile_for(model)
+        payload, notices, perr = self._build_payload(profile, prompt, size=size, quality=quality, n=n,
+                                                     output_format=output_format, model=model, stream=True)
+        if perr:
+            return None, perr
+        self.last_notices = notices
+        wire_pi = profile.wire_key('partial_images')
+        if wire_pi:
+            payload[wire_pi] = 0  # 0=只要最终帧; 1-3=含渐进帧(不落盘)
+        resp, err = self._post(payload, stream=True, api=profile.api)
         if err:
             return None, err
         ctype = (resp.headers or {}).get("content-type", "") or ""
@@ -1919,6 +2337,56 @@ def _edit_config_name(name):
     好处: "免费文生图"与"付费改图"可以分开配置(与主流网关按 operation 路由到不同上游一致)。"""
     base = name[:-4] if str(name).endswith('_gen') else str(name)
     return f'{base}_edit'
+
+
+def render_image_gen_capabilities(lang='zh', cfg_name='image_gen'):
+    """把**当前配置通道**的能力渲染成文本（工具 schema 的能力段落，单一真值 = 档案）。
+
+    存在的理由：能力知识写死在自然语言里必然与代码漂移——2026-09-14 实证：同一个工具
+    描述里同时写着"当前路由上不存在参考图/改图能力"和"传 image 就是改图"。这里同一份
+    档案既构造请求又渲染描述，不可能再自相矛盾。"""
+    zh = str(lang).lower() != 'en'
+    try:
+        keys = reload_mykeys()[0] or {}
+    except Exception:
+        keys = {}
+    if not keys.get(cfg_name):
+        return ('生图通道未配置（image_gen）：调用本工具会立刻返回未配置错误——不要重试，如实告知用户生图未启用。'
+                if zh else
+                'Image channel not configured (image_gen): calls fail immediately. Do not retry; tell the user.')
+    lines = []
+    for name, label in ((cfg_name, '生图通道' if zh else 'generate channel'),
+                        (_edit_config_name(cfg_name), '改图通道' if zh else 'edit channel')):
+        sub = keys.get(name)
+        if not sub:
+            continue
+        model = str(sub.get('model', ''))
+        try:
+            prof = resolve_image_profile(model, sub)
+        except ValueError as e:
+            lines.append(f"[{label}] 配置非法: {e}" if zh else f"[{label}] invalid config: {e}")
+            continue
+        host = str(sub.get('apibase', '')).split('//')[-1].split('/')[0]
+        lines.append(f"[{label}] {prof.describe(model, host, zh)}")
+    if not keys.get(_edit_config_name(cfg_name)):
+        lines.append('改图通道未单独配置（image_edit）：改图能力以上述生图通道的档案声明为准。' if zh else
+                     'No separate edit channel (image_edit): edit capability follows the generate channel profile above.')
+    lines.append('未声明支持的能力一律 fail-closed（如实告知用户做不到，不要重试）；语义参数（size/n）不静默缩水。'
+                 if zh else
+                 'Unsupported capabilities fail closed (tell the user, do not retry); semantic params (size/n) are never silently shrunk.')
+    return '\n'.join(lines)
+
+
+def inject_image_gen_capabilities(schema, text, tool_name='image_gen'):
+    """把能力文本注入指定工具的占位符 `{{IMAGE_GEN_CAPABILITIES}}`（其它工具不动）。"""
+    token = '{{IMAGE_GEN_CAPABILITIES}}'
+    out = []
+    for item in schema or []:
+        fn = item.get('function') if isinstance(item, dict) else None
+        if isinstance(fn, dict) and fn.get('name') == tool_name and token in str(fn.get('description', '')):
+            item = {**item, 'function': {**fn, 'description': fn['description'].replace(token, text)}}
+        out.append(item)
+    return out
 
 
 def resolve_image_gen(name='image_gen', operation='generate'):

@@ -1,0 +1,138 @@
+{
+  "listing": {
+    "status": 200,
+    "models": [
+      "agnes-2.0-flash",
+      "agnes-2.5-flash",
+      "agnes-3.0-flash",
+      "agnes-image-2.0-flash",
+      "agnes-image-2.1-flash",
+      "agnes-image-2.5-flash",
+      "agnes-video-2.5",
+      "agnes-video-2.5-flash",
+      "agnes-video-v2.0",
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+      "gemini-3-pro-image",
+      "gemini-3-pro-image-preview",
+      "gemini-3.0-pro-image-preview",
+      "gemini-3.1-flash-image",
+      "gemini-3.1-flash-image-preview",
+      "glm-5.2",
+      "gpt-image-2",
+      "gpt-image-2.5-flare",
+      "kimi-k3",
+      "sensenova-6.7-flash-lite",
+      "sensenova-6.8-flash-lite",
+      "sensenova-u1-fast",
+      "sensenova-u1.5-lite"
+    ]
+  },
+  "results": [
+    {
+      "model": "gemini-3.1-flash-image",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140529501172138738268d9d60BVbj7iE)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.8
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"image is required (request id: 202609140529505396906078268d9d688k7QG3L)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": true,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"image is required (request id: 202609140529519151255728268d9d6KNT8wJcS)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 1.4
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gemini-3-pro-image",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140529533289462378268d9d6CBC2JO0O)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"image is required (request id: 202609140529537491671388268d9d6OYmVZLc9)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": true,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"image is required (request id: 202609140529551229982348268d9d6PRvjgtNx)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 1.4
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gpt-image-2",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140529565431134678268d9d6721kmGX5)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"image is required (request id: 202609140529569604989258268d9d6UxLGEMQD)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": true,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form (request id: 202609140529583249818438268d9d61V8cBJ2K)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 1.4
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "sensenova-u1.5-lite",
+      "generate_endpoint": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"invalid size, should be auto or WIDTHxHEIGHT. width and height should be multiples of 32, width and height should be in [512,4096], and aspect ratio should be within 3:1\",\"type\":\"invalid_request_error\",\"param\":\"\",\"code\":\"3\"}}",
+        "elapsed": 0.8
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"image is required (request id: 202609140529595361333228268d9d60HIBNiXz)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": true,
+      "edit_json": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"invalid images, should contain between 1 and 5 items\",\"type\":\"invalid_request_error\",\"param\":\"\",\"code\":\"3\"}}",
+        "elapsed": 0.7
+      },
+      "edit_json_ok": true
+    },
+    {
+      "model": "agnes-image-2.5-flash",
+      "generate_endpoint": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"prompt is required (request id: 20260914053001326842497tO54QzRg)\",\"type\":\"invalid_request\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.1
+      },
+      "generate_ok": true,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"image is required (request id: 202609140530017401588388268d9d6YOLRBbWx)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": true,
+      "edit_json": {
+        "status": null,
+        "error": "ReadTimeout: HTTPSConnectionPool(host='newapi.myovo.cc.cd', port=443): Read timed out. (read timeout=30)",
+        "elapsed": 30.0
+      },
+      "edit_json_ok": false
+    }
+  ]
+}

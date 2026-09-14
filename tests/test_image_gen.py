@@ -11,6 +11,7 @@
 
 import base64
 import json
+import pathlib
 import re
 
 import pytest
@@ -22,6 +23,11 @@ _1PX_PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000000010000000108060000001f15c489"
     "0000000d4944415478da63fcffff3f0300050001ff1aa1e66e0000000049454e44ae426082"
 )
+
+# 未建档模型（catalog 无此名）: 档案为"宽松集 + 未验证"，是**兜底自愈**类用例的被测通道。
+# 已建档模型在构造期就把已知不支持的参数裁掉（见 TestChannelProfileCatalog），
+# 因此那些用例必须改用未建档通道才能触发协商路径。
+_UNLISTED_MODEL = "relay-unlisted-image-9"
 
 
 class _FakeResponse:
@@ -454,7 +460,10 @@ class TestDoImageGen:
         monkeypatch.setattr(ga, "resolve_image_gen",
                             lambda name, operation='generate': self._client_with(monkeypatch, [_sync_response([self.B64])]))
         outcome = _drain(h.do_image_gen({"prompt": "a cat", "output_format": "jpeg"}, None))
-        assert re.match(r"^\[FILE:outputs/image_\d{8}_\d{6}_\d{6}\.png\]$", outcome.data)
+        lines = outcome.data.strip().split("\n")
+        assert re.match(r"^\[FILE:outputs/image_\d{8}_\d{6}_\d{6}\.png\]$", lines[-1])
+        # 工具结果里如实告知（不只显示流）: 上游忽略了请求的格式
+        assert "上游返回格式与请求不符" in outcome.data
         assert list((tmp_path / "outputs").glob("image_*.png"))
         assert not list((tmp_path / "outputs").glob("image_*.jpeg"))
 
@@ -473,13 +482,15 @@ class TestDoImageGen:
 # ───────────── 客户端：参数协商自愈（2026-09-13 真实上游实测） ─────────────
 
 class TestClientParamNegotiation:
-    """上游按"队列"裁剪参数(实测 new-api 中转 → agnes-image-2.5-flash 的 text
-    image queue): 收到 output_format/quality 直接 400 invalid_request，而
-    gpt-image-2 恰好接受 output_format。客户端按错误文本协商裁剪后重试，
-    而不是按模型名黑名单（方案 §4 原则）。"""
+    """上游按"队列"裁剪参数(实测 new-api 中转 → agnes 的 text image queue):
+    收到 output_format/quality 直接 400 invalid_request，而 gpt-image-2 恰好接受。
+
+    2026-09-14 档案化后，**已建档模型不会再把已知不支持的参数发出去**（构造期裁剪，
+    见 TestChannelProfileCatalog），所以本类改测**未建档通道**的兜底自愈：
+    上游拒绝时按错误文本裁剪重试，而不是按模型名黑名单。"""
 
     CFG = {"name": "openai", "apibase": "https://api.openai.com/v1",
-           "apikey": "sk-test", "model": "agnes-image-2.5-flash"}
+           "apikey": "sk-test", "model": _UNLISTED_MODEL}
     B64 = base64.b64encode(_1PX_PNG).decode()
 
     @staticmethod
@@ -500,7 +511,7 @@ class TestClientParamNegotiation:
         # 只裁被点名的参数，其余原样（不能连带把 quality 也丢掉）
         assert "output_format" not in second
         assert second["quality"] == "high" and second["size"] == "1024x1024"
-        assert second["model"] == "agnes-image-2.5-flash" and second["prompt"] == "a cat"
+        assert second["model"] == _UNLISTED_MODEL and second["prompt"] == "a cat"
 
     def test_quality_trimmed_then_success(self, monkeypatch):
         fake = _install_fake_http(monkeypatch, [self._err400("quality"), _sync_response([self.B64])])
@@ -604,7 +615,7 @@ class TestConservativeFallbackOnOpaque4xx:
     退回保守参数集重试**一次**(纯装饰参数, 不影响请求语义/交付契约)。"""
 
     CFG = {"name": "openai", "apibase": "https://api.openai.com/v1",
-           "apikey": "sk-test", "model": "agnes-image-2.5-flash", "max_retries": 0}
+           "apikey": "sk-test", "model": _UNLISTED_MODEL, "max_retries": 0}
     B64 = base64.b64encode(_1PX_PNG).decode()
     _OPAQUE = json.dumps({"code": "UPSTREAM_ERROR", "message": "upstream request failed"})
 
@@ -623,7 +634,7 @@ class TestConservativeFallbackOnOpaque4xx:
         # 保守集: 装饰性参数全丢, 但请求语义(必需参数)保持
         for k in llmcore._IMAGE_GEN_TRIMMABLE:
             assert k not in second
-        assert second["model"] == "agnes-image-2.5-flash" and second["prompt"] == "a cat"
+        assert second["model"] == _UNLISTED_MODEL and second["prompt"] == "a cat"
         assert second["size"] == "1024x1024" and second["n"] == 1
 
     def test_conservative_fallback_happens_only_once(self, monkeypatch):
@@ -669,7 +680,7 @@ class TestTrimMemoRemovesRepeatedWastedCalls:
     后续请求直接不发那些装饰性参数。"""
 
     CFG = {"name": "openai", "apibase": "https://relay.example/v1",
-           "apikey": "sk-test", "model": "agnes-image-2.5-flash", "max_retries": 0}
+           "apikey": "sk-test", "model": _UNLISTED_MODEL, "max_retries": 0}
     B64 = base64.b64encode(_1PX_PNG).decode()
 
     @staticmethod
@@ -962,3 +973,180 @@ class TestJsonEditProtocol:
 
     def test_data_url_mime_propagates(self):
         assert llmcore._image_gen_data_url(b"abc", "image/webp").startswith("data:image/webp;base64,")
+
+
+class TestToolSurfacesOmittedParams:
+    """档案省下的装饰参数必须进**工具结果**（不只是显示流）——模型据此知道本次实际生效
+    的参数集，不会以为 webp/quality 已经生效。"""
+
+    B64 = base64.b64encode(_1PX_PNG).decode()
+
+    def test_omitted_decorative_params_reported_to_model(self, monkeypatch, tmp_path):
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = llmcore.OpenAIImageGenClient({"name": "openai", "apibase": "https://relay.example/v1",
+                                               "apikey": "sk-test", "model": "agnes-image-2.5-flash",
+                                               "max_retries": 0})
+        h = _handler(tmp_path)
+        monkeypatch.setattr(ga, "resolve_image_gen", lambda name, operation='generate': client)
+        outcome = _drain(h.do_image_gen({"prompt": "a cat", "quality": "high", "output_format": "webp"}, None))
+        assert "[FILE:outputs/" in outcome.data          # 产物照常交付
+        assert "已省略" in outcome.data and "quality" in outcome.data
+        body = fake.calls[0][1]["json"]
+        assert "quality" not in body and "output_format" not in body
+        assert body["size"] == "1024x1024"
+
+
+# ═══════════ 通道能力档案（2026-09-14，成熟产品形态；DESIGN §8） ═══════════
+
+class TestChannelProfileCatalog:
+    """能力是**数据**：catalog 逐模型声明"支持什么 / 实测被拒什么"，请求在构造期就
+    裁干净，不再"发出去撞 400 再裁"。对齐成熟做法（pi 的 ImagesModel.api + registry、
+    OpenRouter 的 supported_parameters、LiteLLM 的 get_supported_openai_params：不支持
+    的参数默认报错，静默丢弃是显式 opt-in）。"""
+
+    B64 = base64.b64encode(_1PX_PNG).decode()
+
+    def _c(self, monkeypatch, responses, model, **extra):
+        fake = _install_fake_http(monkeypatch, responses)
+        cfg = {"name": "openai", "apibase": "https://relay.example/v1", "apikey": "sk-test",
+               "model": model, "max_retries": 0, **extra}
+        return fake, llmcore.OpenAIImageGenClient(cfg)
+
+    def test_rejected_decorative_params_not_sent_and_reported(self, monkeypatch):
+        # agnes text image queue 实测拒收 output_format/quality → 构造期就不发,
+        # 且必须明示"省略了什么"(装饰参数可省, 但不能静默)
+        fake, client = self._c(monkeypatch, [_sync_response([self.B64])], "agnes-image-2.5-flash")
+        images, err = client.generate("a cat", size="1K", quality="high", output_format="webp")
+        assert err is None and images == [_1PX_PNG]
+        assert len(fake.calls) == 1
+        body = fake.calls[0][1]["json"]
+        assert "quality" not in body and "output_format" not in body
+        assert body["size"] == "1K" and body["n"] == 1
+        assert {p for p, _ in client.last_notices} == {"quality", "output_format"}
+
+    def test_catalog_decides_api_and_edit_shape_without_config(self, monkeypatch):
+        # 配置里没有任何 protocol/operations: 端点与改图形态由档案决定
+        fake, client = self._c(monkeypatch, [_sync_response([self.B64])], "sensenova-u1.5-lite")
+        images, err = client.generate("把方块改成绿色", images=[("ref.png", _1PX_PNG, "image/png")])
+        assert err is None and images == [_1PX_PNG]
+        url, kwargs = fake.calls[0]
+        assert url.endswith("/images/edits") and "json" in kwargs and "files" not in kwargs
+        assert kwargs["json"]["images"][0]["image_url"].startswith("data:image/png;base64,")
+        assert kwargs["json"]["watermark"] is False      # 档案声明的 fixed/extra 参数
+
+    def test_catalog_decides_edit_capability(self, monkeypatch):
+        # agnes 档案只声明 generate → 带参考图必须 fail-closed(不许悄悄按文生图出图)
+        fake, client = self._c(monkeypatch, [], "agnes-image-2.5-flash")
+        images, err = client.generate("x", images=[("r.png", _1PX_PNG, "image/png")])
+        assert images is None and fake.calls == []
+        assert "未声明" in err and "image.edit" in err
+
+    def test_semantic_limit_from_profile_fails_loud(self, monkeypatch):
+        # n 是语义参数(张数属用户契约): 档案 max_n=1 时 n=2 必须如实拒绝, 不静默只出 1 张
+        fake, client = self._c(monkeypatch, [], "sensenova-u1.5-lite")
+        images, err = client.generate("x", n=2)
+        assert images is None and fake.calls == []
+        assert err.startswith("[Error: image_gen") and "n" in err and "1" in err
+
+    def test_unlisted_model_permissive_but_declared_unverified(self, monkeypatch):
+        # 未建档 ≠ 静默降级: 宽松集发送 + 自愈, 但档案被显式标为未验证(可被工具告知模型)
+        fake, client = self._c(monkeypatch, [_sync_response([self.B64])], _UNLISTED_MODEL)
+        assert client.profile.source == "unverified"
+        client.generate("x", quality="high", output_format="webp")
+        body = fake.calls[0][1]["json"]
+        assert body["quality"] == "high" and body["output_format"] == "webp"
+
+    def test_config_explicit_declaration_beats_catalog(self, monkeypatch):
+        # 运营显式声明优先于内置档案(catalog 只是默认值)
+        fake, client = self._c(monkeypatch, [], "agnes-image-2.5-flash",
+                               protocol="images_edits", operations=["edit"])
+        assert client.protocol == "images_edits"
+        assert "edit" in client.operations
+        assert client.generate("x")[1].startswith("[Error: image_gen")   # 只声明 edit → 文生图 fail-closed
+        assert fake.calls == []
+
+    def test_per_request_model_override_switches_profile(self, monkeypatch):
+        # 模型决定能力: 请求里覆写 model 时档案随之切换
+        fake, client = self._c(monkeypatch, [_sync_response([self.B64])], "agnes-image-2.5-flash")
+        client.generate("x", quality="high", model="gpt-image-1")
+        body = fake.calls[0][1]["json"]
+        assert body["model"] == "gpt-image-1" and body["quality"] == "high"
+
+    def test_size_form_is_per_channel_and_never_silently_replaced(self, monkeypatch):
+        # 2026-09-14 实测：agnes 接受档位 1K；gemini/gpt-image/sensenova 只接受 WxH
+        # （传档位被网关回「图片尺寸格式错误，应为 宽x高」且该错被标成 500）。
+        # size 是语义参数 → 形态不符必须 fail-loud，不静默替成 1024x1024。
+        fake, client = self._c(monkeypatch, [], "gemini-3.1-flash-image")
+        images, err = client.generate("a cat", size="1K")
+        assert images is None and fake.calls == []
+        assert err.startswith("[Error: image_gen") and "WxH" in err and "1K" in err
+        # 同一条通道的 WxH 请求正常发出
+        fake2, client2 = self._c(monkeypatch, [_sync_response([self.B64])], "gemini-3.1-flash-image")
+        assert client2.generate("a cat", size="1536x1024")[0] == [_1PX_PNG]
+        assert fake2.calls[0][1]["json"]["size"] == "1536x1024"
+
+    def test_reference_limit_is_per_channel(self, monkeypatch):
+        # sensenova 档案 max_refs=5（实测网关回 invalid images, should contain between 1 and 5 items）
+        fake, client = self._c(monkeypatch, [_sync_response([self.B64])], "sensenova-u1.5-lite")
+        images, err = client.generate("합성", images=[("a.png", _1PX_PNG, "image/png"),
+                                                     ("b.png", _1PX_PNG, "image/png")])
+        assert err is None
+        assert len(fake.calls[0][1]["json"]["images"]) == 2
+
+    def test_describe_states_size_form(self, monkeypatch):
+        prof = llmcore.resolve_image_profile("gemini-3.1-flash-image", {})
+        assert "WxH" in prof.describe("gemini-3.1-flash-image", "relay", zh=True)
+        prof2 = llmcore.resolve_image_profile("agnes-image-2.5-flash", {})
+        assert "1K/2K" in prof2.describe("agnes-image-2.5-flash", "relay", zh=True)
+
+    def test_learned_trim_logs_profile_proposal(self, monkeypatch, capsys):
+        # 有界自愈学到的结论必须可固化成 catalog 补丁(不再只躲在进程内记忆里)
+        err400 = _FakeResponse(status_code=400, text=json.dumps(
+            {"error": {"message": "quality is not supported by this queue"}}))
+        fake, client = self._c(monkeypatch, [err400, _sync_response([self.B64])], _UNLISTED_MODEL)
+        images, err = client.generate("x", quality="high")
+        assert err is None and len(fake.calls) == 2
+        out = capsys.readouterr().out
+        assert "profile-proposal" in out and "quality" in out
+
+
+class TestCapabilityRendering:
+    """工具能力描述由档案渲染（消除"schema 写死能力 + 代码改了两边不一致"）。"""
+
+    def _mykeys(self, monkeypatch, mapping):
+        monkeypatch.setattr(llmcore, "reload_mykeys", lambda: (mapping, False))
+
+    def test_render_reports_ops_limits_and_cost(self, monkeypatch):
+        self._mykeys(monkeypatch, {
+            "image_gen": {"name": "openai", "apibase": "https://relay/v1", "apikey": "k",
+                          "model": "sensenova-u1.5-lite"},
+        })
+        text = llmcore.render_image_gen_capabilities("zh")
+        assert "sensenova-u1.5-lite" in text
+        assert "改图" in text and "参考图" in text and "免费" in text
+
+    def test_render_reports_unconfigured(self, monkeypatch):
+        self._mykeys(monkeypatch, {})
+        assert "未配置" in llmcore.render_image_gen_capabilities("zh")
+
+    def test_render_flags_unlisted_model(self, monkeypatch):
+        self._mykeys(monkeypatch, {
+            "image_gen": {"name": "openai", "apibase": "https://relay/v1", "apikey": "k",
+                          "model": _UNLISTED_MODEL},
+        })
+        assert "未建档" in llmcore.render_image_gen_capabilities("zh")
+
+    def test_schema_static_text_uses_placeholder_and_has_no_capability_claim(self):
+        for f in ("assets/tools_schema.json", "assets/tools_schema_cn.json"):
+            raw = pathlib.Path(f).read_text(encoding="utf-8")
+            assert "{{IMAGE_GEN_CAPABILITIES}}" in raw, f
+            for stale in ("No reference-image", "不存在参考图", "Only ONE reference image"):
+                assert stale not in raw, (f, stale)
+
+    def test_injection_replaces_placeholder_only_in_image_gen(self):
+        schema = [{"type": "function", "function": {"name": "image_gen",
+                                                    "description": "A {{IMAGE_GEN_CAPABILITIES}} B"}},
+                  {"type": "function", "function": {"name": "code_run", "description": "{{IMAGE_GEN_CAPABILITIES}}"}}]
+        out = llmcore.inject_image_gen_capabilities(schema, "CAP")
+        assert out[0]["function"]["description"] == "A CAP B"
+        assert out[1]["function"]["description"] == "{{IMAGE_GEN_CAPABILITIES}}"   # 其它工具不动

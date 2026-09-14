@@ -6,7 +6,9 @@ if sys.stderr is None: sys.stderr = open(os.devnull, "w")
 elif hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(errors='replace')
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from llmcore import reload_mykeys, ToolClient, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession, resolve_client
+from llmcore import (reload_mykeys, ToolClient, MixinSession, NativeToolClient, NativeClaudeSession,
+                     NativeOAISession, resolve_client, render_image_gen_capabilities,
+                     inject_image_gen_capabilities)
 from agent_loop import agent_runner_loop, media_content_blocks
 try:
     from plugins.hooks import discover_and_load; discover_and_load()
@@ -32,6 +34,10 @@ def load_tool_schema(suffix=''):
         TS = f.read()
     TOOLS_SCHEMA = json.loads(TS if os.name == 'nt' else TS.replace('powershell', 'bash'))
     TOOLS_SCHEMA = [t for t in TOOLS_SCHEMA if t.get('function', {}).get('name') not in BANNED_TOOLS]
+    # 图像能力段落由**档案**渲染（单一真值）: 静态 schema 只留占位符, 否则能力知识会在
+    # 自然语言里与代码漂移(2026-09-14 实证: 描述里同时写着"没有改图能力"与"传 image 就是改图")
+    TOOLS_SCHEMA = inject_image_gen_capabilities(
+        TOOLS_SCHEMA, render_image_gen_capabilities('zh' if suffix == '_cn' else 'en'))
 load_tool_schema()
 
 lang_suffix = '_en' if os.environ.get('GA_LANG', '') == 'en' else ''

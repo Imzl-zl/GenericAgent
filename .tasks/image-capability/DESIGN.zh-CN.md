@@ -1,6 +1,6 @@
 # 图像能力架构设计（2026-09-13 立项）
 
-> 状态：**能力矩阵已实测锁定（本文 §2 是证据真值）；P0 已落地；P1/P2 待用户决策渠道方向**。
+> 状态：**能力矩阵已实测锁定（本文 §2 是证据真值）；P0 已落地；P1 直连形态已落地；§8（2026-09-14 修订）把机制从"运行时协商"改为"通道能力档案"，P0/P1/P2 见 §8.8**。
 > 上位设计：`tenant_platform/docs/IM_MEDIA_ARCHITECTURE.zh-CN.md` §6（Phase B 生图）+ `.tasks/im-media-pipeline/PHASE_B_IMAGE_GEN_PLAN.zh-CN.md`（生图方案真值）。
 > 本文只解决一件事：**把"图像能力"从"一个文生图工具"扩成可长期维护、可加模型/加通道/加操作的能力面**，并且每个结论都有实测或源码/文档依据。
 
@@ -178,3 +178,181 @@
 - 生成图质量仍受上游模型能力限制，SOP/自检只能减少无效交付，不能突破模型上限。
 - **能力矩阵必须记录探测所用 key/分组**（本轮已因此误判一次）；接新通道/新模型必须重跑 §2 矩阵，不得按文档或按旧通道推断。
 - 改图是**付费**路径（按张计费）且当前仅支持 1 张参考图；默认档位（flash/pro）与是否启用由运营侧决定。
+
+## 8. 修订（2026-09-14）：通道能力档案（Profiles）—— 能力是数据，不是运行时协商
+
+> 本节**取代 §4.1/§4.2 的机制描述**（配置声明 + 运行时错误文本协商）；§2 证据矩阵、§3 约束、§4.3~§4.5 仍然有效。修订留痕见 §8.9。
+
+### 8.1 为什么现机制不够（含 2026-09-14 实证）
+
+现机制 = 静态声明（`protocol`/`operations`/`extra_params`）+ 运行时错误文本协商（`_IMAGE_GEN_TRIMMABLE` 5 个参数名 + 8 条话术族 + 3 次裁剪预算）+ 保守集兜底一次 + 进程内记忆。四个结构性弱点：
+
+1. **两个真值源**：能力同时由"配置声明"和"运行时学到"决定，冲突时无裁决规则；记忆在**进程内**、重启即失忆——一次任务 20+ 张图省下的白 400，下个任务重新付一遍。
+2. **协商能力硬编码**：可裁剪集（5 个名字）、话术族（8 条）、模型分支（`_is_dalle()` 按模型名子串猜行为）都写死在 `llmcore.py`。每来一个新模型的参数差异，都要改代码——而本渠道（实测 `GET /v1/models`，2026-09-14）就有 **11 个图像模型**（`agnes-image-2.0/2.1/2.5-flash`、`gemini-3-pro-image(-preview)`、`gemini-3.0-pro-image-preview`、`gemini-3.1-flash-image(-preview)`、`gpt-image-2`、`gpt-image-2.5-flare`、`sensenova-u1-fast`、`sensenova-u1.5-lite`）+ 3 个视频模型。
+3. **请求构造没有"按能力构造"这一步**：靠 400 反向学习。未建档的模型最坏 3 次白 400 + 1 次保守集重试 = **4 次往返全部真实计费/耗时**，而且第一次一定失败。
+4. **能力边界没有单一表示**，散落四处各说一半，且会互相矛盾。**实证（2026-09-14 读 `assets/tools_schema.json` 与 `_cn.json`）**：`image_gen` 的工具描述里同时存在
+   - `**No reference-image / image-editing capability exists on the configured route**` / 「**当前路由上不存在参考图/改图能力**」（旧结论，写在 description 里）
+   - 「Supplying `image` … makes this an EDIT/img2img call」/「传了 `image` 就是改图，未声明则 fail-closed」（P1 新加的参数说明）
+
+   于是模型拿到的是**自相矛盾的工具契约**（一边说没有改图能力、一边说传 image 就改图）。根因不是笔误：**能力知识被写死在自然语言里，代码改了它不会改**。§4.1 已把能力维度提为 `operations` 配置，但配置之外还有 schema 文案、`extra_params`、`_is_dalle()` 三处在各自表达能力。
+
+### 8.2 主流做法（调研 2026-09-14；来源见"证据"列）
+
+| 借鉴对象 | 机制 | 采纳什么 |
+|---|---|---|
+| **pi `packages/ai`**（本机源码 `C:\sudy\github\pi`） | `ImagesModel.api` 指定线协议，`images-api-registry` 按 api 注册/分派实现（api 不匹配直接抛 `Mismatched api`）；模型元数据声明 `input`/`output` 模态；`ImagesContext.input` 是**内容块** ⇒ 纯文本=文生图、文本+图=改图（**同一入口**）；`Model.compat` 是逐模型覆盖项（**缺省自动探测，显式值优先**）；错误是返回值（`stopReason:"error"` + `errorMessage`）不是异常 | ①能力归**模型元数据** ②入口唯一、**输入驱动** ③线协议=注册模块 ④错误是值 |
+| **OpenRouter Image API**（官方文档） | 单一端点 `/api/v1/images`；逐模型发现接口给 `supported_parameters`（带类型/枚举）+ `architecture.input_modalities/output_modalities` + `supports_streaming`；统一参数集 `prompt/n/resolution/aspect_ratio/size/output_format/seed/stream/**references**`；**单图模型直接拒绝 `n>1`**；生成失败返回 502 且**不计费** | 「能力发现 + 统一参数面 + 参考图是一等字段」= 档案化的现成工业形态 |
+| **Gemini 图像**（官方文档，Nano Banana） | 单一 `generateContent`：`contents=[prompt, image…]`（多参考图，官方示例 5 张）；**生成与编辑同一条路**；`generationConfig.responseFormat.image.{aspectRatio,imageSize}` | 生成 vs 编辑是**输入差异**，不是端点差异 |
+| **LiteLLM `image_generation`**（官方文档） | OpenAI 参数为统一面，**非 OpenAI 参数按 provider 原样透传**；`get_supported_openai_params(model, provider)` **逐模型声明**支持集；**默认不支持的参数直接抛错**，`drop_params=True` 才丢弃 | 「声明式支持集 + 默认 fail-loud + 丢弃是显式 opt-in」——与本项目"语义参数不静默缩水"红线同构 |
+
+三条结论：
+
+1. 成熟的图像能力面都是**「能力发现 + 统一参数面 + 逐模型声明」**，没有一家是"发出去猜"。
+2. **生成与编辑是输入差异**（参考图是一等输入字段），不是两套工具或两个 operation 名——这与本项目现状（靠 `image` 参数触发 edit）已一致，保留。
+3. **不支持的参数默认报错**，静默丢弃必须是显式 opt-in——所以现在的"保守集兜底"应降级为**显式开关**，不再是默认路径。
+
+### 8.3 设计：三层 + 一条不变量
+
+```
+┌ 意图层（唯一入口，统一参数面）
+│   generate(prompt, references=[...], aspect_ratio=, resolution=, size=,
+│            n=, output_format=, seed=)
+│   references 非空 ⇒ edit（输入驱动，同 pi/Gemini）
+│   语义参数 = prompt / references / n / size / aspect_ratio / resolution
+│   装饰参数 = output_format / quality / seed / stream
+├ 能力档案层（**数据**）：CHANNEL_PROFILES[(gateway_host, model)]
+│   ops / 参数映射(统一参数 → 线参数) / 上限(max_refs,max_n) / 预算(read_timeout,max_retries)
+│   / 分类(latency,cost) / 置信(source) / 证据(evidence)
+├ 线协议层（**代码**，注册表）：images_generations ｜ images_edits_multipart ｜
+│   images_edits_json ｜（未来）gemini_generate_content
+└ 传输与交付（不变）：_post 重试退避 / _extract_images / 魔数嗅探 / outputs/ 落盘 / [FILE:] marker
+```
+
+**唯一不变量（红线，写进测试）**：
+
+> **改变用户意图的参数不允许缩水**——不支持就 fail-loud，且错误文本必须附"该通道实际支持什么"，让模型能改参自愈；
+> **不改变意图的参数可以省略，但必须在工具结果里明示**（`ℹ️ 上游不支持 X，已省略`）。
+
+由此得到与现状相反的动作顺序：**构造期按档案裁干净（不发），而不是发出去被 400 退回再裁**。
+
+### 8.4 档案数据模型
+
+```python
+# llmcore.py 内联常量（为何不能放 assets/ 见 §8.7）
+_CHANNEL_PROFILES = {
+  'agnes-image-2.5-flash': {
+    'api': 'images_generations',
+    'ops': {'generate'},
+    'maps': {'size': 'size',            # 支持（含 1K/2K/3K/4K 档位与原生像素）
+             'aspect_ratio': None,      # 实测：ratio 被网关静默丢弃 ⇒ 不声明
+             'resolution': None,
+             'n': 'n',
+             'output_format': None,     # 实测 400：text image queue 不支持
+             'quality': None,           # 实测 400
+             'seed': None},
+    'limits': {'max_n': 4, 'max_refs': 0},
+    'budget': {'read_timeout': 100, 'max_retries': 1},
+    'latency': 'fast', 'source': 'measured', 'evidence': '2026-09-13 newapi.myovo.cc.cd group=default',
+  },
+  'sensenova-u1.5-lite': {
+    'api': 'images_edits_json',         # 改图走 JSON + images[{image_url: Data-URL}]
+    'ops': {'generate', 'edit'},
+    'maps': {'size': 'size', 'aspect_ratio': None, 'resolution': None,
+             'n': None,                 # 官方：n 只能 1 ⇒ 语义参数不支持, 非 1 时 fail-loud
+             'output_format': None, 'quality': None, 'seed': None},
+    'limits': {'max_n': 1, 'max_refs': 1},
+    'extra_params': {'watermark': False},   # 仍是声明式, 但只在档案里
+    'budget': {'read_timeout': 110, 'max_retries': 1},
+    'latency': 'slow', 'cost': 'free', 'source': 'measured+documented',
+    'evidence': '改图 200/49.6s 像素验证 2026-09-13; 2K 文生图撞 CF 524',
+  },
+  'gemini-3.1-flash-image': {
+    'api': 'images_edits_multipart',    # 文件字段 image
+    'ops': {'generate', 'edit'},
+    'maps': {'size': 'size', 'aspect_ratio': None, 'n': 'n',
+             'output_format': None, 'quality': None, 'seed': None},
+    'limits': {'max_n': 4, 'max_refs': 1},
+    'budget': {'read_timeout': 100, 'max_retries': 1},
+    'latency': 'fast', 'cost': 'paid', 'source': 'measured',
+    'evidence': 'multipart edits 200/9.0s 像素验证 2026-09-13; 返回 JPEG 非请求的 png(魔数嗅探救回)',
+  },
+  # 其余 8 个图像模型：**未建档 ⇒ fail-closed**（错误文本给出已建档清单与建档方法，见 §8.6）
+}
+```
+
+- `maps[param]` 为 `None` = 该通道不支持：语义参数 → fail-loud；装饰参数 → 省略 + 明示。
+- 解析优先级：**mykey 显式 `profile`（含 `unverified: True`）> 内置 catalog（按模型名）> 协议默认最小安全集（fail-closed）**。
+- `source` 三档：`measured`（真实调用验证过）/ `documented`（官方文档）/ `unverified`（仅结构推断）。
+
+### 8.5 协商的新定位（保留，但从主机制降为显式兜底）
+
+- **构造期优先**：档案已定（measured/documented/config）⇒ 请求里不会出现已知被拒参数，协商不触发。
+- **协商作为有界自愈始终保留**（实现定稿，与初稿"只在 unverified 时启用"不同）：上限 3 次裁剪 + 1 次保守集，**且只作用于装饰参数**（`_IMAGE_GEN_TRIMMABLE`），语义参数永不裁剪。
+  保留理由：上游 reseller 的队列会变——agnes 拒收 `output_format`/`quality` 就是**先能用后被拒**（08-14 能用 → 09-13 400）；静态档案会过时，而重试只动装饰参数、不违反红线。
+- 需要"绝不宽松"的部署可用 `unverified: True` 显式把通道标为未验证（对应 LiteLLM `drop_params=True` 的语义：宽松是 opt-in）。
+- 学到的结论**回写同一个 profile 对象**，并打一条可直接粘贴进 catalog 的日志：
+  `[ImageGen Adapt] profile-proposal: {"output_format": None}`——把"运行时发现"变成**可固化的事实**，而不是躲在内存字典里。
+- 保守集兜底（网关清洗错误体时的最后防线）保留，但同样只在 unverified 通道上生效一次。
+- 档案已定（`measured`/`documented`）⇒ **构造期就裁干净，不发** ⇒ 白 400 归零。
+
+### 8.6 建档协议（对齐"收费尽量少测"）
+
+| 步骤 | 动作 | 成本 | 能判定 |
+|---|---|---|---|
+| P0 | `GET /v1/models` | 0 | 模型清单（**已实测**：本渠道 11 图像 + 3 视频） |
+| P1 | 打 `/images/edits` **不带** image | 0（不产生生成） | 端点与适配器是否存在（`image is required` + `convert_request_failed` = 通） |
+| P2 | 发**非法值**装饰参数（`output_format:"zzz"`）或未知字段 | 0~极低 | 参数是否被接受（上游话术常回合法值列表） |
+| P3 | 1 张最小真图 | 1 张计费（免费模型 0） | 端到端 + 响应形态（b64/url）+ 真实格式 |
+
+原则：**先建档案再发真图**；每步结论写进 profile 的 `evidence`。**能力矩阵必须记录探测所用 key/分组**（§7 已因此误判过一次）。
+
+### 8.7 硬约束（决定实现落点）
+
+- **catalog 必须内联 `llmcore.py`**：`tenant_platform/worker-python/src/ga_worker/runtime_overlay.py` 的 `LEGACY_MODULES`/`LEGACY_ASSETS` 是**固定白名单**，且 `OVERLAY_MANIFEST_ENTRIES` 参与 overlay manifest digest（`test_task_identity` 钉住）。新增 `assets/image_models.json` **平台沙箱读不到**；要放 assets 必须同步改 worker-python + 身份测试（本轮不做）。
+- **schema 的能力描述改为运行期由档案渲染**（同一份数据的两个视图），消除 §8.1-4 的自相矛盾；静态描述里只保留"结构性"信息（工具语义、marker 回显、图内文字走合成）。
+- 预算不变式保留并测试钉住：`read_timeout < 120s`（CF 窗口）且 `(max_retries+1) × read_timeout < 300s`（任务预算）。
+- 错误前缀 `[Error: image_gen …]`、`never !!!Error:`、工具层读盘/路径安全/魔数校验、交付 ≤20MiB 全部不变。
+
+### 8.8 分期
+
+| 期 | 内容 | 验收 |
+|---|---|---|
+| **P0（本轮建议）** | 档案内联 catalog + **按档案构造 payload** + 语义/装饰二分（fail-loud vs 省略明示）+ 未建档 fail-closed + schema 描述由档案渲染 + 单测（零网络） | 给定 profile 断言 payload **精确相等**；未声明 operation / 越界 n / 不支持语义参数全部 fail-loud；现有 `tests/test_image_gen.py` 74 例不回归 |
+| **P1** | 建档脚本 + 11 个模型逐个建档（先 P0~P2 零成本三步，免费模型补 P3 真图） | 每模型 profile 带 `evidence`；真实 key 下**零白 400** |
+| **P2** | 平台形态：契约 `capabilities` 维度（`image.generate`/`image.edit`）+ runtime_config `operations` + 参考图进出沙箱（4MiB 请求体上限） | 契约绑定测试 + 端到端 |
+
+### 8.9 与 §4 的关系（留痕）
+
+| 项 | 处置 |
+|---|---|
+| `protocol`（线协议）、`operations`（能力门）、fail-closed 原则、工具层读盘、魔数嗅探、错误前缀 | **保留**（§4.1/§4.2 结论仍有效） |
+| `extra_params` 自由透传 | **取代**：改为档案内的声明式字段（`extra_params` 仅在 `source: unverified` 时作为临时逃生口） |
+| `operations` 作为配置项 | **升级**：由档案派生（配置仍可覆盖） |
+| 运行时错误文本协商 | **降级**：从默认路径改为 `unverified` 通道的显式 opt-in 兜底，且结论回写档案 |
+| schema 里的能力断言 | **删除**：改为运行期由档案渲染 |
+| 新增 | 参数映射表（`maps`）、未建档 fail-closed、profile-proposal 日志、建档协议（§8.6） |
+
+### 8.10 建档回填（2026-09-14，全部 0 计费）
+
+工具：`assets/probe_image_channel.py`（P0 列表 → P1 端点探活 → P2 参数探活 → P3 真图；默认只跑 P0+P1）。
+本轮对 12 个图像模型全量跑过 P0+P1，事实如下（写入 catalog 的 `evidence`）。
+
+| 新实测事实 | 证据 | 对档案的影响 |
+|---|---|---|
+| **`size` 形态逐通道不同** | agnes 传档位 `1K` 通过校验（只回 `prompt is required`）；gemini/gpt-image/sensenova 传档位回「图片尺寸格式错误，应为 宽x高，例如 1024x1024」 | 新增档案字段 `size_style`（`both`/`tier`/`pixels`）；形态不符 **fail-loud**（size 是语义参数，不静默替换） |
+| **该参数校验错被网关标成 `500`** | 上面这条错误响应的 `type=new_api_error` + HTTP 500（不是 400） | 不能只看状态码判定参数错；已建档通道在构造期就不发错形态，故不会触发无意义重试 |
+| **sensenova 参考图是 1..5 张** | 网关原文 `invalid images, should contain between 1 and 5 items` | `max_refs` 由 1 改 **5**。注：§2 记的"仅 1 张"其实是 `n` 的限制，不是参考图上限 |
+| **`image is required` 不能证明上游能改图** | multipart edits 对 gemini/gpt-image **和 agnes 都**回 `image is required`（只说明网关路由存在 + 适配器在转换）；但 agnes 真实改图 08-14 实测 **503/106s**，官方也无 `/images/edits` | **结论矛盾时不声明能力**：agnes 保持 `ops={'generate'}`，带参考图 fail-closed。这是 §2"200 就算成功不可信"的同类教训——**否定信号同样不可单独采信** |
+| **改图请求形态逐模型不同** | gemini/gpt-image 的 JSON edits 被回 `image is required` 或 `failed to parse multipart form`；sensenova 的 JSON edits 明确校验 `images` 数组 | 印证"改图是**通道属性**（适配器决定）"；`api` 取值继续由档案逐模型声明 |
+| **探针自身的两个坑（已修）** | ①`requests` 仅用 `data=` 不会发 multipart（网关回 `multipart boundary not found`，500）→ 必须带 `files=`；②P2 参数探活若留着合法 `prompt`，上游忽略该参数时会**真的出图（=计费）** → 必须让请求必然被拒（prompt 留空） | 探针工具已加注释与修正；`--paid` 默认关闭 |
+
+**生产路径端到端复验（2026-09-14，免费模型，`--e2e`）**：`sensenova-u1.5-lite` 两条操作都跑通且带客观判据——
+文生图 **200/42.9s/862KB/png**；改图（JSON + Data-URL 参考图）**200/70.8s/888KB/png**，
+**像素级验证：参考图纯蓝 → 输出中心像素 (248,10,1) 变红（changed=True）**。
+同时验证了整链：配置里**只写 model**，端点/形态/参数/参考图上限全部由档案得出（`api=images_edits_json`、`size_style=pixels`、`max_refs=5`）；
+工具层 `ga.do_image_gen` 落盘 + `[FILE:]` marker + 省略明示（quality/output_format）+ 魔数改名（请求 webp → 实得 png）全通。
+另：该模型单次实测 42.9s/70.8s，印证 `read_timeout≥110` 与 `max_retries=1` 的预算取舍（最坏 ≈220s < 300s）。
+
+**仍未证实的（不得当作已支持）**：gemini-3-pro-image / 各 preview / gpt-image-2(.5-flare) 的**真图改图**（仅端点探活）；gpt-image 系的 `stream`/`partial_images` 在本网关的实际行为；sensenova 的 `quality`/`output_format`（本轮探针在 size 校验前即返回，得不到结论 → 保守声明为不支持）。
+
+

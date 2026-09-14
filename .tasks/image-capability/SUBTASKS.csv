@@ -1,0 +1,12 @@
+id,task,status,evidence
+P0-1,"内联 _IMAGE_CATALOG + ImageChannelProfile（数据模型/查询/describe/proposal）",done,"llmcore.py: 15 条档案 + size_style/limits/maps/rejected/fixed/evidence"
+P0-2,"客户端按档案构造 payload（只发声明支持的参数；每请求 model 覆盖换档案）",done,"TestChannelProfileCatalog（catalog 决定 api/端点/参数；per-request model 切档案）"
+P0-3,"语义参数不支持 → fail-loud（附支持集）；装饰参数不支持 → 省略 + 明示进工具结果",done,"TestChannelProfileCatalog::test_semantic_limit_from_profile_fails_loud / TestToolSurfacesOmittedParams"
+P0-4,"协商降级为有界自愈 + profile-proposal 日志（可固化回 catalog）",done,"TestChannelProfileCatalog::test_learned_trim_logs_profile_proposal"
+P0-5,"schema 能力描述改为运行期由档案渲染（占位符 + agentmain 注入）",done,"TestCapabilityRendering + agentmain 注入 smoke；旧断言已删"
+P0-6,"测试：新增档案行为用例 + 旧协商用例重指到未建档通道",done,"tests/test_image_gen.py 74→91 passed；根 218 passed"
+P1-1,"建档脚本（P0 列表 → P1 端点探活 → P2 参数探活 → P3 真图）",done,"assets/probe_image_channel.py（默认 0 计费；--paid 显式开启）"
+P1-2,"12 个图像模型逐个建档（免费模型补真图验证，付费仅零成本三步）",partial,"P0+P1 全量跑完并回填 evidence（DESIGN §8.10）；免费模型 sensenova-u1.5-lite 已 --e2e 真图通过（像素验证）；付费模型的真图待预算确认"
+P1-3,"配置：mykey_template 更新为档案形态 + 免费优先",done,"mykey_template 重写说明；本地 mykey.py 已按档案形态配置（agen 生成/sensenova 免费改图）"
+P2-1,"平台形态：契约 capabilities(image.generate/image.edit) + runtime_config operations",todo,
+P2-2,"平台形态：参考图进出沙箱（4MiB 请求体上限）",todo,

@@ -357,15 +357,26 @@ mixin_config = {
 #
 #  不配置本块时 image_gen 工具返回错误文本（[Error: image_gen 未配置…]），
 #  不会崩溃。取消注释并填入真实密钥后生效。
+#
+#  ⚠️ 2026-09-14 起：**能力（端点/操作/参数支持/size 形态/参考图上限）由档案声明**
+#  （llmcore._IMAGE_CATALOG，按模型名索引；新增模型先跑 assets/probe_image_channel.py 建档）。
+#  配置里只需写"用哪条通道、哪个模型、什么预算"，不再手写 protocol/operations。
+#  优先级：配置显式声明 > 内置档案 > 未建档（宽松参数集 + 有界自愈，且工具会明示"未建档"）。
+#  需要覆盖档案时用可选键：'protocol' / 'operations' / 'size_style' /
+#  'profile': {'maps': {...}, 'limits': {...}, 'fixed': {...}, 'unverified': True}。
 # image_gen = {
 #     'name': 'openai',                      # resolve_image_gen 分派关键字（v1: openai/oai）
 #     'apibase': 'https://api.openai.com/v1',  # 直连：真实上游/中转网关；托管（终态）：llm-proxy 地址 + 能力令牌
 #     'apikey': 'sk-<your-image-api-key>',   # 直连：真实密钥；托管（终态）：llm.image capability token
-#     'model': 'gpt-image-1',                # 独立生图模型，与对话模型无关
-#     'stream': False,                       # 可选：True 时走 gpt-image SSE 渐进细化（取最终帧），失败自动降级同步一次
+#     'model': 'gpt-image-1',                # 独立生图模型，与对话模型无关（能力随模型切换）
+#     'stream': False,                       # 可选：True 时走 SSE 渐进细化（仅档案声明支持 stream 的模型；dall-e 等自动走同步）
 #     # 'timeout': 10,                       # 可选：连接超时秒数（默认 10）
-#     # 'read_timeout': 120,                 # 可选：读超时秒数（默认 120）
-#     # 'max_retries': 2,                    # 可选：429/408/5xx 退避重试次数（默认 2）
+#     # 'read_timeout': 120,                 # 可选：读超时秒数（默认 120；**必须 < 120s 的 CF 窗口**）
+#     # 'max_retries': 2,                    # 可选：429/408/5xx 退避重试次数（默认 2；
+#     #                                      #  需满足 (max_retries+1)*read_timeout < 300s 任务预算）
 #     # 'proxy': 'http://127.0.0.1:2082',    # 可选：单客户端代理
 #     # 'verify': True,                      # 可选：TLS 校验（默认 True）
 # }
+# # 改图（参考图）可单独配一条通道：免费文生图 + 付费/慢改图分开（未配则回退 image_gen 配置，
+# # 由档案决定是否会 fail-closed）：
+# # image_edit = {**image_gen, 'model': 'sensenova-u1.5-lite', 'read_timeout': 110, 'max_retries': 1}

@@ -765,6 +765,11 @@ class GenericAgentHandler(BaseHandler):
         if err:
             yield f"[Status] ❌ {err}\n"
             return StepOutcome(err, next_prompt="\n")
+        # 档案按"构造期裁剪"省下的参数必须明示（规则：装饰参数可省，但不能静默）——
+        # 同时进显示流与工具结果，模型据此知道本次实际生效的参数集。
+        notices = [f"[Status] ℹ️ {reason}" for _name, reason in (getattr(client, 'last_notices', None) or [])]
+        for line in notices:
+            yield line + "\n"
         images = produced
         out_dir = os.path.join(self.cwd, 'outputs')
         try:
@@ -801,8 +806,12 @@ class GenericAgentHandler(BaseHandler):
         marker_text = "\n".join(f"[FILE:{m}]" for m in markers)
         if sniffed:
             # 失败诚实: 请求的格式被上游忽略/不支持时明说, 不让模型误以为拿到了 jpeg。
-            yield f"[Status] ℹ️ 上游返回格式与请求不符(按真实格式命名): {', '.join(sorted(set(sniffed)))}\n"
+            note_fmt = f"[Status] ℹ️ 上游返回格式与请求不符(按真实格式命名): {', '.join(sorted(set(sniffed)))}"
+            notices.append(note_fmt)
+            yield note_fmt + "\n"
         yield f"[Status] ✅ 已生成 {len(images)} 张图: {marker_text}\n"
+        if notices:
+            marker_text = "\n".join(notices) + "\n" + marker_text   # 模型可见: 本次生效/省略了什么
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         # marker 回显依赖(二轮审查 I-2): 工具返回 marker ≠ 交付发生, 模型
         # 必须在最终回复中回显 [FILE:...] 才触发交付——next_prompt 再强调。

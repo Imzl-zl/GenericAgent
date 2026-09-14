@@ -1,0 +1,285 @@
+{
+  "listing": {
+    "status": 200,
+    "models": [
+      "agnes-2.0-flash",
+      "agnes-2.5-flash",
+      "agnes-3.0-flash",
+      "agnes-image-2.0-flash",
+      "agnes-image-2.1-flash",
+      "agnes-image-2.5-flash",
+      "agnes-video-2.5",
+      "agnes-video-2.5-flash",
+      "agnes-video-v2.0",
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+      "gemini-3-pro-image",
+      "gemini-3-pro-image-preview",
+      "gemini-3.0-pro-image-preview",
+      "gemini-3.1-flash-image",
+      "gemini-3.1-flash-image-preview",
+      "glm-5.2",
+      "gpt-image-2",
+      "gpt-image-2.5-flare",
+      "kimi-k3",
+      "sensenova-6.7-flash-lite",
+      "sensenova-6.8-flash-lite",
+      "sensenova-u1-fast",
+      "sensenova-u1.5-lite"
+    ]
+  },
+  "results": [
+    {
+      "model": "agnes-image-2.0-flash",
+      "generate_endpoint": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"prompt is required (request id: 20260914052420814225181nkNZYwqF)\",\"type\":\"invalid_request\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.2
+      },
+      "generate_ok": true,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140524214244982128268d9d6ZlPmoTvh)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.6
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": null,
+        "error": "ReadTimeout: HTTPSConnectionPool(host='newapi.myovo.cc.cd', port=443): Read timed out. (read timeout=30)",
+        "elapsed": 30.0
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "agnes-image-2.1-flash",
+      "generate_endpoint": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"prompt is required (request id: 2026091405245468878084pIFvNcFz)\",\"type\":\"invalid_request\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 2.4
+      },
+      "generate_ok": true,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140524544747020528268d9d6BvMRCEaS)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.6
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": null,
+        "error": "ReadTimeout: HTTPSConnectionPool(host='newapi.myovo.cc.cd', port=443): Read timed out. (read timeout=30)",
+        "elapsed": 30.0
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "agnes-image-2.5-flash",
+      "generate_endpoint": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"prompt is required (request id: 20260914052527736828033bEIZXDHg)\",\"type\":\"invalid_request\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 3.1
+      },
+      "generate_ok": true,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140525284111771058268d9d6Kag1ZyyC)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.6
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": null,
+        "error": "ReadTimeout: HTTPSConnectionPool(host='newapi.myovo.cc.cd', port=443): Read timed out. (read timeout=30)",
+        "elapsed": 30.0
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gemini-3.0-pro-image-preview",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"prompt is required (request id: 202609140526009590916078268d9d6BTXo4hHG)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 2.6
+      },
+      "generate_ok": true,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526013754454848268d9d6WaefYla6)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.3
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"image is required (request id: 202609140526027660753398268d9d6YcXtkWLD)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 1.5
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gemini-3-pro-image",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526042239322468268d9d6pmIUM9Sb)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.5
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526046353821018268d9d6EyiLdpfv)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.3
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 20260914052606156727838268d9d602dGhS3P)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gemini-3-pro-image-preview",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526074538261428268d9d6DvvOj6Oo)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526078676911458268d9d69M8DMH2H)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.3
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526092412736228268d9d6gR1l8D7i)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gemini-3.1-flash-image",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526106838250368268d9d6w8JwKZiv)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526110990369148268d9d6j1P0jjqp)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526124711189778268d9d6dP43JB2j)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gemini-3.1-flash-image-preview",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526139097686418268d9d6SAOdROGY)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526143231445508268d9d6Zodtdn3D)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.3
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526157095423128268d9d6p2YTd7wm)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.5
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gpt-image-2",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526171598672508268d9d64E84unA5)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.5
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526175772938678268d9d6oKKk6XS8)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526189586094678268d9d6TUzMuKjf)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "gpt-image-2.5-flare",
+      "generate_endpoint": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526203969872398268d9d6wzNC7yiN)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526208162298968268d9d6Hjr6Xdnb)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"图片尺寸格式必须为 宽x高，例如 1024x1024 (request id: 202609140526221921498948268d9d6ja1bOFUj)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"invalid_request\"}}",
+        "elapsed": 1.4
+      },
+      "edit_json_ok": false
+    },
+    {
+      "model": "sensenova-u1-fast",
+      "generate_endpoint": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"field Prompt invalid, should be at least 1\",\"type\":\"invalid_request_error\",\"param\":\"prompt\",\"code\":\"3\"}}",
+        "elapsed": 0.8
+      },
+      "generate_ok": true,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526233764357308268d9d6UTtgWXOd)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"invalid images, should contain between 1 and 5 items\",\"type\":\"invalid_request_error\",\"param\":\"\",\"code\":\"3\"}}",
+        "elapsed": 0.7
+      },
+      "edit_json_ok": true
+    },
+    {
+      "model": "sensenova-u1.5-lite",
+      "generate_endpoint": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"invalid size, should be auto or WIDTHxHEIGHT. width and height should be multiples of 32, width and height should be in [512,4096], and aspect ratio should be within 3:1\",\"type\":\"invalid_request_error\",\"param\":\"\",\"code\":\"3\"}}",
+        "elapsed": 0.7
+      },
+      "generate_ok": false,
+      "edit_multipart": {
+        "status": 500,
+        "body": "{\"error\":{\"message\":\"failed to parse multipart form: multipart boundary not found (request id: 202609140526250898201268268d9d6M3kb8xFZ)\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":\"convert_request_failed\"}}",
+        "elapsed": 0.4
+      },
+      "edit_multipart_ok": false,
+      "edit_json": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"invalid images, should contain between 1 and 5 items\",\"type\":\"invalid_request_error\",\"param\":\"\",\"code\":\"3\"}}",
+        "elapsed": 0.7
+      },
+      "edit_json_ok": true
+    }
+  ]
+}
