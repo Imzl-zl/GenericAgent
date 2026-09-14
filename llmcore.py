@@ -1455,8 +1455,27 @@ def sniff_image_format(data):
 
 class BaseImageGenClient:
     """生图客户端基类。只解析生图所需配置子集
-    {apibase/apikey/model/stream/timeout/read_timeout/max_retries/proxy/verify},
-    不照抄 BaseSession 的 chat 专属字段(context_win/thinking 等)。"""
+    {apibase/apikey/model/protocol/operations/stream/timeout/read_timeout/max_retries/proxy/verify},
+    不照抄 BaseSession 的 chat 专属字段(context_win/thinking 等)。
+
+    **protocol / operations（2026-09-13 实测新增，见 .tasks/image-capability/DESIGN.zh-CN.md）**：
+    "能否改图"是**通道属性**（上游端点 + 网关转发行为），不是模型属性：
+      - `protocol="images_generations"`（默认）：JSON POST `{apibase}/images/generations`（文生图）；
+      - `protocol="images_edits"`：multipart POST `{apibase}/images/edits`，文件字段 `image`（参考图/改图）；
+    `operations` 声明本通道实际能做什么（缺省由 protocol 推导：edits→{'edit'}、generations→{'generate'}）。
+    **调用未声明的 operation 一律 fail-closed 报错**——因为存在"网关照文档收下参数但静默丢弃"的通道
+    （实测 agnes 的 `extra_body.image` 就是静默无效），宁可知情失败，不可假装成功。"""
+
+    PROTOCOL_GENERATIONS = 'images_generations'
+    PROTOCOL_EDITS = 'images_edits'
+    _PROTOCOLS = (PROTOCOL_GENERATIONS, PROTOCOL_EDITS)
+    # 参考图预算(防内存/上游爆): 单张 ≤8MiB。
+    # **为何只支持 1 张**(2026-09-13 源码依据, 不猜): new-api `relay/helper/valid_request.go`
+    # 的 edits 分支只读 `formData.Get("image")`(单值), 多图形态(`image[]`/`images`)未实测;
+    # Agnes 官方虽支持多图合成, 但那条通道的改图已被网关丢弃(见 DESIGN §2)。
+    # 待实测后再放开——宁可知情拒绝, 不可静默只取第一张。
+    MAX_EDIT_IMAGES = 1
+    MAX_EDIT_IMAGE_BYTES = 8 * 1024 * 1024
 
     def __init__(self, cfg):
         self.name = cfg.get('name', 'image_gen')
@@ -1465,6 +1484,14 @@ class BaseImageGenClient:
         self.model = cfg.get('model', '')
         if not self.api_base or not self.api_key or not self.model:
             raise ValueError('image_gen 配置不完整: 需要 apibase/apikey/model')
+        self.protocol = str(cfg.get('protocol') or self.PROTOCOL_GENERATIONS).strip().lower()
+        if self.protocol not in self._PROTOCOLS:
+            raise ValueError(f"image_gen: 不支持的 protocol {self.protocol!r} (支持 {', '.join(self._PROTOCOLS)})")
+        declared = cfg.get('operations')
+        if declared:
+            self.operations = {str(op).strip().lower() for op in declared if str(op).strip()}
+        else:
+            self.operations = {'edit'} if self.protocol == self.PROTOCOL_EDITS else {'generate'}
         self.stream = bool(cfg.get('stream', False))
         self.max_retries = max(0, int(cfg.get('max_retries', 2)))
         self.max_retry_after = float(cfg.get('max_retry_after', 60.0))
@@ -1479,13 +1506,22 @@ class BaseImageGenClient:
         ml = self.model.lower()
         return 'dall-e' in ml or 'dalle' in ml
 
-    def _endpoint(self):
+    def _endpoint(self, operation='generate'):
+        # 端点由 **operation** 决定(OpenAI 语义两端点), protocol 只描述"改图走什么传输":
+        #   generate → JSON POST /images/generations(所有通道通用)
+        #   edit     → protocol=images_edits 时 multipart POST /images/edits(已验证)
+        # 其它 edits 传输形态(如豆包 seedream 把改图走 generations JSON, 见 new-api PR
+        # #2090)属**未验证扩展点**, 需要时再加 protocol 取值 + 实测, 不提前实现。
+        if operation == 'edit' and self.protocol == self.PROTOCOL_EDITS:
+            return auto_make_url(self.api_base, 'images/edits')
         return auto_make_url(self.api_base, 'images/generations')
 
-    def _headers(self):
-        return {"Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json"}
+    def _headers(self, multipart=False):
+        headers = {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
+        if not multipart:
+            headers["Content-Type"] = "application/json"
+        # multipart 时不能自己设 Content-Type: requests 要写入含 boundary 的头
+        return headers
 
     def _payload(self, prompt, size=None, quality=None, n=None, output_format=None, model=None, stream=None):
         payload = {"model": model or self.model, "prompt": prompt, "n": int(n or 1)}
@@ -1524,12 +1560,13 @@ class BaseImageGenClient:
         # 与 _stream_with_retry(447-487) 完全一致: retry-after=0 时也走指数退避。
         return None if ra is not None and ra > self.max_retry_after else max(_BACKOFF_MIN, ra or min(_BACKOFF_CAP, _IMG_BACKOFF_BASE * (2 ** attempt)))
 
-    def _post(self, payload, stream=False):
+    def _post(self, payload, stream=False, files=None, operation='generate'):
         """带重试语义的 POST + 参数协商自愈。
 
         单轮语义见 _post_once(429/408/5xx 退避集合 + retry-after 上限)。
         外层负责"上游不支持某参数"的自愈: 400/422 且错误文本点名了本次请求
         里的可裁剪参数 → 裁剪后重试(独立预算, 不消耗 max_retries)。
+        files 非空时改走 multipart(改图): payload 作为普通表单字段发送。
 
         返回 (resp|dict|None, err_text), 错误文本统一 [Error: image_gen ...]
         前缀(§6.5, 绝不用 !!!Error:)。stream=True 成功时返回打开的响应对象
@@ -1538,7 +1575,7 @@ class BaseImageGenClient:
         trims = 0
         conservative_done = False
         while True:
-            out, err, err_body, err_status = self._post_once(payload, stream=stream)
+            out, err, err_body, err_status = self._post_once(payload, stream=stream, files=files, operation=operation)
             if err is None:
                 return out, None
             if err_status in _IMAGE_GEN_PARAM_TRIM_STATUS and trims < _IMAGE_GEN_MAX_PARAM_TRIMS:
@@ -1567,18 +1604,20 @@ class BaseImageGenClient:
             # 保留上游 message 供模型自愈改参)。
             return None, err
 
-    def _post_once(self, payload, stream=False):
+    def _post_once(self, payload, stream=False, files=None, operation='generate'):
         """单轮 POST(仿 _stream_with_retry: 429/408/5xx 退避集合 + retry-after
         上限)。返回 (resp|dict|None, err_text, err_body, err_status); err_body
-        仅供参数协商解析(非 4xx 时为 "")。"""
-        url = self._endpoint()
-        headers = self._headers()
+        仅供参数协商解析(非 4xx 时为 "")。files 非空 → multipart。"""
+        url = self._endpoint(operation)
+        headers = self._headers(multipart=bool(files))
+        # multipart 的"参数"在表单字段里, 协商裁剪同样作用于 payload(表单字段)
+        send = {"data": dict(payload), "files": files} if files else {"json": dict(payload)}
         for attempt in range(self.max_retries + 1):
             resp = None
             try:
-                resp = self.http.post(url, headers=headers, json=dict(payload), stream=stream,
+                resp = self.http.post(url, headers=headers, stream=stream,
                                       timeout=(self.connect_timeout, self.read_timeout),
-                                      proxies=self.proxies, verify=self.verify)
+                                      proxies=self.proxies, verify=self.verify, **send)
                 if resp.status_code >= 400:
                     body = ""
                     try:
@@ -1695,9 +1734,55 @@ class BaseImageGenClient:
             return None, "[Error: image_gen 图片直链下载为空]"
         return b"".join(chunks), None
 
-    def generate(self, prompt, size=None, quality=None, n=1, output_format=None, model=None):
-        """统一入口: 同步路径恒可用; cfg stream=true 时先走 SSE 流式路径,
-        失败自动降级重试一次同步路径(§6.5)。返回 (images|None, err_text)。"""
+    def _operation_supported(self, operation):
+        return operation in getattr(self, 'operations', ())
+
+    def _edit_images(self, images):
+        """把调用方给的参考图规整成 requests 的 multipart files 列表。
+
+        images 元素: (filename, bytes, mime) —— **由工具层读盘并做路径安全/大小校验**，
+        客户端只管发送(保持 llmcore 不依赖 cwd/文件系统语义, 也便于单测)。
+        返回 (files|None, err_text)。"""
+        if not images:
+            return None, "[Error: image_gen 改图需要参考图(image 参数)]"
+        if len(images) > self.MAX_EDIT_IMAGES:
+            return None, (f"[Error: image_gen 改图当前仅支持 {self.MAX_EDIT_IMAGES} 张参考图(多图形态未经实测, "
+                          f"见 .tasks/image-capability/DESIGN.zh-CN.md §2), 收到 {len(images)} 张]")
+        files = []
+        for idx, item in enumerate(images, 1):
+            try:
+                name, raw, mime = item[0], item[1], item[2]
+            except (TypeError, IndexError):
+                return None, f"[Error: image_gen 第 {idx} 张参考图格式非法]",
+            if not raw:
+                return None, f"[Error: image_gen 第 {idx} 张参考图为空: {name}]"
+            if len(raw) > self.MAX_EDIT_IMAGE_BYTES:
+                return None, (f"[Error: image_gen 第 {idx} 张参考图 {len(raw)} bytes 超过 "
+                              f"{self.MAX_EDIT_IMAGE_BYTES // (1024 * 1024)}MiB 上限, 请先缩小]")
+            files.append(("image", (name or f"ref{idx}.png", raw, mime or 'image/png')))
+        return files, None
+
+    def generate(self, prompt, size=None, quality=None, n=1, output_format=None, model=None, images=None):
+        """统一入口。operation 由是否带参考图决定: 带图=改图(edit)、不带=文生图(generate)。
+
+        **能力 gate(2026-09-13)**: 调用本通道未声明的 operation 一律 fail-closed——
+        因为存在"网关照文档收下参数但静默丢弃"的通道(实测 agnes 的 extra_body.image),
+        宁可知情失败, 不可假装成功。返回 (images|None, err_text)。"""
+        images = list(images or [])
+        operation = 'edit' if images else 'generate'
+        if not self._operation_supported(operation):
+            want = '改图(image.edit)' if operation == 'edit' else '文生图(image.generate)'
+            have = ','.join(sorted(getattr(self, 'operations', ()))) or '无'
+            return None, (f"[Error: image_gen 当前配置({self.model} @ {self.api_base}) 未声明{want}能力"
+                          f"(已声明: {have}, protocol={self.protocol})——不要重试本工具, 请如实告知用户"
+                          f"该通道做不到, 或换用已声明该能力的配置]")
+        if operation == 'edit':
+            files, ferr = self._edit_images(images)
+            if ferr:
+                return None, ferr
+            return self._generate_sync(prompt, size=size, quality=quality, n=n,
+                                       output_format=output_format, model=model, files=files,
+                                       operation='edit')
         if self.stream and int(n or 1) <= 1 and not self._is_dalle():
             # 流式仅 gpt-image 系列: dall-e 不支持 stream/partial_images
             frame, err = self.generate_stream(prompt, size=size, quality=quality, n=n,
@@ -1705,19 +1790,20 @@ class BaseImageGenClient:
             if frame is not None:
                 return [frame], None
             print(f"[ImageGen] 流式路径失败({err}), 降级重试同步路径一次")
-            images, sync_err = self._generate_sync(prompt, size=size, quality=quality, n=n,
-                                                   output_format=output_format, model=model)
+            images_out, sync_err = self._generate_sync(prompt, size=size, quality=quality, n=n,
+                                                       output_format=output_format, model=model)
             if sync_err:
                 return None, sync_err
-            return images, None
+            return images_out, None
         return self._generate_sync(prompt, size=size, quality=quality, n=n,
                                    output_format=output_format, model=model)
 
-    def _generate_sync(self, prompt, size=None, quality=None, n=1, output_format=None, model=None):
-        """同步路径: POST {apibase}/images/generations → b64_json/url → bytes 列表。"""
+    def _generate_sync(self, prompt, size=None, quality=None, n=1, output_format=None, model=None,
+                       files=None, operation='generate'):
+        """同步路径: POST {apibase}/images/generations(或 /images/edits) → b64_json/url → bytes 列表。"""
         payload = self._payload(prompt, size=size, quality=quality, n=n,
                                 output_format=output_format, model=model, stream=False)
-        data, err = self._post(payload, stream=False)
+        data, err = self._post(payload, stream=False, files=files, operation=operation)
         if err:
             return None, err
         return self._extract_images(data)
@@ -1790,11 +1876,30 @@ class OpenAIImageGenClient(BaseImageGenClient):
 _IMAGE_GEN_SUPPORTED = ('openai', 'oai')
 
 
-def resolve_image_gen(name='image_gen'):
-    """命名分派工厂(仿 resolve_session)。读 mykeys[name](经
-    reload_mykeys()); 未配置抛 ValueError —— 由 do_image_gen 捕获并返回
-    错误文本, 绝不裸抛穿透 dispatch(agent_loop 只捕 StopIteration)。"""
-    cfg = reload_mykeys()[0].get(name)
+def _edit_config_name(name):
+    """编辑通道配置名约定(确定性规则, 不猜也不留歧义):
+    去掉结尾 `_gen` 再拼 `_edit`——`image_gen`→`image_edit`、`image`→`image_edit`、`foo`→`foo_edit`。
+    好处: "免费文生图"与"付费改图"可以分开配置(与主流网关按 operation 路由到不同上游一致)。"""
+    base = name[:-4] if str(name).endswith('_gen') else str(name)
+    return f'{base}_edit'
+
+
+def resolve_image_gen(name='image_gen', operation='generate'):
+    """命名分派工厂(仿 resolve_session)。读 mykeys[name](经 reload_mykeys());
+    未配置抛 ValueError —— 由 do_image_gen 捕获并返回错误文本, 绝不裸抛穿透
+    dispatch(agent_loop 只捕 StopIteration)。
+
+    operation='edit' 时的配置解析顺序(2026-09-13, 见 image-capability/DESIGN §4.1):
+      ① mykeys['<name>_edit'] (如 image_edit) 存在 → 用它——把"便宜/免费的文生图
+         通道"与"付费的改图通道"分开配置(主流网关按 operation 路由到不同上游);
+      ② 否则用 mykeys[name], 但它的 operations 必须含 'edit' → 否则由客户端
+         fail-closed 报错(不用静默丢弃参数的通道假装成功)。"""
+    keys = reload_mykeys()[0]
+    cfg = None
+    if str(operation).lower() == 'edit':
+        cfg = keys.get(_edit_config_name(name)) or keys.get(name)
+    else:
+        cfg = keys.get(name)
     if not cfg:
         raise ValueError(f"Config '{name}' not in mykey")
     kind = str(cfg.get('name', '') or '').strip().lower()

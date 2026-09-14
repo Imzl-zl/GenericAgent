@@ -687,11 +687,49 @@ class GenericAgentHandler(BaseHandler):
         try: return len(re.findall(r'\[ \]', Path(p).read_text(encoding='utf-8', errors='replace')))
         except: return None
     
+    _IMAGE_MIME_BY_FORMAT = {'png': 'image/png', 'jpeg': 'image/jpeg', 'webp': 'image/webp', 'gif': 'image/gif'}
+
+    def _load_reference_images(self, raw):
+        '''改图参考图(argv 为路径列表/逗号分隔): 工具层负责读盘 + 路径安全 + 大小/格式校验，
+        客户端只管发送(见 llmcore.BaseImageGenClient)。
+
+        为何放在工具层: ①llmcore 不依赖 cwd/文件系统语义(沙箱/单测友好);
+        ②路径逃逸、体积、格式这些是“工具输入安全”类问题，与交付链同层防线。
+        返回 ([(name, bytes, mime), ...], err_text)。'''
+        if raw is None or raw == '':
+            return [], None
+        items = raw if isinstance(raw, (list, tuple)) else [p for p in str(raw).replace('\n', ',').split(',')]
+        paths = [str(p).strip() for p in items if str(p).strip()]
+        if not paths:
+            return [], None
+        base = os.path.realpath(self.cwd)
+        out = []
+        for p in paths:
+            full = os.path.realpath(p if os.path.isabs(p) else os.path.join(base, p))
+            if full != base and not full.startswith(base + os.sep):
+                return [], f"[Error: image_gen 参考图必须位于工作区内(拒绝路径逃逸): {p}]"
+            if not os.path.isfile(full):
+                return [], f"[Error: image_gen 参考图不存在: {p}]"
+            try:
+                with open(full, 'rb') as f:
+                    data = f.read(_IMAGE_GEN_MAX_BYTES + 1)
+            except OSError as e:
+                return [], f"[Error: image_gen 参考图读取失败 {p}: {e}]"
+            if len(data) > _IMAGE_GEN_MAX_BYTES:
+                return [], f"[Error: image_gen 参考图超过 20MiB 上限: {p}]"
+            fmt = sniff_image_format(data)
+            if not fmt or fmt not in self._IMAGE_MIME_BY_FORMAT:
+                return [], f"[Error: image_gen 参考图不是可识别的图片(png/jpeg/webp/gif): {p}]"
+            out.append((os.path.basename(full), data, self._IMAGE_MIME_BY_FORMAT[fmt]))
+        return out, None
+
     def do_image_gen(self, args, response):
-        '''调用独立生图模型生成图片(OpenAI images/generations 兼容协议)。
+        '''调用生图模型生成/修改图片(OpenAI images/generations 兼容协议)。
+        - 不带 `image` → 文生图(generate); 带 `image` → 参考图/改图(edit, multipart /images/edits)。
         产物落盘 self.cwd/outputs/ 并返回 [FILE:outputs/<name>] marker 走
         Phase A 出站交付链。失败语义见方案 §6.5: 错误统一
-        [Error: image_gen ...] 前缀给模型。'''
+        [Error: image_gen ...] 前缀给模型；**调用通道未声明的 operation 时
+        fail-closed**(宁可知情失败, 不可静默丢弃参考图假装成功)。'''
         prompt = str(args.get("prompt") or "").strip()
         if not prompt:
             yield "[Action] image_gen: prompt 缺失\n"
@@ -704,21 +742,30 @@ class GenericAgentHandler(BaseHandler):
         # 防御: schema 已限 png/jpeg/webp, 模型可能传任意值——枚举外回退 png(审查 S10)。
         if output_format not in ("png", "jpeg", "webp"): output_format = "png"
         model = args.get("model") or None
-        yield f"[Action] image_gen: 生成 {n} 张图 (prompt={smart_format(prompt, 60)!r}, size={size or '默认'}, quality={quality or '默认'}, format={output_format})\n"
+        # 参考图(2026-09-13): 工具层负责读盘 + 路径安全 + 大小校验(客户端只管发送)。
+        images, ierr = self._load_reference_images(args.get("image"))
+        if ierr:
+            yield f"[Status] ❌ {ierr}\n"
+            return StepOutcome(ierr, next_prompt="\n")
+        op_desc = f"改图(参考图 {len(images)} 张)" if images else "生成"
+        yield (f"[Action] image_gen: {op_desc} {n} 张图 (prompt={smart_format(prompt, 60)!r}, size={size or '默认'}, "
+               f"quality={quality or '默认'}, format={output_format})\n")
         try:
-            client = resolve_image_gen('image_gen')
+            # operation 由是否带参考图决定: 带图→edit(走 image_edit 配置)/否则 generate
+            client = resolve_image_gen('image_gen', operation='edit' if images else 'generate')
         except ValueError as e:
             # 未配置: 明确"不要重试", 避免模型空转 3 次才 LLM_FAILED(§6.5)。
             yield f"[Status] ❌ {e}\n"
             return StepOutcome(f"[Error: image_gen 未配置 ({e})——不要重试本工具，请直接告知用户生图能力未启用]", next_prompt="\n")
         try:
-            images, err = client.generate(prompt, size=size, quality=quality, n=n,
-                                          output_format=output_format, model=model)
+            produced, err = client.generate(prompt, size=size, quality=quality, n=n,
+                                            output_format=output_format, model=model, images=images)
         except Exception as e:
             err = f"[Error: image_gen {type(e).__name__}: {e}]"
         if err:
             yield f"[Status] ❌ {err}\n"
             return StepOutcome(err, next_prompt="\n")
+        images = produced
         out_dir = os.path.join(self.cwd, 'outputs')
         try:
             os.makedirs(out_dir, exist_ok=True)

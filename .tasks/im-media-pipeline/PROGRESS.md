@@ -112,4 +112,6 @@ B4 8MiB+bytea / B5 QQ 主动消息路径）与重要项（I2 content_type、I4 �
 
 | P9 | **托管形态协商失效修复（用户实测暴露）**：llm-proxy 清洗上游错误体（安全边界）→ GA 拿不到参数名 → 模型盲重试 4 次后放弃。两侧互补：①代理 `clientActionableErrorBody` 仅对生图 4xx 参数类话术**只取 message 重建透传**（兄弟字段零泄露）；②客户端 4xx 不可判读时**保守集兜底重试一次** | 代理 3 组新测试（透传 / 兄弟字段不泄露 / 敏感词不放行 / 5xx 与 chat 仍清洗）+ 客户端 4 项新测试；Go 全量 + race 绿、根 148 绿 |
 
+| P10 | **改图/参考图（image.edit）直连形态落地**：`protocol`/`operations` 能力声明 + 端点按 operation 选 + 未声明 fail-closed；工具 `image` 参数（读盘/路径安全/魔数校验）；`image_edit` 与 `image_gen` 分配置。实测 `/images/edits`+`gemini-3.1-flash-image` 200/9.0s 且像素验证生效；源码级坐实 new-api 丢参机制（Extra 合并被注释）与参数白名单 | 根 167 全绿（test_image_gen 54→68）；真实调用 1 次通过 |
+
 **残余风险/后续**：协商遇到新队列先付 1-2 次 400 往返（~1.3s，未做跨请求记忆；高频生图可加按 (apibase, model) 的进程内裁剪记忆）；agnes 非方形比例需 `ratio` 参数（工具 schema 未暴露，需 `size:"2K"` + `ratio:"16:9"`）；Agnes `return_base64` 经该中转被忽略（仍回 url，走既有 url 直下兜底）。**上生产需重建 ga-runner**（内嵌 ga.py/llmcore.py/tools_schema.json）。

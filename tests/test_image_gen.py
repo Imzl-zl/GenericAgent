@@ -376,7 +376,7 @@ class TestDoImageGen:
     def test_success_writes_file_and_returns_marker(self, monkeypatch, tmp_path):
         h = _handler(tmp_path)
         monkeypatch.setattr(ga, "resolve_image_gen",
-                            lambda name: self._client_with(monkeypatch, [_sync_response([self.B64])]))
+                            lambda name, operation='generate': self._client_with(monkeypatch, [_sync_response([self.B64])]))
         outcome = _drain(h.do_image_gen({"prompt": "a cat"}, None))
         assert re.match(r"^\[FILE:outputs/image_\d{8}_\d{6}_\d{6}\.png\]$", outcome.data)
         files = list((tmp_path / "outputs").glob("image_*.png"))
@@ -388,7 +388,7 @@ class TestDoImageGen:
     def test_n2_names_and_two_markers(self, monkeypatch, tmp_path):
         h = _handler(tmp_path)
         monkeypatch.setattr(ga, "resolve_image_gen",
-                            lambda name: self._client_with(monkeypatch, [_sync_response([self.B64, self.B64])]))
+                            lambda name, operation='generate': self._client_with(monkeypatch, [_sync_response([self.B64, self.B64])]))
         outcome = _drain(h.do_image_gen({"prompt": "a cat", "n": 2}, None))
         markers = outcome.data.split("\n")
         assert len(markers) == 2
@@ -407,7 +407,7 @@ class TestDoImageGen:
     def test_unconfigured_returns_error_with_no_retry_hint(self, monkeypatch, tmp_path):
         h = _handler(tmp_path)
 
-        def _raise_unconfigured(name):
+        def _raise_unconfigured(name, operation='generate'):
             raise ValueError("Config 'image_gen' not in mykey")
 
         monkeypatch.setattr(ga, "resolve_image_gen", _raise_unconfigured)
@@ -419,7 +419,7 @@ class TestDoImageGen:
     def test_empty_response_no_marker(self, monkeypatch, tmp_path):
         h = _handler(tmp_path)
         monkeypatch.setattr(ga, "resolve_image_gen",
-                            lambda name: self._client_with(monkeypatch, [_sync_response([])]))
+                            lambda name, operation='generate': self._client_with(monkeypatch, [_sync_response([])]))
         outcome = _drain(h.do_image_gen({"prompt": "a cat"}, None))
         assert "空响应" in outcome.data
         assert "[FILE:" not in outcome.data
@@ -430,7 +430,7 @@ class TestDoImageGen:
         resp = _FakeResponse(status_code=500, headers={"retry-after": "0.5"})
         fake = _install_fake_http(monkeypatch, [resp, resp])
         monkeypatch.setattr(ga, "resolve_image_gen",
-                            lambda name: llmcore.OpenAIImageGenClient({**self.CFG, "max_retries": 1}))
+                            lambda name, operation='generate': llmcore.OpenAIImageGenClient({**self.CFG, "max_retries": 1}))
         outcome = _drain(h.do_image_gen({"prompt": "a cat"}, None))
         assert outcome.data.startswith("[Error: image_gen HTTP 500")
         assert "!!!Error:" not in outcome.data
@@ -440,7 +440,7 @@ class TestDoImageGen:
         h = _handler(tmp_path)
         big = b"x" * (20 * 1024 * 1024 + 1)
         monkeypatch.setattr(ga, "resolve_image_gen",
-                            lambda name: self._client_with(monkeypatch, [_sync_response([base64.b64encode(big).decode()])]))
+                            lambda name, operation='generate': self._client_with(monkeypatch, [_sync_response([base64.b64encode(big).decode()])]))
         outcome = _drain(h.do_image_gen({"prompt": "a cat"}, None))
         assert outcome.data.startswith("[Error: image_gen 产物")
         assert "20MiB" in outcome.data
@@ -452,7 +452,7 @@ class TestDoImageGen:
         # 请求之外的容器格式 → 交付扩展名必须以真实魔数为准, 否则 IM 侧 MIME 失配。
         h = _handler(tmp_path)
         monkeypatch.setattr(ga, "resolve_image_gen",
-                            lambda name: self._client_with(monkeypatch, [_sync_response([self.B64])]))
+                            lambda name, operation='generate': self._client_with(monkeypatch, [_sync_response([self.B64])]))
         outcome = _drain(h.do_image_gen({"prompt": "a cat", "output_format": "jpeg"}, None))
         assert re.match(r"^\[FILE:outputs/image_\d{8}_\d{6}_\d{6}\.png\]$", outcome.data)
         assert list((tmp_path / "outputs").glob("image_*.png"))
@@ -463,7 +463,7 @@ class TestDoImageGen:
         h = _handler(tmp_path)
         blob = b"\x00" * 64
         monkeypatch.setattr(ga, "resolve_image_gen",
-                            lambda name: self._client_with(
+                            lambda name, operation='generate': self._client_with(
                                 monkeypatch, [_sync_response([base64.b64encode(blob).decode()])]))
         outcome = _drain(h.do_image_gen({"prompt": "a cat", "output_format": "jpeg"}, None))
         assert re.match(r"^\[FILE:outputs/image_\d{8}_\d{6}_\d{6}\.jpeg\]$", outcome.data)
@@ -738,3 +738,173 @@ class TestTrimMemoRemovesRepeatedWastedCalls:
         images, err = client.generate("a cat", size="1024x1024")
         assert images is None and len(fake.calls) == 1
         assert llmcore._IMAGE_GEN_TRIM_MEMO == {}        # 无记忆写入
+
+
+# ═══════════ 改图/参考图(image.edit)：2026-09-13 实测新增 ═══════════
+
+class TestEditProtocolAndOperationGate:
+    """`protocol=images_edits` → multipart POST /images/edits(文件字段 image)；
+    `operations` 声明本通道能做什么，未声明一律 fail-closed（防"静默丢弃参数"通道
+    假装成功——实测 agnes 的 extra_body.image 就是静默无效）。"""
+
+    CFG_EDIT = {"name": "openai", "apibase": "https://relay.example/v1", "apikey": "sk-test",
+                "model": "gemini-3.1-flash-image", "protocol": "images_edits",
+                "operations": ["edit"], "max_retries": 0}
+    CFG_GEN = {"name": "openai", "apibase": "https://relay.example/v1", "apikey": "sk-test",
+               "model": "agnes-image-2.5-flash", "max_retries": 0}
+    B64 = base64.b64encode(_1PX_PNG).decode()
+
+    def test_edit_uses_multipart_images_edits_endpoint(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = _client(self.CFG_EDIT, fake)
+        images, err = client.generate("把方块改成绿色", size="1024x1024",
+                                      images=[("ref.png", _1PX_PNG, "image/png")])
+        assert err is None and images == [_1PX_PNG]
+        url, kwargs = fake.calls[0]
+        assert url.endswith("/images/edits")
+        assert "json" not in kwargs                     # multipart, 不能走 json body
+        assert "Content-Type" not in kwargs["headers"]  # boundary 由 requests 生成
+        assert kwargs["files"] == [("image", ("ref.png", _1PX_PNG, "image/png"))]
+        assert kwargs["data"]["model"] == "gemini-3.1-flash-image"
+        assert kwargs["data"]["prompt"] == "把方块改成绿色"
+        assert kwargs["data"]["size"] == "1024x1024"
+
+    def test_generate_path_still_json_generations(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = _client(self.CFG_GEN, fake)
+        assert client.generate("a cat")[0] == [_1PX_PNG]
+        url, kwargs = fake.calls[0]
+        assert url.endswith("/images/generations")
+        assert kwargs["headers"]["Content-Type"] == "application/json"
+        assert "files" not in kwargs
+
+    def test_edit_without_declared_operation_fails_closed(self, monkeypatch):
+        # 通道只声明 generate: 带参考图调用必须知情失败, 不许"悄悄按文生图出图"
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = _client(self.CFG_GEN, fake)
+        images, err = client.generate("x", images=[("ref.png", _1PX_PNG, "image/png")])
+        assert images is None and fake.calls == []
+        assert "未声明" in err and "image.edit" in err and "不要重试" in err
+
+    def test_edit_protocol_without_images_fails_closed(self, monkeypatch):
+        # 反向: 只声明 edit 的通道收到纯文生图请求 → 也 fail-closed
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = _client(self.CFG_EDIT, fake)
+        images, err = client.generate("x")
+        assert images is None and fake.calls == []
+        assert "未声明" in err and "image.generate" in err
+
+    def test_edit_image_budget_and_multi_image_guard(self, monkeypatch):
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64])])
+        client = _client(self.CFG_EDIT, fake)
+        # 多图: new-api 源码只读 formData.Get("image")(单值) → 多图未实测, 明确拒绝
+        images, err = client.generate("x", images=[("a.png", _1PX_PNG, "image/png"),
+                                                   ("b.png", _1PX_PNG, "image/png")])
+        assert images is None and "仅支持 1 张" in err and fake.calls == []
+        # 单张超限
+        big = b"\x89PNG\r\n\x1a\n" + b"x" * (client.MAX_EDIT_IMAGE_BYTES + 1)
+        images, err = client.generate("x", images=[("big.png", big, "image/png")])
+        assert images is None and "超过" in err and fake.calls == []
+        # 空图
+        images, err = client.generate("x", images=[("e.png", b"", "image/png")])
+        assert images is None and "为空" in err
+
+    def test_unions_declared_operations_allow_both(self, monkeypatch):
+        # 一条通道声明两种 operation: 带图走 edits, 不带图走 generations
+        fake = _install_fake_http(monkeypatch, [_sync_response([self.B64]), _sync_response([self.B64])])
+        cfg = {**self.CFG_EDIT, "operations": ["generate", "edit"]}
+        client = _client(cfg, fake)
+        client.generate("x")
+        client.generate("x", images=[("ref.png", _1PX_PNG, "image/png")])
+        assert fake.calls[0][0].endswith("/images/generations")
+        assert fake.calls[1][0].endswith("/images/edits")
+
+    def test_bad_protocol_rejected(self):
+        with pytest.raises(ValueError):
+            llmcore.OpenAIImageGenClient({**self.CFG_EDIT, "protocol": "fal"})
+
+
+class TestResolveImageGenByOperation:
+    """operation='edit' 时优先 <name>_edit 配置(便宜/免费的文生图与付费改图分开配置)。"""
+
+    def _mykeys(self, monkeypatch, mapping):
+        monkeypatch.setattr(llmcore, "reload_mykeys", lambda: (mapping, False))
+
+    def test_edit_prefers_sibling_config(self, monkeypatch):
+        self._mykeys(monkeypatch, {
+            "image_gen": {"name": "openai", "apibase": "https://a/v1", "apikey": "k", "model": "agnes-image-2.5-flash"},
+            "image_edit": {"name": "openai", "apibase": "https://b/v1", "apikey": "k2",
+                           "model": "gemini-3.1-flash-image", "protocol": "images_edits"},
+        })
+        assert llmcore.resolve_image_gen("image_gen").model == "agnes-image-2.5-flash"
+        edit_client = llmcore.resolve_image_gen("image_gen", operation="edit")
+        assert edit_client.model == "gemini-3.1-flash-image"
+        assert edit_client.protocol == "images_edits"
+
+    def test_edit_falls_back_to_base_config_then_fails_closed_at_call(self, monkeypatch):
+        self._mykeys(monkeypatch, {
+            "image_gen": {"name": "openai", "apibase": "https://a/v1", "apikey": "k", "model": "agnes-image-2.5-flash"},
+        })
+        client = llmcore.resolve_image_gen("image_gen", operation="edit")
+        assert client.model == "agnes-image-2.5-flash"      # 找不到 image_edit → 用基础配置
+        images, err = client.generate("x", images=[("r.png", _1PX_PNG, "image/png")])
+        assert images is None and "未声明" in err            # 由 operation gate 兜住
+
+    def test_missing_config_still_raises(self, monkeypatch):
+        self._mykeys(monkeypatch, {})
+        with pytest.raises(ValueError):
+            llmcore.resolve_image_gen("image_gen", operation="edit")
+
+
+class TestDoImageGenEditTool:
+    """工具层负责参考图读盘/路径安全/格式校验(llmcore 只管发送)。"""
+
+    CFG_EDIT = {"name": "openai", "apibase": "https://relay.example/v1", "apikey": "sk-test",
+                "model": "gemini-3.1-flash-image", "protocol": "images_edits",
+                "operations": ["edit"], "max_retries": 0}
+    B64 = base64.b64encode(_1PX_PNG).decode()
+
+    def _edit_client(self, monkeypatch, responses):
+        fake = _install_fake_http(monkeypatch, responses)
+        return fake, llmcore.OpenAIImageGenClient(self.CFG_EDIT)
+
+    def test_reference_image_is_sent_and_output_delivered(self, monkeypatch, tmp_path):
+        (tmp_path / "ref.png").write_bytes(_1PX_PNG)
+        fake, client = self._edit_client(monkeypatch, [_sync_response([self.B64])])
+        h = _handler(tmp_path)
+        monkeypatch.setattr(ga, "resolve_image_gen", lambda name, operation='generate': client)
+        outcome = _drain(h.do_image_gen({"prompt": "改成绿色", "image": "ref.png"}, None))
+        assert re.match(r"^\[FILE:outputs/image_\d{8}_\d{6}_\d{6}\.png\]$", outcome.data)
+        assert fake.calls[0][1]["files"][0][0] == "image"
+        assert fake.calls[0][1]["files"][0][1][0] == "ref.png"
+        assert fake.calls[0][0].endswith("/images/edits")
+
+    def test_path_escape_rejected(self, monkeypatch, tmp_path):
+        outside = tmp_path.parent / "secret.png"
+        outside.write_bytes(_1PX_PNG)
+        fake, client = self._edit_client(monkeypatch, [])
+        h = _handler(tmp_path)
+        monkeypatch.setattr(ga, "resolve_image_gen", lambda name, operation='generate': client)
+        outcome = _drain(h.do_image_gen({"prompt": "x", "image": "../secret.png"}, None))
+        assert outcome.data.startswith("[Error: image_gen 参考图必须位于工作区内")
+        assert fake.calls == []
+
+    def test_missing_and_non_image_reference_rejected(self, monkeypatch, tmp_path):
+        (tmp_path / "notimg.png").write_bytes(b"definitely not an image............")
+        fake, client = self._edit_client(monkeypatch, [])
+        h = _handler(tmp_path)
+        monkeypatch.setattr(ga, "resolve_image_gen", lambda name, operation='generate': client)
+        missing = _drain(h.do_image_gen({"prompt": "x", "image": "nope.png"}, None))
+        assert "参考图不存在" in missing.data
+        bad = _drain(h.do_image_gen({"prompt": "x", "image": "notimg.png"}, None))
+        assert "不是可识别的图片" in bad.data
+        assert fake.calls == []
+
+    def test_edit_config_missing_multi_reference_message(self, monkeypatch, tmp_path):
+        (tmp_path / "a.png").write_bytes(_1PX_PNG)
+        (tmp_path / "b.png").write_bytes(_1PX_PNG)
+        fake, client = self._edit_client(monkeypatch, [])
+        h = _handler(tmp_path)
+        monkeypatch.setattr(ga, "resolve_image_gen", lambda name, operation='generate': client)
+        outcome = _drain(h.do_image_gen({"prompt": "x", "image": "a.png,b.png"}, None))
+        assert "仅支持 1 张" in outcome.data and fake.calls == []

@@ -75,6 +75,7 @@
     "description": "通过独立生图模型生成图片（OpenAI images/generations 兼容协议）。需要创作/生成图片时使用。返回 [FILE:outputs/<name>] 标记；**你必须在最终回复中逐字包含 [FILE:outputs/<name>] 标记行** 才能触发图片交付给用户（工具返回标记本身不等于交付发生）。size/quality 合法取值依上游模型而定：dall-e 系列无 1536x1024、无 output_format；gpt-image 系列全支持；Agnes 图像模型（如 agnes-image-2.5-flash）支持 size 档位 1K/2K/3K/4K，但不接受 quality/output_format。上游不支持的参数会被自动裁剪一次并重试，且**已拒参数按「网关+模型」记住，后续请求不再重发**。**当前链路上不存在参考图/改图能力**（实测：网关静默丢弃 extra_body/ratio，`/images/edits` 无可用渠道）——不要向用户承诺“改这张图/保持这个人”，改用 code_run+PIL 合成或重新生成。**图内文字（诗词/标题/字幕）不要交给生图模型**——用 code_run+PIL 在生成好的背景上合成（这条链路上唯一可靠的做法）。n<=4。",
     "parameters": {"type": "object", "properties": {
       "prompt": {"type": "string", "description": "画面描述（必填）"},
+      "image": {"type": "string", "description": "参考图路径（相对工作区，如 outputs/xxx.png 或入站附件路径）。传了它就变成**改图(img2img)**：让模型按 prompt 修改这张图，并自动改用另一个端点 + image_edit 配置。需要通道具备改图能力：若解析出的通道未声明该能力，工具会**fail-closed 如实报错**（绝不静默忽略参考图）。当前仅支持 1 张参考图（多图合成未经上游实测）。"},
       "size": {"type": "string", "description": "画布尺寸。要特定比例请直接传上游原生尺寸（已实测有效）：1:1 1024x1024 / 2048x2048；3:4 864x1152；4:3 1152x864；16:9 1312x736（1K）/ 2624x1472（2K）；9:16 736x1312；2:3 832x1248；21:9 1568x672。档位式 1K/2K/3K/4K 也可用。其它尺寸会被归一化到最近的原生尺寸（1920x1080→1312x736、1024x768→1152x864），传接近值即可。`ratio` 参数在本网关无效（被静默丢弃），请用原生像素尺寸。"},
       "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "质量等级；仅 gpt-image 系列（Agnes 队列拒绝该参数，会被自动裁剪）。慢模型处在 120s 代理窗口下——大尺寸/慢模型请用 low 或省略 quality，否则可能超时（HTTP 524）"},
       "n": {"type": "integer", "minimum": 1, "maximum": 4, "description": "生成数量（1-4）"},
