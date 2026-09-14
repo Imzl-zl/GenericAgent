@@ -353,6 +353,43 @@ _CHANNEL_PROFILES = {
 工具层 `ga.do_image_gen` 落盘 + `[FILE:]` marker + 省略明示（quality/output_format）+ 魔数改名（请求 webp → 实得 png）全通。
 另：该模型单次实测 42.9s/70.8s，印证 `read_timeout≥110` 与 `max_retries=1` 的预算取舍（最坏 ≈220s < 300s）。
 
+### 8.11 参考图输入预算：为什么不抬 4MiB（2026-09-14 查证 + 定案）
+
+**4MiB 是自己设的**：`tenant_platform/backend-go/internal/infrastructure/llmproxy/handler.go`
+`const MaxWorkerRequestBytes = 4 * 1024 * 1024`——**硬编码常量，不是配置项**（防请求体撑爆内存的读上限）。
+另两处不要混淆：`api.DefaultMaxRequestBodyBytes = 1MiB`（`PLATFORM_MAX_BODY_BYTES`，只管平台 API，
+而入站媒体传的是**路径**不是字节，所以 1MiB 够）；生图**响应**上限 32MiB（另一个常量）。
+又因 base64 膨胀 ~33%，4MiB 请求体 ⇒ 内联图片原始字节上限 ≈ **3MiB**。
+
+**现状（对账后的真实缺口）**：
+
+| 路径 | 现状 | 结论 |
+|---|---|---|
+| 入站视觉注入（用户发照片给模型看） | `agent_loop._image_block_from_file` 已降采样最长边 1568px + JPEG，预算 3.5MB（对齐 4MiB） | **已符合行业做法**，不动 |
+| **改图参考图**（`ga._load_reference_images`） | 直读原始字节（单张 ≤8MiB）→ 原样 base64 发出，**不缩放不重编码** | **缺口**：平台形态必撞 413 `BODY_TOO_LARGE`；直连形态白传带宽/延迟（8MiB 原图 base64 后 ≈10.7MB） |
+| 解压炸弹 | 有字节上限 + 魔数校验，**无像素维度上限** | 8MiB 的 PNG 可解成上亿像素 → 补头部像素校验 |
+
+**行业共识（2026-09-14 查一手文档）**：
+
+1. **内联 data URI 只适合小文件**——fal 官方原文："Data URIs embed the entire file in the request payload. This inflates
+   the request size significantly… **not recommended for files larger than a few KB**. Use CDN uploads or external URLs instead"；
+   其通用形态是 **URL**（本地文件先 CDN 上传，大文件自动 10MB 分片）。Gemini 同类分档：内联 ≤100MB /
+   File API ≤2GB·48h / 外部 URL / GCS URI。
+2. **客户端预缩是主流建议**——Anthropic 官方明说：自己先 resize，传 4000px "the model sees the same thing either way"，
+   只浪费带宽和延迟（Claude 侧自动降采样到长边 1568px ≈ 1.15MP，API 单图 5MB；OpenAI 则是 2048 框→768 短边→512 瓦片）。
+3. **解码前做像素上限**（防解压炸弹）——fal 对 `image_urls` 在解码前只读头部校验 `max_image_pixels`（默认 ~8948 万，PIL `MAX_IMAGE_PIXELS` 同量级），超限回确定性 422 `image_too_large`，
+   而不是 OOM 掉整个 runner。
+
+**定案（不抬 4MiB）**：
+
+- **P2-a（本期可做，直连/托管双受益）**：参考图在**工具层**（与路径安全/魔数/大小同层）归一化——
+  长边 >1568px 等比缩放（对齐出图原生尺寸 1K/2K，再大对生成无收益）、编码 JPEG q85、剥离 EXIF；
+  解码前先读头部尺寸，超 `MAX_IMAGE_PIXELS` 直接拒绝；归一化结果**明示**给模型与用户
+  （"参考图已归一化 4032x3024 → 1568x1176，JPEG 218KB"）。预期把 8MiB 级原图压到 200-500KB，4MiB 不再是约束。
+- **P2-b（真大图才需要）**：平台侧**受控上传→短时 URL**，把"内联字节"换成"引用"。这是主流终态，
+  且 SenseNova/Gemini/fal 都把 URL 当一等输入形态（SenseNova 甚至只收公网 URL 或 Data-URL）。
+- **明令禁止的修法**：直接抬 `MaxWorkerRequestBytes`（那是内存防御，与问题无关；真要大图应该换引用传输）。
+
 **仍未证实的（不得当作已支持）**：gemini-3-pro-image / 各 preview / gpt-image-2(.5-flare) 的**真图改图**（仅端点探活）；gpt-image 系的 `stream`/`partial_images` 在本网关的实际行为；sensenova 的 `quality`/`output_format`（本轮探针在 size 校验前即返回，得不到结论 → 保守声明为不支持）。
 
 
